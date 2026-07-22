@@ -58,6 +58,10 @@ pub struct LSMTFile {
 }
 
 impl LSMTFile {
+    pub fn index(&self) -> Arc<RwLock<ComboIndex>> {
+        self.index.clone()
+    }
+
     fn rw_layout_from_header(header: &HeaderTrailer) -> Result<RwLayout> {
         let is_sparse_rw = header.is_sparse_rw();
         let is_hybrid_rw = header.is_hybrid_rw();
@@ -478,6 +482,10 @@ impl LSMTFile {
     }
 
     pub async fn flatten(&self, dest_file: Arc<dyn VirtualFile>) -> Result<()> {
+        self.flatten_with_args(CommitArgs::new(dest_file)).await
+    }
+
+    pub async fn flatten_with_args(&self, args: CommitArgs) -> Result<()> {
         let virtual_size = self.virtual_size.load(Ordering::Acquire);
         let query = Segment::new(0, virtual_size.div_ceil(ALIGNMENT) as u32);
         let mut mappings = Vec::new();
@@ -485,8 +493,7 @@ impl LSMTFile {
             let idx = self.index.read().await;
             idx.lookup(query, &mut mappings);
         }
-        let commit_args = CommitArgs::new(dest_file);
-        compact_to(&self.layers, &mappings, virtual_size, commit_args).await
+        compact_to(&self.layers, &mappings, virtual_size, args).await
     }
 
     pub async fn commit_with_args(&self, args: CommitArgs) -> Result<()> {
