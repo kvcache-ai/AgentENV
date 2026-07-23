@@ -1,6 +1,5 @@
 use anyhow::anyhow;
 use anyhow::{ensure, Context, Result};
-use crc::{Crc, CRC_32_ISCSI};
 use nix::errno::Errno;
 use roaring::RoaringBitmap;
 use std::io::Write;
@@ -107,8 +106,7 @@ impl CacheMetaDisk {
             .serialize_into(&mut out)
             .context("failed to serialize bitmap")?;
 
-        let crc = Crc::<u32>::new(&CRC_32_ISCSI);
-        let checksum = crc.checksum(&out);
+        let checksum = crc32c::crc32c(&out);
         out.write_all(&checksum.to_le_bytes())?;
 
         Ok(out)
@@ -160,8 +158,7 @@ impl CacheMetaDisk {
             .context("failed to deserialize bitmap")?;
 
         let stored_crc = u32::from_le_bytes(crc_bytes.try_into().context("read meta crc failed")?);
-        let crc = Crc::<u32>::new(&CRC_32_ISCSI);
-        let computed = crc.checksum(&raw[..raw.len() - 4]);
+        let computed = crc32c::crc32c(&raw[..raw.len() - 4]);
         ensure!(
             stored_crc == computed,
             "meta CRC mismatch: stored 0x{stored_crc:08X}, computed 0x{computed:08X}"

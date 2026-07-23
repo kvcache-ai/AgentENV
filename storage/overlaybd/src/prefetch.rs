@@ -2,7 +2,6 @@ use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile};
 use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use crc::{Crc, CRC_32_ISCSI};
 use parking_lot::Mutex;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
@@ -18,7 +17,6 @@ const TRACE_MAGIC: u32 = 3_270_449_184;
 const TRACE_HEADER_SIZE: usize = 24;
 const TRACE_RECORD_SIZE: usize = 24;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
-const CRC32C: Crc<u32> = Crc::<u32>::new(&CRC_32_ISCSI);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrefetchMode {
@@ -183,11 +181,11 @@ impl PrefetcherInner {
         let records = self.record_array.lock().clone();
         let data_size = u64::try_from(records.len().saturating_mul(TRACE_RECORD_SIZE))
             .context("trace data size overflow")?;
-        let mut digest = CRC32C.digest();
+        let mut checksum: u32 = 0;
         let mut encoded = Vec::with_capacity(records.len());
         for record in &records {
             let raw = record.encode();
-            digest.update(&raw);
+            checksum = crc32c::crc32c_append(checksum, &raw);
             encoded.push(raw);
         }
 
@@ -214,7 +212,7 @@ impl PrefetcherInner {
 
         let header = TraceHeader {
             data_size,
-            checksum: digest.finalize(),
+            checksum,
         };
         trace_file.seek(SeekFrom::Start(0))?;
         trace_file.write_all(&header.encode())?;
@@ -251,14 +249,14 @@ impl PrefetcherInner {
             "prefetch trace payload is not record-aligned",
         );
 
-        let mut digest = CRC32C.digest();
+        let mut checksum: u32 = 0;
         let mut queue = VecDeque::new();
         for chunk in raw[TRACE_HEADER_SIZE..].chunks_exact(TRACE_RECORD_SIZE) {
-            digest.update(chunk);
+            checksum = crc32c::crc32c_append(checksum, chunk);
             queue.push_back(TraceRecord::decode(chunk)?);
         }
         ensure!(
-            digest.finalize() == header.checksum,
+            checksum == header.checksum,
             "prefetch trace checksum mismatch",
         );
         Ok(queue)
