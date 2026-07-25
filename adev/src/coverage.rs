@@ -12,10 +12,6 @@ pub struct CoverageArgs {
     #[arg(long, default_value_t = false)]
     pub include_ignored: bool,
 
-    /// Use sudo runner
-    #[arg(long, default_value_t = true)]
-    pub use_sudo_runner: bool,
-
     /// Output directory for coverage artifacts
     #[arg(long)]
     pub output_dir: Option<String>,
@@ -50,19 +46,17 @@ pub fn run(args: CoverageArgs) -> Result<()> {
     });
 
     let include_ignored = args.include_ignored;
-    let use_sudo_runner = args.use_sudo_runner;
 
-    if use_sudo_runner {
-        let arch = util::detect_arch().unwrap_or_else(|_| "x86_64".into());
-        let env_var = format!(
-            "CARGO_TARGET_{}_UNKNOWN_LINUX_GNU_RUNNER",
-            arch.to_uppercase()
+    let arch = util::detect_arch().unwrap_or_else(|_| "x86_64".into());
+    let env_var = format!(
+        "CARGO_TARGET_{}_UNKNOWN_LINUX_GNU_RUNNER",
+        arch.to_uppercase()
+    );
+    if std::env::var_os(&env_var).is_none() {
+        std::env::set_var(
+            env_var,
+            project_root.join("scripts/run-with-capabilities.sh"),
         );
-        if std::env::var(&env_var).is_err() {
-            let path = std::env::var("PATH").unwrap_or_default();
-            let runner = format!("sudo -E env PATH={path}");
-            std::env::set_var(&env_var, &runner);
-        }
     }
 
     std::fs::create_dir_all(&output_dir)?;
