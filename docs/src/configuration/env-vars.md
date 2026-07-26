@@ -54,7 +54,7 @@ These variables configure the E2B SDK and CLI to point at an AgentENV server. Va
 ```bash
 export E2B_API_URL=http://127.0.0.1:8000
 export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=dummy
+export E2B_API_KEY=e2b_000000
 export E2B_ACCESS_TOKEN=dummy
 ```
 
@@ -63,7 +63,7 @@ export E2B_ACCESS_TOKEN=dummy
 ```bash
 export E2B_API_URL=http://127.0.0.1:8080
 export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=dummy
+export E2B_API_KEY=e2b_000000
 export E2B_ACCESS_TOKEN=dummy
 ```
 

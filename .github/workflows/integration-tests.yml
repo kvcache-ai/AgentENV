@@ -78,11 +78,13 @@ jobs:
         with:
           node-version: "24"
       - name: Install e2b CLI
-        run: npm install -g @e2b/cli@2.8.1
+        run: npm install -g @e2b/cli
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
       - name: Install e2b Python SDK
-        run: python3 -m pip install --user e2b==2.14.1
-      - name: Install e2b-code-interpreter Python SDK
-        run: python3 -m pip install --user e2b-code-interpreter==2.6.0
+        run: python3 -m pip install --upgrade e2b e2b-code-interpreter
       - name: E2E tests (${{ matrix.e2e_name }})
         run: |
           if [[ "${{ matrix.e2e_name }}" == "single-node" ]]; then

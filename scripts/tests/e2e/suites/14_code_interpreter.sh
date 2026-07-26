@@ -18,7 +18,7 @@ exit 0
 
 export E2B_API_URL="${AENV_URL}"
 export E2B_SANDBOX_URL="${AENV_PROXY_URL}"
-export E2B_API_KEY="${AENV_API_KEY}"
+export E2B_API_KEY="e2b_000000"
 
 if ! python3 -c 'import e2b_code_interpreter' >/dev/null 2>&1; then
   warn "e2b_code_interpreter Python package not installed; skipping"
