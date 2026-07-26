@@ -9,6 +9,7 @@ on:
   pull_request:
     paths-ignore: &ignore_docs
       - "**.md"
+      - "**.rst"
       - "docs/**"
       - "LICENSE"
       - ".gitignore"
