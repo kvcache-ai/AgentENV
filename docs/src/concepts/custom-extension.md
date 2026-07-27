@@ -27,7 +27,7 @@ All hooks are `POST {url}/sandbox-hook/*` with a JSON body. Any connection error
 
 | Hook | When | Request | Response |
 |------|------|---------|----------|
-| `start-fresh` | Before a fresh sandbox boots, after its network slot is allocated | `sandboxId`, `sandboxInstanceId`, `networkNamespacePath`, `customExtensionParams` | optional `extraBootArgs` appended to the kernel cmdline |
+| `start-fresh` | Before a fresh sandbox boots, after its network slot is allocated | `sandboxId`, `sandboxInstanceId`, `networkNamespacePath`, `hostInteractionIp`, `customExtensionParams` | optional `extraBootArgs` appended to the kernel cmdline |
 | `start-resume` | Before a sandbox resumes from a snapshot (template launch, resume after pause, fork child) | same as above | none |
 | `patch-params` | When a user PATCHes the sandbox's params | `sandboxId`, `patch` (verbatim user body) | updated **full** `customExtensionParams` |
 | `stop` | When the sandbox runtime is torn down, before the network slot is released | `sandboxId`, `sandboxInstanceId` | none |
@@ -38,6 +38,7 @@ Notes:
 - **`stop` also fires on pause.** Pausing persists the sandbox state and then stops the VM process and releases the network namespace; the subsequent resume creates a fresh runtime and fires `start-resume`. In-place pause+resume during snapshot capture does not fire any hook (and keeps the same `sandboxInstanceId`).
 - `stop` is best-effort: delivery failures are only logged, and it is also fired fire-and-forget if a started sandbox is dropped without an explicit stop.
 - `networkNamespacePath` is the host path of the sandbox's netns file (e.g. `/var/run/netns/agentenv-ns-*`), so the extension can enter the namespace (e.g. `nsenter --net=...`) to set up firewall rules or VPN interfaces.
+- `hostInteractionIp` is the per-runtime IPv4 address that AgentENV routes to this sandbox. It can change after pause/resume, so extensions must use the value from the current start hook rather than caching an older one.
 - Concurrent `patch-params` calls to the same sandbox are not serialized; if your patch semantics are not commutative, handle concurrency in the extension.
 
 ---

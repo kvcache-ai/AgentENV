@@ -21,6 +21,9 @@ pub struct StartFreshHookRequest {
     /// Host path of the sandbox's network namespace file (e.g. /var/run/netns/agentenv-ns-*).
     #[serde(rename = "networkNamespacePath")]
     pub network_namespace_path: String,
+    /// Per-runtime host interaction address routed to this sandbox.
+    #[serde(rename = "hostInteractionIp")]
+    pub host_interaction_ip: String,
     /// Opaque JSON object interpreted only by the custom extension. An absent value and an empty object are equivalent: both mean empty params.
     #[serde(
         rename = "customExtensionParams",
@@ -34,11 +37,13 @@ impl StartFreshHookRequest {
         sandbox_id: String,
         sandbox_instance_id: String,
         network_namespace_path: String,
+        host_interaction_ip: String,
     ) -> StartFreshHookRequest {
         StartFreshHookRequest {
             sandbox_id,
             sandbox_instance_id,
             network_namespace_path,
+            host_interaction_ip,
             custom_extension_params: None,
         }
     }

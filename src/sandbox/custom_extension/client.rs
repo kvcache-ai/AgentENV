@@ -30,6 +30,7 @@
 //! a process-wide singleton derived from the global config; when no URL is
 //! configured, all calls are skipped.
 
+use std::net::Ipv4Addr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -118,12 +119,14 @@ impl CustomExtensionClient {
         sandbox_id: SandboxId,
         sandbox_instance_id: SandboxInstanceId,
         network_namespace_path: &str,
+        host_interaction_ip: Ipv4Addr,
         custom_extension_params: Option<&CustomExtensionParams>,
     ) -> Result<Option<String>> {
         let request = models::StartFreshHookRequest {
             sandbox_id: sandbox_id.to_string(),
             sandbox_instance_id: sandbox_instance_id.to_string(),
             network_namespace_path: network_namespace_path.to_string(),
+            host_interaction_ip: host_interaction_ip.to_string(),
             custom_extension_params: Some(
                 custom_extension_params
                     .cloned()
@@ -143,12 +146,14 @@ impl CustomExtensionClient {
         sandbox_id: SandboxId,
         sandbox_instance_id: SandboxInstanceId,
         network_namespace_path: &str,
+        host_interaction_ip: Ipv4Addr,
         custom_extension_params: Option<&CustomExtensionParams>,
     ) -> Result<()> {
         let request = models::StartResumeHookRequest {
             sandbox_id: sandbox_id.to_string(),
             sandbox_instance_id: sandbox_instance_id.to_string(),
             network_namespace_path: network_namespace_path.to_string(),
+            host_interaction_ip: host_interaction_ip.to_string(),
             custom_extension_params: Some(
                 custom_extension_params
                     .cloned()
@@ -257,6 +262,7 @@ impl CustomExtensionHookGuard {
     pub(crate) async fn start_fresh(
         &mut self,
         network_namespace_path: &str,
+        host_interaction_ip: Ipv4Addr,
         custom_extension_params: Option<&CustomExtensionParams>,
     ) -> Result<Option<String>> {
         // Record the instance id before delivering the hook: if the request
@@ -270,6 +276,7 @@ impl CustomExtensionHookGuard {
                 self.sandbox_id,
                 sandbox_instance_id,
                 network_namespace_path,
+                host_interaction_ip,
                 custom_extension_params,
             )
             .await?;
@@ -286,6 +293,7 @@ impl CustomExtensionHookGuard {
     pub(crate) async fn start_resume(
         &mut self,
         network_namespace_path: &str,
+        host_interaction_ip: Ipv4Addr,
         custom_extension_params: Option<&CustomExtensionParams>,
     ) -> Result<()> {
         // Recorded before delivery for the same reason as `start_fresh`.
@@ -296,6 +304,7 @@ impl CustomExtensionHookGuard {
                 self.sandbox_id,
                 sandbox_instance_id,
                 network_namespace_path,
+                host_interaction_ip,
                 custom_extension_params,
             )
             .await?;
@@ -483,6 +492,7 @@ pub(crate) mod tests {
                 sandbox_id,
                 sandbox_instance_id,
                 "/var/run/netns/agentenv-ns-test",
+                Ipv4Addr::new(10, 11, 0, 123),
                 Some(&params(serde_json::json!({"team": "alpha"}))),
             )
             .await
@@ -498,6 +508,7 @@ pub(crate) mod tests {
             json["networkNamespacePath"],
             "/var/run/netns/agentenv-ns-test"
         );
+        assert_eq!(json["hostInteractionIp"], "10.11.0.123");
         assert_eq!(
             json["customExtensionParams"],
             serde_json::json!({"team": "alpha"})
@@ -514,6 +525,7 @@ pub(crate) mod tests {
                 SandboxId::new(),
                 SandboxInstanceId::new(),
                 "/var/run/netns/agentenv-ns-test",
+                Ipv4Addr::new(10, 11, 0, 124),
                 None,
             )
             .await
@@ -534,6 +546,7 @@ pub(crate) mod tests {
                 SandboxId::new(),
                 SandboxInstanceId::new(),
                 "/var/run/netns/agentenv-ns-test",
+                Ipv4Addr::new(10, 11, 0, 125),
                 None,
             )
             .await
@@ -554,6 +567,7 @@ pub(crate) mod tests {
                 sandbox_id,
                 sandbox_instance_id,
                 "/var/run/netns/agentenv-ns-resume",
+                Ipv4Addr::new(10, 11, 0, 126),
                 None,
             )
             .await
@@ -568,6 +582,7 @@ pub(crate) mod tests {
             json["networkNamespacePath"],
             "/var/run/netns/agentenv-ns-resume"
         );
+        assert_eq!(json["hostInteractionIp"], "10.11.0.126");
     }
 
     #[tokio::test]
@@ -578,7 +593,11 @@ pub(crate) mod tests {
 
         let mut guard = CustomExtensionHookGuard::new(client, sandbox_id);
         let extra_boot_args = guard
-            .start_fresh("/var/run/netns/agentenv-ns-test", None)
+            .start_fresh(
+                "/var/run/netns/agentenv-ns-test",
+                Ipv4Addr::new(10, 11, 0, 127),
+                None,
+            )
             .await
             .expect("start-fresh hook should succeed");
         assert!(extra_boot_args.is_none());
@@ -679,7 +698,11 @@ pub(crate) mod tests {
         let sandbox_id = SandboxId::new();
         let mut guard = CustomExtensionHookGuard::new(Arc::new(client), sandbox_id);
         guard
-            .start_resume("/var/run/netns/agentenv-ns-resume", None)
+            .start_resume(
+                "/var/run/netns/agentenv-ns-resume",
+                Ipv4Addr::new(10, 11, 0, 128),
+                None,
+            )
             .await
             .expect("start-resume hook should succeed");
 
@@ -713,7 +736,11 @@ pub(crate) mod tests {
         {
             let mut guard = CustomExtensionHookGuard::new(Arc::new(client), sandbox_id);
             guard
-                .start_fresh("/var/run/netns/agentenv-ns-test", None)
+                .start_fresh(
+                    "/var/run/netns/agentenv-ns-test",
+                    Ipv4Addr::new(10, 11, 0, 129),
+                    None,
+                )
                 .await
                 .expect_err("start-fresh hook must fail on non-2xx");
         } // dropped while armed: must fire the stop hook fire-and-forget
@@ -751,7 +778,11 @@ pub(crate) mod tests {
         {
             let mut guard = CustomExtensionHookGuard::new(Arc::new(client), sandbox_id);
             guard
-                .start_fresh("/var/run/netns/agentenv-ns-test", None)
+                .start_fresh(
+                    "/var/run/netns/agentenv-ns-test",
+                    Ipv4Addr::new(10, 11, 0, 130),
+                    None,
+                )
                 .await
                 .expect("start-fresh hook should succeed");
         } // dropped: must fire the stop hook fire-and-forget

@@ -1215,6 +1215,7 @@ impl FirecrackerSandbox {
             let extra_boot_args = guard
                 .start_fresh(
                     &netns.to_string_lossy(),
+                    interaction_ip,
                     config.common.custom_extension_params.as_ref(),
                 )
                 .await?;
@@ -1418,6 +1419,7 @@ impl FirecrackerSandbox {
             guard
                 .start_resume(
                     &slot.namespace_path().to_string_lossy(),
+                    slot.host_interaction_ip,
                     config.common.custom_extension_params.as_ref(),
                 )
                 .await?;
