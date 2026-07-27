@@ -53,11 +53,16 @@ struct Row {
     snapshot_id: String,
     #[tabled(rename = "NAMES")]
     names: String,
+    #[tabled(rename = "IMAGE REF")]
+    image_ref: String,
 }
 
 fn create(client: &Client, sandbox_id: &str, name: Option<&str>) -> Result<()> {
     let snapshot = client.create_snapshot(sandbox_id, name)?;
     println!("Created snapshot {}", snapshot.snapshot_id);
+    if let Some(image_ref) = &snapshot.image_ref {
+        println!("Image: {image_ref}");
+    }
     Ok(())
 }
 
@@ -70,5 +75,9 @@ fn list(client: &Client, sandbox_id: Option<&str>, format: Format) -> Result<()>
         } else {
             snapshot.names.join(",")
         },
+        image_ref: snapshot
+            .image_ref
+            .clone()
+            .unwrap_or_else(|| "-".to_string()),
     })
 }

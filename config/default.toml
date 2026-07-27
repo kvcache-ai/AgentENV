@@ -129,12 +129,17 @@ p2p_enabled = true
 #   - "oss": store committed snapshots in object storage.
 #     Requires [backend.oss] to be configured.
 #
-# Advanced: enable only when source images already live in an overlaybd-capable
-# registry and AENV has push credentials. When enabled, AENV publishes
-# each new snapshot delta as a new overlaybd image tag in the original source
-# registry, so the snapshot can also be addressed and reused as an image version
-# there. Unsupported source images fall back to the configured snapshot
-# repository.
+# Advanced: only takes effect with repository_backend = "oss". Enable only when
+# source images already live in an overlaybd-capable registry and AENV has push
+# credentials (from ~/.docker/config.json). When enabled, AENV publishes each
+# snapshot rootfs as a new overlaybd image tag "agentenv-snapshot-{snapshot_id}"
+# in the original source registry: existing remote layers are referenced by
+# digest and only new delta layers are uploaded, so the snapshot can also be
+# addressed and reused as an image version there. The published reference is
+# returned as `imageRef` in snapshot APIs. Memory and VM-state artifacts always
+# stay in the snapshot repository. Locally converted (non-overlaybd) source
+# images fall back to object storage; incompatible remote-backed layouts fail
+# the publish instead of mixing sources.
 # [snapshot.image_publish]
 # enabled = true
 

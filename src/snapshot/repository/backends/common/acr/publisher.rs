@@ -9,6 +9,7 @@ use tracing::warn;
 use crate::digest;
 use crate::snapshot::repository::backends::common::write_dense_overlaybd_layer_to_file;
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
+use crate::snapshot::rootfs_snapshot_image_tag;
 use crate::snapshot::{
     ExternalLayer, OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotId,
 };
@@ -19,8 +20,6 @@ use super::source_image::{
     load_source_registry_image, LocalSnapshotDelta, LocalSnapshotDeltaDescriptor,
     SourceRegistryLayer, SourceRegistryRepository,
 };
-
-const SNAPSHOT_TAG_PREFIX: &str = "agentenv-snapshot-";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DiskImageSubject {
@@ -76,30 +75,6 @@ impl AcrDiskImageExporter {
     ) -> RepositoryResult<DiskImageExportOutcome> {
         let image = load_source_registry_image(image_config_path)?;
         let target = &image.target;
-
-        let has_local_delta = image
-            .layers
-            .iter()
-            .any(|layer| matches!(layer, SourceRegistryLayer::LocalDelta(_)));
-        if !has_local_delta {
-            return Ok(DiskImageExportOutcome {
-                layers: image
-                    .layers
-                    .iter()
-                    .map(|layer| match layer {
-                        SourceRegistryLayer::Remote { digest, size } => {
-                            OverlaybdLayerRef::External(ExternalLayer {
-                                digest: digest.clone(),
-                                repo_blob_url: target.repo_blob_url.clone(),
-                                size: *size,
-                            })
-                        }
-                        SourceRegistryLayer::LocalDelta(_) => unreachable!("checked above"),
-                    })
-                    .collect(),
-                publication: None,
-            });
-        }
 
         let tag = snapshot_tag(snapshot_id, &subject);
         validate_snapshot_tag(&tag)?;
@@ -158,6 +133,7 @@ impl AcrDiskImageExporter {
         let manifest = build_oci_image_manifest(
             OciDescriptor::config(config_digest, config_size),
             descriptors,
+            &tag,
         )?;
         let manifest_digest = client
             .put_manifest(&manifest_url, &target.repository, manifest)
@@ -288,11 +264,12 @@ impl AcrDiskImageExporter {
 }
 
 fn snapshot_tag(snapshot_id: &crate::snapshot::SnapshotId, subject: &DiskImageSubject) -> String {
+    let rootfs_tag = rootfs_snapshot_image_tag(snapshot_id);
     match subject {
-        DiskImageSubject::Rootfs => format!("{SNAPSHOT_TAG_PREFIX}{snapshot_id}"),
+        DiskImageSubject::Rootfs => rootfs_tag,
         DiskImageSubject::AttachedDrive { drive_id } => {
             format!(
-                "{SNAPSHOT_TAG_PREFIX}{snapshot_id}-drive-{}",
+                "{rootfs_tag}-drive-{}",
                 sanitize_drive_tag_component(drive_id)
             )
         }
@@ -357,6 +334,7 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
+    use super::super::client::tests::{client as test_client, fake_server, FakeState};
     use super::*;
 
     #[test]
@@ -431,13 +409,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_remote_source_registry_image_publishes_without_registry_mutation() {
+    async fn all_remote_source_registry_image_publishes_manifest_without_layer_upload() {
+        let state = Arc::new(Mutex::new(FakeState::with_existing_blobs()));
+        let base = fake_server(Arc::clone(&state)).await;
         let dir = TempDir::new().unwrap();
         let image = dir.path().join("image.json");
         fs::write(
             &image,
             serde_json::to_vec_pretty(&json!({
-                "repoBlobUrl": "https://registry.example/v2/ns/repo/blobs",
+                "repoBlobUrl": format!("{base}/v2/ns/repo/blobs"),
                 "lowers": [
                     {"digest": "sha256:base", "size": 123},
                     {"digest": "sha256:delta", "size": 456}
@@ -448,34 +428,50 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let publisher = AcrDiskImageExporter::new_with_client_builder(Arc::new(|registry| {
-            panic!("all-remote image should not create ACR client for {registry}")
-        }));
+        let client = test_client();
+        let publisher =
+            AcrDiskImageExporter::new_with_client_builder(Arc::new(move |_| Ok(client.clone())));
+        let snapshot_id = crate::snapshot::SnapshotId::generate();
 
         let outcome = publisher
-            .export(
-                &crate::snapshot::SnapshotId::generate(),
-                DiskImageSubject::Rootfs,
-                &image,
-            )
+            .export(&snapshot_id, DiskImageSubject::Rootfs, &image)
             .await
             .unwrap();
 
+        let expected_tag = format!("agentenv-snapshot-{snapshot_id}");
+        let publication = outcome.publication.unwrap();
+        assert_eq!(publication.tag, expected_tag);
+        assert_eq!(
+            publication.image_ref,
+            format!(
+                "{}/ns/repo:{}",
+                base.trim_start_matches("http://"),
+                expected_tag
+            )
+        );
         assert_eq!(
             outcome.layers,
             vec![
                 OverlaybdLayerRef::External(ExternalLayer {
                     digest: "sha256:base".to_string(),
-                    repo_blob_url: "https://registry.example/v2/ns/repo/blobs".to_string(),
+                    repo_blob_url: format!("{base}/v2/ns/repo/blobs"),
                     size: 123,
                 }),
                 OverlaybdLayerRef::External(ExternalLayer {
                     digest: "sha256:delta".to_string(),
-                    repo_blob_url: "https://registry.example/v2/ns/repo/blobs".to_string(),
+                    repo_blob_url: format!("{base}/v2/ns/repo/blobs"),
                     size: 456,
                 }),
             ]
         );
-        assert!(outcome.publication.is_none());
+        let state = state.lock().unwrap();
+        assert_eq!(state.manifest_puts.len(), 1);
+        let manifest: serde_json::Value = serde_json::from_slice(&state.manifest_puts[0]).unwrap();
+        assert_eq!(manifest["layers"][0]["digest"], "sha256:base");
+        assert_eq!(manifest["layers"][1]["digest"], "sha256:delta");
+        assert_eq!(
+            manifest["annotations"]["io.agentenv.snapshot.tag"],
+            expected_tag
+        );
     }
 }

@@ -373,6 +373,18 @@ impl SnapshotRecord {
         self.committed = Some(committed);
     }
 
+    /// Returns the published rootfs OCI image reference, if source-registry
+    /// image publication produced one for this snapshot.
+    pub(crate) fn published_rootfs_image_ref(&self) -> Option<&str> {
+        let committed = self.committed.as_ref()?;
+        let expected_tag = rootfs_snapshot_image_tag(&self.id);
+        committed
+            .disk_publications
+            .iter()
+            .find(|publication| publication.tag == expected_tag)
+            .map(|publication| publication.image_ref.as_str())
+    }
+
     #[cfg(test)]
     pub fn mock_ready(committed: CommittedSnapshot) -> Self {
         Self {
@@ -428,6 +440,13 @@ pub struct PersistedDiskImagePublication {
     pub tag: String,
     pub manifest_digest: String,
     pub repo_blob_url: String,
+}
+
+const SNAPSHOT_IMAGE_TAG_PREFIX: &str = "agentenv-snapshot-";
+
+/// OCI tag used when publishing a snapshot rootfs image to its source registry.
+pub(crate) fn rootfs_snapshot_image_tag(snapshot_id: &SnapshotId) -> String {
+    format!("{SNAPSHOT_IMAGE_TAG_PREFIX}{snapshot_id}")
 }
 
 pub(crate) trait RuntimeArtifactLease: Send + Sync {}
@@ -550,9 +569,22 @@ impl fmt::Debug for RunnableSnapshot {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandContext, CommittedSnapshot, ManagedLayer, SnapshotRecord, TemplateBuildErrorReason,
+        rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ManagedLayer,
+        PersistedDiskImagePublication, SnapshotRecord, TemplateBuildErrorReason,
     };
     use std::collections::HashMap;
+
+    fn publication(
+        image_ref: impl Into<String>,
+        tag: impl Into<String>,
+    ) -> PersistedDiskImagePublication {
+        PersistedDiskImagePublication {
+            image_ref: image_ref.into(),
+            tag: tag.into(),
+            manifest_digest: "sha256:manifest".to_string(),
+            repo_blob_url: "https://registry.example/v2/ns/app/blobs".to_string(),
+        }
+    }
 
     #[test]
     fn snapshot_record_without_tools_drive_version_remains_readable() {
@@ -589,6 +621,34 @@ mod tests {
         );
         let value = serde_json::to_value(&layer).expect("serialize uuid layer");
         assert_eq!(value["uuid"], "11111111-2222-3333-4444-555555555555");
+    }
+
+    #[test]
+    fn returns_published_rootfs_image_ref_by_exact_tag() {
+        let mut record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let rootfs_tag = rootfs_snapshot_image_tag(&record.id);
+        let expected = format!("registry.example/ns/app:{rootfs_tag}");
+        record.committed.as_mut().unwrap().disk_publications = vec![
+            publication(
+                "registry.example/ns/app:drive",
+                format!("{rootfs_tag}-drive-data-0123456789ab"),
+            ),
+            publication(expected.clone(), rootfs_tag),
+        ];
+
+        assert_eq!(record.published_rootfs_image_ref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn drive_only_publication_has_no_rootfs_image_ref() {
+        let mut record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let rootfs_tag = rootfs_snapshot_image_tag(&record.id);
+        record.committed.as_mut().unwrap().disk_publications = vec![publication(
+            "registry.example/ns/app:drive",
+            format!("{rootfs_tag}-drive-data-0123456789ab"),
+        )];
+
+        assert_eq!(record.published_rootfs_image_ref(), None);
     }
 
     #[test]

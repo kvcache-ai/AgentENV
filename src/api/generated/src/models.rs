@@ -6598,6 +6598,12 @@ pub struct SnapshotInfo {
     /// Time when the snapshot was last updated
     #[serde(rename = "updatedAt")]
     pub updated_at: chrono::DateTime<chrono::Utc>,
+
+    /// OverlayBD-native OCI image reference for the snapshot rootfs when source-registry image publication was enabled and succeeded. Omitted when no rootfs image was published.
+    #[serde(rename = "imageRef")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
 }
 
 impl SnapshotInfo {
@@ -6619,6 +6625,7 @@ impl SnapshotInfo {
             disk_size_mb,
             created_at,
             updated_at,
+            image_ref: None,
         }
     }
 }
@@ -6648,6 +6655,9 @@ impl std::fmt::Display for SnapshotInfo {
             // Skipping createdAt in query parameter serialization
 
             // Skipping updatedAt in query parameter serialization
+            self.image_ref
+                .as_ref()
+                .map(|image_ref| ["imageRef".to_string(), image_ref.to_string()].join(",")),
         ];
 
         write!(
@@ -6676,6 +6686,7 @@ impl std::str::FromStr for SnapshotInfo {
             pub disk_size_mb: Vec<u32>,
             pub created_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub updated_at: Vec<chrono::DateTime<chrono::Utc>>,
+            pub image_ref: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -6729,6 +6740,10 @@ impl std::str::FromStr for SnapshotInfo {
                         <chrono::DateTime<chrono::Utc> as std::str::FromStr>::from_str(val)
                             .map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "imageRef" => intermediate_rep.image_ref.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SnapshotInfo".to_string(),
@@ -6778,6 +6793,7 @@ impl std::str::FromStr for SnapshotInfo {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "updatedAt missing in SnapshotInfo".to_string())?,
+            image_ref: intermediate_rep.image_ref.into_iter().next(),
         })
     }
 }
