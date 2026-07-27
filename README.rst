@@ -10,7 +10,7 @@
 
 |coverage-status| |coverage-report| 📖 `Full documentation <https://kvcache-ai.github.io/AgentENV/>`_ 
 
-AgentENV (AENV) is a distributed system for running agent environments at scale. Its components power agentic RL training for **Kimi K3** and an unreleased model.
+AgentENV (AENV) is a distributed system for running agent environments at scale. Its components power agentic RL training for **Kimi K3** and other models.
 
 ----
 
@@ -131,65 +131,3 @@ outputs a table on TTY and JSON when piped; override with ``--output table|json`
 
 ----
 
-📑 Research Background and Citation
---------------------------------------
-
-AgentENV builds on and integrates some of the ideas and motivation behind our
-TrEnv-X research. If you find these ideas useful, please cite the following
-paper:
-
-.. code-block:: bibtex
-
-   @article{huang2026trenvx,
-     author    = {Huang, Jialiang and Ma, Teng and Liu, Zheng and Lin, Sixing and Chen, Kang and Jiang, Jinlei and Liao, Xia and Shan, Yingdi and Wu, Yongwei and Zhang, Ning and Lu, Mengting and Ma, Tao and Gong, Haifeng and Zhang, Mingxing},
-     title     = {TrEnv-X: Transparently Share Serverless Execution Environments Across Different Functions and Nodes},
-     year      = {2026},
-     publisher = {Association for Computing Machinery},
-     address   = {New York, NY, USA},
-     issn      = {0734-2071},
-     url       = {https://doi.org/10.1145/3805475},
-     doi       = {10.1145/3805475},
-     note      = {Just Accepted},
-     journal   = {ACM Trans. Comput. Syst.},
-     month     = mar,
-     keywords  = {Serverless, Agent, Sandbox, CXL, Cold Start}
-   }
-
-.. raw:: html
-
-   <details>
-   <summary>Earlier work: TrEnv</summary>
-
-.. code-block:: bibtex
-
-   @inproceedings{huang2024trenv,
-     author    = {Huang, Jialiang and Zhang, MingXing and Ma, Teng and Liu, Zheng and Lin, Sixing and Chen, Kang and Jiang, Jinlei and Liao, Xia and Shan, Yingdi and Zhang, Ning and Lu, Mengting and Ma, Tao and Gong, Haifeng and Wu, YongWei},
-     title     = {TrEnv: Transparently Share Serverless Execution Environments Across Different Functions and Nodes},
-     year      = {2024},
-     isbn      = {9798400712517},
-     publisher = {Association for Computing Machinery},
-     address   = {New York, NY, USA},
-     url       = {https://doi.org/10.1145/3694715.3695967},
-     doi       = {10.1145/3694715.3695967},
-     booktitle = {Proceedings of the ACM SIGOPS 30th Symposium on Operating Systems Principles},
-     pages     = {421–437},
-     numpages  = {17},
-     keywords  = {serverless, cold start, CXL, remote memory},
-     location  = {Austin, TX, USA},
-     series    = {SOSP '24}
-   }
-
-.. raw:: html
-
-   </details>
-
-.. _Latest coverage metadata: https://github.com/kvcache-ai/AgentENV/blob/coverage-data/coverage/coverage.json
-.. _Coverage workflow history: https://github.com/kvcache-ai/AgentENV/actions/workflows/coverage.yml
-
-.. |coverage-status| image:: https://github.com/kvcache-ai/AgentENV/actions/workflows/coverage.yml/badge.svg?branch=main&event=push
-   :target: https://github.com/kvcache-ai/AgentENV/actions/workflows/coverage.yml
-   :alt: Coverage workflow status
-
-.. |coverage-report| image:: https://github.com/kvcache-ai/AgentENV/blob/coverage-data/coverage/badge.svg?raw=1
-   :target: https://github.com/kvcache-ai/AgentENV/blob/coverage-data/coverage/coverage.json
-   :alt: Latest coverage report
