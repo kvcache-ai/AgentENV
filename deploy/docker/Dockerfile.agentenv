@@ -31,9 +31,12 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS build-deps
 
 COPY --from=planner /build/recipe.json recipe.json
+# Keep Cargo target artifacts in this image layer rather than a BuildKit cache
+# mount. Cache mounts are local to a builder and are not included in exported
+# external caches; persisting target here lets fresh CI runners reuse the
+# cargo-chef dependency layer.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,target=/build/target,sharing=locked \
     cargo chef cook --release --recipe-path recipe.json
 
 FROM build-deps AS builder
@@ -41,7 +44,6 @@ FROM build-deps AS builder
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,target=/build/target,sharing=locked \
     cargo build --release -p agentenv --bin server -p uvm-ublk-daemon --bin uvm-ublk-daemon \
     && cp /build/target/release/server /out-server \
     && cp /build/target/release/uvm-ublk-daemon /out-uvm-ublk-daemon

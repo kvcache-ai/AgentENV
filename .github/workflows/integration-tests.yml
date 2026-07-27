@@ -74,6 +74,39 @@ jobs:
       - name: Configure ublk test host
         if: ${{ matrix.e2e_name != 'single-node' }}
         run: sudo scripts/tests/setup-ublk-access.sh "$(id -un)" "$(id -gn)"
+      - name: Set up Docker Buildx
+        if: ${{ matrix.e2e_name == 'docker-compose' }}
+        uses: docker/setup-buildx-action@v4
+      - name: Build AgentENV runtime image
+        if: ${{ matrix.e2e_name == 'docker-compose' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.agentenv
+          load: true
+          tags: agentenv-runtime:latest
+          cache-from: type=gha,scope=agentenv-runtime
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=agentenv-runtime,mode=max' || '' }}
+      - name: Build gateway image
+        if: ${{ matrix.e2e_name == 'docker-compose' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.gateway
+          load: true
+          tags: agentenv-gateway:latest
+          cache-from: type=gha,scope=agentenv-gateway
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=agentenv-gateway,mode=max' || '' }}
+      - name: Build scheduler image
+        if: ${{ matrix.e2e_name == 'docker-compose' }}
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile.scheduler
+          load: true
+          tags: agentenv-scheduler:latest
+          cache-from: type=gha,scope=agentenv-scheduler
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=agentenv-scheduler,mode=max' || '' }}
       - name: Install Node.js
         uses: actions/setup-node@v6
         with:
@@ -91,7 +124,7 @@ jobs:
           if [[ "${{ matrix.e2e_name }}" == "single-node" ]]; then
             sg kvm -c "make ${{ matrix.make_target }} PROFILE=debug"
           else
-            make ${{ matrix.make_target }} PROFILE=debug
+            SKIP_BUILD=1 make ${{ matrix.make_target }} PROFILE=debug
           fi
       - uses: ./.github/actions/sandbox-artifacts-cleanup
         if: always()

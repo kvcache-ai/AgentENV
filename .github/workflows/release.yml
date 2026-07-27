@@ -190,6 +190,7 @@ jobs:
           context: .
           file: deploy/docker/Dockerfile.agentenv
           push: true
+          cache-from: type=gha,scope=agentenv-runtime
           tags: |
             ghcr.io/${{ env.OWNER }}/aenv-server:${{ github.ref_name }}
             ghcr.io/${{ env.OWNER }}/aenv-server:latest
