@@ -4,6 +4,7 @@
 
 - [Overview](./getting-started/overview.md)
 - [Quick Start](./getting-started/quickstart.md)
+- [On-Demand Loading](./getting-started/on-demand-loading.md)
 - [aenv CLI Reference](./getting-started/aenv-cli.md)
 
 # Deployment
@@ -33,8 +34,7 @@
 
 # Integration
 
-- [E2B SDK](./integration/e2b-sdk.md)
-- [E2B CLI](./integration/e2b-cli.md)
+- [E2B](./integration/e2b.md)
 
 # Troubleshooting
 

@@ -5,9 +5,10 @@ The repository is available at <https://github.com/kvcache-ai/AgentENV>.
 
 ## Why AgentENV
 
-- **Sub-50 ms sandbox boot, massive concurrency** — Sandboxes boot from a template snapshot in ~49 ms. Sandboxes forked from the same template share a single mmap'd memory device; memory pages are fetched lazily via copy-on-write, so per-sandbox overhead stays low and many sandboxes can run concurrently on a single host.
-- **Efficient snapshots** — Snapshot creation completes in ~133 ms. Firecracker diff snapshots capture only dirty pages, and each delta is compressed and stacked as a new overlaybd layer. Snapshots are first-class primitives — pause, fork, and restore any running sandbox at any point.
-- **On-demand image pull** — Images are never fully downloaded upfront. The runtime reads blocks directly from the OCI registry on demand, so sandboxes start immediately without waiting for a full image pull.
+- **Scale across diverse environments**: AENV runs massive numbers of Firecracker environments across machines and diverse OCI-compatible images, loaded on demand via overlaybd. Local disk acts as a bounded cache, retaining hot data and evicting cold, so images can exceed disk capacity while startup stays fast cluster-wide, without pre-warming every host.
+- **Make idle environments inexpensive**: Snapshot-backed environments boot or resume in under 50 ms and pause in under 100 ms. Idle environments can quickly release CPU and memory, then return when new work arrives.
+- **Native snapshot and fork support**: AENV snapshots memory and filesystem changes incrementally, completing in under 100 ms even under heavy disk modification. A running environment can fork into multiple independent sandboxes for parallel agent workflows. Snapshots persist to S3-compatible object storage or a shared distributed filesystem to prevent data loss.
+- **Preserve performance and density over time**: AENV delivers high-performance I/O via ublk while sharing the host page cache across storage and memory-snapshot data. Memory ballooning returns reclaimable guest memory to the host, sustaining high overcommit as environments run longer and diverge.
 
 ## Features
 
@@ -30,8 +31,7 @@ AgentENV exposes an HTTP API. There are four ways to use it:
 | Method | Best for |
 |--------|----------|
 | **[aenv CLI](./aenv-cli.md)** | Interactive use, scripting, local development |
-| **[E2B CLI](../integration/e2b-cli.md)** | E2B-familiar workflows from the terminal |
-| **[E2B SDK](../integration/e2b-sdk.md)** | Application code — the existing E2B SDK works against AgentENV without modification |
+| **[E2B](../integration/e2b.md)** | Application code — existing E2B-based applications work with AgentENV without modification |
 | **[HTTP API](../api/index.md)** | Direct control, other languages, automation |
 
 ## Where to Go Next

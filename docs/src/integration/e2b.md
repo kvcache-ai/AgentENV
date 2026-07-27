@@ -1,8 +1,10 @@
-# E2B SDK
+# E2B
+
+## E2B SDK
 
 AgentENV exposes an E2B-compatible API, so the official [E2B SDK](https://github.com/e2b-dev/e2b) works out of the box.
 
-## General Settings
+### General Settings
 
 Set environment variables to point at your AgentENV server. See [Environment Variables](../configuration/env-vars.md) for values per deployment mode.
 
@@ -14,9 +16,9 @@ export E2B_API_KEY=e2b_000000
 export E2B_ACCESS_TOKEN=dummy
 ```
 
-## TypeScript SDK
+### TypeScript SDK
 
-### Setup
+#### Setup
 
 Install the SDK:
 
@@ -24,7 +26,7 @@ Install the SDK:
 npm install e2b
 ```
 
-### Usage
+#### Usage
 
 ```typescript
 import { Sandbox } from "e2b";
@@ -56,9 +58,9 @@ await sandbox.kill();
 
 Replace `<template-id>` with a template that exists in your local template store. Use `e2b template list` or `GET /v2/templates` to see available templates.
 
-## Python SDK
+### Python SDK
 
-### Setup
+#### Setup
 
 Install the SDK:
 
@@ -66,7 +68,7 @@ Install the SDK:
 pip install e2b
 ```
 
-### Usage
+#### Usage
 
 ```python
 from e2b import Sandbox, SandboxQuery, SandboxState
@@ -94,3 +96,8 @@ sandbox.beta_pause()
 # Kill the sandbox
 sandbox.kill()
 ```
+
+## E2B CLI
+
+AgentENV is compatible with the E2B CLI, but we recommend using the
+[aenv CLI](../getting-started/aenv-cli.md) for AgentENV workflows.
