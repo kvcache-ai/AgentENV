@@ -97,14 +97,23 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	}
 
 	eligible := FilterByResourceLimit(rich, s.resourceLimit)
+	preferred, locality := PreferLocalNodes(
+		eligible,
+		req.GetHint().GetLocalityRequirements(),
+		s.artifacts,
+	)
 
-	node, selectErr := s.strategy.Select(eligible, req.GetHint())
+	node, selectErr := s.strategy.Select(preferred, req.GetHint())
 	if selectErr != nil {
 		s.logger.Debug("scheduler selection failed",
 			zap.String("strategy", s.strategy.Name()),
 			zap.String("hint", summarizeScheduleHint(req.GetHint())),
 			zap.Int("candidate_nodes", len(rich)),
 			zap.Int("eligible_nodes", len(eligible)),
+			zap.Int("preferred_nodes", len(preferred)),
+			zap.Int("locality_requirements", locality.RequirementCount),
+			zap.Int("locality_provider_nodes", locality.ProviderNodeCount),
+			zap.Int("locality_max_coverage", locality.MaxCoverage),
 			zap.Error(selectErr),
 		)
 		if errors.Is(selectErr, ErrNoNodes) {
@@ -121,6 +130,10 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		zap.String("endpoint", node.Endpoint),
 		zap.Int("candidate_nodes", len(rich)),
 		zap.Int("eligible_nodes", len(eligible)),
+		zap.Int("preferred_nodes", len(preferred)),
+		zap.Int("locality_requirements", locality.RequirementCount),
+		zap.Int("locality_provider_nodes", locality.ProviderNodeCount),
+		zap.Int("locality_max_coverage", locality.MaxCoverage),
 	)
 	return &schedulerv1.ScheduleResponse{Node: node.Node.ToProto()}, nil
 }

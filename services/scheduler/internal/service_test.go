@@ -7,6 +7,7 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/config"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -260,6 +261,82 @@ func TestScheduleOnlyConsidersReadyNodes(t *testing.T) {
 			t.Fatalf("iteration %d: expected node-a, got %s", i, got)
 		}
 	}
+}
+
+func TestSchedulePrefersNodeWithSnapshotArtifacts(t *testing.T) {
+	registry := NewAtomicNodeRegistry([]Node{
+		{ID: "node-a", Endpoint: "http://node-a"},
+		{ID: "node-b", Endpoint: "http://node-b"},
+	}, defaultObservedReportTTL)
+	artifacts := NewInMemoryArtifactStore(10, 1)
+	service := NewService(
+		zap.NewNop(),
+		registry,
+		NewStrategy("round_robin"),
+		NewInMemoryBindingStore(defaultObservedReportTTL),
+		WithArtifactStore(artifacts),
+	)
+	registerLocalityNodeForTest(t, service, "node-a", 0)
+	registerLocalityNodeForTest(t, service, "node-b", 0)
+	artifacts.Record("cluster-1", "iroh", "snapshot-key", "node-b")
+
+	resp, err := service.Schedule(context.Background(), localityScheduleRequest("snapshot-key"))
+	if err != nil {
+		t.Fatalf("schedule failed: %v", err)
+	}
+	if got := resp.GetNode().GetNodeId(); got != "node-b" {
+		t.Fatalf("selected node = %q, want node-b", got)
+	}
+}
+
+func TestScheduleDoesNotRestoreResourceFilteredLocalNode(t *testing.T) {
+	registry := NewAtomicNodeRegistry([]Node{
+		{ID: "node-a", Endpoint: "http://node-a"},
+		{ID: "node-b", Endpoint: "http://node-b"},
+	}, defaultObservedReportTTL)
+	artifacts := NewInMemoryArtifactStore(10, 0)
+	service := NewService(
+		zap.NewNop(),
+		registry,
+		NewStrategy("round_robin"),
+		NewInMemoryBindingStore(defaultObservedReportTTL),
+		WithArtifactStore(artifacts),
+		WithNodeResourceLimit(&config.NodeResourceLimit{MaxSandboxCount: uint32Ptr(0)}),
+	)
+	registerLocalityNodeForTest(t, service, "node-a", 1)
+	registerLocalityNodeForTest(t, service, "node-b", 0)
+	artifacts.Record("cluster-1", "iroh", "snapshot-key", "node-a")
+
+	resp, err := service.Schedule(context.Background(), localityScheduleRequest("snapshot-key"))
+	if err != nil {
+		t.Fatalf("schedule failed: %v", err)
+	}
+	if got := resp.GetNode().GetNodeId(); got != "node-b" {
+		t.Fatalf("selected node = %q, want resource-eligible node-b", got)
+	}
+}
+
+func registerLocalityNodeForTest(t *testing.T, service *Service, nodeID string, sandboxCount uint32) {
+	t.Helper()
+	_, err := service.Heartbeat(context.Background(), &schedulerv1.HeartbeatRequest{
+		NodeId:            nodeID,
+		ClusterId:         "cluster-1",
+		ServiceInstanceId: "svc-" + nodeID,
+		Snapshot: &schedulerv1.NodeSnapshot{
+			Status:       schedulerv1.NodeStatus_NODE_STATUS_READY,
+			SandboxCount: sandboxCount,
+		},
+		P2PEndpoint: &schedulerv1.P2PEndpoint{Backend: "iroh", Address: "addr-" + nodeID},
+	})
+	if err != nil {
+		t.Fatalf("heartbeat %s failed: %v", nodeID, err)
+	}
+}
+
+func localityScheduleRequest(keys ...string) *schedulerv1.ScheduleRequest {
+	return &schedulerv1.ScheduleRequest{Hint: &schedulerv1.ScheduleRequestHint{
+		LocalityRequirements: localityTestRequirements(keys...),
+	}}
 }
 
 func TestGetObservedNodeAfterHeartbeat(t *testing.T) {
