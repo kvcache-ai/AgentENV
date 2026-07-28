@@ -14,6 +14,13 @@ import (
 	"go.uber.org/zap"
 )
 
+const (
+	defaultTemplateAliasHTTPTimeout       = 2 * time.Second
+	defaultTemplateAliasLookupTimeout     = 2 * time.Second
+	defaultTemplateAliasScheduleReserve   = 5 * time.Second
+	defaultTemplateAliasLookupConcurrency = 8
+)
+
 type templateAliasResponse struct {
 	TemplateID string `json:"templateID"`
 }
@@ -41,7 +48,13 @@ func (s *Server) resolveSnapshotLocalityHint(
 		}
 
 		var err error
-		canonicalID, err = s.resolveTemplateAlias(ctx, incoming, templateID)
+		lookupCtx, cancel, ok := s.templateAliasLookupContext(ctx)
+		if !ok {
+			hint.LocalityRequirements = nil
+			return hint
+		}
+		canonicalID, err = s.resolveTemplateAlias(lookupCtx, incoming, templateID)
+		cancel()
 		if err != nil {
 			s.logger.Debug("snapshot alias locality resolution unavailable",
 				zap.String("template_id", templateID),
@@ -54,6 +67,33 @@ func (s *Server) resolveSnapshotLocalityHint(
 
 	hint.LocalityRequirements = snapshotLocalityRequirements(canonicalID)
 	return hint
+}
+
+func (s *Server) templateAliasLookupContext(parent context.Context) (context.Context, context.CancelFunc, bool) {
+	lookupTimeout := s.templateAliasLookupTimeout
+	if lookupTimeout <= 0 {
+		lookupTimeout = defaultTemplateAliasLookupTimeout
+	}
+
+	reserve := s.templateAliasScheduleReserve
+	if reserve < 0 {
+		reserve = 0
+	}
+	if deadline, ok := parent.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= reserve {
+			return nil, func() {}, false
+		}
+		if available := remaining - reserve; lookupTimeout > available {
+			lookupTimeout = available
+		}
+	}
+	if lookupTimeout <= 0 {
+		return nil, func() {}, false
+	}
+
+	lookupCtx, cancel := context.WithTimeout(parent, lookupTimeout)
+	return lookupCtx, cancel, true
 }
 
 func canonicalSnapshotID(value string) (string, bool) {
@@ -116,10 +156,26 @@ func (s *Server) resolveTemplateAlias(
 	results := make(chan result, len(nodes))
 	lookupCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	concurrency := s.templateAliasLookupConcurrency
+	if concurrency <= 0 {
+		concurrency = defaultTemplateAliasLookupConcurrency
+	}
+	if concurrency > len(nodes) {
+		concurrency = len(nodes)
+	}
+	semaphore := make(chan struct{}, concurrency)
 
 	for _, node := range nodes {
 		node := node
 		go func() {
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-lookupCtx.Done():
+				results <- result{err: lookupCtx.Err()}
+				return
+			}
+
 			canonicalID, err := s.resolveTemplateAliasOnNode(lookupCtx, incoming, node, alias)
 			results <- result{canonicalID: canonicalID, err: err}
 		}()
@@ -165,7 +221,11 @@ func (s *Server) resolveTemplateAliasOnNode(
 	}
 	req.Header.Del("Content-Length")
 
-	resp, err := s.httpClient.Do(req)
+	client := s.templateAliasHTTPClient
+	if client == nil {
+		client = s.httpClient
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("query template alias on node %s: %w", node.GetNodeId(), err)
 	}
