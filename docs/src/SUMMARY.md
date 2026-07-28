@@ -34,6 +34,7 @@
 
 # Integration
 
+- [Crabbox](./integration/crabbox.md)
 - [E2B](./integration/e2b.md)
 
 # Troubleshooting

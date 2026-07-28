@@ -36,9 +36,9 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_FIRECRACKER_SERIAL_DIR` | `$AENV_HOME/logs/serial` | Override the directory for persistent Firecracker serial output. Files are grouped under `{serial_dir}/{sandbox_id}/`. |
 | `AENV_PERSISTED_SANDBOX_STORE_PATH` | `$AENV_HOME/persisted-sandboxes` | Override the directory where paused sandbox state is persisted across server restarts. |
 
-## E2B SDK / CLI
+## E2B SDK / CLI / Crabbox
 
-These variables configure the E2B SDK and CLI to point at an AgentENV server. Values depend on your deployment mode.
+These variables configure the E2B SDK, E2B CLI, and [Crabbox](../integration/crabbox.md)’s `e2b` provider to point at an AgentENV server. Values depend on your deployment mode.
 
 | Variable | Description |
 |----------|-------------|
@@ -46,6 +46,9 @@ These variables configure the E2B SDK and CLI to point at an AgentENV server. Va
 | `E2B_SANDBOX_URL` | Sandbox proxy URL (for WebSocket and process interaction) |
 | `E2B_API_KEY` | API key for authentication |
 | `E2B_ACCESS_TOKEN` | Access token (used by `e2b template` commands) |
+| `CRABBOX_E2B_API_URL` | Crabbox override for `E2B_API_URL` (takes precedence) |
+| `CRABBOX_E2B_API_KEY` | Crabbox override for `E2B_API_KEY` (takes precedence) |
+| `CRABBOX_E2B_TEMPLATE` | AgentENV template id/name for `crabbox run --provider e2b` |
 
 ### Values by Deployment Mode
 

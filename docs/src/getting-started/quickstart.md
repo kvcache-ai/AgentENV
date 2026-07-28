@@ -103,5 +103,6 @@ aenv start ubuntu            # starts a sandbox and attaches an interactive shel
 
 - [Deployment](../deployment/manual-compile.md) — build from source, multi-node options
 - [Core Concepts](../concepts/overview.md) — how sandboxes, templates, and snapshots work
+- [Crabbox](../integration/crabbox.md) — openclaw/crabbox client for sync + remote run
 - [E2B](../integration/e2b.md) — SDK and CLI compatibility
 - [API Reference](../api/index.md) — full HTTP API

@@ -16,7 +16,7 @@ The repository is available at <https://github.com/kvcache-ai/AgentENV>.
 - **Pause and resume** with memory + disk snapshots for instant cold start
 - **Layered block devices** via overlaybd + ublk for copy-on-write image sharing
 - **Snapshot-backed template builder** for publishing reusable, pre-configured sandbox runtimes
-- **E2B-compatible API** so existing E2B SDKs and CLIs work out of the box
+- **E2B-compatible API** so existing E2B SDKs, CLIs, and [Crabbox](../integration/crabbox.md) work out of the box
 - **Reverse proxy** to reach services running inside sandboxes via HTTP and WebSocket
 - **Multi-node scaling** with a gateway + scheduler control plane (prototype)
 
@@ -26,11 +26,12 @@ AgentENV is built for teams running AI agents that need isolated execution envir
 
 ## Interacting with the Server
 
-AgentENV exposes an HTTP API. There are four ways to use it:
+AgentENV exposes an HTTP API. There are several ways to use it:
 
 | Method | Best for |
 |--------|----------|
 | **[aenv CLI](./aenv-cli.md)** | Interactive use, scripting, local development |
+| **[Crabbox](../integration/crabbox.md)** | Recommended sandbox client ([openclaw/crabbox](https://github.com/openclaw/crabbox)) — repo sync + remote run for agents and automation |
 | **[E2B](../integration/e2b.md)** | Application code — existing E2B-based applications work with AgentENV without modification |
 | **[HTTP API](../api/index.md)** | Direct control, other languages, automation |
 

@@ -1,0 +1,22 @@
+# Example openclaw/crabbox config for AgentENV.
+# Copy to the repo root as `.crabbox.yaml`, or merge into your user Crabbox config.
+# Docs: https://crabbox.sh/  ·  Provider: https://crabbox.sh/providers/e2b.html
+#
+# Auth stays in the environment (never commit keys):
+#   export E2B_API_URL=http://127.0.0.1:8000   # or https://… behind TLS
+#   export E2B_API_KEY=e2b_000000
+#
+# Then:
+#   brew install openclaw/tap/crabbox
+#   crabbox doctor --provider e2b
+#   crabbox run --provider e2b -- make test-unit
+
+provider: e2b
+target: linux
+e2b:
+  # Override with E2B_API_URL / CRABBOX_E2B_API_URL when unset here.
+  apiUrl: http://127.0.0.1:8000
+  # AgentENV template id or name (aenv pull … / aenv template list)
+  template: ubuntu
+  # Dedicated subdirectory inside the sandbox (not /, /tmp, …)
+  workdir: crabbox

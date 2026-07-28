@@ -64,4 +64,24 @@ API_ADDR=0.0.0.0:8001 make start-server
 
 Also check `[envd].init_timeout_secs` in your config. The default is 60 seconds. If the rootfs image is large, the in-guest envd daemon may need more time to initialize.
 
+## Crabbox cannot reach AgentENV
+
+**Symptom**: `crabbox doctor --provider e2b` or `crabbox run --provider e2b` fails with auth or connection errors.
+
+**Solution**:
+
+1. Install the upstream CLI: `brew install openclaw/tap/crabbox` (see [crabbox.sh](https://crabbox.sh/)).
+2. Point Crabbox at AgentENV with the same vars as the E2B SDK:
+
+```bash
+export E2B_API_URL=http://127.0.0.1:8000
+export E2B_API_KEY=e2b_000000
+export CRABBOX_E2B_TEMPLATE=<template-id-or-name>
+```
+
+3. Copy `config/crabbox.example.yaml` to `.crabbox.yaml` if you want project-local defaults.
+4. Plain HTTP is only accepted for localhost / loopback; use HTTPS for remote AgentENV endpoints.
+
+See [Crabbox integration](../integration/crabbox.md).
+
 > TODO: Expand with more common issues as they are reported.

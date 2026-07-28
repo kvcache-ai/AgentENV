@@ -1,0 +1,115 @@
+name: crabbox
+
+# Validates the openclaw/crabbox integration (https://crabbox.sh).
+# - Always installs upstream crabbox, checks the e2b provider, and runs doctor.
+# - Validates config/crabbox.example.yaml parses as YAML.
+# - Builds mdBook so the Crabbox integration page stays linked.
+# - Optional Islo smoke when repository secret ISLO_API_KEY is set
+#   (mint with: islo api-key create …). Forks without the secret no-op cleanly.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "config/crabbox.example.yaml"
+      - "docs/src/integration/crabbox.md"
+      - "docs/src/SUMMARY.md"
+      - "docs/src/configuration/env-vars.md"
+      - "docs/src/getting-started/**"
+      - ".github/workflows/crabbox.yml"
+  pull_request:
+    paths:
+      - "config/crabbox.example.yaml"
+      - "docs/src/integration/crabbox.md"
+      - "docs/src/SUMMARY.md"
+      - "docs/src/configuration/env-vars.md"
+      - "docs/src/getting-started/**"
+      - ".github/workflows/crabbox.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crabbox-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  integrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate config/crabbox.example.yaml
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          try:
+              import yaml
+          except ImportError:
+              import subprocess, sys
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "pyyaml"])
+              import yaml
+          path = Path("config/crabbox.example.yaml")
+          data = yaml.safe_load(path.read_text())
+          assert data.get("provider") == "e2b", data
+          assert data.get("target") == "linux", data
+          e2b = data.get("e2b") or {}
+          assert "apiUrl" in e2b and "template" in e2b and "workdir" in e2b, e2b
+          print("ok", path, "provider=e2b template=", e2b["template"])
+          PY
+
+      - name: Install openclaw/crabbox
+        run: |
+          set -euo pipefail
+          tag="$(curl -fsSL https://api.github.com/repos/openclaw/crabbox/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)"
+          ver="${tag#v}"
+          curl -fsSL "https://github.com/openclaw/crabbox/releases/download/${tag}/crabbox_${ver}_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin crabbox
+          crabbox --version
+
+      - name: crabbox providers include e2b
+        run: |
+          set -euo pipefail
+          crabbox providers 2>&1 | tee /tmp/crabbox-providers.txt
+          grep -E '(^|[[:space:]])e2b([[:space:]]|$)' /tmp/crabbox-providers.txt
+
+      - name: crabbox doctor
+        run: crabbox doctor
+
+      - uses: taiki-e/install-action@mdbook
+
+      - name: Build docs (mdBook)
+        run: |
+          set -euo pipefail
+          ln -sf ../../src/api/openapi.yml docs/src/openapi.yml
+          mdbook build docs
+
+      - name: Guard — optional Islo smoke
+        id: guard
+        env:
+          ISLO_API_KEY: ${{ secrets.ISLO_API_KEY }}
+        run: |
+          if [ -z "${ISLO_API_KEY}" ]; then
+            echo "ISLO_API_KEY not configured — skipping islo smoke."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: crabbox run --provider islo
+        if: steps.guard.outputs.run == 'true'
+        env:
+          ISLO_API_KEY: ${{ secrets.ISLO_API_KEY }}
+        run: |
+          set -euo pipefail
+          # Prefer Islo tenant defaults (omit --islo-image); keep the lease small.
+          crabbox run \
+            --provider islo \
+            --islo-vcpus 2 \
+            --islo-memory-mb 2048 \
+            --islo-disk-gb 10 \
+            --no-sync \
+            -- echo crabbox-islo-ok
