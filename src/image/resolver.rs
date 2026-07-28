@@ -15,7 +15,32 @@ use crate::image::oci_image::ImageFormat;
 use crate::observability::prometheus::MetricGuard;
 
 const IMAGE_RESOLVE_STAGE_DURATION: &str = "agentenv_image_resolve_stage_duration_seconds";
+
+/// artifactType published by accelerated-container-image (`obdconv`) for
+/// overlaybd-native images.
 const OVERLAYBD_NATIVE_ARTIFACT_TYPE: &str = "application/vnd.containerd.overlaybd.native.v1+json";
+
+/// artifactType published by Azure Container Registry artifact streaming.
+///
+/// ACR converts an image to overlaybd and attaches the result as an OCI
+/// referrer, but labels it with its own artifactType instead of
+/// [`OVERLAYBD_NATIVE_ARTIFACT_TYPE`]. The referrer manifest itself is an
+/// ordinary overlaybd-native manifest: each layer carries a tar `mediaType`
+/// plus a `containerd.io/snapshot/overlaybd/blob-digest` annotation equal to
+/// the layer's own digest, which [`ImageFormat::OverlaybdNative`] already
+/// recognises. Only the discovery label differs, so accepting this
+/// artifactType is enough to stream ACR images.
+const ACR_ARTIFACT_STREAMING_ARTIFACT_TYPE: &str = "application/vnd.azure.artifact.streaming.v1";
+
+/// artifactTypes that may front an overlaybd-native referrer, in preference
+/// order. The referrer manifest is always re-validated by
+/// [`try_resolve_overlaybd_referrer`] before it is used, so this list only
+/// controls discovery.
+const OVERLAYBD_REFERRER_ARTIFACT_TYPES: &[&str] = &[
+    OVERLAYBD_NATIVE_ARTIFACT_TYPE,
+    ACR_ARTIFACT_STREAMING_ARTIFACT_TYPE,
+];
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedBlockImage {
     pub image_ref: String,
@@ -154,13 +179,13 @@ impl ImageResolver {
         {
             match try_resolve_overlaybd_referrer(&self.regctl_binary, &source_image_ref, arch).await
             {
-                Ok(Some(referrer)) => {
+                Ok(Some((referrer, artifact_type))) => {
                     overlaybd_image_ref = referrer.selected_image_ref.clone();
                     info!(
                         image = %image_ref,
                         subject = %source_image_ref,
                         overlaybd_referrer = %overlaybd_image_ref,
-                        artifact_type = OVERLAYBD_NATIVE_ARTIFACT_TYPE,
+                        artifact_type,
                         "using overlaybd-native OCI referrer instead of source image"
                     );
                     referrer
@@ -169,7 +194,7 @@ impl ImageResolver {
                     trace!(
                         image = %image_ref,
                         subject = %source_image_ref,
-                        artifact_type = OVERLAYBD_NATIVE_ARTIFACT_TYPE,
+                        artifact_types = ?OVERLAYBD_REFERRER_ARTIFACT_TYPES,
                         "no overlaybd-native OCI referrer found; continuing with source image"
                     );
                     fetched
@@ -326,9 +351,9 @@ async fn try_resolve_overlaybd_referrer(
     regctl_binary: &std::path::Path,
     subject_ref: &str,
     arch: &str,
-) -> Result<Option<oci_image::FetchedManifest>> {
-    let Some(referrer_digest) =
-        discover_overlaybd_native_referrer(regctl_binary, subject_ref).await?
+) -> Result<Option<(oci_image::FetchedManifest, &'static str)>> {
+    let Some((referrer_digest, artifact_type)) =
+        discover_overlaybd_referrer(regctl_binary, subject_ref).await?
     else {
         return Ok(None);
     };
@@ -339,24 +364,26 @@ async fn try_resolve_overlaybd_referrer(
         .with_context(|| format!("fetch overlaybd referrer manifest for {referrer_ref}"))?;
     if referrer.format() != ImageFormat::OverlaybdNative {
         bail!(
-            "OCI referrer {referrer_ref} advertised artifactType {OVERLAYBD_NATIVE_ARTIFACT_TYPE} but its manifest is not overlaybd-native"
+            "OCI referrer {referrer_ref} advertised artifactType {artifact_type} but its manifest is not overlaybd-native"
         );
     }
-    Ok(Some(referrer))
+    Ok(Some((referrer, artifact_type)))
 }
 
-async fn discover_overlaybd_native_referrer(
+async fn discover_overlaybd_referrer(
     regctl_binary: &std::path::Path,
     subject_ref: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, &'static str)>> {
     oci_image::ensure_regctl_binary(regctl_binary)
         .context("regctl is required to query OCI referrers")?;
 
+    // The referrers index is fetched unfiltered and matched locally against
+    // OVERLAYBD_REFERRER_ARTIFACT_TYPES: `regctl artifact list` takes a single
+    // `--filter-artifact-type`, which cannot express "any of these types" in
+    // one call.
     let output = oci_image::regctl_command(regctl_binary)
         .arg("artifact")
         .arg("list")
-        .arg("--filter-artifact-type")
-        .arg(OVERLAYBD_NATIVE_ARTIFACT_TYPE)
         .arg("--format")
         .arg("body")
         .arg(subject_ref)
@@ -372,31 +399,32 @@ async fn discover_overlaybd_native_referrer(
     }
 
     let body = String::from_utf8(output.stdout).context("regctl output is not UTF-8")?;
-    parse_overlaybd_native_referrer_digest(&body)
+    parse_overlaybd_referrer(&body)
         .with_context(|| format!("parse regctl referrers response for {subject_ref}"))
 }
 
-fn parse_overlaybd_native_referrer_digest(body: &str) -> Result<Option<String>> {
+fn parse_overlaybd_referrer(body: &str) -> Result<Option<(String, &'static str)>> {
     let index: ReferrersIndex = serde_json::from_str(body).context("parse referrers index JSON")?;
-    let matches: Vec<_> = index
-        .manifests
-        .into_iter()
-        .filter(|descriptor| {
-            descriptor.artifact_type.as_deref() == Some(OVERLAYBD_NATIVE_ARTIFACT_TYPE)
-        })
-        .collect();
-    if matches.len() > 1 {
-        warn!(
-            artifact_type = OVERLAYBD_NATIVE_ARTIFACT_TYPE,
-            selected_digest = %matches[0].digest,
-            candidates = matches.len(),
-            "multiple overlaybd-native OCI referrers found; using first"
-        );
+    for &artifact_type in OVERLAYBD_REFERRER_ARTIFACT_TYPES {
+        let mut matches = index
+            .manifests
+            .iter()
+            .filter(|descriptor| descriptor.artifact_type.as_deref() == Some(artifact_type));
+        let Some(selected) = matches.next() else {
+            continue;
+        };
+        let candidates = matches.count() + 1;
+        if candidates > 1 {
+            warn!(
+                artifact_type,
+                selected_digest = %selected.digest,
+                candidates,
+                "multiple overlaybd-native OCI referrers found; using first"
+            );
+        }
+        return Ok(Some((selected.digest.clone(), artifact_type)));
     }
-    Ok(matches
-        .into_iter()
-        .next()
-        .map(|descriptor| descriptor.digest))
+    Ok(None)
 }
 
 #[derive(Debug, Deserialize)]
@@ -634,7 +662,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_overlaybd_native_referrer_digest_picks_matching_artifact() {
+    fn parse_overlaybd_referrer_picks_matching_artifact() {
         let body = json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.index.v1+json",
@@ -655,13 +683,15 @@ mod tests {
         });
 
         assert_eq!(
-            parse_overlaybd_native_referrer_digest(&body.to_string()).expect("parse"),
+            parse_overlaybd_referrer(&body.to_string())
+                .expect("parse")
+                .map(|(digest, _)| digest),
             Some("sha256:overlaybd".to_string())
         );
     }
 
     #[test]
-    fn parse_overlaybd_native_referrer_digest_keeps_first_matching_artifact() {
+    fn parse_overlaybd_referrer_keeps_first_matching_artifact() {
         let body = json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.index.v1+json",
@@ -682,13 +712,15 @@ mod tests {
         });
 
         assert_eq!(
-            parse_overlaybd_native_referrer_digest(&body.to_string()).expect("parse"),
+            parse_overlaybd_referrer(&body.to_string())
+                .expect("parse")
+                .map(|(digest, _)| digest),
             Some("sha256:first".to_string())
         );
     }
 
     #[test]
-    fn parse_overlaybd_native_referrer_digest_returns_none_without_match() {
+    fn parse_overlaybd_referrer_returns_none_without_match() {
         let body = json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.index.v1+json",
@@ -696,7 +728,99 @@ mod tests {
         });
 
         assert_eq!(
-            parse_overlaybd_native_referrer_digest(&body.to_string()).expect("parse"),
+            parse_overlaybd_referrer(&body.to_string()).expect("parse"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_overlaybd_referrer_accepts_acr_artifact_streaming() {
+        // Shape emitted by `az acr artifact-streaming create`, annotations
+        // included. Only the artifactType differs from
+        // accelerated-container-image: the referrer it points at is an ordinary
+        // overlaybd-native manifest whose layers carry a tar mediaType plus a
+        // blob-digest annotation equal to the layer's own digest.
+        let body = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:0a21030948e9223e054ab830dd82b0ad85f921df34f11c5bf769bb0ed636d72a",
+                    "size": 1234,
+                    "artifactType": ACR_ARTIFACT_STREAMING_ARTIFACT_TYPE,
+                    "annotations": {
+                        "streaming.format": "overlaybd",
+                        "streaming.version": "v1",
+                        "streaming.platform.os": "linux",
+                        "streaming.platform.arch": "amd64"
+                    }
+                }
+            ]
+        });
+
+        assert_eq!(
+            parse_overlaybd_referrer(&body.to_string()).expect("parse"),
+            Some((
+                "sha256:0a21030948e9223e054ab830dd82b0ad85f921df34f11c5bf769bb0ed636d72a"
+                    .to_string(),
+                ACR_ARTIFACT_STREAMING_ARTIFACT_TYPE
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_overlaybd_referrer_prefers_containerd_native_over_acr_streaming() {
+        let body = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:acr",
+                    "size": 10,
+                    "artifactType": ACR_ARTIFACT_STREAMING_ARTIFACT_TYPE
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:native",
+                    "size": 20,
+                    "artifactType": OVERLAYBD_NATIVE_ARTIFACT_TYPE
+                }
+            ]
+        });
+
+        assert_eq!(
+            parse_overlaybd_referrer(&body.to_string()).expect("parse"),
+            Some(("sha256:native".to_string(), OVERLAYBD_NATIVE_ARTIFACT_TYPE))
+        );
+    }
+
+    #[test]
+    fn parse_overlaybd_referrer_ignores_unrelated_artifact_types() {
+        // Turbo-OCI in particular must never be selected: AgentENV's overlaybd
+        // runtime does not implement the turbo read path.
+        let body = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:sbom",
+                    "size": 10,
+                    "artifactType": "application/spdx+json"
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:turbo",
+                    "size": 20,
+                    "artifactType": "application/vnd.containerd.overlaybd.turbo.v1+json"
+                }
+            ]
+        });
+
+        assert_eq!(
+            parse_overlaybd_referrer(&body.to_string()).expect("parse"),
             None
         );
     }

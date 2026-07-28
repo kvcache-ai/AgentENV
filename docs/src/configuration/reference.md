@@ -115,6 +115,23 @@ Image resolution runs in two phases, and the three keys act at different points:
    covered by `allowed_registries` — no separate whitelist entry is needed for
    referrers.
 
+   Two referrer `artifactType`s are recognized, in this order:
+
+   | `artifactType` | Produced by |
+   |-----|-----|
+   | `application/vnd.containerd.overlaybd.native.v1+json` | accelerated-container-image (`obdconv`) |
+   | `application/vnd.azure.artifact.streaming.v1` | Azure Container Registry artifact streaming (`az acr artifact-streaming create`) |
+
+   Both point at an overlaybd-native manifest; only the discovery label
+   differs. The referrer manifest is re-validated after it is fetched, so a
+   referrer that is not actually overlaybd-native is rejected rather than
+   used. Turbo-OCI referrers
+   (`application/vnd.containerd.overlaybd.turbo.v1+json`) are never selected —
+   AgentENV's overlaybd runtime does not implement the turbo read path.
+
+   To stream from ACR, add your registry (with the trailing slash) to the
+   list, e.g. `try_referrers_overlaybd_prefixes = ["myregistry.azurecr.io/"]`.
+
 ## `[image.cache]`
 
 Node-local cache root for resolved and converted user images.
