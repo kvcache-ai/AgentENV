@@ -76,9 +76,9 @@ LSMT (Log Structured Merge Tree) based layered image format.
 
 **Compression**: zstd (level 3) with random-access jump tables and CRC32C checksums.
 
-**Snapshot**: `snapshot_runtime()` copies upper layer data/index to a snapshot directory using reflink (CoW) where the filesystem supports it.
+**Snapshot**: `ImageFile::create_snapshot_and_restack()` is the primary pause path. It seals the live upper layer via `LSMTFile::close_seal_and_reopen()` so the upper becomes the newest lower layer, then reopens a fresh writable upper in place. `image/snapshot.rs::export_upper_as_snapshot_layer()` retains the explicit upper-export path used by packaging and export flows.
 
-**Key files**: `image_file.rs` (high-level image), `index_file.rs` (LSMT stacking: `LSMTReadOnlyFile`, `LSMTFile`), `format.rs` (binary format), `index.rs` (segment mapping), `zfile.rs` (compression), `snapshot.rs`.
+**Key files**: `image/image_file.rs` (high-level image), `lsmt/file/` (LSMT stacking: `readonly.rs` for `LSMTReadOnlyFile`, `readwrite.rs` for `LSMTFile`, `stack.rs` for open/merge/stack helpers), `lsmt/format.rs` (binary format), `lsmt/index.rs` (segment mapping), `compression/zfile.rs` (compression), `image/snapshot.rs`.
 
 ### ublk (`storage/ublk/`)
 
@@ -269,14 +269,20 @@ at render/apply time so AgentENV runtime config remains single-sourced.
 ```
 storage/
 ├── overlaybd/src/              # layered image format (core)
-│   ├── image_file.rs           # high-level image abstraction
-│   ├── index_file.rs           # LSMT layer stacking
-│   ├── format.rs               # binary format (HeaderTrailer, DiskSegmentMapping)
-│   ├── index.rs                # segment mapping
-│   ├── zfile.rs                # zstd compression + jump tables
-│   ├── snapshot.rs             # snapshot capture
-│   ├── local.rs                # LocalFile backend (io_uring)
-│   └── registryfs_v2.rs        # OCI registry backend
+│   ├── image/                  # high-level image abstraction
+│   │   ├── image_file.rs       # ImageFile: reads/writes across the layer stack
+│   │   ├── image_service.rs    # shared io_uring and image services
+│   │   ├── helper.rs           # runtime upper preparation, path rewriting
+│   │   └── snapshot.rs         # explicit upper export
+│   ├── lsmt/                   # LSMT layer stacking
+│   │   ├── file/               # LSMTReadOnlyFile, LSMTFile, stack helpers
+│   │   ├── format.rs           # binary format (HeaderTrailer, DiskSegmentMapping)
+│   │   └── index.rs            # segment mapping
+│   ├── compression/zfile.rs    # zstd compression + jump tables
+│   └── backend/                # pluggable VirtualFile backends
+│       ├── local.rs            # LocalFile backend (io_uring)
+│       ├── registryfs_v2.rs    # OCI registry backend
+│       └── tar.rs              # tar archive backend
 ├── ublk/src/                   # userspace block device server
 │   ├── lib.rs                  # public API
 │   ├── ctrl.rs                 # /dev/ublk-control interface
