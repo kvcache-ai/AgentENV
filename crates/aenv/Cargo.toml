@@ -17,12 +17,13 @@ directories = "5"
 envd = { path = "../../thirdparty/envd" }
 futures = "0.3"
 prost = "0.14"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream"] }
+reqwest = { version = "0.13", default-features = false, features = ["multipart", "rustls", "stream"] }
 rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tabled = "0.16"
-tokio = { version = "1", features = ["macros", "rt", "io-std", "io-util", "signal"] }
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "rt", "signal", "sync", "time"] }
 toml = "0.9"
 ureq = { version = "2", features = ["json", "tls"] }
 shell-util = { path = "../../crates/shell-util" }

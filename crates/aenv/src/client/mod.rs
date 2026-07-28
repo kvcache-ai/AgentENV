@@ -1,3 +1,4 @@
+pub mod files;
 pub mod sandboxes;
 pub mod snapshots;
 pub mod templates;

@@ -28,6 +28,10 @@ enum Cmd {
     Start(commands::start::Args),
     /// Run a command in a sandbox
     Exec(commands::exec::Args),
+    /// Upload a file to a sandbox
+    Upload(commands::upload::Args),
+    /// Download a file from a sandbox
+    Download(commands::download::Args),
     /// Attach an interactive shell to a running sandbox
     #[command(alias = "cn")]
     Connect(commands::connect::Args),
@@ -59,6 +63,8 @@ fn main() -> Result<()> {
         Cmd::Build(a) => commands::build::run(a),
         Cmd::Start(a) => commands::start::run(a),
         Cmd::Exec(a) => commands::exec::run(a),
+        Cmd::Upload(a) => commands::upload::run(a),
+        Cmd::Download(a) => commands::download::run(a),
         Cmd::Connect(a) => commands::connect::run(a),
         Cmd::Pause(a) => commands::pause::run(a),
         Cmd::Resume(a) => commands::resume::run(a),

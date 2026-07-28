@@ -169,7 +169,7 @@ impl Transport {
     }
 }
 
-fn bypass_proxy_for_base_url(base_url: &str) -> bool {
+pub(crate) fn bypass_proxy_for_base_url(base_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(base_url) else {
         return false;
     };

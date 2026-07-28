@@ -2,6 +2,7 @@ pub mod auth;
 pub mod build;
 pub mod connect;
 pub mod delete;
+pub mod download;
 pub mod exec;
 pub mod list;
 pub mod pause;
@@ -11,6 +12,7 @@ pub mod snapshot;
 pub mod start;
 pub mod template;
 pub mod timeout;
+pub mod upload;
 
 use crate::client::Client;
 use anyhow::Result;

@@ -54,6 +54,7 @@ dependencies = [
  "serde_json",
  "shell-util",
  "tabled",
+ "tempfile",
  "tokio",
  "toml",
  "ureq",

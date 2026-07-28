@@ -163,6 +163,43 @@ Run a one-shot command in a sandbox and stream its output.
 aenv exec <sandbox-id> ls -la /
 ```
 
+### `aenv upload <sandbox-id> <local-path> <remote-path>`
+
+Upload a local file to a sandbox through envd. The remote file is overwritten
+if it already exists, and envd creates missing remote parent directories.
+When the remote path ends in `/`, the local filename is appended automatically.
+
+```bash
+aenv upload <sandbox-id> ./config.json /workspace/config.json
+aenv upload <sandbox-id> ./config.json /workspace/
+aenv upload --user app <sandbox-id> ./config.json config.json
+```
+
+| Flag | Description |
+|------|-------------|
+| `--user <user>` | Resolve relative remote paths as this user and set the uploaded file's owner |
+
+Only regular files are supported. Directory uploads and stdin input are not
+supported.
+
+### `aenv download <sandbox-id> <remote-path> [local-path]`
+
+Download a file from a sandbox through envd.
+
+```bash
+aenv download <sandbox-id> /workspace/result.txt ./result.txt
+aenv download <sandbox-id> /workspace/result.txt
+aenv download <sandbox-id> /workspace/result.txt ./output/
+aenv download --user app --force <sandbox-id> result.txt ./result.txt
+```
+
+| Flag | Description |
+|------|-------------|
+| `--user <user>` | Resolve relative remote paths as this user |
+| `--force` | Replace the local destination if it already exists |
+
+When the local path is omitted, the remote filename is used in the current directory. When the local path names an existing directory or ends in `/`, the remote filename is appended automatically. The resulting local parent directory must already exist. Downloads are written to a temporary file and moved into place only after the transfer succeeds. Existing local files are protected unless `--force` is specified. Directory downloads and stdout output are not supported.
+
 ### `aenv list`
 
 List all sandboxes. Alias: `aenv ls`.
