@@ -130,7 +130,12 @@ func TestPreferLocalNodesCountsRequirementsBeforeEarlyReturn(t *testing.T) {
 
 type duplicateArtifactProvider struct{}
 
-func (duplicateArtifactProvider) LookupAll(string, string, string) []string {
+func (duplicateArtifactProvider) LookupEligible(
+	string,
+	string,
+	string,
+	map[string]struct{},
+) []string {
 	return []string{"node-a", "node-a"}
 }
 

@@ -21,7 +21,12 @@ type ArtifactStore interface {
 	Record(clusterID string, backend string, key string, nodeID string)
 	Forget(clusterID string, backend string, key string, nodeID string)
 	Lookup(clusterID string, backend string, key string) []string
-	LookupAll(clusterID string, backend string, key string) []string
+	LookupEligible(
+		clusterID string,
+		backend string,
+		key string,
+		eligibleNodeIDs map[string]struct{},
+	) []string
 	ForgetNode(nodeID string)
 }
 
@@ -225,8 +230,34 @@ func (s *InMemoryArtifactStore) Lookup(clusterID string, backend string, key str
 	return s.lookup(clusterID, backend, key, s.lookupNodeLimit)
 }
 
-func (s *InMemoryArtifactStore) LookupAll(clusterID string, backend string, key string) []string {
-	return s.lookup(clusterID, backend, key, 0)
+func (s *InMemoryArtifactStore) LookupEligible(
+	clusterID string,
+	backend string,
+	key string,
+	eligibleNodeIDs map[string]struct{},
+) []string {
+	indexKey, ok := normalizeArtifactIndexKey(clusterID, backend, key)
+	if !ok || len(eligibleNodeIDs) == 0 {
+		return nil
+	}
+
+	s.mu.RLock()
+	nodes := s.entries[indexKey]
+	if len(nodes) == 0 {
+		s.mu.RUnlock()
+		return nil
+	}
+	s.lru.Get(indexKey)
+	resultCapacity := min(len(nodes), len(eligibleNodeIDs))
+	result := make([]string, 0, resultCapacity)
+	for nodeID := range eligibleNodeIDs {
+		if _, exists := nodes[nodeID]; exists {
+			result = append(result, nodeID)
+		}
+	}
+	s.mu.RUnlock()
+
+	return result
 }
 
 func (s *InMemoryArtifactStore) lookup(clusterID string, backend string, key string, limit int) []string {

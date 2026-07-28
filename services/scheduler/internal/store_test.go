@@ -216,14 +216,25 @@ func TestArtifactStoreLookupLimitsReturnedNodes(t *testing.T) {
 	}
 }
 
-func TestArtifactStoreLookupAllIgnoresReturnedNodeLimit(t *testing.T) {
+func TestArtifactStoreLookupEligibleIntersectsCandidates(t *testing.T) {
 	store := NewInMemoryArtifactStore(10, 1)
-	for _, nodeID := range []string{"node-a", "node-b", "node-c"} {
+	for _, nodeID := range []string{"node-a", "node-b", "stale-node"} {
 		store.Record("cluster", "backend", "key", nodeID)
 	}
 
-	if got := len(store.LookupAll("cluster", "backend", "key")); got != 3 {
-		t.Fatalf("LookupAll returned %d nodes, want 3", got)
+	eligible := map[string]struct{}{
+		"node-a":       {},
+		"node-b":       {},
+		"missing-node": {},
+	}
+	nodes := store.LookupEligible("cluster", "backend", "key", eligible)
+	if len(nodes) != 2 {
+		t.Fatalf("LookupEligible returned %v, want node-a and node-b", nodes)
+	}
+	for _, nodeID := range nodes {
+		if nodeID != "node-a" && nodeID != "node-b" {
+			t.Fatalf("LookupEligible returned unexpected node %q", nodeID)
+		}
 	}
 }
 

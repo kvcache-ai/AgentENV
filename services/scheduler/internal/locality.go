@@ -7,7 +7,12 @@ import (
 )
 
 type ArtifactProviderLookup interface {
-	LookupAll(clusterID string, backend string, key string) []string
+	LookupEligible(
+		clusterID string,
+		backend string,
+		key string,
+		eligibleNodeIDs map[string]struct{},
+	) []string
 }
 
 type LocalityPreferenceStats struct {
@@ -58,7 +63,12 @@ func PreferLocalNodes(
 	for namespace, namespaceCandidates := range candidates {
 		for _, key := range keys {
 			seenProviders := make(map[string]struct{})
-			for _, nodeID := range providers.LookupAll(namespace.clusterID, namespace.backend, key) {
+			for _, nodeID := range providers.LookupEligible(
+				namespace.clusterID,
+				namespace.backend,
+				key,
+				namespaceCandidates,
+			) {
 				if _, seen := seenProviders[nodeID]; seen {
 					continue
 				}
