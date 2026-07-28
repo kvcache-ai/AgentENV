@@ -894,6 +894,19 @@ impl FirecrackerSandbox {
         )
     }
 
+    fn configure_network_slot(
+        &mut self,
+        slot: Slot,
+        policy: Option<&SandboxNetworkPolicy>,
+    ) -> Result<()> {
+        self.network_slot = Some(slot);
+        self.network_slot
+            .as_ref()
+            .expect("network slot was just assigned")
+            .set_egress_policy(policy)
+            .context("Failed to configure sandbox egress policy")
+    }
+
     fn mmds_metadata(&self, common: &FirecrackerCommonConfig) -> MmdsMetadata {
         common
             .mmds_metadata
@@ -1216,9 +1229,7 @@ impl FirecrackerSandbox {
         // valid DNS server IP in the 8th field. See that method for format details.
         let ip_config = slot.build_ip_boot_arg();
         let netns = slot.namespace_path();
-        slot.set_egress_policy(config.common.network_policy.as_ref())
-            .context("Failed to configure sandbox egress policy")?;
-        self.network_slot = Some(slot);
+        self.configure_network_slot(slot, config.common.network_policy.as_ref())?;
         boot_args = Some(match boot_args.take() {
             Some(existing) => format!("{existing} {ip_config}"),
             None => ip_config,
@@ -1961,6 +1972,24 @@ mod tests {
             .take()
             .expect("network slot should still be present");
         manager.release(slot)?;
+        Ok(())
+    }
+
+    #[test]
+    fn egress_policy_failure_keeps_network_slot_owned_for_cleanup() -> Result<()> {
+        let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
+        let manager = NetworkManager::new(false, 0, 0);
+        let slot = manager.allocate_test_slot()?;
+
+        sandbox
+            .configure_network_slot(slot, None)
+            .expect_err("test slot has no network namespace");
+
+        let slot = sandbox
+            .network_slot
+            .take()
+            .expect("failed policy setup must leave the slot owned by the sandbox");
+        manager.cleanup_allocated_slot(slot, true)?;
         Ok(())
     }
 
