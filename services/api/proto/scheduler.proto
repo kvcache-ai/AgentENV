@@ -34,6 +34,13 @@ message ScheduleRequestHint {
     NewColdSandboxHint new_cold_sandbox = 1;
     NewSandboxHint new_sandbox = 2;
   }
+  // Stable artifact identities that can be used to prefer nodes which already
+  // provide content needed by this request. Requirements are advisory.
+  repeated LocalityRequirement locality_requirements = 3;
+}
+
+message LocalityRequirement {
+  string key = 1;
 }
 
 // NewColdSandboxHint describes a POST /sandboxes-cold request.
@@ -51,6 +58,8 @@ message NewColdSandboxHint {
 message NewSandboxHint {
   // Sandbox metadata key/value pairs parsed from the request body.
   map<string, string> metadata = 1;
+  // Template identifier supplied by POST /sandboxes.
+  string template_id = 2;
 }
 
 message ScheduleRequest {

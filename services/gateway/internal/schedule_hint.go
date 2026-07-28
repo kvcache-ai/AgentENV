@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -36,10 +37,12 @@ func buildScheduleHint(r *http.Request) (*schedulerv1.ScheduleRequestHint, error
 		if err != nil {
 			return nil, err
 		}
+		newSandbox := parseNewSandboxHint(body)
 		return &schedulerv1.ScheduleRequestHint{
 			Kind: &schedulerv1.ScheduleRequestHint_NewSandbox{
-				NewSandbox: parseNewSandboxHint(body),
+				NewSandbox: newSandbox,
 			},
+			LocalityRequirements: snapshotLocalityRequirements(newSandbox.GetTemplateId()),
 		}, nil
 	default:
 		return nil, nil
@@ -134,7 +137,8 @@ func parseNewColdSandboxHint(body []byte) *schedulerv1.NewColdSandboxHint {
 // newSandboxBody mirrors the subset of NewSandbox (src/api/openapi.yml) that is
 // relevant for scheduling.
 type newSandboxBody struct {
-	Metadata map[string]string `json:"metadata"`
+	TemplateID string            `json:"templateID"`
+	Metadata   map[string]string `json:"metadata"`
 }
 
 // parseNewSandboxHint extracts the structured sandbox hint from the request
@@ -149,6 +153,19 @@ func parseNewSandboxHint(body []byte) *schedulerv1.NewSandboxHint {
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return hint
 	}
+	hint.TemplateId = parsed.TemplateID
 	hint.Metadata = parsed.Metadata
 	return hint
+}
+
+func snapshotLocalityRequirements(templateID string) []*schedulerv1.LocalityRequirement {
+	templateID = strings.TrimSpace(templateID)
+	if templateID == "" {
+		return nil
+	}
+	prefix := fmt.Sprintf("snapshot/v1/artifacts/%s/", templateID)
+	return []*schedulerv1.LocalityRequirement{
+		{Key: prefix + "vm_state.bin"},
+		{Key: prefix + "firecracker-manifest.json"},
+	}
 }

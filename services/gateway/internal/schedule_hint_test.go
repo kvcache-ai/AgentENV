@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	schedulerv1 "agentenv/services/api/proto"
 )
 
 func newHintRequest(t *testing.T, method, target, body string) *http.Request {
@@ -34,6 +36,16 @@ func TestBuildScheduleHintNewSandbox(t *testing.T) {
 	}
 	if hint.GetNewColdSandbox() != nil {
 		t.Fatalf("did not expect cold sandbox hint")
+	}
+	if got := hint.GetNewSandbox().GetTemplateId(); got != "tmpl" {
+		t.Fatalf("template_id = %q, want tmpl", got)
+	}
+	wantRequirements := []string{
+		"snapshot/v1/artifacts/tmpl/vm_state.bin",
+		"snapshot/v1/artifacts/tmpl/firecracker-manifest.json",
+	}
+	if got := localityRequirementKeys(hint.GetLocalityRequirements()); !equalStrings(got, wantRequirements) {
+		t.Fatalf("locality requirements = %v, want %v", got, wantRequirements)
 	}
 
 	// Body must remain available for the upstream request.
@@ -156,6 +168,47 @@ func TestParseNewColdSandboxHint(t *testing.T) {
 			t.Fatalf("images = %v", got)
 		}
 	})
+}
+
+func TestParseNewSandboxHint(t *testing.T) {
+	t.Run("extracts template and metadata", func(t *testing.T) {
+		hint := parseNewSandboxHint([]byte(`{"templateID":"tmpl","metadata":{"team":"infra"}}`))
+		if hint.GetTemplateId() != "tmpl" {
+			t.Fatalf("template_id = %q, want tmpl", hint.GetTemplateId())
+		}
+		if hint.GetMetadata()["team"] != "infra" {
+			t.Fatalf("metadata = %v", hint.GetMetadata())
+		}
+	})
+
+	t.Run("malformed json", func(t *testing.T) {
+		hint := parseNewSandboxHint([]byte("{not json"))
+		if hint.GetTemplateId() != "" || len(hint.GetMetadata()) != 0 {
+			t.Fatalf("expected best-effort empty hint, got %v", hint)
+		}
+	})
+}
+
+func TestSnapshotLocalityRequirements(t *testing.T) {
+	if got := snapshotLocalityRequirements("  "); got != nil {
+		t.Fatalf("empty template requirements = %v, want nil", got)
+	}
+
+	want := []string{
+		"snapshot/v1/artifacts/snapshot-1/vm_state.bin",
+		"snapshot/v1/artifacts/snapshot-1/firecracker-manifest.json",
+	}
+	if got := localityRequirementKeys(snapshotLocalityRequirements(" snapshot-1 ")); !equalStrings(got, want) {
+		t.Fatalf("requirements = %v, want %v", got, want)
+	}
+}
+
+func localityRequirementKeys(requirements []*schedulerv1.LocalityRequirement) []string {
+	keys := make([]string, 0, len(requirements))
+	for _, requirement := range requirements {
+		keys = append(keys, requirement.GetKey())
+	}
+	return keys
 }
 
 func TestCaptureRequestBodyNil(t *testing.T) {
