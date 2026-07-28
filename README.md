@@ -16,7 +16,7 @@ AgentENV (AENV) is a platform for running agent environments at scale, powering 
 
 ## 🚀 Why AgentENV
 
-- **Scale across diverse environments**: AENV runs massive numbers of Firecracker environments across machines and diverse OCI-compatible images, loaded on demand via overlaybd. Local disk acts as a bounded cache, retaining hot data and evicting cold, so images can exceed disk capacity while startup stays fast cluster-wide, without pre-warming every host.
+- **Scale across diverse environments**: AENV runs massive numbers of Firecracker environments across machines and diverse OCI-compatible images, loaded on demand via [overlaybd](https://containerd.github.io/overlaybd/#/). Local disk acts as a bounded cache, retaining hot data and evicting cold, so images can exceed disk capacity while startup stays fast cluster-wide, without pre-warming every host.
 - **Make idle environments inexpensive**: Snapshot-backed environments boot or resume in under 50 ms and pause in under 100 ms. Idle environments can quickly release CPU and memory, then return when new work arrives.
 - **Native snapshot and fork support**: AENV snapshots memory and filesystem changes incrementally, completing in under 100 ms even under heavy disk modification. A running environment can fork into multiple independent sandboxes for parallel agent workflows. Snapshots persist to S3-compatible object storage or a shared distributed filesystem to prevent data loss.
 - **Preserve performance and density over time**: AENV delivers high-performance I/O via ublk while sharing the host page cache across storage and memory-snapshot data. Memory ballooning returns reclaimable guest memory to the host, sustaining high overcommit as environments run longer and diverge.
