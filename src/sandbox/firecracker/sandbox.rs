@@ -454,8 +454,23 @@ impl FirecrackerSandbox {
     #[tracing::instrument(skip(self))]
     pub async fn start(&mut self) -> Result<()> {
         debug!("starting firecracker sandbox");
-        self.start_nowait().await?;
-        self.wait_for_ready().await
+        let start_result = async {
+            self.start_nowait().await?;
+            self.wait_for_ready().await
+        }
+        .await;
+
+        if let Err(err) = start_result {
+            if let Err(stop_err) = self.stop().await {
+                warn!(
+                    error = %stop_err,
+                    "failed to stop sandbox after start failure"
+                );
+            }
+            return Err(err);
+        }
+
+        Ok(())
     }
 
     /// Start the sandbox WITHOUT waiting for envd's readiness.
@@ -1906,6 +1921,27 @@ mod tests {
         sandbox.stop().await?;
 
         assert!(sandbox.envd_instance.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_failure_rolls_back_initialized_runtime_state() -> Result<()> {
+        let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
+        sandbox.envd_instance = Some(EnvdInstance::new(format!(
+            "http://127.0.0.1:{}",
+            ToolsConfig::default().control_plane_port
+        )));
+
+        let err = sandbox
+            .start()
+            .await
+            .expect_err("missing launch artifacts should fail validation");
+
+        assert!(err.to_string().contains("firecracker binary not found"));
+        assert!(
+            sandbox.envd_instance.is_none(),
+            "failed start must roll back initialized runtime state"
+        );
         Ok(())
     }
 
