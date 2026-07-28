@@ -262,8 +262,17 @@ fn main() -> Result<()> {
         tracing::warn!(?err, target, "failed to raise RLIMIT_NOFILE");
     }
 
+    // Device creation does short blocking work (open/ioctl on /dev) between
+    // awaits, so a small worker pool throttles concurrent sandbox creates.
+    // Default generously and allow tuning without a rebuild.
+    let worker_threads = std::env::var("AENV_UBLK_DAEMON_WORKER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(32);
+    tracing::info!(worker_threads, "starting ublk daemon runtime");
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
+        .worker_threads(worker_threads)
         .enable_all()
         .build()
         .context("build tokio runtime")?;

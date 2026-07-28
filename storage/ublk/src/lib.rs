@@ -65,36 +65,76 @@ pub async fn delete_dev(
 /// The block node can appear before udev applies its group and mode rules. A
 /// mere existence check therefore races non-root consumers such as
 /// Firecracker's snapshot memory backend.
+/// Poll schedule as `(interval_ms, retries)`, totalling ~30s.
+///
+/// The block node normally appears within about a millisecond, so poll finely
+/// first and back off afterwards. The previous schedule started at 10ms, which
+/// charged nearly every device creation a full 10ms of dead wait.
+const WAIT_SCHEDULE: [(u64, u32); 5] = [(1, 20), (5, 16), (50, 18), (500, 10), (1000, 24)];
+
+/// One non-blocking readiness probe. `Ok(true)` means the node is open-able.
+fn probe_ublk_dev(path: &Path, warned_permission: &mut bool) -> Result<bool> {
+    match std::fs::File::open(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            if !*warned_permission {
+                tracing::warn!(
+                    path = %path.display(),
+                    "ublk device is not readable yet; udev rules may still be applying"
+                );
+                *warned_permission = true;
+            }
+            Ok(false)
+        }
+        Err(error) => Err(error).with_context(|| format!("open {}", path.display())),
+    }
+}
+
+fn wait_timed_out(dev_id: u32, path: &Path) -> anyhow::Error {
+    anyhow::anyhow!(
+        "ublk device {dev_id} did not become accessible at {}",
+        path.display()
+    )
+}
+
+/// Blocking variant, for synchronous callers (CLI, tests).
+///
+/// Do not call this from an async task: it parks the executor thread. Use
+/// [`wait_for_ublk_dev_async`] there instead.
 pub fn wait_for_ublk_dev(dev_id: u32) -> Result<()> {
     let p = format!("/dev/ublkb{}", dev_id);
     let p = Path::new(&p);
-    // Total around 30 seconds timeout
-    let interval_ms = [10, 100, 500, 1000];
-    let retry_times = [5, 10, 10, 24];
     let mut warned_permission = false;
-    for (interval, retry) in interval_ms.into_iter().zip(retry_times) {
+    for (interval, retry) in WAIT_SCHEDULE {
         for _ in 0..retry {
-            match std::fs::File::open(p) {
-                Ok(_) => return Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                    if !warned_permission {
-                        tracing::warn!(
-                            path = %p.display(),
-                            "ublk device is not readable yet; udev rules may still be applying"
-                        );
-                        warned_permission = true;
-                    }
-                }
-                Err(error) => return Err(error).with_context(|| format!("open {}", p.display())),
+            if probe_ublk_dev(p, &mut warned_permission)? {
+                return Ok(());
             }
             std::thread::sleep(Duration::from_millis(interval));
         }
     }
-    bail!(
-        "ublk device {dev_id} did not become accessible at {}",
-        p.display()
-    );
+    Err(wait_timed_out(dev_id, p))
+}
+
+/// Async variant that yields instead of parking the worker thread.
+///
+/// Device creation runs on the daemon's shared multi-thread runtime; blocking a
+/// worker here caps concurrent creations at the worker-thread count, which was
+/// the dominant limit on per-node sandbox create throughput.
+pub async fn wait_for_ublk_dev_async(dev_id: u32) -> Result<()> {
+    let p = format!("/dev/ublkb{}", dev_id);
+    let p = Path::new(&p);
+    let mut warned_permission = false;
+    for (interval, retry) in WAIT_SCHEDULE {
+        for _ in 0..retry {
+            if probe_ublk_dev(p, &mut warned_permission)? {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(interval)).await;
+        }
+    }
+    Err(wait_timed_out(dev_id, p))
 }
 
 const LOG_FORMAT_ENV: &str = "AENV_LOG_FORMAT";

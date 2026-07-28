@@ -19,8 +19,8 @@ use warm_pool::{PoolConfig, PoolMaintenanceAction, WarmPool};
 
 use storage_util::io_ring::IoRingHandle;
 use uvm_ublk::{
-    delete_dev, ublk_caps, wait_for_ublk_dev, BasicCowConfig, BasicCowTarget, OverlaybdTarget,
-    UVMUblkCtrlBuilder, UVMUblkDev, UVMUblkDevBuilder, UVMUblkTarget,
+    delete_dev, ublk_caps, wait_for_ublk_dev_async, BasicCowConfig, BasicCowTarget,
+    OverlaybdTarget, UVMUblkCtrlBuilder, UVMUblkDev, UVMUblkDevBuilder, UVMUblkTarget,
 };
 
 use crate::protocol::{
@@ -773,7 +773,10 @@ async fn create_overlaybd_device(
         return Err(err);
     }
 
-    if let Err(err) = wait_for_ublk_dev(dev_id).context("wait for ublk device") {
+    if let Err(err) = wait_for_ublk_dev_async(dev_id)
+        .await
+        .context("wait for ublk device")
+    {
         cleanup_failed_ublk_start(ctrl_ring.clone(), dev).await;
         return Err(err);
     }
@@ -828,7 +831,10 @@ async fn handle_create_cow(
         cleanup_failed_ublk_start(ctrl_ring.clone(), dev).await;
         return Err(err);
     }
-    if let Err(err) = wait_for_ublk_dev(dev_id).context("wait for ublk device") {
+    if let Err(err) = wait_for_ublk_dev_async(dev_id)
+        .await
+        .context("wait for ublk device")
+    {
         cleanup_failed_ublk_start(ctrl_ring.clone(), dev).await;
         return Err(err);
     }
@@ -1609,7 +1615,10 @@ async fn create_new_device(
         cleanup_failed_ublk_start(ctrl_ring.clone(), dev).await;
         return Err(err);
     }
-    if let Err(err) = wait_for_ublk_dev(dev_id).context("wait for ublk device") {
+    if let Err(err) = wait_for_ublk_dev_async(dev_id)
+        .await
+        .context("wait for ublk device")
+    {
         cleanup_failed_ublk_start(ctrl_ring.clone(), dev).await;
         return Err(err);
     }
