@@ -83,6 +83,11 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn print_samples(name: &str, samples: &[Duration]) {
+    if samples.is_empty() {
+        println!("{name:<28} no samples");
+        return;
+    }
+
     let total: Duration = samples.iter().copied().sum();
     let mean = total / samples.len() as u32;
     let min = samples.iter().copied().min().unwrap_or_default();
