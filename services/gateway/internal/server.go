@@ -49,17 +49,12 @@ type ServerOptions struct {
 }
 
 type Server struct {
-	logger                         *zap.Logger
-	scheduler                      schedulerv1.SchedulerClient
-	queryOnlyScheduler             schedulerv1.SchedulerClient
-	httpClient                     *http.Client
-	templateAliasHTTPClient        *http.Client
-	requestTimeout                 time.Duration
-	templateAliasLookupTimeout     time.Duration
-	templateAliasScheduleReserve   time.Duration
-	templateAliasLookupConcurrency int
-	templateAliasResolutionSlots   chan struct{}
-	maxRespSize                    int64
+	logger             *zap.Logger
+	scheduler          schedulerv1.SchedulerClient
+	queryOnlyScheduler schedulerv1.SchedulerClient
+	httpClient         *http.Client
+	requestTimeout     time.Duration
+	maxRespSize        int64
 	// debugMode, when true, enables debug-only behaviors such as exposing
 	// the backend node id on proxied responses via the x-agentenv-node-id
 	// header. Off by default; toggled via GatewayConfig.DebugMode.
@@ -79,19 +74,14 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 	}
 
 	return &Server{
-		logger:                         logger,
-		scheduler:                      schedulerClient,
-		queryOnlyScheduler:             queryOnlyScheduler,
-		httpClient:                     &http.Client{},
-		templateAliasHTTPClient:        &http.Client{Timeout: defaultTemplateAliasHTTPTimeout},
-		requestTimeout:                 options.RequestTimeout,
-		templateAliasLookupTimeout:     defaultTemplateAliasLookupTimeout,
-		templateAliasScheduleReserve:   defaultTemplateAliasScheduleReserve,
-		templateAliasLookupConcurrency: defaultTemplateAliasLookupConcurrency,
-		templateAliasResolutionSlots:   make(chan struct{}, defaultTemplateAliasResolutionConcurrency),
-		maxRespSize:                    options.MaxResponseSize,
-		debugMode:                      options.DebugMode,
-		sandboxProxyDomains:            sandboxProxyDomains,
+		logger:              logger,
+		scheduler:           schedulerClient,
+		queryOnlyScheduler:  queryOnlyScheduler,
+		httpClient:          &http.Client{},
+		requestTimeout:      options.RequestTimeout,
+		maxRespSize:         options.MaxResponseSize,
+		debugMode:           options.DebugMode,
+		sandboxProxyDomains: sandboxProxyDomains,
 	}, nil
 }
 
@@ -228,7 +218,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
 			return
 		}
-		resolvedHint := s.resolveSnapshotLocalityHint(routingCtx, r, hint)
+		resolvedHint := resolveSnapshotLocalityHint(hint)
 		rpcStart := time.Now()
 		resp, err := s.scheduler.Schedule(routingCtx, &schedulerv1.ScheduleRequest{
 			Hint: resolvedHint,
