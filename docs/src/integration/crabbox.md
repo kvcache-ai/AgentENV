@@ -1,95 +1,169 @@
 # Crabbox
 
-[Crabbox](https://crabbox.sh/) ([openclaw/crabbox](https://github.com/openclaw/crabbox)) is the recommended sandbox client for AgentENV when you want an edit–sync–run loop against Firecracker sandboxes from a laptop, CI job, or coding agent.
+[Crabbox](https://crabbox.sh/)
+([openclaw/crabbox](https://github.com/openclaw/crabbox)) is a sandbox client
+for edit–sync–run loops from a laptop, CI job, or coding agent. Its built-in
+`e2b` provider can use AgentENV's E2B-compatible control plane and host-based
+sandbox data plane.
 
-AgentENV exposes an E2B-compatible HTTP API. Crabbox’s built-in `e2b` provider talks to that API — install the upstream CLI, point it at your server, and run. No AgentENV-side code changes and no repo-local wrapper script.
+No AgentENV-side plugin or repository-local wrapper is required. The deployment
+does need the optional sandbox proxy domain described below; setting only
+`E2B_API_URL` is not enough for a Crabbox run.
 
 ## When to use Crabbox
 
 | Client | Best for |
 |--------|----------|
 | **[aenv CLI](../getting-started/aenv-cli.md)** | Interactive shells, pause/resume, template management |
-| **[Crabbox](https://crabbox.sh/)** | Repo sync + remote command execution, agent/automation workflows, auditable run evidence |
+| **[Crabbox](https://crabbox.sh/)** | Repo sync + remote command execution for agents and automation |
 | **[E2B SDK](./e2b.md)** | Embedding sandbox create/run/kill in application code |
 
-Use Crabbox when the workflow is “sync this checkout, run a command in an AgentENV sandbox, stream the output.” Prefer `aenv` for interactive attach, snapshot operations, and day-to-day cluster ops.
+Use Crabbox when the workflow is “sync this checkout, run a command in an
+AgentENV sandbox, and stream the output.” Prefer `aenv` for interactive attach,
+snapshot operations, and cluster administration.
 
-## Install
+## How the connection works
+
+Crabbox uses two routes:
+
+1. Lifecycle calls such as create, list, connect, and delete go to
+   `CRABBOX_E2B_API_URL` (or `E2B_API_URL`).
+2. File upload and process calls go to
+   `https://{port}-{sandboxID}.{domain}`.
+
+AgentENV returns the first configured `[sandbox_proxy].domains` entry in create,
+connect, and detail responses. Crabbox uses that advertised domain for the
+second route.
+
+Crabbox's `e2b` provider does not read `E2B_SANDBOX_URL`, so the routing-header
+setup used by the E2B SDK cannot replace the host-based route. In particular, a
+plain `http://127.0.0.1:8000` API URL can support `doctor` and `list`, but
+`warmup` and `run` also need an HTTPS sandbox proxy domain.
+
+## Configure AgentENV routing
+
+Choose a DNS name dedicated to sandbox traffic, for example
+`sandbox.agentenv.example.com`.
+
+For a single node, configure the server:
+
+```bash
+export AENV_SANDBOX_PROXY_DOMAINS=sandbox.agentenv.example.com
+make start-server
+```
+
+For the Docker Compose or Kubernetes multi-node helpers, configure the shared
+gateway/runtime value:
+
+```bash
+export SANDBOX_PROXY_DOMAINS=sandbox.agentenv.example.com
+make deploy-up
+```
+
+The deployment must also provide:
+
+- wildcard DNS for `*.sandbox.agentenv.example.com` pointing to the AgentENV
+  server or gateway;
+- a wildcard TLS certificate for that name;
+- a TLS load balancer or reverse proxy that preserves the original `Host` and
+  forwards requests to AgentENV.
+
+The server and gateway accept only explicitly configured domains. See
+[Proxy](../concepts/proxy.md), [Environment Variables](../configuration/env-vars.md),
+and the relevant deployment guide for more detail.
+
+## Install and configure Crabbox
+
+Install the upstream CLI:
 
 ```bash
 brew install openclaw/tap/crabbox
-# or: https://crabbox.sh/ for other platforms
+# See https://crabbox.sh/ for other platforms.
 crabbox --version
 ```
 
-## Point Crabbox at AgentENV
-
-1. Run an AgentENV server ([Quick Start](../getting-started/quickstart.md)).
-2. Ensure a template exists (`aenv pull …` / `aenv template list`).
-3. Export the same E2B-compatible env vars used by the [E2B SDK](./e2b.md) (see also [Environment Variables](../configuration/env-vars.md)):
+Point Crabbox's control plane at the AgentENV API and select an existing
+template:
 
 ```bash
-# Single-node example
-export E2B_API_URL=http://127.0.0.1:8000
-export E2B_API_KEY=e2b_000000
-export CRABBOX_E2B_TEMPLATE=ubuntu   # AgentENV template id or name
+export CRABBOX_E2B_API_URL=https://agentenv.example.com
+export CRABBOX_E2B_API_KEY=e2b_000000
+export CRABBOX_E2B_TEMPLATE=ubuntu
 ```
 
-Crabbox also accepts `CRABBOX_E2B_API_URL` / `CRABBOX_E2B_API_KEY` (these take precedence over `E2B_*`). Plain HTTP is allowed only for localhost / loopback; remote deployments should terminate TLS and use `https://…`.
+`CRABBOX_E2B_*` values take precedence over the corresponding `E2B_*` values.
+`E2B_API_KEY` or `CRABBOX_E2B_API_KEY` must be non-empty because Crabbox checks
+for it. AgentENV does not currently enforce that key, so keep the API on a
+trusted network even when TLS is enabled.
+
+AgentENV normally advertises the configured sandbox proxy domain. If an
+intermediary strips the `domain` response field, set the same value explicitly:
+
+```bash
+export CRABBOX_E2B_DOMAIN=sandbox.agentenv.example.com
+```
 
 ### Project config
 
-Copy the checked-in example and adjust the template name:
+Install the checked-in example with private permissions and adjust the template:
 
 ```bash
-cp config/crabbox.example.yaml .crabbox.yaml
+install -m 600 config/crabbox.example.yaml .crabbox.yaml
 ```
 
 ```yaml
 provider: e2b
 target: linux
 e2b:
-  apiUrl: http://127.0.0.1:8000
-  template: ubuntu          # AgentENV template id or name
-  workdir: crabbox          # dedicated subdirectory inside the sandbox
+  template: ubuntu
+  workdir: crabbox
 ```
 
-Keep keys in the environment — do not commit secrets into `.crabbox.yaml`.
+Keep API destinations and credentials in explicit environment variables or
+trusted user configuration. Crabbox intentionally refuses to send inherited
+credentials to a destination supplied only by repository configuration.
+Crabbox also requires loaded configuration files to be private (`0600`), which
+is why the example uses `install` rather than a plain `cp`.
 
 ## Run against AgentENV
 
 ```bash
 crabbox doctor --provider e2b
 
-# one-shot: create sandbox, sync tree, run, release
+# One shot: create, sync, run, and release.
 crabbox run --provider e2b --e2b-template ubuntu -- make test-unit
 
-# warm lease for repeated agent / edit loops
+# Keep a warm sandbox for repeated edit/run loops.
 crabbox warmup --provider e2b --e2b-template ubuntu
-lease=<slug-or-id-from-warmup>
-crabbox run --provider e2b --id "$lease" --shell 'make test-unit'
+lease=<slug-or-cbx-id-from-warmup>
 crabbox status --provider e2b --id "$lease" --wait
+crabbox run --provider e2b --id "$lease" --shell 'make test-unit'
 crabbox stop --provider e2b "$lease"
 crabbox list --provider e2b --json
 ```
 
-What happens under the hood:
+Under the hood, Crabbox:
 
-1. Crabbox creates an AgentENV sandbox through the E2B-compatible control plane.
-2. It archive-syncs the local working tree into the sandbox workdir.
-3. It runs the command via the sandbox process API and streams stdout/stderr.
-4. On release (unless kept), it deletes the sandbox.
+1. creates an AgentENV sandbox from the selected template;
+2. archive-syncs the Git-managed working set into the sandbox workdir;
+3. runs the command through envd's process API and streams stdout/stderr;
+4. deletes a one-shot sandbox on release, unless retention was requested.
 
 ## Notes and limits
 
-- Crabbox uses the delegated `e2b` provider path: no SSH lease into the Firecracker guest.
-- Prefer a dedicated `e2b.workdir` subdirectory; Crabbox rejects broad system roots such as `/` or `/tmp`.
-- Pause/resume, fork, and snapshot APIs remain AgentENV-native — use `aenv` or the HTTP API for those. Crabbox covers create → sync → run → stop.
-- AgentENV currently does not enforce authorization. Do not expose the API publicly; keep Crabbox pointed at a trusted network endpoint.
+- The `e2b` provider is a delegated-run path, not an SSH lease.
+- Use a dedicated `e2b.workdir`; Crabbox rejects broad roots such as `/`,
+  `/home`, and `/tmp`.
+- Pause/resume, fork, and snapshot APIs remain AgentENV-native. Use `aenv` or
+  the HTTP API for those operations.
+- Crabbox's E2B sandbox timeout is capped at one hour.
+- AgentENV currently does not enforce authorization. Do not expose its control
+  or sandbox data plane directly to the public internet.
 
-## Verified with Islo
+## Upstream CLI verification
 
-openclaw/crabbox was exercised against [Islo](https://islo.dev) (`crabbox --provider islo`) to validate the delegated-sandbox client path before recommending it for AgentENV’s E2B API.
+The upstream Crabbox binary was also exercised against
+[Islo](https://islo.dev) through Crabbox's separate `islo` provider:
 
 ```bash
 islo api-key create crabbox-agentenv-smoke --show
@@ -100,13 +174,17 @@ crabbox list --provider islo --json
 crabbox run --provider islo --no-sync -- echo crabbox-islo-ok
 ```
 
-AgentENV usage stays on `--provider e2b` + `E2B_API_URL`. Islo is only the external verification provider.
+This verifies the upstream delegated-run CLI path; it does not replace an
+AgentENV E2B smoke test. AgentENV usage remains on `--provider e2b` with the
+control-plane and wildcard-domain setup above.
 
 ## Related docs
 
-- [E2B integration](./e2b.md) — SDK and shared env vars
+- [E2B integration](./e2b.md) — SDK setup and shared environment variables
+- [Proxy](../concepts/proxy.md) — routing headers and host-based URLs
 - [aenv CLI](../getting-started/aenv-cli.md) — interactive AgentENV workflows
-- `config/crabbox.example.yaml` — checked-in Crabbox config example at the repository root
-- [Crabbox E2B provider](https://crabbox.sh/providers/e2b.html) — provider flags, auth, and gotchas
-- [Crabbox Islo provider](https://crabbox.sh/providers/islo.html) — verification provider
-- [crabbox.sh](https://crabbox.sh/) — product overview and install
+- `config/crabbox.example.yaml` — checked-in project configuration
+- [Crabbox E2B provider](https://crabbox.sh/providers/e2b.html) — upstream
+  provider flags, auth, and limits
+- [Crabbox Islo provider](https://crabbox.sh/providers/islo.html) — external CLI
+  verification provider

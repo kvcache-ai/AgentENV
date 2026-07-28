@@ -103,14 +103,18 @@ Firecracker sandbox, run a command, stream output, and release.
 ```bash
 brew install openclaw/tap/crabbox
 
-export E2B_API_URL=http://127.0.0.1:8000
-export E2B_API_KEY=e2b_000000
+export CRABBOX_E2B_API_URL=https://agentenv.example.com
+export CRABBOX_E2B_API_KEY=e2b_000000
 export CRABBOX_E2B_TEMPLATE=ubuntu   # AgentENV template id or name
-# optional: cp config/crabbox.example.yaml .crabbox.yaml
+# optional: install -m 600 config/crabbox.example.yaml .crabbox.yaml
 
 crabbox doctor --provider e2b
 crabbox run --provider e2b -- make test-unit
 ```
+
+`crabbox run` requires AgentENV to advertise an HTTPS wildcard sandbox proxy
+domain; the control-plane URL alone is not sufficient. See the integration guide
+for the server, DNS, and TLS setup.
 
 See 📖 [Crabbox integration](https://kvcache-ai.github.io/AgentENV/integration/crabbox.html).
 Verified with [Islo](https://islo.dev) via `crabbox --provider islo` while landing
@@ -119,8 +123,9 @@ this client path.
 ## 🔌 E2B compatibility
 
 AgentENV exposes an E2B-compatible HTTP API. Point `E2B_API_URL` at your
-server and use the standard E2B Python / TypeScript SDK — or Crabbox’s
-`e2b` provider — without any AgentENV code changes. See 📖
+server and use the standard E2B Python / TypeScript SDK without any AgentENV
+code changes. Crabbox’s `e2b` provider also works when host-based sandbox
+routing is configured. See 📖
 [E2B integration](https://kvcache-ai.github.io/AgentENV/integration/e2b.html)
 for SDK setup details.
 

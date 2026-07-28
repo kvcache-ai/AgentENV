@@ -38,7 +38,9 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 
 ## E2B SDK / CLI / Crabbox
 
-These variables configure the E2B SDK, E2B CLI, and [Crabbox](../integration/crabbox.md)’s `e2b` provider to point at an AgentENV server. Values depend on your deployment mode.
+These variables configure the E2B SDK and CLI to point at an AgentENV server.
+[Crabbox](../integration/crabbox.md)’s `e2b` provider shares some of them but
+uses host-based sandbox URLs rather than `E2B_SANDBOX_URL`.
 
 | Variable | Description |
 |----------|-------------|
@@ -48,7 +50,10 @@ These variables configure the E2B SDK, E2B CLI, and [Crabbox](../integration/cra
 | `E2B_ACCESS_TOKEN` | Access token (used by `e2b template` commands) |
 | `CRABBOX_E2B_API_URL` | Crabbox override for `E2B_API_URL` (takes precedence) |
 | `CRABBOX_E2B_API_KEY` | Crabbox override for `E2B_API_KEY` (takes precedence) |
+| `CRABBOX_E2B_DOMAIN` | Fallback wildcard sandbox domain; AgentENV normally advertises `[sandbox_proxy].domains[0]` in its sandbox response |
 | `CRABBOX_E2B_TEMPLATE` | AgentENV template id/name for `crabbox run --provider e2b` |
+| `CRABBOX_E2B_WORKDIR` | Dedicated directory inside the sandbox used for repo sync and commands |
+| `CRABBOX_E2B_USER` | Optional sandbox login name used for file ownership and commands |
 
 ### Values by Deployment Mode
 
@@ -75,6 +80,13 @@ export E2B_ACCESS_TOKEN=dummy
 > (`${E2B_API_URL}/proxy`) is still accepted for back-compat.
 
 > For local development, any non-empty value works for `E2B_API_KEY` and `E2B_ACCESS_TOKEN` because the server only checks that the auth header is present.
+
+> Crabbox does not read `E2B_SANDBOX_URL`. Its `e2b` provider connects to
+> `https://{port}-{sandboxID}.{domain}`. Configure AgentENV's host-based sandbox
+> routing, wildcard DNS, and TLS as described in the
+> [Crabbox integration](../integration/crabbox.md). A plain loopback
+> `E2B_API_URL` is sufficient for `crabbox doctor` and `list`, but not for
+> `warmup` or `run`.
 
 ## Gateway and Scheduler
 

@@ -66,21 +66,43 @@ Also check `[envd].init_timeout_secs` in your config. The default is 60 seconds.
 
 ## Crabbox cannot reach AgentENV
 
-**Symptom**: `crabbox doctor --provider e2b` or `crabbox run --provider e2b` fails with auth or connection errors.
+**Symptom**: `crabbox doctor --provider e2b` or
+`crabbox run --provider e2b` fails with auth, DNS, TLS, or connection errors.
 
 **Solution**:
 
-1. Install the upstream CLI: `brew install openclaw/tap/crabbox` (see [crabbox.sh](https://crabbox.sh/)).
-2. Point Crabbox at AgentENV with the same vars as the E2B SDK:
+1. Install the upstream CLI: `brew install openclaw/tap/crabbox` (see
+   [crabbox.sh](https://crabbox.sh/)).
+2. Set the AgentENV control-plane URL, a non-empty key, and an existing template:
 
 ```bash
-export E2B_API_URL=http://127.0.0.1:8000
-export E2B_API_KEY=e2b_000000
+export CRABBOX_E2B_API_URL=https://agentenv.example.com
+export CRABBOX_E2B_API_KEY=e2b_000000
 export CRABBOX_E2B_TEMPLATE=<template-id-or-name>
 ```
 
-3. Copy `config/crabbox.example.yaml` to `.crabbox.yaml` if you want project-local defaults.
-4. Plain HTTP is only accepted for localhost / loopback; use HTTPS for remote AgentENV endpoints.
+3. Confirm `crabbox doctor --provider e2b` succeeds. If it fails, verify the API
+   URL is reachable and was set explicitly in the environment. Crabbox refuses
+   inherited credentials paired only with a repository-configured endpoint.
+4. If `doctor` succeeds but `warmup` or `run` fails, verify AgentENV advertises a
+   sandbox domain:
+
+   ```bash
+   export AENV_SANDBOX_PROXY_DOMAINS=sandbox.agentenv.example.com
+   ```
+
+   Wildcard DNS and TLS for `*.sandbox.agentenv.example.com` must route to the
+   AgentENV server or gateway. Crabbox does not read `E2B_SANDBOX_URL`; a plain
+   loopback API URL alone cannot carry its file and process traffic.
+5. Install the example with private permissions if you want project template
+   and workdir defaults:
+
+   ```bash
+   install -m 600 config/crabbox.example.yaml .crabbox.yaml
+   ```
+
+   If doctor reports `permissions 0644 want 0600`, run
+   `chmod 600 .crabbox.yaml`.
 
 See [Crabbox integration](../integration/crabbox.md).
 

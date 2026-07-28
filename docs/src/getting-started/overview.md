@@ -16,7 +16,7 @@ The repository is available at <https://github.com/kvcache-ai/AgentENV>.
 - **Pause and resume** with memory + disk snapshots for instant cold start
 - **Layered block devices** via overlaybd + ublk for copy-on-write image sharing
 - **Snapshot-backed template builder** for publishing reusable, pre-configured sandbox runtimes
-- **E2B-compatible API** so existing E2B SDKs, CLIs, and [Crabbox](../integration/crabbox.md) work out of the box
+- **E2B-compatible API** for existing E2B SDKs and CLIs, plus [Crabbox](../integration/crabbox.md) on deployments with host-based sandbox routing
 - **Reverse proxy** to reach services running inside sandboxes via HTTP and WebSocket
 - **Multi-node scaling** with a gateway + scheduler control plane (prototype)
 

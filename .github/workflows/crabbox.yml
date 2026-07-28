@@ -1,8 +1,9 @@
 name: crabbox
 
 # Validates the openclaw/crabbox integration (https://crabbox.sh).
-# - Always installs upstream crabbox, checks the e2b provider, and runs doctor.
-# - Validates config/crabbox.example.yaml parses as YAML.
+# - Installs a pinned, checksum-verified upstream Crabbox release.
+# - Loads config/crabbox.example.yaml through Crabbox itself.
+# - Exercises E2B lifecycle, archive sync, and process streaming against a strict mock.
 # - Builds mdBook so the Crabbox integration page stays linked.
 # - Optional Islo smoke when repository secret ISLO_API_KEY is set
 #   (mint with: islo api-key create …). Forks without the secret no-op cleanly.
@@ -12,23 +13,35 @@ on:
   push:
     branches: [main]
     paths:
+      - "README.md"
       - "config/crabbox.example.yaml"
       - "docs/src/integration/crabbox.md"
+      - "docs/src/integration/e2b.md"
       - "docs/src/SUMMARY.md"
       - "docs/src/configuration/env-vars.md"
       - "docs/src/getting-started/**"
+      - "docs/src/troubleshooting/common-issues.md"
+      - "scripts/tests/crabbox-e2b-contract-server.py"
       - ".github/workflows/crabbox.yml"
   pull_request:
     paths:
+      - "README.md"
       - "config/crabbox.example.yaml"
       - "docs/src/integration/crabbox.md"
+      - "docs/src/integration/e2b.md"
       - "docs/src/SUMMARY.md"
       - "docs/src/configuration/env-vars.md"
       - "docs/src/getting-started/**"
+      - "docs/src/troubleshooting/common-issues.md"
+      - "scripts/tests/crabbox-e2b-contract-server.py"
       - ".github/workflows/crabbox.yml"
 
 permissions:
   contents: read
+
+env:
+  CRABBOX_VERSION: "0.40.0"
+  CRABBOX_LINUX_AMD64_SHA256: "3bcd7c48b9866e3ac05b35bb67afa3282e831d1b9f749c5998c102944c1a5cfe"
 
 concurrency:
   group: crabbox-${{ github.workflow }}-${{ github.ref }}
@@ -41,43 +54,111 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Validate config/crabbox.example.yaml
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          try:
-              import yaml
-          except ImportError:
-              import subprocess, sys
-              subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "pyyaml"])
-              import yaml
-          path = Path("config/crabbox.example.yaml")
-          data = yaml.safe_load(path.read_text())
-          assert data.get("provider") == "e2b", data
-          assert data.get("target") == "linux", data
-          e2b = data.get("e2b") or {}
-          assert "apiUrl" in e2b and "template" in e2b and "workdir" in e2b, e2b
-          print("ok", path, "provider=e2b template=", e2b["template"])
-          PY
-
       - name: Install openclaw/crabbox
         run: |
           set -euo pipefail
-          tag="$(curl -fsSL https://api.github.com/repos/openclaw/crabbox/releases/latest | grep -m1 '"tag_name"' | cut -d'"' -f4)"
-          ver="${tag#v}"
-          curl -fsSL "https://github.com/openclaw/crabbox/releases/download/${tag}/crabbox_${ver}_linux_amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin crabbox
-          crabbox --version
+          install_dir="${RUNNER_TEMP}/crabbox/bin"
+          archive="crabbox_${CRABBOX_VERSION}_linux_amd64.tar.gz"
+          mkdir -p "${install_dir}"
+          curl --fail --location --silent --show-error \
+            "https://github.com/openclaw/crabbox/releases/download/v${CRABBOX_VERSION}/${archive}" \
+            --output "${RUNNER_TEMP}/${archive}"
+          (
+            cd "${RUNNER_TEMP}"
+            printf '%s  %s\n' "${CRABBOX_LINUX_AMD64_SHA256}" "${archive}" | sha256sum --check -
+          )
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${install_dir}" crabbox
+          echo "${install_dir}" >> "${GITHUB_PATH}"
+          "${install_dir}/crabbox" --version
 
-      - name: crabbox providers include e2b
+      - name: Validate AgentENV E2B control and data-plane contract
+        env:
+          CRABBOX_E2B_API_URL: http://127.0.0.1:18080
+          CRABBOX_E2B_API_KEY: agentenv-ci-placeholder
         run: |
           set -euo pipefail
-          crabbox providers 2>&1 | tee /tmp/crabbox-providers.txt
-          grep -E '(^|[[:space:]])e2b([[:space:]]|$)' /tmp/crabbox-providers.txt
+          config_path="${RUNNER_TEMP}/crabbox.example.yaml"
+          install -m 600 config/crabbox.example.yaml "${config_path}"
+          export CRABBOX_CONFIG="${config_path}"
+          export XDG_CONFIG_HOME="${RUNNER_TEMP}/crabbox-xdg"
 
-      - name: crabbox doctor
-        run: crabbox doctor
+          cert_dir="${RUNNER_TEMP}/crabbox-contract-tls"
+          mkdir -p "${cert_dir}"
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "${cert_dir}/key.pem" \
+            -out "${cert_dir}/cert.pem" \
+            -days 1 \
+            -subj "/CN=*.localhost" \
+            -addext "subjectAltName=DNS:*.localhost" \
+            >/dev/null 2>&1
+          export SSL_CERT_FILE="${cert_dir}/cert.pem"
+
+          python3 scripts/tests/crabbox-e2b-contract-server.py \
+            --cert "${cert_dir}/cert.pem" \
+            --key "${cert_dir}/key.pem" \
+            >"${RUNNER_TEMP}/crabbox-contract-server.log" 2>&1 &
+          server_pid=$!
+          cleanup() {
+            kill "${server_pid}" 2>/dev/null || true
+            wait "${server_pid}" 2>/dev/null || true
+            cat "${RUNNER_TEMP}/crabbox-contract-server.log"
+          }
+          trap cleanup EXIT
+
+          for _ in {1..50}; do
+            if curl --fail --silent --output /dev/null http://127.0.0.1:18080/health; then
+              break
+            fi
+            sleep 0.1
+          done
+          curl --fail --silent --output /dev/null http://127.0.0.1:18080/health
+
+          crabbox providers | grep -E '^e2b$'
+          crabbox config show --json > "${RUNNER_TEMP}/crabbox-config.json"
+          python3 - "${RUNNER_TEMP}/crabbox-config.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              config = json.load(handle)
+          assert config["provider"] == "e2b", config["provider"]
+          assert config["target"] == "linux", config["target"]
+          assert config["e2b"]["template"] == "ubuntu", config["e2b"]
+          assert config["e2b"]["workdir"] == "crabbox", config["e2b"]
+          assert config["e2b"]["apiUrl"] == "http://127.0.0.1:18080", config["e2b"]
+          PY
+          crabbox doctor --provider e2b
+
+          contract_repo="${RUNNER_TEMP}/crabbox-contract-repo"
+          git init --quiet "${contract_repo}"
+          git -C "${contract_repo}" config user.name "AgentENV CI"
+          git -C "${contract_repo}" config user.email "ci@agentenv.invalid"
+          printf 'archive-sync-contract\n' > "${contract_repo}/contract.txt"
+          git -C "${contract_repo}" add contract.txt
+          git -C "${contract_repo}" commit --quiet -m "test fixture"
+          (
+            cd "${contract_repo}"
+            crabbox run --provider e2b -- echo crabbox-agentenv-contract-ok
+          ) 2>&1 | tee "${RUNNER_TEMP}/crabbox-run.log"
+          grep -Fx "crabbox-agentenv-contract-ok" "${RUNNER_TEMP}/crabbox-run.log"
+
+          curl --fail --silent http://127.0.0.1:18080/contract-state \
+            > "${RUNNER_TEMP}/crabbox-contract-state.json"
+          python3 - "${RUNNER_TEMP}/crabbox-contract-state.json" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as handle:
+              state = json.load(handle)
+          assert state["errors"] == [], state
+          assert state["list"] >= 1, state
+          assert state["create"] == 1, state
+          assert state["connect"] == 1, state
+          assert state["upload"] == 1, state
+          assert state["process"] >= 3, state
+          assert state["marker_commands"] == 1, state
+          assert state["delete"] == 1, state
+          PY
 
       - uses: taiki-e/install-action@mdbook
 
