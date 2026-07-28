@@ -72,6 +72,20 @@ struct DaemonTomlConfig {
     deps_path: Option<PathBuf>,
     pool: Option<DaemonPoolTomlConfig>,
     ublk: Option<DaemonUblkTomlConfig>,
+    machine: Option<DaemonMachineConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonMachineConfig {
+    disk_weight_scheduler: Option<DaemonDiskWeightSchedulerConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonDiskWeightSchedulerConfig {
+    enabled: Option<bool>,
+    total_bandwidth_bytes_per_sec: Option<u64>,
+    default_weight: Option<u32>,
+    refill_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,6 +333,29 @@ fn main() -> Result<()> {
                 .enable_pool(pool_config)
                 .await
                 .context("enable warm pool")?;
+        }
+
+        // Initialize weight-based I/O scheduler from config.
+        if let Some(ws_cfg) = daemon_config
+            .as_ref()
+            .and_then(|c| c.machine.as_ref())
+            .and_then(|m| m.disk_weight_scheduler.as_ref())
+        {
+            if ws_cfg.enabled.unwrap_or(false) {
+                let config = uvm_ublk::io_weight_scheduler::SchedulerConfig {
+                    total_bandwidth_bytes_per_sec: ws_cfg
+                        .total_bandwidth_bytes_per_sec
+                        .unwrap_or(500 * 1024 * 1024),
+                    refill_interval: std::time::Duration::from_millis(
+                        ws_cfg.refill_interval_ms.unwrap_or(100),
+                    ),
+                };
+                uvm_ublk::io_weight_scheduler::IoWeightScheduler::init_global(config);
+                tracing::info!(
+                    total_bw = ws_cfg.total_bandwidth_bytes_per_sec.unwrap_or(500 * 1024 * 1024),
+                    "weight-based I/O scheduler enabled"
+                );
+            }
         }
 
         // Open a pidfd for the parent process. When the parent process

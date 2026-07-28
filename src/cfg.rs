@@ -254,6 +254,8 @@ pub struct MachineConfig {
     pub mem_size_mib: u32,
     #[config(nested)]
     pub disk_rate_limit: DiskRateLimitConfig,
+    #[config(nested)]
+    pub disk_weight_scheduler: DiskWeightSchedulerConfig,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -276,6 +278,22 @@ pub struct DiskRateLimitConfig {
     /// Token bucket refill period in milliseconds.
     #[config(default = 1000u64)]
     pub refill_time_ms: u64,
+}
+
+#[derive(Debug, Config, Clone)]
+pub struct DiskWeightSchedulerConfig {
+    /// Enable weight-based I/O scheduling across sandboxes at the ublk layer.
+    #[config(default = false)]
+    pub enabled: bool,
+    /// Total node bandwidth budget in bytes/sec shared across all active sandboxes.
+    #[config(default = 524288000u64)]
+    pub total_bandwidth_bytes_per_sec: u64,
+    /// Default weight for new sandboxes (higher = more I/O share).
+    #[config(default = 100u32)]
+    pub default_weight: u32,
+    /// Token refill interval in milliseconds.
+    #[config(default = 100u64)]
+    pub refill_interval_ms: u64,
 }
 
 #[derive(Debug, Config, Clone)]

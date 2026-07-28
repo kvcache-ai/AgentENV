@@ -13,6 +13,7 @@ mod ctrl;
 mod dev;
 pub mod impls;
 mod io_buffer;
+pub mod io_weight_scheduler;
 mod queue;
 pub mod ublk_caps;
 

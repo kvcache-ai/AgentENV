@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use storage_util::io_ring::AsyncIoRing;
 
+use crate::io_weight_scheduler::IoWeightHandle;
 use crate::{IOBuffer, UVMUblkTarget, UblkDescOperation};
 
 const DEFAULT_PHYSICAL_BS_SHIFT: u8 = 12;
@@ -46,6 +47,8 @@ pub struct OverlaybdTargetConfig {
 
 pub struct OverlaybdTarget {
     state: ArcSwap<TargetState>,
+    /// Optional weight-based I/O throttle handle. Set via `set_io_weight` after creation.
+    io_weight: ArcSwap<Option<Arc<IoWeightHandle>>>,
 }
 
 impl fmt::Debug for OverlaybdTarget {
@@ -120,7 +123,13 @@ impl OverlaybdTarget {
 
         Ok(Self {
             state: ArcSwap::new(Arc::new(state)),
+            io_weight: ArcSwap::new(Arc::new(None)),
         })
+    }
+
+    /// Attach a weight-based I/O scheduling handle to this target.
+    pub fn set_io_weight(&self, handle: Arc<IoWeightHandle>) {
+        self.io_weight.store(Arc::new(Some(handle)));
     }
 
     /// Swap the target's backing image and capacity atomically.
@@ -349,6 +358,11 @@ impl UVMUblkTarget for OverlaybdTarget {
         };
 
         tracing::debug!(qid, tag, ?op, offset, len, "handle overlaybd ublk request");
+
+        // Weight-based I/O throttle: acquire tokens proportional to request size.
+        if let Some(ref wh) = **self.io_weight.load() {
+            wh.acquire(len as u64).await;
+        }
 
         let ctx = IoCtx::new(io_ring);
         let result: Result<i32> = match op {

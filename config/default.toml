@@ -118,6 +118,13 @@ vcpu_count = 2
 # iops_burst = 500
 # refill_time_ms = 1000
 
+[machine.disk_weight_scheduler]
+enabled = true
+total_bandwidth_bytes_per_sec = 209715200  # 200 MB/s total budget
+default_weight = 100
+refill_interval_ms = 100
+
+
 [envd]
 version = "0.5.15"
 init_timeout_secs = 60

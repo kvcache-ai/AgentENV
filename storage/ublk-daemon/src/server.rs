@@ -768,6 +768,14 @@ async fn create_overlaybd_device(
         .context("build ublk dev")?;
 
     let dev_id = dev.dev_id();
+
+    // Register with weight scheduler if enabled globally.
+    if let Some(scheduler) = uvm_ublk::io_weight_scheduler::IoWeightScheduler::global() {
+        let default_weight = 100;
+        let handle = scheduler.register_device(dev_id, default_weight);
+        dev.target().set_io_weight(Arc::new(handle));
+    }
+
     if let Err(err) = dev.start().await.context("start ublk dev") {
         cleanup_failed_ublk_start(ctrl_ring.clone(), dev).await;
         return Err(err);
@@ -1133,12 +1141,26 @@ async fn prepare_overlaybd_device(
                 .with_context(|| format!("update {mode} device size for dev_id={dev_id}"))?;
         }
 
+        // Register with weight scheduler when device is acquired for active use.
+        if let Some(scheduler) = uvm_ublk::io_weight_scheduler::IoWeightScheduler::global() {
+            let handle = scheduler.register_device(dev_id, 100);
+            p.dev.target().set_io_weight(Arc::new(handle));
+        }
+
         Ok((p.dev, true))
     } else {
         tracing::debug!(mode, "pool miss: creating new device");
         let dev = create_new_device(ctrl_ring.clone(), image_config, image)
             .await
             .with_context(|| format!("create new {mode} ublk device on pool miss"))?;
+
+        // Register with weight scheduler for newly created device.
+        let dev_id = dev.dev_id();
+        if let Some(scheduler) = uvm_ublk::io_weight_scheduler::IoWeightScheduler::global() {
+            let handle = scheduler.register_device(dev_id, 100);
+            dev.target().set_io_weight(Arc::new(handle));
+        }
+
         Ok((dev, false))
     }
 }
