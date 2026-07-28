@@ -58,7 +58,12 @@ func PreferLocalNodes(
 	providerNodes := make(map[string]struct{})
 	for namespace, namespaceCandidates := range candidates {
 		for _, key := range keys {
+			seenProviders := make(map[string]struct{})
 			for _, nodeID := range providers.LookupAll(namespace.clusterID, namespace.backend, key) {
+				if _, seen := seenProviders[nodeID]; seen {
+					continue
+				}
+				seenProviders[nodeID] = struct{}{}
 				if _, eligible := namespaceCandidates[nodeID]; !eligible {
 					continue
 				}
