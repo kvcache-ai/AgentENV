@@ -252,6 +252,30 @@ pub struct MachineConfig {
     pub vcpu_count: u32,
     #[config(default = 1024u32)]
     pub mem_size_mib: u32,
+    #[config(nested)]
+    pub disk_rate_limit: DiskRateLimitConfig,
+}
+
+#[derive(Debug, Config, Clone)]
+pub struct DiskRateLimitConfig {
+    /// Enable per-sandbox disk I/O rate limiting via Firecracker's virtio-blk rate limiter.
+    #[config(default = false)]
+    pub enabled: bool,
+    /// Sustained disk bandwidth limit in bytes per second (0 = unlimited).
+    #[config(default = 0u64)]
+    pub bandwidth_bytes_per_sec: u64,
+    /// One-time burst allowance in bytes above the sustained bandwidth.
+    #[config(default = 0u64)]
+    pub bandwidth_burst_bytes: u64,
+    /// Sustained IOPS limit (0 = unlimited).
+    #[config(default = 0u64)]
+    pub iops: u64,
+    /// One-time burst allowance in operations above the sustained IOPS.
+    #[config(default = 0u64)]
+    pub iops_burst: u64,
+    /// Token bucket refill period in milliseconds.
+    #[config(default = 1000u64)]
+    pub refill_time_ms: u64,
 }
 
 #[derive(Debug, Config, Clone)]

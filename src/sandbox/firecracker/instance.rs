@@ -8,7 +8,9 @@ use anyhow::{bail, Context, Result};
 use firecracker_client::models::drive::IoEngine;
 use firecracker_client::models::instance_action_info::ActionType;
 use firecracker_client::models::vm::State as VmState;
-use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig};
+use firecracker_client::models::{
+    mmds_config::Version as MmdsVersion, MmdsConfig, PartialDrive,
+};
 use firecracker_client::models::{
     Balloon, BootSource, DirtyMemoryRanges, Drive, InstanceActionInfo, Logger,
     MachineConfiguration, MemoryBackend, NetworkInterface, NetworkOverride, RateLimiter,
@@ -320,17 +322,34 @@ impl FirecrackerInstance {
         read_only: bool,
         direct: bool,
         io_engine: IoEngine,
+        rate_limiter: Option<Box<RateLimiter>>,
     ) -> Result<()> {
         let mut drive = Drive::new(drive_id.to_string(), is_root_device);
         drive.path_on_host = Some(path_on_host.to_string_lossy().into_owned());
         drive.is_read_only = Some(read_only);
         drive.direct = Some(direct);
         drive.io_engine = Some(io_engine);
+        drive.rate_limiter = rate_limiter;
         let path = format!("/drives/{}", drive_id);
         self.client
             .request_no_content(Method::PUT, &path, Some(&drive))
             .await
             .with_context(|| format!("Failed to add/update drive {}", drive_id))
+    }
+
+    /// Updates the rate limiter on a running VM's drive via PATCH.
+    pub async fn patch_drive_rate_limiter(
+        &self,
+        drive_id: &str,
+        rate_limiter: Box<RateLimiter>,
+    ) -> Result<()> {
+        let mut partial = PartialDrive::new(drive_id.to_string());
+        partial.rate_limiter = Some(rate_limiter);
+        let path = format!("/drives/{}", drive_id);
+        self.client
+            .request_no_content(Method::PATCH, &path, Some(&partial))
+            .await
+            .with_context(|| format!("Failed to patch rate limiter on drive {}", drive_id))
     }
 
     /// Adds a network interface.
