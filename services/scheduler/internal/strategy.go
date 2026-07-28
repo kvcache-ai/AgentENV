@@ -113,6 +113,10 @@ func projectedNodeLoad(snapshot *schedulerv1.NodeSnapshot, requestedCPU, request
 	if snapshot == nil {
 		return nodeLoad{}
 	}
+	if (requestedCPU > 0 && snapshot.GetCpuCount() == 0) ||
+		(requestedMemoryBytes > 0 && snapshot.GetMemoryTotalBytes() == 0) {
+		return nodeLoad{}
+	}
 
 	pressure := 0.0
 	known := false

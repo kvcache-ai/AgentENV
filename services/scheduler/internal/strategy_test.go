@@ -103,6 +103,39 @@ func TestLeastLoadedPrefersObservedCapacity(t *testing.T) {
 	}
 }
 
+func TestLeastLoadedRequiresCapacityForRequestedResources(t *testing.T) {
+	s := &LeastLoadedStrategy{}
+	fullyObserved := richNode("fully-observed", 8, 7, 1_000, 900)
+
+	missingMemory := richNode("missing-memory", 8, 1, 0, 0)
+	memoryHint := &schedulerv1.ScheduleRequestHint{
+		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+			NewColdSandbox: &schedulerv1.NewColdSandboxHint{MemoryMb: 1},
+		},
+	}
+	got, err := s.Select([]RichNode{missingMemory, fullyObserved}, memoryHint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != fullyObserved.ID {
+		t.Fatalf("expected node with observed memory capacity, got %s", got.ID)
+	}
+
+	missingCPU := richNode("missing-cpu", 0, 0, 1_000, 100)
+	cpuHint := &schedulerv1.ScheduleRequestHint{
+		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+			NewColdSandbox: &schedulerv1.NewColdSandboxHint{CpuCount: 1},
+		},
+	}
+	got, err = s.Select([]RichNode{missingCPU, fullyObserved}, cpuHint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != fullyObserved.ID {
+		t.Fatalf("expected node with observed CPU capacity, got %s", got.ID)
+	}
+}
+
 func TestLeastLoadedRoundRobinsEqualCandidates(t *testing.T) {
 	s := &LeastLoadedStrategy{}
 	nodes := []RichNode{
