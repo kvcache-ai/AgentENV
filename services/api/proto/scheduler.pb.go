@@ -24,12 +24,12 @@ const (
 // NodeStatus describes the effective state of a node as derived by the
 // scheduler from its discovery state and heartbeat history.
 //
-//   active  + heartbeat OK      → READY        — accepts new sandboxes
-//   active  + no heartbeat      → CONNECTING    — discovered but not yet confirmed
-//   active  + heartbeat timeout → UNHEALTHY     — heartbeat lost
-//   lingering + heartbeat OK    → LINGERING     — terminating, draining existing work
-//   lingering + no heartbeat    → CONNECTING    — terminating, never confirmed
-//   lingering + heartbeat timeout → UNHEALTHY   — terminating, heartbeat lost
+//	active  + heartbeat OK      → READY        — accepts new sandboxes
+//	active  + no heartbeat      → CONNECTING    — discovered but not yet confirmed
+//	active  + heartbeat timeout → UNHEALTHY     — heartbeat lost
+//	lingering + heartbeat OK    → LINGERING     — terminating, draining existing work
+//	lingering + no heartbeat    → CONNECTING    — terminating, never confirmed
+//	lingering + heartbeat timeout → UNHEALTHY   — terminating, heartbeat lost
 type NodeStatus int32
 
 const (
