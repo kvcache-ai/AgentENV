@@ -11,7 +11,17 @@ type Node struct {
 // Strategy implementations can use Snapshot for load-aware scheduling.
 type RichNode struct {
 	Node
-	Snapshot *schedulerv1.NodeSnapshot // nil if no heartbeat received yet
+	Snapshot   *schedulerv1.NodeSnapshot // nil if no heartbeat received yet
+	ClusterID  string
+	P2pBackend string
+}
+
+// NodeSchedulingContext contains heartbeat state used only for placement.
+// P2P endpoint addresses remain private to peer discovery.
+type NodeSchedulingContext struct {
+	Snapshot   *schedulerv1.NodeSnapshot
+	ClusterID  string
+	P2pBackend string
 }
 
 func (n Node) ToProto() *schedulerv1.Node {

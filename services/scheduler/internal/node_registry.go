@@ -21,11 +21,9 @@ type NodeRegistry interface {
 	ListP2pPeers(clusterID string, backend string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
 	FilterP2pPeers(clusterID string, backend string, nodeIDs []string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
 	GetObserved(nodeID string, clusterID string, now time.Time) (*schedulerv1.ObservedNode, bool)
-	// PeekObserved returns the latest heartbeat-reported NodeSnapshot for a node.
-	// Unlike GetObserved, it does not derive status from discovery state or TTL,
-	// and returns only the raw snapshot suitable for scheduling decisions.
-	// Returns nil if the node has never sent a heartbeat.
-	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
+	// PeekSchedulingContext returns raw heartbeat state suitable for placement.
+	// Unlike GetObserved, it does not derive status from discovery state or TTL.
+	PeekSchedulingContext(nodeID string) NodeSchedulingContext
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
 }
 
@@ -331,18 +329,21 @@ func (r *AtomicNodeRegistry) GetObserved(nodeID string, clusterID string, now ti
 	return r.deriveObservedNodeViewLocked(record, nowMs), true
 }
 
-func (r *AtomicNodeRegistry) PeekObserved(nodeID string) *schedulerv1.NodeSnapshot {
+func (r *AtomicNodeRegistry) PeekSchedulingContext(nodeID string) NodeSchedulingContext {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	record, ok := r.observed[nodeID]
 	if !ok || record.node == nil {
-		return nil
+		return NodeSchedulingContext{}
 	}
-	snapshot := record.node.GetSnapshot()
-	if snapshot == nil {
-		return nil
+	context := NodeSchedulingContext{
+		Snapshot:  cloneSnapshot(record.node.GetSnapshot()),
+		ClusterID: record.node.GetClusterId(),
 	}
-	return cloneSnapshot(snapshot)
+	if record.p2pEndpoint.GetAddress() != "" {
+		context.P2pBackend = record.p2pEndpoint.GetBackend()
+	}
+	return context
 }
 
 func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID string) error {

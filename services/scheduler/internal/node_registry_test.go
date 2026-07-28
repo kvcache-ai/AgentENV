@@ -124,6 +124,50 @@ func TestHeartbeatStoresP2PEndpointForPeerListing(t *testing.T) {
 	}
 }
 
+func TestPeekSchedulingContext(t *testing.T) {
+	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, 30*time.Second)
+	now := time.Unix(100, 0)
+	registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+		NodeId:            "node-a",
+		ClusterId:         "cluster-a",
+		ServiceInstanceId: "svc-a",
+		Snapshot:          &schedulerv1.NodeSnapshot{AllocatedCpu: 2},
+		P2PEndpoint:       &schedulerv1.P2PEndpoint{Backend: "iroh", Address: "node-a-iroh-endpoint"},
+	}, now)
+
+	context := registry.PeekSchedulingContext("node-a")
+	if context.ClusterID != "cluster-a" || context.P2pBackend != "iroh" {
+		t.Fatalf("unexpected locality context: %+v", context)
+	}
+	if context.Snapshot.GetAllocatedCpu() != 2 {
+		t.Fatalf("unexpected snapshot: %+v", context.Snapshot)
+	}
+
+	// Scheduling callers must not be able to mutate registry-owned state.
+	context.Snapshot.AllocatedCpu = 99
+	if got := registry.PeekSchedulingContext("node-a").Snapshot.GetAllocatedCpu(); got != 2 {
+		t.Fatalf("registry snapshot was mutated through scheduling context: %d", got)
+	}
+}
+
+func TestPeekSchedulingContextWithoutP2PEndpoint(t *testing.T) {
+	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, 30*time.Second)
+	registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+		NodeId:            "node-a",
+		ClusterId:         "cluster-a",
+		ServiceInstanceId: "svc-a",
+		Snapshot:          &schedulerv1.NodeSnapshot{AllocatedCpu: 2},
+	}, time.Unix(100, 0))
+
+	context := registry.PeekSchedulingContext("node-a")
+	if context.ClusterID != "cluster-a" || context.P2pBackend != "" {
+		t.Fatalf("unexpected scheduling context: %+v", context)
+	}
+	if missing := registry.PeekSchedulingContext("missing"); missing != (NodeSchedulingContext{}) {
+		t.Fatalf("missing node context = %+v, want zero value", missing)
+	}
+}
+
 func TestUnregisterRemovesP2PEndpointPeer(t *testing.T) {
 	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, 30*time.Second)
 	now := time.Unix(100, 0)

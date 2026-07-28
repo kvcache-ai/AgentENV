@@ -87,9 +87,12 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	discovered := s.nodes.Snapshot( /* allowLingering */ false)
 	rich := make([]RichNode, 0, len(discovered))
 	for _, n := range discovered {
+		context := s.nodes.PeekSchedulingContext(n.ID)
 		rich = append(rich, RichNode{
-			Node:     n,
-			Snapshot: s.nodes.PeekObserved(n.ID),
+			Node:       n,
+			Snapshot:   context.Snapshot,
+			ClusterID:  context.ClusterID,
+			P2pBackend: context.P2pBackend,
 		})
 	}
 
