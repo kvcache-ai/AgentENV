@@ -6,6 +6,7 @@ mod client;
 mod commands;
 mod grpc;
 mod output;
+mod progress;
 mod pty;
 
 #[derive(Parser)]

@@ -3,23 +3,30 @@ use envd::filesystem::{
     EntryInfo, ListDirRequest, ListDirResponse, MakeDirRequest, MakeDirResponse, StatRequest,
     StatResponse,
 };
-use envd::http_client::apis::{configuration::Configuration, files_api, Error as EnvdApiError};
-use reqwest::header::{HeaderMap, HeaderValue};
+use futures::TryStreamExt;
+use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
 use std::path::Path;
 use std::time::Duration;
+use tokio::sync::watch;
+use tokio::time::{sleep, timeout, Instant};
+use tokio_util::io::ReaderStream;
 
 use super::Client;
 use crate::grpc::{RpcError, Transport, ENVD_PORT_STR};
+use crate::progress::TransferProgress;
 
 const API_KEY_HEADER: &str = "X-API-Key";
 const SANDBOX_ID_HEADER: &str = "x-agentenv-sandbox-id";
 const TARGET_PORT_HEADER: &str = "x-agentenv-target-port";
 const FILESYSTEM_SERVICE: &str = "filesystem.Filesystem";
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+pub(crate) const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub struct EnvdFilesClient {
-    config: Configuration,
+    base_url: String,
+    http: reqwest::Client,
     transport: Transport,
 }
 
@@ -35,6 +42,11 @@ impl EnvdFilesClient {
             HeaderValue::from_str(sandbox_id).context("invalid sandbox ID header value")?,
         );
         headers.insert(TARGET_PORT_HEADER, HeaderValue::from_static(ENVD_PORT_STR));
+        headers.insert(
+            USER_AGENT,
+            HeaderValue::from_str(&format!("aenv/{}", env!("CARGO_PKG_VERSION")))
+                .context("invalid aenv user agent header value")?,
+        );
 
         let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
@@ -46,15 +58,8 @@ impl EnvdFilesClient {
         let client = builder.build().context("building envd files client")?;
 
         Ok(Self {
-            config: Configuration {
-                base_path: base_url.trim_end_matches('/').to_string(),
-                user_agent: Some(format!("aenv/{}", env!("CARGO_PKG_VERSION"))),
-                client,
-                basic_auth: None,
-                oauth_access_token: None,
-                bearer_access_token: None,
-                api_key: None,
-            },
+            base_url: base_url.trim_end_matches('/').to_string(),
+            http: client,
             transport: Transport::new(base_url, api_key, sandbox_id)?,
         })
     }
@@ -64,11 +69,12 @@ impl EnvdFilesClient {
         local_path: &Path,
         remote_path: &str,
         username: Option<&str>,
+        progress: &TransferProgress,
     ) -> Result<()> {
         // envd 0.5.13 returns a JSON body with a text/plain content type for
         // successful multipart uploads. The generated files_post helper
-        // rejects that response before parsing it, so issue only uploads
-        // directly and keep using the generated helper for downloads.
+        // rejects that response before parsing it, so build the streaming
+        // multipart request directly.
         let file = tokio::fs::File::open(local_path)
             .await
             .with_context(|| format!("opening local file {}", local_path.display()))?;
@@ -81,23 +87,53 @@ impl EnvdFilesClient {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let part = Part::stream_with_length(file, file_size).file_name(file_name);
+        let (activity_tx, mut activity_rx) = watch::channel(());
+        let progress = progress.clone();
+        let stream = ReaderStream::new(file).map_ok(move |bytes| {
+            let _ = activity_tx.send(());
+            progress.inc(bytes.len() as u64);
+            bytes
+        });
+        let part = Part::stream_with_length(reqwest::Body::wrap_stream(stream), file_size)
+            .file_name(file_name);
         let form = Form::new().part("file", part);
 
         let mut request = self
-            .config
-            .client
-            .post(format!("{}/files", self.config.base_path))
+            .http
+            .post(format!("{}/files", self.base_url))
             .query(&[("path", remote_path)])
             .multipart(form);
         if let Some(username) = username {
             request = request.query(&[("username", username)]);
         }
 
-        let response = request
-            .send()
-            .await
-            .with_context(|| format!("uploading file to {remote_path}"))?;
+        let operation = format!("uploading file to {remote_path}");
+        let send = request.send();
+        tokio::pin!(send);
+        let idle = sleep(TRANSFER_IDLE_TIMEOUT);
+        tokio::pin!(idle);
+        let mut activity_open = true;
+        let response = loop {
+            tokio::select! {
+                response = &mut send => {
+                    break response.with_context(|| operation.clone())?;
+                }
+                changed = activity_rx.changed(), if activity_open => {
+                    if changed.is_ok() {
+                        idle.as_mut().reset(Instant::now() + TRANSFER_IDLE_TIMEOUT);
+                    } else {
+                        activity_open = false;
+                    }
+                }
+                () = &mut idle => {
+                    return Err(anyhow!(
+                        "transfer made no progress for {} seconds",
+                        TRANSFER_IDLE_TIMEOUT.as_secs()
+                    ))
+                    .context(operation);
+                }
+            }
+        };
         ensure_http_success(response).await?;
         Ok(())
     }
@@ -107,11 +143,24 @@ impl EnvdFilesClient {
         remote_path: &str,
         username: Option<&str>,
     ) -> Result<reqwest::Response> {
-        files_api::files_get(&self.config, Some(remote_path), username, None, None)
+        let operation = format!("downloading file from {remote_path}");
+        let mut request = self
+            .http
+            .get(format!("{}/files", self.base_url))
+            .query(&[("path", remote_path)]);
+        if let Some(username) = username {
+            request = request.query(&[("username", username)]);
+        }
+        let response = timeout(TRANSFER_IDLE_TIMEOUT, request.send())
             .await
-            .map_err(|error| {
-                format_envd_api_error(error, &format!("downloading file from {remote_path}"))
-            })
+            .with_context(|| {
+                format!(
+                    "{operation}: no response for {} seconds",
+                    TRANSFER_IDLE_TIMEOUT.as_secs()
+                )
+            })?
+            .with_context(|| operation.clone())?;
+        ensure_http_success(response).await
     }
 
     pub async fn stat(&self, path: &str, username: Option<&str>) -> Result<Option<EntryInfo>> {
@@ -183,20 +232,53 @@ async fn ensure_http_success(response: reqwest::Response) -> Result<reqwest::Res
     }
 
     let status = response.status();
-    let content = response.text().await.unwrap_or_default();
+    let content = read_error_body(response).await?;
     Err(format_envd_response_error(status, &content))
 }
 
-fn format_envd_api_error<T>(error: EnvdApiError<T>, operation: &str) -> anyhow::Error
-where
-    T: std::fmt::Debug,
-{
-    match error {
-        EnvdApiError::ResponseError(response) => {
-            format_envd_response_error(response.status, &response.content)
+async fn read_error_body(mut response: reqwest::Response) -> Result<String> {
+    let mut content = Vec::new();
+    let mut truncated = false;
+    loop {
+        let chunk = timeout(TRANSFER_IDLE_TIMEOUT, response.chunk())
+            .await
+            .with_context(|| {
+                format!(
+                    "response body made no progress for {} seconds",
+                    TRANSFER_IDLE_TIMEOUT.as_secs()
+                )
+            })?
+            .context("reading response body")?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(content.len());
+        if chunk.len() > remaining {
+            content.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
         }
-        other => anyhow!(other.to_string()).context(operation.to_string()),
+        content.extend_from_slice(&chunk);
+        if content.len() == MAX_ERROR_BODY_BYTES {
+            truncated = timeout(TRANSFER_IDLE_TIMEOUT, response.chunk())
+                .await
+                .with_context(|| {
+                    format!(
+                        "response body made no progress for {} seconds",
+                        TRANSFER_IDLE_TIMEOUT.as_secs()
+                    )
+                })?
+                .context("reading response body")?
+                .is_some();
+            break;
+        }
     }
+
+    let mut content = String::from_utf8_lossy(&content).into_owned();
+    if truncated {
+        content.push_str("\n[response body truncated]");
+    }
+    Ok(content)
 }
 
 fn format_envd_response_error(status: reqwest::StatusCode, content: &str) -> anyhow::Error {

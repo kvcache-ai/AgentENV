@@ -1,4 +1,5 @@
 use crate::client::{files::EnvdFilesClient, Client};
+use crate::progress::TransferProgress;
 use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
 use envd::filesystem::FileType;
@@ -41,9 +42,22 @@ async fn run_async(client: Client, args: Args) -> Result<()> {
     let files = client.files(&args.sandbox_id)?;
     if metadata.is_file() {
         let remote_path = resolve_remote_file_path(&args.local_path, &args.remote_path)?;
-        files
-            .upload(&args.local_path, &remote_path, args.user.as_deref())
-            .await?;
+        let progress = TransferProgress::new("Uploading", metadata.len())?;
+        progress.set_message(args.local_path.display().to_string());
+        let result = files
+            .upload(
+                &args.local_path,
+                &remote_path,
+                args.user.as_deref(),
+                &progress,
+            )
+            .await;
+        if result.is_ok() {
+            progress.finish();
+        } else {
+            progress.abandon();
+        }
+        result?;
         println!(
             "Uploaded {} to {}:{}",
             args.local_path.display(),
@@ -65,17 +79,42 @@ async fn run_async(client: Client, args: Args) -> Result<()> {
     require_absolute_remote_path(&args.remote_path)?;
 
     let entries = collect_local_directory(&args.local_path)?;
+    let total_bytes = entries
+        .iter()
+        .filter(|entry| entry.kind == LocalEntryKind::File)
+        .try_fold(0u64, |total, entry| {
+            total.checked_add(entry.size).with_context(|| {
+                format!(
+                    "total size overflow while collecting local directory {}",
+                    args.local_path.display()
+                )
+            })
+        })?;
     let remote_root =
         resolve_remote_directory_root(&files, &args.local_path, &args.remote_path).await?;
     prepare_remote_directories(&files, &remote_root, &entries).await?;
+    let progress = TransferProgress::new("Uploading", total_bytes)?;
 
-    for entry in entries
-        .iter()
-        .filter(|entry| entry.kind == LocalEntryKind::File)
-    {
-        let remote_path = join_remote(&remote_root, &entry.relative)?;
-        files.upload(&entry.path, &remote_path, None).await?;
+    let result = async {
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.kind == LocalEntryKind::File)
+        {
+            progress.set_message(entry.relative.display().to_string());
+            let remote_path = join_remote(&remote_root, &entry.relative)?;
+            files
+                .upload(&entry.path, &remote_path, None, &progress)
+                .await?;
+        }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
+    if result.is_ok() {
+        progress.finish();
+    } else {
+        progress.abandon();
+    }
+    result?;
 
     println!(
         "Uploaded directory {} to {}:{}",
@@ -153,6 +192,7 @@ struct LocalEntry {
     path: PathBuf,
     relative: PathBuf,
     kind: LocalEntryKind,
+    size: u64,
 }
 
 fn collect_local_directory(root: &Path) -> Result<Vec<LocalEntry>> {
@@ -186,6 +226,14 @@ fn collect_local_directory(root: &Path) -> Result<Vec<LocalEntry>> {
             path: entry.path().to_path_buf(),
             relative,
             kind,
+            size: if kind == LocalEntryKind::File {
+                entry
+                    .metadata()
+                    .with_context(|| format!("reading metadata for {}", entry.path().display()))?
+                    .len()
+            } else {
+                0
+            },
         });
     }
     entries.sort_by(|left, right| {

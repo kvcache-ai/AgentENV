@@ -1,4 +1,6 @@
+use crate::client::files::TRANSFER_IDLE_TIMEOUT;
 use crate::client::{files::EnvdFilesClient, Client};
+use crate::progress::TransferProgress;
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use clap::Args as ClapArgs;
@@ -7,6 +9,7 @@ use futures::{Stream, StreamExt};
 use std::path::{Component, Path, PathBuf};
 use tempfile::Builder;
 use tokio::io::AsyncWriteExt;
+use tokio::time::timeout;
 
 #[derive(ClapArgs)]
 #[command(after_help = "Examples:
@@ -45,14 +48,24 @@ async fn run_async(client: Client, args: Args) -> Result<()> {
     if remote_entry.r#type == FileType::File as i32 {
         let local_path = resolve_local_root(&args.remote_path, args.local_path.as_deref())?;
         validate_file_destination(&local_path, args.force)?;
-        download_file(
+        let total_bytes = remote_file_size(remote_entry.size, &args.remote_path)?;
+        let progress = TransferProgress::new("Downloading", total_bytes)?;
+        progress.set_message(args.remote_path.clone());
+        let result = download_file(
             &files,
             &args.remote_path,
             args.user.as_deref(),
             &local_path,
             args.force,
+            &progress,
         )
-        .await?;
+        .await;
+        if result.is_ok() {
+            progress.finish();
+        } else {
+            progress.abandon();
+        }
+        result?;
         println!(
             "Downloaded {}:{} to {}",
             args.sandbox_id,
@@ -75,16 +88,47 @@ async fn run_async(client: Client, args: Args) -> Result<()> {
 
     let local_root = resolve_local_root(&args.remote_path, args.local_path.as_deref())?;
     let entries = collect_remote_directory(&files, &args.remote_path).await?;
-    preflight_directory_download(&local_root, &entries, args.force)?;
-    create_local_directories(&local_root, &entries)?;
-
-    for entry in entries
+    let total_bytes = entries
         .iter()
         .filter(|entry| entry.kind == RemoteEntryKind::File)
-    {
-        let destination = local_root.join(&entry.relative);
-        download_file(&files, &entry.remote_path, None, &destination, args.force).await?;
+        .try_fold(0u64, |total, entry| {
+            total.checked_add(entry.size).with_context(|| {
+                format!(
+                    "total size overflow while collecting remote directory {}",
+                    args.remote_path
+                )
+            })
+        })?;
+    preflight_directory_download(&local_root, &entries, args.force)?;
+    create_local_directories(&local_root, &entries)?;
+    let progress = TransferProgress::new("Downloading", total_bytes)?;
+
+    let result = async {
+        for entry in entries
+            .iter()
+            .filter(|entry| entry.kind == RemoteEntryKind::File)
+        {
+            progress.set_message(entry.relative.display().to_string());
+            let destination = local_root.join(&entry.relative);
+            download_file(
+                &files,
+                &entry.remote_path,
+                None,
+                &destination,
+                args.force,
+                &progress,
+            )
+            .await?;
+        }
+        Ok::<(), anyhow::Error>(())
     }
+    .await;
+    if result.is_ok() {
+        progress.finish();
+    } else {
+        progress.abandon();
+    }
+    result?;
 
     println!(
         "Downloaded directory {}:{} to {}",
@@ -101,9 +145,10 @@ async fn download_file(
     username: Option<&str>,
     local_path: &Path,
     force: bool,
+    progress: &TransferProgress,
 ) -> Result<()> {
     let response = files.download(remote_path, username).await?;
-    save_stream(response.bytes_stream(), local_path, force).await
+    save_stream(response.bytes_stream(), local_path, force, progress).await
 }
 
 fn resolve_local_root(remote_path: &str, local_path: Option<&Path>) -> Result<PathBuf> {
@@ -159,6 +204,7 @@ struct RemoteEntry {
     remote_path: String,
     relative: PathBuf,
     kind: RemoteEntryKind,
+    size: u64,
 }
 
 async fn collect_remote_directory(
@@ -189,6 +235,11 @@ async fn collect_remote_directory(
                 remote_path: remote_path.clone(),
                 relative: relative.clone(),
                 kind,
+                size: if kind == RemoteEntryKind::File {
+                    remote_file_size(child.size, &remote_path)?
+                } else {
+                    0
+                },
             });
             if kind == RemoteEntryKind::Directory {
                 pending.push((remote_path, relative));
@@ -202,6 +253,11 @@ async fn collect_remote_directory(
         left_key.cmp(&right_key)
     });
     Ok(entries)
+}
+
+fn remote_file_size(size: i64, remote_path: &str) -> Result<u64> {
+    u64::try_from(size)
+        .with_context(|| format!("remote file has negative size {size}: {remote_path}"))
 }
 
 fn preflight_directory_download(
@@ -324,7 +380,12 @@ fn destination_parent(destination: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-async fn save_stream<S, E>(stream: S, destination: &Path, force: bool) -> Result<()>
+async fn save_stream<S, E>(
+    stream: S,
+    destination: &Path,
+    force: bool,
+    progress: &TransferProgress,
+) -> Result<()>
 where
     S: Stream<Item = std::result::Result<Bytes, E>>,
     E: std::error::Error + Send + Sync + 'static,
@@ -338,8 +399,20 @@ where
     let mut file = tokio::fs::File::from_std(std_file);
 
     tokio::pin!(stream);
-    while let Some(chunk) = stream.next().await {
+    loop {
+        let next = timeout(TRANSFER_IDLE_TIMEOUT, stream.next())
+            .await
+            .with_context(|| {
+                format!(
+                    "download made no progress for {} seconds",
+                    TRANSFER_IDLE_TIMEOUT.as_secs()
+                )
+            })?;
+        let Some(chunk) = next else {
+            break;
+        };
         let chunk = chunk.map_err(|err| anyhow!(err).context("reading download stream"))?;
+        progress.inc(chunk.len() as u64);
         file.write_all(&chunk)
             .await
             .context("writing downloaded file")?;
@@ -455,6 +528,12 @@ mod tests {
     }
 
     #[test]
+    fn remote_file_size_rejects_negative_values() {
+        let error = remote_file_size(-1, "/workspace/result.txt").unwrap_err();
+        assert!(error.to_string().contains("negative size -1"));
+    }
+
+    #[test]
     fn preflight_merges_directories_and_requires_force_for_files() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join("project");
@@ -465,11 +544,13 @@ mod tests {
                 remote_path: "/project/nested".into(),
                 relative: PathBuf::from("nested"),
                 kind: RemoteEntryKind::Directory,
+                size: 0,
             },
             RemoteEntry {
                 remote_path: "/project/nested/file.txt".into(),
                 relative: PathBuf::from("nested/file.txt"),
                 kind: RemoteEntryKind::File,
+                size: 3,
             },
         ];
 
@@ -510,6 +591,7 @@ mod tests {
             stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"new"))]),
             &destination,
             false,
+            &TransferProgress::new("Downloading", 3).unwrap(),
         )
         .await
         .unwrap_err();
@@ -528,6 +610,7 @@ mod tests {
             stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"new"))]),
             &destination,
             true,
+            &TransferProgress::new("Downloading", 3).unwrap(),
         )
         .await
         .unwrap();
@@ -544,7 +627,14 @@ mod tests {
             Err(std::io::Error::other("stream failed")),
         ]);
 
-        save_stream(stream, &destination, false).await.unwrap_err();
+        save_stream(
+            stream,
+            &destination,
+            false,
+            &TransferProgress::new("Downloading", 7).unwrap(),
+        )
+        .await
+        .unwrap_err();
         assert!(!destination.exists());
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
