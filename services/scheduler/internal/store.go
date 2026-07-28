@@ -21,6 +21,7 @@ type ArtifactStore interface {
 	Record(clusterID string, backend string, key string, nodeID string)
 	Forget(clusterID string, backend string, key string, nodeID string)
 	Lookup(clusterID string, backend string, key string) []string
+	LookupAll(clusterID string, backend string, key string) []string
 	ForgetNode(nodeID string)
 }
 
@@ -221,6 +222,14 @@ func (s *InMemoryArtifactStore) Forget(clusterID string, backend string, key str
 }
 
 func (s *InMemoryArtifactStore) Lookup(clusterID string, backend string, key string) []string {
+	return s.lookup(clusterID, backend, key, s.lookupNodeLimit)
+}
+
+func (s *InMemoryArtifactStore) LookupAll(clusterID string, backend string, key string) []string {
+	return s.lookup(clusterID, backend, key, 0)
+}
+
+func (s *InMemoryArtifactStore) lookup(clusterID string, backend string, key string, limit int) []string {
 	indexKey, ok := normalizeArtifactIndexKey(clusterID, backend, key)
 	if !ok {
 		return nil
@@ -234,13 +243,13 @@ func (s *InMemoryArtifactStore) Lookup(clusterID string, backend string, key str
 	}
 	s.lru.Get(indexKey)
 	resultCapacity := len(nodes)
-	if s.lookupNodeLimit > 0 && s.lookupNodeLimit < resultCapacity {
-		resultCapacity = s.lookupNodeLimit
+	if limit > 0 && limit < resultCapacity {
+		resultCapacity = limit
 	}
 	result := make([]string, 0, resultCapacity)
 	for nodeID := range nodes {
 		result = append(result, nodeID)
-		if s.lookupNodeLimit > 0 && len(result) >= s.lookupNodeLimit {
+		if limit > 0 && len(result) >= limit {
 			break
 		}
 	}

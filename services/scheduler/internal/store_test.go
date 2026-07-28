@@ -216,6 +216,17 @@ func TestArtifactStoreLookupLimitsReturnedNodes(t *testing.T) {
 	}
 }
 
+func TestArtifactStoreLookupAllIgnoresReturnedNodeLimit(t *testing.T) {
+	store := NewInMemoryArtifactStore(10, 1)
+	for _, nodeID := range []string{"node-a", "node-b", "node-c"} {
+		store.Record("cluster", "backend", "key", nodeID)
+	}
+
+	if got := len(store.LookupAll("cluster", "backend", "key")); got != 3 {
+		t.Fatalf("LookupAll returned %d nodes, want 3", got)
+	}
+}
+
 func TestArtifactStoreLookupReturnsAllNodesWhenLimitIsNonPositive(t *testing.T) {
 	for _, limit := range []int{0, -1} {
 		store := NewInMemoryArtifactStore(10, limit)
