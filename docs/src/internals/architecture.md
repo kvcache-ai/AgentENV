@@ -135,7 +135,9 @@ Memory snapshot restore uses ublk-backed overlaybd devices rather than userfault
 
 ## Per-Node Subsystems
 
-Each node is an AgentENV server binary (`src/bin/server.rs`) on a Linux host with `/dev/kvm`.
+Each node is an AgentENV server binary (`src/bin/server.rs`) on a Linux host
+with `/dev/kvm` and one configured virtualization mode. KVM is the default;
+PVM currently requires x86_64 and the `kvm_pvm` host module.
 
 | Subsystem | Location | Responsibility |
 |-----------|----------|---------------|
@@ -261,6 +263,7 @@ make k8s-apply
 In Kubernetes deployments, AgentENV runtime nodes run as a privileged DaemonSet
 so each host gets exactly one runtime Pod with access to `/dev/kvm`,
 iptables/network-namespace operations, and a hostPath-backed workspace cache.
+Runtime Pods on a host must all use the host's selected KVM/PVM mode.
 The deployment helpers materialize the DaemonSet ConfigMap from `config/default.toml`
 at render/apply time so AgentENV runtime config remains single-sourced.
 

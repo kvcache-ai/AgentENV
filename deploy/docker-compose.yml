@@ -4,6 +4,7 @@ x-agentenv-base: &agentenv-base
   working_dir: /workspace
   environment: &agentenv-environment
     AENV_CONFIG_PATH: /workspace/config/default.toml
+    AENV_VIRTUALIZATION_MODE: ${AENV_VIRTUALIZATION_MODE:-kvm}
     API_ADDR: 0.0.0.0:8000
     AENV_UBLK_DAEMON_BINARY_PATH: /usr/local/bin/uvm-ublk-daemon
     AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED: "true"

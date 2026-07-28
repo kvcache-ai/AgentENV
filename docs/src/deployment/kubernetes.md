@@ -19,11 +19,15 @@ Deploy AgentENV across a Kubernetes cluster with a gateway, scheduler, and runti
 
 ## Prerequisites
 
-- Kubernetes worker nodes with **Linux kernel 6.8+** and `/dev/kvm` access
+- Kubernetes worker nodes with **Linux kernel 6.8+**
+- `/dev/kvm` access on every runtime worker
 - Runtime Pods run privileged
 - Docker
 - `build-essential` (`sudo apt install -y build-essential`)
 - `kubectl` with Kustomize support
+
+The provided manifests use standard KVM. To prepare a separate PVM node pool
+when standard KVM is unavailable, see [PVM Deployment](./pvm.md).
 
 ## Clone the Repository
 ```bash

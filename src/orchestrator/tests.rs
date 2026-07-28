@@ -3441,6 +3441,64 @@ async fn resume_running_with_none_timeout_clears_timeout() -> Result<()> {
 }
 
 #[tokio::test]
+async fn resume_rejects_paused_sandbox_from_other_virtualization_mode_without_mutation() {
+    use crate::virtualization::VirtualizationMode;
+
+    setup();
+    let sandbox_id = SandboxId::new();
+    let node_mode = ConfigManager::global_config().virtualization_mode;
+    let sandbox_mode = match node_mode {
+        VirtualizationMode::Kvm => VirtualizationMode::Pvm,
+        VirtualizationMode::Pvm => VirtualizationMode::Kvm,
+    };
+    let persister = RecordingPersister::with_loaded(vec![SandboxMetadata {
+        id: sandbox_id,
+        state: SandboxState::Paused,
+        virtualization_mode: sandbox_mode,
+        paused_state: None,
+        ..Default::default()
+    }]);
+    let orchestrator = Orchestrator::new_inner(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+        test_runtime_image_refs(),
+    )
+    .await
+    .expect("orchestrator should retain incompatible paused metadata");
+
+    let listed = orchestrator.list_sandboxes().await.expect("list metadata");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, sandbox_id);
+    assert_eq!(listed[0].virtualization_mode, sandbox_mode);
+
+    let error = orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+        .await
+        .expect_err("cross-mode paused sandbox must not resume");
+
+    assert!(matches!(
+        error,
+        OrchestratorError::VirtualizationModeMismatch {
+            resource,
+            resource_mode,
+            node_mode: actual_node_mode,
+        } if resource == format!("paused sandbox {sandbox_id}")
+            && resource_mode == sandbox_mode
+            && actual_node_mode == node_mode
+    ));
+    let metadata = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await
+        .expect("get metadata")
+        .expect("metadata remains visible");
+    assert_eq!(metadata.state, SandboxState::Paused);
+    assert_eq!(metadata.virtualization_mode, sandbox_mode);
+    assert!(metadata.paused_state.is_none());
+    assert_eq!(persister.calls(), vec![RecordingCall::LoadAll]);
+}
+
+#[tokio::test]
 async fn auto_evict_expired_sandbox() -> anyhow::Result<()> {
     setup();
     let orchestrator = make_orchestrator().await;

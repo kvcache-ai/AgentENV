@@ -20,6 +20,7 @@ use crate::snapshot::{
     StartupCommand,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::virtualization::VirtualizationMode;
 
 /// Default command to use for ready check when start command is provided but ready command is not.
 /// Use the same default ready command as E2B
@@ -66,6 +67,7 @@ pub(crate) struct TemplateBuildContext {
     pub steps: Vec<TemplateBuildStep>,
     pub base: TemplateBuildBase,
     pub cpu_config_json: Option<String>,
+    pub virtualization_mode: VirtualizationMode,
 }
 
 impl TemplateBuildContext {

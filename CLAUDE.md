@@ -2,7 +2,7 @@
 
 ## What is AgentENV
 
-AgentENV is a Rust workspace for running AI agents inside isolated, snapshot-capable Firecracker-based environments. It exposes an E2B-compatible HTTP API so agents can create, pause, resume, and reuse sandboxes. Requires a Linux host with `/dev/kvm` access.
+AgentENV is a Rust workspace for running AI agents inside isolated, snapshot-capable Firecracker-based environments. It exposes an E2B-compatible HTTP API so agents can create, pause, resume, and reuse sandboxes. Requires a Linux host with `/dev/kvm` access and a host virtualization setup matching `virtualization_mode` (`kvm` by default; `pvm` requires x86_64 and `kvm_pvm`).
 
 ## Build, Lint, Test Commands
 
@@ -28,7 +28,7 @@ make agentenv-server          # shorthand for cargo adev codegen server
 make custom-extension-client  # shorthand for cargo adev codegen custom-extension
 ```
 
-Dependency downloads, generated OverlayBD runtime configs, and OverlayBD packaging are provisioned automatically during server startup. Machine-wide KVM group access, ublk device permissions, OverlayBD system config, and network sysctls require a one-time root setup via `server --setup-host --runtime-user <user> --runtime-group <group>`; normal startup validates those prerequisites and fails with actionable errors when they are missing.
+Dependency downloads, generated OverlayBD runtime configs, and OverlayBD packaging are provisioned automatically during server startup. Machine-wide `/dev/kvm` group access, ublk device permissions, OverlayBD system config, and network sysctls require a one-time root setup via `server --setup-host --runtime-user <user> --runtime-group <group>`; normal startup validates those prerequisites and the selected KVM/PVM mode, and fails with actionable errors when they are missing. AgentENV does not load or install `kvm_pvm`.
 
 All registry access goes through `regctl`: userImage manifest fetch, config blob fetch, layer download, tools drive image download (`src/setup/deps.rs::extract_ext4_from_ghcr`, unpacked with `umoci`), and OCI referrers lookup when `[image_resolver].try_referrers_overlaybd_prefixes` is non-empty (referrers lookup failures fall back to the source image). Server setup provisions both automatically: `regctl` is downloaded from the `[regclient]` entry in `config/deps_manifest.toml` to `/usr/local/bin/regctl`, and `umoci` is installed as a `[packages.runtime]` system package. `src/image/oci_image.rs` fetches the manifest via `regctl manifest get` and classifies it — standard OCI tar images trigger a full `regctl image copy` + per-layer conversion into local `.commit` files, while overlaybd-native images skip blob download entirely and emit a remote-ref `image.json` that the overlaybd runtime's `registryfs_v2` backend reads directly from the registry. User-facing image references are normalized by `ImageResolver` from template API `userImage` fields and CLI image arguments. For private registries referenced by `userImage`, run `docker login <registry>` before starting the server; `write_generated_overlaybd_global_config` auto-detects `~/.docker/config.json` (or `$DOCKER_CONFIG/config.json`) and wires the overlaybd runtime's `credentialConfig.mode=file` so the runtime can authenticate too.
 
@@ -57,7 +57,7 @@ sudo -E cargo test -p agentenv --test orchestrator_integration orchestrator::
 sudo -E cargo test -p agentenv --test orchestrator_integration orchestrator::test_name
 ```
 
-Integration tests require root (network namespaces), `/dev/kvm`, and `AENV_CONFIG_PATH` pointing to a valid config.
+Integration tests require root (network namespaces), `/dev/kvm`, host modules matching `AENV_VIRTUALIZATION_MODE`, and `AENV_CONFIG_PATH` pointing to a valid config.
 
 ## Architecture
 
@@ -95,7 +95,7 @@ When changing code under `services/`, validate via `make -C services test` (or `
 
 ### Per-Node Subsystems
 
-Each node is an AgentENV server binary (`src/bin/server.rs`) running on a Linux host with `/dev/kvm`. It wires together:
+Each node is an AgentENV server binary (`src/bin/server.rs`) running on a Linux host with `/dev/kvm` and one configured KVM/PVM mode. It wires together:
 
 **API layer** (`src/api/`): Axum HTTP server with OpenAPI-generated endpoint traits (`src/api/generated/` from `src/api/openapi.yml`) plus a reverse proxy. Implementations live in `src/api/impls/` (sandbox CRUD, snapshot CRUD, template-facing CRUD, auth, generic cursor-based pagination). The proxy (`src/api/proxy.rs`) forwards HTTP/WebSocket to sandboxes using routing headers (`x-agentenv-sandbox-id`, `x-agentenv-target-port`).
 

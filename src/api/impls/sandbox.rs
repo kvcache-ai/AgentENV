@@ -1133,6 +1133,7 @@ impl Sandboxes<()> for ApiImpl {
                         startup: capture.metadata.startup.clone(),
                         resources: capture.metadata.resources,
                         runtime_versions: capture.metadata.runtime_versions.clone(),
+                        virtualization_mode: capture.metadata.virtualization_mode,
                         image_configs: capture.metadata.image_configs.clone(),
                         custom_extension_params: capture.metadata.custom_extension_params.clone(),
                     },

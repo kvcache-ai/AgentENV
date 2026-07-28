@@ -10,11 +10,14 @@
 #   AENV_SNAPSHOT_LOCAL_CACHE_PATH
 
 home_path = "../env"
+# Node-wide mutually exclusive virtualization backend. Override with
+# AENV_VIRTUALIZATION_MODE.
+virtualization_mode = "kvm"
 # OSS validation keeps its downloaded dependencies directly under ../env.
 deps_path = "../env"
 
 [firecracker]
-boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/init"
+boot_args = "console=ttyS0 reboot=k panic=1 pci=off mitigations=off init=/init"
 # Optional allowlist for cold-start extraBootArgs prefixes. If omitted or empty,
 # no request-provided extra boot args are appended.
 # allowed_extra_boot_args_prefixes = ["aenv-custom."]

@@ -180,6 +180,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
             envd_version: "test-envd".to_string(),
             tools_drive_version: "0.1.0".to_string(),
         },
+        virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
         image_configs: agentenv::types::ImageConfigs::new(),
         custom_extension_params: None,
     };

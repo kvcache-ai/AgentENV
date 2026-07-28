@@ -23,6 +23,8 @@ spec:
           env:
             - name: AENV_CONFIG_PATH
               value: /workspace/config/agentenv.toml
+            - name: AENV_VIRTUALIZATION_MODE
+              value: "kvm"
             - name: API_ADDR
               value: "0.0.0.0:8000"
             - name: AENV_UBLK_DAEMON_BINARY_PATH

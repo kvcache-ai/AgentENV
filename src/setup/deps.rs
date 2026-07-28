@@ -14,11 +14,12 @@ use crate::cfg::{
     AppConfig, OssBackendConfig, OverlaybdDependencyConfig, SnapshotRepositoryBackendKind,
 };
 use crate::digest::FileDigest;
+use crate::virtualization::VirtualizationMode;
 
 #[derive(Debug, Deserialize)]
 struct SetupDependencyManifest {
-    firecracker: ManifestDownload,
-    kernel: ManifestDownload,
+    firecracker: ManifestVirtualizationDownloads,
+    kernel: ManifestVirtualizationDownloads,
     tools: ManifestTools,
     overlaybd: OverlaybdDependencyConfig,
     #[serde(rename = "regclient")]
@@ -29,6 +30,21 @@ struct SetupDependencyManifest {
 struct ManifestDownload {
     version: String,
     url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestVirtualizationDownloads {
+    kvm: ManifestDownload,
+    pvm: ManifestDownload,
+}
+
+impl ManifestVirtualizationDownloads {
+    fn for_mode(&self, mode: VirtualizationMode) -> &ManifestDownload {
+        match mode {
+            VirtualizationMode::Kvm => &self.kvm,
+            VirtualizationMode::Pvm => &self.pvm,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +83,9 @@ pub async fn ensure(config: &AppConfig, deps_path: &Path) -> Result<()> {
 
     // Architecture is resolved once and reused across dependency URL/path derivation.
     let arch = detect_arch()?;
+    if config.virtualization_mode == VirtualizationMode::Pvm && arch != "x86_64" {
+        bail!("PVM virtualization mode is only supported on x86_64 hosts");
+    }
 
     std::fs::create_dir_all(deps_path)?;
 
@@ -105,16 +124,17 @@ async fn ensure_firecracker(
         return Ok(());
     }
 
+    let mode_manifest = manifest.firecracker.for_mode(config.virtualization_mode);
     let fc_version = config
         .firecracker
         .version
         .as_deref()
-        .unwrap_or(&manifest.firecracker.version);
+        .unwrap_or(&mode_manifest.version);
     let fc_url_template = config
         .firecracker
         .url
         .as_deref()
-        .unwrap_or(&manifest.firecracker.url);
+        .unwrap_or(&mode_manifest.url);
     let fc_dir = fc_path
         .parent()
         .context("resolved firecracker binary path has no parent")?;
@@ -140,12 +160,13 @@ async fn ensure_kernel(config: &AppConfig, manifest: &SetupDependencyManifest) -
         return Ok(());
     }
 
+    let mode_manifest = manifest.kernel.for_mode(config.virtualization_mode);
     let kernel_version = config
         .kernel
         .version
         .as_deref()
-        .unwrap_or(&manifest.kernel.version);
-    let kernel_url_template = config.kernel.url.as_deref().unwrap_or(&manifest.kernel.url);
+        .unwrap_or(&mode_manifest.version);
+    let kernel_url_template = config.kernel.url.as_deref().unwrap_or(&mode_manifest.url);
     let kernel_url = resolve_url(kernel_url_template, &[("version", kernel_version)]);
     download_file(&kernel_url, &kernel_path).await
 }

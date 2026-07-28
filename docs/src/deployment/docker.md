@@ -8,12 +8,16 @@ Run a single AgentENV node in a Docker container. This avoids installing the Rus
 - `/dev/kvm` access for Firecracker microVM execution
 - Docker
 
+If the server does not support standard KVM, follow
+[PVM Deployment](./pvm.md) for the required host setup and PVM image.
+
 ## Build
 
 **Option A — Pre-built Image**
 
 ```bash
 docker pull ghcr.io/kvcache-ai/aenv-server:latest
+
 curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/docker-setup.sh | sudo bash
 ```
 

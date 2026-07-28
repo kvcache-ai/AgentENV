@@ -90,6 +90,8 @@ async fn publish_captured_snapshot_for_test(
                     disk_size_mib: 0,
                 },
                 runtime_versions: sample_runtime_versions(),
+                virtualization_mode: agentenv::cfg::ConfigManager::global_config()
+                    .virtualization_mode,
                 image_configs: agentenv::types::ImageConfigs::new(),
                 custom_extension_params: None,
             },

@@ -11,7 +11,7 @@
 #            service -> /etc/systemd/system/aenv.service
 #            env     -> /etc/default/aenv
 # Runs:      sudo server --setup-only  (provisions runtime dependencies)
-#            sudo server --setup-host  (provisions KVM, ublk, and networking)
+#            sudo server --setup-host  (provisions virtualization access, ublk, and networking)
 #
 # Usage:
 #   curl -fsSL https://github.com/kvcache-ai/AgentENV/releases/latest/download/install.sh | sudo bash
@@ -40,6 +40,15 @@ SERVICE_GROUP="${AENV_SERVICE_GROUP:-aenv}"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 ENV_FILE="/etc/default/${SERVICE_NAME}"
 RUNTIME_DIR="/run/aenv"
+VIRTUALIZATION_MODE="${AENV_VIRTUALIZATION_MODE:-kvm}"
+
+case "$VIRTUALIZATION_MODE" in
+    kvm|pvm) ;;
+    *)
+        echo "error: unsupported AENV_VIRTUALIZATION_MODE=${VIRTUALIZATION_MODE@Q}; expected kvm or pvm" >&2
+        exit 1
+        ;;
+esac
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -57,7 +66,11 @@ if [[ "$OS" != "linux" ]]; then
 fi
 
 RELEASE_API="https://api.github.com/repos/${REPO}/releases/latest"
-TARBALL="aenv-server-${OS}-${ARCH_TAG}.tar.gz"
+if [[ "$VIRTUALIZATION_MODE" == "pvm" ]]; then
+    TARBALL="aenv-server-${OS}-${ARCH_TAG}-pvm.tar.gz"
+else
+    TARBALL="aenv-server-${OS}-${ARCH_TAG}.tar.gz"
+fi
 
 curl_get() {
     curl -fsSL --retry 5 --retry-delay 10 --retry-max-time 60 "$@"
@@ -213,10 +226,12 @@ if [[ "$SKIP_SETUP" == "1" ]]; then
 else
     echo "Running dependency setup ..."
     sudo AENV_CONFIG_PATH="${CONFIG_PATH}" AENV_HOME_PATH="${DATA_DIR}" \
+        AENV_VIRTUALIZATION_MODE="${VIRTUALIZATION_MODE}" \
         "${INSTALL_DIR}/server" --setup-only
 
-    echo "Provisioning KVM, ublk, and host networking for ${SERVICE_USER} ..."
+    echo "Provisioning virtualization device access, ublk, and host networking for ${SERVICE_USER} ..."
     sudo AENV_CONFIG_PATH="${CONFIG_PATH}" AENV_HOME_PATH="${DATA_DIR}" \
+        AENV_VIRTUALIZATION_MODE="${VIRTUALIZATION_MODE}" \
         "${INSTALL_DIR}/server" --setup-host \
         --runtime-user "$SERVICE_USER" --runtime-group "$SERVICE_GROUP"
 fi
@@ -240,6 +255,7 @@ API_ADDR="127.0.0.1:8000"
 AENV_CONFIG_PATH="${CONFIG_PATH}"
 AENV_HOME_PATH="${DATA_DIR}"
 AENV_RUNTIME_PATH="${RUNTIME_DIR}"
+AENV_VIRTUALIZATION_MODE="${VIRTUALIZATION_MODE}"
 EOF
         ENV_FILE_STATUS="written"
     else
@@ -262,6 +278,7 @@ EOF
         found_config=0
         found_home=0
         found_runtime=0
+        found_virtualization=0
         while IFS= read -r line || [[ -n "$line" ]]; do
             case "$line" in
                 AENV_CONFIG_PATH=*)
@@ -276,6 +293,10 @@ EOF
                     printf 'AENV_RUNTIME_PATH="%s"\n' "$RUNTIME_DIR" >> "$tmp_env"
                     found_runtime=1
                     ;;
+                AENV_VIRTUALIZATION_MODE=*)
+                    printf 'AENV_VIRTUALIZATION_MODE="%s"\n' "$VIRTUALIZATION_MODE" >> "$tmp_env"
+                    found_virtualization=1
+                    ;;
                 *)
                     printf '%s\n' "$line" >> "$tmp_env"
                     ;;
@@ -289,6 +310,9 @@ EOF
         fi
         if [[ "$found_runtime" == "0" ]]; then
             printf 'AENV_RUNTIME_PATH="%s"\n' "$RUNTIME_DIR" >> "$tmp_env"
+        fi
+        if [[ "$found_virtualization" == "0" ]]; then
+            printf 'AENV_VIRTUALIZATION_MODE="%s"\n' "$VIRTUALIZATION_MODE" >> "$tmp_env"
         fi
         sudo install -m 0644 "$tmp_env" "$ENV_FILE"
         rm -f "$current_env" "$tmp_env"
@@ -340,6 +364,7 @@ echo "  CLI    : ${INSTALL_DIR}/aenv"
 echo "  Server : ${INSTALL_DIR}/server"
 echo "  Data   : ${DATA_DIR}"
 echo "  Config : ${CONFIG_PATH}"
+echo "  Mode   : ${VIRTUALIZATION_MODE}"
 if [[ -d /run/systemd/system ]]; then
     if [[ "$ENV_FILE_STATUS" == "written" ]]; then
         echo "  Env    : ${ENV_FILE}"
@@ -365,6 +390,7 @@ else
     echo "    --inh-caps=+net_admin,+sys_admin --ambient-caps=+net_admin,+sys_admin \\"
     echo "    --bounding-set=-all,+net_admin,+sys_admin --nnp \\"
     echo "    env AENV_CONFIG_PATH=${CONFIG_PATH} AENV_HOME_PATH=${DATA_DIR} AENV_RUNTIME_PATH=${RUNTIME_DIR} \\"
+    echo "    AENV_VIRTUALIZATION_MODE=${VIRTUALIZATION_MODE} \\"
     echo "    API_ADDR=127.0.0.1:8000 ${INSTALL_DIR}/server"
 fi
 echo ""

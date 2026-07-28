@@ -132,6 +132,7 @@ impl PosixFsSnapshotRepository {
             context: metadata.context.clone(),
             startup: metadata.startup.clone(),
             runtime_versions: metadata.runtime_versions.clone(),
+            virtualization_mode: metadata.virtualization_mode,
             image_configs: metadata.image_configs.clone(),
             custom_extension_params: metadata.custom_extension_params.clone(),
             rootfs_layers: built.rootfs_layers,
@@ -639,6 +640,7 @@ mod tests {
             context: metadata.context.clone(),
             startup: metadata.startup.clone(),
             runtime_versions: metadata.runtime_versions.clone(),
+            virtualization_mode: metadata.virtualization_mode,
             image_configs: metadata.image_configs.clone(),
             rootfs_layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
                 digest: "sharedfs:missing".to_string(),
@@ -695,6 +697,7 @@ mod tests {
             context: metadata.context.clone(),
             startup: metadata.startup.clone(),
             runtime_versions: metadata.runtime_versions.clone(),
+            virtualization_mode: metadata.virtualization_mode,
             image_configs: metadata.image_configs.clone(),
             rootfs_layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
                 digest: "sharedfs:test".to_string(),

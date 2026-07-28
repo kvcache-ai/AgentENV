@@ -11,6 +11,9 @@ If you want to skip building from source, see [Quick Start](../getting-started/q
 - Rust toolchain (stable) — install via [rustup](https://rustup.rs)
 - `sudo` access
 
+If the server does not support standard KVM, follow
+[PVM Deployment](./pvm.md) instead of this guide.
+
 ## Clone the Repository
 
 ```bash

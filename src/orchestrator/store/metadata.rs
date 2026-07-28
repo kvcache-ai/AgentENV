@@ -11,6 +11,7 @@ use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{PausedSandboxState, SandboxNetworkPolicy};
 use crate::snapshot::{CommandContext, SnapshotRuntimeVersions, StartupCommand};
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::virtualization::VirtualizationMode;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum SandboxTimeoutAction {
@@ -37,6 +38,9 @@ pub struct SandboxMetadata {
     pub timeout_action: SandboxTimeoutAction,
     pub expires_at: Option<SystemTime>,
     pub auto_resume: bool,
+    /// Virtualization mode used by this sandbox for its entire lifecycle.
+    #[serde(default)]
+    pub virtualization_mode: VirtualizationMode,
     pub runtime_versions: SnapshotRuntimeVersions,
     pub resources: SandboxResources,
     pub context: CommandContext,
@@ -68,6 +72,7 @@ impl Default for SandboxMetadata {
             timeout_action: SandboxTimeoutAction::Pause,
             expires_at: None,
             auto_resume: false,
+            virtualization_mode: VirtualizationMode::default(),
             runtime_versions: SnapshotRuntimeVersions::new(
                 "unknown".to_string(),
                 "unknown".to_string(),

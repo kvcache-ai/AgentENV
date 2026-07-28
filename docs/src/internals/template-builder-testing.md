@@ -218,6 +218,7 @@ Repository/backend unit tests under `src/snapshot/repository/backends/` cover:
 
 - overlaybd base config paths are missing or invalid
 - `ublk` is disabled while using overlaybd build bases
-- Linux host prerequisites for Firecracker / KVM / namespaces are missing
+- Linux host prerequisites for Firecracker, the selected KVM/PVM mode, or
+  network namespaces are missing
 - repository alias conflicts during publish
 - runtime resolver cannot materialize local paths from committed artifacts

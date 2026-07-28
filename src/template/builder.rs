@@ -135,6 +135,7 @@ impl TemplateBuilder {
                     startup: build_execution.startup,
                     resources,
                     runtime_versions: build_execution.runtime_versions,
+                    virtualization_mode: context.virtualization_mode,
                     image_configs: build_execution.image_configs,
                     // Template builds intentionally do not propagate the base
                     // snapshot's extension custom config: it is a per-sandbox
@@ -211,6 +212,7 @@ impl TemplateBuilder {
             steps: spec.steps().to_vec(),
             base,
             cpu_config_json: self.current_cpu_config(),
+            virtualization_mode: ConfigManager::global_config().virtualization_mode,
         })
     }
 
@@ -229,6 +231,15 @@ impl TemplateBuilder {
             return Err(TemplateBuildError::invalid_input(
                 "snapshot-based build must not override the rootfs base",
             ));
+        }
+
+        let node_mode = ConfigManager::global_config().virtualization_mode;
+        let base_mode = base_snapshot.committed().virtualization_mode;
+        if base_mode != node_mode {
+            return Err(TemplateBuildError::invalid_input(format!(
+                "base snapshot '{}' uses virtualization mode '{base_mode}', but this node runs in mode '{node_mode}'",
+                base_snapshot.record().id
+            )));
         }
 
         let resources = *base_snapshot.resources();
@@ -265,6 +276,7 @@ impl TemplateBuilder {
                 base_snapshot: Box::new(base_snapshot.clone()),
             },
             cpu_config_json: self.current_cpu_config(),
+            virtualization_mode: base_mode,
         })
     }
 
@@ -423,6 +435,38 @@ mod tests {
             .expect_err("snapshot-based build should reject target id reuse");
 
         assert!(matches!(err, TemplateBuildError::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn snapshot_base_context_rejects_other_virtualization_mode() {
+        let manager = TemplateBuilder::new();
+        let node_mode = ConfigManager::global_config().virtualization_mode;
+        let base_mode = match node_mode {
+            crate::virtualization::VirtualizationMode::Kvm => {
+                crate::virtualization::VirtualizationMode::Pvm
+            }
+            crate::virtualization::VirtualizationMode::Pvm => {
+                crate::virtualization::VirtualizationMode::Kvm
+            }
+        };
+        let mut committed = CommittedSnapshot::mock();
+        committed.virtualization_mode = base_mode;
+        let runnable =
+            RunnableSnapshot::from_test_manifest(SnapshotRecord::mock_ready(committed), Vec::new());
+
+        let error = manager
+            .prepare_snapshot_base_context(
+                &TemplateBuildSpec::new(),
+                SnapshotId::generate(),
+                &runnable,
+            )
+            .expect_err("snapshot-based build must reject the other mode");
+
+        assert!(
+            matches!(error, TemplateBuildError::InvalidInput { ref reason }
+                if reason.contains(&format!("uses virtualization mode '{base_mode}'"))
+                    && reason.contains(&format!("node runs in mode '{node_mode}'")))
+        );
     }
 
     #[test]

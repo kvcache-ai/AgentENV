@@ -83,39 +83,59 @@ jobs:
 
       - name: Stage artifacts
         run: |
-          mkdir -p dist/bundle/ublk
-          cp target/release/server dist/bundle/server
-          strip dist/bundle/server
-          cp target/release/uvm-ublk-daemon dist/bundle/ublk/uvm-ublk-daemon
-          strip dist/bundle/ublk/uvm-ublk-daemon
-          cp config/default.toml dist/bundle/default.toml
+          set -euo pipefail
 
-          STAGE_HOME="$PWD/dist/tmp-aenv"
-          STAGE_DEPS="$STAGE_HOME/deps"
-          mkdir -p "$STAGE_HOME"
-          AENV_HOME_PATH="$STAGE_HOME" dist/bundle/server --setup-only || {
-            echo "ERROR: --setup-only failed; check network and dependency downloads"
-            exit 1
-          }
+          for MODE in kvm pvm; do
+            BUNDLE="dist/bundle-$MODE"
+            mkdir -p "$BUNDLE/ublk"
+            cp target/release/server "$BUNDLE/server"
+            strip "$BUNDLE/server"
+            cp target/release/uvm-ublk-daemon "$BUNDLE/ublk/uvm-ublk-daemon"
+            strip "$BUNDLE/ublk/uvm-ublk-daemon"
+            cp config/default.toml "$BUNDLE/default.toml"
 
-          test -d "$STAGE_DEPS" || {
-            echo "ERROR: deps dir missing at $STAGE_DEPS after --setup-only"
-            exit 1
-          }
-          test -f "$STAGE_DEPS/overlaybd/etc/overlaybd/overlaybd.json" || {
-            echo "ERROR: missing staged overlaybd default config after --setup-only"
-            exit 1
-          }
-          cp -a "$STAGE_DEPS" dist/bundle/deps
-          mkdir -p dist/bundle/etc/overlaybd
-          cp "$STAGE_DEPS/overlaybd/etc/overlaybd/overlaybd.json" dist/bundle/etc/overlaybd/overlaybd.json
-          rm -rf "$STAGE_HOME"
-          tar -czf dist/aenv-server-linux-x86_64.tar.gz -C dist/bundle .
+            sed -i \
+              "s/^virtualization_mode = .*/virtualization_mode = \"$MODE\"/" \
+              "$BUNDLE/default.toml"
+            grep -qx "virtualization_mode = \"$MODE\"" "$BUNDLE/default.toml" || {
+              echo "ERROR: failed to configure virtualization_mode=$MODE"
+              exit 1
+            }
+
+            STAGE_HOME="$PWD/dist/tmp-aenv-$MODE"
+            STAGE_DEPS="$STAGE_HOME/deps"
+            mkdir -p "$STAGE_HOME"
+            AENV_VIRTUALIZATION_MODE="$MODE" \
+              AENV_HOME_PATH="$STAGE_HOME" \
+              "$BUNDLE/server" --setup-only || {
+                echo "ERROR: $MODE --setup-only failed; check network and dependency downloads"
+                exit 1
+              }
+
+            test -d "$STAGE_DEPS" || {
+              echo "ERROR: deps dir missing at $STAGE_DEPS after $MODE --setup-only"
+              exit 1
+            }
+            test -f "$STAGE_DEPS/overlaybd/etc/overlaybd/overlaybd.json" || {
+              echo "ERROR: missing staged overlaybd default config for $MODE"
+              exit 1
+            }
+            cp -a "$STAGE_DEPS" "$BUNDLE/deps"
+            mkdir -p "$BUNDLE/etc/overlaybd"
+            cp "$STAGE_DEPS/overlaybd/etc/overlaybd/overlaybd.json" "$BUNDLE/etc/overlaybd/overlaybd.json"
+            rm -rf "$STAGE_HOME"
+            if [[ "$MODE" == "kvm" ]]; then
+              ARCHIVE="dist/aenv-server-linux-x86_64.tar.gz"
+            else
+              ARCHIVE="dist/aenv-server-linux-x86_64-pvm.tar.gz"
+            fi
+            tar -czf "$ARCHIVE" -C "$BUNDLE" .
+          done
 
       - uses: actions/upload-artifact@v7
         with:
-          name: server-bundle
-          path: dist/aenv-server-linux-x86_64.tar.gz
+          name: server-bundles
+          path: dist/aenv-server-linux-x86_64*.tar.gz
 
   release:
     name: Create GitHub Release
@@ -154,6 +174,7 @@ jobs:
             dist/aenv-linux-aarch64
             dist/aenv-darwin-x86_64
             dist/aenv-darwin-aarch64
+            dist/aenv-server-linux-x86_64-pvm.tar.gz
             dist/aenv-server-linux-x86_64.tar.gz
 
       - uses: actions/upload-artifact@v7
@@ -162,9 +183,17 @@ jobs:
           path: dist/
 
   docker-publish:
-    name: Build and push Docker images
+    name: Build and push Docker image (${{ matrix.mode }})
     needs: release
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: kvm
+            version_suffix: ""
+          - mode: pvm
+            version_suffix: "-pvm"
     permissions:
       contents: read
       packages: write
@@ -191,6 +220,8 @@ jobs:
           file: deploy/docker/Dockerfile.agentenv
           push: true
           cache-from: type=gha,scope=agentenv-runtime
+          build-args: |
+            AENV_VIRTUALIZATION_MODE=${{ matrix.mode }}
           tags: |
-            ghcr.io/${{ env.OWNER }}/aenv-server:${{ github.ref_name }}
-            ghcr.io/${{ env.OWNER }}/aenv-server:latest
+            ghcr.io/${{ env.OWNER }}/aenv-server:${{ github.ref_name }}${{ matrix.version_suffix }}
+            ghcr.io/${{ env.OWNER }}/aenv-server:latest${{ matrix.version_suffix }}

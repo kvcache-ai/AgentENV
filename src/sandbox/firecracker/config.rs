@@ -460,6 +460,15 @@ impl FirecrackerSnapshotConfig {
         let manifest = snapshot.manifest();
 
         let app_config = ConfigManager::global_config();
+        let snapshot_mode = snapshot.committed().virtualization_mode;
+        if snapshot_mode != app_config.virtualization_mode {
+            bail!(
+                "snapshot '{}' uses virtualization mode '{}', but this node runs in mode '{}'",
+                snapshot.record().id,
+                snapshot_mode,
+                app_config.virtualization_mode
+            );
+        }
         if !app_config.ublk.enabled {
             bail!("repository-backed snapshot launch requires ublk to be enabled");
         }
@@ -907,5 +916,27 @@ mod tests {
         assert!(err
             .to_string()
             .contains("snapshot does not record a tools drive version"));
+    }
+
+    #[test]
+    fn runnable_snapshot_rejects_cross_virtualization_mode() {
+        use crate::virtualization::VirtualizationMode;
+
+        let node_mode = ConfigManager::global_config().virtualization_mode;
+        let snapshot_mode = match node_mode {
+            VirtualizationMode::Kvm => VirtualizationMode::Pvm,
+            VirtualizationMode::Pvm => VirtualizationMode::Kvm,
+        };
+        let mut committed = CommittedSnapshot::mock();
+        committed.virtualization_mode = snapshot_mode;
+        let snapshot =
+            RunnableSnapshot::from_test_manifest(SnapshotRecord::mock_ready(committed), Vec::new());
+
+        let err = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)
+            .expect_err("node must reject a snapshot from the other virtualization mode");
+
+        assert!(err
+            .to_string()
+            .contains(&format!("uses virtualization mode '{snapshot_mode}'")));
     }
 }

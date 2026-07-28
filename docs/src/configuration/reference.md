@@ -15,6 +15,10 @@ cargo run --bin server -- --config /path/to/config.toml
 | `home_path` | string | `"/var/lib/aenv"` | Base directory for local AgentENV state. Overridden by `AENV_HOME_PATH` |
 | `runtime_path` | string | `"/run/aenv"` | Base directory for transient namespace and daemon-socket state. Overridden by `AENV_RUNTIME_PATH` |
 | `deps_path` | string | `"$AENV_HOME/deps"` | Root directory for auto-downloaded runtime assets. Overridden by `AENV_DEPS_PATH` |
+| `virtualization_mode` | `"kvm"` or `"pvm"` | `"kvm"` | Virtualization mode for this node. Keep the default unless following the [PVM Deployment](../deployment/pvm.md) guide. Overridden by `AENV_VIRTUALIZATION_MODE` |
+
+Snapshots and paused sandboxes can only be restored in the mode in which they
+were created.
 
 `$AENV_HOME` is a literal placeholder in state-path values, not a shell
 environment variable. AgentENV replaces it with the resolved `home_path` after
@@ -24,8 +28,9 @@ placeholders are resolved against the directory containing the configuration
 file.
 
 Packaged runtime dependency versions and download URLs live in
-`config/deps_manifest.toml`. `config.toml` should contain runtime behavior
-and explicit local path overrides, not the default dependency catalog.
+`config/deps_manifest.toml`. Only the dependencies for the selected mode are
+installed. User configuration should contain runtime behavior and explicit
+local path overrides, not the default dependency catalog.
 
 ## `[firecracker]`
 

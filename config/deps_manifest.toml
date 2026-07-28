@@ -1,10 +1,18 @@
-[firecracker]
+[firecracker.kvm]
 version = "1.15.1-patch-v1"
 url = "https://pub-4ee15c400f554ab7a9eac3f5bc8f53de.r2.dev/firecracker-{version}-{arch}.tgz"
 
-[kernel]
+[firecracker.pvm]
+version = "v1.17.0-next.1"
+url = "https://github.com/kvcache-ai/firecracker-next/releases/download/{version}/firecracker-next-{version}-{arch}.tgz"
+
+[kernel.kvm]
 version = "vmlinux-6.1.175"
 url = "https://pub-4ee15c400f554ab7a9eac3f5bc8f53de.r2.dev/{version}"
+
+[kernel.pvm]
+version = "6.12.33-pvm"
+url = "https://github.com/kvcache-ai/linux/releases/download/pvm-kernel-6.12.33/vmlinux-guest-6.12.33-pvm"
 
 [tools]
 version = "0.1.0"
@@ -67,4 +75,3 @@ jq = { default = "jq" }
 sudo = { default = "sudo" }
 umoci = { default = "umoci" }
 zstd = { default = "zstd" }
-

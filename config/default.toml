@@ -12,11 +12,15 @@
 # override. AENV_RUNTIME_PATH separately defaults to "/run/aenv".
 home_path = "/var/lib/aenv"
 
+# Node-wide mutually exclusive virtualization backend. Override with
+# AENV_VIRTUALIZATION_MODE.
+virtualization_mode = "kvm"
+
 [firecracker]
 # Boot arguments passed to the guest kernel. This value takes precedence over
 # the DEFAULT_BOOT_ARGS constant in src/sandbox/firecracker/config.rs.
 # Keep the DAMON reclaim parameters in sync between both locations.
-boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/init damon_reclaim.enabled=Y damon_reclaim.min_age=60000000 damon_reclaim.quota_ms=100 damon_reclaim.quota_sz=1073741824 damon_reclaim.quota_reset_interval_ms=1000 damon_reclaim.wmarks_high=900 damon_reclaim.wmarks_mid=700 damon_reclaim.wmarks_low=200 damon_reclaim.skip_anon=Y damon_reclaim.wmarks_interval=5000000"
+boot_args = "console=ttyS0 reboot=k panic=1 pci=off mitigations=off init=/init damon_reclaim.enabled=Y damon_reclaim.min_age=60000000 damon_reclaim.quota_ms=100 damon_reclaim.quota_sz=1073741824 damon_reclaim.quota_reset_interval_ms=1000 damon_reclaim.wmarks_high=900 damon_reclaim.wmarks_mid=700 damon_reclaim.wmarks_low=200 damon_reclaim.skip_anon=Y damon_reclaim.wmarks_interval=5000000"
 # Optional allowlist for cold-start extraBootArgs prefixes. If omitted or empty,
 # no request-provided extra boot args are appended.
 # allowed_extra_boot_args_prefixes = ["aenv-custom."]

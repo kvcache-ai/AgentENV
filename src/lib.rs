@@ -16,3 +16,4 @@ pub mod setup;
 pub mod snapshot;
 pub mod template;
 pub mod types;
+pub mod virtualization;

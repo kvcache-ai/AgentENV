@@ -1,5 +1,6 @@
 use crate::common;
 
+use agentenv::cfg::ConfigManager;
 use agentenv::orchestrator::{
     CreateSandboxRequest, FileBackedSandboxPersister, InMemoryMetadataStore, NewTimeout,
     Orchestrator, ProxyLookupResult, SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
@@ -11,11 +12,16 @@ use agentenv::snapshot::{
 };
 
 use anyhow::Result;
+use std::path::PathBuf;
 use tempfile::tempdir;
 use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn host_file_persister(root: PathBuf) -> FileBackedSandboxPersister {
+    FileBackedSandboxPersister::new(root, ConfigManager::global_config().virtualization_mode)
+}
 
 #[tokio::test]
 async fn orchestrator_lifecycle() -> Result<()> {
@@ -38,7 +44,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
         let store = InMemoryMetadataStore::new();
         let factory = FirecrackerSandboxFactory::new();
         let paused_store = root.path().join("paused-sandboxes");
-        let persister = FileBackedSandboxPersister::new(paused_store.clone());
+        let persister = host_file_persister(paused_store.clone());
         let orchestrator = Orchestrator::new(store, factory, persister).await?;
         let case_id = Uuid::now_v7().to_string();
 
@@ -95,7 +101,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
         let restarted = Orchestrator::new(
             InMemoryMetadataStore::new(),
             FirecrackerSandboxFactory::new(),
-            FileBackedSandboxPersister::new(paused_store),
+            host_file_persister(paused_store),
         )
         .await?;
         let restored = restarted
@@ -205,6 +211,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                     startup: capture.metadata.startup.clone(),
                     resources: capture.metadata.resources,
                     runtime_versions: capture.metadata.runtime_versions.clone(),
+                    virtualization_mode: capture.metadata.virtualization_mode,
                     image_configs: capture.metadata.image_configs.clone(),
                     custom_extension_params: None,
                 },

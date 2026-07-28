@@ -57,7 +57,8 @@ make k8s-apply      # apply to cluster
 Deployment model:
 - `gateway`: Deployment + ClusterIP Service
 - `scheduler`: single-replica Deployment + ClusterIP Service
-- `agentenv-node`: privileged DaemonSet with `/dev/kvm` and hostPath
+- `agentenv-node`: privileged DaemonSet with `/dev/kvm`, one host-compatible
+  KVM/PVM mode, and hostPath
 - `agentenv-nodes`: headless Service for scheduler EndpointSlice discovery
 
 ## gRPC API

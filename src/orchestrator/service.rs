@@ -127,6 +127,7 @@ where
         let store = InMemoryMetadataStore::new();
         let persister = FileBackedSandboxPersister::new(
             config.orchestrator.persisted_sandbox_store_path.clone(),
+            config.virtualization_mode,
         );
         Self::new(store, factory, persister).await
     }
@@ -359,6 +360,15 @@ where
             SandboxLaunchSource::Snapshot(snapshot) => {
                 let record = snapshot.record();
                 let committed = snapshot.committed();
+                let configured_mode = ConfigManager::global_config().virtualization_mode;
+                if committed.virtualization_mode != configured_mode {
+                    self.counters.record_create_fail(1);
+                    return Err(OrchestratorError::VirtualizationModeMismatch {
+                        resource: format!("snapshot {}", record.id),
+                        resource_mode: committed.virtualization_mode,
+                        node_mode: configured_mode,
+                    });
+                }
                 let launch_image_configs = committed.image_configs.clone();
                 // Effective custom config: a launch-provided value overrides the
                 // one persisted in the source snapshot; otherwise inherit it.
@@ -377,6 +387,7 @@ where
                     id: sandbox_id,
                     snapshot_id: record.id.to_string(),
                     snapshot_alias: record.alias.as_ref().map(ToString::to_string),
+                    virtualization_mode: committed.virtualization_mode,
                     runtime_versions: committed.runtime_versions.clone(),
                     resources: *snapshot.resources(),
                     context: committed.context.clone(),
@@ -428,6 +439,7 @@ where
                     id: sandbox_id,
                     snapshot_id: image_ref,
                     snapshot_alias: None,
+                    virtualization_mode: ConfigManager::global_config().virtualization_mode,
                     runtime_versions: configured_runtime_versions(),
                     resources,
                     context,
@@ -1234,6 +1246,15 @@ where
             state => {
                 return Err(OrchestratorError::InvalidSandboxState { sandbox_id, state });
             }
+        }
+
+        let node_mode = ConfigManager::global_config().virtualization_mode;
+        if metadata.virtualization_mode != node_mode {
+            return Err(OrchestratorError::VirtualizationModeMismatch {
+                resource: format!("paused sandbox {sandbox_id}"),
+                resource_mode: metadata.virtualization_mode,
+                node_mode,
+            });
         }
 
         match self

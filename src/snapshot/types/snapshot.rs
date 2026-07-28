@@ -9,6 +9,7 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 
 use crate::sandbox::CustomExtensionParams;
+use crate::virtualization::VirtualizationMode;
 use shell_util::shell_quote;
 
 use super::drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
@@ -17,7 +18,7 @@ use super::version::SnapshotRuntimeVersions;
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::types::{ImageConfigs, SandboxResources};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct SnapshotPublishMetadata {
     pub id: SnapshotId,
     pub alias: Option<SnapshotAlias>,
@@ -26,11 +27,10 @@ pub struct SnapshotPublishMetadata {
     pub startup: Option<StartupCommand>,
     pub resources: SandboxResources,
     pub runtime_versions: SnapshotRuntimeVersions,
-    #[serde(default, skip_serializing_if = "ImageConfigs::is_empty")]
+    pub virtualization_mode: VirtualizationMode,
     pub image_configs: ImageConfigs,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Template launches inherit it unless overridden at create time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<CustomExtensionParams>,
 }
 
@@ -50,6 +50,7 @@ impl SnapshotPublishMetadata {
                 envd_version: "envd".to_string(),
                 tools_drive_version: "0.1.0".to_string(),
             },
+            virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
             image_configs: ImageConfigs::new(),
             custom_extension_params: None,
         }
@@ -285,6 +286,9 @@ pub struct CommittedSnapshot {
     pub context: CommandContext,
     pub startup: Option<StartupCommand>,
     pub runtime_versions: SnapshotRuntimeVersions,
+    /// Node virtualization ABI used to capture this snapshot.
+    #[serde(default)]
+    pub virtualization_mode: VirtualizationMode,
     #[serde(default, skip_serializing_if = "ImageConfigs::is_empty")]
     pub image_configs: ImageConfigs,
     pub rootfs_layers: Vec<OverlaybdLayerRef>,
@@ -310,6 +314,7 @@ impl CommittedSnapshot {
                 envd_version: "envd".to_string(),
                 tools_drive_version: "0.1.0".to_string(),
             },
+            virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
             image_configs: ImageConfigs::new(),
             rootfs_layers: Vec::new(),
             attached_drives: Vec::new(),

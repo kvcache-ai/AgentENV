@@ -97,7 +97,7 @@ fn is_valid_runtime_account_name(name: &str) -> bool {
 /// Run all environment setup steps. Fails fast if any prerequisite is unmet.
 ///
 /// Steps:
-/// 1. Verify KVM is available and user has access
+/// 1. Verify the configured KVM/PVM host mode and `/dev/kvm` access
 /// 2. Ensure ublk kernel module is loaded and permissions are set
 /// 3. Download dependencies (firecracker, kernel, tools drive, overlaybd) if missing
 pub async fn ensure_environment(
@@ -118,9 +118,9 @@ pub async fn ensure_environment(
     // 1. Validate runtime OS packages without attempting elevation.
     packages::check_runtime()?;
 
-    // 2. KVM check
-    info!("checking KVM availability");
-    kvm::check()?;
+    // 2. Selected virtualization mode and /dev/kvm check.
+    info!(virtualization_mode = %config.virtualization_mode, "checking virtualization availability");
+    kvm::check(config.virtualization_mode)?;
 
     // 3. ublk setup (only if ublk is enabled in config)
     if config.ublk.enabled {

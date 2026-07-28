@@ -13,6 +13,7 @@
 - [Docker Compose (Multi-Node Simulation)](./deployment/docker-compose.md)
 - [Kubernetes (Multi-Node)](./deployment/kubernetes.md)
 - [Manual Compile (Single Node)](./deployment/manual-compile.md)
+- [PVM Deployment (When KVM Is Unavailable)](./deployment/pvm.md)
 
 # Configuration
 

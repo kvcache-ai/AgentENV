@@ -167,7 +167,8 @@ resumed_sandbox.stop().await?;
 ### Runtime prerequisites
 
 - Linux host
-- `/dev/kvm` accessible by current user
+- `/dev/kvm` accessible by the current user, with the host modules matching
+  `virtualization_mode` (KVM by default; PVM requires x86_64 and `kvm_pvm`)
 - `debugfs` (e2fsprogs) if you use init injection or disk-inspection helpers
 
 ## 2) Global Config Manager (`src/cfg.rs`)
@@ -516,7 +517,8 @@ resumed_sandbox.stop().await?;
    performs validation only and never invokes `sudo`.
 3. Host setup installs a udev rule for `/dev/ublk-control`, `/dev/ublkc*`, and `/dev/ublkb*`, so the runtime group can access the control and dynamic device nodes.
 4. Update `config/default.toml` paths, or point `AENV_CONFIG_PATH` to a custom config file.
-5. Ensure `/dev/kvm` is accessible by the runtime user.
+5. Ensure `/dev/kvm` is accessible by the runtime user and the configured
+   virtualization mode matches the host modules.
 6. If you run template tests, ensure the host can run `regctl` (server setup installs it automatically from the `[regclient]` manifest entry) and access the registry for template `fromImage` resolution.
 7. Run `scripts/tests/e2e/run_e2e.sh` for API-level E2E coverage. The runner exports `E2E_TEMPLATE_USER_IMAGE`. Suite `05_template_lifecycle.sh` also creates a template build with `E2E_SHORT_USER_IMAGE` to verify short-name image resolution.
 8. Run `make test-agent-integration` to run the `agentenv` integration test modules in `tests/integration/` as a non-root user with the required capabilities, plus the Docker/MinIO-backed OSS snapshot repository test (`crates/e2e-tests/tests/snapshot_oss_e2e_test.rs`).

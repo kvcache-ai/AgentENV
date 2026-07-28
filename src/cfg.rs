@@ -13,12 +13,14 @@ pub use network::{NetworkConfig, NetworkEgressConfig, NetworkInternalConfig};
 use overlaybd::config::UpperMode;
 use serde::Deserialize;
 
+use crate::virtualization::VirtualizationMode;
+
 const ENV_CONFIG_PATH: &str = "AENV_CONFIG_PATH";
 
 #[derive(Debug, Deserialize)]
 struct SetupDependencyManifest {
-    firecracker: ManifestDownload,
-    kernel: ManifestDownload,
+    firecracker: ManifestVirtualizationDownloads,
+    kernel: ManifestVirtualizationDownloads,
     tools: ManifestTools,
     overlaybd: ManifestDownload,
     #[serde(rename = "regclient")]
@@ -28,6 +30,21 @@ struct SetupDependencyManifest {
 #[derive(Debug, Deserialize)]
 struct ManifestDownload {
     version: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestVirtualizationDownloads {
+    kvm: ManifestDownload,
+    pvm: ManifestDownload,
+}
+
+impl ManifestVirtualizationDownloads {
+    fn for_mode(&self, mode: VirtualizationMode) -> &ManifestDownload {
+        match mode {
+            VirtualizationMode::Kvm => &self.kvm,
+            VirtualizationMode::Pvm => &self.pvm,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +91,8 @@ pub struct AppConfig {
         default = "$AENV_HOME/deps"
     )]
     pub deps_path: PathBuf,
+    #[config(default = "kvm", env = "AENV_VIRTUALIZATION_MODE")]
+    pub virtualization_mode: VirtualizationMode,
     #[config(nested)]
     pub firecracker: FirecrackerConfig,
     #[config(nested)]
@@ -537,14 +556,25 @@ impl_config_default!(
 );
 
 impl AppConfig {
+    fn manifest_firecracker(&self) -> &ManifestDownload {
+        SetupDependencyManifest::get()
+            .firecracker
+            .for_mode(self.virtualization_mode)
+    }
+
+    fn manifest_kernel(&self) -> &ManifestDownload {
+        SetupDependencyManifest::get()
+            .kernel
+            .for_mode(self.virtualization_mode)
+    }
+
     pub fn resolved_firecracker_binary_path(&self) -> PathBuf {
         self.firecracker.binary_path.clone().unwrap_or_else(|| {
-            let manifest = SetupDependencyManifest::get();
             let version = self
                 .firecracker
                 .version
                 .as_deref()
-                .unwrap_or(&manifest.firecracker.version);
+                .unwrap_or(&self.manifest_firecracker().version);
             self.deps_path
                 .join("firecracker")
                 .join(version)
@@ -554,12 +584,11 @@ impl AppConfig {
 
     pub fn resolved_kernel_image_path(&self) -> PathBuf {
         self.kernel.image_path.clone().unwrap_or_else(|| {
-            let manifest = SetupDependencyManifest::get();
             let version = self
                 .kernel
                 .version
                 .as_deref()
-                .unwrap_or(&manifest.kernel.version);
+                .unwrap_or(&self.manifest_kernel().version);
             self.deps_path
                 .join("kernel")
                 .join(version)
@@ -606,12 +635,11 @@ impl AppConfig {
     /// Resolve the cpu-template-helper binary path derived from deps_path + version.
     /// Returns `None` if the binary does not exist on disk.
     pub fn resolved_cpu_template_helper(&self) -> Option<PathBuf> {
-        let manifest = SetupDependencyManifest::get();
         let version = self
             .firecracker
             .version
             .as_deref()
-            .unwrap_or(&manifest.firecracker.version);
+            .unwrap_or(&self.manifest_firecracker().version);
         let path = self
             .deps_path
             .join("firecracker")
@@ -1333,6 +1361,42 @@ mod tests {
             .is_err());
 
         Ok(())
+    }
+
+    #[test]
+    fn managed_dependency_paths_select_the_active_mode_versions() {
+        let manifest = SetupDependencyManifest::get();
+        let mut config = AppConfig {
+            deps_path: PathBuf::from("/deps"),
+            virtualization_mode: VirtualizationMode::Kvm,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.resolved_firecracker_binary_path(),
+            PathBuf::from("/deps/firecracker")
+                .join(&manifest.firecracker.kvm.version)
+                .join("firecracker")
+        );
+        assert_eq!(
+            config.resolved_kernel_image_path(),
+            PathBuf::from("/deps/kernel")
+                .join(&manifest.kernel.kvm.version)
+                .join("vmlinux.bin")
+        );
+
+        config.virtualization_mode = VirtualizationMode::Pvm;
+        assert_eq!(
+            config.resolved_firecracker_binary_path(),
+            PathBuf::from("/deps/firecracker")
+                .join(&manifest.firecracker.pvm.version)
+                .join("firecracker")
+        );
+        assert_eq!(
+            config.resolved_kernel_image_path(),
+            PathBuf::from("/deps/kernel")
+                .join(&manifest.kernel.pvm.version)
+                .join("vmlinux.bin")
+        );
     }
 
     #[test]

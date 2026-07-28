@@ -2,7 +2,8 @@
 # End-to-end test runner for AgentENV.
 #
 # Builds the server, starts it, creates a base template, then runs each suite.
-# Requires: curl, jq, and a Linux host with /dev/kvm.
+# Requires: curl, jq, and a Linux host whose /dev/kvm and modules match
+# AENV_VIRTUALIZATION_MODE (kvm by default).
 #
 # Environment variables:
 #   AENV_PORT         - Port for the test server (default: 18080)

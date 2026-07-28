@@ -5,9 +5,12 @@
 - **Linux kernel 6.8+**; the install script additionally requires **Ubuntu 24.04**
 - `/dev/kvm` access for Firecracker microVM execution
 
+> If your server does not support standard KVM, use the dedicated
+> [PVM Deployment](../deployment/pvm.md) guide instead.
+
 The install script attempts to install missing download and checksum commands,
-provisions KVM permissions, loads the `ublk_drv` kernel module, and downloads
-all runtime assets on first run.
+provisions `/dev/kvm` permissions, loads the `ublk_drv` kernel module, and
+downloads the required AgentENV runtime assets.
 
 Installation requires root, but the installed service does not run as root. It
 uses a dedicated `aenv` system account with `CAP_NET_ADMIN` and
@@ -102,6 +105,7 @@ aenv start ubuntu            # starts a sandbox and attaches an interactive shel
 ## Next Steps
 
 - [Deployment](../deployment/manual-compile.md) — build from source, multi-node options
+- [PVM Deployment](../deployment/pvm.md) — deploy when standard KVM is unavailable
 - [Core Concepts](../concepts/overview.md) — how sandboxes, templates, and snapshots work
 - [E2B](../integration/e2b.md) — SDK and CLI compatibility
 - [API Reference](../api/index.md) — full HTTP API

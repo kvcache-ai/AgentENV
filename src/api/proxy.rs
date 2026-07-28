@@ -1544,7 +1544,7 @@ mod tests {
         let orchestrator = Orchestrator::new(
             crate::orchestrator::InMemoryMetadataStore::new(),
             crate::sandbox::FirecrackerSandboxFactory::new(),
-            FileBackedSandboxPersister::new(root.path().to_path_buf()),
+            FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
         )
         .await
         .unwrap();
