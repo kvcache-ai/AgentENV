@@ -10,7 +10,7 @@ pub(super) fn managed_layer_file_name(digest: &str) -> String {
 }
 
 /// Committed artifact layout for the POSIX-backed snapshot repository.
-pub(super) struct PosixFsSnapshotArtifactLayout {
+pub(crate) struct PosixFsSnapshotArtifactLayout {
     root: PathBuf,
     snapshot_id: SnapshotId,
 }
@@ -59,7 +59,7 @@ impl PosixFsSnapshotArtifactLayout {
         root.join("managed-layers")
     }
 
-    pub(super) fn managed_layer_path(root: &Path, digest: &str) -> PathBuf {
+    pub(crate) fn managed_layer_path(root: &Path, digest: &str) -> PathBuf {
         Self::managed_layers_dir(root).join(managed_layer_file_name(digest))
     }
 

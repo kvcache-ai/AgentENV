@@ -59,6 +59,33 @@ Notes:
 - Deleting a snapshot also attempts to delete its published manifest from the
   registry.
 
+## Export a Snapshot Rootfs as a Standalone OCI Image
+
+`aenv-snapshot-image` (build with `make build-snapshot-image`; not part of the
+server binary, Docker image, or install packages) publishes a committed
+snapshot's rootfs — never attached drives or memory — as an OverlayBD-native
+OCI image and prints the image reference on stdout (logs go to stderr):
+
+```bash
+aenv-snapshot-image <snapshot-id-or-alias> \
+  [--target-repository registry.example.com/team/app] [--tag release-1]
+```
+
+It reads the server config (`AENV_CONFIG_PATH` or `--config`) for the
+`posix_fs`/`oss` snapshot repository and does all registry I/O through
+`regctl` (`docker login` provides credentials). An explicit
+`--target-repository` defaults to the `latest` tag. When the target is omitted,
+the tool resolves the original repository from the snapshot's rootfs
+publication metadata, or from its unique external source, and defaults to
+`snapshot-<snapshot-id>`. Persisted publication metadata is never treated as
+registry truth: every invocation checks the target manifest. Publishing is
+idempotent through the manifest digest, pre-existing conflicting references
+are refused, and blobs already present at the target are skipped. The conflict
+check is not atomic against concurrent tag writers. The tool records no new
+publication state. If the selected reference is already recorded as a
+snapshot-managed publication, the tool warns that it may be deleted with the
+snapshot; other exported references live independently of snapshot deletion.
+
 ## Manage Snapshots
 
 ### List Snapshots

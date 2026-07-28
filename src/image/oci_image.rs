@@ -53,8 +53,8 @@ use crate::digest;
 /// GOMAXPROCS ceiling applied to every spawned `regctl` process; see
 /// [`regctl_command`] for the rationale.
 const REGCTL_GOMAXPROCS: &str = "4";
-const REGCTL_RETRY_ATTEMPTS: u32 = 5;
-const REGCTL_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+pub(crate) const REGCTL_RETRY_ATTEMPTS: u32 = 5;
+pub(crate) const REGCTL_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 const OCI_LAYER_BLOB_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_INDEX_RESOLUTION_DEPTH: usize = 4;
 /// Virtual block-device size baked into every converted overlaybd layer. The
@@ -761,7 +761,7 @@ async fn fetch_manifest(
 /// regctl renders these as `... not found [http 404]: {...}`. Network/DNS
 /// failures do not carry the `[http 404]` marker and must keep their 5xx
 /// classification.
-fn regctl_stderr_is_not_found(stderr: &str) -> bool {
+pub(crate) fn regctl_stderr_is_not_found(stderr: &str) -> bool {
     stderr.contains("[http 404]")
 }
 
@@ -785,7 +785,10 @@ pub(crate) fn regctl_command(binary: impl AsRef<std::ffi::OsStr>) -> Command {
 
 /// Run a regctl invocation, retrying failures with exponential backoff to
 /// absorb transient registry errors.
-async fn run_regctl(regctl_binary: &Path, args: &[&str]) -> ImageResult<std::process::Output> {
+pub(crate) async fn run_regctl(
+    regctl_binary: &Path,
+    args: &[&str],
+) -> ImageResult<std::process::Output> {
     ensure_regctl_binary(regctl_binary)?;
     let mut backoff = REGCTL_RETRY_BASE_DELAY;
     let mut last_stderr = String::new();

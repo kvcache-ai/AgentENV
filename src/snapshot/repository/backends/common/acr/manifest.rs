@@ -105,6 +105,17 @@ pub(crate) fn minimal_oci_config_blob(
     Ok((bytes, digest, size))
 }
 
+/// OCI architecture string of the host running this binary.
+pub(crate) fn host_architecture_for_oci() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "arm" => "arm",
+        "riscv64" => "riscv64",
+        other => other,
+    }
+}
+
 pub(crate) fn build_oci_image_manifest(
     config: OciDescriptor,
     layers: Vec<OciDescriptor>,

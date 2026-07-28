@@ -1,7 +1,7 @@
 use crate::snapshot::SnapshotId;
 
 /// Committed object layout for the OSS snapshot backend.
-pub(super) struct OssSnapshotArtifactLayout<'a> {
+pub(crate) struct OssSnapshotArtifactLayout<'a> {
     snapshot_id: &'a SnapshotId,
 }
 
@@ -18,7 +18,7 @@ impl<'a> OssSnapshotArtifactLayout<'a> {
         format!("catalog/records/{id}.json")
     }
 
-    pub(super) fn managed_layer_key(digest: &str) -> String {
+    pub(crate) fn managed_layer_key(digest: &str) -> String {
         format!("managed-layers/{digest}")
     }
 

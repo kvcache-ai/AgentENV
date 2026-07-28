@@ -15,7 +15,9 @@ use crate::snapshot::{
 };
 
 use super::client::{AcrClient, AcrClientError};
-use super::manifest::{build_oci_image_manifest, minimal_oci_config_blob, OciDescriptor};
+use super::manifest::{
+    build_oci_image_manifest, host_architecture_for_oci, minimal_oci_config_blob, OciDescriptor,
+};
 use super::source_image::{
     load_source_registry_image, LocalSnapshotDelta, LocalSnapshotDeltaDescriptor,
     SourceRegistryLayer, SourceRegistryRepository,
@@ -312,19 +314,6 @@ fn is_tag_start(ch: char) -> bool {
 
 fn is_tag_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-')
-}
-
-fn host_architecture_for_oci() -> &'static str {
-    // This follows the server binary's target architecture. If AgentENV ever
-    // supports guest images for a different architecture, pass the runtime
-    // architecture into the ACR manifest builder instead.
-    match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        "arm" => "arm",
-        "riscv64" => "riscv64",
-        other => other,
-    }
 }
 
 #[cfg(test)]

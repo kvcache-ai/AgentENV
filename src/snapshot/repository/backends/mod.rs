@@ -1,6 +1,6 @@
 pub(crate) mod common;
-mod oss;
-mod posixfs;
+pub(crate) mod oss;
+pub(crate) mod posixfs;
 
 use std::path::PathBuf;
 use std::sync::Arc;

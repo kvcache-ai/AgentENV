@@ -35,7 +35,10 @@ impl SourceRegistryRepository {
         let host = url.host_str().ok_or_else(|| RepositoryError::Unsupported {
             feature: format!("ACR repoBlobUrl is missing registry host: {repo_blob_url}"),
         })?;
+        // Strip the default HTTPS :443 so equivalent source URLs normalize to
+        // one registry; keep every other explicit port intact.
         let registry = match url.port() {
+            Some(443) if url.scheme() == "https" => host.to_string(),
             Some(port) => format!("{host}:{port}"),
             None => host.to_string(),
         };
@@ -44,7 +47,7 @@ impl SourceRegistryRepository {
             .path_segments()
             .map(|segments| segments.collect())
             .unwrap_or_default();
-        if segments.len() < 4
+        if segments.len() < 3
             || segments.first() != Some(&"v2")
             || segments.last() != Some(&"blobs")
         {

@@ -48,6 +48,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 
 .PHONY: all build release \
 	build-server build-server-release \
+	build-snapshot-image \
 	build-aenv build-aenv-release install-aenv uninstall-aenv \
 	build-ublk install-ublk \
 	fmt clippy \
@@ -77,6 +78,9 @@ build-server:
 
 build-server-release:
 	$(CARGO) build --release -p agentenv --bin server
+
+build-snapshot-image:
+	$(CARGO) build -p agentenv --bin aenv-snapshot-image
 
 build-aenv:
 	$(CARGO) build -p aenv

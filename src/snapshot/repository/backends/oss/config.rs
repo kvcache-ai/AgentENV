@@ -7,7 +7,7 @@ use object_store_operator::{
 use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy};
 
 #[derive(Debug, Clone)]
-pub(super) struct NormalizedOssConfig {
+pub(crate) struct NormalizedOssConfig {
     bucket: String,
     endpoint: String,
     region: String,

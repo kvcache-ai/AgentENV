@@ -15,9 +15,10 @@ use crate::p2p::P2pTransport;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 
-use self::client::OssClient;
-use self::config::NormalizedOssConfig;
-use self::repository::OssSnapshotRepository;
+pub(crate) use self::client::OssClient;
+pub(crate) use self::config::NormalizedOssConfig;
+pub(crate) use self::layout::OssSnapshotArtifactLayout;
+pub(crate) use self::repository::OssSnapshotRepository;
 use self::resolver::OssRuntimeResolver;
 
 /// OSS-backed snapshot backend.
