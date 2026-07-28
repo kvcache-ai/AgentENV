@@ -29,12 +29,11 @@ func PreferLocalNodes(
 	providers ArtifactProviderLookup,
 ) ([]RichNode, LocalityPreferenceStats) {
 	stats := LocalityPreferenceStats{}
+	keys := deduplicateLocalityRequirementKeys(requirements)
+	stats.RequirementCount = len(keys)
 	if len(nodes) == 0 || providers == nil {
 		return nodes, stats
 	}
-
-	keys := deduplicateLocalityRequirementKeys(requirements)
-	stats.RequirementCount = len(keys)
 	if len(keys) == 0 {
 		return nodes, stats
 	}
