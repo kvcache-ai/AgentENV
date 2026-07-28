@@ -1,4 +1,8 @@
 use anyhow::{anyhow, Context, Result};
+use envd::filesystem::{
+    EntryInfo, ListDirRequest, ListDirResponse, MakeDirRequest, MakeDirResponse, StatRequest,
+    StatResponse,
+};
 use envd::http_client::apis::{configuration::Configuration, files_api, Error as EnvdApiError};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::multipart::{Form, Part};
@@ -7,14 +11,16 @@ use std::path::Path;
 use std::time::Duration;
 
 use super::Client;
-use crate::grpc::ENVD_PORT_STR;
+use crate::grpc::{RpcError, Transport, ENVD_PORT_STR};
 
 const API_KEY_HEADER: &str = "X-API-Key";
 const SANDBOX_ID_HEADER: &str = "x-agentenv-sandbox-id";
 const TARGET_PORT_HEADER: &str = "x-agentenv-target-port";
+const FILESYSTEM_SERVICE: &str = "filesystem.Filesystem";
 
 pub struct EnvdFilesClient {
     config: Configuration,
+    transport: Transport,
 }
 
 impl EnvdFilesClient {
@@ -49,6 +55,7 @@ impl EnvdFilesClient {
                 bearer_access_token: None,
                 api_key: None,
             },
+            transport: Transport::new(base_url, api_key, sandbox_id)?,
         })
     }
 
@@ -106,6 +113,63 @@ impl EnvdFilesClient {
                 format_envd_api_error(error, &format!("downloading file from {remote_path}"))
             })
     }
+
+    pub async fn stat(&self, path: &str, username: Option<&str>) -> Result<Option<EntryInfo>> {
+        let response = self
+            .transport
+            .unary_service::<_, StatResponse>(
+                FILESYSTEM_SERVICE,
+                "Stat",
+                StatRequest {
+                    path: path.to_string(),
+                },
+                username,
+            )
+            .await;
+        match response {
+            Ok(response) => Ok(response.entry),
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("stating remote path {path}")),
+        }
+    }
+
+    pub async fn list_dir(&self, path: &str) -> Result<Vec<EntryInfo>> {
+        let response = self
+            .transport
+            .unary_service::<_, ListDirResponse>(
+                FILESYSTEM_SERVICE,
+                "ListDir",
+                ListDirRequest {
+                    path: path.to_string(),
+                    depth: 1,
+                },
+                None,
+            )
+            .await
+            .with_context(|| format!("listing remote directory {path}"))?;
+        Ok(response.entries)
+    }
+
+    pub async fn make_dir(&self, path: &str) -> Result<()> {
+        self.transport
+            .unary_service::<_, MakeDirResponse>(
+                FILESYSTEM_SERVICE,
+                "MakeDir",
+                MakeDirRequest {
+                    path: path.to_string(),
+                },
+                None,
+            )
+            .await
+            .with_context(|| format!("creating remote directory {path}"))?;
+        Ok(())
+    }
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<RpcError>()
+        .is_some_and(|error| error.is_code("not_found"))
 }
 
 #[derive(Deserialize)]

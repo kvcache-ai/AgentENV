@@ -16,15 +16,40 @@ use envd::process::{process_event, ListRequest, ProcessConfig, Pty, StartRequest
 use futures::{stream::unfold, Stream, StreamExt};
 use prost::Message;
 use reqwest::Client as HttpClient;
+use std::fmt;
 use std::io::Write;
 use std::pin::Pin;
 use std::time::Duration;
 
 pub const ENVD_PORT_STR: &str = "49983";
 
-const SERVICE: &str = "process.Process";
+const PROCESS_SERVICE: &str = "process.Process";
 const FLAG_DATA: u8 = 0x00;
 const FLAG_END: u8 = 0x02;
+
+#[derive(Debug)]
+pub struct RpcError {
+    pub code: String,
+    pub message: String,
+}
+
+impl RpcError {
+    pub fn is_code(&self, code: &str) -> bool {
+        self.code == code
+    }
+}
+
+impl fmt::Display for RpcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.message.is_empty() {
+            write!(f, "{}", self.code)
+        } else {
+            write!(f, "{}: {}", self.code, self.message)
+        }
+    }
+}
+
+impl std::error::Error for RpcError {}
 
 pub struct Transport {
     http: HttpClient,
@@ -47,6 +72,7 @@ impl Transport {
     fn http_client(base_url: &str) -> Result<HttpClient> {
         let builder = HttpClient::builder()
             .http1_only()
+            .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(2))
             .tcp_keepalive(Duration::from_secs(3))
             .tcp_keepalive_interval(Duration::from_secs(1))
@@ -63,8 +89,8 @@ impl Transport {
         builder.build().context("building HTTP client")
     }
 
-    fn url(&self, method: &str) -> String {
-        format!("{}/{}/{}", self.base_url, SERVICE, method)
+    fn url(&self, service: &str, method: &str) -> String {
+        format!("{}/{}/{}", self.base_url, service, method)
     }
 
     fn auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -73,6 +99,21 @@ impl Transport {
             .header("x-agentenv-sandbox-id", &self.sandbox_id)
             .header("x-agentenv-target-port", ENVD_PORT_STR)
             .header("Connect-Protocol-Version", "1")
+    }
+
+    fn unary_request(
+        &self,
+        service: &str,
+        method: &str,
+        username: Option<&str>,
+    ) -> reqwest::RequestBuilder {
+        let request = self
+            .auth(self.http.post(self.url(service, method)))
+            .header("Content-Type", "application/proto");
+        match username {
+            Some(username) => request.basic_auth(username, Option::<&str>::None),
+            None => request,
+        }
     }
 
     pub async fn ready(&self) -> Result<()> {
@@ -86,10 +127,23 @@ impl Transport {
         Req: Message,
         Resp: Message + Default,
     {
+        self.unary_service(PROCESS_SERVICE, method, req, None).await
+    }
+
+    pub async fn unary_service<Req, Resp>(
+        &self,
+        service: &str,
+        method: &str,
+        req: Req,
+        username: Option<&str>,
+    ) -> Result<Resp>
+    where
+        Req: Message,
+        Resp: Message + Default,
+    {
         let body = req.encode_to_vec();
         let resp = self
-            .auth(self.http.post(self.url(method)))
-            .header("Content-Type", "application/proto")
+            .unary_request(service, method, username)
             .body(body)
             .send()
             .await
@@ -98,6 +152,9 @@ impl Transport {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            if let Some(error) = parse_connect_http_error(&text) {
+                return Err(error.into());
+            }
             bail!("{}: {}", status, text.trim());
         }
 
@@ -117,7 +174,7 @@ impl Transport {
         let initial = encode_envelope(FLAG_DATA, &req.encode_to_vec());
         let http = Self::http_client(&self.base_url)?;
         let resp = self
-            .auth(http.post(self.url(method)))
+            .auth(http.post(self.url(PROCESS_SERVICE, method)))
             .header("Content-Type", "application/connect+proto")
             .body(initial)
             .send()
@@ -147,7 +204,7 @@ impl Transport {
             )))
         });
         let resp = self
-            .auth(http.post(self.url(method)))
+            .auth(http.post(self.url(PROCESS_SERVICE, method)))
             .header("Content-Type", "application/connect+proto")
             .body(reqwest::Body::wrap_stream(body))
             .send()
@@ -297,7 +354,24 @@ fn parse_connect_error(body: &[u8]) -> Option<anyhow::Error> {
     let err = trailer.error?;
     let code = err.code.unwrap_or_else(|| "unknown".into());
     let message = err.message.unwrap_or_default();
-    Some(anyhow!("{}: {}", code, message))
+    Some(RpcError { code, message }.into())
+}
+
+fn parse_connect_http_error(body: &str) -> Option<RpcError> {
+    #[derive(serde::Deserialize)]
+    struct ErrBody {
+        #[serde(default)]
+        code: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+    }
+
+    let error: ErrBody = serde_json::from_str(body).ok()?;
+    let code = error.code.filter(|code| !code.is_empty())?;
+    Some(RpcError {
+        code,
+        message: error.message.unwrap_or_default(),
+    })
 }
 
 pub struct StartOpts<'a> {
@@ -390,5 +464,54 @@ fn remap_term(local: Option<&str>) -> String {
     match local {
         Some(t) if SAFE.contains(&t) => t.to_string(),
         _ => "xterm-256color".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_connect_http_error, RpcError, Transport};
+    use reqwest::header::AUTHORIZATION;
+
+    #[test]
+    fn rpc_error_display_preserves_code() {
+        let error = RpcError {
+            code: "permission_denied".into(),
+            message: "access denied".into(),
+        };
+
+        assert_eq!(error.to_string(), "permission_denied: access denied");
+    }
+
+    #[test]
+    fn connect_http_error_requires_non_empty_code() {
+        assert!(parse_connect_http_error(r#"{"message":"gateway failure"}"#).is_none());
+        assert!(parse_connect_http_error(r#"{"code":"","message":"failure"}"#).is_none());
+
+        let error = parse_connect_http_error(
+            r#"{"code":"unauthenticated","message":"invalid credentials"}"#,
+        )
+        .unwrap();
+        assert_eq!(error.code, "unauthenticated");
+        assert_eq!(error.message, "invalid credentials");
+    }
+
+    #[test]
+    fn unary_user_is_sent_as_basic_auth() {
+        let transport = Transport::new("http://127.0.0.1", "api-key", "sandbox-id").unwrap();
+        let request = transport
+            .unary_request("filesystem.Filesystem", "Stat", Some("app"))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request.headers().get(AUTHORIZATION).unwrap(),
+            "Basic YXBwOg=="
+        );
+
+        let request = transport
+            .unary_request("filesystem.Filesystem", "Stat", None)
+            .build()
+            .unwrap();
+        assert!(!request.headers().contains_key(AUTHORIZATION));
     }
 }

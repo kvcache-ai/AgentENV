@@ -59,6 +59,7 @@ dependencies = [
  "toml",
  "ureq",
  "uuid",
+ "walkdir",
 ]
 
 [[package]]

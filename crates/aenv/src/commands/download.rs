@@ -1,9 +1,10 @@
-use crate::client::Client;
+use crate::client::{files::EnvdFilesClient, Client};
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use clap::Args as ClapArgs;
+use envd::filesystem::FileType;
 use futures::{Stream, StreamExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tempfile::Builder;
 use tokio::io::AsyncWriteExt;
 
@@ -11,19 +12,19 @@ use tokio::io::AsyncWriteExt;
 #[command(after_help = "Examples:
   aenv download <sandbox-id> /workspace/result.txt ./result.txt
   aenv download <sandbox-id> /workspace/result.txt
-  aenv download <sandbox-id> /workspace/result.txt ./output/
+  aenv download <sandbox-id> /workspace/project ./backup/
   aenv download --user app --force <sandbox-id> result.txt ./result.txt")]
 pub struct Args {
     /// Sandbox ID
     sandbox_id: String,
-    /// Source file path inside the sandbox
+    /// Source file or directory path inside the sandbox
     remote_path: String,
     /// Local destination file or directory. Defaults to the current directory
     local_path: Option<PathBuf>,
-    /// User used by envd for relative path resolution
+    /// User whose home directory resolves relative remote file paths
     #[arg(long)]
     user: Option<String>,
-    /// Replace the local destination if it already exists
+    /// Replace conflicting local files
     #[arg(long)]
     force: bool,
 }
@@ -35,37 +36,88 @@ pub fn run(args: Args) -> Result<()> {
 }
 
 async fn run_async(client: Client, args: Args) -> Result<()> {
-    let local_path = resolve_destination(&args.remote_path, args.local_path.as_deref())?;
-    validate_destination(&local_path, args.force)?;
+    let files = client.files(&args.sandbox_id)?;
+    let remote_entry = files.stat(&args.remote_path, args.user.as_deref()).await?;
+    let Some(remote_entry) = remote_entry else {
+        bail!("remote path does not exist: {}", args.remote_path);
+    };
 
-    let response = client
-        .files(&args.sandbox_id)?
-        .download(&args.remote_path, args.user.as_deref())
+    if remote_entry.r#type == FileType::File as i32 {
+        let local_path = resolve_local_root(&args.remote_path, args.local_path.as_deref())?;
+        validate_file_destination(&local_path, args.force)?;
+        download_file(
+            &files,
+            &args.remote_path,
+            args.user.as_deref(),
+            &local_path,
+            args.force,
+        )
         .await?;
-    save_stream(response.bytes_stream(), &local_path, args.force).await?;
+        println!(
+            "Downloaded {}:{} to {}",
+            args.sandbox_id,
+            args.remote_path,
+            local_path.display()
+        );
+        return Ok(());
+    }
+    if remote_entry.r#type != FileType::Directory as i32 {
+        bail!(
+            "remote source is not a regular file or directory: {}",
+            args.remote_path
+        );
+    }
+
+    if args.user.is_some() {
+        bail!("--user is not supported for directory downloads");
+    }
+    require_absolute_remote_path(&args.remote_path)?;
+
+    let local_root = resolve_local_root(&args.remote_path, args.local_path.as_deref())?;
+    let entries = collect_remote_directory(&files, &args.remote_path).await?;
+    preflight_directory_download(&local_root, &entries, args.force)?;
+    create_local_directories(&local_root, &entries)?;
+
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.kind == RemoteEntryKind::File)
+    {
+        let destination = local_root.join(&entry.relative);
+        download_file(&files, &entry.remote_path, None, &destination, args.force).await?;
+    }
 
     println!(
-        "Downloaded {}:{} to {}",
+        "Downloaded directory {}:{} to {}",
         args.sandbox_id,
         args.remote_path,
-        local_path.display()
+        local_root.display()
     );
     Ok(())
 }
 
-fn resolve_destination(remote_path: &str, local_path: Option<&Path>) -> Result<PathBuf> {
+async fn download_file(
+    files: &EnvdFilesClient,
+    remote_path: &str,
+    username: Option<&str>,
+    local_path: &Path,
+    force: bool,
+) -> Result<()> {
+    let response = files.download(remote_path, username).await?;
+    save_stream(response.bytes_stream(), local_path, force).await
+}
+
+fn resolve_local_root(remote_path: &str, local_path: Option<&Path>) -> Result<PathBuf> {
     let remote_file_name = remote_file_name(remote_path)?;
     let local_path = local_path.unwrap_or_else(|| Path::new("."));
 
-    match std::fs::metadata(local_path) {
+    match std::fs::symlink_metadata(local_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("symbolic links are not supported: {}", local_path.display())
+        }
         Ok(metadata) if metadata.is_dir() => Ok(local_path.join(remote_file_name)),
         Ok(_) => Ok(local_path.to_path_buf()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            if local_path
-                .as_os_str()
-                .to_string_lossy()
-                .ends_with(std::path::MAIN_SEPARATOR)
-            {
+            if path_ends_with_separator(local_path) {
                 Ok(local_path.join(remote_file_name))
             } else {
                 Ok(local_path.to_path_buf())
@@ -77,51 +129,192 @@ fn resolve_destination(remote_path: &str, local_path: Option<&Path>) -> Result<P
     }
 }
 
-fn remote_file_name(remote_path: &str) -> Result<&str> {
-    if remote_path.is_empty() || remote_path.ends_with('/') {
-        bail!("remote download source must include a file name: {remote_path}");
-    }
-
-    Path::new(remote_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .context("remote download source must include a valid UTF-8 file name")
+fn path_ends_with_separator(path: &Path) -> bool {
+    path.as_os_str()
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|byte| std::path::is_separator(char::from(*byte)))
 }
 
-fn validate_destination(destination: &Path, force: bool) -> Result<()> {
+fn remote_file_name(remote_path: &str) -> Result<&str> {
+    let remote_path = remote_path.trim_end_matches('/');
+    if remote_path.is_empty() {
+        bail!("remote source must include a file or directory name");
+    }
+    remote_path
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .context("remote source must include a valid file or directory name")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemoteEntryKind {
+    Directory,
+    File,
+}
+
+#[derive(Debug)]
+struct RemoteEntry {
+    remote_path: String,
+    relative: PathBuf,
+    kind: RemoteEntryKind,
+}
+
+async fn collect_remote_directory(
+    files: &EnvdFilesClient,
+    remote_root: &str,
+) -> Result<Vec<RemoteEntry>> {
+    let remote_root = normalize_remote_path(remote_root);
+    let mut pending = vec![(remote_root.clone(), PathBuf::new())];
+    let mut entries = Vec::new();
+
+    while let Some((directory, relative_directory)) = pending.pop() {
+        let children = files.list_dir(&directory).await?;
+        for child in children {
+            validate_remote_entry_name(&child.name)?;
+            let remote_path = join_remote_component(&directory, &child.name);
+            let relative = relative_directory.join(&child.name);
+            validate_relative_path(&relative)?;
+            let kind = if child.r#type == FileType::Directory as i32 {
+                RemoteEntryKind::Directory
+            } else if child.r#type == FileType::File as i32 {
+                RemoteEntryKind::File
+            } else if child.r#type == FileType::Symlink as i32 {
+                bail!("symbolic links are not supported: {remote_path}");
+            } else {
+                bail!("special remote files are not supported: {remote_path}");
+            };
+            entries.push(RemoteEntry {
+                remote_path: remote_path.clone(),
+                relative: relative.clone(),
+                kind,
+            });
+            if kind == RemoteEntryKind::Directory {
+                pending.push((remote_path, relative));
+            }
+        }
+    }
+
+    entries.sort_by(|left, right| {
+        let left_key = (left.kind == RemoteEntryKind::File, &left.relative);
+        let right_key = (right.kind == RemoteEntryKind::File, &right.relative);
+        left_key.cmp(&right_key)
+    });
+    Ok(entries)
+}
+
+fn preflight_directory_download(
+    local_root: &Path,
+    entries: &[RemoteEntry],
+    force: bool,
+) -> Result<()> {
+    validate_root_parent(local_root)?;
+    validate_expected_directory(local_root)?;
+
+    for entry in entries {
+        let destination = local_root.join(&entry.relative);
+        match entry.kind {
+            RemoteEntryKind::Directory => validate_expected_directory(&destination)?,
+            RemoteEntryKind::File => validate_expected_file(&destination, force)?,
+        }
+    }
+    Ok(())
+}
+
+fn validate_root_parent(local_root: &Path) -> Result<()> {
+    let parent = destination_parent(local_root);
+    let metadata = std::fs::symlink_metadata(parent)
+        .with_context(|| format!("reading destination directory {}", parent.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("symbolic links are not supported: {}", parent.display());
+    }
+    if !metadata.is_dir() {
+        bail!(
+            "download destination parent is not a directory: {}",
+            parent.display()
+        );
+    }
+    validate_existing_ancestors(local_root)
+}
+
+fn validate_existing_ancestors(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!("symbolic links are not supported: {}", current.display())
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => {
+                return Err(err).with_context(|| format!("reading {}", current.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_expected_directory(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("symbolic links are not supported: {}", path.display())
+        }
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => bail!(
+            "local path exists and is not a directory: {}",
+            path.display()
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn validate_expected_file(path: &Path, force: bool) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("symbolic links are not supported: {}", path.display())
+        }
+        Ok(metadata) if metadata.is_dir() => {
+            bail!("local path exists and is a directory: {}", path.display())
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            bail!("special local files are not supported: {}", path.display())
+        }
+        Ok(_) if !force => bail!(
+            "local download destination already exists: {}; use --force to replace it",
+            path.display()
+        ),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("reading {}", path.display())),
+    }
+}
+
+fn create_local_directories(local_root: &Path, entries: &[RemoteEntry]) -> Result<()> {
+    std::fs::create_dir_all(local_root)
+        .with_context(|| format!("creating directory {}", local_root.display()))?;
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.kind == RemoteEntryKind::Directory)
+    {
+        let path = local_root.join(&entry.relative);
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("creating directory {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn validate_file_destination(destination: &Path, force: bool) -> Result<()> {
     if destination.file_name().is_none() {
         bail!(
             "local download destination must be a file path: {}",
             destination.display()
         );
     }
-
-    let parent = destination_parent(destination);
-    let parent_metadata = std::fs::metadata(parent)
-        .with_context(|| format!("reading destination directory {}", parent.display()))?;
-    if !parent_metadata.is_dir() {
-        bail!(
-            "download destination parent is not a directory: {}",
-            parent.display()
-        );
-    }
-
-    match std::fs::symlink_metadata(destination) {
-        Ok(metadata) if metadata.is_dir() => bail!(
-            "local download destination is a directory: {}",
-            destination.display()
-        ),
-        Ok(_) if !force => bail!(
-            "local download destination already exists: {}; use --force to replace it",
-            destination.display()
-        ),
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => {
-            Err(err).with_context(|| format!("reading destination {}", destination.display()))
-        }
-    }
+    validate_root_parent(destination)?;
+    validate_expected_file(destination, force)
 }
 
 fn destination_parent(destination: &Path) -> &Path {
@@ -170,6 +363,49 @@ where
     }
 }
 
+fn require_absolute_remote_path(path: &str) -> Result<()> {
+    if !path.starts_with('/') {
+        bail!("directory transfers require an absolute remote path: {path}");
+    }
+    if path.split('/').any(|component| component == "..") {
+        bail!("remote path must not contain '..': {path}");
+    }
+    Ok(())
+}
+
+fn normalize_remote_path(path: &str) -> String {
+    if path == "/" {
+        "/".to_string()
+    } else {
+        path.trim_end_matches('/').to_string()
+    }
+}
+
+fn join_remote_component(base: &str, component: &str) -> String {
+    if base == "/" {
+        format!("/{component}")
+    } else {
+        format!("{base}/{component}")
+    }
+}
+
+fn validate_remote_entry_name(name: &str) -> Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        bail!("invalid remote directory entry name: {name:?}");
+    }
+    Ok(())
+}
+
+fn validate_relative_path(path: &Path) -> Result<()> {
+    if path
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Ok(());
+    }
+    bail!("invalid relative path: {}", path.display())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,57 +413,91 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn omitted_destination_uses_remote_filename_in_current_directory() {
+    fn omitted_destination_uses_remote_name_in_current_directory() {
         assert_eq!(
-            resolve_destination("/workspace/result.txt", None).unwrap(),
-            PathBuf::from("./result.txt")
+            resolve_local_root("/workspace/project", None).unwrap(),
+            PathBuf::from("./project")
         );
     }
 
     #[test]
-    fn directory_destination_appends_remote_filename() {
+    fn directory_destination_appends_remote_name() {
         let temp = TempDir::new().unwrap();
-
         assert_eq!(
-            resolve_destination("/workspace/result.txt", Some(temp.path())).unwrap(),
-            temp.path().join("result.txt")
+            resolve_local_root("/workspace/project", Some(temp.path())).unwrap(),
+            temp.path().join("project")
         );
     }
 
     #[test]
-    fn trailing_slash_destination_appends_remote_filename() {
+    fn explicit_destination_is_preserved() {
         assert_eq!(
-            resolve_destination("/workspace/result.txt", Some(Path::new("output/"))).unwrap(),
-            PathBuf::from("output/result.txt")
+            resolve_local_root("/workspace/project", Some(Path::new("./backup"))).unwrap(),
+            PathBuf::from("./backup")
         );
     }
 
     #[test]
-    fn explicit_destination_filename_is_preserved() {
+    fn nonexistent_destination_with_forward_slash_appends_remote_name() {
         assert_eq!(
-            resolve_destination("/workspace/result.txt", Some(Path::new("./renamed.txt"))).unwrap(),
-            PathBuf::from("./renamed.txt")
+            resolve_local_root("/workspace/project", Some(Path::new("backup/"))).unwrap(),
+            PathBuf::from("backup/project")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nonexistent_destination_with_backslash_appends_remote_name() {
+        assert_eq!(
+            resolve_local_root("/workspace/project", Some(Path::new(r"backup\"))).unwrap(),
+            PathBuf::from(r"backup\project")
         );
     }
 
     #[test]
-    fn remote_source_requires_filename_for_inference() {
-        let error = resolve_destination("/workspace/", None).unwrap_err();
+    fn preflight_merges_directories_and_requires_force_for_files() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/file.txt"), "old").unwrap();
+        let entries = vec![
+            RemoteEntry {
+                remote_path: "/project/nested".into(),
+                relative: PathBuf::from("nested"),
+                kind: RemoteEntryKind::Directory,
+            },
+            RemoteEntry {
+                remote_path: "/project/nested/file.txt".into(),
+                relative: PathBuf::from("nested/file.txt"),
+                kind: RemoteEntryKind::File,
+            },
+        ];
 
+        assert!(preflight_directory_download(&root, &entries, false).is_err());
+        preflight_directory_download(&root, &entries, true).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_rejects_symlink_destinations() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let root = temp.path().join("project");
+        symlink(&target, &root).unwrap();
+
+        let error = preflight_directory_download(&root, &[], false).unwrap_err();
         assert!(error
             .to_string()
-            .contains("remote download source must include a file name"));
+            .contains("symbolic links are not supported"));
     }
 
     #[test]
-    fn existing_destination_requires_force() {
-        let temp = TempDir::new().unwrap();
-        let destination = temp.path().join("result.txt");
-        std::fs::write(&destination, "old").unwrap();
-
-        let err = validate_destination(&destination, false).unwrap_err();
-        assert!(err.to_string().contains("use --force"));
-        validate_destination(&destination, true).unwrap();
+    fn directory_remote_path_must_be_absolute() {
+        assert!(require_absolute_remote_path("/workspace/project").is_ok());
+        assert!(require_absolute_remote_path("workspace/project").is_err());
     }
 
     #[tokio::test]
@@ -236,7 +506,7 @@ mod tests {
         let destination = temp.path().join("result.txt");
         tokio::fs::write(&destination, b"old").await.unwrap();
 
-        let err = save_stream(
+        let error = save_stream(
             stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"new"))]),
             &destination,
             false,
@@ -244,7 +514,7 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(err.to_string().contains("use --force"));
+        assert!(error.to_string().contains("use --force"));
         assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"old");
     }
 
@@ -255,17 +525,14 @@ mod tests {
         tokio::fs::write(&destination, b"old").await.unwrap();
 
         save_stream(
-            stream::iter([
-                Ok::<_, std::io::Error>(Bytes::from_static(b"new ")),
-                Ok(Bytes::from_static(b"content")),
-            ]),
+            stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"new"))]),
             &destination,
             true,
         )
         .await
         .unwrap();
 
-        assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"new content");
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"new");
     }
 
     #[tokio::test]
@@ -278,9 +545,7 @@ mod tests {
         ]);
 
         save_stream(stream, &destination, false).await.unwrap_err();
-
         assert!(!destination.exists());
-        let entries = std::fs::read_dir(temp.path()).unwrap().count();
-        assert_eq!(entries, 0);
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
     }
 }

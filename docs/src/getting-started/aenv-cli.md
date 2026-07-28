@@ -165,40 +165,59 @@ aenv exec <sandbox-id> ls -la /
 
 ### `aenv upload <sandbox-id> <local-path> <remote-path>`
 
-Upload a local file to a sandbox through envd. The remote file is overwritten
-if it already exists, and envd creates missing remote parent directories.
-When the remote path ends in `/`, the local filename is appended automatically.
+Upload a local file or directory to a sandbox through envd. Files are streamed
+individually, and missing remote directories are created automatically.
 
 ```bash
 aenv upload <sandbox-id> ./config.json /workspace/config.json
 aenv upload <sandbox-id> ./config.json /workspace/
+aenv upload <sandbox-id> ./project /workspace/
+aenv upload <sandbox-id> ./project /workspace/app
 aenv upload --user app <sandbox-id> ./config.json config.json
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--user <user>` | Resolve relative remote paths as this user and set the uploaded file's owner |
+| `--user <user>` | Resolve relative remote file paths as this user and set the uploaded file's owner |
 
-Only regular files are supported. Directory uploads and stdin input are not
-supported.
+For directory uploads, the remote path must be absolute and `--user` is not
+supported. If the remote destination ends in `/` or already exists as a
+directory, the local directory name is appended. Otherwise the destination is
+used as the new directory root. Hidden files and empty directories are copied;
+symbolic links and special files are rejected.
+
+Upload copies file contents and directory structure only. It does **not**
+preserve host ownership or group, permissions (including executable bits),
+timestamps, ACLs, extended attributes, or hard-link relationships. Destination
+metadata is assigned by envd and the sandbox filesystem.
 
 ### `aenv download <sandbox-id> <remote-path> [local-path]`
 
-Download a file from a sandbox through envd.
+Download a file or directory from a sandbox through envd.
 
 ```bash
 aenv download <sandbox-id> /workspace/result.txt ./result.txt
 aenv download <sandbox-id> /workspace/result.txt
 aenv download <sandbox-id> /workspace/result.txt ./output/
+aenv download <sandbox-id> /workspace/project ./backup/
 aenv download --user app --force <sandbox-id> result.txt ./result.txt
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--user <user>` | Resolve relative remote paths as this user |
-| `--force` | Replace the local destination if it already exists |
+| `--user <user>` | Resolve relative remote file paths from this user's home directory |
+| `--force` | Replace conflicting local files |
 
-When the local path is omitted, the remote filename is used in the current directory. When the local path names an existing directory or ends in `/`, the remote filename is appended automatically. The resulting local parent directory must already exist. Downloads are written to a temporary file and moved into place only after the transfer succeeds. Existing local files are protected unless `--force` is specified. Directory downloads and stdout output are not supported.
+When the local path is omitted, the remote name is used in the current
+directory. When the local path names an existing directory or ends in `/`, the
+remote name is appended automatically. The resulting local parent directory
+must already exist. Directory downloads require an absolute remote path and do
+not support `--user`. Existing directories are merged; unrelated files remain,
+while conflicting files require `--force`. Each file is written through a
+temporary file and moved into place only after that file succeeds. Symbolic
+links and special files are rejected. Downloads do **not** preserve remote
+ownership or group, permissions (including executable bits), timestamps, ACLs,
+extended attributes, or hard-link relationships.
 
 ### `aenv list`
 
