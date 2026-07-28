@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
@@ -19,6 +20,9 @@ const (
 	defaultTemplateAliasLookupTimeout     = 2 * time.Second
 	defaultTemplateAliasScheduleReserve   = 5 * time.Second
 	defaultTemplateAliasLookupConcurrency = 8
+	// Alias resolution is advisory, so cap concurrent cluster fan-outs globally
+	// and skip locality when the gateway is already at capacity.
+	defaultTemplateAliasResolutionConcurrency = 8
 )
 
 type templateAliasResponse struct {
@@ -47,6 +51,13 @@ func (s *Server) resolveSnapshotLocalityHint(
 			return hint
 		}
 
+		release, ok := s.tryAcquireTemplateAliasResolution()
+		if !ok {
+			hint.LocalityRequirements = nil
+			return hint
+		}
+		defer release()
+
 		var err error
 		lookupCtx, cancel, ok := s.templateAliasLookupContext(ctx)
 		if !ok {
@@ -67,6 +78,19 @@ func (s *Server) resolveSnapshotLocalityHint(
 
 	hint.LocalityRequirements = snapshotLocalityRequirements(canonicalID)
 	return hint
+}
+
+func (s *Server) tryAcquireTemplateAliasResolution() (func(), bool) {
+	slots := s.templateAliasResolutionSlots
+	if slots == nil {
+		return func() {}, true
+	}
+	select {
+	case slots <- struct{}{}:
+		return func() { <-slots }, true
+	default:
+		return func() {}, false
+	}
 }
 
 func (s *Server) templateAliasLookupContext(parent context.Context) (context.Context, context.CancelFunc, bool) {
@@ -153,7 +177,6 @@ func (s *Server) resolveTemplateAlias(
 		canonicalID string
 		err         error
 	}
-	results := make(chan result, len(nodes))
 	lookupCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	concurrency := s.templateAliasLookupConcurrency
@@ -163,27 +186,51 @@ func (s *Server) resolveTemplateAlias(
 	if concurrency > len(nodes) {
 		concurrency = len(nodes)
 	}
-	semaphore := make(chan struct{}, concurrency)
-
-	for _, node := range nodes {
-		node := node
+	results := make(chan result, concurrency)
+	nextNode := make(chan *schedulerv1.Node)
+	var workers sync.WaitGroup
+	workers.Add(concurrency)
+	for range concurrency {
 		go func() {
-			select {
-			case semaphore <- struct{}{}:
-				defer func() { <-semaphore }()
-			case <-lookupCtx.Done():
-				results <- result{err: lookupCtx.Err()}
-				return
-			}
+			defer workers.Done()
+			for {
+				var node *schedulerv1.Node
+				var ok bool
+				select {
+				case node, ok = <-nextNode:
+					if !ok {
+						return
+					}
+				case <-lookupCtx.Done():
+					return
+				}
 
-			canonicalID, err := s.resolveTemplateAliasOnNode(lookupCtx, incoming, node, alias)
-			results <- result{canonicalID: canonicalID, err: err}
+				canonicalID, err := s.resolveTemplateAliasOnNode(lookupCtx, incoming, node, alias)
+				select {
+				case results <- result{canonicalID: canonicalID, err: err}:
+				case <-lookupCtx.Done():
+					return
+				}
+			}
 		}()
 	}
+	go func() {
+		defer close(nextNode)
+		for _, node := range nodes {
+			select {
+			case nextNode <- node:
+			case <-lookupCtx.Done():
+				return
+			}
+		}
+	}()
+	go func() {
+		workers.Wait()
+		close(results)
+	}()
 
 	var firstErr error
-	for range nodes {
-		resolved := <-results
+	for resolved := range results {
 		if resolved.err == nil {
 			cancel()
 			return resolved.canonicalID, nil
@@ -191,6 +238,12 @@ func (s *Server) resolveTemplateAlias(
 		if firstErr == nil {
 			firstErr = resolved.err
 		}
+	}
+	if firstErr == nil {
+		firstErr = lookupCtx.Err()
+	}
+	if firstErr == nil {
+		firstErr = fmt.Errorf("template alias resolution produced no result")
 	}
 	return "", firstErr
 }

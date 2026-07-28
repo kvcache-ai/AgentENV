@@ -58,6 +58,7 @@ type Server struct {
 	templateAliasLookupTimeout     time.Duration
 	templateAliasScheduleReserve   time.Duration
 	templateAliasLookupConcurrency int
+	templateAliasResolutionSlots   chan struct{}
 	maxRespSize                    int64
 	// debugMode, when true, enables debug-only behaviors such as exposing
 	// the backend node id on proxied responses via the x-agentenv-node-id
@@ -87,6 +88,7 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		templateAliasLookupTimeout:     defaultTemplateAliasLookupTimeout,
 		templateAliasScheduleReserve:   defaultTemplateAliasScheduleReserve,
 		templateAliasLookupConcurrency: defaultTemplateAliasLookupConcurrency,
+		templateAliasResolutionSlots:   make(chan struct{}, defaultTemplateAliasResolutionConcurrency),
 		maxRespSize:                    options.MaxResponseSize,
 		debugMode:                      options.DebugMode,
 		sandboxProxyDomains:            sandboxProxyDomains,

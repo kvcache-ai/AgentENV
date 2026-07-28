@@ -95,6 +95,33 @@ func TestResolveSnapshotLocalityHintDropsUnresolvedAlias(t *testing.T) {
 	}
 }
 
+func TestResolveSnapshotLocalityHintSkipsWhenGlobalResolutionBusy(t *testing.T) {
+	var listNodesCalls atomic.Int32
+	server := newTestServer(t, stubSchedulerClient{
+		listNodesFunc: func(_ context.Context, _ *schedulerv1.ListNodesRequest, _ ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
+			listNodesCalls.Add(1)
+			return nil, fmt.Errorf("unexpected ListNodes call")
+		},
+	}, 0, 1024)
+	server.templateAliasResolutionSlots = make(chan struct{}, 1)
+	server.templateAliasResolutionSlots <- struct{}{}
+	defer func() { <-server.templateAliasResolutionSlots }()
+
+	request := newHintRequest(t, http.MethodPost, "/sandboxes", `{"templateID":"busy-template"}`)
+	hint, err := buildScheduleHint(request)
+	if err != nil {
+		t.Fatalf("buildScheduleHint returned error: %v", err)
+	}
+	hint = server.resolveSnapshotLocalityHint(context.Background(), request, hint)
+
+	if got := len(hint.GetLocalityRequirements()); got != 0 {
+		t.Fatalf("busy resolver produced locality requirements: %d", got)
+	}
+	if got := listNodesCalls.Load(); got != 0 {
+		t.Fatalf("ListNodes calls = %d, want 0 while global resolver is busy", got)
+	}
+}
+
 func TestHandleProxyContinuesSchedulingAfterTemplateAliasLookupTimeout(t *testing.T) {
 	lookupStarted := make(chan struct{})
 	aliasNode := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
