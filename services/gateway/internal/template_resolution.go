@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ const (
 	defaultTemplateAliasLookupTimeout     = 2 * time.Second
 	defaultTemplateAliasScheduleReserve   = 5 * time.Second
 	defaultTemplateAliasLookupConcurrency = 8
+	maxTemplateAliasResponseBytes         = 4 * 1024
 	// Alias resolution is advisory, so cap concurrent cluster fan-outs globally
 	// and skip locality when the gateway is already at capacity.
 	defaultTemplateAliasResolutionConcurrency = 8
@@ -288,8 +290,15 @@ func (s *Server) resolveTemplateAliasOnNode(
 		return "", fmt.Errorf("node %s returned status %d for template alias", node.GetNodeId(), resp.StatusCode)
 	}
 
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, maxTemplateAliasResponseBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("read template alias response from node %s: %w", node.GetNodeId(), err)
+	}
+	if len(payload) > maxTemplateAliasResponseBytes {
+		return "", fmt.Errorf("template alias response from node %s exceeds size limit", node.GetNodeId())
+	}
 	var body templateAliasResponse
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(payload, &body); err != nil {
 		return "", fmt.Errorf("decode template alias response from node %s: %w", node.GetNodeId(), err)
 	}
 	canonicalID, ok := canonicalSnapshotID(body.TemplateID)

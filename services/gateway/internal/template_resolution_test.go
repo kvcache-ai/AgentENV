@@ -71,6 +71,24 @@ func TestResolveSnapshotLocalityHintNormalizesCanonicalID(t *testing.T) {
 	}
 }
 
+func TestResolveTemplateAliasRejectsOversizedResponse(t *testing.T) {
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"templateID":"`+strings.Repeat("a", maxTemplateAliasResponseBytes)+`"}`)
+	}))
+	defer node.Close()
+
+	server := newTestServer(t, stubSchedulerClient{}, 0, 1024)
+	_, err := server.resolveTemplateAliasOnNode(
+		context.Background(),
+		nil,
+		&schedulerv1.Node{NodeId: "node-a", Endpoint: node.URL},
+		"warm-template",
+	)
+	if err == nil || !strings.Contains(err.Error(), "exceeds size limit") {
+		t.Fatalf("oversized alias response error = %v, want size-limit error", err)
+	}
+}
+
 func TestResolveSnapshotLocalityHintDropsUnresolvedAlias(t *testing.T) {
 	node := httptest.NewServer(http.NotFoundHandler())
 	defer node.Close()
