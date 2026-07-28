@@ -3,7 +3,9 @@ package scheduler
 import (
 	"errors"
 	"strconv"
+	"sync"
 	"testing"
+	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
 	"google.golang.org/protobuf/proto"
@@ -148,6 +150,104 @@ func TestLeastLoadedRoundRobinsEqualCandidates(t *testing.T) {
 	got3, _ := s.Select(nodes, nil)
 	if got1.ID != "a" || got2.ID != "b" || got3.ID != "a" {
 		t.Fatalf("unexpected tie order: %s %s %s", got1.ID, got2.ID, got3.ID)
+	}
+}
+
+func TestLeastLoadedReservesConcurrentSelections(t *testing.T) {
+	s := &LeastLoadedStrategy{}
+	nodes := []RichNode{
+		richNode("a", 8, 0, 8_000, 0),
+		richNode("b", 8, 0, 8_000, 0),
+	}
+	hint := &schedulerv1.ScheduleRequestHint{
+		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+			NewColdSandbox: &schedulerv1.NewColdSandboxHint{CpuCount: 1},
+		},
+	}
+
+	const requests = 64
+	start := make(chan struct{})
+	counts := map[string]int{}
+	var countsMu sync.Mutex
+	var wg sync.WaitGroup
+	for range requests {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			selected, err := s.Select(nodes, hint)
+			if err != nil {
+				t.Errorf("select node: %v", err)
+				return
+			}
+			countsMu.Lock()
+			counts[selected.ID]++
+			countsMu.Unlock()
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	if counts["a"] != requests/2 || counts["b"] != requests/2 {
+		t.Fatalf("expected balanced reservations, got a=%d b=%d", counts["a"], counts["b"])
+	}
+}
+
+func TestLeastLoadedExpiresFailedReservations(t *testing.T) {
+	now := time.Unix(100, 0)
+	s := &LeastLoadedStrategy{
+		now:            func() time.Time { return now },
+		reservationTTL: time.Second,
+	}
+	nodes := []RichNode{
+		richNode("a", 8, 0, 8_000, 0),
+		richNode("b", 8, 4, 8_000, 4_000),
+	}
+	hint := &schedulerv1.ScheduleRequestHint{
+		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+			NewColdSandbox: &schedulerv1.NewColdSandboxHint{CpuCount: 4},
+		},
+	}
+
+	first, _ := s.Select(nodes, hint)
+	second, _ := s.Select(nodes, hint)
+	if first.ID != "a" || second.ID != "b" {
+		t.Fatalf("expected pending reservation to shift selection, got %s then %s", first.ID, second.ID)
+	}
+
+	now = now.Add(2 * time.Second)
+	afterExpiry, _ := s.Select(nodes, hint)
+	if afterExpiry.ID != "a" {
+		t.Fatalf("expected expired reservations to be ignored, got %s", afterExpiry.ID)
+	}
+}
+
+func TestLeastLoadedReconcilesReservationsFromHeartbeat(t *testing.T) {
+	now := time.Unix(100, 0)
+	s := &LeastLoadedStrategy{now: func() time.Time { return now }}
+	node := richNode("a", 8, 0, 8_000, 0)
+	node.Snapshot.ReportedAtUnixMs = 1
+	hint := &schedulerv1.ScheduleRequestHint{
+		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+			NewColdSandbox: &schedulerv1.NewColdSandboxHint{CpuCount: 1},
+		},
+	}
+
+	if _, err := s.Select([]RichNode{node}, hint); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(s.pendingByNode["a"].items); got != 1 {
+		t.Fatalf("expected one pending reservation, got %d", got)
+	}
+
+	node.Snapshot.ReportedAtUnixMs = 2
+	node.Snapshot.SandboxStartingCount = 1
+	node.Snapshot.AllocatedCpu = 1
+	if pending := s.pendingResources(node); pending.count != 0 {
+		t.Fatalf("expected heartbeat to consume reservation, got %d", pending.count)
+	}
+	if _, exists := s.pendingByNode["a"]; exists {
+		t.Fatal("expected reconciled reservation state to be removed")
 	}
 }
 
