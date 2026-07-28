@@ -191,7 +191,8 @@ pub trait SandboxBackend: Send + 'static {
     ///
     /// [`SandboxCaptureError::Terminal`] indicates snapshot capture mutated the live
     /// runtime before failing, so callers must not keep treating the sandbox
-    /// as safely runnable.
+    /// as safely runnable. After a recoverable failure, callers must invoke
+    /// [`resume`][Self::resume] before treating the sandbox as running again.
     async fn pause(
         &mut self,
         artifact_root: Option<&Path>,

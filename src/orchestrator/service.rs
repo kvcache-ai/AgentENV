@@ -1068,7 +1068,7 @@ where
             Ok(s) => s,
             Err(err) => {
                 warn!(error = ?err, "failed to pause sandbox");
-                if err.is_terminal() {
+                let source = if err.is_terminal() {
                     // The handle was already detached from `self.sandboxes`
                     // before `pause()`. Do not reinsert it here: the live
                     // runtime may have been mutated and is no longer safe to
@@ -1081,25 +1081,56 @@ where
                         warn!(error = ?stop_err, "failed to stop sandbox after terminal pause failure");
                     }
                     self.store.remove(&sandbox_id).await?;
+                    err.into()
                 } else {
-                    self.sandboxes.write().await.insert(sandbox_id, handle);
-                    self.restore_proxy_route(sandbox_id, removed_proxy_route)
-                        .await;
-                    let _ = self
-                        .store
-                        .update_state_if_state(
-                            &sandbox_id,
-                            SandboxState::Running,
-                            &[SandboxState::Pausing],
-                        )
-                        .await;
-                }
+                    let resume_result = {
+                        let mut sandbox = handle.lock().await;
+                        sandbox.resume().await
+                    };
+                    match resume_result {
+                        Ok(()) => {
+                            self.sandboxes.write().await.insert(sandbox_id, handle);
+                            self.restore_proxy_route(sandbox_id, removed_proxy_route)
+                                .await;
+                            let _ = self
+                                .store
+                                .update_state_if_state(
+                                    &sandbox_id,
+                                    SandboxState::Running,
+                                    &[SandboxState::Pausing],
+                                )
+                                .await;
+                            err.into()
+                        }
+                        Err(resume_err) => {
+                            warn!(
+                                error = ?resume_err,
+                                "failed to resume sandbox after recoverable pause failure"
+                            );
+                            let stop_result = {
+                                let mut sandbox = handle.lock().await;
+                                sandbox.stop().await
+                            };
+                            if let Err(stop_err) = stop_result {
+                                warn!(
+                                    error = ?stop_err,
+                                    "failed to stop sandbox after pause recovery failure"
+                                );
+                            }
+                            self.store.remove(&sandbox_id).await?;
+                            anyhow::anyhow!(
+                                "pause failed and sandbox could not be resumed: pause error: \
+                                 {err}; resume error: {resume_err:#}"
+                            )
+                        }
+                    }
+                };
                 self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                     .await;
                 return Err(OrchestratorError::SandboxOperationFailed {
                     sandbox_id,
                     operation: SandboxOperation::Pause,
-                    source: err.into(),
+                    source,
                 });
             }
         };
