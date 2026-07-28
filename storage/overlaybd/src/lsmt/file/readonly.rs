@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::io::vfile_io::{CtxRead, DirectRead, FileReader};
+use crate::io::vfile_io::{read_exact, CtxRead, DirectRead, FileReader};
 use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile, VirtualFileWriter};
 use crate::lsmt::index::{LogIndex, ReadOnlyIndex, Segment, SegmentMapping};
 use storage_util::CompactWriter;
@@ -272,16 +272,13 @@ impl LSMTReadOnlyFile {
                     let layer_idx = m.tag as usize;
 
                     if let Some(layer) = self.layers.get(layer_idx) {
-                        let n = reader
-                            .read(
-                                layer.as_ref(),
-                                phys_offset,
-                                &mut buf[local_buf_pos..local_buf_pos + actual_copy_len],
-                            )
-                            .await?;
-                        if n < actual_copy_len {
-                            buf[local_buf_pos + n..local_buf_pos + actual_copy_len].fill(0);
-                        }
+                        read_exact(
+                            reader,
+                            layer.as_ref(),
+                            phys_offset,
+                            &mut buf[local_buf_pos..local_buf_pos + actual_copy_len],
+                        )
+                        .await?;
                     } else {
                         bail!("Layer index {} out of range", layer_idx);
                     }

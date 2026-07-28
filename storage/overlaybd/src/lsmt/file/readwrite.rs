@@ -13,7 +13,9 @@ use uuid::Uuid;
 use zerocopy::little_endian::U64;
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::io::vfile_io::{CtxRead, CtxWrite, DirectRead, DirectWrite, FileReader, FileWriter};
+use crate::io::vfile_io::{
+    read_exact, CtxRead, CtxWrite, DirectRead, DirectWrite, FileReader, FileWriter,
+};
 use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile};
 use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer};
 use crate::lsmt::index::{
@@ -1111,16 +1113,13 @@ impl LSMTFile {
                 let layer_idx = m.tag as usize;
 
                 if let Some(layer) = self.layers.get(layer_idx) {
-                    let n = reader
-                        .read(
-                            layer.as_ref(),
-                            phys_offset,
-                            &mut buf[local_buf_pos..local_buf_pos + actual_read_len],
-                        )
-                        .await?;
-                    if n < actual_read_len {
-                        buf[local_buf_pos + n..local_buf_pos + actual_read_len].fill(0);
-                    }
+                    read_exact(
+                        reader,
+                        layer.as_ref(),
+                        phys_offset,
+                        &mut buf[local_buf_pos..local_buf_pos + actual_read_len],
+                    )
+                    .await?;
                 } else {
                     bail!("Invalid layer tag {}", layer_idx);
                 }

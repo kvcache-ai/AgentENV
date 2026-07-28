@@ -3189,14 +3189,10 @@ async fn test_lsmt_readonly_read_at_into() {
     assert_read_at_into_matches(&stacked, 4096, 4096).await;
 }
 
-#[tokio::test]
-async fn test_lsmt_read_at_into_short_read_layer() {
-    // Test that short reads from a layer are handled correctly
-    // (remaining bytes zero-filled).
-    let short_data = vec![0xDD; 4096];
-    let layer: Arc<dyn VirtualFile> = Arc::new(ShortReadFile::new(short_data, 128));
-
-    // Create and seal a base layer with a mapping
+async fn open_mapped_read_stacks(
+    mapped_data_len: usize,
+    trim: usize,
+) -> (LSMTReadOnlyFile, LSMTFile) {
     let base_dir = TempDir::new().unwrap();
     let vsize = 64 * 1024u64;
     let (f_data, _f_index, lsmt) = create_lsmt_env(&base_dir, vsize).await;
@@ -3206,24 +3202,83 @@ async fn test_lsmt_read_at_into_short_read_layer() {
     lsmt.close_seal().await.unwrap();
     drop(lsmt);
 
-    let base_ro_index = load_base_index(f_data.clone()).await;
+    let base_ro_index = Arc::new(load_base_index(f_data.clone()).await);
+    let opened_readonly = open_files_ro(&[f_data.clone() as Arc<dyn VirtualFile>])
+        .await
+        .unwrap();
+    let merged_ro_index = opened_readonly.index_view().unwrap();
+    let mapping = base_ro_index
+        .mappings()
+        .first()
+        .expect("test layer should contain a mapped extent");
+    let physical_offset = (mapping.moffset * ALIGNMENT) as usize;
+    let mut layer_data = vec![0u8; physical_offset];
+    layer_data.extend(std::iter::repeat_n(0xDD, mapped_data_len));
+    let layer: Arc<dyn VirtualFile> = Arc::new(ShortReadFile::new(layer_data, trim));
+    let readonly = LSMTReadOnlyFile::from_merged_layers(
+        vec![layer.clone()],
+        merged_ro_index,
+        vsize,
+        vec![Uuid::nil()],
+        LSMTFileType::ReadOnly,
+    );
 
-    // Create a proper upper LSMT layer (in a separate dir)
     let upper_dir = TempDir::new().unwrap();
     let (upper_data, upper_index, upper_lsmt) = create_lsmt_env(&upper_dir, vsize).await;
     drop(upper_lsmt);
 
-    let stacked = LSMTFile::open(
+    let writable = LSMTFile::open(
         upper_data,
         Some(upper_index),
-        Some(Arc::new(base_ro_index)),
+        Some(base_ro_index),
         vec![layer],
     )
     .await
     .unwrap();
 
-    // Both paths should produce the same result with the short-reading layer
-    assert_read_at_into_matches(&stacked, 0, 4096).await;
+    (readonly, writable)
+}
+
+async fn assert_mapped_read_equals(file: &dyn VirtualFile, expected: &[u8]) {
+    let data = file
+        .read_at(0, expected.len())
+        .await
+        .expect("mapped read_at");
+    assert_eq!(data.as_ref(), expected);
+
+    let mut dst = vec![0u8; expected.len()];
+    let n = file
+        .read_at_into(0, &mut dst)
+        .await
+        .expect("mapped read_at_into");
+    assert_eq!(n, expected.len());
+    assert_eq!(dst, expected);
+}
+
+async fn assert_truncated_mapped_read_fails(file: &dyn VirtualFile) {
+    let err = file.read_at(0, 4096).await.unwrap_err();
+    assert_err_contains(&err, "unexpected EOF");
+
+    let mut dst = vec![0u8; 4096];
+    let err = file.read_at_into(0, &mut dst).await.unwrap_err();
+    assert_err_contains(&err, "unexpected EOF");
+}
+
+#[tokio::test]
+async fn test_lsmt_retries_short_mapped_reads() {
+    let expected = vec![0xDD; 4096];
+    let (readonly, writable) = open_mapped_read_stacks(4096, 128).await;
+
+    assert_mapped_read_equals(&readonly, &expected).await;
+    assert_mapped_read_equals(&writable, &expected).await;
+}
+
+#[tokio::test]
+async fn test_lsmt_rejects_truncated_mapped_reads() {
+    let (readonly, writable) = open_mapped_read_stacks(4096 - 128, 0).await;
+
+    assert_truncated_mapped_read_fails(&readonly).await;
+    assert_truncated_mapped_read_fails(&writable).await;
 }
 
 #[tokio::test]
