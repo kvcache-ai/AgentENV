@@ -120,6 +120,8 @@ func schedulerStrategyLabel(strategy string) string {
 		return "round_robin"
 	case "random":
 		return "random"
+	case "least_loaded":
+		return "least_loaded"
 	default:
 		return "unknown"
 	}

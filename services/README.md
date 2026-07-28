@@ -107,8 +107,13 @@ General config notes:
 |---|---|
 | `round_robin` (default) | Cycles through eligible nodes in stable order |
 | `random` | Picks a uniformly random eligible node |
+| `least_loaded` | Minimizes projected CPU/memory allocation pressure using heartbeat data; uses starting/running/paused counts as tie-breakers and round-robins equal candidates |
 
-The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). Current built-in strategies ignore the snapshot, but custom strategy implementations can use it for load-aware decisions.
+The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). `least_loaded` uses the snapshot and, for cold sandbox creation, the requested CPU and memory scheduling hint. The other built-in strategies ignore the snapshot.
+
+`least_loaded` prefers nodes with observed capacity over nodes without a usable
+heartbeat snapshot. If all candidates are unobserved, or if multiple candidates
+have the same projected load, it distributes those candidates round-robin.
 
 ### Node resource limit
 
