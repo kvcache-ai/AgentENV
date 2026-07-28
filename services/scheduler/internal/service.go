@@ -90,6 +90,12 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		recordSchedulerSchedule(s.strategy.Name(), start, err)
 	}()
 
+	requirements := req.GetHint().GetLocalityRequirements()
+	if len(requirements) > maxLocalityRequirements {
+		err = status.Error(codes.InvalidArgument, "too many locality requirements")
+		return nil, err
+	}
+
 	discovered := s.nodes.Snapshot( /* allowLingering */ false)
 	rich := make([]RichNode, 0, len(discovered))
 	for _, n := range discovered {
@@ -103,11 +109,6 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	}
 
 	eligible := FilterByResourceLimit(rich, s.resourceLimit)
-	requirements := req.GetHint().GetLocalityRequirements()
-	if len(requirements) > maxLocalityRequirements {
-		err = status.Error(codes.InvalidArgument, "too many locality requirements")
-		return nil, err
-	}
 	preferred, locality := PreferLocalNodes(
 		eligible,
 		requirements,

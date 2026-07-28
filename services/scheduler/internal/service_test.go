@@ -17,6 +17,16 @@ import (
 
 type failingBindingStore struct{}
 
+type snapshotCountingNodeRegistry struct {
+	NodeRegistry
+	snapshotCalls int
+}
+
+func (r *snapshotCountingNodeRegistry) Snapshot(allowLingering bool) []Node {
+	r.snapshotCalls++
+	return r.NodeRegistry.Snapshot(allowLingering)
+}
+
 func (failingBindingStore) Get(string, time.Time) (Node, bool, error) {
 	return Node{}, false, errors.New("binding store failed")
 }
@@ -296,15 +306,42 @@ func TestScheduleRejectsTooManyLocalityRequirements(t *testing.T) {
 		keys[i] = fmt.Sprintf("locality-key-%d", i)
 	}
 
+	registry := &snapshotCountingNodeRegistry{
+		NodeRegistry: NewAtomicNodeRegistry(nil, defaultObservedReportTTL),
+	}
 	service := NewService(
 		zap.NewNop(),
-		NewAtomicNodeRegistry(nil, defaultObservedReportTTL),
+		registry,
 		NewStrategy("round_robin"),
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 	_, err := service.Schedule(context.Background(), localityScheduleRequest(keys...))
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("schedule error code = %s, want InvalidArgument (err=%v)", status.Code(err), err)
+	}
+	if registry.snapshotCalls != 0 {
+		t.Fatalf("registry Snapshot calls = %d, want 0 for invalid request", registry.snapshotCalls)
+	}
+}
+
+func TestScheduleAllowsMaxLocalityRequirements(t *testing.T) {
+	keys := make([]string, maxLocalityRequirements)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("locality-key-%d", i)
+	}
+
+	service := NewService(
+		zap.NewNop(),
+		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
+		NewStrategy("round_robin"),
+		NewInMemoryBindingStore(defaultObservedReportTTL),
+	)
+	resp, err := service.Schedule(context.Background(), localityScheduleRequest(keys...))
+	if err != nil {
+		t.Fatalf("schedule with maximum locality requirements failed: %v", err)
+	}
+	if got := resp.GetNode().GetNodeId(); got != "node-a" {
+		t.Fatalf("selected node = %q, want node-a", got)
 	}
 }
 
