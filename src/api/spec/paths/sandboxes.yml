@@ -1,0 +1,561 @@
+paths:
+/sandboxes:
+  get:
+    summary: List running sandboxes
+    description: List all running sandboxes. Use GET /v2/sandboxes instead.
+    deprecated: true
+    tags: [sandboxes]
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    parameters:
+      - name: metadata
+        in: query
+        description: Metadata query used to filter the sandboxes (e.g. "user=abc&app=prod"). Each key and values must be URL encoded.
+        required: false
+        schema:
+          type: string
+    responses:
+      "200":
+        description: Successfully returned all running sandboxes
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/ListedSandbox"
+      "401":
+        $ref: "#/components/responses/401"
+      "400":
+        $ref: "#/components/responses/400"
+      "500":
+        $ref: "#/components/responses/500"
+  post:
+    summary: Create sandbox
+    description: >
+      Create a sandbox from an existing template/snapshot. Use
+      POST /sandboxes-cold to create a sandbox directly from an external OCI
+      image.
+    tags: [sandboxes]
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/NewSandbox"
+    responses:
+      "201":
+        description: The sandbox was created successfully
+        headers:
+          x-agentenv-sandbox-id:
+            description: Identifier of the created sandbox for proxy routing.
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Sandbox"
+      "401":
+        $ref: "#/components/responses/401"
+      "400":
+        $ref: "#/components/responses/400"
+      "500":
+        $ref: "#/components/responses/500"
+
+/sandboxes-cold:
+  post:
+    description: >
+      Create a sandbox directly from an explicit external OCI image
+      reference. Cold starts may pull and convert OCI layers on a cache miss
+      and can take tens of seconds; clients should use a long HTTP timeout
+      for this path.
+    tags: [sandboxes]
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/NewColdSandbox"
+    responses:
+      "201":
+        description: The sandbox was created successfully
+        headers:
+          x-agentenv-sandbox-id:
+            description: Identifier of the created sandbox for proxy routing.
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Sandbox"
+      "401":
+        $ref: "#/components/responses/401"
+      "400":
+        $ref: "#/components/responses/400"
+      "500":
+        $ref: "#/components/responses/500"
+
+/v2/sandboxes:
+  get:
+    summary: List sandboxes (v2)
+    description: List all sandboxes
+    tags: [sandboxes]
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    parameters:
+      - name: metadata
+        in: query
+        description: Metadata query used to filter the sandboxes (e.g. "user=abc&app=prod"). Each key and values must be URL encoded.
+        required: false
+        schema:
+          type: string
+      - name: state
+        in: query
+        description: Filter sandboxes by one or more states
+        required: false
+        schema:
+          type: array
+          items:
+            $ref: "#/components/schemas/SandboxState"
+        style: form
+        explode: false
+      - $ref: "#/components/parameters/paginationNextToken"
+      - $ref: "#/components/parameters/paginationLimit"
+    responses:
+      "200":
+        description: Successfully returned all running sandboxes
+        headers:
+          x-next-token:
+            description: Pagination token for the next page. Returned only when more results are available.
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/ListedSandbox"
+      "401":
+        $ref: "#/components/responses/401"
+      "400":
+        $ref: "#/components/responses/400"
+      "500":
+        $ref: "#/components/responses/500"
+
+/sandboxes/{sandboxID}:
+  get:
+    summary: Sandbox
+    description: Get a sandbox by id
+    tags: [sandboxes]
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    parameters:
+      - $ref: "#/components/parameters/sandboxID"
+    responses:
+      "200":
+        description: Successfully returned the sandbox
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SandboxDetail"
+      "404":
+        $ref: "#/components/responses/404"
+      "401":
+        $ref: "#/components/responses/401"
+      "500":
+        $ref: "#/components/responses/500"
+
+  delete:
+    summary: Kill sandbox
+    description: Kill a sandbox
+    tags: [sandboxes]
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    parameters:
+      - $ref: "#/components/parameters/sandboxID"
+    responses:
+      "204":
+        description: The sandbox was killed successfully
+      "404":
+        $ref: "#/components/responses/404"
+      "401":
+        $ref: "#/components/responses/401"
+      "500":
+        $ref: "#/components/responses/500"
+
+# TODO: Pause and resume might be exposed as POST /sandboxes/{sandboxID}/snapshot and then POST /sandboxes with specified snapshotting setup
+/sandboxes/{sandboxID}/pause:
+  post:
+    summary: Pause sandbox
+    description: Pause the sandbox
+    tags: [sandboxes]
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    parameters:
+      - $ref: "#/components/parameters/sandboxID"
+    responses:
+      "204":
+        description: The sandbox was paused successfully and can be resumed
+      "409":
+        $ref: "#/components/responses/409"
+      "404":
+        $ref: "#/components/responses/404"
+      "401":
+        $ref: "#/components/responses/401"
+      "500":
+        $ref: "#/components/responses/500"
+
+/sandboxes/{sandboxID}/resume:
+  post:
+    summary: Resume sandbox
+    deprecated: true
+    description: Resume the sandbox
+    tags: [sandboxes]
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    parameters:
+      - $ref: "#/components/parameters/sandboxID"
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ResumedSandbox"
+    responses:
+      "201":
+        description: The sandbox was resumed successfully
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Sandbox"
+      "409":
+        $ref: "#/components/responses/409"
+      "404":
+        $ref: "#/components/responses/404"
+      "401":
+        $ref: "#/components/responses/401"
+      "500":
+        $ref: "#/components/responses/500"
+
+/sandboxes/{sandboxID}/fork:
+  post:
+    summary: Fork sandbox
+    description: >-
+      Fork the sandbox: checkpoint the running sandbox in place (it is
+      briefly paused, snapshotted with its full memory state, and resumed on
+      its node, keeping its ID and expiration untouched) and create count
+      new sandboxes from that snapshot. Returns one result per requested
+      fork, each carrying either the created sandbox or the error that
+      prevented it from starting. A non-201 status means the request failed
+      before any fork was attempted.
+    tags: [sandboxes]
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    parameters:
+      - $ref: "#/components/parameters/sandboxID"
+    requestBody:
+      required: false
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SandboxForkRequest"
+    responses:
+      "201":
+        description: >-
+          The sandbox was snapshotted and the forks were attempted; each
+          entry reports one fork's outcome
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/SandboxForkResult"
+      "400":
+        $ref: "#/components/responses/400"
+      "409":
+        $ref: "#/components/responses/409"
+      "404":
+        $ref: "#/components/responses/404"
+      "401":
+        $ref: "#/components/responses/401"
+      "500":
+        $ref: "#/components/responses/500"
+
+/sandboxes/{sandboxID}/connect:
+  post:
+    summary: Connect sandbox
+    description: Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
+    tags: [sandboxes]
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    parameters:
+      - $ref: "#/components/parameters/sandboxID"
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ConnectSandbox"
+    responses:
+      "200":
+        description: The sandbox was already running
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Sandbox"
+      "201":
+        description: The sandbox was resumed successfully
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Sandbox"
+      "400":
+        $ref: "#/components/responses/400"
+      "401":
+        $ref: "#/components/responses/401"
+      "404":
+        $ref: "#/components/responses/404"
+      "500":
+        $ref: "#/components/responses/500"
+
+/sandboxes/{sandboxID}/timeout:
+  post:
+    summary: Set sandbox timeout
+    description: Set the timeout for the sandbox. The sandbox will expire x seconds from the time of the request. Calling this method multiple times overwrites the TTL, each time using the current timestamp as the starting point to measure the timeout duration.
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    tags: [sandboxes]
+    requestBody:
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SandboxTimeoutRequest"
+    parameters:
+      - $ref: "#/components/parameters/sandboxID"
+    responses:
+      "204":
+        description: Successfully set the sandbox timeout
+      "401":
+        $ref: "#/components/responses/401"
+      "404":
+        $ref: "#/components/responses/404"
+      "500":
+        $ref: "#/components/responses/500"
+
+/sandboxes/{sandboxID}/network:
+  put:
+    summary: Update sandbox network
+    description: Update the network configuration for a running sandbox. Replaces the current egress rules with the provided configuration. Omitting field clears it.
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    tags: [sandboxes]
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SandboxNetworkUpdateConfig"
+    parameters:
+      - $ref: "#/components/parameters/sandboxID"
+    responses:
+      "204":
+        description: Successfully updated the sandbox network configuration
+      "400":
+        $ref: "#/components/responses/400"
+      "401":
+        $ref: "#/components/responses/401"
+      "404":
+        $ref: "#/components/responses/404"
+      "409":
+        $ref: "#/components/responses/409"
+      "500":
+        $ref: "#/components/responses/500"
+
+/sandboxes/{sandboxID}/custom-extension-params:
+  get:
+    description: >
+      Get the current custom extension params of the sandbox. Returns an
+      empty object when no params are set.
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    tags: [sandboxes]
+    parameters:
+      - $ref: "#/components/parameters/sandboxID"
+    responses:
+      "200":
+        description: The current custom extension params
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CustomExtensionParams"
+      "401":
+        $ref: "#/components/responses/401"
+      "404":
+        $ref: "#/components/responses/404"
+      "500":
+        $ref: "#/components/responses/500"
+  patch:
+    description: >
+      Patch the custom extension params of a running sandbox. The request
+      body is passed through verbatim to the custom extension's
+      patch-params hook, whose semantics are defined entirely by the
+      extension. The hook returns the updated full params, which become the
+      sandbox's new current params and are returned by this call. Requires
+      the custom extension to be configured on the server. Concurrent
+      patches to the same sandbox are not serialized; non-commutative
+      patch semantics must be handled by the extension.
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    tags: [sandboxes]
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+            description: >
+              Opaque JSON patch document passed through verbatim to the
+              custom extension's patch-params hook. Its semantics are
+              defined entirely by the extension.
+    parameters:
+      - $ref: "#/components/parameters/sandboxID"
+    responses:
+      "200":
+        description: The updated full custom extension params
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CustomExtensionParams"
+      "400":
+        $ref: "#/components/responses/400"
+      "401":
+        $ref: "#/components/responses/401"
+      "404":
+        $ref: "#/components/responses/404"
+      "409":
+        $ref: "#/components/responses/409"
+      "500":
+        $ref: "#/components/responses/500"
+
+/sandboxes/{sandboxID}/refreshes:
+  post:
+    summary: Refresh sandbox
+    description: Refresh the sandbox extending its time to live
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    tags: [sandboxes]
+    requestBody:
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SandboxRefreshRequest"
+    parameters:
+      - $ref: "#/components/parameters/sandboxID"
+    responses:
+      "204":
+        description: Successfully refreshed the sandbox
+      "401":
+        $ref: "#/components/responses/401"
+      "404":
+        $ref: "#/components/responses/404"
+      "500":
+        $ref: "#/components/responses/500"
+
+/sandboxes/{sandboxID}/snapshots:
+  post:
+    summary: Create snapshot
+    description: Create a persistent snapshot from the sandbox's current state. Snapshots can be used to create new sandboxes and persist beyond the original sandbox's lifetime.
+    tags: [sandboxes]
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    parameters:
+      - $ref: "#/components/parameters/sandboxID"
+    requestBody:
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SandboxSnapshotRequest"
+    responses:
+      "201":
+        description: Snapshot created successfully
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnapshotInfo"
+      "400":
+        $ref: "#/components/responses/400"
+      "401":
+        $ref: "#/components/responses/401"
+      "404":
+        $ref: "#/components/responses/404"
+      "500":
+        $ref: "#/components/responses/500"

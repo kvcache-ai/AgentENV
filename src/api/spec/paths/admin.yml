@@ -1,0 +1,59 @@
+paths:
+/nodes:
+  get:
+    summary: List nodes
+    description: List all nodes
+    tags: [admin]
+    security:
+      - AdminApiKeyAuth: []
+    parameters:
+      - in: query
+        name: clusterID
+        description: Identifier of the cluster
+        required: false
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: Successfully returned all nodes
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/Node"
+      "401":
+        $ref: "#/components/responses/401"
+      "500":
+        $ref: "#/components/responses/500"
+
+/nodes/{nodeID}:
+  get:
+    summary: Node info
+    description: Get node info
+    tags: [admin]
+    security:
+      - AdminApiKeyAuth: []
+    parameters:
+      - $ref: "#/components/parameters/nodeID"
+      - in: query
+        name: clusterID
+        description: Identifier of the cluster
+        required: false
+        schema:
+          type: string
+          format: uuid
+    responses:
+      "200":
+        description: Successfully returned the node
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NodeDetail"
+      "401":
+        $ref: "#/components/responses/401"
+      "404":
+        $ref: "#/components/responses/404"
+      "500":
+        $ref: "#/components/responses/500"

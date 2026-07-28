@@ -21,3 +21,4 @@ zip = "2"
 regex = "1"
 serde_json = "1"
 chrono = { version = "0.4", features = ["clock"] }
+upon = { version = "0.10", default-features = false, features = ["serde"] }

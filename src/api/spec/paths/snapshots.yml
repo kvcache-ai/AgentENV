@@ -1,0 +1,74 @@
+paths:
+/snapshots:
+  get:
+    summary: List snapshots
+    description: List all snapshots for the team
+    tags: [snapshots]
+    security:
+      - ApiKeyAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    parameters:
+      - name: sandboxID
+        in: query
+        required: false
+        schema:
+          type: string
+          description: Filter snapshots by source sandbox ID
+      - name: name
+        in: query
+        description: Filter snapshots by name or ID, optionally tag-qualified (e.g. "my-snapshot", "my-team/my-snapshot" or "my-snapshot:v1").
+        required: false
+        schema:
+          type: string
+      - $ref: "#/components/parameters/paginationLimit"
+      - $ref: "#/components/parameters/paginationNextToken"
+    responses:
+      "200":
+        description: Successfully returned snapshots
+        headers:
+          x-next-token:
+            description: Pagination token for the next page. Returned only when more results are available.
+            schema:
+              type: string
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: "#/components/schemas/SnapshotInfo"
+      "400":
+        $ref: "#/components/responses/400"
+      "401":
+        $ref: "#/components/responses/401"
+      "500":
+        $ref: "#/components/responses/500"
+
+/snapshots/{snapshotID}:
+  get:
+    description: Get information about a single snapshot by its ID or alias
+    tags: [snapshots]
+    security:
+      - ApiKeyAuth: []
+      - AccessTokenAuth: []
+      - AuthProviderBearerAuth: []
+        AuthProviderTeamAuth: []
+      - AdminApiKeyAuth: []
+        AdminTeamAuth: []
+    parameters:
+      - $ref: "#/components/parameters/snapshotID"
+    responses:
+      "200":
+        description: Successfully returned the snapshot
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SnapshotInfo"
+      "401":
+        $ref: "#/components/responses/401"
+      "404":
+        $ref: "#/components/responses/404"
+      "500":
+        $ref: "#/components/responses/500"

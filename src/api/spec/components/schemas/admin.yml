@@ -1,0 +1,229 @@
+schemas:
+  NodeStatus:
+    type: string
+    description: |
+      Status of the node.
+      - draining: the node is bound to be shut down. It will not accept new sandboxes and will stop once all existing sandboxes are done.
+    enum:
+      - ready
+      - draining
+      - connecting
+      - unhealthy
+    x-enum-varnames:
+      - NodeStatusReady
+      - NodeStatusDraining
+      - NodeStatusConnecting
+      - NodeStatusUnhealthy
+
+  DiskMetrics:
+    required:
+      - mountPoint
+      - device
+      - filesystemType
+      - usedBytes
+      - totalBytes
+    properties:
+      mountPoint:
+        type: string
+        description: Mount point of the disk
+      device:
+        type: string
+        description: Device name
+      filesystemType:
+        type: string
+        description: Filesystem type (e.g., ext4, xfs)
+      usedBytes:
+        type: integer
+        format: uint64
+        description: Used space in bytes
+      totalBytes:
+        type: integer
+        format: uint64
+        description: Total space in bytes
+
+  NodeMetrics:
+    description: Node metrics
+    required:
+      - allocatedCPU
+      - allocatedMemoryBytes
+      - cpuPercent
+      - memoryUsedBytes
+      - cpuCount
+      - memoryTotalBytes
+      - disks
+      - pausedAllocatedCPU
+      - pausedAllocatedMemoryBytes
+    properties:
+      allocatedCPU:
+        type: integer
+        format: uint32
+        description: Number of allocated CPU cores for the active running sandboxes (excludes paused)
+      cpuPercent:
+        type: integer
+        format: uint32
+        description: Node CPU usage percentage
+      cpuCount:
+        type: integer
+        format: uint32
+        description: Total number of CPU cores on the node
+      allocatedMemoryBytes:
+        type: integer
+        format: uint64
+        description: Amount of allocated memory in bytes for the active running sandboxes (excludes paused)
+      memoryUsedBytes:
+        type: integer
+        format: uint64
+        description: Node memory used in bytes
+      memoryTotalBytes:
+        type: integer
+        format: uint64
+        description: Total node memory in bytes
+      disks:
+        type: array
+        description: Detailed metrics for each disk/mount point
+        items:
+          $ref: "#/components/schemas/DiskMetrics"
+      pausedAllocatedCPU:
+        type: integer
+        format: uint32
+        description: Sum of CPU reservations across all sandboxes currently in the Paused state
+      pausedAllocatedMemoryBytes:
+        type: integer
+        format: uint64
+        description: Sum of memory reservations (bytes) across all sandboxes currently in the Paused state
+  MachineInfo:
+    required:
+      - cpuFamily
+      - cpuModel
+      - cpuModelName
+      - cpuArchitecture
+    properties:
+      cpuFamily:
+        type: string
+        description: CPU family of the node
+      cpuModel:
+        type: string
+        description: CPU model of the node
+      cpuModelName:
+        type: string
+        description: CPU model name of the node
+      cpuArchitecture:
+        type: string
+        description: CPU architecture of the node
+
+  Node:
+    required:
+      - id
+      - serviceInstanceID
+      - clusterID
+      - status
+      - sandboxCount
+      - metrics
+      - createSuccesses
+      - createFails
+      - sandboxStartingCount
+      - sandboxPausedCount
+      - version
+      - commit
+      - machineInfo
+    properties:
+      version:
+        type: string
+        description: Version of the orchestrator
+      commit:
+        type: string
+        description: Commit of the orchestrator
+      id:
+        type: string
+        description: Identifier of the node
+      serviceInstanceID:
+        type: string
+        description: Service instance identifier of the node
+      clusterID:
+        type: string
+        description: Identifier of the cluster
+      machineInfo:
+        $ref: "#/components/schemas/MachineInfo"
+      status:
+        $ref: "#/components/schemas/NodeStatus"
+      sandboxCount:
+        type: integer
+        format: uint32
+        description: Number of sandboxes running on the node
+      metrics:
+        $ref: "#/components/schemas/NodeMetrics"
+      createSuccesses:
+        type: integer
+        format: uint64
+        description: Number of sandbox create successes
+      createFails:
+        type: integer
+        format: uint64
+        description: Number of sandbox create fails
+      sandboxStartingCount:
+        type: integer
+        format: uint32
+        description: Number of starting Sandboxes
+      sandboxPausedCount:
+        type: integer
+        format: uint32
+        description: Number of sandboxes currently in the Paused state
+
+  NodeDetail:
+    required:
+      - id
+      - serviceInstanceID
+      - clusterID
+      - status
+      - sandboxCount
+      - cachedBuilds
+      - createSuccesses
+      - createFails
+      - sandboxPausedCount
+      - version
+      - commit
+      - metrics
+      - machineInfo
+    properties:
+      clusterID:
+        type: string
+        description: Identifier of the cluster
+      version:
+        type: string
+        description: Version of the orchestrator
+      commit:
+        type: string
+        description: Commit of the orchestrator
+      id:
+        type: string
+        description: Identifier of the node
+      serviceInstanceID:
+        type: string
+        description: Service instance identifier of the node
+      machineInfo:
+        $ref: "#/components/schemas/MachineInfo"
+      status:
+        $ref: "#/components/schemas/NodeStatus"
+      sandboxCount:
+        type: integer
+        format: uint32
+        description: Number of sandboxes running on the node
+      metrics:
+        $ref: "#/components/schemas/NodeMetrics"
+      cachedBuilds:
+        type: array
+        description: List of cached builds id on the node
+        items:
+          type: string
+      createSuccesses:
+        type: integer
+        format: uint64
+        description: Number of sandbox create successes
+      createFails:
+        type: integer
+        format: uint64
+        description: Number of sandbox create fails
+      sandboxPausedCount:
+        type: integer
+        format: uint32
+        description: Number of sandboxes currently in the Paused state

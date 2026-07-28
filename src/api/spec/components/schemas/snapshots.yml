@@ -1,0 +1,41 @@
+schemas:
+  SnapshotInfo:
+    type: object
+    required:
+      - snapshotID
+      - names
+      - cpuCount
+      - memoryMB
+      - diskSizeMB
+      - createdAt
+      - updatedAt
+    properties:
+      snapshotID:
+        type: string
+        description: The actual snapshot ID (stable identifier). Always contains the raw snapshot UUID, never an alias.
+      names:
+        type: array
+        items:
+          type: string
+        description: User-provided aliases for the snapshot. Empty if no alias was assigned during snapshot creation.
+      cpuCount:
+        $ref: "#/components/schemas/CPUCount"
+      memoryMB:
+        $ref: "#/components/schemas/MemoryMB"
+      diskSizeMB:
+        $ref: "#/components/schemas/DiskSizeMB"
+      createdAt:
+        type: string
+        format: date-time
+        description: Time when the snapshot was created
+      updatedAt:
+        type: string
+        format: date-time
+        description: Time when the snapshot was last updated
+
+  SandboxSnapshotRequest:
+    type: object
+    properties:
+      name:
+        type: string
+        description: Optional name for the snapshot template. If a snapshot template with this name already exists, a new build will be assigned to the existing template instead of creating a new one.

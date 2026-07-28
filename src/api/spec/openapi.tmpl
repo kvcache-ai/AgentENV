@@ -1,0 +1,39 @@
+openapi: 3.0.0
+info:
+  version: 0.1.0
+  title: E2B API
+
+servers:
+  - url: https://api.e2b.app
+
+tags:
+  - name: admin
+  - name: templates
+  - name: sandboxes
+  - name: snapshots
+
+components:
+  securitySchemes:
+{{ security }}
+
+  parameters:
+{{ parameters }}
+
+  responses:
+{{ responses }}
+
+  schemas:
+{{ schemas }}
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      description: Health check
+      responses:
+        "204":
+          description: The service is healthy
+        "401":
+          $ref: "#/components/responses/401"
+
+{{ paths }}

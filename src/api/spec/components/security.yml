@@ -1,0 +1,25 @@
+securitySchemes:
+  ApiKeyAuth:
+    type: apiKey
+    in: header
+    name: X-API-Key
+  # AuthProviderBearerAuth / AuthProviderTeamAuth: B before T in the name
+  # so Bearer is validated before Team.
+  AuthProviderBearerAuth:
+    type: http
+    scheme: bearer
+    bearerFormat: access_token
+  AuthProviderTeamAuth:
+    type: apiKey
+    in: header
+    name: X-Team-ID
+  # AdminApiKeyAuth / AdminTeamAuth: alphabetical names ensure token
+  # validation runs before team context population.
+  AdminApiKeyAuth:
+    type: apiKey
+    in: header
+    name: X-Admin-Token
+  AdminTeamAuth:
+    type: apiKey
+    in: header
+    name: X-Team-ID

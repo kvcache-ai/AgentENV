@@ -1,0 +1,471 @@
+schemas:
+  SandboxMetadata:
+    additionalProperties:
+      type: string
+      description: Metadata of the sandbox
+
+  SandboxState:
+    type: string
+    description: State of the sandbox
+    enum:
+      - running
+      - paused
+
+  EnvVars:
+    additionalProperties:
+      type: string
+      description: Environment variables for the sandbox
+
+  AttachedDriveSource:
+    type: object
+    description: >
+      Source for a sandbox attached drive. `image` must be provided.
+    required:
+      - image
+    properties:
+      image:
+        type: string
+        description: OCI image reference to resolve into an OverlayBD drive.
+
+  AttachedDrive:
+    type: object
+    required:
+      - driveID
+      - source
+    description: >
+      Block drive to attach when starting a sandbox. Attached drives are
+      sandbox launch inputs; if the sandbox is later snapshotted, the current
+      drive state is captured into the resulting snapshot.
+    properties:
+      driveID:
+        type: string
+        description: Identifier used for the attached Firecracker drive. Must be non-empty, unique per sandbox, and must not contain "/".
+      readOnly:
+        type: boolean
+        default: true
+        description: Whether the attached drive should be mounted read-only. Defaults to true.
+      mountPath:
+        type: string
+        description: >
+          Absolute guest mount path. Defaults to `/mnt/{driveID}`. Must not
+          be `/`, contain `..`, spaces, commas, or colons, and must not be
+          under reserved paths such as `/proc`, `/sys`, `/dev`, `/run`,
+          `/agentenv`, or `/opt/agentenv`.
+      subPath:
+        type: string
+        description: >
+          Optional sub-directory inside the drive to expose at
+          `mountPath`, matching Kubernetes `volumeMounts.subPath`. When
+          set, only the named sub-directory of the drive is visible at
+          `mountPath` inside the guest. Must be a relative path, must
+          not be empty, must not contain `..`, spaces, commas, or
+          colons, and must not start with `/`.
+      diskSizeMB:
+        $ref: "#/components/schemas/DiskSizeMB"
+      source:
+        $ref: "#/components/schemas/AttachedDriveSource"
+
+  AttachedDrives:
+    type: array
+    description: Sandbox startup block drive declarations.
+    items:
+      $ref: "#/components/schemas/AttachedDrive"
+
+  Mcp:
+    type: object
+    description: MCP configuration for the sandbox
+    additionalProperties: {}
+    nullable: true
+
+  CustomExtensionParams:
+    type: object
+    additionalProperties: true
+    description: >
+      Opaque JSON object interpreted only by the custom extension. An
+      absent value and an empty object are equivalent: both mean empty
+      params.
+
+  SandboxNetworkConfig:
+    type: object
+    properties:
+      allowPublicTraffic:
+        type: boolean
+        default: true
+        description: Specify if the sandbox URLs should be accessible only with authentication.
+      allowOut:
+        type: array
+        description: List of allowed destinations for egress traffic. Each entry can be a CIDR block (e.g. "8.8.8.8/32"), a bare IP address (e.g. "8.8.8.8"), or a domain name (e.g. "example.com", "*.example.com"). Allowed entries always take precedence over denied entries.
+        items:
+          type: string
+      denyOut:
+        type: array
+        description: List of denied CIDR blocks or IP addresses for egress traffic. Domain names are not supported for deny rules.
+        items:
+          type: string
+      maskRequestHost:
+        type: string
+        description: Specify host mask which will be used for all sandbox requests
+
+  SandboxNetworkUpdateConfig:
+    type: object
+    description: Network configuration update for a running sandbox. Replaces the current egress rules with the provided configuration. Omitting a field clears it.
+    properties:
+      allowOut:
+        type: array
+        description: List of allowed destinations for egress traffic. Each entry can be a CIDR block (e.g. "8.8.8.8/32"), a bare IP address (e.g. "8.8.8.8"), or a domain name (e.g. "example.com", "*.example.com"). Allowed entries always take precedence over denied entries.
+        items:
+          type: string
+      denyOut:
+        type: array
+        description: List of denied CIDR blocks or IP addresses for egress traffic. Domain names are not supported for deny rules.
+        items:
+          type: string
+      allow_internet_access:
+        type: boolean
+        description:
+          Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut
+          to 0.0.0.0/0 in the network config.
+
+  SandboxAutoResumeEnabled:
+    type: boolean
+    description: Auto-resume enabled flag for paused sandboxes. Default false.
+    default: false
+
+  SandboxAutoResumeConfig:
+    type: object
+    description: Auto-resume configuration for paused sandboxes.
+    required:
+      - enabled
+    properties:
+      enabled:
+        $ref: "#/components/schemas/SandboxAutoResumeEnabled"
+
+  SandboxOnTimeout:
+    type: string
+    description: Action taken when the sandbox times out.
+    enum:
+      - kill
+      - pause
+
+  SandboxLifecycle:
+    type: object
+    description: Sandbox lifecycle policy returned by sandbox info.
+    required:
+      - autoResume
+      - onTimeout
+    properties:
+      autoResume:
+        type: boolean
+        description: Whether the sandbox can auto-resume.
+      onTimeout:
+        $ref: "#/components/schemas/SandboxOnTimeout"
+  Sandbox:
+    required:
+      - templateID
+      - sandboxID
+      - clientID
+      - envdVersion
+    properties:
+      templateID:
+        type: string
+        description: Identifier of the template from which is the sandbox created
+      sandboxID:
+        type: string
+        description: Identifier of the sandbox
+      alias:
+        type: string
+        description: Alias of the template
+      clientID:
+        type: string
+        deprecated: true
+        description: Identifier of the client
+      envdVersion:
+        $ref: "#/components/schemas/EnvdVersion"
+      envdAccessToken:
+        type: string
+        description: Access token used for envd communication
+      trafficAccessToken:
+        type: string
+        nullable: true
+        description: Token required for accessing sandbox via proxy.
+      domain:
+        type: string
+        nullable: true
+        description: Base domain where the sandbox traffic is accessible
+
+  SandboxDetail:
+    required:
+      - templateID
+      - sandboxID
+      - clientID
+      - startedAt
+      - cpuCount
+      - memoryMB
+      - diskSizeMB
+      - endAt
+      - state
+      - envdVersion
+    properties:
+      templateID:
+        type: string
+        description: Identifier of the template from which is the sandbox created
+      alias:
+        type: string
+        description: Alias of the template
+      sandboxID:
+        type: string
+        description: Identifier of the sandbox
+      clientID:
+        type: string
+        deprecated: true
+        description: Identifier of the client
+      startedAt:
+        type: string
+        format: date-time
+        description: Time when the sandbox was started
+      endAt:
+        type: string
+        format: date-time
+        description: Time when the sandbox will expire
+      envdVersion:
+        $ref: "#/components/schemas/EnvdVersion"
+      envdAccessToken:
+        type: string
+        description: Access token used for envd communication
+      allowInternetAccess:
+        type: boolean
+        nullable: true
+        description: Whether internet access was explicitly enabled or disabled for the sandbox. Null means it was not explicitly set.
+      domain:
+        type: string
+        nullable: true
+        description: Base domain where the sandbox traffic is accessible
+      cpuCount:
+        $ref: "#/components/schemas/CPUCount"
+      memoryMB:
+        $ref: "#/components/schemas/MemoryMB"
+      diskSizeMB:
+        $ref: "#/components/schemas/DiskSizeMB"
+      metadata:
+        $ref: "#/components/schemas/SandboxMetadata"
+      state:
+        $ref: "#/components/schemas/SandboxState"
+      network:
+        $ref: "#/components/schemas/SandboxNetworkConfig"
+      lifecycle:
+        $ref: "#/components/schemas/SandboxLifecycle"
+
+  ListedSandbox:
+    required:
+      - templateID
+      - sandboxID
+      - clientID
+      - startedAt
+      - cpuCount
+      - memoryMB
+      - diskSizeMB
+      - endAt
+      - state
+      - envdVersion
+    properties:
+      templateID:
+        type: string
+        description: Identifier of the template from which is the sandbox created
+      alias:
+        type: string
+        description: Alias of the template
+      sandboxID:
+        type: string
+        description: Identifier of the sandbox
+      clientID:
+        type: string
+        deprecated: true
+        description: Identifier of the client
+      startedAt:
+        type: string
+        format: date-time
+        description: Time when the sandbox was started
+      endAt:
+        type: string
+        format: date-time
+        description: Time when the sandbox will expire
+      cpuCount:
+        $ref: "#/components/schemas/CPUCount"
+      memoryMB:
+        $ref: "#/components/schemas/MemoryMB"
+      diskSizeMB:
+        $ref: "#/components/schemas/DiskSizeMB"
+      metadata:
+        $ref: "#/components/schemas/SandboxMetadata"
+      state:
+        $ref: "#/components/schemas/SandboxState"
+      envdVersion:
+        $ref: "#/components/schemas/EnvdVersion"
+
+  NewSandbox:
+    required:
+      - templateID
+    properties:
+      templateID:
+        type: string
+        description: >
+          Identifier of the required template/snapshot. Use
+          POST /sandboxes-cold to create a sandbox directly from an external
+          OCI image.
+      timeout:
+        type: integer
+        format: int32
+        minimum: 0
+        default: 15
+        description: Time to live for the sandbox in seconds.
+      autoPause:
+        type: boolean
+        default: true
+        description: Automatically pauses the sandbox after the timeout
+      autoResume:
+        $ref: "#/components/schemas/SandboxAutoResumeConfig"
+      secure:
+        type: boolean
+        description: Secure all system communication with sandbox
+      allow_internet_access:
+        type: boolean
+        description:
+          Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut
+          to 0.0.0.0/0 in the network config.
+      network:
+        $ref: "#/components/schemas/SandboxNetworkConfig"
+      metadata:
+        $ref: "#/components/schemas/SandboxMetadata"
+      envVars:
+        $ref: "#/components/schemas/EnvVars"
+      customExtensionParams:
+        $ref: "#/components/schemas/CustomExtensionParams"
+      mcp:
+        $ref: "#/components/schemas/Mcp"
+
+  ResumedSandbox:
+    properties:
+      timeout:
+        type: integer
+        format: int32
+        minimum: 0
+        default: 15
+        description: Time to live for the sandbox in seconds.
+
+  NewColdSandbox:
+    required:
+      - image
+    properties:
+      image:
+        type: string
+        description: >
+          Explicit external OCI image reference to use as the sandbox rootfs.
+          Cold starts may pull and convert OCI layers on a cache miss and can
+          take tens of seconds.
+      timeout:
+        type: integer
+        format: int32
+        minimum: 0
+        default: 15
+        description: Time to live for the sandbox in seconds.
+      autoPause:
+        type: boolean
+        default: true
+        description: Automatically pauses the sandbox after the timeout
+      autoResume:
+        $ref: "#/components/schemas/SandboxAutoResumeConfig"
+      allowInternetAccess:
+        type: boolean
+        description:
+          Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut
+          to 0.0.0.0/0 in the network config.
+      network:
+        $ref: "#/components/schemas/SandboxNetworkConfig"
+      metadata:
+        $ref: "#/components/schemas/SandboxMetadata"
+      envVars:
+        $ref: "#/components/schemas/EnvVars"
+      customExtensionParams:
+        $ref: "#/components/schemas/CustomExtensionParams"
+      cpuCount:
+        allOf:
+          - $ref: "#/components/schemas/CPUCount"
+        description: CPU cores for the cold-start sandbox.
+      memoryMB:
+        allOf:
+          - $ref: "#/components/schemas/MemoryMB"
+        description: Memory for the cold-start sandbox in MiB.
+      diskSizeMB:
+        $ref: "#/components/schemas/DiskSizeMB"
+      attachedDrives:
+        allOf:
+          - $ref: "#/components/schemas/AttachedDrives"
+        description: Attached drives for the cold-start sandbox. If the sandbox is later snapshotted, current drive state is captured into the snapshot.
+      extraBootArgs:
+        type: string
+        description: Additional kernel command-line arguments appended to the Firecracker boot args for this cold-start sandbox. Arguments are whitespace-separated and may contain only 0-9, a-z, A-Z, underscore, hyphen, dot, slash, plus, or equals sign, so base64 values are allowed. The server also applies the firecracker.allowed_extra_boot_args_prefixes allowlist; non-matching or invalid arguments are silently ignored.
+
+  ConnectSandbox:
+    type: object
+    required:
+      - timeout
+    properties:
+      timeout:
+        description: Timeout in seconds from the current time after which the sandbox should expire
+        type: integer
+        format: int32
+        minimum: 0
+
+  SandboxTimeoutRequest:
+    type: object
+    required:
+      - timeout
+    properties:
+      timeout:
+        description: Timeout in seconds from the current time after which the sandbox should expire
+        type: integer
+        format: int32
+        minimum: 0
+
+  SandboxRefreshRequest:
+    type: object
+    properties:
+      duration:
+        description: Duration for which the sandbox should be kept alive in seconds
+        type: integer
+        maximum: 3600 # 1 hour
+        minimum: 0
+
+  SandboxForkRequest:
+    type: object
+    properties:
+      timeout:
+        type: integer
+        format: int32
+        minimum: 0
+        description: >-
+          Time to live for the new forked sandboxes in seconds. When omitted,
+          each fork inherits the source sandbox timeout.
+      count:
+        type: integer
+        format: int32
+        minimum: 1
+        maximum: 100
+        default: 1
+        description: >-
+          Number of forked sandboxes to create. All forks boot from the same
+          snapshot, so the snapshot is captured once regardless of count.
+          Each fork succeeds or fails independently; the outcome of each is
+          reported in its entry of the response list.
+
+  SandboxForkResult:
+    type: object
+    description: >-
+      Result of one requested fork. Exactly one of sandbox or error is set:
+      sandbox when the fork started successfully, error when it failed to
+      start.
+    properties:
+      sandbox:
+        $ref: "#/components/schemas/Sandbox"
+      error:
+        $ref: "#/components/schemas/Error"

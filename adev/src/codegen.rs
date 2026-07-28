@@ -1,4 +1,6 @@
-use anyhow::Result;
+use std::fs;
+
+use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 
 use crate::config;
@@ -29,6 +31,7 @@ pub enum CodegenTarget {
 /// npm wrapper version for @openapitools/openapi-generator-cli.
 /// The actual generator jar version is controlled by openapitools.json in the project root.
 const OPENAPI_GENERATOR_CLI_VERSION: &str = "2.32.0";
+const OPENAPI_TEMPLATE_NAME: &str = "openapi";
 
 pub fn run(args: CodegenArgs) -> Result<()> {
     let project_root = config::project_root()?;
@@ -82,6 +85,169 @@ fn run_custom_extension(project_root: &std::path::Path) -> Result<()> {
     util::cmd("cargo", &["fmt", "-p", "custom_extension_client"])?;
     util::info("custom extension client generated.");
     Ok(())
+}
+
+fn render_server_spec_source(spec_dir: &std::path::Path) -> Result<String> {
+    let template_path = spec_dir.join("openapi.tmpl");
+    let template_source = fs::read_to_string(&template_path)
+        .with_context(|| format!("read OpenAPI template {}", template_path.display()))?;
+    let security = read_section_file(
+        &spec_dir.join("components/security.yml"),
+        "securitySchemes",
+        2,
+    )?;
+    let parameters =
+        read_section_file(&spec_dir.join("components/parameters.yml"), "parameters", 2)?;
+    let responses = read_section_file(&spec_dir.join("components/responses.yml"), "responses", 2)?;
+    let tags = template_tag_order(&template_source)?;
+    let schemas = read_schema_sections(&spec_dir.join("components/schemas"), &tags)?;
+    let paths = read_tagged_sections(&spec_dir.join("paths"), &tags, "paths", 2, &[])?;
+
+    let mut engine = upon::Engine::new();
+    engine
+        .add_template(OPENAPI_TEMPLATE_NAME, template_source)
+        .with_context(|| format!("compile OpenAPI template {}", template_path.display()))?;
+    engine
+        .template(OPENAPI_TEMPLATE_NAME)
+        .render(upon::value! {
+            security: security,
+            parameters: parameters,
+            responses: responses,
+            schemas: schemas,
+            paths: paths,
+        })
+        .to_string()
+        .with_context(|| format!("render OpenAPI template {}", template_path.display()))
+}
+
+fn template_tag_order(template: &str) -> Result<Vec<String>> {
+    let mut lines = template.lines();
+    lines
+        .find(|line| *line == "tags:")
+        .ok_or_else(|| anyhow::anyhow!("OpenAPI template is missing a top-level `tags` section"))?;
+    let tags = lines
+        .take_while(|line| line.is_empty() || line.starts_with(' '))
+        .filter_map(|line| line.strip_prefix("  - name: "))
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+    if tags.is_empty() {
+        anyhow::bail!("OpenAPI template does not define any tags");
+    }
+    if tags
+        .iter()
+        .enumerate()
+        .any(|(index, tag)| tags[..index].contains(tag))
+    {
+        anyhow::bail!("OpenAPI template contains duplicate tags");
+    }
+    Ok(tags)
+}
+
+fn read_schema_sections(dir: &std::path::Path, tags: &[String]) -> Result<String> {
+    let common = read_section_file(&dir.join("common.yml"), "schemas", 2)?;
+    let tagged = read_tagged_sections(dir, tags, "schemas", 2, &["common"])?;
+    if tagged.is_empty() {
+        Ok(common)
+    } else {
+        Ok(format!("{common}\n\n{tagged}"))
+    }
+}
+
+fn read_tagged_sections(
+    dir: &std::path::Path,
+    tags: &[String],
+    expected_header: &str,
+    indent: usize,
+    ignored_stems: &[&str],
+) -> Result<String> {
+    let mut paths = yaml_files(dir)?;
+    paths.sort();
+    paths.retain(|path| {
+        !ignored_stems.iter().any(|ignored| {
+            path.file_stem()
+                .is_some_and(|file_stem| file_stem == *ignored)
+        })
+    });
+
+    let mut sections = Vec::with_capacity(paths.len());
+    for tag in tags {
+        let Some(index) = paths.iter().position(|path| {
+            path.file_stem()
+                .is_some_and(|file_stem| file_stem == tag.as_str())
+        }) else {
+            continue;
+        };
+        sections.push(read_section_file(
+            &paths.remove(index),
+            expected_header,
+            indent,
+        )?);
+    }
+
+    if let Some(path) = paths.first() {
+        anyhow::bail!(
+            "{expected_header} section `{}` has no matching tag in the OpenAPI template",
+            path.display(),
+        );
+    }
+    Ok(sections.join("\n\n"))
+}
+
+fn yaml_files(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    let entries = fs::read_dir(dir)
+        .with_context(|| format!("read OpenAPI section directory {}", dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("read entries from {}", dir.display()))?;
+
+    Ok(entries
+        .into_iter()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "yml" || extension == "yaml")
+        })
+        .collect())
+}
+
+fn read_section_file(
+    path: &std::path::Path,
+    expected_header: &str,
+    indent: usize,
+) -> Result<String> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("read OpenAPI section {}", path.display()))?;
+    render_section_body(&content, expected_header, indent)
+        .with_context(|| format!("render OpenAPI section {}", path.display()))
+}
+
+fn render_section_body(content: &str, expected_header: &str, indent: usize) -> Result<String> {
+    let (header, body) = content
+        .split_once('\n')
+        .ok_or_else(|| anyhow::anyhow!("section must contain a header and body"))?;
+    let expected = format!("{expected_header}:");
+    if header.trim_end() != expected {
+        anyhow::bail!("expected first line `{expected}`, found `{header}`");
+    }
+    if body.trim().is_empty() {
+        anyhow::bail!("section `{expected_header}` has an empty body");
+    }
+
+    let prefix = " ".repeat(indent);
+    Ok(body
+        .trim_end()
+        .lines()
+        .map(|line| {
+            if line.is_empty() {
+                String::new()
+            } else {
+                format!("{prefix}{line}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 /// Run openapi-generator-cli via npx.
@@ -152,7 +318,15 @@ fn run_envd(project_root: &std::path::Path) -> Result<()> {
 fn run_server(project_root: &std::path::Path) -> Result<()> {
     let server_dir = project_root.join("src/api/generated");
     let spec = project_root.join("src/api/openapi.yml");
+    let spec_dir = project_root.join("src/api/spec");
 
+    let rendered = render_server_spec_source(&spec_dir)?;
+    fs::write(&spec, rendered)
+        .with_context(|| format!("write rendered OpenAPI spec {}", spec.display()))?;
+    util::info(&format!(
+        "AENV OpenAPI spec rendered to {}.",
+        spec.display()
+    ));
     util::info("Regenerating AENV HTTP server...");
     run_openapi_generator(
         project_root,
@@ -239,4 +413,81 @@ fn fix_duplicate_auth_trait(path: &std::path::Path) -> Result<()> {
         path.display()
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_section_body, render_server_spec_source, template_tag_order};
+
+    #[test]
+    fn repository_template_renders_expected_structure() {
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let rendered = render_server_spec_source(&project_root.join("src/api/spec")).unwrap();
+
+        assert!(rendered.starts_with("openapi: 3.0.0\n"));
+        assert!(rendered.contains("\ncomponents:\n"));
+        assert!(rendered.contains("\npaths:\n"));
+
+        let mut previous = 0;
+        for path in [
+            "\n  /health:",
+            "\n  /nodes:",
+            "\n  /v3/templates:",
+            "\n  /sandboxes:",
+            "\n  /snapshots:",
+        ] {
+            let current = rendered.find(path).unwrap();
+            assert!(current >= previous, "{path} rendered out of tag order");
+            previous = current;
+        }
+
+        let mut previous = 0;
+        for schema in [
+            "\n    CPUCount:",
+            "\n    NodeStatus:",
+            "\n    Template:",
+            "\n    SandboxMetadata:",
+            "\n    SnapshotInfo:",
+        ] {
+            let current = rendered.find(schema).unwrap();
+            assert!(current >= previous, "{schema} rendered out of tag order");
+            previous = current;
+        }
+    }
+
+    #[test]
+    fn reads_path_order_from_template_tags() {
+        let template = "\ntags:\n  - name: admin\n  - name: sandboxes\n\npaths:\n";
+
+        assert_eq!(
+            template_tag_order(template).unwrap(),
+            ["admin", "sandboxes"]
+        );
+    }
+
+    #[test]
+    fn renders_section_body_with_requested_indentation() {
+        let rendered = render_section_body(
+            "schemas:\n  First:\n    type: string\n\n  Second:\n    type: integer\n",
+            "schemas",
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rendered,
+            "    First:\n      type: string\n\n    Second:\n      type: integer"
+        );
+    }
+
+    #[test]
+    fn rejects_a_section_with_the_wrong_header() {
+        let error = render_section_body("paths:\n/example:\n  get: {}\n", "schemas", 2)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("expected first line `schemas:`"));
+    }
 }

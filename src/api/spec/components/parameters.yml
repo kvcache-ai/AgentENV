@@ -1,0 +1,75 @@
+parameters:
+  templateID:
+    name: templateID
+    in: path
+    required: true
+    schema:
+      type: string
+  buildID:
+    name: buildID
+    in: path
+    required: true
+    schema:
+      type: string
+  sandboxID:
+    name: sandboxID
+    in: path
+    required: true
+    schema:
+      type: string
+  teamID:
+    name: teamID
+    in: path
+    required: true
+    schema:
+      type: string
+  nodeID:
+    name: nodeID
+    in: path
+    required: true
+    schema:
+      type: string
+  apiKeyID:
+    name: apiKeyID
+    in: path
+    required: true
+    schema:
+      type: string
+  accessTokenID:
+    name: accessTokenID
+    in: path
+    required: true
+    schema:
+      type: string
+  snapshotID:
+    name: snapshotID
+    in: path
+    required: true
+    schema:
+      type: string
+      description: Identifier of the snapshot (template ID)
+  tag:
+    name: tag
+    in: path
+    required: true
+    schema:
+      type: string
+      description: Tag name
+  paginationLimit:
+    name: limit
+    in: query
+    description: Maximum number of items to return per page
+    required: false
+    schema:
+      type: integer
+      format: int32
+      minimum: 1
+      default: 100
+      maximum: 100
+  paginationNextToken:
+    name: nextToken
+    in: query
+    description: Cursor to start the list from
+    required: false
+    schema:
+      type: string
