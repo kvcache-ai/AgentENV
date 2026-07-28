@@ -97,9 +97,14 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	}
 
 	eligible := FilterByResourceLimit(rich, s.resourceLimit)
+	requirements := req.GetHint().GetLocalityRequirements()
+	if len(requirements) > maxLocalityRequirements {
+		err = status.Error(codes.InvalidArgument, "too many locality requirements")
+		return nil, err
+	}
 	preferred, locality := PreferLocalNodes(
 		eligible,
-		req.GetHint().GetLocalityRequirements(),
+		requirements,
 		s.artifacts,
 	)
 
