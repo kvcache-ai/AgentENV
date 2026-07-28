@@ -326,6 +326,7 @@ pub struct FirecrackerSandboxConfig {
     pub boot_args: Option<String>,
     pub vcpu_count: u32,
     pub mem_size_mib: u32,
+    pub disk_rate_limit: crate::cfg::DiskRateLimitConfig,
 }
 
 impl FirecrackerSandboxConfig {
@@ -352,6 +353,7 @@ impl FirecrackerSandboxConfig {
             boot_args: None,
             vcpu_count: app_config.machine.vcpu_count,
             mem_size_mib: app_config.machine.mem_size_mib,
+            disk_rate_limit: app_config.machine.disk_rate_limit,
         }
     }
 
@@ -385,6 +387,7 @@ impl FirecrackerSandboxConfig {
                 .or_else(|| Some(DEFAULT_BOOT_ARGS.to_string())),
             vcpu_count: config.machine.vcpu_count,
             mem_size_mib: config.machine.mem_size_mib,
+            disk_rate_limit: config.machine.disk_rate_limit.clone(),
         })
     }
 

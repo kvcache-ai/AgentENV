@@ -56,6 +56,39 @@ const VM_STATE_FILE_NAME: &str = "vm_state.bin";
 const ROOTFS_DRIVE_PATH: &str = "rootfs.ext4";
 const USER_ROOTFS_DRIVE_PATH: &str = "user-rootfs";
 
+fn build_disk_rate_limiter(
+    cfg: &crate::cfg::DiskRateLimitConfig,
+) -> Option<Box<firecracker_client::models::RateLimiter>> {
+    if !cfg.enabled {
+        return None;
+    }
+    let mut rl = firecracker_client::models::RateLimiter::new();
+    if cfg.bandwidth_bytes_per_sec > 0 {
+        let mut bw = firecracker_client::models::TokenBucket::new(
+            cfg.refill_time_ms as i64,
+            cfg.bandwidth_bytes_per_sec as i64,
+        );
+        if cfg.bandwidth_burst_bytes > 0 {
+            bw.one_time_burst = Some(cfg.bandwidth_burst_bytes as i64);
+        }
+        rl.bandwidth = Some(Box::new(bw));
+    }
+    if cfg.iops > 0 {
+        let mut ops = firecracker_client::models::TokenBucket::new(
+            cfg.refill_time_ms as i64,
+            cfg.iops as i64,
+        );
+        if cfg.iops_burst > 0 {
+            ops.one_time_burst = Some(cfg.iops_burst as i64);
+        }
+        rl.ops = Some(Box::new(ops));
+    }
+    if rl.bandwidth.is_none() && rl.ops.is_none() {
+        return None;
+    }
+    Some(Box::new(rl))
+}
+
 pub(super) fn managed_snapshot_base() -> PathBuf {
     ConfigManager::global_config()
         .firecracker
@@ -1470,6 +1503,15 @@ impl FirecrackerSandbox {
         self.fc_instance.set_mmds(&mmds_metadata).await?;
         self.fc_instance.resume().await?;
 
+        // Apply disk rate limiter to user rootfs drive after resume.
+        let disk_rl_cfg = &ConfigManager::global_config().machine.disk_rate_limit;
+        if let Some(rl) = build_disk_rate_limiter(disk_rl_cfg) {
+            self.fc_instance
+                .patch_drive_rate_limiter(USER_ROOTFS_DRIVE_ID, rl)
+                .await
+                .context("apply disk rate limiter after resume")?;
+        }
+
         debug!("sandbox restored from snapshot config");
         Ok(())
     }
@@ -1572,6 +1614,7 @@ impl FirecrackerSandbox {
                 true,
                 false,
                 IoEngine::Sync,
+                None,
             )
             .await
             .with_context(|| {
@@ -1582,6 +1625,7 @@ impl FirecrackerSandbox {
             })?;
 
         // Drive 1 (/dev/vdb): user image, writable.
+        let disk_rl = build_disk_rate_limiter(&config.disk_rate_limit);
         self.fc_instance
             .add_drive(
                 USER_ROOTFS_DRIVE_ID,
@@ -1590,6 +1634,7 @@ impl FirecrackerSandbox {
                 false,
                 true,
                 IoEngine::Async,
+                disk_rl,
             )
             .await?;
 
@@ -1631,6 +1676,7 @@ impl FirecrackerSandbox {
                     drive.read_only,
                     true,
                     IoEngine::Async,
+                    None,
                 )
                 .await
                 .with_context(|| format!("Failed to add extra drive {}", drive.drive_id))?;
