@@ -110,6 +110,30 @@ General config notes:
 
 The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). Current built-in strategies ignore the snapshot, but custom strategy implementations can use it for load-aware decisions.
 
+### Snapshot locality preference
+
+For `POST /sandboxes`, the Gateway derives advisory locality requirements from
+the requested `templateID` using the snapshot's stable P2P artifact keys:
+
+- `snapshot/v1/artifacts/{snapshot_id}/vm_state.bin`
+- `snapshot/v1/artifacts/{snapshot_id}/firecracker-manifest.json`
+
+After applying node resource limits, the scheduler checks the existing P2P
+artifact index and keeps the eligible nodes tied for the highest positive
+requirement coverage. The configured scheduling strategy then selects from
+that preferred set. Artifact lookups use each candidate node's heartbeat
+reported cluster ID and P2P backend, so records do not cross cluster or backend
+boundaries.
+
+Locality is best-effort. If the request has no requirements, no eligible node
+has a matching record, or a node has not reported P2P context, the scheduler
+passes the full eligible candidate set to the configured strategy. Stale
+artifact records therefore affect placement only; the selected AgentENV node
+continues to use its normal local cache, P2P, repository, or registry fallback.
+
+This initial implementation does not resolve OCI image references into
+OverlayBD layer requirements and does not index non-P2P local caches.
+
 ### Node resource limit
 
 `scheduler.node_resource_limit` defines per-node resource thresholds that are evaluated **before** the strategy runs. Any node whose heartbeat snapshot exceeds a configured limit is removed from the candidate list, regardless of which strategy is in use. This is a generic guard-rail that sits above the strategy layer — strategies only see nodes that already passed the resource filter.
