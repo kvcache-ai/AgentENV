@@ -688,6 +688,7 @@ impl PosixFsCatalogStore {
             resources,
             created_at_unix_ms: now_unix_ms,
             updated_at_unix_ms: now_unix_ms,
+            deleting: false,
             committed: Some(committed),
         })
     }

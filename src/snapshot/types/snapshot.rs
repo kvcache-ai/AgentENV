@@ -328,6 +328,10 @@ pub struct SnapshotRecord {
     pub resources: SandboxResources,
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
+    /// Durable tombstone set before external publication cleanup starts.
+    /// Tombstoned records retain retry metadata but are hidden from readers.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub deleting: bool,
     pub committed: Option<CommittedSnapshot>,
 }
 
@@ -347,6 +351,7 @@ impl SnapshotRecord {
             resources,
             created_at_unix_ms: now_unix_ms,
             updated_at_unix_ms: now_unix_ms,
+            deleting: false,
             committed: None,
         }
     }
@@ -373,6 +378,11 @@ impl SnapshotRecord {
         self.committed = Some(committed);
     }
 
+    pub fn mark_deleting(&mut self, now_unix_ms: i64) {
+        self.deleting = true;
+        self.updated_at_unix_ms = now_unix_ms;
+    }
+
     #[cfg(test)]
     pub fn mock_ready(committed: CommittedSnapshot) -> Self {
         Self {
@@ -389,9 +399,14 @@ impl SnapshotRecord {
             resources: SandboxResources::default(),
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
+            deleting: false,
             committed: Some(committed),
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn now_unix_ms() -> i64 {
@@ -572,6 +587,22 @@ mod tests {
             .runtime_versions
             .tools_drive_version
             .is_empty());
+    }
+
+    #[test]
+    fn snapshot_deleting_tombstone_is_backward_compatible_and_persisted() {
+        let record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let legacy = serde_json::to_value(&record).expect("serialize snapshot record");
+        assert!(legacy.get("deleting").is_none());
+
+        let mut restored: SnapshotRecord =
+            serde_json::from_value(legacy).expect("deserialize legacy snapshot record");
+        assert!(!restored.deleting);
+
+        restored.mark_deleting(123);
+        let tombstone = serde_json::to_value(&restored).expect("serialize tombstone");
+        assert_eq!(tombstone["deleting"], true);
+        assert_eq!(tombstone["updated_at_unix_ms"], 123);
     }
 
     #[test]

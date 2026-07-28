@@ -154,6 +154,10 @@ pub trait SnapshotRepository: Send + Sync {
     ///
     /// For committed records, implementations should also remove per-snapshot committed artifacts and
     /// any alias binding that still points at the deleted id.
+    ///
+    /// Backends that remove externally referenced publications before the
+    /// catalog record must first persist a reader-invisible tombstone while
+    /// retaining enough metadata to retry interrupted cleanup.
     async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()>;
 
     /// Resolves a human-readable alias to the current snapshot id.

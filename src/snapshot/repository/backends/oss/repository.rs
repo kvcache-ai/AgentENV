@@ -340,22 +340,10 @@ impl SnapshotRepository for OssSnapshotRepository {
     }
 
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        // Try by id first.
-        if let Ok(direct_id) = crate::snapshot::SnapshotId::parse(id_or_alias) {
-            if let Some(record) = self.read_record(&direct_id).await? {
-                return Ok(Some(record));
-            }
-        }
-
-        // Try by alias.
-        let resolved_id = match self.resolve_alias(id_or_alias).await {
-            Ok(id) => id,
-            Err(error) => return Err(error),
-        };
-        let Some(resolved_id) = resolved_id else {
-            return Ok(None);
-        };
-        self.read_record(&resolved_id).await
+        Ok(self
+            .read_record_by_id_or_alias(id_or_alias)
+            .await?
+            .filter(Self::is_visible_record))
     }
 
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
@@ -378,7 +366,9 @@ impl SnapshotRepository for OssSnapshotRepository {
             .try_collect()
             .await?;
 
-        records.retain(|record| Self::matches_record_filter(record, &filter));
+        records.retain(|record| {
+            Self::is_visible_record(record) && Self::matches_record_filter(record, &filter)
+        });
         records.sort_by(|a, b| {
             b.created_at_unix_ms
                 .cmp(&a.created_at_unix_ms)
@@ -390,25 +380,39 @@ impl SnapshotRepository for OssSnapshotRepository {
 
     async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
         // Resolve the actual id + metadata.
-        let record = match self.get(id_or_alias).await? {
+        let mut record = match self.read_record_by_id_or_alias(id_or_alias).await? {
             Some(t) => t,
             None => return Ok(()), // Idempotent.
         };
-        let id = &record.id;
-        let layout = self.layout(id);
+        let id = record.id.clone();
+        let layout = self.layout(&id);
 
-        // 1. Delete external publications while the durable record still
-        // contains the metadata required to retry cleanup. Manifest deletion
-        // treats 404 as success, so a partially completed cleanup is safe to
-        // retry.
+        // 1. Hide the snapshot durably before removing anything external.
+        // The tombstoned record retains publication metadata for retries, while
+        // get/list no longer expose a snapshot that may be partially deleted.
+        if !record.deleting {
+            record.mark_deleting(now_unix_ms());
+            self.write_record(&record).await?;
+        }
+
+        // 2. Delete external publications. Manifest deletion treats 404 as
+        // success, so a partially completed cleanup is safe to retry by id or
+        // alias while the tombstone remains durable.
         if let Some(committed) = record.committed.as_ref() {
-            self.delete_disk_publications(id, &committed.disk_publications)
+            self.delete_disk_publications(&id, &committed.disk_publications)
                 .await?;
         }
 
-        // 2. Delete alias binding.
+        // 3. Delete the catalog record. Until this succeeds, the alias remains
+        // available as a retry handle but resolves to an invisible tombstone.
+        self.client
+            .delete(&OssSnapshotArtifactLayout::record_key(&id))
+            .await
+            .map_err(|e| RepositoryError::backend("delete snapshot record from oss", e))?;
+
+        // 4. Delete alias binding.
         if let Some(ref alias) = record.alias {
-            if self.load_alias_target(alias.as_ref()).await?.as_ref() == Some(id) {
+            if self.load_alias_target(alias.as_ref()).await?.as_ref() == Some(&id) {
                 if let Err(error) = self
                     .client
                     .delete(&OssSnapshotArtifactLayout::alias_key(alias.as_ref()))
@@ -419,13 +423,7 @@ impl SnapshotRepository for OssSnapshotRepository {
             }
         }
 
-        // 3. Delete the catalog record.
-        self.client
-            .delete(&OssSnapshotArtifactLayout::record_key(id))
-            .await
-            .map_err(|e| RepositoryError::backend("delete snapshot record from oss", e))?;
-
-        // 4. Delete artifacts.
+        // 5. Delete artifacts.
         if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
             warn!(snapshot_id = %id, error = %error, "failed to delete oss snapshot artifacts");
         }
@@ -447,14 +445,19 @@ impl SnapshotRepository for OssSnapshotRepository {
         let id: SnapshotId = serde_json::from_slice(&data)
             .map_err(|e| RepositoryError::backend(format!("parse alias '{alias}'"), e))?;
 
-        // Stale-alias cleanup: if the snapshot record doesn't exist, delete the alias
-        // and return None (mirrors PosixFs catalog.rs:236 behavior).
-        let snapshot_exists = self.snapshot_exists(&id).await?;
-        if !snapshot_exists {
+        // Stale-alias cleanup: if the snapshot record doesn't exist, delete the
+        // alias and return None (mirrors PosixFs catalog.rs:236 behavior).
+        // Tombstoned records remain durable for deletion retries but are not
+        // exposed through public alias resolution.
+        let record = self.read_record(&id).await?;
+        if record.is_none() {
             warn!(alias = %alias, snapshot_id = %id, "cleaning up stale alias pointing to missing snapshot");
             if let Err(error) = self.client.delete(&key).await {
                 warn!(alias = %alias, snapshot_id = %id, error = %error, "failed to delete stale oss alias");
             }
+            return Ok(None);
+        }
+        if record.is_some_and(|record| record.deleting) {
             return Ok(None);
         }
 
@@ -515,6 +518,26 @@ impl SnapshotRepository for OssSnapshotRepository {
 // ── private helpers ────────────────────────────────────────────────────
 
 impl OssSnapshotRepository {
+    fn is_visible_record(record: &SnapshotRecord) -> bool {
+        !record.deleting
+    }
+
+    async fn read_record_by_id_or_alias(
+        &self,
+        id_or_alias: &str,
+    ) -> RepositoryResult<Option<SnapshotRecord>> {
+        if let Ok(direct_id) = SnapshotId::parse(id_or_alias) {
+            if let Some(record) = self.read_record(&direct_id).await? {
+                return Ok(Some(record));
+            }
+        }
+
+        let Some(resolved_id) = self.load_alias_target(id_or_alias).await? else {
+            return Ok(None);
+        };
+        self.read_record(&resolved_id).await
+    }
+
     async fn read_record(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>> {
         let key = OssSnapshotArtifactLayout::record_key(id);
         match self.client.get_bytes(&key).await {
@@ -571,6 +594,7 @@ impl OssSnapshotRepository {
                 resources,
                 created_at_unix_ms: now,
                 updated_at_unix_ms: now,
+                deleting: false,
                 committed: Some(committed),
             }
         };
@@ -1193,6 +1217,15 @@ mod tests {
         )
         .expect("oss client");
         OssSnapshotRepository::new(Arc::new(client), SnapshotImageStoragePolicy::ObjectStorage)
+    }
+
+    #[test]
+    fn deleting_records_are_hidden_from_readers() {
+        let mut record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        assert!(OssSnapshotRepository::is_visible_record(&record));
+
+        record.mark_deleting(1);
+        assert!(!OssSnapshotRepository::is_visible_record(&record));
     }
 
     #[test]
