@@ -113,7 +113,10 @@ The strategy interface receives `RichNode` values that carry the node identity (
 ### Snapshot locality preference
 
 For `POST /sandboxes`, the Gateway derives advisory locality requirements from
-the requested `templateID` using the snapshot's stable P2P artifact keys:
+the requested `templateID` using the snapshot's stable P2P artifact keys. UUID
+template IDs are normalized to their canonical lowercase form. When the
+request uses a template alias, the Gateway resolves it through the discovered
+nodes' alias endpoint before building the keys:
 
 - `snapshot/v1/artifacts/{snapshot_id}/vm_state.bin`
 - `snapshot/v1/artifacts/{snapshot_id}/firecracker-manifest.json`
@@ -125,11 +128,12 @@ that preferred set. Artifact lookups use each candidate node's heartbeat
 reported cluster ID and P2P backend, so records do not cross cluster or backend
 boundaries.
 
-Locality is best-effort. If the request has no requirements, no eligible node
-has a matching record, or a node has not reported P2P context, the scheduler
-passes the full eligible candidate set to the configured strategy. Stale
-artifact records therefore affect placement only; the selected AgentENV node
-continues to use its normal local cache, P2P, repository, or registry fallback.
+Locality is best-effort. If alias resolution is unavailable, the request has no
+requirements, no eligible node has a matching record, or a node has not
+reported P2P context, the scheduler passes the full eligible candidate set to
+the configured strategy. Stale artifact records therefore affect placement
+only; the selected AgentENV node continues to use its normal local cache, P2P,
+repository, or registry fallback.
 
 This initial implementation does not resolve OCI image references into
 OverlayBD layer requirements and does not index non-P2P local caches.

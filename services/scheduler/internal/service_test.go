@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -286,6 +287,24 @@ func TestSchedulePrefersNodeWithSnapshotArtifacts(t *testing.T) {
 	}
 	if got := resp.GetNode().GetNodeId(); got != "node-b" {
 		t.Fatalf("selected node = %q, want node-b", got)
+	}
+}
+
+func TestScheduleRejectsTooManyLocalityRequirements(t *testing.T) {
+	keys := make([]string, maxLocalityRequirements+1)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("locality-key-%d", i)
+	}
+
+	service := NewService(
+		zap.NewNop(),
+		NewAtomicNodeRegistry(nil, defaultObservedReportTTL),
+		NewStrategy("round_robin"),
+		NewInMemoryBindingStore(defaultObservedReportTTL),
+	)
+	_, err := service.Schedule(context.Background(), localityScheduleRequest(keys...))
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("schedule error code = %s, want InvalidArgument (err=%v)", status.Code(err), err)
 	}
 }
 

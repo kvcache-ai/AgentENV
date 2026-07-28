@@ -25,6 +25,12 @@ type Service struct {
 	resourceLimit *config.NodeResourceLimit
 }
 
+// maxLocalityRequirements bounds the amount of scheduler work driven by one
+// Schedule request. The gateway currently emits two fixed snapshot artifact
+// requirements, so this leaves room for future hint expansion without adding
+// a per-deployment tuning knob for an internal safety limit.
+const maxLocalityRequirements = 32
+
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
 	if logger == nil {
 		logger = zap.NewNop()

@@ -42,7 +42,6 @@ func buildScheduleHint(r *http.Request) (*schedulerv1.ScheduleRequestHint, error
 			Kind: &schedulerv1.ScheduleRequestHint_NewSandbox{
 				NewSandbox: newSandbox,
 			},
-			LocalityRequirements: snapshotLocalityRequirements(newSandbox.GetTemplateId()),
 		}, nil
 	default:
 		return nil, nil

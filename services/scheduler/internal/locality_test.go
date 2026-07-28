@@ -117,6 +117,35 @@ func TestPreferLocalNodesSkipsCandidatesWithoutLocalityContext(t *testing.T) {
 	}
 }
 
+func TestPreferLocalNodesCountsRequirementsBeforeEarlyReturn(t *testing.T) {
+	_, stats := PreferLocalNodes(
+		nil,
+		localityTestRequirements("key-a", "key-a", "key-b"),
+		NewInMemoryArtifactStore(10, 0),
+	)
+	if stats.RequirementCount != 2 {
+		t.Fatalf("requirement count = %d, want 2", stats.RequirementCount)
+	}
+}
+
+type duplicateArtifactProvider struct{}
+
+func (duplicateArtifactProvider) LookupAll(string, string, string) []string {
+	return []string{"node-a", "node-a"}
+}
+
+func TestPreferLocalNodesDeduplicatesProviderNodeIDs(t *testing.T) {
+	preferred, stats := PreferLocalNodes(
+		localityTestNodes("cluster", "iroh", "node-a"),
+		localityTestRequirements("key-a"),
+		duplicateArtifactProvider{},
+	)
+	assertLocalityNodeIDs(t, preferred, "node-a")
+	if stats.MaxCoverage != 1 || stats.ProviderNodeCount != 1 {
+		t.Fatalf("unexpected duplicate provider stats: %+v", stats)
+	}
+}
+
 func localityTestNodes(clusterID, backend string, nodeIDs ...string) []RichNode {
 	nodes := make([]RichNode, 0, len(nodeIDs))
 	for _, nodeID := range nodeIDs {

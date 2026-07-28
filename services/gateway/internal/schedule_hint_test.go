@@ -40,12 +40,8 @@ func TestBuildScheduleHintNewSandbox(t *testing.T) {
 	if got := hint.GetNewSandbox().GetTemplateId(); got != "tmpl" {
 		t.Fatalf("template_id = %q, want tmpl", got)
 	}
-	wantRequirements := []string{
-		"snapshot/v1/artifacts/tmpl/vm_state.bin",
-		"snapshot/v1/artifacts/tmpl/firecracker-manifest.json",
-	}
-	if got := localityRequirementKeys(hint.GetLocalityRequirements()); !equalStrings(got, wantRequirements) {
-		t.Fatalf("locality requirements = %v, want %v", got, wantRequirements)
+	if got := hint.GetLocalityRequirements(); len(got) != 0 {
+		t.Fatalf("raw schedule hint must not derive locality keys from an unresolved template reference: %v", got)
 	}
 
 	// Body must remain available for the upstream request.
@@ -195,10 +191,10 @@ func TestSnapshotLocalityRequirements(t *testing.T) {
 	}
 
 	want := []string{
-		"snapshot/v1/artifacts/snapshot-1/vm_state.bin",
-		"snapshot/v1/artifacts/snapshot-1/firecracker-manifest.json",
+		"snapshot/v1/artifacts/550e8400-e29b-41d4-a716-446655440000/vm_state.bin",
+		"snapshot/v1/artifacts/550e8400-e29b-41d4-a716-446655440000/firecracker-manifest.json",
 	}
-	if got := localityRequirementKeys(snapshotLocalityRequirements(" snapshot-1 ")); !equalStrings(got, want) {
+	if got := localityRequirementKeys(snapshotLocalityRequirements(" 550e8400-e29b-41d4-a716-446655440000 ")); !equalStrings(got, want) {
 		t.Fatalf("requirements = %v, want %v", got, want)
 	}
 }
