@@ -3,15 +3,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use tempfile::NamedTempFile;
-use tracing::warn;
-
 use crate::digest;
 use crate::snapshot::repository::backends::common::write_dense_overlaybd_layer_to_file;
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::{
     ExternalLayer, OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotId,
 };
+use tempfile::NamedTempFile;
 
 use super::client::{AcrClient, AcrClientError};
 use super::manifest::{build_oci_image_manifest, minimal_oci_config_blob, OciDescriptor};
@@ -158,6 +156,7 @@ impl AcrDiskImageExporter {
         let manifest = build_oci_image_manifest(
             OciDescriptor::config(config_digest, config_size),
             descriptors,
+            &tag,
         )?;
         let manifest_digest = client
             .put_manifest(&manifest_url, &target.repository, manifest)
@@ -181,12 +180,12 @@ impl AcrDiskImageExporter {
         let repository_ref = match SourceRegistryRepository::parse(&publication.repo_blob_url) {
             Ok(repository_ref) => repository_ref,
             Err(error) => {
-                warn!(
-                    repo_blob_url = %publication.repo_blob_url,
-                    error = %error,
-                    "cannot roll back ACR publication with invalid repoBlobUrl"
-                );
-                return Ok(());
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!(
+                        "cannot delete ACR publication with invalid repoBlobUrl '{}': {error}",
+                        publication.repo_blob_url
+                    ),
+                });
             }
         };
         let client = self.client_for_registry(&repository_ref.registry).await?;
@@ -477,5 +476,25 @@ mod tests {
             ]
         );
         assert!(outcome.publication.is_none());
+    }
+
+    #[tokio::test]
+    async fn rollback_rejects_invalid_persisted_repository_metadata() {
+        let publisher = AcrDiskImageExporter::new_with_client_builder(Arc::new(|registry| {
+            panic!("invalid metadata must fail before creating a client for {registry}")
+        }));
+        let publication = PersistedDiskImagePublication {
+            image_ref: "invalid".to_string(),
+            tag: "agentenv-snapshot-test".to_string(),
+            manifest_digest: "sha256:manifest".to_string(),
+            repo_blob_url: "not-a-repository-url".to_string(),
+        };
+
+        let error = publisher
+            .rollback_publication(&publication)
+            .await
+            .expect_err("invalid persisted metadata must not be treated as cleaned up");
+
+        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
     }
 }

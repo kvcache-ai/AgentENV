@@ -10,6 +10,7 @@ pub(crate) const OCI_IMAGE_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.
 pub(crate) const OCI_TAR_LAYER_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar";
 const OVERLAYBD_BLOB_DIGEST_ANNOTATION: &str = "containerd.io/snapshot/overlaybd/blob-digest";
 const OVERLAYBD_BLOB_SIZE_ANNOTATION: &str = "containerd.io/snapshot/overlaybd/blob-size";
+const SNAPSHOT_TAG_ANNOTATION: &str = "io.agentenv.snapshot.tag";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +52,7 @@ struct OciManifest {
     media_type: String,
     config: OciDescriptor,
     layers: Vec<OciDescriptor>,
+    annotations: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -106,12 +108,19 @@ pub(crate) fn minimal_oci_config_blob(
 pub(crate) fn build_oci_image_manifest(
     config: OciDescriptor,
     layers: Vec<OciDescriptor>,
+    publication_tag: &str,
 ) -> RepositoryResult<Vec<u8>> {
+    let mut annotations = BTreeMap::new();
+    annotations.insert(
+        SNAPSHOT_TAG_ANNOTATION.to_string(),
+        publication_tag.to_string(),
+    );
     let manifest = OciManifest {
         schema_version: 2,
         media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
         config,
         layers,
+        annotations,
     };
     serde_json::to_vec(&manifest)
         .map_err(|e| RepositoryError::backend("serialize OCI image manifest", e))
@@ -140,6 +149,7 @@ mod tests {
         let manifest = build_oci_image_manifest(
             OciDescriptor::config("sha256:config".to_string(), 2),
             vec![layer],
+            "agentenv-snapshot-test",
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
@@ -159,6 +169,27 @@ mod tests {
         assert_eq!(
             value["layers"][0]["annotations"]["containerd.io/snapshot/overlaybd/blob-size"],
             "123"
+        );
+        assert_eq!(
+            value["annotations"]["io.agentenv.snapshot.tag"],
+            "agentenv-snapshot-test"
+        );
+    }
+
+    #[test]
+    fn publication_tag_makes_manifest_digest_unique() {
+        let config = OciDescriptor::config("sha256:config".to_string(), 2);
+        let layers = vec![OciDescriptor::overlaybd_layer(
+            "sha256:layer".to_string(),
+            123,
+        )];
+        let first =
+            build_oci_image_manifest(config.clone(), layers.clone(), "snapshot-first").unwrap();
+        let second = build_oci_image_manifest(config, layers, "snapshot-second").unwrap();
+
+        assert_ne!(
+            crate::digest::sha256_digest(&first),
+            crate::digest::sha256_digest(&second)
         );
     }
 }

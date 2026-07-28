@@ -397,7 +397,16 @@ impl SnapshotRepository for OssSnapshotRepository {
         let id = &record.id;
         let layout = self.layout(id);
 
-        // 1. Delete alias binding.
+        // 1. Delete external publications while the durable record still
+        // contains the metadata required to retry cleanup. Manifest deletion
+        // treats 404 as success, so a partially completed cleanup is safe to
+        // retry.
+        if let Some(committed) = record.committed.as_ref() {
+            self.delete_disk_publications(id, &committed.disk_publications)
+                .await?;
+        }
+
+        // 2. Delete alias binding.
         if let Some(ref alias) = record.alias {
             if self.load_alias_target(alias.as_ref()).await?.as_ref() == Some(id) {
                 if let Err(error) = self
@@ -410,17 +419,11 @@ impl SnapshotRepository for OssSnapshotRepository {
             }
         }
 
-        // 2. Delete the catalog record.
+        // 3. Delete the catalog record.
         self.client
             .delete(&OssSnapshotArtifactLayout::record_key(id))
             .await
             .map_err(|e| RepositoryError::backend("delete snapshot record from oss", e))?;
-
-        // 3. Delete external disk publications on a best-effort basis.
-        if let Some(committed) = record.committed.as_ref() {
-            self.delete_disk_publications(id, &committed.disk_publications)
-                .await;
-        }
 
         // 4. Delete artifacts.
         if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
@@ -840,18 +843,20 @@ impl OssSnapshotRepository {
         &self,
         snapshot_id: &SnapshotId,
         publications: &[PersistedDiskImagePublication],
-    ) {
+    ) -> RepositoryResult<()> {
         for publication in publications.iter().rev() {
-            if let Err(error) = self.acr_exporter.rollback_publication(publication).await {
-                warn!(
-                    snapshot_id = %snapshot_id,
-                    image_ref = %publication.image_ref,
-                    manifest_digest = %publication.manifest_digest,
-                    error = %error,
-                    "failed to delete ACR publication during snapshot removal; continuing OSS cleanup"
-                );
-            }
+            self.acr_exporter
+                .rollback_publication(publication)
+                .await
+                .map_err(|error| RepositoryError::Backend {
+                    message: format!(
+                        "delete ACR publication '{}' for snapshot '{}'",
+                        publication.image_ref, snapshot_id
+                    ),
+                    source: Some(anyhow::Error::from(error)),
+                })?;
         }
+        Ok(())
     }
 
     /// Export attached-drive disk images and derive committed metadata.
