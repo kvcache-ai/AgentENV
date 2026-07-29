@@ -360,8 +360,8 @@ type NewSandboxHint struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Sandbox metadata key/value pairs parsed from the request body.
 	Metadata map[string]string `protobuf:"bytes,1,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	// Template or snapshot reference supplied by POST /sandboxes. The locality
-	// strategy treats the exact reference as an advisory workload identity.
+	// Template or snapshot reference supplied by POST /sandboxes. The grouped
+	// round-robin strategy treats the exact reference as a workload identity.
 	TemplateId    string `protobuf:"bytes,2,opt,name=template_id,json=templateId,proto3" json:"template_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

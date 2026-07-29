@@ -8,8 +8,8 @@ import (
 	schedulerv1 "agentenv/services/api/proto"
 )
 
-func TestGroupedLocalityInterleavesImageGroups(t *testing.T) {
-	strategy := NewGroupedLocalityStrategy(LocalityGroupLimits{MaxSandboxCount: 2})
+func TestGroupedRoundRobinInterleavesImageGroups(t *testing.T) {
+	strategy := NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{MaxSandboxCount: 2})
 	nodes := readyNodes("a", "b", "c")
 
 	got := []string{
@@ -26,8 +26,8 @@ func TestGroupedLocalityInterleavesImageGroups(t *testing.T) {
 	}
 }
 
-func TestGroupedLocalityClosesGroupAtCPULimit(t *testing.T) {
-	strategy := NewGroupedLocalityStrategy(LocalityGroupLimits{
+func TestGroupedRoundRobinClosesGroupAtCPULimit(t *testing.T) {
+	strategy := NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{
 		MaxSandboxCount: 10,
 		MaxCPUCount:     4,
 	})
@@ -45,8 +45,8 @@ func TestGroupedLocalityClosesGroupAtCPULimit(t *testing.T) {
 	}
 }
 
-func TestGroupedLocalityClosesGroupAtMemoryLimit(t *testing.T) {
-	strategy := NewGroupedLocalityStrategy(LocalityGroupLimits{
+func TestGroupedRoundRobinClosesGroupAtMemoryLimit(t *testing.T) {
+	strategy := NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{
 		MaxSandboxCount: 10,
 		MaxMemoryMB:     1024,
 	})
@@ -63,8 +63,8 @@ func TestGroupedLocalityClosesGroupAtMemoryLimit(t *testing.T) {
 	}
 }
 
-func TestGroupedLocalityOversizedRequestDoesNotLeaveOpenGroup(t *testing.T) {
-	strategy := NewGroupedLocalityStrategy(LocalityGroupLimits{
+func TestGroupedRoundRobinOversizedRequestDoesNotLeaveOpenGroup(t *testing.T) {
+	strategy := NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{
 		MaxSandboxCount: 10,
 		MaxCPUCount:     2,
 	})
@@ -80,8 +80,8 @@ func TestGroupedLocalityOversizedRequestDoesNotLeaveOpenGroup(t *testing.T) {
 	}
 }
 
-func TestGroupedLocalityClosesGroupWhenNodeBecomesIneligible(t *testing.T) {
-	strategy := NewGroupedLocalityStrategy(LocalityGroupLimits{MaxSandboxCount: 3})
+func TestGroupedRoundRobinClosesGroupWhenNodeBecomesIneligible(t *testing.T) {
+	strategy := NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{MaxSandboxCount: 3})
 	nodes := readyNodes("a", "b")
 
 	if got := selectNodeID(t, strategy, nodes, coldHint("ubuntu", 0, 0)); got != "a" {
@@ -94,8 +94,8 @@ func TestGroupedLocalityClosesGroupWhenNodeBecomesIneligible(t *testing.T) {
 	}
 }
 
-func TestGroupedLocalitySkipsNodesWithoutReadyHeartbeat(t *testing.T) {
-	strategy := NewGroupedLocalityStrategy(LocalityGroupLimits{MaxSandboxCount: 2})
+func TestGroupedRoundRobinSkipsNodesWithoutReadyHeartbeat(t *testing.T) {
+	strategy := NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{MaxSandboxCount: 2})
 	nodes := []RichNode{
 		{Node: Node{ID: "missing"}},
 		{
@@ -112,8 +112,8 @@ func TestGroupedLocalitySkipsNodesWithoutReadyHeartbeat(t *testing.T) {
 	}
 }
 
-func TestGroupedLocalityGroupsTemplatesByExactReference(t *testing.T) {
-	strategy := NewGroupedLocalityStrategy(LocalityGroupLimits{MaxSandboxCount: 2})
+func TestGroupedRoundRobinGroupsTemplatesByExactReference(t *testing.T) {
+	strategy := NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{MaxSandboxCount: 2})
 	nodes := readyNodes("a", "b")
 
 	got := []string{
@@ -129,12 +129,12 @@ func TestGroupedLocalityGroupsTemplatesByExactReference(t *testing.T) {
 	}
 }
 
-func TestGroupedLocalityFallsBackToGlobalRoundRobin(t *testing.T) {
-	strategy := NewGroupedLocalityStrategy(LocalityGroupLimits{MaxSandboxCount: 2})
+func TestGroupedRoundRobinFallsBackToGlobalRoundRobin(t *testing.T) {
+	strategy := NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{MaxSandboxCount: 2})
 	nodes := readyNodes("a", "b", "c")
 
 	tooLong := coldHint("x", 0, 0)
-	tooLong.GetNewColdSandbox().Images[0] = string(make([]byte, maxLocalityGroupKeyBytes+1))
+	tooLong.GetNewColdSandbox().Images[0] = string(make([]byte, maxGroupedRoundRobinKeyBytes+1))
 	got := []string{
 		selectNodeID(t, strategy, nodes, nil),
 		selectNodeID(t, strategy, nodes, coldHint("", 0, 0)),
@@ -146,8 +146,8 @@ func TestGroupedLocalityFallsBackToGlobalRoundRobin(t *testing.T) {
 	}
 }
 
-func TestGroupedLocalityFallbackDoesNotAdvanceGroupCursor(t *testing.T) {
-	strategy := NewGroupedLocalityStrategy(LocalityGroupLimits{MaxSandboxCount: 2})
+func TestGroupedRoundRobinFallbackDoesNotAdvanceGroupCursor(t *testing.T) {
+	strategy := NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{MaxSandboxCount: 2})
 	nodes := readyNodes("a", "b")
 
 	if got := selectNodeID(t, strategy, nodes, nil); got != "a" {
@@ -158,23 +158,23 @@ func TestGroupedLocalityFallbackDoesNotAdvanceGroupCursor(t *testing.T) {
 	}
 }
 
-func TestGroupedLocalityBoundsOpenGroupState(t *testing.T) {
-	strategy := NewGroupedLocalityStrategy(LocalityGroupLimits{MaxSandboxCount: 2})
+func TestGroupedRoundRobinBoundsOpenGroupState(t *testing.T) {
+	strategy := NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{MaxSandboxCount: 2})
 	nodes := readyNodes("a")
 
-	for i := 0; i <= maxOpenLocalityGroups; i++ {
+	for i := 0; i <= maxOpenGroupedRoundRobinGroups; i++ {
 		selectNodeID(t, strategy, nodes, coldHint(fmt.Sprintf("image-%d", i), 0, 0))
 	}
-	if got := len(strategy.groups); got != maxOpenLocalityGroups {
-		t.Fatalf("open group count = %d, want %d", got, maxOpenLocalityGroups)
+	if got := len(strategy.groups); got != maxOpenGroupedRoundRobinGroups {
+		t.Fatalf("open group count = %d, want %d", got, maxOpenGroupedRoundRobinGroups)
 	}
 	if _, ok := strategy.groups["image:image-0"]; ok {
 		t.Fatal("oldest open group was not evicted")
 	}
 }
 
-func TestGroupedLocalityCountsConcurrentPlacementsAtomically(t *testing.T) {
-	strategy := NewGroupedLocalityStrategy(LocalityGroupLimits{MaxSandboxCount: 10})
+func TestGroupedRoundRobinCountsConcurrentPlacementsAtomically(t *testing.T) {
+	strategy := NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{MaxSandboxCount: 10})
 	nodes := readyNodes("a", "b")
 
 	const requests = 200
@@ -207,13 +207,13 @@ func TestGroupedLocalityCountsConcurrentPlacementsAtomically(t *testing.T) {
 	}
 }
 
-func TestNewStrategySelectsLocalityCaseInsensitively(t *testing.T) {
+func TestNewStrategySelectsGroupedRoundRobinCaseInsensitively(t *testing.T) {
 	strategy := NewStrategy(
-		" LOCALITY ",
-		WithLocalityGroupLimits(LocalityGroupLimits{MaxSandboxCount: 2}),
+		" GROUPED_ROUND_ROBIN ",
+		WithGroupedRoundRobinLimits(GroupedRoundRobinLimits{MaxSandboxCount: 2}),
 	)
-	if strategy.Name() != "locality" {
-		t.Fatalf("strategy name = %q, want locality", strategy.Name())
+	if strategy.Name() != "grouped_round_robin" {
+		t.Fatalf("strategy name = %q, want grouped_round_robin", strategy.Name())
 	}
 }
 

@@ -57,9 +57,9 @@ type NodeResourceLimit struct {
 	MaxAllocatedMemoryBytesIncludingPaused *uint64 `json:"max_allocated_memory_bytes_including_paused"`
 }
 
-// LocalityGroupConfig bounds each same-workload placement group. A group is
+// GroupedRoundRobinConfig bounds each same-workload placement group. A group is
 // closed before adding a sandbox that would exceed any enabled limit.
-type LocalityGroupConfig struct {
+type GroupedRoundRobinConfig struct {
 	MaxSandboxCount uint32 `json:"max_sandbox_count"`
 	MaxCPUCount     uint32 `json:"max_cpu_count"`
 	MaxMemoryMB     uint64 `json:"max_memory_mb"`
@@ -77,7 +77,7 @@ type SchedulerConfig struct {
 	Nodes                   []Node                   `json:"nodes"`
 	Discovery               SchedulerDiscoveryConfig `json:"discovery"`
 	NodeResourceLimit       *NodeResourceLimit       `json:"node_resource_limit"`
-	LocalityGroup           LocalityGroupConfig      `json:"locality_group"`
+	GroupedRoundRobin       GroupedRoundRobinConfig  `json:"grouped_round_robin"`
 }
 
 func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
@@ -93,7 +93,7 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		Nodes                   *[]Node                   `json:"nodes"`
 		Discovery               *SchedulerDiscoveryConfig `json:"discovery"`
 		NodeResourceLimit       *NodeResourceLimit        `json:"node_resource_limit"`
-		LocalityGroup           *LocalityGroupConfig      `json:"locality_group"`
+		GroupedRoundRobin       *GroupedRoundRobinConfig  `json:"grouped_round_robin"`
 	}
 
 	parsed := wire{}
@@ -119,8 +119,8 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	if parsed.NodeResourceLimit != nil {
 		s.NodeResourceLimit = parsed.NodeResourceLimit
 	}
-	if parsed.LocalityGroup != nil {
-		s.LocalityGroup = *parsed.LocalityGroup
+	if parsed.GroupedRoundRobin != nil {
+		s.GroupedRoundRobin = *parsed.GroupedRoundRobin
 	}
 	if parsed.RedisAddr != nil {
 		s.RedisAddr = *parsed.RedisAddr
@@ -366,28 +366,28 @@ func overrideWithEnv(cfg *Config) error {
 		cfg.Scheduler.ArtifactLookupNodeLimit = limit
 	}
 
-	if v := strings.TrimSpace(os.Getenv("SCHEDULER_LOCALITY_GROUP_MAX_SANDBOX_COUNT")); v != "" {
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_GROUPED_ROUND_ROBIN_MAX_SANDBOX_COUNT")); v != "" {
 		limit, err := strconv.ParseUint(v, 10, 32)
 		if err != nil {
-			return fmt.Errorf("invalid SCHEDULER_LOCALITY_GROUP_MAX_SANDBOX_COUNT %q: %w", v, err)
+			return fmt.Errorf("invalid SCHEDULER_GROUPED_ROUND_ROBIN_MAX_SANDBOX_COUNT %q: %w", v, err)
 		}
-		cfg.Scheduler.LocalityGroup.MaxSandboxCount = uint32(limit)
+		cfg.Scheduler.GroupedRoundRobin.MaxSandboxCount = uint32(limit)
 	}
 
-	if v := strings.TrimSpace(os.Getenv("SCHEDULER_LOCALITY_GROUP_MAX_CPU_COUNT")); v != "" {
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_GROUPED_ROUND_ROBIN_MAX_CPU_COUNT")); v != "" {
 		limit, err := strconv.ParseUint(v, 10, 32)
 		if err != nil {
-			return fmt.Errorf("invalid SCHEDULER_LOCALITY_GROUP_MAX_CPU_COUNT %q: %w", v, err)
+			return fmt.Errorf("invalid SCHEDULER_GROUPED_ROUND_ROBIN_MAX_CPU_COUNT %q: %w", v, err)
 		}
-		cfg.Scheduler.LocalityGroup.MaxCPUCount = uint32(limit)
+		cfg.Scheduler.GroupedRoundRobin.MaxCPUCount = uint32(limit)
 	}
 
-	if v := strings.TrimSpace(os.Getenv("SCHEDULER_LOCALITY_GROUP_MAX_MEMORY_MB")); v != "" {
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_GROUPED_ROUND_ROBIN_MAX_MEMORY_MB")); v != "" {
 		limit, err := strconv.ParseUint(v, 10, 64)
 		if err != nil {
-			return fmt.Errorf("invalid SCHEDULER_LOCALITY_GROUP_MAX_MEMORY_MB %q: %w", v, err)
+			return fmt.Errorf("invalid SCHEDULER_GROUPED_ROUND_ROBIN_MAX_MEMORY_MB %q: %w", v, err)
 		}
-		cfg.Scheduler.LocalityGroup.MaxMemoryMB = limit
+		cfg.Scheduler.GroupedRoundRobin.MaxMemoryMB = limit
 	}
 
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_REQUEST_TIMEOUT")); v != "" {
@@ -480,9 +480,9 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 			}
 			return nil
 		}
-		if strings.EqualFold(strings.TrimSpace(c.Scheduler.Strategy), "locality") &&
-			c.Scheduler.LocalityGroup.MaxSandboxCount == 0 {
-			return errors.New("scheduler.locality_group.max_sandbox_count must be greater than zero for locality strategy")
+		if strings.EqualFold(strings.TrimSpace(c.Scheduler.Strategy), "grouped_round_robin") &&
+			c.Scheduler.GroupedRoundRobin.MaxSandboxCount == 0 {
+			return errors.New("scheduler.grouped_round_robin.max_sandbox_count must be greater than zero for grouped_round_robin strategy")
 		}
 		if c.Scheduler.ArtifactStoreCapacity <= 0 {
 			return errors.New("scheduler.artifact_store_capacity must be greater than zero")

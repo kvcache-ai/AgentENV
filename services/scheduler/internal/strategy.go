@@ -52,67 +52,67 @@ func (s *RandomStrategy) Name() string {
 	return "random"
 }
 
-// LocalityGroupLimits bounds a same-workload placement group. Zero CPU and
+// GroupedRoundRobinLimits bounds a same-workload placement group. Zero CPU and
 // memory limits disable those checks; MaxSandboxCount is always enforced.
-type LocalityGroupLimits struct {
+type GroupedRoundRobinLimits struct {
 	MaxSandboxCount uint32
 	MaxCPUCount     uint32
 	MaxMemoryMB     uint64
 }
 
-type localityRequest struct {
+type groupedRoundRobinRequest struct {
 	key      string
 	cpuCount uint32
 	memoryMB uint64
 }
 
-type localityGroup struct {
+type groupedRoundRobinGroup struct {
 	nodeID       string
 	sandboxCount uint32
 	cpuCount     uint64
 	memoryMB     uint64
 }
 
-type localityGroupEntry struct {
+type groupedRoundRobinGroupEntry struct {
 	key   string
-	group localityGroup
+	group groupedRoundRobinGroup
 }
 
 const (
-	maxLocalityGroupKeyBytes = 1024
-	maxOpenLocalityGroups    = 10_000
+	maxGroupedRoundRobinKeyBytes   = 1024
+	maxOpenGroupedRoundRobinGroups = 10_000
 )
 
-// GroupedLocalityStrategy keeps same-workload requests on one node until the
+// GroupedRoundRobinStrategy keeps same-workload requests on one node until the
 // current group reaches a configured budget. New groups share a global
 // round-robin cursor so popular workloads spread progressively across nodes.
-type GroupedLocalityStrategy struct {
+type GroupedRoundRobinStrategy struct {
 	mu                 sync.Mutex
 	lastGroupNodeID    string
 	lastFallbackNodeID string
-	limits             LocalityGroupLimits
+	limits             GroupedRoundRobinLimits
 	groups             map[string]*list.Element
 	lru                list.List
 }
 
-func NewGroupedLocalityStrategy(limits LocalityGroupLimits) *GroupedLocalityStrategy {
+func NewGroupedRoundRobinStrategy(limits GroupedRoundRobinLimits) *GroupedRoundRobinStrategy {
 	if limits.MaxSandboxCount == 0 {
 		// Production config rejects this, but keep direct construction bounded.
 		limits.MaxSandboxCount = 1
 	}
-	return &GroupedLocalityStrategy{
+	return &GroupedRoundRobinStrategy{
 		limits: limits,
 		groups: make(map[string]*list.Element),
 	}
 }
 
-func (s *GroupedLocalityStrategy) Select(nodes []RichNode, hint *schedulerv1.ScheduleRequestHint) (RichNode, error) {
-	ready := readyLocalityNodes(nodes)
+func (s *GroupedRoundRobinStrategy) Select(nodes []RichNode, hint *schedulerv1.ScheduleRequestHint) (RichNode, error) {
+	ready := readyGroupedRoundRobinNodes(nodes)
 	if len(ready) == 0 {
 		return RichNode{}, ErrNoNodes
 	}
 
-	request, grouped := localityRequestFromHint(hint)
+	request, grouped := groupedRoundRobinRequestFromHint(hint)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -122,7 +122,7 @@ func (s *GroupedLocalityStrategy) Select(nodes []RichNode, hint *schedulerv1.Sch
 	}
 
 	if element, ok := s.groups[request.key]; ok {
-		entry := element.Value.(*localityGroupEntry)
+		entry := element.Value.(*groupedRoundRobinGroupEntry)
 		if node, eligible := findNode(ready, entry.group.nodeID); eligible &&
 			groupCanFit(entry.group, request, s.limits) {
 			addToGroup(&entry.group, request)
@@ -137,7 +137,7 @@ func (s *GroupedLocalityStrategy) Select(nodes []RichNode, hint *schedulerv1.Sch
 	}
 
 	node := selectNext(ready, &s.lastGroupNodeID)
-	group := localityGroup{nodeID: node.ID}
+	group := groupedRoundRobinGroup{nodeID: node.ID}
 	addToGroup(&group, request)
 	if groupCanRemainOpen(group, s.limits) {
 		s.putGroup(request.key, group)
@@ -145,8 +145,8 @@ func (s *GroupedLocalityStrategy) Select(nodes []RichNode, hint *schedulerv1.Sch
 	return node, nil
 }
 
-func (s *GroupedLocalityStrategy) Name() string {
-	return "locality"
+func (s *GroupedRoundRobinStrategy) Name() string {
+	return "grouped_round_robin"
 }
 
 func selectNext(nodes []RichNode, lastNodeID *string) RichNode {
@@ -164,25 +164,25 @@ func selectNext(nodes []RichNode, lastNodeID *string) RichNode {
 	return node
 }
 
-func (s *GroupedLocalityStrategy) putGroup(key string, group localityGroup) {
-	element := s.lru.PushFront(&localityGroupEntry{key: key, group: group})
+func (s *GroupedRoundRobinStrategy) putGroup(key string, group groupedRoundRobinGroup) {
+	element := s.lru.PushFront(&groupedRoundRobinGroupEntry{key: key, group: group})
 	s.groups[key] = element
-	if len(s.groups) <= maxOpenLocalityGroups {
+	if len(s.groups) <= maxOpenGroupedRoundRobinGroups {
 		return
 	}
 	s.removeGroup(s.lru.Back())
 }
 
-func (s *GroupedLocalityStrategy) removeGroup(element *list.Element) {
+func (s *GroupedRoundRobinStrategy) removeGroup(element *list.Element) {
 	if element == nil {
 		return
 	}
-	entry := element.Value.(*localityGroupEntry)
+	entry := element.Value.(*groupedRoundRobinGroupEntry)
 	delete(s.groups, entry.key)
 	s.lru.Remove(element)
 }
 
-func readyLocalityNodes(nodes []RichNode) []RichNode {
+func readyGroupedRoundRobinNodes(nodes []RichNode) []RichNode {
 	ready := make([]RichNode, 0, len(nodes))
 	for _, node := range nodes {
 		if node.Snapshot == nil ||
@@ -197,15 +197,15 @@ func readyLocalityNodes(nodes []RichNode) []RichNode {
 	return ready
 }
 
-func localityRequestFromHint(hint *schedulerv1.ScheduleRequestHint) (localityRequest, bool) {
-	var request localityRequest
+func groupedRoundRobinRequestFromHint(hint *schedulerv1.ScheduleRequestHint) (groupedRoundRobinRequest, bool) {
+	var request groupedRoundRobinRequest
 	switch kind := hint.GetKind().(type) {
 	case *schedulerv1.ScheduleRequestHint_NewColdSandbox:
 		images := kind.NewColdSandbox.GetImages()
 		if len(images) == 0 {
-			return localityRequest{}, false
+			return groupedRoundRobinRequest{}, false
 		}
-		request = localityRequest{
+		request = groupedRoundRobinRequest{
 			key:      "image:" + strings.TrimSpace(images[0]),
 			cpuCount: kind.NewColdSandbox.GetCpuCount(),
 			memoryMB: kind.NewColdSandbox.GetMemoryMb(),
@@ -213,10 +213,10 @@ func localityRequestFromHint(hint *schedulerv1.ScheduleRequestHint) (localityReq
 	case *schedulerv1.ScheduleRequestHint_NewSandbox:
 		request.key = "template:" + strings.TrimSpace(kind.NewSandbox.GetTemplateId())
 	default:
-		return localityRequest{}, false
+		return groupedRoundRobinRequest{}, false
 	}
-	if strings.HasSuffix(request.key, ":") || len(request.key) > maxLocalityGroupKeyBytes {
-		return localityRequest{}, false
+	if strings.HasSuffix(request.key, ":") || len(request.key) > maxGroupedRoundRobinKeyBytes {
+		return groupedRoundRobinRequest{}, false
 	}
 	return request, true
 }
@@ -230,7 +230,7 @@ func findNode(nodes []RichNode, nodeID string) (RichNode, bool) {
 	return RichNode{}, false
 }
 
-func groupCanFit(group localityGroup, request localityRequest, limits LocalityGroupLimits) bool {
+func groupCanFit(group groupedRoundRobinGroup, request groupedRoundRobinRequest, limits GroupedRoundRobinLimits) bool {
 	if group.sandboxCount >= limits.MaxSandboxCount {
 		return false
 	}
@@ -244,37 +244,37 @@ func exceedsLimit(current, added, limit uint64) bool {
 	return limit > 0 && (added > limit || current > limit-added)
 }
 
-func addToGroup(group *localityGroup, request localityRequest) {
+func addToGroup(group *groupedRoundRobinGroup, request groupedRoundRobinRequest) {
 	group.sandboxCount++
 	group.cpuCount += uint64(request.cpuCount)
 	group.memoryMB += request.memoryMB
 }
 
-func groupIsFull(group localityGroup, limits LocalityGroupLimits) bool {
+func groupIsFull(group groupedRoundRobinGroup, limits GroupedRoundRobinLimits) bool {
 	return group.sandboxCount >= limits.MaxSandboxCount ||
 		(limits.MaxCPUCount > 0 && group.cpuCount >= uint64(limits.MaxCPUCount)) ||
 		(limits.MaxMemoryMB > 0 && group.memoryMB >= limits.MaxMemoryMB)
 }
 
-func groupCanRemainOpen(group localityGroup, limits LocalityGroupLimits) bool {
+func groupCanRemainOpen(group groupedRoundRobinGroup, limits GroupedRoundRobinLimits) bool {
 	return !groupIsFull(group, limits)
 }
 
 type strategyOptions struct {
-	localityGroupLimits LocalityGroupLimits
+	groupedRoundRobinLimits GroupedRoundRobinLimits
 }
 
 type StrategyOption func(*strategyOptions)
 
-func WithLocalityGroupLimits(limits LocalityGroupLimits) StrategyOption {
+func WithGroupedRoundRobinLimits(limits GroupedRoundRobinLimits) StrategyOption {
 	return func(options *strategyOptions) {
-		options.localityGroupLimits = limits
+		options.groupedRoundRobinLimits = limits
 	}
 }
 
 func NewStrategy(name string, opts ...StrategyOption) Strategy {
 	options := strategyOptions{
-		localityGroupLimits: LocalityGroupLimits{MaxSandboxCount: 1},
+		groupedRoundRobinLimits: GroupedRoundRobinLimits{MaxSandboxCount: 1},
 	}
 	for _, opt := range opts {
 		opt(&options)
@@ -283,8 +283,8 @@ func NewStrategy(name string, opts ...StrategyOption) Strategy {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "random":
 		return NewRandomStrategy()
-	case "locality":
-		return NewGroupedLocalityStrategy(options.localityGroupLimits)
+	case "grouped_round_robin":
+		return NewGroupedRoundRobinStrategy(options.groupedRoundRobinLimits)
 	case "round_robin":
 		fallthrough
 	default:

@@ -51,8 +51,8 @@ message NewColdSandboxHint {
 message NewSandboxHint {
   // Sandbox metadata key/value pairs parsed from the request body.
   map<string, string> metadata = 1;
-  // Template or snapshot reference supplied by POST /sandboxes. The locality
-  // strategy treats the exact reference as an advisory workload identity.
+  // Template or snapshot reference supplied by POST /sandboxes. The grouped
+  // round-robin strategy treats the exact reference as a workload identity.
   string template_id = 2;
 }
 
