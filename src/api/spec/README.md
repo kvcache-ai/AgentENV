@@ -16,9 +16,9 @@ server code.
    - `components/parameters.yml`
    - `components/responses.yml`
 3. Render `components/schemas/common.yml` first.
-4. For each tag, in the order declared by `openapi.tmpl`, render the matching
-   `components/schemas/<tag>.yml` file when it exists.
-5. Keep `/health` from `openapi.tmpl`, then render each matching
+4. For each tag, in the order declared by `openapi.tmpl`, render its required
+   `components/schemas/<tag>.yml` file.
+5. Keep `/health` from `openapi.tmpl`, then render each required
    `paths/<tag>.yml` file in tag order.
 6. Write the combined document to the committed `src/api/openapi.yml`.
 7. Run OpenAPI Generator and update `src/api/generated`.
@@ -26,9 +26,9 @@ server code.
 Tag declarations may move within `openapi.tmpl`; only the order of entries
 inside the `tags` section controls the rendered schema and path order.
 
-A tag does not have to provide both a schema file and a path file. Missing
-matching files are skipped. A schema or path file whose name does not match a
-declared tag is rejected so that API definitions cannot be silently omitted.
+Every tag must provide both a schema file and a path file. A missing matching
+file, or a schema or path file whose name does not match a declared tag, is
+rejected so that API definitions cannot be silently omitted.
 
 ## Fragment format
 
@@ -74,7 +74,7 @@ For a new API category:
 
 1. Add the tag to `openapi.tmpl` in the desired rendering order.
 2. Create `paths/<tag>.yml`.
-3. Create `components/schemas/<tag>.yml` if the tag owns any models.
+3. Create `components/schemas/<tag>.yml`.
 4. Follow the existing-tag workflow above.
 
 When moving definitions between fragments without changing their contents,
@@ -88,7 +88,7 @@ Render the specification and regenerate the Rust Axum server:
 make agentenv-server
 ```
 
-Build the documentation, rendering the temporary specification first:
+Build the documentation from the committed specification:
 
 ```bash
 make docs

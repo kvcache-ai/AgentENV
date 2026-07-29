@@ -178,7 +178,10 @@ fn read_tagged_sections(
             path.file_stem()
                 .is_some_and(|file_stem| file_stem == tag.as_str())
         }) else {
-            continue;
+            anyhow::bail!(
+                "missing {expected_header} section for tag `{tag}` in {}",
+                dir.display(),
+            );
         };
         sections.push(read_section_file(
             &paths.remove(index),

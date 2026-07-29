@@ -5912,7 +5912,7 @@ pub struct SandboxNetworkUpdateConfig {
     pub deny_out: Option<Vec<String>>,
 
     /// Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut to 0.0.0.0/0 in the network config.
-    #[serde(rename = "allow_internet_access")]
+    #[serde(rename = "allowInternetAccess")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_internet_access: Option<bool>,
 }
@@ -5960,7 +5960,7 @@ impl std::fmt::Display for SandboxNetworkUpdateConfig {
                 .as_ref()
                 .map(|allow_internet_access| {
                     [
-                        "allow_internet_access".to_string(),
+                        "allowInternetAccess".to_string(),
                         allow_internet_access.to_string(),
                     ]
                     .join(",")
@@ -6013,7 +6013,7 @@ impl std::str::FromStr for SandboxNetworkUpdateConfig {
                     "allowOut" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkUpdateConfig".to_string()),
                     "denyOut" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxNetworkUpdateConfig".to_string()),
                     #[allow(clippy::redundant_clone)]
-                    "allow_internet_access" => intermediate_rep.allow_internet_access.push(<bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    "allowInternetAccess" => intermediate_rep.allow_internet_access.push(<bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     _ => return std::result::Result::Err("Unexpected key while parsing SandboxNetworkUpdateConfig".to_string())
                 }
             }

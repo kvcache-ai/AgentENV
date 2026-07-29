@@ -120,7 +120,7 @@ schemas:
         description: List of denied CIDR blocks or IP addresses for egress traffic. Domain names are not supported for deny rules.
         items:
           type: string
-      allow_internet_access:
+      allowInternetAccess:
         type: boolean
         description:
           Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut
