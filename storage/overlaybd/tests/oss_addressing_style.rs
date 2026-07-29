@@ -36,7 +36,16 @@ fn config_with_style(endpoint: String, style: &str) -> OssConfig {
 async fn record_one_request(listener: TcpListener) -> String {
     let (mut socket, _) = listener.accept().await.expect("accept recorder connection");
     let mut buf = vec![0u8; 8192];
-    let n = socket.read(&mut buf).await.expect("read request head");
+    // A single read may return a partial head, so keep reading until the
+    // header terminator, EOF, or the buffer limit.
+    let mut n = 0;
+    while n < buf.len() && !buf[..n].windows(4).any(|window| window == b"\r\n\r\n") {
+        let read = socket.read(&mut buf[n..]).await.expect("read request head");
+        if read == 0 {
+            break;
+        }
+        n += read;
+    }
     let head = String::from_utf8_lossy(&buf[..n]).into_owned();
     let _ = socket
         .write_all(
@@ -60,13 +69,14 @@ async fn explicit_path_override_reaches_the_wire() {
         .open_with_size_hint("s3://127/layers/explicit-style-object", None)
         .expect("open remote layer file");
 
-    // The read fails (the recorder answers 500); only the request matters.
-    let _ = file.read_at(0, 4).await;
-
-    let head = tokio::time::timeout(std::time::Duration::from_secs(30), recorder)
-        .await
-        .expect("no request reached the recorder — was the addressing override dropped?")
-        .expect("recorder task");
+    // One bound covers the whole interaction: the read (which fails with the
+    // recorder's 500 response; only the request matters) and the capture.
+    let head = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let _ = file.read_at(0, 4).await;
+        recorder.await.expect("recorder task")
+    })
+    .await
+    .expect("no request reached the recorder — was the addressing override dropped?");
     let request_line = head.lines().next().unwrap_or_default().to_string();
     assert!(
         request_line.contains("/127/layers/explicit-style-object"),
