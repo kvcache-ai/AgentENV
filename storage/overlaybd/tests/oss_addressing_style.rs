@@ -49,7 +49,7 @@ async fn record_one_request(listener: TcpListener) -> String {
     let head = String::from_utf8_lossy(&buf[..n]).into_owned();
     let _ = socket
         .write_all(
-            b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
         )
         .await;
     head
