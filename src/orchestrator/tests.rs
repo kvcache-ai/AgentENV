@@ -34,6 +34,51 @@ use crate::snapshot::RunnableSnapshot;
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 
 const STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const TEST_SYNC_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn wait_for_notification_or_abort<T>(
+    notification: &Notify,
+    task: &mut tokio::task::JoinHandle<T>,
+    context: &str,
+) {
+    tokio::select! {
+        _ = notification.notified() => {}
+        result = &mut *task => {
+            match result {
+                Ok(_) => panic!("{context}: task completed before the synchronization point"),
+                Err(error) => panic!("{context}: task ended before the synchronization point: {error}"),
+            }
+        }
+        _ = sleep(TEST_SYNC_TIMEOUT) => {
+            task.abort();
+            let _ = (&mut *task).await;
+            panic!("{context}: timed out after {TEST_SYNC_TIMEOUT:?}");
+        }
+    }
+}
+
+async fn join_task_or_abort<T>(
+    mut task: tokio::task::JoinHandle<T>,
+    context: &str,
+) -> std::result::Result<T, tokio::task::JoinError> {
+    tokio::select! {
+        result = &mut task => result,
+        _ = sleep(TEST_SYNC_TIMEOUT) => {
+            task.abort();
+            let _ = (&mut task).await;
+            panic!("{context}: timed out after {TEST_SYNC_TIMEOUT:?}");
+        }
+    }
+}
+
+async fn await_test_future<F>(future: F, context: &str) -> F::Output
+where
+    F: std::future::Future,
+{
+    timeout(TEST_SYNC_TIMEOUT, future)
+        .await
+        .unwrap_or_else(|_| panic!("{context}: timed out after {TEST_SYNC_TIMEOUT:?}"))
+}
 
 type TestOrchestrator<
     S = InMemoryMetadataStore,
@@ -140,6 +185,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         lifecycle_operations: Arc::new(StdMutex::new(HashMap::new())),
         lifecycle_join_started: StdMutex::new(None),
         sandboxes: RwLock::new(HashMap::new()),
+        cleanup_handles: RwLock::new(HashMap::new()),
         proxy_routes: RwLock::new(ProxyRouteTable::default()),
         next_proxy_route_version: AtomicU64::new(1),
         counters: Default::default(),
@@ -1004,13 +1050,16 @@ async fn proxy_lookup_rejects_route_replaced_during_metadata_read() -> Result<()
         release: Arc::clone(&allow_first_read),
     });
 
-    let lookup_task = {
+    let mut lookup_task = {
         let orchestrator = Arc::clone(&orchestrator);
         tokio::spawn(async move { orchestrator.proxy_lookup_for(&created.id).await })
     };
-    timeout(Duration::from_secs(1), first_read_started.notified())
-        .await
-        .expect("proxy lookup should snapshot metadata after reading the route");
+    wait_for_notification_or_abort(
+        &first_read_started,
+        &mut lookup_task,
+        "proxy lookup should snapshot metadata after reading the route",
+    )
+    .await;
     assert_eq!(
         store_control.get_calls() - get_calls_before_lookup,
         1,
@@ -1024,10 +1073,12 @@ async fn proxy_lookup_rejects_route_replaced_during_metadata_read() -> Result<()
 
     let get_calls_before_release = store_control.get_calls();
     allow_first_read.notify_one();
-    let lookup = timeout(Duration::from_secs(1), lookup_task)
-        .await
-        .expect("proxy lookup should finish after its first read is released")
-        .expect("proxy lookup task should not panic")?;
+    let lookup = join_task_or_abort(
+        lookup_task,
+        "proxy lookup should finish after its first read is released",
+    )
+    .await
+    .expect("proxy lookup task should not panic")?;
     assert_eq!(
         lookup,
         ProxyLookupResult::RouteMissing,
@@ -1039,6 +1090,113 @@ async fn proxy_lookup_rejects_route_replaced_during_metadata_read() -> Result<()
         "the proxy lookup must not issue a second metadata read after validation"
     );
     orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxy_lookup_rejects_route_when_pause_state_is_published() -> Result<()> {
+    setup();
+    let store_control = Arc::new(ScriptedStoreControl::default());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&store_control)),
+        MockBackendFactory::new(),
+    );
+    let sandbox_id = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?
+        .id;
+
+    let lookup_read_started = Arc::new(Notify::new());
+    let allow_lookup_read = Arc::new(Notify::new());
+    store_control.push_get_action(StoreAction::BlockAfter {
+        started: Arc::clone(&lookup_read_started),
+        release: Arc::clone(&allow_lookup_read),
+    });
+    let mut lookup_task = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move { orchestrator.proxy_lookup_for(&sandbox_id).await })
+    };
+    wait_for_notification_or_abort(
+        &lookup_read_started,
+        &mut lookup_task,
+        "proxy lookup should snapshot Running metadata",
+    )
+    .await;
+
+    let pause_transition_started = Arc::new(Notify::new());
+    let allow_pause_transition = Arc::new(Notify::new());
+    store_control.push_update_if_state_action(StoreAction::BlockAfter {
+        started: Arc::clone(&pause_transition_started),
+        release: Arc::clone(&allow_pause_transition),
+    });
+    let mut pause_task = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move { orchestrator.pause_sandbox(sandbox_id).await })
+    };
+    wait_for_notification_or_abort(
+        &pause_transition_started,
+        &mut pause_task,
+        "pause should publish Pausing after invalidating the route",
+    )
+    .await;
+
+    allow_lookup_read.notify_one();
+    let lookup = join_task_or_abort(lookup_task, "proxy lookup should finish after release")
+        .await
+        .expect("proxy lookup task should not panic")?;
+    assert_eq!(
+        lookup,
+        ProxyLookupResult::RouteMissing,
+        "a lookup that observed the old Running state must not return a route after pause starts"
+    );
+
+    allow_pause_transition.notify_one();
+    join_task_or_abort(pause_task, "pause should finish after transition release")
+        .await
+        .expect("pause task should not panic")?;
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_transition_failure_restores_route_without_metadata_read() -> Result<()> {
+    setup();
+    let store_control = Arc::new(ScriptedStoreControl::default());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&store_control)),
+        MockBackendFactory::new(),
+    );
+    let sandbox_id = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?
+        .id;
+    let target = proxy_target_for(&orchestrator, &sandbox_id)
+        .await?
+        .expect("running sandbox should have a proxy route");
+    let get_calls_before_pause = store_control.get_calls();
+    store_control.push_update_if_state_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("forced pause transition failure"),
+    }));
+
+    let error = orchestrator
+        .pause_sandbox(sandbox_id)
+        .await
+        .expect_err("pause transition should fail");
+    assert!(
+        format!("{error:#}").contains("forced pause transition failure"),
+        "{error:#}"
+    );
+    assert_eq!(
+        store_control.get_calls(),
+        get_calls_before_pause,
+        "restoring the invalidated route must not depend on another store read"
+    );
+    assert_eq!(
+        proxy_target_for(&orchestrator, &sandbox_id).await?,
+        Some(target)
+    );
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
     Ok(())
 }
 
@@ -2500,23 +2658,29 @@ async fn pause_waiting_for_failed_delete_retries_from_restored_running_state() -
         release: Arc::clone(&allow_delete_transition),
     });
 
-    let delete_task = {
+    let mut delete_task = {
         let orchestrator = Arc::clone(&orchestrator);
         tokio::spawn(async move { orchestrator.delete_sandbox(sandbox_id).await })
     };
-    timeout(Duration::from_secs(1), delete_transition_started.notified())
-        .await
-        .expect("delete should enter Killing before attempting stop");
+    wait_for_notification_or_abort(
+        &delete_transition_started,
+        &mut delete_task,
+        "delete should enter Killing before attempting stop",
+    )
+    .await;
 
     let pause_join_started = Arc::new(Notify::new());
     orchestrator.notify_on_next_lifecycle_join(Arc::clone(&pause_join_started));
-    let pause_task = {
+    let mut pause_task = {
         let orchestrator = Arc::clone(&orchestrator);
         tokio::spawn(async move { orchestrator.pause_sandbox(sandbox_id).await })
     };
-    timeout(Duration::from_secs(1), pause_join_started.notified())
-        .await
-        .expect("pause should join the in-flight delete operation");
+    wait_for_notification_or_abort(
+        &pause_join_started,
+        &mut pause_task,
+        "pause should join the in-flight delete operation",
+    )
+    .await;
 
     allow_delete_transition.notify_one();
     pause_task
@@ -2810,24 +2974,27 @@ async fn concurrent_unknown_deletes_both_report_not_found() -> Result<()> {
     );
     let missing_id = SandboxId::new();
 
-    let first_delete = {
+    let mut first_delete = {
         let orchestrator = Arc::clone(&orchestrator);
         tokio::spawn(async move { orchestrator.delete_sandbox(missing_id).await })
     };
-    timeout(Duration::from_secs(1), first_delete_started.notified())
-        .await
-        .expect("first delete should reach the blocked store operation");
+    wait_for_notification_or_abort(
+        &first_delete_started,
+        &mut first_delete,
+        "first delete should reach the blocked store operation",
+    )
+    .await;
     let second_delete = {
         let second_delete_join_started = Arc::new(Notify::new());
         orchestrator.notify_on_next_lifecycle_join(Arc::clone(&second_delete_join_started));
         let orchestrator = Arc::clone(&orchestrator);
-        let task = tokio::spawn(async move { orchestrator.delete_sandbox(missing_id).await });
-        timeout(
-            Duration::from_secs(1),
-            second_delete_join_started.notified(),
+        let mut task = tokio::spawn(async move { orchestrator.delete_sandbox(missing_id).await });
+        wait_for_notification_or_abort(
+            &second_delete_join_started,
+            &mut task,
+            "second delete should join the first lifecycle operation",
         )
-        .await
-        .expect("second delete should join the first lifecycle operation");
+        .await;
         task
     };
 
@@ -3388,7 +3555,7 @@ async fn pause_recovery_metadata_cleanup_failure_releases_paused_image_refs() ->
     assert_eq!(behavior.stop_calls(), 1);
     assert!(
         orchestrator
-            .sandboxes
+            .cleanup_handles
             .read()
             .await
             .contains_key(&sandbox_id),
@@ -3467,7 +3634,7 @@ async fn pause_recovery_retains_handle_when_cleanup_state_update_fails() -> Resu
     );
     assert!(
         orchestrator
-            .sandboxes
+            .cleanup_handles
             .read()
             .await
             .contains_key(&sandbox_id),
@@ -3516,7 +3683,7 @@ async fn cleanup_handle_is_reachable_before_cleanup_state_transition() -> Result
         started: Arc::clone(&transition_started),
         release: Arc::new(Notify::new()),
     });
-    let retain_task = {
+    let mut retain_task = {
         let orchestrator = Arc::clone(&orchestrator);
         tokio::spawn(async move {
             orchestrator
@@ -3524,12 +3691,15 @@ async fn cleanup_handle_is_reachable_before_cleanup_state_transition() -> Result
                 .await
         })
     };
-    timeout(Duration::from_secs(1), transition_started.notified())
-        .await
-        .expect("cleanup state transition should start");
+    wait_for_notification_or_abort(
+        &transition_started,
+        &mut retain_task,
+        "cleanup state transition should start",
+    )
+    .await;
     assert!(
         orchestrator
-            .sandboxes
+            .cleanup_handles
             .read()
             .await
             .contains_key(&sandbox_id),
@@ -3546,6 +3716,55 @@ async fn cleanup_handle_is_reachable_before_cleanup_state_transition() -> Result
     );
     orchestrator.delete_sandbox(sandbox_id).await?;
     assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_retries_cleanup_handle_after_metadata_disappears() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+    let sandbox_id = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?
+        .id;
+    orchestrator
+        .store
+        .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
+        .await?;
+    let (handle, _) = orchestrator
+        .detach_sandbox_handle_and_route(&sandbox_id)
+        .await;
+    let handle = handle.expect("created sandbox should have a backend handle");
+    orchestrator.store.remove(&sandbox_id).await?;
+
+    let retain_error = orchestrator
+        .retain_sandbox_handle_for_cleanup(sandbox_id, handle)
+        .await
+        .expect_err("missing metadata should prevent the Killing transition");
+    assert!(matches!(
+        retain_error,
+        StoreError::SandboxNotFound { sandbox_id: missing } if missing == sandbox_id
+    ));
+    assert!(
+        orchestrator
+            .cleanup_handles
+            .read()
+            .await
+            .contains_key(&sandbox_id),
+        "cleanup ownership must survive independently of metadata"
+    );
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    assert_eq!(behavior.stop_calls(), 1);
+    assert!(!orchestrator
+        .cleanup_handles
+        .read()
+        .await
+        .contains_key(&sandbox_id));
     Ok(())
 }
 
@@ -3581,20 +3800,22 @@ async fn pause_recovery_store_wait_does_not_block_other_sandbox_tables() -> Resu
         release: Arc::clone(&allow_restore),
     });
 
-    let pause_task = {
+    let mut pause_task = {
         let orchestrator = Arc::clone(&orchestrator);
         tokio::spawn(async move { orchestrator.pause_sandbox(recovering.id).await })
     };
-    timeout(Duration::from_secs(1), restore_started.notified())
-        .await
-        .expect("pause recovery should reach the blocked metadata restore");
-
-    let unaffected_lookup = timeout(
-        Duration::from_secs(1),
-        orchestrator.proxy_lookup_for(&unaffected.id),
+    wait_for_notification_or_abort(
+        &restore_started,
+        &mut pause_task,
+        "pause recovery should reach the blocked metadata restore",
     )
-    .await
-    .expect("blocked recovery store call must not hold global sandbox tables")?;
+    .await;
+
+    let unaffected_lookup = await_test_future(
+        orchestrator.proxy_lookup_for(&unaffected.id),
+        "blocked recovery store call must not hold global sandbox tables",
+    )
+    .await?;
     assert_eq!(
         unaffected_lookup,
         ProxyLookupResult::Ready(unaffected_target)
@@ -3658,7 +3879,7 @@ async fn pause_recovery_stop_failure_allows_delete_retry() -> Result<()> {
     assert_eq!(metadata.state, SandboxState::Killing);
     assert!(
         orchestrator
-            .sandboxes
+            .cleanup_handles
             .read()
             .await
             .contains_key(&sandbox_id),
@@ -4371,13 +4592,16 @@ async fn cancelled_shutdown_does_not_cancel_in_flight_pause_recovery() -> Result
         release: Arc::clone(&allow_restore),
     });
 
-    let shutdown_task = {
+    let mut shutdown_task = {
         let orchestrator = Arc::clone(&orchestrator);
         tokio::spawn(async move { orchestrator.shutdown().await })
     };
-    timeout(Duration::from_secs(1), restore_started.notified())
-        .await
-        .expect("shutdown pause should reach the blocked metadata restore");
+    wait_for_notification_or_abort(
+        &restore_started,
+        &mut shutdown_task,
+        "shutdown pause should reach the blocked metadata restore",
+    )
+    .await;
     shutdown_task.abort();
     assert!(shutdown_task
         .await
@@ -4385,32 +4609,34 @@ async fn cancelled_shutdown_does_not_cancel_in_flight_pause_recovery() -> Result
         .is_cancelled());
 
     allow_restore.notify_one();
-    timeout(Duration::from_secs(1), async {
-        loop {
-            let metadata = orchestrator
-                .get_sandbox(&sandbox_id)
-                .await
-                .expect("metadata lookup should succeed");
-            let lookup = orchestrator
-                .proxy_lookup_for(&sandbox_id)
-                .await
-                .expect("proxy lookup should succeed");
-            let lifecycle_retired = !orchestrator
-                .lifecycle_operations
-                .lock()
-                .expect("lifecycle operations mutex poisoned")
-                .contains_key(&sandbox_id);
-            if metadata.is_some_and(|metadata| metadata.state == SandboxState::Running)
-                && matches!(lookup, ProxyLookupResult::Ready(_))
-                && lifecycle_retired
-            {
-                break;
+    await_test_future(
+        async {
+            loop {
+                let metadata = orchestrator
+                    .get_sandbox(&sandbox_id)
+                    .await
+                    .expect("metadata lookup should succeed");
+                let lookup = orchestrator
+                    .proxy_lookup_for(&sandbox_id)
+                    .await
+                    .expect("proxy lookup should succeed");
+                let lifecycle_retired = !orchestrator
+                    .lifecycle_operations
+                    .lock()
+                    .expect("lifecycle operations mutex poisoned")
+                    .contains_key(&sandbox_id);
+                if metadata.is_some_and(|metadata| metadata.state == SandboxState::Running)
+                    && matches!(lookup, ProxyLookupResult::Ready(_))
+                    && lifecycle_retired
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("detached pause recovery should restore the running sandbox");
+        },
+        "detached pause recovery should restore the running sandbox",
+    )
+    .await;
     assert!(
         !orchestrator
             .lifecycle_operations

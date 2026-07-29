@@ -134,6 +134,7 @@ pub struct Orchestrator<
     #[cfg(test)]
     lifecycle_join_started: StdMutex<Option<Arc<tokio::sync::Notify>>>,
     sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
+    cleanup_handles: RwLock<HashMap<SandboxId, SandboxHandle>>,
     proxy_routes: RwLock<ProxyRouteTable>,
     next_proxy_route_version: AtomicU64,
     counters: OrchestratorCounters,
@@ -219,6 +220,7 @@ where
             #[cfg(test)]
             lifecycle_join_started: StdMutex::new(None),
             sandboxes: RwLock::new(HashMap::new()),
+            cleanup_handles: RwLock::new(HashMap::new()),
             proxy_routes: RwLock::new(ProxyRouteTable::default()),
             next_proxy_route_version: AtomicU64::new(1),
             counters: OrchestratorCounters::default(),
@@ -355,10 +357,13 @@ where
         sandbox_id: SandboxId,
         handle: SandboxHandle,
     ) -> std::result::Result<(), StoreError> {
-        // Publish cleanup ownership before exposing Killing. If the metadata
-        // write is cancelled or fails, a later delete can still find the
-        // detached backend and retry stop from its existing Pausing state.
-        self.sandboxes.write().await.insert(sandbox_id, handle);
+        // Publish cleanup ownership before exposing Killing. This registry is
+        // deliberately independent of metadata: an ambiguous or failed store
+        // write must not make a potentially live backend unreachable.
+        self.cleanup_handles
+            .write()
+            .await
+            .insert(sandbox_id, handle);
 
         let state_result = self
             .store
@@ -1037,6 +1042,12 @@ where
                         }));
                     }
                 },
+                Err(StoreError::SandboxNotFound { .. })
+                    if self.cleanup_handles.read().await.contains_key(&sandbox_id) =>
+                {
+                    debug!("retrying backend cleanup without sandbox metadata");
+                    break SandboxState::Killing;
+                }
                 Err(StoreError::SandboxNotFound { .. }) if prior_delete_succeeded => {
                     info!("sandbox was deleted by a concurrent cleanup");
                     return Ok(());
@@ -1047,7 +1058,12 @@ where
             }
         };
 
-        let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
+        let (active_handle, removed_route) =
+            self.detach_sandbox_handle_and_route(&sandbox_id).await;
+        let handle = match active_handle {
+            Some(handle) => Some(handle),
+            None => self.cleanup_handles.write().await.remove(&sandbox_id),
+        };
 
         // If the sandbox is still in memory, attempt to stop it.
         if let Some(handle) = handle {
@@ -1058,8 +1074,8 @@ where
 
             if let Err(err) = stop_result {
                 warn!(error = ?err, "failed to stop sandbox during delete");
-                self.sandboxes.write().await.insert(sandbox_id, handle);
                 if matches!(previous_state, SandboxState::Running | SandboxState::Paused) {
+                    self.sandboxes.write().await.insert(sandbox_id, handle);
                     self.restore_proxy_route(sandbox_id, removed_route).await;
                     self.store
                         .update_state_if_state(
@@ -1068,6 +1084,11 @@ where
                             &[SandboxState::Killing],
                         )
                         .await?;
+                } else {
+                    self.cleanup_handles
+                        .write()
+                        .await
+                        .insert(sandbox_id, handle);
                 }
 
                 return Err(OrchestratorError::SandboxOperationFailed {
@@ -1174,6 +1195,9 @@ where
 
     async fn pause_sandbox_owned_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("pausing sandbox");
+        let pause_handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
+        let removed_proxy_route = self.remove_proxy_route(&sandbox_id).await;
+
         match self
             .store
             .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
@@ -1181,6 +1205,12 @@ where
         {
             Ok(_) => {}
             Err(StoreError::StateConflict { actual_state, .. }) => {
+                self.restore_invalidated_proxy_route(
+                    sandbox_id,
+                    pause_handle.as_ref(),
+                    removed_proxy_route,
+                )
+                .await;
                 return match actual_state {
                     // Another task is already performing the pause.  Wait for
                     // it to finish and then report the final outcome.
@@ -1199,7 +1229,15 @@ where
                     }
                 };
             }
-            Err(err) => return Err(OrchestratorError::from(err)),
+            Err(err) => {
+                self.restore_invalidated_proxy_route(
+                    sandbox_id,
+                    pause_handle.as_ref(),
+                    removed_proxy_route,
+                )
+                .await;
+                return Err(OrchestratorError::from(err));
+            }
         }
 
         // Pin paused runtime artifacts before detaching from the running set.
@@ -1222,14 +1260,22 @@ where
             .await
         {
             warn!(error = %error, "failed to protect paused runtime artifacts; keeping sandbox Running");
-            let _ = self
+            let rollback_result = self
                 .store
                 .update_state_if_state(&sandbox_id, SandboxState::Running, &[SandboxState::Pausing])
                 .await;
+            if rollback_result.is_ok() {
+                self.restore_invalidated_proxy_route(
+                    sandbox_id,
+                    pause_handle.as_ref(),
+                    removed_proxy_route,
+                )
+                .await;
+            }
             return Err(error);
         }
 
-        let (handle, removed_proxy_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
+        let handle = self.sandboxes.write().await.remove(&sandbox_id);
 
         let Some(handle) = handle else {
             warn!("sandbox handle not found while pausing, removing from store");
@@ -2556,6 +2602,51 @@ where
             .await;
     }
 
+    async fn remove_proxy_route(&self, sandbox_id: &SandboxId) -> Option<ProxyRoute> {
+        let removed_route = self.proxy_routes.write().await.remove(sandbox_id);
+        if let Some(route) = removed_route.as_ref() {
+            debug!(version = route.version(), "removed runtime proxy route");
+        }
+        removed_route
+    }
+
+    async fn restore_invalidated_proxy_route(
+        &self,
+        sandbox_id: SandboxId,
+        expected_handle: Option<&SandboxHandle>,
+        route: Option<ProxyRoute>,
+    ) {
+        let (Some(expected_handle), Some(route)) = (expected_handle, route) else {
+            return;
+        };
+
+        // A fresh route generation is safe even when the state write failed
+        // ambiguously: metadata still gates proxy visibility, while stale
+        // lookups that captured the removed generation will fail validation.
+        // Holding the handle table while publishing also prevents a stale
+        // backend from restoring a route after it has been replaced.
+        let sandboxes = self.sandboxes.read().await;
+        if !sandboxes
+            .get(&sandbox_id)
+            .is_some_and(|current| Arc::ptr_eq(current, expected_handle))
+        {
+            return;
+        }
+
+        let mut routes = self.proxy_routes.write().await;
+        if routes.route(&sandbox_id).is_some() {
+            return;
+        }
+        let version = self
+            .next_proxy_route_version
+            .fetch_add(1, Ordering::Relaxed);
+        routes.upsert(sandbox_id, route.target().clone(), version);
+        debug!(
+            version,
+            "restored runtime proxy route after failed pause transition"
+        );
+    }
+
     async fn detach_sandbox_handle_and_route(
         &self,
         sandbox_id: &SandboxId,
@@ -2565,10 +2656,7 @@ where
         let mut sandboxes = self.sandboxes.write().await;
         let handle = sandboxes.remove(sandbox_id);
 
-        let removed_route = self.proxy_routes.write().await.remove(sandbox_id);
-        if let Some(route) = removed_route.as_ref() {
-            debug!(version = route.version(), "removed runtime proxy route");
-        }
+        let removed_route = self.remove_proxy_route(sandbox_id).await;
 
         drop(sandboxes);
         (handle, removed_route)
@@ -2580,6 +2668,14 @@ where
 
         // Preserve recoverable sandboxes by pausing running VMs before process exit.
         for pass in 1..=MAX_SHUTDOWN_PASSES {
+            last_failures.clear();
+            let cleanup_ids = self
+                .cleanup_handles
+                .read()
+                .await
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
             let sandboxes = self
                 .store
                 .list_filtered(SandboxListFilter {
@@ -2588,19 +2684,27 @@ where
                     user_metadata: None,
                 })
                 .await?;
-            if sandboxes.is_empty() {
+            if cleanup_ids.is_empty() && sandboxes.is_empty() {
                 break;
             }
-            last_failures.clear();
 
             info!(
                 pass,
-                remaining = sandboxes.len(),
+                remaining = cleanup_ids.len() + sandboxes.len(),
                 "preserving sandboxes during shutdown"
             );
 
+            for sandbox_id in cleanup_ids.iter().copied() {
+                if let Err(err) = self.delete_sandbox(sandbox_id).await {
+                    last_failures.push(format!("{sandbox_id}: {err}"));
+                }
+            }
+
             for metadata in sandboxes {
                 let sandbox_id = metadata.id;
+                if cleanup_ids.contains(&sandbox_id) {
+                    continue;
+                }
                 match metadata.state {
                     SandboxState::Paused => {
                         unreachable!("paused sandboxes should have been filtered out")
