@@ -149,6 +149,7 @@ impl AcrClient {
     ) -> Result<Self, AcrClientError> {
         let http = reqwest::Client::builder()
             .timeout(options.timeout)
+            .redirect(redirect_policy(&options))
             .build()
             .map_err(|e| AcrClientError::Registry {
                 message: format!("build ACR HTTP client: {e}"),
@@ -711,6 +712,47 @@ fn retry_after_delay(value: Option<&HeaderValue>) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+fn redirect_policy(options: &AcrClientOptions) -> reqwest::redirect::Policy {
+    let allow_insecure_http = insecure_http_allowed(options);
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many ACR HTTP redirects");
+        }
+        let Some(origin) = attempt.previous().first() else {
+            return attempt.error("ACR HTTP redirect is missing its origin URL");
+        };
+        if !same_origin(origin, attempt.url()) {
+            return attempt.error("ACR HTTP redirect target must keep the original origin");
+        }
+        if attempt.url().scheme() != "https" && !allow_insecure_http {
+            return attempt.error("ACR HTTP redirect target must use https");
+        }
+        attempt.follow()
+    })
+}
+
+fn same_origin(left: &Url, right: &Url) -> bool {
+    left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default()
+}
+
+fn redirect_target_allowed(url: &Url, options: &AcrClientOptions) -> bool {
+    url.scheme() == "https" || insecure_http_allowed(options)
+}
+
+fn insecure_http_allowed(options: &AcrClientOptions) -> bool {
+    #[cfg(not(test))]
+    {
+        let _ = options;
+        false
+    }
+    #[cfg(test)]
+    {
+        options.allow_insecure_http
+    }
+}
+
 fn validate_https_url_str(
     url: &str,
     description: &str,
@@ -727,18 +769,13 @@ fn validate_https_url(
     description: &str,
     options: &AcrClientOptions,
 ) -> Result<(), AcrClientError> {
-    if url.scheme() == "https" {
-        return Ok(());
+    if redirect_target_allowed(url, options) {
+        Ok(())
+    } else {
+        Err(AcrClientError::Registry {
+            message: format!("{description} must use https: {url}"),
+        })
     }
-    #[cfg(not(test))]
-    let _ = options;
-    #[cfg(test)]
-    if options.allow_insecure_http {
-        return Ok(());
-    }
-    Err(AcrClientError::Registry {
-        message: format!("{description} must use https: {url}"),
-    })
 }
 
 fn load_docker_credentials(
@@ -1032,14 +1069,15 @@ fn challenge_cache_key(url: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::net::SocketAddr;
+pub(super) mod tests {
+    use std::error::Error as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use axum::body::Bytes;
     use axum::extract::State;
     use axum::http::{HeaderMap as AxumHeaderMap, HeaderValue, StatusCode as AxumStatusCode};
-    use axum::response::IntoResponse;
+    use axum::response::{IntoResponse, Redirect};
     use axum::routing::{delete, get, head, patch, post, put};
     use axum::Router;
     use tempfile::TempDir;
@@ -1048,11 +1086,11 @@ mod tests {
     use super::*;
 
     #[derive(Default)]
-    struct FakeState {
+    pub(crate) struct FakeState {
         token_scopes: Vec<String>,
         uploads: Vec<Vec<u8>>,
         upload_completes: usize,
-        manifest_puts: Vec<Vec<u8>>,
+        pub(crate) manifest_puts: Vec<Vec<u8>>,
         deletes: Vec<String>,
         blob_exists: bool,
         blob_head_429s_remaining: usize,
@@ -1060,7 +1098,23 @@ mod tests {
         omit_manifest_digest: bool,
     }
 
-    async fn fake_server(state: Arc<Mutex<FakeState>>) -> String {
+    impl FakeState {
+        pub(crate) fn with_existing_blobs() -> Self {
+            Self {
+                blob_exists: true,
+                ..Default::default()
+            }
+        }
+    }
+
+    async fn serve(app: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    pub(crate) async fn fake_server(state: Arc<Mutex<FakeState>>) -> String {
         let app = Router::new()
             .route("/token", get(token))
             .route("/v2/ns/repo/blobs/{digest}", head(blob_head))
@@ -1071,12 +1125,7 @@ mod tests {
             .route("/v2/ns/repo/manifests/{reference}", put(manifest_put))
             .route("/v2/ns/repo/manifests/{reference}", delete(manifest_delete))
             .with_state(state);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr: SocketAddr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        format!("http://{addr}")
+        serve(app).await
     }
 
     fn bearer_challenge(base: &str) -> String {
@@ -1095,7 +1144,7 @@ mod tests {
         format!("{base}/v2/ns/repo/blobs")
     }
 
-    fn client() -> AcrClient {
+    pub(crate) fn client() -> AcrClient {
         client_with_retry_count(0)
     }
 
@@ -1344,6 +1393,58 @@ printf '{"Username":"helper-user","Secret":"helper-secret"}'
             .await
             .unwrap());
         assert_eq!(state.lock().unwrap().blob_head_429s_remaining, 0);
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_rejects_cross_origin_body_replay() {
+        async fn receive_body(
+            State(reached): State<Arc<AtomicBool>>,
+            _body: Bytes,
+        ) -> AxumStatusCode {
+            reached.store(true, Ordering::SeqCst);
+            AxumStatusCode::OK
+        }
+
+        let reached = Arc::new(AtomicBool::new(false));
+        let target = Router::new()
+            .route("/upload", put(receive_body))
+            .with_state(Arc::clone(&reached));
+        let target_url = format!("{}/upload", serve(target).await);
+
+        let redirect = Router::new().route(
+            "/upload",
+            put(move || {
+                let target_url = target_url.clone();
+                async move { Redirect::temporary(&target_url) }
+            }),
+        );
+        let redirect_url = format!("{}/upload", serve(redirect).await);
+
+        client()
+            .http
+            .put(redirect_url)
+            .body("snapshot-data")
+            .send()
+            .await
+            .expect_err("cross-origin redirect must be rejected");
+        assert!(!reached.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn redirect_policy_limits_redirect_chain() {
+        async fn redirect_to_self(headers: AxumHeaderMap) -> Redirect {
+            let host = headers.get("host").unwrap().to_str().unwrap();
+            Redirect::temporary(&format!("http://{host}/loop"))
+        }
+
+        let app = Router::new().route("/loop", get(redirect_to_self));
+        let url = format!("{}/loop", serve(app).await);
+
+        let error = client().http.get(url).send().await.unwrap_err();
+        assert_eq!(
+            error.source().map(ToString::to_string).as_deref(),
+            Some("too many ACR HTTP redirects")
+        );
     }
 
     #[tokio::test]

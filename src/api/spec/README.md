@@ -1,10 +1,6 @@
 # OpenAPI source layout
 
-This directory contains the source files for the AgentENV HTTP API
-specification. `src/api/openapi.yml` is the committed, generated specification;
-do not edit it directly. Update `openapi.tmpl` or the YAML fragments here, then
-run code generation to refresh both the combined specification and the Rust
-server code.
+This directory contains the source files for the AgentENV HTTP API specification. `src/api/openapi.yml` is the committed, generated specification; do not edit it directly. Update `openapi.tmpl` or the YAML fragments here, then run code generation to refresh both the combined specification and the Rust server code.
 
 ## Rendering
 
@@ -16,24 +12,18 @@ server code.
    - `components/parameters.yml`
    - `components/responses.yml`
 3. Render `components/schemas/common.yml` first.
-4. For each tag, in the order declared by `openapi.tmpl`, render its required
-   `components/schemas/<tag>.yml` file.
-5. Keep `/health` from `openapi.tmpl`, then render each required
-   `paths/<tag>.yml` file in tag order.
+4. For each tag, in the order declared by `openapi.tmpl`, render its required `components/schemas/<tag>.yml` file.
+5. Keep `/health` from `openapi.tmpl`, then render each required `paths/<tag>.yml` file in tag order.
 6. Write the combined document to the committed `src/api/openapi.yml`.
 7. Run OpenAPI Generator and update `src/api/generated`.
 
-Tag declarations may move within `openapi.tmpl`; only the order of entries
-inside the `tags` section controls the rendered schema and path order.
+Tag declarations may move within `openapi.tmpl`; only the order of entries inside the `tags` section controls the rendered schema and path order.
 
-Every tag must provide both a schema file and a path file. A missing matching
-file, or a schema or path file whose name does not match a declared tag, is
-rejected so that API definitions cannot be silently omitted.
+Every tag must provide both a schema file and a path file. A missing matching file, or a schema or path file whose name does not match a declared tag, is rejected so that API definitions cannot be silently omitted.
 
 ## Fragment format
 
-Each fragment includes the section key as its first line. The renderer removes
-that line and indents the remaining body into the combined document.
+Each fragment includes the section key as its first line. The renderer removes that line and indents the remaining body into the combined document.
 
 For example, `paths/sandboxes.yml` starts with:
 
@@ -52,9 +42,7 @@ schemas:
     type: object
 ```
 
-Keep models shared by multiple tags, primitive aliases, and common error types
-in `components/schemas/common.yml`. Put tag-owned models in
-`components/schemas/<tag>.yml`.
+Keep models shared by multiple tags, primitive aliases, and common error types in `components/schemas/common.yml`. Put tag-owned models in `components/schemas/<tag>.yml`.
 
 ## Adding or changing an API
 
@@ -62,11 +50,9 @@ For an endpoint under an existing tag:
 
 1. Add the operation to `paths/<tag>.yml`.
 2. Set the operation's `tags` field to the same tag.
-3. Add tag-owned request or response models to
-   `components/schemas/<tag>.yml`.
+3. Add tag-owned request or response models to `components/schemas/<tag>.yml`.
 4. Add reusable models to `components/schemas/common.yml`.
-5. Reuse shared parameters and responses with `$ref`; add new shared entries
-   to `components/parameters.yml` or `components/responses.yml` when needed.
+5. Reuse shared parameters and responses with `$ref`; add new shared entries to `components/parameters.yml` or `components/responses.yml` when needed.
 6. Run `make agentenv-server`.
 7. Review changes under `src/api/generated` and run the relevant Rust tests.
 
@@ -77,8 +63,7 @@ For a new API category:
 3. Create `components/schemas/<tag>.yml`.
 4. Follow the existing-tag workflow above.
 
-When moving definitions between fragments without changing their contents,
-`src/api/generated` should remain unchanged.
+When moving definitions between fragments without changing their contents, `src/api/generated` should remain unchanged.
 
 ## Commands
 

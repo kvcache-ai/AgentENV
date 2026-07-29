@@ -14,6 +14,8 @@ pub struct SnapshotInfo {
     pub snapshot_id: String,
     #[serde(default)]
     pub names: Vec<String>,
+    #[serde(rename = "imageRef", default, skip_serializing_if = "Option::is_none")]
+    pub image_ref: Option<String>,
 }
 
 impl Client {
@@ -59,7 +61,7 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::CreateSnapshot;
+    use super::{CreateSnapshot, SnapshotInfo};
 
     #[test]
     fn create_snapshot_serializes_optional_name() {
@@ -68,5 +70,30 @@ mod tests {
 
         let unnamed = serde_json::to_value(CreateSnapshot { name: None }).unwrap();
         assert_eq!(unnamed, serde_json::json!({}));
+    }
+
+    #[test]
+    fn snapshot_info_supports_optional_image_ref() {
+        let with_ref: SnapshotInfo = serde_json::from_value(serde_json::json!({
+            "snapshotID": "snap-1",
+            "names": [],
+            "imageRef": "registry.example/ns/app:agentenv-snapshot-snap-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            with_ref.image_ref.as_deref(),
+            Some("registry.example/ns/app:agentenv-snapshot-snap-1")
+        );
+
+        let without_ref: SnapshotInfo = serde_json::from_value(serde_json::json!({
+            "snapshotID": "snap-2",
+            "names": []
+        }))
+        .unwrap();
+        assert_eq!(without_ref.image_ref, None);
+        assert!(serde_json::to_value(without_ref)
+            .unwrap()
+            .get("imageRef")
+            .is_none());
     }
 }

@@ -16,6 +16,7 @@ use super::ApiImpl;
 impl From<SnapshotRecord> for models::SnapshotInfo {
     fn from(record: SnapshotRecord) -> Self {
         let snapshot_id = record.id.to_string();
+        let image_ref = record.published_rootfs_image_ref().map(str::to_owned);
         let names = if let Some(alias) = record.alias {
             vec![alias.to_string()]
         } else {
@@ -33,6 +34,7 @@ impl From<SnapshotRecord> for models::SnapshotInfo {
             updated_at: chrono::DateTime::<chrono::Utc>::from(system_time_from_unix_ms(
                 record.updated_at_unix_ms,
             )),
+            image_ref,
         }
     }
 }
@@ -145,5 +147,42 @@ impl Snapshots<()> for ApiImpl {
                 Self::snapshot_manager_error(&err),
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::{
+        rootfs_snapshot_image_tag, CommittedSnapshot, PersistedDiskImagePublication,
+    };
+
+    #[test]
+    fn snapshot_info_includes_published_rootfs_image_ref() {
+        let mut record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let tag = rootfs_snapshot_image_tag(&record.id);
+        let expected = format!("registry.example/ns/app:{tag}");
+        record.committed.as_mut().unwrap().disk_publications =
+            vec![PersistedDiskImagePublication {
+                image_ref: expected.clone(),
+                tag,
+                manifest_digest: "sha256:manifest".to_string(),
+                repo_blob_url: "https://registry.example/v2/ns/app/blobs".to_string(),
+            }];
+
+        let info = models::SnapshotInfo::from(record);
+
+        assert_eq!(info.image_ref.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn snapshot_info_omits_image_ref_without_publication() {
+        let record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+
+        let info = models::SnapshotInfo::from(record);
+
+        assert_eq!(info.image_ref, None);
+        let serialized = serde_json::to_value(&info).expect("serialize SnapshotInfo");
+        assert!(serialized.get("imageRef").is_none());
     }
 }

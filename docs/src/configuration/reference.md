@@ -349,6 +349,14 @@ Environment variable overrides:
 
 - `AENV_SNAPSHOT_LOCAL_CACHE_PATH`
 
+## `[snapshot.image_publish]`
+
+Source-registry image publication. Only takes effect when `snapshot.repository_backend = "oss"`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | When enabled, publishing a snapshot also pushes its rootfs as an OverlayBD-native OCI image tag `agentenv-snapshot-{snapshot_id}` to the original source registry. Requires source images to be OverlayBD-native in that registry and push credentials in the Docker config (`~/.docker/config.json`). Existing remote layers are referenced by digest; only new delta layers are uploaded. The published reference is exposed as `imageRef` in snapshot APIs. Memory and VM-state artifacts always remain in the snapshot repository. |
+
 ## `[backend.posix_fs]`
 
 POSIX filesystem-backed snapshot repository configuration. This section is used when `snapshot.repository_backend = "posix_fs"`.

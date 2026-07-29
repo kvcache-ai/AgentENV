@@ -6,7 +6,7 @@ mod version;
 
 pub use artifacts::SNAPSHOT_ARTIFACT_LAYOUT;
 pub use drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
-pub(crate) use snapshot::RuntimeArtifactLease;
+pub(crate) use snapshot::{rootfs_snapshot_image_tag, RuntimeArtifactLease};
 pub use snapshot::{
     CommandContext, CommittedSnapshot, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
     PersistedDiskImagePublication, RunnableSnapshot, SnapshotPublishMetadata,

@@ -27,6 +27,38 @@ Recoverable failures leave the sandbox running and surface the error to the
 caller. Terminal failures — where the runtime was mutated past safe resume —
 tear down the sandbox.
 
+## OverlayBD Image Publication
+
+When the snapshot repository backend is `oss` and `[snapshot.image_publish]` is
+enabled, publishing a snapshot also writes its rootfs back to the original
+OverlayBD-native OCI registry as an image tag:
+
+```text
+Created snapshot 018f0d93-aaaa-bbbb-cccc-0123456789ab
+Image: registry.example.com/team/app:agentenv-snapshot-018f0d93-aaaa-bbbb-cccc-0123456789ab
+```
+
+The tag lives in the same registry and repository as the source image.
+Publication is incremental: layers already present in that repository (the
+base image and previously published snapshot deltas) are referenced by digest
+and never re-uploaded; only new runtime delta layers are pushed. The result is
+an OverlayBD-native OCI image that can be used directly as a `userImage` to
+cold boot new sandboxes.
+
+Notes:
+
+- The image contains only the root filesystem. Memory state and `vm_state.bin`
+  remain in the snapshot repository, so resuming with full memory state still
+  requires starting from the snapshot itself.
+- The published reference is returned as `imageRef` in snapshot create/GET/list
+  API responses and shown by `aenv snapshot create` and `aenv snapshot list`.
+- Snapshots created from non-OverlayBD-native source images, or created while
+  publication is disabled, do not produce an `imageRef`.
+- AgentENV never overwrites an existing generated snapshot tag. Registry
+  administrators can still move or replace tags through external tooling.
+- Deleting a snapshot also attempts to delete its published manifest from the
+  registry.
+
 ## Manage Snapshots
 
 ### List Snapshots

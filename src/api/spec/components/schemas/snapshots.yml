@@ -32,6 +32,12 @@ schemas:
         type: string
         format: date-time
         description: Time when the snapshot was last updated
+      imageRef:
+        type: string
+        description: >
+          OverlayBD-native OCI image reference for the snapshot rootfs when
+          source-registry image publication was enabled and succeeded.
+          Omitted when no rootfs image was published.
 
   SandboxSnapshotRequest:
     type: object

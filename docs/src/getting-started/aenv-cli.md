@@ -199,6 +199,8 @@ aenv snapshot create <sandbox-id> --name my-base
 |------|-------------|
 | `--name <name>` | Snapshot name or alias |
 
+When source-registry image publication is enabled on the server, the command also prints the published OverlayBD-native image reference on an `Image:` line; that tag can be used directly as a `userImage`.
+
 ### `aenv snapshot list`
 
 List persistent snapshots. Alias: `aenv snapshot ls`, `aenv snap ls`.
@@ -212,5 +214,7 @@ aenv snapshot list --sandbox-id <sandbox-id>
 |------|-------------|
 | `--sandbox-id <id>` | Filter snapshots by source sandbox ID |
 | `--output <format>` | Output format: `table` (default on TTY) or `json` |
+
+The table output includes an `IMAGE REF` column (`-` when no image was published); JSON output includes the optional `imageRef` field.
 
 To delete a snapshot, use `aenv template delete <snapshot-id>` or `aenv template delete <name>` — snapshots share the same underlying store as templates and are deleted through the same command.
