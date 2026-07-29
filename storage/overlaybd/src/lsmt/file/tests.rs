@@ -3213,7 +3213,7 @@ async fn open_mapped_read_stacks(
         .expect("test layer should contain a mapped extent");
     let physical_offset = (mapping.moffset * ALIGNMENT) as usize;
     let mut layer_data = vec![0u8; physical_offset];
-    layer_data.extend(std::iter::repeat_n(0xDD, mapped_data_len));
+    layer_data.extend(mapped_pattern(mapped_data_len));
     let layer: Arc<dyn VirtualFile> = Arc::new(ShortReadFile::new(layer_data, trim));
     let readonly = LSMTReadOnlyFile::from_merged_layers(
         vec![layer.clone()],
@@ -3237,6 +3237,10 @@ async fn open_mapped_read_stacks(
     .unwrap();
 
     (readonly, writable)
+}
+
+fn mapped_pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|index| (index % 251) as u8).collect()
 }
 
 async fn assert_mapped_read_equals(file: &dyn VirtualFile, expected: &[u8]) {
@@ -3266,7 +3270,7 @@ async fn assert_truncated_mapped_read_fails(file: &dyn VirtualFile) {
 
 #[tokio::test]
 async fn test_lsmt_retries_short_mapped_reads() {
-    let expected = vec![0xDD; 4096];
+    let expected = mapped_pattern(4096);
     let (readonly, writable) = open_mapped_read_stacks(4096, 128).await;
 
     assert_mapped_read_equals(&readonly, &expected).await;
