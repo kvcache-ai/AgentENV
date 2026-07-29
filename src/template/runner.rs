@@ -299,8 +299,10 @@ async fn ensure_default_user(
     let script = format!(
         "id -u {quoted} >/dev/null 2>&1 || useradd -m {quoted} 2>/dev/null || adduser -D {quoted}"
     );
+    // /bin/sh, not bash: the images most likely to be missing the account
+    // (Alpine/BusyBox) are also the ones without bash, and the script is POSIX.
     let result = sandbox
-        .run_command_with_opts("/bin/bash", &["-lc", &script], &ProcessOpts::default())
+        .run_command_with_opts("/bin/sh", &["-c", &script], &ProcessOpts::default())
         .await;
     match result {
         Ok(output) if output.exit_code == 0 => Ok(()),
