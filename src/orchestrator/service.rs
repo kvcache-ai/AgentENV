@@ -334,19 +334,22 @@ where
         sandbox_id: SandboxId,
         handle: SandboxHandle,
     ) -> std::result::Result<(), StoreError> {
-        match self
+        // Publish cleanup ownership before exposing Killing. If the metadata
+        // write is cancelled or fails, a later delete can still find the
+        // detached backend and retry stop from its existing Pausing state.
+        self.sandboxes.write().await.insert(sandbox_id, handle);
+
+        let state_result = self
             .store
             .update_state_if_state(&sandbox_id, SandboxState::Killing, &[SandboxState::Pausing])
-            .await
-        {
+            .await;
+
+        match state_result {
             Ok(_)
             | Err(StoreError::StateConflict {
                 actual_state: SandboxState::Killing,
                 ..
-            }) => {
-                self.sandboxes.write().await.insert(sandbox_id, handle);
-                Ok(())
-            }
+            }) => Ok(()),
             Err(err) => Err(err),
         }
     }

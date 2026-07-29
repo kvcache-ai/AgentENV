@@ -3397,7 +3397,7 @@ async fn pause_recovery_metadata_cleanup_failure_releases_paused_image_refs() ->
 }
 
 #[tokio::test]
-async fn pause_recovery_does_not_retain_handle_without_stable_cleanup_state() -> Result<()> {
+async fn pause_recovery_retains_handle_when_cleanup_state_update_fails() -> Result<()> {
     setup();
     let store_control = Arc::new(ScriptedStoreControl::default());
     store_control.push_remove_action(StoreAction::Fail(StoreError::Backend {
@@ -3444,12 +3444,12 @@ async fn pause_recovery_does_not_retain_handle_without_stable_cleanup_state() ->
         "{message}"
     );
     assert!(
-        !orchestrator
+        orchestrator
             .sandboxes
             .read()
             .await
             .contains_key(&sandbox_id),
-        "a handle must not be published without a stable cleanup state"
+        "an unresolved cleanup state must not make the backend handle unreachable"
     );
     assert_eq!(
         orchestrator.proxy_lookup_for(&sandbox_id).await?,
@@ -3465,6 +3465,65 @@ async fn pause_recovery_does_not_retain_handle_without_stable_cleanup_state() ->
     );
 
     orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_handle_is_reachable_before_cleanup_state_transition() -> Result<()> {
+    setup();
+    let store_control = Arc::new(ScriptedStoreControl::default());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&store_control)),
+        MockBackendFactory::new(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    orchestrator
+        .store
+        .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
+        .await?;
+    let (handle, _) = orchestrator
+        .detach_sandbox_handle_and_route(&sandbox_id)
+        .await;
+    let handle = handle.expect("created sandbox should have a backend handle");
+
+    let transition_started = Arc::new(Notify::new());
+    store_control.push_update_if_state_action(StoreAction::Block {
+        started: Arc::clone(&transition_started),
+        release: Arc::new(Notify::new()),
+    });
+    let retain_task = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move {
+            orchestrator
+                .retain_sandbox_handle_for_cleanup(sandbox_id, handle)
+                .await
+        })
+    };
+    timeout(Duration::from_secs(1), transition_started.notified())
+        .await
+        .expect("cleanup state transition should start");
+    assert!(
+        orchestrator
+            .sandboxes
+            .read()
+            .await
+            .contains_key(&sandbox_id),
+        "backend ownership must be published before the cleanup state write"
+    );
+
+    retain_task.abort();
+    assert!(
+        retain_task
+            .await
+            .expect_err("retain task should be cancelled")
+            .is_cancelled(),
+        "retain task should stop at the blocked cleanup state transition"
+    );
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
     Ok(())
 }
 
