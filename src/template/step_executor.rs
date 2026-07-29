@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
+use shell_util::shell_quote;
 use tracing::debug;
 
 use super::build_spec::{TemplateBuildStep, TemplateBuildStepKind};
@@ -35,7 +36,9 @@ impl TemplateStepExecutor {
                     context = context.with_env_var(key.clone(), value.clone());
                 }
                 TemplateBuildStepKind::Workdir { path } => {
-                    context = context.with_workdir(path.to_string_lossy());
+                    let path = path.to_string_lossy().into_owned();
+                    self.ensure_workdir(sandbox, &context, &path).await?;
+                    context = context.with_workdir(path);
                 }
                 TemplateBuildStepKind::User { value } => {
                     context = context.with_user(Some(value.clone()));
@@ -68,6 +71,41 @@ impl TemplateStepExecutor {
         debug!("template build steps completed");
 
         Ok(context)
+    }
+
+    /// Docker's WORKDIR creates the directory when it does not exist, and both
+    /// Dockerfile front-ends (`aenv build` and the e2b SDK's `from_dockerfile`,
+    /// which also injects a default `WORKDIR /home/user`) map WORKDIR to this
+    /// step — so it must materialize the directory, not only record metadata.
+    /// Relative paths resolve against the current workdir, as in Docker.
+    async fn ensure_workdir(
+        &self,
+        sandbox: &impl SandboxExecutor,
+        context: &CommandContext,
+        path: &str,
+    ) -> Result<()> {
+        let cmd = format!("mkdir -p -- {}", shell_quote(path));
+        let opts = ProcessOpts {
+            envs: context.env_vars.clone(),
+            cwd: Some(context.workdir.clone()),
+            ..ProcessOpts::default()
+        };
+
+        let output = sandbox
+            .run_command_with_opts("/bin/bash", &["-lc", &cmd], &opts)
+            .await
+            .with_context(|| {
+                TemplateBuildFailure::with_step("build step failed", format!("WORKDIR {path}"))
+            })?;
+        if output.exit_code != 0 {
+            let message = format!(
+                "build step failed: command exited with status {}{}",
+                output.exit_code,
+                command_output_suffix(&output.stdout, &output.stderr)
+            );
+            return Err(TemplateBuildFailure::with_step(message, format!("WORKDIR {path}")).into());
+        }
+        Ok(())
     }
 
     async fn run_step(
@@ -103,10 +141,13 @@ impl TemplateStepExecutor {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
 
     use super::TemplateStepExecutor;
+    use crate::template::errors::TemplateBuildFailure;
     use crate::sandbox::{Executor, ProcessHandle, ProcessOpts, ProcessOutput, SandboxExecutor};
     use crate::snapshot::CommandContext;
     use crate::template::build_spec::TemplateBuildStep;
@@ -125,6 +166,70 @@ mod tests {
             _opts: &ProcessOpts,
         ) -> Result<ProcessOutput> {
             Err(anyhow!("not used"))
+        }
+        async fn start_process(
+            &self,
+            _cmd: &str,
+            _args: &[&str],
+            _opts: &ProcessOpts,
+        ) -> Result<ProcessHandle> {
+            Err(anyhow!("not used"))
+        }
+    }
+
+    /// Records every command the executor runs and reports success for all.
+    struct RecordingSandbox {
+        commands: Mutex<Vec<(String, Vec<String>, Option<String>)>>,
+        exit_code: i32,
+    }
+
+    impl RecordingSandbox {
+        fn succeeding() -> Self {
+            Self {
+                commands: Mutex::new(Vec::new()),
+                exit_code: 0,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                commands: Mutex::new(Vec::new()),
+                exit_code: 1,
+            }
+        }
+
+        fn commands(&self) -> Vec<(String, Vec<String>, Option<String>)> {
+            self.commands
+                .lock()
+                .expect("commands mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl SandboxExecutor for RecordingSandbox {
+        fn executor(&self) -> Result<Executor<'_>> {
+            Err(anyhow!("not used"))
+        }
+        async fn run_command_with_opts(
+            &self,
+            cmd: &str,
+            args: &[&str],
+            opts: &ProcessOpts,
+        ) -> Result<ProcessOutput> {
+            self.commands
+                .lock()
+                .expect("commands mutex should not be poisoned")
+                .push((
+                    cmd.to_string(),
+                    args.iter().map(|a| a.to_string()).collect(),
+                    opts.cwd.clone(),
+                ));
+            Ok(ProcessOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: self.exit_code,
+            })
         }
         async fn start_process(
             &self,
@@ -203,7 +308,74 @@ mod tests {
 
     #[tokio::test]
     async fn workdir_step_updates_workdir() {
-        let ctx = run(vec![TemplateBuildStep::workdir("/workspace")]).await;
+        let sandbox = RecordingSandbox::succeeding();
+        let ctx = TemplateStepExecutor::new()
+            .execute(
+                &sandbox,
+                &[TemplateBuildStep::workdir("/workspace")],
+                CommandContext::default(),
+            )
+            .await
+            .unwrap();
         assert_eq!(ctx.workdir, "/workspace");
+    }
+
+    #[tokio::test]
+    async fn workdir_step_creates_the_directory() {
+        // Docker's WORKDIR creates missing directories; images built from
+        // Dockerfiles (and the e2b SDK's injected default workdir) rely on it.
+        let sandbox = RecordingSandbox::succeeding();
+        TemplateStepExecutor::new()
+            .execute(
+                &sandbox,
+                &[TemplateBuildStep::workdir("/app")],
+                CommandContext::default(),
+            )
+            .await
+            .unwrap();
+        let commands = sandbox.commands();
+        assert_eq!(commands.len(), 1);
+        let (cmd, args, _) = &commands[0];
+        assert_eq!(cmd, "/bin/bash");
+        // shell_quote leaves safe paths bare and quotes the rest.
+        assert_eq!(args[1], "mkdir -p -- /app");
+    }
+
+    #[tokio::test]
+    async fn workdir_step_resolves_relative_paths_against_current_workdir() {
+        let sandbox = RecordingSandbox::succeeding();
+        TemplateStepExecutor::new()
+            .execute(
+                &sandbox,
+                &[
+                    TemplateBuildStep::workdir("/base"),
+                    TemplateBuildStep::workdir("nested"),
+                ],
+                CommandContext::default(),
+            )
+            .await
+            .unwrap();
+        let commands = sandbox.commands();
+        assert_eq!(commands.len(), 2);
+        // The second mkdir runs with the first workdir as its cwd, so the
+        // relative path lands in /base/nested as Docker would resolve it.
+        assert_eq!(commands[1].2.as_deref(), Some("/base"));
+    }
+
+    #[tokio::test]
+    async fn workdir_step_failure_is_labelled_with_the_step() {
+        let sandbox = RecordingSandbox::failing();
+        let error = TemplateStepExecutor::new()
+            .execute(
+                &sandbox,
+                &[TemplateBuildStep::workdir("/app")],
+                CommandContext::default(),
+            )
+            .await
+            .expect_err("a failed mkdir should fail the build");
+        let failure = error
+            .downcast_ref::<TemplateBuildFailure>()
+            .expect("the error should be a TemplateBuildFailure");
+        assert_eq!(failure.reason.step.as_deref(), Some("WORKDIR /app"));
     }
 }

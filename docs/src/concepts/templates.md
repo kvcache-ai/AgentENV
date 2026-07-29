@@ -58,7 +58,7 @@ Supported Dockerfile instructions:
 | `RUN` | Shell command executed inside the build sandbox |
 | `ENV` | Set an environment variable |
 | `ARG` | Set a build-time variable |
-| `WORKDIR` | Set the working directory |
+| `WORKDIR` | Create the directory if needed and set it as the working directory |
 | `USER` | Set the default user |
 | `ENTRYPOINT` | Becomes the template `startCmd` |
 | `CMD` | Becomes `startCmd` if no `ENTRYPOINT` is present |
