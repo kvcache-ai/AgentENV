@@ -67,6 +67,11 @@ access_key_secret = "YOUR_ACCESS_KEY_SECRET"
 max_size_gb = 100
 ```
 
+If your provider only supports virtual-host bucket addressing — for example
+[Tigris](https://www.tigrisdata.com/docs/) or Cloudflare R2 — also set
+`addressing_style = "virtual"`; see the
+[configuration reference](../configuration/reference.md#backendoss) for details.
+
 ## 3. Apply the configuration
 
 If AgentENV is running as a systemd service, restart it:

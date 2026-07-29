@@ -1185,6 +1185,7 @@ mod tests {
             "region".to_string(),
             "prefix".to_string(),
             CredentialSource::Anonymous,
+            None,
         )
         .expect("oss client");
         OssSnapshotRepository::new(Arc::new(client), SnapshotImageStoragePolicy::ObjectStorage)

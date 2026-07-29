@@ -34,10 +34,17 @@ impl OssClient {
         region: String,
         prefix: String,
         credential_source: CredentialSource,
+        addressing_override: Option<AddressingStyle>,
     ) -> Result<Self> {
+        // An explicit config override wins; otherwise fall back to
+        // endpoint-based detection (Alibaba OSS / bucket-in-endpoint hosts).
+        let addressing_style = match addressing_override {
+            Some(style) => style,
+            None => detect_addressing_style(&endpoint, &bucket)?,
+        };
         Ok(Self {
             operator_config: ObjectStoreOperatorConfig {
-                addressing_style: detect_addressing_style(&endpoint, &bucket)?,
+                addressing_style,
                 bucket,
                 endpoint,
                 region,
@@ -394,4 +401,50 @@ async fn upload_file_to_operator(
 
 fn io_error_to_opendal(error: std::io::Error, message: &'static str) -> OpenDalError {
     OpenDalError::new(OpenDalErrorKind::Unexpected, message).set_source(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{detect_addressing_style, OssClient};
+    use object_store_operator::{AddressingStyle, CredentialSource};
+
+    #[test]
+    fn detect_defaults_to_path_for_generic_endpoint() {
+        // Virtual-host-only providers such as Tigris (t3.storage.dev) are not
+        // matched by the heuristic and fall back to path style, which is why an
+        // explicit `addressing_style` override exists.
+        assert_eq!(
+            detect_addressing_style("https://t3.storage.dev", "snapshots").unwrap(),
+            AddressingStyle::Path
+        );
+    }
+
+    #[test]
+    fn detect_uses_virtual_for_aliyun_and_bucket_host() {
+        assert_eq!(
+            detect_addressing_style("https://oss-cn-hangzhou.aliyuncs.com", "b").unwrap(),
+            AddressingStyle::Virtual
+        );
+        assert_eq!(
+            detect_addressing_style("https://b.example.com", "b").unwrap(),
+            AddressingStyle::Virtual
+        );
+    }
+
+    #[test]
+    fn explicit_override_takes_precedence_over_detection() {
+        let client = OssClient::new(
+            "snapshots".to_string(),
+            "https://t3.storage.dev".to_string(),
+            "auto".to_string(),
+            String::new(),
+            CredentialSource::Anonymous,
+            Some(AddressingStyle::Virtual),
+        )
+        .expect("build client");
+        assert_eq!(
+            client.operator_config.addressing_style,
+            AddressingStyle::Virtual
+        );
+    }
 }

@@ -724,6 +724,7 @@ mod tests {
             access_key_secret: Some(" sk ".to_string()),
             security_token: Some(" token ".to_string()),
             region: Some(" cn-hangzhou ".to_string()),
+            addressing_style: None,
             cache_max_size_gb: Some(4),
         }
     }
