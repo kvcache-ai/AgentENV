@@ -1228,6 +1228,11 @@ mod tests {
             .unwrap();
     }
 
+    // `previous_runtime` models the idle flow to the stopped VM. Bytes arriving on
+    // it mean the client reused that stale connection; a new `accept()` models a
+    // connection to the next VM that inherited the same address. The return value
+    // is true only when the previous runtime's connection was reused.
+
     async fn simulate_runtime_generation_change(listener: tokio::net::TcpListener) -> bool {
         let (mut previous_runtime, _) = listener.accept().await.unwrap();
         read_http_request_head(&mut previous_runtime).await;
