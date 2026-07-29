@@ -26,8 +26,8 @@ fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-fn env_req(key: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| panic!("missing required env var {key}"))
+fn env_req(key: &str) -> anyhow::Result<String> {
+    std::env::var(key).map_err(|err| anyhow::anyhow!("required env var {key}: {err}"))
 }
 
 #[tokio::main]
@@ -39,10 +39,10 @@ async fn main() -> anyhow::Result<()> {
         "path" => AddressingStyle::Path,
         other => anyhow::bail!("SMOKE_STYLE must be 'virtual' or 'path', got '{other}'"),
     };
-    let bucket = env_req("SMOKE_BUCKET");
+    let bucket = env_req("SMOKE_BUCKET")?;
     let cred = ResolvedCredential::new(
-        env_req("SMOKE_ACCESS_KEY_ID"),
-        env_req("SMOKE_SECRET_ACCESS_KEY"),
+        env_req("SMOKE_ACCESS_KEY_ID")?,
+        env_req("SMOKE_SECRET_ACCESS_KEY")?,
         None,
         None,
     )?;
@@ -59,20 +59,21 @@ async fn main() -> anyhow::Result<()> {
     println!("endpoint={endpoint} bucket={bucket} addressing_style={style:?}");
     let op = build_object_store_operator(&config, Some(&cred))?;
 
-    // Collision-resistant per-run key so concurrent runs cannot interfere and
+    // Random per-run key so concurrent runs (on any host) cannot interfere and
     // the test never overwrites or deletes a pre-existing object.
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before unix epoch")
-        .as_nanos();
-    let key = format!(
-        "agentenv-smoke/{nonce}-{}/roundtrip.txt",
-        std::process::id()
-    );
+    let key = format!("agentenv-smoke/{}/roundtrip.txt", uuid::Uuid::new_v4());
     let payload = b"agentenv addressing-style smoke test".to_vec();
 
+    // A failed write can still have committed the object remotely (timeout or
+    // retry ambiguity), so attempt cleanup even then; the unique key makes the
+    // extra delete safe.
     println!("-> write  {key}");
-    op.write(&key, payload.clone()).await?;
+    if let Err(write_err) = op.write(&key, payload.clone()).await {
+        if let Err(cleanup_err) = op.delete(&key).await {
+            eprintln!("warning: failed to delete {key} after write error: {cleanup_err}");
+        }
+        return Err(write_err.into());
+    }
 
     // From here on the object exists remotely, so always attempt cleanup even
     // when the read or content check fails, then surface the primary error.

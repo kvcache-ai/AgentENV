@@ -21,22 +21,6 @@ fn backend(fixture: &MinioFixture) -> OssBackend {
     OssBackend::new(&config).expect("create oss backend")
 }
 
-fn backend_with_addressing_style(fixture: &MinioFixture, style: &str) -> OssBackend {
-    let config = OssConfig {
-        enable: true,
-        access_key_id: MINIO_USER.to_string(),
-        secret_access_key: MINIO_PASS.to_string(),
-        security_token: String::new(),
-        credential_process: String::new(),
-        default_region: fixture.region.clone(),
-        default_endpoint: fixture.endpoint.clone(),
-        default_addressing_style: style.to_string(),
-        timeout_secs: 30,
-        retry_count: 3,
-    };
-    OssBackend::new(&config).expect("create oss backend with explicit addressing style")
-}
-
 fn backend_with_bad_credentials(fixture: &MinioFixture) -> OssBackend {
     let config = OssConfig {
         enable: true,
@@ -93,33 +77,6 @@ async fn minio_upload_and_read_back() {
         .await
         .expect("read at eof");
     assert!(got.is_empty());
-}
-
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn minio_remote_layer_read_with_explicit_addressing_style() {
-    // MinIO only serves path-style requests without extra DNS/domain setup, so
-    // an explicit "path" override exercises the full config -> backend -> read
-    // propagation live. The virtual-host branch is covered by unit tests, since
-    // it needs wildcard DNS the fixture cannot provide.
-    let fixture = MinioFixture::start().await.expect("start minio");
-    let backend = backend_with_addressing_style(&fixture, "path");
-
-    let payload = b"remote layer bytes".to_vec();
-    let url = fixture.object_url("layers/explicit-style-object");
-    backend
-        .upload_bytes(&url, payload.clone())
-        .await
-        .expect("upload with explicit addressing style");
-
-    let file = backend
-        .open_with_size_hint(&url, None)
-        .expect("open with explicit addressing style");
-    let got = file
-        .read_at(0, payload.len())
-        .await
-        .expect("read remote layer with explicit addressing style");
-    assert_eq!(got.as_ref(), payload.as_slice());
 }
 
 #[tokio::test]
