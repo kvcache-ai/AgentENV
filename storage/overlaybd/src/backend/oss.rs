@@ -31,6 +31,7 @@ struct OssBackendInner {
     credentials: CachedCredentialSource,
     default_region: String,
     default_endpoint: String,
+    addressing_override: Option<AddressingStyle>,
     timeout: Duration,
     retry_count: u32,
     cached_operators: RwLock<HashMap<OperatorCacheKey, OperatorWithCredential>>,
@@ -63,6 +64,7 @@ struct OperatorCacheKey {
 impl OssBackend {
     pub fn new(config: &OssConfig) -> Result<Self> {
         let credential_source = credential_source_from_config(config)?;
+        let addressing_override = parse_addressing_style(&config.default_addressing_style)?;
         let timeout = if config.timeout_secs == 0 {
             DEFAULT_TIMEOUT
         } else {
@@ -79,6 +81,7 @@ impl OssBackend {
                 credentials: CachedCredentialSource::new(credential_source),
                 default_region: config.default_region.clone(),
                 default_endpoint: config.default_endpoint.clone(),
+                addressing_override,
                 timeout,
                 retry_count,
                 cached_operators: RwLock::new(HashMap::new()),
@@ -95,6 +98,7 @@ impl OssBackend {
             url.as_ref(),
             &self.inner.default_endpoint,
             &self.inner.default_region,
+            self.inner.addressing_override.clone(),
         )?;
 
         Ok(Arc::new(OssFile {
@@ -125,6 +129,7 @@ impl OssBackend {
             url.as_ref(),
             &self.inner.default_endpoint,
             &self.inner.default_region,
+            self.inner.addressing_override.clone(),
         )?;
         let key = location.key.clone();
 
@@ -143,7 +148,12 @@ impl OssBackend {
 }
 
 impl ParsedOssUrl {
-    fn parse(raw: &str, default_endpoint: &str, default_region: &str) -> Result<Self> {
+    fn parse(
+        raw: &str,
+        default_endpoint: &str,
+        default_region: &str,
+        addressing_override: Option<AddressingStyle>,
+    ) -> Result<Self> {
         let url = Url::parse(raw).context(format!("invalid oss url {raw}"))?;
         ensure!(
             matches!(url.scheme(), "s3" | "oss"),
@@ -187,7 +197,10 @@ impl ParsedOssUrl {
                 }
             })
             .ok_or_else(|| anyhow::anyhow!("oss region is missing"))?;
-        let addressing_style = detect_addressing_style(&endpoint, &bucket)?;
+        // Detection also validates the endpoint URL, so it always runs; an
+        // explicit override from the config then wins over the detected style.
+        let detected_style = detect_addressing_style(&endpoint, &bucket)?;
+        let addressing_style = addressing_override.unwrap_or(detected_style);
 
         Ok(Self {
             bucket,
@@ -453,6 +466,19 @@ fn detect_addressing_style(endpoint: &str, bucket: &str) -> Result<AddressingSty
     Ok(AddressingStyle::Path)
 }
 
+/// Parse the config-level addressing style: `"virtual"`, `"path"`, or empty
+/// for `None` (auto-detect per URL).
+fn parse_addressing_style(value: &str) -> Result<Option<AddressingStyle>> {
+    match value.trim() {
+        "" => Ok(None),
+        "virtual" => Ok(Some(AddressingStyle::Virtual)),
+        "path" => Ok(Some(AddressingStyle::Path)),
+        other => bail!(
+            "invalid oss defaultAddressingStyle '{other}': expected 'virtual', 'path', or empty for auto-detection"
+        ),
+    }
+}
+
 fn credential_source_from_config(config: &OssConfig) -> Result<CredentialSource> {
     credential_source_from_fields(
         CredentialFields {
@@ -511,11 +537,68 @@ mod tests {
             credential_process: "echo '{}'".to_string(),
             default_region: "us-east-1".to_string(),
             default_endpoint: "https://s3.us-east-1.amazonaws.com".to_string(),
+            default_addressing_style: String::new(),
             timeout_secs: 30,
             retry_count: 3,
         };
 
         let err = credential_source_from_config(&config).expect_err("mixed source should fail");
         assert!(err.to_string().contains("credential_process"));
+    }
+
+    #[test]
+    fn test_parse_addressing_style_values() {
+        assert_eq!(parse_addressing_style("").expect("empty"), None);
+        assert_eq!(parse_addressing_style("  ").expect("blank"), None);
+        assert_eq!(
+            parse_addressing_style("virtual").expect("virtual"),
+            Some(AddressingStyle::Virtual)
+        );
+        assert_eq!(
+            parse_addressing_style("path").expect("path"),
+            Some(AddressingStyle::Path)
+        );
+        parse_addressing_style("bogus").expect_err("invalid style must be rejected");
+    }
+
+    #[test]
+    fn test_parsed_url_applies_addressing_override() {
+        // A generic endpoint auto-detects to path style...
+        let detected = ParsedOssUrl::parse(
+            "s3://demo-bucket/layers/obj",
+            "https://t3.storage.dev",
+            "auto",
+            None,
+        )
+        .expect("parse without override");
+        assert_eq!(detected.addressing_style, AddressingStyle::Path);
+
+        // ...and the config-level override switches remote layer reads to
+        // virtual-host style for providers that require it.
+        let overridden = ParsedOssUrl::parse(
+            "s3://demo-bucket/layers/obj",
+            "https://t3.storage.dev",
+            "auto",
+            Some(AddressingStyle::Virtual),
+        )
+        .expect("parse with override");
+        assert_eq!(overridden.addressing_style, AddressingStyle::Virtual);
+        assert_eq!(
+            overridden
+                .operator_config(Duration::from_secs(30), 3)
+                .addressing_style,
+            AddressingStyle::Virtual
+        );
+    }
+
+    #[test]
+    fn test_parsed_url_override_still_validates_endpoint() {
+        ParsedOssUrl::parse(
+            "s3://demo-bucket/layers/obj",
+            "not a valid endpoint",
+            "auto",
+            Some(AddressingStyle::Virtual),
+        )
+        .expect_err("malformed endpoint must fail even with an explicit override");
     }
 }

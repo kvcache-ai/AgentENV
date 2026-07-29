@@ -59,18 +59,39 @@ async fn main() -> anyhow::Result<()> {
     println!("endpoint={endpoint} bucket={bucket} addressing_style={style:?}");
     let op = build_object_store_operator(&config, Some(&cred))?;
 
-    let key = "agentenv-smoke/roundtrip.txt";
+    // Collision-resistant per-run key so concurrent runs cannot interfere and
+    // the test never overwrites or deletes a pre-existing object.
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_nanos();
+    let key = format!(
+        "agentenv-smoke/{nonce}-{}/roundtrip.txt",
+        std::process::id()
+    );
     let payload = b"agentenv addressing-style smoke test".to_vec();
 
     println!("-> write  {key}");
-    op.write(key, payload.clone()).await?;
+    op.write(&key, payload.clone()).await?;
 
-    println!("-> read   {key}");
-    let got = op.read(key).await?.to_vec();
-    anyhow::ensure!(got == payload, "read-back mismatch: object content differs");
+    // From here on the object exists remotely, so always attempt cleanup even
+    // when the read or content check fails, then surface the primary error.
+    let round_trip = async {
+        println!("-> read   {key}");
+        let got = op.read(&key).await?.to_vec();
+        anyhow::ensure!(got == payload, "read-back mismatch: object content differs");
+        Ok(())
+    }
+    .await;
 
     println!("-> delete {key}");
-    op.delete(key).await?;
+    let cleanup = op.delete(&key).await;
+    if let Err(err) = &cleanup {
+        eprintln!("warning: failed to delete {key}: {err}");
+    }
+
+    round_trip?;
+    cleanup?;
 
     println!("OK: {style:?}-host round-trip succeeded against {endpoint}");
     Ok(())

@@ -292,6 +292,15 @@ pub enum OssAddressingStyle {
     Virtual,
 }
 
+impl OssAddressingStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Virtual => "virtual",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct OssBackendConfig {
     pub endpoint: String,

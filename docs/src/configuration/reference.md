@@ -384,6 +384,7 @@ Notes:
 - `credential_process` should be written as a portable argv-style command line. Avoid `$VAR`, backticks, `$(...)`, pipes, and shell builtins.
 - Although the config section is still named `oss`, the runtime path is implemented via a shared S3-compatible client, so `region` must be configured.
 - Leave `addressing_style` unset for Alibaba OSS and MinIO. Set it to `"virtual"` for S3-compatible providers that only support virtual-host bucket addressing; path-style requests to those endpoints are rejected.
+- The setting covers both halves of the data path: the snapshot repository client (metadata and artifact upload/download) and the generated OverlayBD runtime config (`ossConfig.defaultAddressingStyle`), which the runtime uses when reading remote managed snapshot layers during sandbox restore.
 
 For an S3-compatible provider that requires virtual-host addressing — for example [Tigris](https://www.tigrisdata.com/docs/) — set `addressing_style` explicitly:
 
