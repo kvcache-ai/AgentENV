@@ -57,6 +57,14 @@ type NodeResourceLimit struct {
 	MaxAllocatedMemoryBytesIncludingPaused *uint64 `json:"max_allocated_memory_bytes_including_paused"`
 }
 
+// LocalityGroupConfig bounds each same-workload placement group. A group is
+// closed before adding a sandbox that would exceed any enabled limit.
+type LocalityGroupConfig struct {
+	MaxSandboxCount uint32 `json:"max_sandbox_count"`
+	MaxCPUCount     uint32 `json:"max_cpu_count"`
+	MaxMemoryMB     uint64 `json:"max_memory_mb"`
+}
+
 type SchedulerConfig struct {
 	GRPCListenAddr          string                   `json:"grpc_listen_addr"`
 	MetricsListenAddr       string                   `json:"metrics_listen_addr"`
@@ -69,6 +77,7 @@ type SchedulerConfig struct {
 	Nodes                   []Node                   `json:"nodes"`
 	Discovery               SchedulerDiscoveryConfig `json:"discovery"`
 	NodeResourceLimit       *NodeResourceLimit       `json:"node_resource_limit"`
+	LocalityGroup           LocalityGroupConfig      `json:"locality_group"`
 }
 
 func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
@@ -84,6 +93,7 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		Nodes                   *[]Node                   `json:"nodes"`
 		Discovery               *SchedulerDiscoveryConfig `json:"discovery"`
 		NodeResourceLimit       *NodeResourceLimit        `json:"node_resource_limit"`
+		LocalityGroup           *LocalityGroupConfig      `json:"locality_group"`
 	}
 
 	parsed := wire{}
@@ -108,6 +118,9 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.NodeResourceLimit != nil {
 		s.NodeResourceLimit = parsed.NodeResourceLimit
+	}
+	if parsed.LocalityGroup != nil {
+		s.LocalityGroup = *parsed.LocalityGroup
 	}
 	if parsed.RedisAddr != nil {
 		s.RedisAddr = *parsed.RedisAddr
@@ -353,6 +366,30 @@ func overrideWithEnv(cfg *Config) error {
 		cfg.Scheduler.ArtifactLookupNodeLimit = limit
 	}
 
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_LOCALITY_GROUP_MAX_SANDBOX_COUNT")); v != "" {
+		limit, err := strconv.ParseUint(v, 10, 32)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_LOCALITY_GROUP_MAX_SANDBOX_COUNT %q: %w", v, err)
+		}
+		cfg.Scheduler.LocalityGroup.MaxSandboxCount = uint32(limit)
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_LOCALITY_GROUP_MAX_CPU_COUNT")); v != "" {
+		limit, err := strconv.ParseUint(v, 10, 32)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_LOCALITY_GROUP_MAX_CPU_COUNT %q: %w", v, err)
+		}
+		cfg.Scheduler.LocalityGroup.MaxCPUCount = uint32(limit)
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_LOCALITY_GROUP_MAX_MEMORY_MB")); v != "" {
+		limit, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_LOCALITY_GROUP_MAX_MEMORY_MB %q: %w", v, err)
+		}
+		cfg.Scheduler.LocalityGroup.MaxMemoryMB = limit
+	}
+
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_REQUEST_TIMEOUT")); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
@@ -442,6 +479,10 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 				return errors.New("scheduler --query-only requires scheduler.redis_addr")
 			}
 			return nil
+		}
+		if strings.EqualFold(strings.TrimSpace(c.Scheduler.Strategy), "locality") &&
+			c.Scheduler.LocalityGroup.MaxSandboxCount == 0 {
+			return errors.New("scheduler.locality_group.max_sandbox_count must be greater than zero for locality strategy")
 		}
 		if c.Scheduler.ArtifactStoreCapacity <= 0 {
 			return errors.New("scheduler.artifact_store_capacity must be greater than zero")
