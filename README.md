@@ -125,3 +125,11 @@ aenv delete  <sandbox-id>               # alias: aenv rm
 
 `aenv start` accepts a template UUID or human-readable name/alias. `aenv list`
 outputs a table on TTY and JSON when piped; override with `--output table|json`.
+
+---
+
+## 🤝 Contributing
+
+Bug reports, feature proposals, documentation fixes, and pull requests are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or submitting a change.
+
+Follow [SECURITY.md](SECURITY.md) to report security vulnerabilities privately; do not disclose them in a public issue.

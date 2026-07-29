@@ -1,0 +1,134 @@
+name: Feature request
+description: Propose an actionable improvement to AgentENV
+labels:
+  - enhancement
+type: feature
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the problem before proposing an implementation. For broad or exploratory ideas, start a Discussion first.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      options:
+        - API server / proxy
+        - Orchestrator / sandbox lifecycle
+        - Firecracker runtime
+        - Snapshot / template builder
+        - OverlayBD / image resolution
+        - ublk / ublk-daemon
+        - Network
+        - P2P artifact transport
+        - CLI
+        - Gateway / scheduler
+        - Observability
+        - Custom extension
+        - Build / installation
+        - Documentation
+        - Cross-cutting / other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What concrete user problem or limitation are you trying to solve? Avoid describing only a preferred implementation.
+      placeholder: |
+        As a ...
+        I need ...
+        Because the current behavior ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Use case
+      description: Describe the workload, scale, environment, and frequency where this capability is needed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: Current behavior and workarounds
+      description: Explain how this is handled today and why the workaround is insufficient.
+    validations:
+      required: true
+
+  - type: textarea
+    id: desired
+    attributes:
+      label: Desired behavior
+      description: Describe observable behavior and acceptance criteria from a user's perspective.
+      placeholder: |
+        - Given ...
+        - When ...
+        - Then ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: Optional. Outline an implementation only if you have considered the existing architecture.
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and operational impact
+      description: Consider APIs, configuration, snapshot/storage formats, upgrades, host permissions, dependencies, and rollback.
+      value: |
+        API/config changes:
+
+        Snapshot or storage format changes:
+
+        New host/runtime requirements:
+
+        Upgrade and rollback considerations:
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other designs or existing features did you consider?
+    validations:
+      required: true
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: What is explicitly outside the scope of this request?
+
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Contribution
+      description: Are you willing to help implement or validate this feature?
+      options:
+        - I can implement it
+        - I can help test or review it
+        - I can provide more design details
+        - I cannot contribute implementation work
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I searched existing issues and discussions and did not find a duplicate.
+          required: true
+        - label: I described a concrete problem and use case, not only a proposed technology.
+          required: true
+        - label: I understand that acceptance of the problem does not imply approval of a particular implementation.
+          required: true

@@ -20,6 +20,8 @@ on:
       - ".github/workflows/coverage.yml"
       - ".github/workflows/services-ci.yml"
       - ".github/workflows/mutation-tests.yml"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/pull_request_template.md"
   push:
     paths-ignore: *ignore_docs
 

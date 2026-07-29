@@ -1,0 +1,68 @@
+name: Documentation issue
+description: Report incorrect, missing, outdated, or unclear documentation
+labels:
+  - documentation
+body:
+  - type: dropdown
+    id: type
+    attributes:
+      label: Documentation problem
+      options:
+        - Incorrect
+        - Outdated
+        - Missing
+        - Unclear
+        - Broken link or example
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: location
+    attributes:
+      label: Location
+      description: Provide the file path, page title, section, or URL.
+      placeholder: docs/src/internals/architecture.md — Storage section
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: Current content or problem
+      description: Quote only the minimum necessary text and explain what is wrong or confusing.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Suggested correction
+      description: Describe what the documentation should say or cover.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Include the version, commands tried, screenshots, or related code when relevant.
+
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - I can submit a pull request
+        - I can review a proposed correction
+        - I am only reporting the problem
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true

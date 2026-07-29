@@ -1,0 +1,124 @@
+name: Performance regression
+description: Report a measured and reproducible performance regression
+labels:
+  - performance
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Performance reports must compare a baseline and current result under equivalent conditions. Attach raw measurements when possible.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component or operation
+      options:
+        - Sandbox creation / boot
+        - Pause / resume
+        - Fork
+        - Snapshot capture / publish
+        - Image pull / conversion
+        - OverlayBD read / write
+        - ublk I/O
+        - P2P artifact transfer
+        - API / control plane
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Regression summary
+      description: State the metric, observed regression, and user impact.
+      placeholder: Snapshot publish p95 increased from 1.2 s to 2.0 s for a 4 GiB VM.
+    validations:
+      required: true
+
+  - type: textarea
+    id: versions
+    attributes:
+      label: Compared versions
+      description: Provide exact commits or releases. If known, include the first bad commit.
+      value: |
+        - Baseline:
+        - Current:
+        - First known bad:
+        - Local modifications:
+    validations:
+      required: true
+
+  - type: textarea
+    id: host
+    attributes:
+      label: Host and workload
+      description: Include all variables that could materially affect the result.
+      value: |
+        - OS and kernel:
+        - Architecture and CPU:
+        - Memory:
+        - Disk and filesystem:
+        - Bare metal, VM, or cloud:
+        - VM vCPU/memory:
+        - Image and snapshot sizes:
+        - Snapshot chain depth:
+        - Attached drives:
+        - P2P enabled:
+        - Cold or warm caches:
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Benchmark command and procedure
+      description: Provide the exact command and steps, including cache preparation and number of repetitions.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      description: Include sample count, units, p50/p95/p99 or throughput, and variability for both versions.
+      value: |
+        - Runs:
+        - Baseline:
+          - p50:
+          - p95:
+          - p99:
+        - Current:
+          - p50:
+          - p95:
+          - p99:
+        - Change:
+    validations:
+      required: true
+
+  - type: textarea
+    id: raw
+    attributes:
+      label: Raw data
+      description: Paste or link to raw benchmark output. Redact sensitive information.
+      render: text
+
+  - type: textarea
+    id: profiles
+    attributes:
+      label: Profiles and diagnostics
+      description: Add flamegraphs, perf data, tracing output, I/O statistics, or logs if available.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Measurement checklist
+      options:
+        - label: I ran the baseline and current versions on the same host or documented the differences.
+          required: true
+        - label: I repeated the measurement and reported the sample count.
+          required: true
+        - label: I controlled or documented cold/warm caches and other relevant variables.
+          required: true
+        - label: I searched existing issues and did not find a duplicate.
+          required: true

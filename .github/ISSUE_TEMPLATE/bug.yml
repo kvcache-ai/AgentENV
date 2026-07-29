@@ -1,0 +1,150 @@
+name: Bug report
+description: Report a reproducible problem in AgentENV
+labels:
+  - bug
+type: bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug.
+
+        Search existing issues before filing a new one. Please do not report security vulnerabilities here; use the private security advisory link in the issue chooser instead.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      description: Select the component most closely related to the problem.
+      options:
+        - API server / proxy
+        - Orchestrator / sandbox lifecycle
+        - Firecracker runtime
+        - Snapshot / template builder
+        - OverlayBD / image resolution
+        - ublk / ublk-daemon
+        - Network
+        - P2P artifact transport
+        - CLI
+        - Gateway / scheduler
+        - Observability
+        - Custom extension
+        - Build / installation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: version
+    attributes:
+      label: AgentENV version
+      description: Provide the release version or exact commit, and state whether the source was modified.
+      value: |
+        - Version or commit:
+        - Local modifications: none
+    validations:
+      required: true
+
+  - type: textarea
+    id: host
+    attributes:
+      label: Host environment
+      description: Include enough host information to reproduce a Firecracker, storage, or networking issue.
+      value: |
+        - OS:
+        - Kernel (`uname -a`):
+        - Architecture:
+        - Bare metal, VM, or cloud:
+        - ublk support:
+        - CPU:
+        - Memory:
+        - Storage/filesystem:
+    validations:
+      required: true
+
+  - type: textarea
+    id: operation
+    attributes:
+      label: Operation and configuration
+      description: Show the exact CLI command, HTTP request, API operation, and relevant redacted configuration.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Provide a minimal, numbered procedure that maintainers can run.
+      placeholder: |
+        1. Start AgentENV with ...
+        2. Create a sandbox with ...
+        3. Pause or resume the sandbox ...
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Include the complete error message.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and diagnostics
+      description: |
+        Paste relevant server, ublk-daemon, Firecracker, or scheduler logs. Include timestamps and backtraces when available. Redact credentials and private registry information.
+      render: text
+
+  - type: dropdown
+    id: frequency
+    attributes:
+      label: Reproduction frequency
+      options:
+        - Always
+        - Often
+        - Intermittently
+        - Once
+    validations:
+      required: true
+
+  - type: textarea
+    id: regression
+    attributes:
+      label: Regression information
+      description: If this worked before, provide the last known good release or commit and the first known bad release or commit.
+      value: |
+        - Last known good:
+        - First known bad:
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add screenshots, traces, a minimal repository, or anything else that may help.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checklist
+      options:
+        - label: I searched existing open and closed issues and did not find a duplicate.
+          required: true
+        - label: I provided a minimal reproduction or explained why one cannot be provided.
+          required: true
+        - label: I removed credentials, tokens, private image references, and other sensitive information.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
