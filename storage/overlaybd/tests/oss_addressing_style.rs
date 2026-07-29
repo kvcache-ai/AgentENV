@@ -70,7 +70,7 @@ async fn explicit_path_override_reaches_the_wire() {
         .expect("open remote layer file");
 
     // One bound covers the whole interaction: the read (which fails with the
-    // recorder's 500 response; only the request matters) and the capture.
+    // recorder's 404 response; only the request matters) and the capture.
     let head = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let _ = file.read_at(0, 4).await;
         recorder.await.expect("recorder task")
