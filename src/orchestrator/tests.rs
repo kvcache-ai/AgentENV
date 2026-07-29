@@ -3703,11 +3703,6 @@ async fn pause_recovery_stop_failure_allows_delete_retry() -> Result<()> {
 async fn pause_running_state_restore_failure_stops_and_removes_sandbox() -> Result<()> {
     setup();
     let store_control = Arc::new(ScriptedStoreControl::default());
-    store_control.push_update_if_state_action(StoreAction::Delegate);
-    store_control.push_update_if_state_action(StoreAction::Delegate);
-    store_control.push_update_if_state_action(StoreAction::Fail(StoreError::Backend {
-        source: anyhow::anyhow!("forced running state restore failure"),
-    }));
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
         MockOperation::Pause,
@@ -3716,7 +3711,7 @@ async fn pause_running_state_restore_failure_stops_and_removes_sandbox() -> Resu
         },
     );
     let orchestrator = make_orchestrator_without_background_with_factory(
-        ScriptedStore::new(store_control),
+        ScriptedStore::new(Arc::clone(&store_control)),
         MockBackendFactory::with_behavior(Arc::clone(&behavior)),
     );
 
@@ -3724,6 +3719,10 @@ async fn pause_running_state_restore_failure_stops_and_removes_sandbox() -> Resu
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
     let sandbox_id = created.id;
+    store_control.push_update_if_state_action(StoreAction::Delegate);
+    store_control.push_update_if_state_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("forced running state restore failure"),
+    }));
 
     let err = orchestrator
         .pause_sandbox(sandbox_id)
