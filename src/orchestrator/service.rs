@@ -131,6 +131,8 @@ pub struct Orchestrator<
     factory: F,
     persister: P,
     lifecycle_operations: LifecycleOperationMap,
+    #[cfg(test)]
+    lifecycle_join_started: StdMutex<Option<Arc<tokio::sync::Notify>>>,
     sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
     proxy_routes: RwLock<ProxyRouteTable>,
     next_proxy_route_version: AtomicU64,
@@ -214,6 +216,8 @@ where
             factory,
             persister,
             lifecycle_operations: Arc::new(StdMutex::new(HashMap::new())),
+            #[cfg(test)]
+            lifecycle_join_started: StdMutex::new(None),
             sandboxes: RwLock::new(HashMap::new()),
             proxy_routes: RwLock::new(ProxyRouteTable::default()),
             next_proxy_route_version: AtomicU64::new(1),
@@ -301,14 +305,31 @@ where
             }))
         }));
         drop(operations);
-        (
-            LifecycleOperationLease {
-                sandbox_id,
-                operation_lock,
-                operations: Arc::clone(&self.lifecycle_operations),
-            },
-            already_existed,
-        )
+        let lease = LifecycleOperationLease {
+            sandbox_id,
+            operation_lock,
+            operations: Arc::clone(&self.lifecycle_operations),
+        };
+        #[cfg(test)]
+        if already_existed {
+            if let Some(started) = self
+                .lifecycle_join_started
+                .lock()
+                .expect("lifecycle join hook mutex poisoned")
+                .take()
+            {
+                started.notify_one();
+            }
+        }
+        (lease, already_existed)
+    }
+
+    #[cfg(test)]
+    fn notify_on_next_lifecycle_join(&self, started: Arc<tokio::sync::Notify>) {
+        *self
+            .lifecycle_join_started
+            .lock()
+            .expect("lifecycle join hook mutex poisoned") = Some(started);
     }
 
     async fn protect_image_refs(
@@ -1137,8 +1158,9 @@ where
             Err(_) => {
                 let mut operation_guard = operation_lease.operation_lock.lock().await;
                 if operation_guard.kind == LifecycleOperationKind::Pause {
+                    let result = self.join_concurrent_pause(sandbox_id).await;
                     drop(operation_guard);
-                    return self.join_concurrent_pause(sandbox_id).await;
+                    return result;
                 }
                 operation_guard.kind = LifecycleOperationKind::Pause;
                 operation_guard

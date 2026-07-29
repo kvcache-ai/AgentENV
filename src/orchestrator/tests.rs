@@ -138,6 +138,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         factory,
         persister,
         lifecycle_operations: Arc::new(StdMutex::new(HashMap::new())),
+        lifecycle_join_started: StdMutex::new(None),
         sandboxes: RwLock::new(HashMap::new()),
         proxy_routes: RwLock::new(ProxyRouteTable::default()),
         next_proxy_route_version: AtomicU64::new(1),
@@ -2476,28 +2477,52 @@ async fn orchestrator_concurrent_delete_calls_are_idempotent() -> Result<()> {
 #[tokio::test]
 async fn pause_waiting_for_failed_delete_retries_from_restored_running_state() -> Result<()> {
     setup();
+    let store_control = Arc::new(ScriptedStoreControl::default());
     let behavior = Arc::new(MockBehavior::new());
     behavior.push_action(
         MockOperation::Stop,
-        MockAction::FailAfter {
-            delay: Duration::from_millis(200),
+        MockAction::Fail {
             message: "forced delete stop failure".to_string(),
         },
     );
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&store_control)),
+        MockBackendFactory::with_behavior(behavior),
+    );
     let created = orchestrator
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
     let sandbox_id = created.id;
+    let delete_transition_started = Arc::new(Notify::new());
+    let allow_delete_transition = Arc::new(Notify::new());
+    store_control.push_update_if_state_action(StoreAction::BlockAfter {
+        started: Arc::clone(&delete_transition_started),
+        release: Arc::clone(&allow_delete_transition),
+    });
 
     let delete_task = {
         let orchestrator = Arc::clone(&orchestrator);
         tokio::spawn(async move { orchestrator.delete_sandbox(sandbox_id).await })
     };
-    wait_for_state(&orchestrator, &sandbox_id, SandboxState::Killing).await?;
+    timeout(Duration::from_secs(1), delete_transition_started.notified())
+        .await
+        .expect("delete should enter Killing before attempting stop");
 
-    orchestrator.pause_sandbox(sandbox_id).await?;
+    let pause_join_started = Arc::new(Notify::new());
+    orchestrator.notify_on_next_lifecycle_join(Arc::clone(&pause_join_started));
+    let pause_task = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move { orchestrator.pause_sandbox(sandbox_id).await })
+    };
+    timeout(Duration::from_secs(1), pause_join_started.notified())
+        .await
+        .expect("pause should join the in-flight delete operation");
+
+    allow_delete_transition.notify_one();
+    pause_task
+        .await
+        .expect("pause task should not panic")
+        .expect("pause should retry after delete restores Running");
     let delete_error = delete_task
         .await
         .expect("delete task should not panic")
@@ -2793,25 +2818,18 @@ async fn concurrent_unknown_deletes_both_report_not_found() -> Result<()> {
         .await
         .expect("first delete should reach the blocked store operation");
     let second_delete = {
+        let second_delete_join_started = Arc::new(Notify::new());
+        orchestrator.notify_on_next_lifecycle_join(Arc::clone(&second_delete_join_started));
         let orchestrator = Arc::clone(&orchestrator);
-        tokio::spawn(async move { orchestrator.delete_sandbox(missing_id).await })
+        let task = tokio::spawn(async move { orchestrator.delete_sandbox(missing_id).await });
+        timeout(
+            Duration::from_secs(1),
+            second_delete_join_started.notified(),
+        )
+        .await
+        .expect("second delete should join the first lifecycle operation");
+        task
     };
-    timeout(Duration::from_secs(1), async {
-        loop {
-            let second_delete_joined = orchestrator
-                .lifecycle_operations
-                .lock()
-                .expect("lifecycle operations mutex poisoned")
-                .get(&missing_id)
-                .is_some_and(|operation| Arc::strong_count(operation) >= 3);
-            if second_delete_joined {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("second delete should join the first lifecycle operation");
 
     allow_first_delete.notify_one();
     for result in [first_delete.await, second_delete.await] {
