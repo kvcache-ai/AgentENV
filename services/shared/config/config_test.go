@@ -38,18 +38,18 @@ func TestDefaultSchedulerDiscoveryModeIsStatic(t *testing.T) {
 	if got := cfg.Scheduler.ArtifactLookupNodeLimit; got != 0 {
 		t.Fatalf("expected scheduler artifact lookup node limit 0, got %d", got)
 	}
-	if got := cfg.Scheduler.LocalityGroup; got != (LocalityGroupConfig{}) {
-		t.Fatalf("expected zero-value locality group config, got %+v", got)
+	if got := cfg.Scheduler.GroupedRoundRobin; got != (GroupedRoundRobinConfig{}) {
+		t.Fatalf("expected zero-value grouped round-robin config, got %+v", got)
 	}
 }
 
-func TestLoadParsesSchedulerLocalityGroup(t *testing.T) {
+func TestLoadParsesSchedulerGroupedRoundRobin(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "config.json")
 	content := `{
 		"scheduler": {
-			"strategy": "locality",
-			"locality_group": {
+			"strategy": "grouped_round_robin",
+			"grouped_round_robin": {
 				"max_sandbox_count": 4,
 				"max_cpu_count": 8,
 				"max_memory_mb": 16384
@@ -64,23 +64,23 @@ func TestLoadParsesSchedulerLocalityGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config failed: %v", err)
 	}
-	want := LocalityGroupConfig{
+	want := GroupedRoundRobinConfig{
 		MaxSandboxCount: 4,
 		MaxCPUCount:     8,
 		MaxMemoryMB:     16384,
 	}
-	if got := cfg.Scheduler.LocalityGroup; got != want {
-		t.Fatalf("locality group = %+v, want %+v", got, want)
+	if got := cfg.Scheduler.GroupedRoundRobin; got != want {
+		t.Fatalf("grouped round-robin config = %+v, want %+v", got, want)
 	}
 }
 
-func TestLoadRejectsLocalityWithoutSandboxGroupLimit(t *testing.T) {
+func TestLoadRejectsGroupedRoundRobinWithoutSandboxGroupLimit(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "config.json")
 	content := `{
 		"scheduler": {
-			"strategy": "locality",
-			"locality_group": {
+			"strategy": "grouped_round_robin",
+			"grouped_round_robin": {
 				"max_cpu_count": 8,
 				"max_memory_mb": 16384
 			}
@@ -91,34 +91,34 @@ func TestLoadRejectsLocalityWithoutSandboxGroupLimit(t *testing.T) {
 	}
 
 	if _, err := Load(path, "scheduler"); err == nil {
-		t.Fatal("expected locality strategy without max_sandbox_count to fail")
+		t.Fatal("expected grouped_round_robin strategy without max_sandbox_count to fail")
 	}
 }
 
-func TestLoadAppliesSchedulerLocalityGroupEnv(t *testing.T) {
-	t.Setenv("SCHEDULER_STRATEGY", "locality")
-	t.Setenv("SCHEDULER_LOCALITY_GROUP_MAX_SANDBOX_COUNT", "3")
-	t.Setenv("SCHEDULER_LOCALITY_GROUP_MAX_CPU_COUNT", "6")
-	t.Setenv("SCHEDULER_LOCALITY_GROUP_MAX_MEMORY_MB", "12288")
+func TestLoadAppliesSchedulerGroupedRoundRobinEnv(t *testing.T) {
+	t.Setenv("SCHEDULER_STRATEGY", "grouped_round_robin")
+	t.Setenv("SCHEDULER_GROUPED_ROUND_ROBIN_MAX_SANDBOX_COUNT", "3")
+	t.Setenv("SCHEDULER_GROUPED_ROUND_ROBIN_MAX_CPU_COUNT", "6")
+	t.Setenv("SCHEDULER_GROUPED_ROUND_ROBIN_MAX_MEMORY_MB", "12288")
 
 	cfg, err := Load("", "scheduler")
 	if err != nil {
 		t.Fatalf("load config failed: %v", err)
 	}
-	if got := cfg.Scheduler.LocalityGroup; got != (LocalityGroupConfig{
+	if got := cfg.Scheduler.GroupedRoundRobin; got != (GroupedRoundRobinConfig{
 		MaxSandboxCount: 3,
 		MaxCPUCount:     6,
 		MaxMemoryMB:     12288,
 	}) {
-		t.Fatalf("unexpected locality group from env: %+v", got)
+		t.Fatalf("unexpected grouped round-robin config from env: %+v", got)
 	}
 }
 
-func TestLoadRejectsInvalidSchedulerLocalityGroupEnv(t *testing.T) {
-	t.Setenv("SCHEDULER_LOCALITY_GROUP_MAX_SANDBOX_COUNT", "-1")
+func TestLoadRejectsInvalidSchedulerGroupedRoundRobinEnv(t *testing.T) {
+	t.Setenv("SCHEDULER_GROUPED_ROUND_ROBIN_MAX_SANDBOX_COUNT", "-1")
 
 	if _, err := Load("", "scheduler"); err == nil {
-		t.Fatal("expected invalid locality group env to fail")
+		t.Fatal("expected invalid grouped round-robin env to fail")
 	}
 }
 

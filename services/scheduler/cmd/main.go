@@ -71,10 +71,10 @@ func main() {
 			registry,
 			scheduler.NewStrategy(
 				cfg.Scheduler.Strategy,
-				scheduler.WithLocalityGroupLimits(scheduler.LocalityGroupLimits{
-					MaxSandboxCount: cfg.Scheduler.LocalityGroup.MaxSandboxCount,
-					MaxCPUCount:     cfg.Scheduler.LocalityGroup.MaxCPUCount,
-					MaxMemoryMB:     cfg.Scheduler.LocalityGroup.MaxMemoryMB,
+				scheduler.WithGroupedRoundRobinLimits(scheduler.GroupedRoundRobinLimits{
+					MaxSandboxCount: cfg.Scheduler.GroupedRoundRobin.MaxSandboxCount,
+					MaxCPUCount:     cfg.Scheduler.GroupedRoundRobin.MaxCPUCount,
+					MaxMemoryMB:     cfg.Scheduler.GroupedRoundRobin.MaxMemoryMB,
 				}),
 			),
 			store,

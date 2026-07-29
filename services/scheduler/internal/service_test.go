@@ -232,7 +232,7 @@ func TestScheduleReturnsUnavailableWhenRegistryIsEmpty(t *testing.T) {
 	}
 }
 
-func TestLocalityScheduleSkipsStaleHeartbeat(t *testing.T) {
+func TestGroupedRoundRobinScheduleSkipsStaleHeartbeat(t *testing.T) {
 	registry := NewAtomicNodeRegistry(
 		[]Node{
 			{ID: "node-a", Endpoint: "http://node-a"},
@@ -264,7 +264,7 @@ func TestLocalityScheduleSkipsStaleHeartbeat(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		registry,
-		NewGroupedLocalityStrategy(LocalityGroupLimits{MaxSandboxCount: 2}),
+		NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{MaxSandboxCount: 2}),
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 	response, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{

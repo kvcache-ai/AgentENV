@@ -10,7 +10,7 @@ Go implementation of a distributed Gateway and pluggable Scheduler for AgentENV.
 - Gateway resolves `GET /nodes/{id}` via scheduler and proxies to the target node.
 - Gateway routes sandbox requests by existing sandbox-to-node binding.
 - Scheduler exposes gRPC API and supports pluggable strategy providers.
-- Built-in strategies in v1: round_robin, random, and locality.
+- Built-in strategies in v1: round_robin, random, and grouped_round_robin.
 - Scheduler supports both static node configuration and Kubernetes EndpointSlice discovery.
 - Scheduler sandbox binding store can be in-memory or Redis-backed.
 - Scheduler can run as a primary read/write service or as query-only replicas that serve only `LookupNode` from Redis.
@@ -98,9 +98,9 @@ General config notes:
 - `SCHEDULER_REDIS_ADDR=<addr>` overrides `scheduler.redis_addr` from the environment.
 - `SCHEDULER_ARTIFACT_STORE_CAPACITY=<count>` overrides `scheduler.artifact_store_capacity` from the environment.
 - `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT=<count>` overrides `scheduler.artifact_lookup_node_limit` from the environment.
-- `SCHEDULER_LOCALITY_GROUP_MAX_SANDBOX_COUNT=<count>` overrides `scheduler.locality_group.max_sandbox_count`.
-- `SCHEDULER_LOCALITY_GROUP_MAX_CPU_COUNT=<count>` overrides `scheduler.locality_group.max_cpu_count`.
-- `SCHEDULER_LOCALITY_GROUP_MAX_MEMORY_MB=<count>` overrides `scheduler.locality_group.max_memory_mb`.
+- `SCHEDULER_GROUPED_ROUND_ROBIN_MAX_SANDBOX_COUNT=<count>` overrides `scheduler.grouped_round_robin.max_sandbox_count`.
+- `SCHEDULER_GROUPED_ROUND_ROBIN_MAX_CPU_COUNT=<count>` overrides `scheduler.grouped_round_robin.max_cpu_count`.
+- `SCHEDULER_GROUPED_ROUND_ROBIN_MAX_MEMORY_MB=<count>` overrides `scheduler.grouped_round_robin.max_memory_mb`.
 
 ### Scheduling strategy
 
@@ -110,19 +110,19 @@ General config notes:
 |---|---|
 | `round_robin` (default) | Cycles through eligible nodes in stable order |
 | `random` | Picks a uniformly random eligible node |
-| `locality` | Keeps requests for the same image/template in a resource-bounded group, then assigns the next group by global round-robin |
+| `grouped_round_robin` | Keeps requests for the same image/template in a resource-bounded group, then assigns the next group by global round-robin |
 
 The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics).
 
-The `locality` strategy uses the rootfs image reference from `POST /sandboxes-cold` or the exact template reference from `POST /sandboxes` as its grouping key. Requests for the same key stay on the current group's node until adding another request would exceed any configured group limit. A full group is closed permanently, and the next group is assigned to the next eligible node through one global round-robin cursor shared by all keys. If the open group's node is no longer ready or was removed by the node resource filter, the group closes early.
+The `grouped_round_robin` strategy uses the rootfs image reference from `POST /sandboxes-cold` or the exact template reference from `POST /sandboxes` as its grouping key. Requests for the same key stay on the current group's node until adding another request would exceed any configured group limit. A full group is closed permanently, and the next group is assigned to the next eligible node through one global round-robin cursor shared by all keys. If the open group's node is no longer ready or was removed by the node resource filter, the group closes early.
 
 Group accounting occurs atomically during scheduling, before the runtime finishes creating the sandbox, so bursts cannot overfill an open group while heartbeat metrics lag. Groups are advisory and in-memory; scheduler restart forgets them. The strategy requires a fresh READY heartbeat and skips nodes with missing or stale telemetry.
 
-`scheduler.locality_group.max_sandbox_count` is required and must be greater than zero when `scheduler.strategy` is `locality`. CPU and memory limits are optional additional bounds for cold-start requests:
+`scheduler.grouped_round_robin.max_sandbox_count` is required and must be greater than zero when `scheduler.strategy` is `grouped_round_robin`. CPU and memory limits are optional additional bounds for cold-start requests:
 
 ```json
-"strategy": "locality",
-"locality_group": {
+"strategy": "grouped_round_robin",
+"grouped_round_robin": {
   "max_sandbox_count": 4,
   "max_cpu_count": 8,
   "max_memory_mb": 16384
