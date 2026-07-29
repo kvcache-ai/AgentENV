@@ -365,8 +365,10 @@ impl SandboxPersister for FileBackedSandboxPersister {
 
     async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "deleting paused sandbox record and artifacts");
-        self.remove_record(sandbox_id).await?;
+        // Remove artifacts before the record so a failed artifact cleanup cannot
+        // leave a restart-loadable record without its backing files.
         Self::remove_artifact_root(&self.sandbox_artifact_root(sandbox_id)).await?;
+        self.remove_record(sandbox_id).await?;
         Ok(())
     }
 }

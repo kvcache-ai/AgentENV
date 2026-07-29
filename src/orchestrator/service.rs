@@ -894,6 +894,28 @@ where
             }
         };
 
+        // Remove durable paused state before detaching/stopping the runtime so a
+        // failed cleanup can restore the previous state while the handle and
+        // proxy route are still intact (including for Running sandboxes).
+        if let Err(err) = self
+            .persister
+            .delete_record_and_artifacts(&sandbox_id)
+            .await
+        {
+            warn!(error = ?err, "failed to delete persisted sandbox state");
+            if let Err(restore_err) = self
+                .store
+                .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
+                .await
+            {
+                warn!(
+                    error = ?restore_err,
+                    "failed to restore sandbox state after persistence cleanup failure"
+                );
+            }
+            return Err(OrchestratorError::from(err));
+        }
+
         let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
 
         // If the sandbox is still in memory, attempt to stop it.
@@ -919,30 +941,18 @@ where
             }
         }
 
-        // Remove durable paused state before dropping in-memory metadata so a
-        // failed cleanup cannot resurrect the sandbox after restart. On failure,
-        // restore the pre-delete state so the client can retry.
-        if let Err(err) = self
-            .persister
-            .delete_record_and_artifacts(&sandbox_id)
-            .await
-        {
-            warn!(error = ?err, "failed to delete persisted sandbox state");
-            if let Err(restore_err) = self
-                .store
-                .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
-                .await
-            {
+        // Durable state is gone; drop in-memory metadata. Retry once if the
+        // store remove is transiently unavailable.
+        let metadata = match self.store.remove(&sandbox_id).await {
+            Ok(metadata) => metadata,
+            Err(err) => {
                 warn!(
-                    error = ?restore_err,
-                    "failed to restore sandbox state after persistence cleanup failure"
+                    error = ?err,
+                    "failed to remove sandbox metadata after durable cleanup; retrying"
                 );
+                self.store.remove(&sandbox_id).await?
             }
-            return Err(OrchestratorError::from(err));
-        }
-
-        // Now the sandbox is successfully stopped, remove its metadata.
-        let metadata = self.store.remove(&sandbox_id).await?;
+        };
         if let Some(metadata) = metadata {
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Delete,
@@ -2017,6 +2027,16 @@ where
                 );
                 self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
                     .await;
+                // cleanup_failed_launch already attempted rollback_resuming once.
+                // Retry so a transient failure cannot leave a Resuming marker that
+                // load_all would discard on the next process start.
+                if let Err(rollback_err) = self.persister.rollback_resuming(&sandbox_id).await {
+                    warn!(
+                        error = %format_args!("{rollback_err:#}"),
+                        "failed to restore persisted sandbox record after resume rollback"
+                    );
+                    return Err(OrchestratorError::from(rollback_err));
+                }
                 return Err(OrchestratorError::from(err));
             }
         }
@@ -2097,6 +2117,12 @@ where
                 }
             }
             LaunchPlan::Resume(_) => {
+                // Restore durable lifecycle before flipping in-memory state so a
+                // crash cannot observe Paused metadata with a Resuming record
+                // that load_all would discard.
+                if let Err(err) = self.persister.rollback_resuming(&plan.sandbox_id()).await {
+                    warn!(error = %format_args!("{err:#}"), "failed to restore persisted sandbox record lifecycle during launch rollback");
+                }
                 if let Err(err) = self
                     .store
                     .update_state_if_state(
@@ -2107,9 +2133,6 @@ where
                     .await
                 {
                     warn!(error = %format_args!("{err:#}"), "failed to restore sandbox metadata during launch rollback");
-                }
-                if let Err(err) = self.persister.rollback_resuming(&plan.sandbox_id()).await {
-                    warn!(error = %format_args!("{err:#}"), "failed to restore persisted sandbox record lifecycle during launch rollback");
                 }
             }
         }

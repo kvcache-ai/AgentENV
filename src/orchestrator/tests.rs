@@ -130,6 +130,7 @@ type StoreHookSlot = StdMutex<Option<StoreHook>>;
 struct ScriptedStoreControl {
     add_actions: StdMutex<VecDeque<StoreAction>>,
     update_if_state_actions: StdMutex<VecDeque<StoreAction>>,
+    remove_actions: StdMutex<VecDeque<StoreAction>>,
     on_add: StoreHookSlot,
 }
 
@@ -145,6 +146,13 @@ impl ScriptedStoreControl {
         self.update_if_state_actions
             .lock()
             .expect("update_if_state actions mutex poisoned")
+            .push_back(action);
+    }
+
+    fn push_remove_action(&self, action: StoreAction) {
+        self.remove_actions
+            .lock()
+            .expect("remove actions mutex poisoned")
             .push_back(action);
     }
 
@@ -238,7 +246,10 @@ impl MetadataStore for ScriptedStore {
         &self,
         sandbox_id: &SandboxId,
     ) -> StdResult<Option<SandboxMetadata>, StoreError> {
-        self.inner.remove(sandbox_id).await
+        match ScriptedStoreControl::take_action(&self.control.remove_actions) {
+            StoreAction::Delegate => self.inner.remove(sandbox_id).await,
+            StoreAction::Fail(err) => Err(err),
+        }
     }
 
     async fn list(&self) -> StdResult<Vec<SandboxMetadata>, StoreError> {
@@ -3238,6 +3249,75 @@ async fn delete_sandbox_fails_when_persisted_state_cannot_be_removed() -> Result
 }
 
 #[tokio::test]
+async fn delete_running_sandbox_preserves_runtime_when_persist_cleanup_fails() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(
+            Some(60),
+            &[("team", "delete-running-persist-fail")],
+        ))
+        .await?;
+    persister.clear_calls();
+    persister.fail_next(RecordingCall::DeleteRecordAndArtifacts);
+
+    let err = orchestrator
+        .delete_sandbox(created.id)
+        .await
+        .expect_err("delete must fail before detaching a running sandbox");
+
+    assert!(matches!(
+        err,
+        OrchestratorError::SandboxPersistenceFailed(_)
+    ));
+    let metadata = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("running sandbox metadata must remain");
+    assert_eq!(metadata.state, SandboxState::Running);
+    assert_proxy_ready(&orchestrator, &created.id).await?;
+
+    orchestrator.delete_sandbox(created.id).await?;
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_sandbox_retries_metadata_remove_after_durable_cleanup() -> Result<()> {
+    setup();
+    let control = Arc::new(ScriptedStoreControl::default());
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        ScriptedStore::new(Arc::clone(&control)),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "delete-remove-retry")]))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+    persister.clear_calls();
+
+    // First metadata remove fails after durable cleanup; retry delegates.
+    control.push_remove_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("injected metadata remove failure after durable cleanup"),
+    }));
+
+    orchestrator.delete_sandbox(created.id).await?;
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    assert_eq!(
+        persister.calls(),
+        vec![RecordingCall::DeleteRecordAndArtifacts]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn resume_delete_record_failure_rolls_back_to_paused() -> Result<()> {
     setup();
     let persister = RecordingPersister::default();
@@ -3267,6 +3347,7 @@ async fn resume_delete_record_failure_rolls_back_to_paused() -> Result<()> {
         vec![
             RecordingCall::MarkResuming,
             RecordingCall::DeleteRecord,
+            RecordingCall::RollbackResuming,
             RecordingCall::RollbackResuming
         ]
     );
@@ -3278,6 +3359,64 @@ async fn resume_delete_record_failure_rolls_back_to_paused() -> Result<()> {
     assert!(metadata.paused_state.is_some());
     assert_proxy_paused(&orchestrator, &created.id).await?;
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_rollback_resuming_failure_is_surfaced() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(
+            Some(60),
+            &[("team", "resume-rollback-fail")],
+        ))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+    persister.clear_calls();
+    persister.fail_next(RecordingCall::DeleteRecord);
+    // cleanup_failed_launch rolls back once; the resume path retries once more.
+    persister.fail_next(RecordingCall::RollbackResuming);
+    persister.fail_next(RecordingCall::RollbackResuming);
+
+    let err = orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await
+        .expect_err("resume must fail when Resuming cannot be rolled back");
+
+    assert!(matches!(
+        err,
+        OrchestratorError::SandboxPersistenceFailed(_)
+    ));
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::MarkResuming,
+            RecordingCall::DeleteRecord,
+            RecordingCall::RollbackResuming,
+            RecordingCall::RollbackResuming
+        ]
+    );
+    let metadata = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("metadata should remain after failed resume rollback");
+    // Durable rollback failed, so in-memory state may still be Running from the
+    // aborted resume; the important guarantee is we return a persistence error
+    // instead of reporting success with a Resuming marker.
+    assert!(
+        matches!(
+            metadata.state,
+            SandboxState::Paused | SandboxState::Running | SandboxState::Resuming
+        ),
+        "unexpected state after rollback failure: {:?}",
+        metadata.state
+    );
     Ok(())
 }
 
