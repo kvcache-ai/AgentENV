@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use shell_util::shell_quote;
 use tracing::debug;
 
 use super::build_spec::{TemplateBuildStep, TemplateBuildStepKind};
@@ -36,19 +35,7 @@ impl TemplateStepExecutor {
                     context = context.with_env_var(key.clone(), value.clone());
                 }
                 TemplateBuildStepKind::Workdir { path } => {
-                    // Resolve relative paths against the current workdir, as
-                    // Docker does, so both the created directory and the
-                    // context agree on the absolute location.
-                    let path = path.to_string_lossy();
-                    let resolved = if std::path::Path::new(path.as_ref()).is_absolute() {
-                        path.into_owned()
-                    } else {
-                        let base = if context.workdir.is_empty() { "/" } else { &context.workdir };
-                        std::path::Path::new(base)
-                            .join(path.as_ref())
-                            .to_string_lossy()
-                            .into_owned()
-                    };
+                    let resolved = resolve_workdir(&context.workdir, &path.to_string_lossy());
                     self.ensure_workdir(sandbox, &context, &resolved).await?;
                     context = context.with_workdir(resolved);
                 }
@@ -95,15 +82,16 @@ impl TemplateStepExecutor {
         context: &CommandContext,
         path: &str,
     ) -> Result<()> {
-        let cmd = format!("mkdir -p -- {}", shell_quote(path));
         let opts = ProcessOpts {
             envs: context.env_vars.clone(),
-            cwd: Some(context.workdir.clone()),
+            cwd: (!context.workdir.is_empty()).then(|| context.workdir.clone()),
             ..ProcessOpts::default()
         };
 
+        // mkdir directly, not through a shell: Docker creates WORKDIR without
+        // one, and minimal images may not ship bash.
         let output = sandbox
-            .run_command_with_opts("/bin/bash", &["-lc", &cmd], &opts)
+            .run_command_with_opts("/bin/mkdir", &["-p", "--", path], &opts)
             .await
             .with_context(|| {
                 TemplateBuildFailure::with_step("build step failed", format!("WORKDIR {path}"))
@@ -148,6 +136,35 @@ impl TemplateStepExecutor {
         }
         Ok(())
     }
+}
+
+/// Resolve a WORKDIR value to the absolute, lexically normalized path Docker
+/// would record: relative paths join the current workdir, and `.` / `..`
+/// components are resolved without consulting the filesystem.
+fn resolve_workdir(current: &str, path: &str) -> String {
+    use std::path::{Component, Path, PathBuf};
+
+    let base = if current.is_empty() { "/" } else { current };
+    let joined = if Path::new(path).is_absolute() {
+        PathBuf::from(path)
+    } else {
+        Path::new(base).join(path)
+    };
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in joined.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop();
+            }
+            Component::Normal(part) => parts.push(part.to_os_string()),
+        }
+    }
+    let mut resolved = PathBuf::from("/");
+    for part in parts {
+        resolved.push(part);
+    }
+    resolved.to_string_lossy().into_owned()
 }
 
 #[cfg(test)]
@@ -346,10 +363,10 @@ mod tests {
             .unwrap();
         let commands = sandbox.commands();
         assert_eq!(commands.len(), 1);
-        let (cmd, args, _) = &commands[0];
-        assert_eq!(cmd, "/bin/bash");
-        // shell_quote leaves safe paths bare and quotes the rest.
-        assert_eq!(args[1], "mkdir -p -- /app");
+        let (cmd, args, cwd) = &commands[0];
+        assert_eq!(cmd, "/bin/mkdir");
+        assert_eq!(args, &["-p", "--", "/app"]);
+        assert_eq!(cwd.as_deref(), Some("/")); // the default context workdir
     }
 
     #[tokio::test]
@@ -371,7 +388,26 @@ mod tests {
         assert_eq!(ctx.workdir, "/base/nested");
         let commands = sandbox.commands();
         assert_eq!(commands.len(), 2);
-        assert_eq!(commands[1].1[1], "mkdir -p -- /base/nested");
+        assert_eq!(commands[1].1, vec!["-p", "--", "/base/nested"]);
+    }
+
+    #[tokio::test]
+    async fn workdir_step_normalizes_dot_components() {
+        let sandbox = RecordingSandbox::succeeding();
+        let ctx = TemplateStepExecutor::new()
+            .execute(
+                &sandbox,
+                &[
+                    TemplateBuildStep::workdir("/base/deep"),
+                    TemplateBuildStep::workdir("../app"),
+                ],
+                CommandContext::default(),
+            )
+            .await
+            .unwrap();
+        // Docker records the normalized path, not /base/deep/../app.
+        assert_eq!(ctx.workdir, "/base/app");
+        assert_eq!(sandbox.commands()[1].1, vec!["-p", "--", "/base/app"]);
     }
 
     #[tokio::test]
