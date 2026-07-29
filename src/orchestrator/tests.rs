@@ -2808,6 +2808,16 @@ async fn orchestrator_delete_paused_sandbox_removes_metadata() -> Result<()> {
 async fn pause_failure_rolls_back_to_running_and_preserves_handle() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
+    let resume_calls = Arc::new(StdMutex::new(0usize));
+    let resume_calls_for_hook = Arc::clone(&resume_calls);
+    behavior.set_on_operation(
+        MockOperation::Resume,
+        Arc::new(move || {
+            *resume_calls_for_hook
+                .lock()
+                .expect("resume call counter mutex poisoned") += 1;
+        }),
+    );
     behavior.push_action(
         MockOperation::Pause,
         MockAction::Fail {
@@ -2815,7 +2825,8 @@ async fn pause_failure_rolls_back_to_running_and_preserves_handle() -> Result<()
         },
     );
     let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
 
     let created = orchestrator
         .create_sandbox(create_request(Some(60), &[("team", "pause-failure")]))
@@ -2859,8 +2870,65 @@ async fn pause_failure_rolls_back_to_running_and_preserves_handle() -> Result<()
         created.resources.memory_mib,
     )
     .await;
+    assert_eq!(
+        *resume_calls
+            .lock()
+            .expect("resume call counter mutex poisoned"),
+        1,
+        "recoverable pause failure should resume the backend before returning"
+    );
 
     orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_failure_with_failed_recovery_removes_sandbox() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::Fail {
+            message: "forced pause failure".to_string(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::Resume,
+        MockAction::Fail {
+            message: "forced resume failure".to_string(),
+        },
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+
+    let created = orchestrator
+        .create_sandbox(create_request(
+            Some(60),
+            &[("team", "pause-recovery-failure")],
+        ))
+        .await?;
+    let sandbox_id = created.id;
+
+    let err = orchestrator
+        .pause_sandbox(sandbox_id)
+        .await
+        .expect_err("pause should fail terminally when the backend cannot recover");
+    let message = format!("{err:#}");
+    assert!(matches!(
+        err,
+        OrchestratorError::SandboxOperationFailed {
+            operation: SandboxOperation::Pause,
+            ..
+        }
+    ));
+    assert!(message.contains("forced pause failure"), "{message}");
+    assert!(message.contains("forced resume failure"), "{message}");
+
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
+    assert_eq!(behavior.stop_calls(), 1);
+    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
     Ok(())
 }
 

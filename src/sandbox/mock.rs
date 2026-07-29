@@ -278,9 +278,21 @@ impl SandboxBackend for MockSandboxBackend {
         &mut self,
         _artifact_root: Option<&Path>,
     ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
-        self.behavior
+        let pause_result = self
+            .behavior
             .apply_capture_result(MockOperation::Pause)
-            .await?;
+            .await;
+        if let Err(pause_err) = pause_result {
+            if pause_err.is_terminal() {
+                return Err(pause_err);
+            }
+            if let Err(resume_err) = self.behavior.apply_async(MockOperation::Resume).await {
+                return Err(SandboxCaptureError::terminal(anyhow!(
+                    "pause failed and sandbox could not be resumed: pause error: {pause_err}; resume error: {resume_err:#}"
+                )));
+            }
+            return Err(pause_err);
+        }
         Ok(Arc::new(MockSnapshot))
     }
 

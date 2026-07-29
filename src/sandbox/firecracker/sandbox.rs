@@ -183,16 +183,26 @@ impl SandboxBackend for FirecrackerSandbox {
         &mut self,
         artifact_root: Option<&Path>,
     ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
-        let snapshot_config = match artifact_root {
-            Some(artifact_root) => {
-                let (snapshot_config, _) = FirecrackerSandbox::pause_to_dir(self, artifact_root)
-                    .await
-                    .map_err(SandboxCaptureError::from)?;
-                snapshot_config
-            }
-            None => FirecrackerSandbox::pause(self)
+        let pause_result = match artifact_root {
+            Some(artifact_root) => FirecrackerSandbox::pause_to_dir(self, artifact_root)
                 .await
-                .map_err(SandboxCaptureError::from)?,
+                .map(|(snapshot_config, _)| snapshot_config),
+            None => FirecrackerSandbox::pause(self).await,
+        };
+        let snapshot_config = match pause_result {
+            Ok(snapshot_config) => snapshot_config,
+            Err(err) => {
+                let pause_err = SandboxCaptureError::from(err);
+                if pause_err.is_terminal() {
+                    return Err(pause_err);
+                }
+                if let Err(resume_err) = FirecrackerSandbox::resume(self).await {
+                    return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
+                        "pause failed and sandbox could not be resumed: pause error: {pause_err}; resume error: {resume_err:#}"
+                    )));
+                }
+                return Err(pause_err);
+            }
         };
         Ok(Arc::new(FirecrackerPausedState::new(snapshot_config)))
     }
