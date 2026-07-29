@@ -4437,6 +4437,72 @@ async fn fork_sandbox_terminal_failure_removes_source_and_cleans_up_metrics() ->
     Ok(())
 }
 
+/// If the source cannot leave `Forking` after a successful backend fork, the
+/// operation fails and forked children are stopped instead of being registered.
+#[tokio::test]
+async fn fork_sandbox_fails_when_source_cannot_leave_forking() -> Result<()> {
+    setup();
+    let control = Arc::new(ScriptedStoreControl::default());
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&control)),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+
+    let source = orchestrator
+        .create_sandbox(create_request(
+            Some(60),
+            &[("team", "fork-restore-source-fail")],
+        ))
+        .await?;
+    let baseline = current_metrics(&orchestrator).await;
+
+    // First update_if_state (Running -> Forking) succeeds via Delegate.
+    // Second update_state_if_state (Forking -> Running) fails.
+    control.push_update_if_state_action(StoreAction::Delegate);
+    control.push_update_if_state_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("injected failure restoring source after fork"),
+    }));
+
+    let err = orchestrator
+        .fork_sandbox(source.id, 2, NewTimeout::Set(Duration::from_secs(15)))
+        .await
+        .expect_err("fork must fail when source cannot leave Forking");
+
+    assert!(matches!(
+        err,
+        OrchestratorError::StoreOperationFailed(StoreError::Backend { .. })
+    ));
+
+    let source_after = orchestrator
+        .get_sandbox(&source.id)
+        .await?
+        .expect("source sandbox metadata should remain");
+    assert_eq!(
+        source_after.state,
+        SandboxState::Forking,
+        "store restore failed, so source remains in Forking until a later recovery path"
+    );
+    assert_eq!(
+        behavior.stop_calls(),
+        2,
+        "both forked children must be stopped when source restore fails"
+    );
+    assert_eq!(orchestrator.list_sandboxes().await?.len(), 1);
+    assert_metrics_values(
+        &orchestrator,
+        baseline.create_successes,
+        baseline.create_fails + 2,
+        1,
+        0,
+        source_after.resources.cpu_count,
+        source_after.resources.memory_mib,
+    )
+    .await;
+
+    Ok(())
+}
+
 /// A failure during one child registration is reported for that child without
 /// rolling back a sibling that was registered successfully.
 #[tokio::test]

@@ -561,7 +561,10 @@ where
             }
         };
 
-        // Restore the source sandbox's state to Running.
+        // Restore the source sandbox's state to Running. A failure here must
+        // abort the fork: leaving the source in Forking blocks pause/resume/
+        // delete waiters, and registering children would report success while
+        // the source is stuck in a transitional state.
         if let Err(err) = self
             .store
             .update_state_if_state(
@@ -572,6 +575,23 @@ where
             .await
         {
             warn!(error = ?err, "failed to restore source sandbox metadata after fork");
+            self.counters.record_create_fail(u64::from(count));
+            for (sandbox_id, backend) in child_ids.iter().zip(forked_backends) {
+                if let Ok(backend) = backend {
+                    Self::stop_failed_fork(backend, *sandbox_id).await;
+                }
+            }
+            return Err(match err {
+                StoreError::StateConflict {
+                    sandbox_id,
+                    actual_state,
+                    ..
+                } => OrchestratorError::InvalidSandboxState {
+                    sandbox_id,
+                    state: actual_state,
+                },
+                other => OrchestratorError::from(other),
+            });
         }
 
         // Register each forked sandbox in the store and runtime, and publish events.
