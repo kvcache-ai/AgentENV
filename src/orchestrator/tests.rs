@@ -4437,10 +4437,10 @@ async fn fork_sandbox_terminal_failure_removes_source_and_cleans_up_metrics() ->
     Ok(())
 }
 
-/// If the source cannot leave `Forking` after a successful backend fork, the
-/// operation fails and forked children are stopped instead of being registered.
+/// A transient failure restoring the source from `Forking` is retried so the
+/// source returns to a usable `Running` state and children can still register.
 #[tokio::test]
-async fn fork_sandbox_fails_when_source_cannot_leave_forking() -> Result<()> {
+async fn fork_sandbox_retries_source_restore_after_transient_store_failure() -> Result<()> {
     setup();
     let control = Arc::new(ScriptedStoreControl::default());
     let behavior = Arc::new(MockBehavior::new());
@@ -4452,17 +4452,70 @@ async fn fork_sandbox_fails_when_source_cannot_leave_forking() -> Result<()> {
     let source = orchestrator
         .create_sandbox(create_request(
             Some(60),
-            &[("team", "fork-restore-source-fail")],
+            &[("team", "fork-restore-retry")],
+        ))
+        .await?;
+
+    // Running -> Forking succeeds; first Forking -> Running fails; retry delegates.
+    control.push_update_if_state_action(StoreAction::Delegate);
+    control.push_update_if_state_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("injected transient failure restoring source after fork"),
+    }));
+
+    let outcomes = orchestrator
+        .fork_sandbox(source.id, 2, NewTimeout::Set(Duration::from_secs(15)))
+        .await?;
+    let children = outcomes.into_iter().collect::<StdResult<Vec<_>, _>>()?;
+    assert_eq!(children.len(), 2);
+
+    let source_after = orchestrator
+        .get_sandbox(&source.id)
+        .await?
+        .expect("source sandbox metadata should remain");
+    assert_eq!(
+        source_after.state,
+        SandboxState::Running,
+        "a failed fork restore must retry until the source is usable again"
+    );
+    for child in &children {
+        assert_eq!(child.state, SandboxState::Running);
+        assert_proxy_ready(&orchestrator, &child.id).await?;
+    }
+
+    for child in children {
+        orchestrator.delete_sandbox(child.id).await?;
+    }
+    orchestrator.delete_sandbox(source.id).await?;
+    Ok(())
+}
+
+/// If every restore attempt fails, forked children are stopped and the source
+/// is removed instead of being left permanently in `Forking`.
+#[tokio::test]
+async fn fork_sandbox_terminates_source_when_restore_cannot_complete() -> Result<()> {
+    setup();
+    let control = Arc::new(ScriptedStoreControl::default());
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&control)),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+
+    let source = orchestrator
+        .create_sandbox(create_request(
+            Some(60),
+            &[("team", "fork-restore-terminal")],
         ))
         .await?;
     let baseline = current_metrics(&orchestrator).await;
 
-    // First update_if_state (Running -> Forking) succeeds via Delegate.
-    // Second update_state_if_state (Forking -> Running) fails.
+    // Running -> Forking succeeds; all three Forking -> Running attempts fail.
     control.push_update_if_state_action(StoreAction::Delegate);
-    control.push_update_if_state_action(StoreAction::Fail(StoreError::Backend {
-        source: anyhow::anyhow!("injected failure restoring source after fork"),
-    }));
+    for _ in 0..3 {
+        control.push_update_if_state_action(StoreAction::Fail(StoreError::Backend {
+            source: anyhow::anyhow!("injected persistent failure restoring source after fork"),
+        }));
+    }
 
     let err = orchestrator
         .fork_sandbox(source.id, 2, NewTimeout::Set(Duration::from_secs(15)))
@@ -4473,30 +4526,24 @@ async fn fork_sandbox_fails_when_source_cannot_leave_forking() -> Result<()> {
         err,
         OrchestratorError::StoreOperationFailed(StoreError::Backend { .. })
     ));
-
-    let source_after = orchestrator
-        .get_sandbox(&source.id)
-        .await?
-        .expect("source sandbox metadata should remain");
-    assert_eq!(
-        source_after.state,
-        SandboxState::Forking,
-        "store restore failed, so source remains in Forking until a later recovery path"
+    assert!(
+        orchestrator.get_sandbox(&source.id).await?.is_none(),
+        "unrestorable source must be removed rather than left in Forking"
     );
-    assert_eq!(
-        behavior.stop_calls(),
-        2,
-        "both forked children must be stopped when source restore fails"
+    assert!(
+        behavior.stop_calls() >= 3,
+        "source and both forked children must be stopped; got {}",
+        behavior.stop_calls()
     );
-    assert_eq!(orchestrator.list_sandboxes().await?.len(), 1);
+    assert!(orchestrator.list_sandboxes().await?.is_empty());
     assert_metrics_values(
         &orchestrator,
         baseline.create_successes,
         baseline.create_fails + 2,
-        1,
         0,
-        source_after.resources.cpu_count,
-        source_after.resources.memory_mib,
+        0,
+        0,
+        0,
     )
     .await;
 

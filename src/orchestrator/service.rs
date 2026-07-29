@@ -561,26 +561,54 @@ where
             }
         };
 
-        // Restore the source sandbox's state to Running. A failure here must
-        // abort the fork: leaving the source in Forking blocks pause/resume/
-        // delete waiters, and registering children would report success while
-        // the source is stuck in a transitional state.
-        if let Err(err) = self
-            .store
-            .update_state_if_state(
-                &source_sandbox_id,
-                SandboxState::Running,
-                &[SandboxState::Forking],
-            )
-            .await
-        {
-            warn!(error = ?err, "failed to restore source sandbox metadata after fork");
-            self.counters.record_create_fail(u64::from(count));
-            for (sandbox_id, backend) in child_ids.iter().zip(forked_backends) {
-                if let Ok(backend) = backend {
-                    Self::stop_failed_fork(backend, *sandbox_id).await;
+        // Restore the source sandbox's state to Running. Leaving the source in
+        // Forking permanently strands pause/resume/delete waiters, so retry a
+        // few times and fall back to terminal source cleanup if persistence
+        // cannot recover a stable state.
+        const SOURCE_RESTORE_ATTEMPTS: u32 = 3;
+        let mut restore_err = None;
+        for attempt in 1..=SOURCE_RESTORE_ATTEMPTS {
+            match self
+                .store
+                .update_state_if_state(
+                    &source_sandbox_id,
+                    SandboxState::Running,
+                    &[SandboxState::Forking],
+                )
+                .await
+            {
+                Ok(_) => {
+                    restore_err = None;
+                    break;
+                }
+                Err(err) => {
+                    warn!(
+                        attempt,
+                        error = ?err,
+                        "failed to restore source sandbox metadata after fork"
+                    );
+                    restore_err = Some(err);
+                    if attempt < SOURCE_RESTORE_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(10 * u64::from(attempt))).await;
+                    }
                 }
             }
+        }
+        if let Some(err) = restore_err {
+            self.counters.record_create_fail(u64::from(count));
+            for (sandbox_id, backend) in child_ids.into_iter().zip(forked_backends) {
+                if let Ok(backend) = backend {
+                    Self::stop_failed_fork(backend, sandbox_id).await;
+                }
+            }
+            // Terminal cleanup: do not leave the source stranded in Forking.
+            self.detach_sandbox_handle_and_route(&source_sandbox_id)
+                .await;
+            let _ = {
+                let mut sandbox = source_handle.lock().await;
+                sandbox.stop().await
+            };
+            let _ = self.store.remove(&source_sandbox_id).await;
             return Err(match err {
                 StoreError::StateConflict {
                     sandbox_id,
