@@ -1,7 +1,9 @@
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::{stream, StreamExt, TryStreamExt};
 use overlaybd::config::{DownloadConfig, LayerConfig};
 use tracing::debug;
 
@@ -22,11 +24,43 @@ use crate::snapshot::{
     ResolvedAttachedDrive, RunnableSnapshot, SnapshotId, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
+const MANAGED_LAYER_EXISTS_CONCURRENCY: usize = 16;
+
 struct MaterializeSpec<'a> {
     label: &'a str,
     cache_key: &'a str,
     allow_empty_layers: bool,
     download: Option<DownloadConfig>,
+}
+
+async fn validate_managed_layers<F, Fut>(
+    layers: &[(usize, String)],
+    label: &str,
+    exists: F,
+) -> RepositoryResult<()>
+where
+    F: Fn(String) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = anyhow::Result<bool>> + Send,
+{
+    stream::iter(layers.iter().cloned())
+        .map(|(index, digest)| {
+            let exists = exists.clone();
+            async move {
+                let key = OssSnapshotArtifactLayout::managed_layer_key(&digest);
+                let present = exists(key.clone()).await.map_err(|error| {
+                    RepositoryError::backend(format!("check managed layer '{key}'"), error)
+                })?;
+                if !present {
+                    return Err(RepositoryError::ArtifactNotFound {
+                        artifact: format!("{label}: managed layer {index} '{digest}' is missing"),
+                    });
+                }
+                Ok(())
+            }
+        })
+        .buffer_unordered(MANAGED_LAYER_EXISTS_CONCURRENCY)
+        .try_for_each(|()| async { Ok(()) })
+        .await
 }
 
 /// Resolves committed OSS-backed snapshots into node-local runnable paths.
@@ -230,6 +264,21 @@ impl OssRuntimeResolver {
         label: &str,
         download: Option<DownloadConfig>,
     ) -> RepositoryResult<PathBuf> {
+        let managed_layers = layers
+            .iter()
+            .enumerate()
+            .filter_map(|(index, layer)| match layer {
+                OverlaybdLayerRef::Managed(layer) => Some((index, layer.digest.clone())),
+                OverlaybdLayerRef::External(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let client = Arc::clone(&self.client);
+        validate_managed_layers(&managed_layers, label, move |key| {
+            let client = Arc::clone(&client);
+            async move { client.exists(&key).await }
+        })
+        .await?;
+
         self.image_materializer
             .materialize_image_config(
                 layers,
@@ -237,22 +286,11 @@ impl OssRuntimeResolver {
                 label,
                 Some(&self.managed_layers_repo_blob_url),
                 download,
-                |index, managed| async move {
-                    let key = OssSnapshotArtifactLayout::managed_layer_key(&managed.digest);
-                    if !self.client.exists(&key).await.map_err(|e| {
-                        RepositoryError::backend(format!("check managed layer '{key}'"), e)
-                    })? {
-                        return Err(RepositoryError::ArtifactNotFound {
-                            artifact: format!(
-                                "{label}: managed layer {index} '{}' is missing",
-                                managed.digest
-                            ),
-                        });
-                    }
+                |_, managed| async move {
                     Ok(LayerConfig {
-                        digest: managed.digest.clone(),
+                        digest: managed.digest,
                         size: managed.size,
-                        uuid: managed.uuid.clone().unwrap_or_default(),
+                        uuid: managed.uuid.unwrap_or_default(),
                         ..Default::default()
                     })
                 },
@@ -371,5 +409,79 @@ impl OssRuntimeResolver {
             )
         })?;
         parse_firecracker_manifest(&bytes, &key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::*;
+    use tokio::sync::Barrier;
+
+    fn digest(index: usize) -> String {
+        format!("sha256:{index:064x}")
+    }
+
+    #[tokio::test]
+    async fn validate_managed_layers_reports_missing_layer() {
+        let indexed_layers = [(3, digest(3)), (7, digest(7)), (11, digest(11))];
+        let missing_key = OssSnapshotArtifactLayout::managed_layer_key(&indexed_layers[2].1);
+        let expected_artifact = format!(
+            "rootfs: managed layer 11 '{}' is missing",
+            indexed_layers[2].1
+        );
+
+        let error = validate_managed_layers(&indexed_layers, "rootfs", move |key| {
+            let missing_key = missing_key.clone();
+            async move { Ok(key != missing_key) }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RepositoryError::ArtifactNotFound { artifact } if artifact == expected_artifact
+        ));
+    }
+
+    #[tokio::test]
+    async fn validate_managed_layers_limits_concurrency_to_sixteen() {
+        let indexed_layers = (0..32)
+            .map(|index| (index, digest(index)))
+            .collect::<Vec<_>>();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(MANAGED_LAYER_EXISTS_CONCURRENCY));
+
+        validate_managed_layers(&indexed_layers, "memory", {
+            let in_flight = Arc::clone(&in_flight);
+            let maximum = Arc::clone(&maximum);
+            let barrier = Arc::clone(&barrier);
+            move |_| {
+                let in_flight = Arc::clone(&in_flight);
+                let maximum = Arc::clone(&maximum);
+                let barrier = Arc::clone(&barrier);
+                async move {
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::timeout(Duration::from_secs(1), barrier.wait())
+                        .await
+                        .map_err(|_| anyhow::anyhow!("concurrency barrier timed out"))?;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(true)
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(MANAGED_LAYER_EXISTS_CONCURRENCY, 16);
+        assert_eq!(
+            maximum.load(Ordering::SeqCst),
+            MANAGED_LAYER_EXISTS_CONCURRENCY
+        );
     }
 }
