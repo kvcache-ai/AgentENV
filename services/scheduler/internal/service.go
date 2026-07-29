@@ -89,7 +89,7 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	for _, n := range discovered {
 		rich = append(rich, RichNode{
 			Node:     n,
-			Snapshot: s.nodes.PeekObserved(n.ID),
+			Snapshot: s.nodes.SchedulingSnapshot(n.ID, start),
 		})
 	}
 
