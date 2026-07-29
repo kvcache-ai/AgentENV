@@ -38,6 +38,88 @@ func TestDefaultSchedulerDiscoveryModeIsStatic(t *testing.T) {
 	if got := cfg.Scheduler.ArtifactLookupNodeLimit; got != 0 {
 		t.Fatalf("expected scheduler artifact lookup node limit 0, got %d", got)
 	}
+	if got := cfg.Scheduler.LocalityGroup; got != (LocalityGroupConfig{}) {
+		t.Fatalf("expected zero-value locality group config, got %+v", got)
+	}
+}
+
+func TestLoadParsesSchedulerLocalityGroup(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"scheduler": {
+			"strategy": "locality",
+			"locality_group": {
+				"max_sandbox_count": 4,
+				"max_cpu_count": 8,
+				"max_memory_mb": 16384
+			}
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	cfg, err := Load(path, "scheduler")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	want := LocalityGroupConfig{
+		MaxSandboxCount: 4,
+		MaxCPUCount:     8,
+		MaxMemoryMB:     16384,
+	}
+	if got := cfg.Scheduler.LocalityGroup; got != want {
+		t.Fatalf("locality group = %+v, want %+v", got, want)
+	}
+}
+
+func TestLoadRejectsLocalityWithoutSandboxGroupLimit(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"scheduler": {
+			"strategy": "locality",
+			"locality_group": {
+				"max_cpu_count": 8,
+				"max_memory_mb": 16384
+			}
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	if _, err := Load(path, "scheduler"); err == nil {
+		t.Fatal("expected locality strategy without max_sandbox_count to fail")
+	}
+}
+
+func TestLoadAppliesSchedulerLocalityGroupEnv(t *testing.T) {
+	t.Setenv("SCHEDULER_STRATEGY", "locality")
+	t.Setenv("SCHEDULER_LOCALITY_GROUP_MAX_SANDBOX_COUNT", "3")
+	t.Setenv("SCHEDULER_LOCALITY_GROUP_MAX_CPU_COUNT", "6")
+	t.Setenv("SCHEDULER_LOCALITY_GROUP_MAX_MEMORY_MB", "12288")
+
+	cfg, err := Load("", "scheduler")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if got := cfg.Scheduler.LocalityGroup; got != (LocalityGroupConfig{
+		MaxSandboxCount: 3,
+		MaxCPUCount:     6,
+		MaxMemoryMB:     12288,
+	}) {
+		t.Fatalf("unexpected locality group from env: %+v", got)
+	}
+}
+
+func TestLoadRejectsInvalidSchedulerLocalityGroupEnv(t *testing.T) {
+	t.Setenv("SCHEDULER_LOCALITY_GROUP_MAX_SANDBOX_COUNT", "-1")
+
+	if _, err := Load("", "scheduler"); err == nil {
+		t.Fatal("expected invalid locality group env to fail")
+	}
 }
 
 func TestLoadSchedulerAllowsQueryOnlyWithRedisWithoutNodes(t *testing.T) {

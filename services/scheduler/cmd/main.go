@@ -69,7 +69,14 @@ func main() {
 		svc := scheduler.NewService(
 			logger,
 			registry,
-			scheduler.NewStrategy(cfg.Scheduler.Strategy),
+			scheduler.NewStrategy(
+				cfg.Scheduler.Strategy,
+				scheduler.WithLocalityGroupLimits(scheduler.LocalityGroupLimits{
+					MaxSandboxCount: cfg.Scheduler.LocalityGroup.MaxSandboxCount,
+					MaxCPUCount:     cfg.Scheduler.LocalityGroup.MaxCPUCount,
+					MaxMemoryMB:     cfg.Scheduler.LocalityGroup.MaxMemoryMB,
+				}),
+			),
 			store,
 			scheduler.WithArtifactStore(scheduler.NewInMemoryArtifactStore(
 				cfg.Scheduler.ArtifactStoreCapacity,
