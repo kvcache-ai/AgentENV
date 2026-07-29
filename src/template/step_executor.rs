@@ -36,9 +36,21 @@ impl TemplateStepExecutor {
                     context = context.with_env_var(key.clone(), value.clone());
                 }
                 TemplateBuildStepKind::Workdir { path } => {
-                    let path = path.to_string_lossy().into_owned();
-                    self.ensure_workdir(sandbox, &context, &path).await?;
-                    context = context.with_workdir(path);
+                    // Resolve relative paths against the current workdir, as
+                    // Docker does, so both the created directory and the
+                    // context agree on the absolute location.
+                    let path = path.to_string_lossy();
+                    let resolved = if std::path::Path::new(path.as_ref()).is_absolute() {
+                        path.into_owned()
+                    } else {
+                        let base = if context.workdir.is_empty() { "/" } else { &context.workdir };
+                        std::path::Path::new(base)
+                            .join(path.as_ref())
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    self.ensure_workdir(sandbox, &context, &resolved).await?;
+                    context = context.with_workdir(resolved);
                 }
                 TemplateBuildStepKind::User { value } => {
                     context = context.with_user(Some(value.clone()));
@@ -77,7 +89,6 @@ impl TemplateStepExecutor {
     /// Dockerfile front-ends (`aenv build` and the e2b SDK's `from_dockerfile`,
     /// which also injects a default `WORKDIR /home/user`) map WORKDIR to this
     /// step — so it must materialize the directory, not only record metadata.
-    /// Relative paths resolve against the current workdir, as in Docker.
     async fn ensure_workdir(
         &self,
         sandbox: &impl SandboxExecutor,
@@ -344,7 +355,7 @@ mod tests {
     #[tokio::test]
     async fn workdir_step_resolves_relative_paths_against_current_workdir() {
         let sandbox = RecordingSandbox::succeeding();
-        TemplateStepExecutor::new()
+        let ctx = TemplateStepExecutor::new()
             .execute(
                 &sandbox,
                 &[
@@ -355,11 +366,12 @@ mod tests {
             )
             .await
             .unwrap();
+        // Docker resolves a relative WORKDIR against the previous one; the
+        // created directory and the recorded workdir must both be absolute.
+        assert_eq!(ctx.workdir, "/base/nested");
         let commands = sandbox.commands();
         assert_eq!(commands.len(), 2);
-        // The second mkdir runs with the first workdir as its cwd, so the
-        // relative path lands in /base/nested as Docker would resolve it.
-        assert_eq!(commands[1].2.as_deref(), Some("/base"));
+        assert_eq!(commands[1].1[1], "mkdir -p -- /base/nested");
     }
 
     #[tokio::test]
