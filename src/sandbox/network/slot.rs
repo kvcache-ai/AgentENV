@@ -376,15 +376,15 @@ impl Slot {
         }
 
         // Create tap0 interface (Tun/Tap)
-        let mut command = Command::new("ip");
-        crate::privileges::configure_std_command_capabilities(
-            &mut command,
+        let status = crate::privileges::run_with_scoped_capabilities(
             &[crate::privileges::CAP_NET_ADMIN],
-        );
-        let status = command
-            .args(["tuntap", "add", "tap0", "mode", "tap"])
-            .status()
-            .context("Failed to execute ip tuntap")?;
+            || {
+                Command::new("ip")
+                    .args(["tuntap", "add", "tap0", "mode", "tap"])
+                    .status()
+                    .context("Failed to execute ip tuntap")
+            },
+        )?;
         if !status.success() {
             return Err(anyhow!("ip tuntap add failed"));
         }
@@ -621,23 +621,23 @@ impl Slot {
             //
             // Using `ip route add` command as netlink route add with gateway on /31
             // subnet has compatibility issues with some kernel configurations.
-            let mut command = std::process::Command::new("ip");
-            crate::privileges::configure_std_command_capabilities(
-                &mut command,
+            let output = crate::privileges::run_with_scoped_capabilities(
                 &[crate::privileges::CAP_NET_ADMIN],
-            );
-            let output = command
-                .args([
-                    "route",
-                    "add",
-                    &format!("{}/32", host_interaction_ip),
-                    "via",
-                    &veth_vm_ip.to_string(),
-                    "dev",
-                    &veth_name,
-                ])
-                .output()
-                .context("Failed to execute ip route add")?;
+                || {
+                    std::process::Command::new("ip")
+                        .args([
+                            "route",
+                            "add",
+                            &format!("{}/32", host_interaction_ip),
+                            "via",
+                            &veth_vm_ip.to_string(),
+                            "dev",
+                            &veth_name,
+                        ])
+                        .output()
+                        .context("Failed to execute ip route add")
+                },
+            )?;
 
             if !output.status.success() {
                 return Err(anyhow!(
@@ -708,15 +708,15 @@ impl Slot {
     /// Tokio context may already be unavailable.
     fn delete_host_veth_interface_sync(idx: u32) -> Result<()> {
         let veth_name = Self::host_veth_name(idx);
-        let mut command = Command::new("ip");
-        crate::privileges::configure_std_command_capabilities(
-            &mut command,
+        let output = crate::privileges::run_with_scoped_capabilities(
             &[crate::privileges::CAP_NET_ADMIN],
-        );
-        let output = command
-            .args(["link", "del", &veth_name])
-            .output()
-            .context("Failed to execute ip link del")?;
+            || {
+                Command::new("ip")
+                    .args(["link", "del", &veth_name])
+                    .output()
+                    .context("Failed to execute ip link del")
+            },
+        )?;
 
         if output.status.success() {
             return Ok(());

@@ -105,38 +105,35 @@ fn build_restore_script(commands: &[IptablesRestoreCommand]) -> String {
 }
 
 fn apply_restore_script(script: &str) -> Result<()> {
-    let mut command = Command::new("iptables-restore");
-    crate::privileges::configure_std_command_capabilities(
-        &mut command,
-        &[crate::privileges::CAP_NET_ADMIN],
-    );
-    let mut child = command
-        .arg("--noflush")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("Failed to spawn iptables-restore")?;
+    crate::privileges::run_with_scoped_capabilities(&[crate::privileges::CAP_NET_ADMIN], || {
+        let mut child = Command::new("iptables-restore")
+            .arg("--noflush")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Failed to spawn iptables-restore")?;
 
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .context("Failed to open stdin for iptables-restore")?;
-        stdin
-            .write_all(script.as_bytes())
-            .context("Failed to write iptables-restore script")?;
-    }
+        {
+            let stdin = child
+                .stdin
+                .as_mut()
+                .context("Failed to open stdin for iptables-restore")?;
+            stdin
+                .write_all(script.as_bytes())
+                .context("Failed to write iptables-restore script")?;
+        }
 
-    let output = child
-        .wait_with_output()
-        .context("Failed to wait for iptables-restore")?;
-    if output.status.success() {
-        return Ok(());
-    }
+        let output = child
+            .wait_with_output()
+            .context("Failed to wait for iptables-restore")?;
+        if output.status.success() {
+            return Ok(());
+        }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    Err(anyhow!("iptables-restore failed: {}", stderr.trim()))
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(anyhow!("iptables-restore failed: {}", stderr.trim()))
+    })
 }
 
 fn handle_restore_failure(err: anyhow::Error, policy: OpenFailurePolicy) -> Result<()> {

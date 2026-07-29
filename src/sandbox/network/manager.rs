@@ -662,12 +662,12 @@ fn collect_conflict_report(output: &str, patterns: &[String]) -> ConflictReport 
 }
 
 fn run_command(command: &str, args: &[&str], capabilities: &'static [i32]) -> Option<String> {
-    let mut child = Command::new(command);
-    if !capabilities.is_empty() {
-        crate::privileges::configure_std_command_capabilities(&mut child, capabilities);
-    }
-
-    let output = match child.args(args).output() {
+    let output = match crate::privileges::run_with_scoped_capabilities(capabilities, || {
+        Command::new(command)
+            .args(args)
+            .output()
+            .map_err(anyhow::Error::from)
+    }) {
         Ok(output) => output,
         Err(err) => {
             debug!(command, args = ?args, error = %err, "failed to inspect host networking state");

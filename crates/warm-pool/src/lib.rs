@@ -182,6 +182,16 @@ impl<T: Send> WarmPool<T> {
         *target = next;
     }
 
+    fn record_acquisition_pressure(&self, pool_len: usize) {
+        self.grow_fill_target_after_pressure(pool_len);
+        if matches!(
+            self.compute_maintenance_action(pool_len),
+            PoolMaintenanceAction::Fill(_)
+        ) {
+            self.request_maintenance();
+        }
+    }
+
     /// Request the maintenance worker to wake up and check watermarks.
     pub fn request_maintenance(&self) {
         if !self.config.maintenance_enabled || self.is_shutting_down() {
@@ -199,17 +209,19 @@ impl<T: Send> WarmPool<T> {
     /// Try to acquire a resource from the pool (fast path).
     ///
     /// Returns `Some(resource)` if one is available, `None` if the pool is empty.
-    /// Caller should request maintenance if pool is below low watermark.
+    /// Acquisition pressure grows the refill target and wakes maintenance even
+    /// on a miss, allowing a burst that starts from an empty pool to influence
+    /// future warm capacity.
     pub fn try_acquire(&self) -> Option<T> {
         if self.is_shutting_down() {
             return None;
         }
         let mut pool = self.pool.lock().unwrap();
-        let resource = pool.pop_front()?;
+        let resource = pool.pop_front();
         let next_pool_len = pool.len();
         drop(pool);
-        self.grow_fill_target_after_pressure(next_pool_len);
-        Some(resource)
+        self.record_acquisition_pressure(next_pool_len);
+        resource
     }
 
     /// Try to acquire the first resource matching `predicate`.
@@ -223,11 +235,11 @@ impl<T: Send> WarmPool<T> {
         let resource = pool
             .iter()
             .position(&mut predicate)
-            .and_then(|idx| pool.remove(idx))?;
+            .and_then(|idx| pool.remove(idx));
         let next_pool_len = pool.len();
         drop(pool);
-        self.grow_fill_target_after_pressure(next_pool_len);
-        Some(resource)
+        self.record_acquisition_pressure(next_pool_len);
+        resource
     }
 
     /// Try to enqueue an idle resource only if the pool is below the high watermark.
@@ -441,6 +453,48 @@ mod tests {
             pool.compute_maintenance_action(0),
             PoolMaintenanceAction::Fill(8)
         );
+    }
+
+    #[test]
+    fn acquisition_misses_grow_fill_target_geometrically() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 10,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+        });
+
+        assert_eq!(pool.try_acquire(), None);
+        assert_eq!(
+            pool.compute_maintenance_action(0),
+            PoolMaintenanceAction::Fill(4)
+        );
+
+        assert_eq!(pool.try_acquire(), None);
+        assert_eq!(
+            pool.compute_maintenance_action(0),
+            PoolMaintenanceAction::Fill(8)
+        );
+
+        assert_eq!(pool.try_acquire_where(|_| true), None);
+        assert_eq!(
+            pool.compute_maintenance_action(0),
+            PoolMaintenanceAction::Fill(10)
+        );
+    }
+
+    #[test]
+    fn acquisition_miss_requests_maintenance() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 10,
+            maintenance_enabled: true,
+            startup_prewarm: false,
+        });
+
+        assert!(!pool.maintenance_signal.lock().unwrap().pending);
+        assert_eq!(pool.try_acquire(), None);
+        assert!(pool.maintenance_signal.lock().unwrap().pending);
     }
 
     #[test]

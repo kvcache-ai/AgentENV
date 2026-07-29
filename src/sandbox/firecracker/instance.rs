@@ -85,31 +85,18 @@ impl FirecrackerInstance {
             "spawning firecracker process"
         );
 
+        let netns = netns
+            .map(|netns_path| {
+                fs::File::open(netns_path).with_context(|| {
+                    format!(
+                        "open Firecracker network namespace {}",
+                        netns_path.display()
+                    )
+                })
+            })
+            .transpose()?;
+
         let mut cmd = Command::new(&firecracker_binary);
-        if let Some(netns_path) = netns {
-            let netns = fs::File::open(netns_path).with_context(|| {
-                format!(
-                    "open Firecracker network namespace {}",
-                    netns_path.display()
-                )
-            })?;
-            // SAFETY: the closure only calls setns, which is safe between fork
-            // and exec, and owns the namespace fd until the child is spawned.
-            unsafe {
-                cmd.pre_exec(move || {
-                    let rc = libc::setns(netns.as_raw_fd(), libc::CLONE_NEWNET);
-                    if rc == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
-                    }
-                });
-            }
-        }
-        // Register this after setns: entering the namespace requires
-        // CAP_SYS_ADMIN. The empty slice intentionally drops all capabilities
-        // from Firecracker itself.
-        crate::privileges::configure_tokio_command_capabilities(&mut cmd, &[]);
         cmd.process_group(0);
 
         cmd.arg("--api-sock")
@@ -130,7 +117,19 @@ impl FirecrackerInstance {
 
         cmd.stdout(stdout).stderr(stderr);
 
-        let child = cmd.spawn().context("failed to spawn firecracker")?;
+        let child = crate::privileges::spawn_tokio_command_scoped(cmd, &[], move || {
+            if let Some(netns) = netns {
+                // SAFETY: `netns` is an open network namespace descriptor and
+                // this short-lived launcher thread has not spawned a child yet.
+                let rc = unsafe { libc::setns(netns.as_raw_fd(), libc::CLONE_NEWNET) };
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        })
+        .await
+        .context("failed to spawn firecracker")?;
         trace!("firecracker process spawned");
 
         // Set oom_score_adj to maximum (1000) so the firecracker process is

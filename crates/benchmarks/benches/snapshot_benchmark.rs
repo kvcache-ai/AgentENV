@@ -1,7 +1,7 @@
 use agentenv::image::ImageResolver;
 use agentenv::sandbox::{
-    FirecrackerSandbox, FirecrackerSandboxConfig, OverlaybdConfig, SandboxExecutor,
-    UblkDeviceManager,
+    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotConfig, OverlaybdConfig,
+    SandboxExecutor, UblkDeviceManager,
 };
 use anyhow::{Context, Result};
 use criterion::Criterion;
@@ -95,6 +95,15 @@ fn print_samples(name: &str, samples: &[Duration]) {
         format_duration(max),
         samples.len()
     );
+
+    if std::env::var_os("AENV_BENCH_PRINT_SAMPLES").is_some() {
+        let samples = samples
+            .iter()
+            .map(|duration| format_duration(*duration))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{name:<28} samples [{samples}]");
+    }
 }
 
 fn run_default_benchmark<F>(name: &str, filters: &[String], mut run: F) -> bool
@@ -518,11 +527,11 @@ fn default_snapshot_resume(rt: &Runtime) -> Result<Vec<Duration>> {
     Ok(samples)
 }
 
-fn default_concurrent_resume(rt: &Runtime) -> Result<Vec<Duration>> {
-    let base_snapshot = rt.block_on(prepare_snapshot())?;
-    let mut warm_sandbox = rt.block_on(async {
-        FirecrackerSandbox::resume_from_snapshot_config(&base_snapshot).await
-    })?;
+fn run_concurrent_resume_samples(
+    rt: &Runtime,
+    base_snapshot: &FirecrackerSnapshotConfig,
+    sample_count: usize,
+) -> Result<Vec<Duration>> {
     let start_barrier = Arc::new(Barrier::new(CONCURRENCY));
     let handles: Vec<_> = (0..CONCURRENCY)
         .map(|_| {
@@ -532,10 +541,10 @@ fn default_concurrent_resume(rt: &Runtime) -> Result<Vec<Duration>> {
             let settle_time = cleanup_settle_time();
 
             thread::spawn(move || -> Result<Vec<Duration>> {
-                let mut samples = Vec::with_capacity(DEFAULT_SAMPLE_COUNT);
+                let mut samples = Vec::with_capacity(sample_count);
 
                 start_barrier.wait();
-                for _ in 0..DEFAULT_SAMPLE_COUNT {
+                for _ in 0..sample_count {
                     let start = std::time::Instant::now();
                     let mut sandbox = handle.block_on(async {
                         FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await
@@ -553,28 +562,52 @@ fn default_concurrent_resume(rt: &Runtime) -> Result<Vec<Duration>> {
         })
         .collect();
 
-    let mut samples = vec![Duration::ZERO; DEFAULT_SAMPLE_COUNT];
-    let worker_result = (|| -> Result<()> {
-        for handle in handles {
-            let worker_samples = handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("concurrent resume worker panicked"))??;
-            for (sample, duration) in samples.iter_mut().zip(worker_samples) {
-                *sample += duration;
+    let mut samples = vec![Duration::ZERO; sample_count];
+    let mut first_error = None;
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok(worker_samples)) => {
+                for (sample, duration) in samples.iter_mut().zip(worker_samples) {
+                    *sample += duration;
+                }
+            }
+            Ok(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Err(_) => {
+                first_error
+                    .get_or_insert_with(|| anyhow::anyhow!("concurrent resume worker panicked"));
             }
         }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
 
-        for sample in &mut samples {
-            *sample /= CONCURRENCY as u32;
-        }
-        Ok(())
+    for sample in &mut samples {
+        *sample /= CONCURRENCY as u32;
+    }
+    Ok(samples)
+}
+
+fn default_concurrent_resume(rt: &Runtime) -> Result<Vec<Duration>> {
+    let base_snapshot = rt.block_on(prepare_snapshot())?;
+    let mut warm_sandbox = rt.block_on(async {
+        FirecrackerSandbox::resume_from_snapshot_config(&base_snapshot).await
+    })?;
+
+    let benchmark_result = (|| {
+        // The bounded runner does not get Criterion's warm-up phase. Prime the
+        // adaptive network, block-device, and Firecracker pools with the same
+        // burst shape before collecting samples.
+        run_concurrent_resume_samples(rt, &base_snapshot, 1)?;
+        run_concurrent_resume_samples(rt, &base_snapshot, DEFAULT_SAMPLE_COUNT)
     })();
 
     rt.block_on(async {
         let _ = warm_sandbox.stop().await;
     });
-    worker_result?;
-    Ok(samples)
+    benchmark_result
 }
 
 fn run_default_snapshot_benchmarks() -> Result<()> {
