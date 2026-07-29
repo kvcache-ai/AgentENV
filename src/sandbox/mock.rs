@@ -345,14 +345,16 @@ impl SandboxBackend for MockSandboxBackend {
         &mut self,
         policy: Option<super::SandboxNetworkPolicy>,
     ) -> Result<()> {
+        let applied_policy = policy.clone();
+        self.behavior
+            .apply_async(MockOperation::UpdateNetwork)
+            .await?;
         self.behavior
             .applied_network_policies
             .lock()
             .expect("mock behavior mutex poisoned")
-            .push(policy);
-        self.behavior
-            .apply_async(MockOperation::UpdateNetwork)
-            .await
+            .push(applied_policy);
+        Ok(())
     }
 
     fn update_custom_extension_params(&mut self, _params: Option<CustomExtensionParams>) {}

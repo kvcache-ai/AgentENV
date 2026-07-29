@@ -1427,10 +1427,38 @@ where
 
     #[tracing::instrument(skip(self, network_policy), fields(sandbox_id = %sandbox_id))]
     pub async fn replace_sandbox_network_policy(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        network_policy: SandboxNetworkPolicy,
+    ) -> Result<()> {
+        let this = Arc::clone(self);
+        self.run_lifecycle_operation("update_network", sandbox_id, async move {
+            this.replace_sandbox_network_policy_inner(sandbox_id, network_policy)
+                .await
+        })
+        .await
+    }
+
+    async fn replace_sandbox_network_policy_inner(
         &self,
         sandbox_id: SandboxId,
         network_policy: SandboxNetworkPolicy,
     ) -> Result<()> {
+        let sandbox = {
+            let sandboxes = self.sandboxes.read().await;
+            sandboxes.get(&sandbox_id).cloned()
+        }
+        .ok_or_else(|| OrchestratorError::SandboxOperationConflict {
+            sandbox_id,
+            operation: SandboxOperation::UpdateNetwork,
+        })?;
+
+        // Hold the sandbox lock across apply / persist / rollback so concurrent
+        // replacements cannot interleave a newer policy between a failed persist
+        // and its compensating rollback. Combined with run_lifecycle_operation,
+        // the compensation also survives caller cancellation.
+        let mut sandbox_guard = sandbox.lock().await;
+
         let metadata = self
             .store
             .get(&sandbox_id)
@@ -1443,31 +1471,18 @@ where
             });
         }
 
-        let sandbox = {
-            let sandboxes = self.sandboxes.read().await;
-            sandboxes.get(&sandbox_id).cloned()
-        }
-        .ok_or_else(|| OrchestratorError::SandboxOperationConflict {
-            sandbox_id,
-            operation: SandboxOperation::UpdateNetwork,
-        })?;
-
         let previous_policy = metadata.network_policy.clone();
         let runtime_policy = network_policy.runtime_policy();
 
-        let update_result = {
-            let mut sandbox = sandbox.lock().await;
-            sandbox.update_network_policy(runtime_policy).await
-        };
-        update_result.map_err(|source| OrchestratorError::SandboxOperationFailed {
-            sandbox_id,
-            operation: SandboxOperation::UpdateNetwork,
-            source,
-        })?;
+        sandbox_guard
+            .update_network_policy(runtime_policy)
+            .await
+            .map_err(|source| OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::UpdateNetwork,
+                source,
+            })?;
 
-        // Live egress rules are already applied. If metadata persistence fails,
-        // roll the runtime policy back so GET/pause/snapshot cannot diverge from
-        // the enforced iptables state.
         if let Err(err) = self
             .store
             .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
@@ -1475,16 +1490,21 @@ where
             })
             .await
         {
-            let rollback_policy = previous_policy.runtime_policy();
-            let rollback_result = {
-                let mut sandbox = sandbox.lock().await;
-                sandbox.update_network_policy(rollback_policy).await
-            };
+            let rollback_result = sandbox_guard
+                .update_network_policy(previous_policy.runtime_policy())
+                .await;
             if let Err(rollback_err) = rollback_result {
                 warn!(
                     error = ?rollback_err,
                     "failed to roll back sandbox network policy after metadata persist failure"
                 );
+                return Err(OrchestratorError::SandboxOperationFailed {
+                    sandbox_id,
+                    operation: SandboxOperation::UpdateNetwork,
+                    source: anyhow::anyhow!(
+                        "network policy metadata persist failed ({err:#}); runtime rollback also failed ({rollback_err:#}); runtime enforcement and metadata may disagree"
+                    ),
+                });
             }
 
             return Err(match err {

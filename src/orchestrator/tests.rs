@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use async_trait::async_trait;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
@@ -131,6 +131,9 @@ struct ScriptedStoreControl {
     add_actions: StdMutex<VecDeque<StoreAction>>,
     update_if_state_actions: StdMutex<VecDeque<StoreAction>>,
     on_add: StoreHookSlot,
+    /// Optional one-shot gate: the next `update_if_state` / `update_state_if_state`
+    /// signals `entered` then waits for `release` before continuing.
+    update_gate: StdMutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 impl ScriptedStoreControl {
@@ -150,6 +153,28 @@ impl ScriptedStoreControl {
 
     fn set_on_add(&self, hook: StoreHook) {
         *self.on_add.lock().expect("on_add mutex poisoned") = Some(hook);
+    }
+
+    fn arm_next_update_gate(&self) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self
+            .update_gate
+            .lock()
+            .expect("update gate mutex poisoned") = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    async fn wait_update_gate(&self) {
+        let gate = self
+            .update_gate
+            .lock()
+            .expect("update gate mutex poisoned")
+            .take();
+        if let Some((entered_tx, release_rx)) = gate {
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+        }
     }
 
     fn take_action(queue: &StdMutex<VecDeque<StoreAction>>) -> StoreAction {
@@ -201,6 +226,7 @@ impl MetadataStore for ScriptedStore {
         new_state: SandboxState,
         expected_states: &[SandboxState],
     ) -> StdResult<SandboxState, StoreError> {
+        self.control.wait_update_gate().await;
         match ScriptedStoreControl::take_action(&self.control.update_if_state_actions) {
             StoreAction::Delegate => {
                 self.inner
@@ -220,6 +246,7 @@ impl MetadataStore for ScriptedStore {
     where
         F: FnOnce(&mut SandboxMetadata) + Send,
     {
+        self.control.wait_update_gate().await;
         match ScriptedStoreControl::take_action(&self.control.update_if_state_actions) {
             StoreAction::Delegate => {
                 self.inner
@@ -1318,6 +1345,223 @@ async fn sandbox_network_policy_rolls_back_when_metadata_persist_fails() -> Resu
     assert_eq!(
         metadata.network_policy, initial_policy,
         "failed persist must leave stored policy unchanged"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn sandbox_network_policy_surfaces_rollback_failure() -> Result<()> {
+    setup();
+    let control = Arc::new(ScriptedStoreControl::default());
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&control)),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+
+    let initial_policy = SandboxNetworkPolicy::new(
+        BaseSandboxNetworkPolicy::Deny,
+        SandboxNetworkEgressPolicy::new(
+            Some(vec!["8.8.8.8".to_string()]),
+            Some(vec!["203.0.113.0/24".to_string()]),
+        )?,
+    );
+    let mut request = create_request(Some(60), &[]);
+    request.network_policy = initial_policy.clone();
+    let created = orchestrator.create_sandbox(request).await?;
+
+    let updated_policy = SandboxNetworkPolicy::new(
+        BaseSandboxNetworkPolicy::Allow,
+        SandboxNetworkEgressPolicy::new(None, Some(vec!["198.51.100.0/24".to_string()]))?,
+    );
+
+    behavior.push_action(MockOperation::UpdateNetwork, MockAction::Succeed);
+    behavior.push_action(
+        MockOperation::UpdateNetwork,
+        MockAction::Fail {
+            message: "injected rollback failure".to_string(),
+        },
+    );
+    control.push_update_if_state_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("injected metadata failure during network policy update"),
+    }));
+
+    let err = orchestrator
+        .replace_sandbox_network_policy(created.id, updated_policy.clone())
+        .await
+        .expect_err("double failure must surface enforcement inconsistency");
+
+    match err {
+        OrchestratorError::SandboxOperationFailed {
+            operation: SandboxOperation::UpdateNetwork,
+            source,
+            ..
+        } => {
+            let message = source.to_string();
+            assert!(
+                message.contains("runtime enforcement and metadata may disagree"),
+                "unexpected error message: {message}"
+            );
+            assert!(
+                message.contains("injected rollback failure"),
+                "unexpected error message: {message}"
+            );
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    assert_eq!(behavior.update_network_calls(), 2);
+    assert_eq!(
+        behavior.applied_network_policies(),
+        vec![updated_policy.runtime_policy()],
+        "failed rollback must not be recorded as applied"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sandbox_network_policy_completes_rollback_after_caller_cancel() -> Result<()> {
+    setup();
+    let control = Arc::new(ScriptedStoreControl::default());
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&control)),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+
+    let initial_policy = SandboxNetworkPolicy::new(
+        BaseSandboxNetworkPolicy::Deny,
+        SandboxNetworkEgressPolicy::new(
+            Some(vec!["8.8.8.8".to_string()]),
+            Some(vec!["203.0.113.0/24".to_string()]),
+        )?,
+    );
+    let mut request = create_request(Some(60), &[]);
+    request.network_policy = initial_policy.clone();
+    let created = orchestrator.create_sandbox(request).await?;
+    let sandbox_id = created.id;
+
+    let updated_policy = SandboxNetworkPolicy::new(
+        BaseSandboxNetworkPolicy::Allow,
+        SandboxNetworkEgressPolicy::new(None, Some(vec!["198.51.100.0/24".to_string()]))?,
+    );
+
+    let (entered_rx, release_tx) = control.arm_next_update_gate();
+    control.push_update_if_state_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("injected metadata failure during network policy update"),
+    }));
+
+    let orch = Arc::clone(&orchestrator);
+    let replace_task = tokio::spawn(async move {
+        orch.replace_sandbox_network_policy(sandbox_id, updated_policy)
+            .await
+    });
+
+    entered_rx
+        .await
+        .expect("store update should signal that the live policy was already applied");
+    replace_task.abort();
+    let _ = replace_task.await;
+    release_tx
+        .send(())
+        .expect("lifecycle task should still be waiting on the update gate");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while behavior.update_network_calls() < 2 {
+        if std::time::Instant::now() >= deadline {
+            panic!("rollback did not complete after caller cancellation");
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+
+    assert_eq!(
+        behavior.applied_network_policies(),
+        vec![
+            SandboxNetworkPolicy::new(
+                BaseSandboxNetworkPolicy::Allow,
+                SandboxNetworkEgressPolicy::new(None, Some(vec!["198.51.100.0/24".to_string()]))?,
+            )
+            .runtime_policy(),
+            initial_policy.runtime_policy(),
+        ]
+    );
+    let metadata = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("sandbox metadata should remain");
+    assert_eq!(metadata.network_policy, initial_policy);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sandbox_network_policy_serializes_concurrent_replacements() -> Result<()> {
+    setup();
+    let control = Arc::new(ScriptedStoreControl::default());
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&control)),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+
+    let initial_policy = SandboxNetworkPolicy::new(
+        BaseSandboxNetworkPolicy::Deny,
+        SandboxNetworkEgressPolicy::new(
+            Some(vec!["8.8.8.8".to_string()]),
+            Some(vec!["203.0.113.0/24".to_string()]),
+        )?,
+    );
+    let mut request = create_request(Some(60), &[]);
+    request.network_policy = initial_policy.clone();
+    let created = orchestrator.create_sandbox(request).await?;
+    let sandbox_id = created.id;
+
+    let failing_policy = SandboxNetworkPolicy::new(
+        BaseSandboxNetworkPolicy::Allow,
+        SandboxNetworkEgressPolicy::new(None, Some(vec!["198.51.100.0/24".to_string()]))?,
+    );
+    let winning_policy = SandboxNetworkPolicy::new(
+        BaseSandboxNetworkPolicy::Deny,
+        SandboxNetworkEgressPolicy::new(
+            Some(vec!["1.1.1.1".to_string()]),
+            Some(vec!["192.0.2.0/24".to_string()]),
+        )?,
+    );
+
+    // Whichever replacement persists first fails once; the other succeeds.
+    // Holding the sandbox lock across apply/persist/rollback keeps runtime and
+    // metadata aligned with the last successful replacement.
+    control.push_update_if_state_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("injected metadata failure during concurrent network update"),
+    }));
+
+    let orch_a = Arc::clone(&orchestrator);
+    let orch_b = Arc::clone(&orchestrator);
+    let failing = failing_policy.clone();
+    let winning = winning_policy.clone();
+    let (a, b) = tokio::join!(
+        async move { orch_a.replace_sandbox_network_policy(sandbox_id, failing).await },
+        async move { orch_b.replace_sandbox_network_policy(sandbox_id, winning).await },
+    );
+
+    assert!(a.is_err() ^ b.is_err(), "exactly one replacement should fail: {a:?} / {b:?}");
+    let expected = if a.is_ok() {
+        failing_policy
+    } else {
+        winning_policy
+    };
+
+    let metadata = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("sandbox metadata should remain");
+    assert_eq!(metadata.network_policy, expected);
+    let applied = behavior.applied_network_policies();
+    assert_eq!(
+        applied.last().cloned().flatten(),
+        expected.runtime_policy(),
+        "runtime enforcement must end on the successfully persisted policy: {applied:?}"
     );
 
     Ok(())
