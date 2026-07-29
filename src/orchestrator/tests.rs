@@ -1260,6 +1260,69 @@ async fn sandbox_network_policy_is_applied_and_persisted() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn sandbox_network_policy_rolls_back_when_metadata_persist_fails() -> Result<()> {
+    setup();
+    let control = Arc::new(ScriptedStoreControl::default());
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&control)),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+
+    let initial_policy = SandboxNetworkPolicy::new(
+        BaseSandboxNetworkPolicy::Deny,
+        SandboxNetworkEgressPolicy::new(
+            Some(vec!["8.8.8.8".to_string()]),
+            Some(vec!["203.0.113.0/24".to_string()]),
+        )?,
+    );
+    let mut request = create_request(Some(60), &[]);
+    request.network_policy = initial_policy.clone();
+    let created = orchestrator.create_sandbox(request).await?;
+    assert_eq!(created.network_policy, initial_policy);
+
+    let updated_policy = SandboxNetworkPolicy::new(
+        BaseSandboxNetworkPolicy::Allow,
+        SandboxNetworkEgressPolicy::new(None, Some(vec!["198.51.100.0/24".to_string()]))?,
+    );
+
+    // Fail the metadata write that follows the successful live policy apply.
+    control.push_update_if_state_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("injected metadata failure during network policy update"),
+    }));
+
+    let err = orchestrator
+        .replace_sandbox_network_policy(created.id, updated_policy.clone())
+        .await
+        .expect_err("network policy update must fail when metadata cannot persist");
+
+    assert!(matches!(
+        err,
+        OrchestratorError::StoreOperationFailed(StoreError::Backend { .. })
+    ));
+    assert_eq!(
+        behavior.update_network_calls(),
+        2,
+        "runtime policy apply must be followed by a rollback apply"
+    );
+    let applied = behavior.applied_network_policies();
+    assert_eq!(applied.len(), 2);
+    assert_eq!(applied[0], updated_policy.runtime_policy());
+    assert_eq!(applied[1], initial_policy.runtime_policy());
+
+    let metadata = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("sandbox metadata should remain");
+    assert_eq!(
+        metadata.network_policy, initial_policy,
+        "failed persist must leave stored policy unchanged"
+    );
+
+    Ok(())
+}
+
 async fn wait_for_state(
     orchestrator: &Arc<TestOrchestrator>,
     sandbox_id: &SandboxId,

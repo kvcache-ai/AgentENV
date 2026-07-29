@@ -24,7 +24,7 @@ use super::backend::{
     SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult, SandboxRuntimeInfo,
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
-use crate::sandbox::CustomExtensionParams;
+use crate::sandbox::{CustomExtensionParams, SandboxNetworkPolicy};
 
 #[derive(Debug)]
 pub struct MockSnapshot;
@@ -73,6 +73,7 @@ pub struct MockBehavior {
     on_operation: Mutex<HashMap<MockOperation, Arc<dyn Fn() + Send + Sync>>>,
     runtime_info: Mutex<SandboxRuntimeInfo>,
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
+    applied_network_policies: Mutex<Vec<Option<SandboxNetworkPolicy>>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
 }
@@ -128,6 +129,13 @@ impl MockBehavior {
 
     pub fn update_network_calls(&self) -> usize {
         self.update_network_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn applied_network_policies(&self) -> Vec<Option<SandboxNetworkPolicy>> {
+        self.applied_network_policies
+            .lock()
+            .expect("mock behavior mutex poisoned")
+            .clone()
     }
 
     fn pop_action(&self, operation: MockOperation) -> MockAction {
@@ -335,8 +343,13 @@ impl SandboxBackend for MockSandboxBackend {
 
     async fn update_network_policy(
         &mut self,
-        _policy: Option<super::SandboxNetworkPolicy>,
+        policy: Option<super::SandboxNetworkPolicy>,
     ) -> Result<()> {
+        self.behavior
+            .applied_network_policies
+            .lock()
+            .expect("mock behavior mutex poisoned")
+            .push(policy);
         self.behavior
             .apply_async(MockOperation::UpdateNetwork)
             .await
