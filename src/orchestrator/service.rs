@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, Mutex as StdMutex,
 };
 use std::time::{Duration, SystemTime};
 
@@ -35,11 +35,41 @@ use super::types::{
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
 type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
+type LifecycleOperationLock = Arc<Mutex<LifecycleOperationState>>;
+type LifecycleOperationMap = Arc<StdMutex<HashMap<SandboxId, LifecycleOperationLock>>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LifecycleOperationKind {
     Delete,
     Pause,
+}
+
+#[derive(Debug)]
+struct LifecycleOperationState {
+    kind: LifecycleOperationKind,
+    delete_succeeded: bool,
+}
+
+struct LifecycleOperationLease {
+    sandbox_id: SandboxId,
+    operation_lock: LifecycleOperationLock,
+    operations: LifecycleOperationMap,
+}
+
+impl Drop for LifecycleOperationLease {
+    fn drop(&mut self) {
+        let mut operations = self
+            .operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if Arc::strong_count(&self.operation_lock) == 2
+            && operations
+                .get(&self.sandbox_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.operation_lock))
+        {
+            operations.remove(&self.sandbox_id);
+        }
+    }
 }
 
 /// Maximum time to wait for a sandbox to leave a transitional state.
@@ -100,7 +130,7 @@ pub struct Orchestrator<
     store: S,
     factory: F,
     persister: P,
-    lifecycle_operations: Mutex<HashMap<SandboxId, Arc<Mutex<LifecycleOperationKind>>>>,
+    lifecycle_operations: LifecycleOperationMap,
     sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
     proxy_routes: RwLock<ProxyRouteTable>,
     next_proxy_route_version: AtomicU64,
@@ -183,7 +213,7 @@ where
             store,
             factory,
             persister,
-            lifecycle_operations: Mutex::new(HashMap::new()),
+            lifecycle_operations: Arc::new(StdMutex::new(HashMap::new())),
             sandboxes: RwLock::new(HashMap::new()),
             proxy_routes: RwLock::new(ProxyRouteTable::default()),
             next_proxy_route_version: AtomicU64::new(1),
@@ -254,34 +284,31 @@ where
         })?
     }
 
-    async fn lifecycle_operation_lock(
+    fn lifecycle_operation_lock(
         &self,
         sandbox_id: SandboxId,
         operation: LifecycleOperationKind,
-    ) -> (Arc<Mutex<LifecycleOperationKind>>, bool) {
-        let mut operations = self.lifecycle_operations.lock().await;
+    ) -> (LifecycleOperationLease, bool) {
+        let mut operations = self
+            .lifecycle_operations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let already_existed = operations.contains_key(&sandbox_id);
-        let operation_lock = Arc::clone(
-            operations
-                .entry(sandbox_id)
-                .or_insert_with(|| Arc::new(Mutex::new(operation))),
-        );
-        (operation_lock, already_existed)
-    }
-
-    async fn retire_lifecycle_operation_lock(
-        &self,
-        sandbox_id: SandboxId,
-        operation_lock: &Arc<Mutex<LifecycleOperationKind>>,
-    ) {
-        let mut operations = self.lifecycle_operations.lock().await;
-        if Arc::strong_count(operation_lock) == 2
-            && operations
-                .get(&sandbox_id)
-                .is_some_and(|current| Arc::ptr_eq(current, operation_lock))
-        {
-            operations.remove(&sandbox_id);
-        }
+        let operation_lock = Arc::clone(operations.entry(sandbox_id).or_insert_with(|| {
+            Arc::new(Mutex::new(LifecycleOperationState {
+                kind: operation,
+                delete_succeeded: false,
+            }))
+        }));
+        drop(operations);
+        (
+            LifecycleOperationLease {
+                sandbox_id,
+                operation_lock,
+                operations: Arc::clone(&self.lifecycle_operations),
+            },
+            already_existed,
+        )
     }
 
     async fn protect_image_refs(
@@ -903,24 +930,24 @@ where
     async fn delete_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("deleting sandbox");
 
-        let (operation_lock, cleanup_already_in_flight) = self
-            .lifecycle_operation_lock(sandbox_id, LifecycleOperationKind::Delete)
-            .await;
-        let mut operation_guard = operation_lock.lock().await;
-        *operation_guard = LifecycleOperationKind::Delete;
+        let (operation_lease, already_existed) =
+            self.lifecycle_operation_lock(sandbox_id, LifecycleOperationKind::Delete);
+        let mut operation_guard = operation_lease.operation_lock.lock().await;
+        let prior_delete_succeeded = already_existed && operation_guard.delete_succeeded;
+        operation_guard.kind = LifecycleOperationKind::Delete;
         let result = self
-            .delete_sandbox_owned_inner(sandbox_id, cleanup_already_in_flight)
+            .delete_sandbox_owned_inner(sandbox_id, prior_delete_succeeded)
             .await;
+        operation_guard.delete_succeeded |= result.is_ok();
         drop(operation_guard);
-        self.retire_lifecycle_operation_lock(sandbox_id, &operation_lock)
-            .await;
+        drop(operation_lease);
         result
     }
 
     async fn delete_sandbox_owned_inner(
         self: &Arc<Self>,
         sandbox_id: SandboxId,
-        cleanup_already_in_flight: bool,
+        prior_delete_succeeded: bool,
     ) -> Result<()> {
         // Attempt to transition to Killing, retrying after waiting whenever we
         // find the sandbox in a transitional state.
@@ -984,7 +1011,7 @@ where
                         }));
                     }
                 },
-                Err(StoreError::SandboxNotFound { .. }) if cleanup_already_in_flight => {
+                Err(StoreError::SandboxNotFound { .. }) if prior_delete_succeeded => {
                     info!("sandbox was deleted by a concurrent cleanup");
                     return Ok(());
                 }
@@ -1095,30 +1122,26 @@ where
         fields(sandbox_id = %sandbox_id)
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
-        let (operation_lock, _) = self
-            .lifecycle_operation_lock(sandbox_id, LifecycleOperationKind::Pause)
-            .await;
-        let operation_guard = match operation_lock.try_lock() {
+        let (operation_lease, _) =
+            self.lifecycle_operation_lock(sandbox_id, LifecycleOperationKind::Pause);
+        let operation_guard = match operation_lease.operation_lock.try_lock() {
             Ok(mut operation_guard) => {
-                *operation_guard = LifecycleOperationKind::Pause;
+                operation_guard.kind = LifecycleOperationKind::Pause;
                 operation_guard
             }
             Err(_) => {
-                let mut operation_guard = operation_lock.lock().await;
-                if *operation_guard == LifecycleOperationKind::Pause {
+                let mut operation_guard = operation_lease.operation_lock.lock().await;
+                if operation_guard.kind == LifecycleOperationKind::Pause {
                     drop(operation_guard);
-                    self.retire_lifecycle_operation_lock(sandbox_id, &operation_lock)
-                        .await;
                     return self.join_concurrent_pause(sandbox_id).await;
                 }
-                *operation_guard = LifecycleOperationKind::Pause;
+                operation_guard.kind = LifecycleOperationKind::Pause;
                 operation_guard
             }
         };
         let result = self.pause_sandbox_owned_inner(sandbox_id).await;
         drop(operation_guard);
-        self.retire_lifecycle_operation_lock(sandbox_id, &operation_lock)
-            .await;
+        drop(operation_lease);
         result
     }
 
@@ -2038,8 +2061,8 @@ where
                 continue;
             }
             if let Err(err) = match metadata.timeout_action {
-                SandboxTimeoutAction::Pause => self.pause_sandbox_inner(metadata.id).await,
-                SandboxTimeoutAction::Delete => self.delete_sandbox_inner(metadata.id).await,
+                SandboxTimeoutAction::Pause => self.pause_sandbox(metadata.id).await,
+                SandboxTimeoutAction::Delete => self.delete_sandbox(metadata.id).await,
             } {
                 warn!(
                     sandbox_id = %metadata.id,
@@ -2556,7 +2579,7 @@ where
                         unreachable!("paused sandboxes should have been filtered out")
                     }
                     SandboxState::Running => {
-                        if let Err(err) = self.pause_sandbox_inner(sandbox_id).await {
+                        if let Err(err) = self.pause_sandbox(sandbox_id).await {
                             last_failures.push(format!("{sandbox_id}: {err}"));
                         }
                     }

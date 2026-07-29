@@ -136,7 +136,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         store,
         factory,
         persister,
-        lifecycle_operations: Mutex::new(HashMap::new()),
+        lifecycle_operations: Arc::new(StdMutex::new(HashMap::new())),
         sandboxes: RwLock::new(HashMap::new()),
         proxy_routes: RwLock::new(ProxyRouteTable::default()),
         next_proxy_route_version: AtomicU64::new(1),
@@ -1665,7 +1665,7 @@ async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
         !orchestrator
             .lifecycle_operations
             .lock()
-            .await
+            .expect("lifecycle operations mutex poisoned")
             .contains_key(&sandbox_id),
         "terminal pause cleanup should retire lifecycle ownership"
     );
@@ -2399,7 +2399,7 @@ async fn pause_waiting_for_failed_delete_retries_from_restored_running_state() -
         !orchestrator
             .lifecycle_operations
             .lock()
-            .await
+            .expect("lifecycle operations mutex poisoned")
             .contains_key(&sandbox_id),
         "completed pause and delete should retire lifecycle ownership"
     );
@@ -2614,7 +2614,7 @@ async fn orchestrator_unknown_sandbox_behaviors() -> Result<()> {
         !orchestrator
             .lifecycle_operations
             .lock()
-            .await
+            .expect("lifecycle operations mutex poisoned")
             .contains_key(&missing_id),
         "unknown pause should not leave lifecycle ownership behind"
     );
@@ -2635,7 +2635,7 @@ async fn orchestrator_unknown_sandbox_behaviors() -> Result<()> {
         !orchestrator
             .lifecycle_operations
             .lock()
-            .await
+            .expect("lifecycle operations mutex poisoned")
             .contains_key(&missing_id),
         "failed delete should retire lifecycle ownership"
     );
@@ -2647,6 +2647,97 @@ async fn orchestrator_unknown_sandbox_behaviors() -> Result<()> {
     assert!(matches!(retry_err, OrchestratorError::SandboxNotFound(_)));
 
     Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_unknown_deletes_both_report_not_found() -> Result<()> {
+    setup();
+    let store_control = Arc::new(ScriptedStoreControl::default());
+    let first_delete_started = Arc::new(Notify::new());
+    let allow_first_delete = Arc::new(Notify::new());
+    store_control.push_update_if_state_action(StoreAction::Block {
+        started: Arc::clone(&first_delete_started),
+        release: Arc::clone(&allow_first_delete),
+    });
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(store_control),
+        MockBackendFactory::new(),
+    );
+    let missing_id = SandboxId::new();
+
+    let first_delete = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move { orchestrator.delete_sandbox(missing_id).await })
+    };
+    timeout(Duration::from_secs(1), first_delete_started.notified())
+        .await
+        .expect("first delete should reach the blocked store operation");
+    let second_delete = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move { orchestrator.delete_sandbox(missing_id).await })
+    };
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let second_delete_joined = orchestrator
+                .lifecycle_operations
+                .lock()
+                .expect("lifecycle operations mutex poisoned")
+                .get(&missing_id)
+                .is_some_and(|operation| Arc::strong_count(operation) >= 3);
+            if second_delete_joined {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("second delete should join the first lifecycle operation");
+
+    allow_first_delete.notify_one();
+    for result in [first_delete.await, second_delete.await] {
+        let error = result
+            .expect("delete task should not panic")
+            .expect_err("an unknown sandbox must not become idempotently deleted");
+        assert!(matches!(error, OrchestratorError::SandboxNotFound(_)));
+    }
+    assert!(
+        !orchestrator
+            .lifecycle_operations
+            .lock()
+            .expect("lifecycle operations mutex poisoned")
+            .contains_key(&missing_id),
+        "completed failed deletes should retire lifecycle ownership"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn lifecycle_operation_lease_retires_on_panic() {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let sandbox_id = SandboxId::new();
+    let operation_task = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move {
+            let (operation_lease, _) =
+                orchestrator.lifecycle_operation_lock(sandbox_id, LifecycleOperationKind::Pause);
+            let _operation_guard = operation_lease.operation_lock.lock().await;
+            panic!("forced lifecycle operation panic");
+        })
+    };
+
+    assert!(operation_task
+        .await
+        .expect_err("lifecycle task should panic")
+        .is_panic());
+    assert!(
+        !orchestrator
+            .lifecycle_operations
+            .lock()
+            .expect("lifecycle operations mutex poisoned")
+            .contains_key(&sandbox_id),
+        "a panicking operation must release its lifecycle-map membership"
+    );
 }
 
 #[tokio::test]
@@ -3252,7 +3343,7 @@ async fn pause_recovery_does_not_retain_handle_without_stable_cleanup_state() ->
         !orchestrator
             .lifecycle_operations
             .lock()
-            .await
+            .expect("lifecycle operations mutex poisoned")
             .contains_key(&sandbox_id),
         "failed recovery should retire lifecycle ownership"
     );
@@ -4052,6 +4143,94 @@ async fn auto_evict_task_does_not_keep_orchestrator_alive() -> anyhow::Result<()
     tokio::task::yield_now().await;
 
     assert!(weak.upgrade().is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_shutdown_does_not_cancel_in_flight_pause_recovery() -> Result<()> {
+    setup();
+    let store_control = Arc::new(ScriptedStoreControl::default());
+    let restore_started = Arc::new(Notify::new());
+    let allow_restore = Arc::new(Notify::new());
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::Fail {
+            message: "forced pause failure".to_string(),
+        },
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&store_control)),
+        MockBackendFactory::with_behavior(behavior),
+    );
+    let sandbox_id = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?
+        .id;
+    store_control.push_update_if_state_action(StoreAction::Delegate);
+    store_control.push_update_if_state_action(StoreAction::Block {
+        started: Arc::clone(&restore_started),
+        release: Arc::clone(&allow_restore),
+    });
+
+    let shutdown_task = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move { orchestrator.shutdown().await })
+    };
+    timeout(Duration::from_secs(1), restore_started.notified())
+        .await
+        .expect("shutdown pause should reach the blocked metadata restore");
+    shutdown_task.abort();
+    assert!(shutdown_task
+        .await
+        .expect_err("shutdown task should be cancelled")
+        .is_cancelled());
+
+    allow_restore.notify_one();
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let metadata = orchestrator
+                .get_sandbox(&sandbox_id)
+                .await
+                .expect("metadata lookup should succeed");
+            let lookup = orchestrator
+                .proxy_lookup_for(&sandbox_id)
+                .await
+                .expect("proxy lookup should succeed");
+            let lifecycle_retired = !orchestrator
+                .lifecycle_operations
+                .lock()
+                .expect("lifecycle operations mutex poisoned")
+                .contains_key(&sandbox_id);
+            if metadata.is_some_and(|metadata| metadata.state == SandboxState::Running)
+                && matches!(lookup, ProxyLookupResult::Ready(_))
+                && lifecycle_retired
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached pause recovery should restore the running sandbox");
+    assert!(
+        !orchestrator
+            .lifecycle_operations
+            .lock()
+            .expect("lifecycle operations mutex poisoned")
+            .contains_key(&sandbox_id),
+        "detached pause recovery should retire lifecycle ownership"
+    );
+
+    orchestrator.shutdown().await?;
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("shutdown should preserve paused metadata")
+            .state,
+        SandboxState::Paused
+    );
     Ok(())
 }
 
