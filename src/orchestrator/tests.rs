@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use async_trait::async_trait;
@@ -170,6 +171,7 @@ type StoreHookSlot = StdMutex<Option<StoreHook>>;
 struct ScriptedStoreControl {
     add_actions: StdMutex<VecDeque<StoreAction>>,
     get_actions: StdMutex<VecDeque<StoreAction>>,
+    get_calls: AtomicUsize,
     update_if_state_actions: StdMutex<VecDeque<StoreAction>>,
     remove_actions: StdMutex<VecDeque<StoreAction>>,
     on_add: StoreHookSlot,
@@ -195,6 +197,10 @@ impl ScriptedStoreControl {
             .lock()
             .expect("get actions mutex poisoned")
             .push_back(action);
+    }
+
+    fn get_calls(&self) -> usize {
+        self.get_calls.load(Ordering::Relaxed)
     }
 
     fn push_remove_action(&self, action: StoreAction) {
@@ -330,6 +336,7 @@ impl MetadataStore for ScriptedStore {
     }
 
     async fn get(&self, sandbox_id: &SandboxId) -> StdResult<Option<SandboxMetadata>, StoreError> {
+        self.control.get_calls.fetch_add(1, Ordering::Relaxed);
         match ScriptedStoreControl::take_action(&self.control.get_actions) {
             StoreAction::Delegate => self.inner.get(sandbox_id).await,
             StoreAction::Block { started, release } => {
@@ -978,7 +985,7 @@ async fn proxy_target_for_only_returns_running_routes() {
 }
 
 #[tokio::test]
-async fn proxy_lookup_revalidates_running_state_after_reading_route() -> Result<()> {
+async fn proxy_lookup_rejects_route_replaced_during_metadata_read() -> Result<()> {
     setup();
     let store_control = Arc::new(ScriptedStoreControl::default());
     let orchestrator = make_orchestrator_without_background_with_factory(
@@ -988,6 +995,7 @@ async fn proxy_lookup_revalidates_running_state_after_reading_route() -> Result<
     let created = orchestrator
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
+    let get_calls_before_lookup = store_control.get_calls();
     let first_read_started = Arc::new(Notify::new());
     let allow_first_read = Arc::new(Notify::new());
     store_control.push_get_action(StoreAction::BlockAfter {
@@ -1001,22 +1009,19 @@ async fn proxy_lookup_revalidates_running_state_after_reading_route() -> Result<
     };
     timeout(Duration::from_secs(1), first_read_started.notified())
         .await
-        .expect("proxy lookup should complete its first metadata read");
+        .expect("proxy lookup should snapshot metadata after reading the route");
+    assert_eq!(
+        store_control.get_calls() - get_calls_before_lookup,
+        1,
+        "the suspended proxy lookup should have issued one metadata read"
+    );
 
-    let transition_started = Arc::new(Notify::new());
-    let allow_transition = Arc::new(Notify::new());
-    store_control.push_update_if_state_action(StoreAction::BlockAfter {
-        started: Arc::clone(&transition_started),
-        release: Arc::clone(&allow_transition),
-    });
-    let pause_task = {
-        let orchestrator = Arc::clone(&orchestrator);
-        tokio::spawn(async move { orchestrator.pause_sandbox(created.id).await })
-    };
-    timeout(Duration::from_secs(1), transition_started.notified())
-        .await
-        .expect("pause should persist Pausing before detaching the route");
+    orchestrator.pause_sandbox(created.id).await?;
+    orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await?;
 
+    let get_calls_before_release = store_control.get_calls();
     allow_first_read.notify_one();
     let lookup = timeout(Duration::from_secs(1), lookup_task)
         .await
@@ -1024,15 +1029,14 @@ async fn proxy_lookup_revalidates_running_state_after_reading_route() -> Result<
         .expect("proxy lookup task should not panic")?;
     assert_eq!(
         lookup,
-        ProxyLookupResult::Unavailable(SandboxState::Pausing),
-        "a route read against stale Running metadata must not remain proxyable"
+        ProxyLookupResult::RouteMissing,
+        "a replaced route generation must not be returned with stale Running metadata"
     );
-
-    allow_transition.notify_one();
-    pause_task
-        .await
-        .expect("pause task should not panic")
-        .expect("pause should succeed");
+    assert_eq!(
+        store_control.get_calls(),
+        get_calls_before_release,
+        "the proxy lookup must not issue a second metadata read after validation"
+    );
     orchestrator.delete_sandbox(created.id).await?;
     Ok(())
 }

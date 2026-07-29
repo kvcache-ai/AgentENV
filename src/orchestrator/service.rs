@@ -788,6 +788,7 @@ where
     /// Resolves the current proxyability of a sandbox without touching the sandbox mutex.
     #[tracing::instrument(skip(self), fields(sandbox_id = %sandbox_id))]
     pub async fn proxy_lookup_for(&self, sandbox_id: &SandboxId) -> Result<ProxyLookupResult> {
+        let route = self.proxy_routes.read().await.route(sandbox_id).cloned();
         let metadata = self.store.get(sandbox_id).await?;
         Ok(match metadata {
             None => {
@@ -795,28 +796,19 @@ where
                 ProxyLookupResult::NotFound
             }
             Some(metadata) if metadata.state == SandboxState::Running => {
-                let route = self.proxy_routes.read().await.route(sandbox_id).cloned();
-                match self.store.get(sandbox_id).await? {
-                    None => ProxyLookupResult::NotFound,
-                    Some(current) if current.state == SandboxState::Running => match route {
-                        Some(route) => {
-                            trace!(
-                                version = route.version(),
-                                "resolved running proxy target from runtime table"
-                            );
-                            ProxyLookupResult::Ready(route.target().clone())
-                        }
-                        None => {
-                            warn!("running sandbox is missing a runtime proxy route");
-                            ProxyLookupResult::RouteMissing
-                        }
-                    },
-                    Some(current) if current.state == SandboxState::Paused => {
-                        ProxyLookupResult::Paused {
-                            auto_resume: current.auto_resume,
-                        }
+                let routes = self.proxy_routes.read().await;
+                match (route, routes.route(sandbox_id)) {
+                    (Some(route), Some(current)) if route.version() == current.version() => {
+                        trace!(
+                            version = route.version(),
+                            "resolved running proxy target from runtime table"
+                        );
+                        ProxyLookupResult::Ready(route.target().clone())
                     }
-                    Some(current) => ProxyLookupResult::Unavailable(current.state),
+                    _ => {
+                        warn!("running sandbox proxy route changed during state validation");
+                        ProxyLookupResult::RouteMissing
+                    }
                 }
             }
             Some(metadata) if metadata.state == SandboxState::Paused => {
