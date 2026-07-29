@@ -919,6 +919,28 @@ where
             }
         }
 
+        // Remove durable paused state before dropping in-memory metadata so a
+        // failed cleanup cannot resurrect the sandbox after restart. On failure,
+        // restore the pre-delete state so the client can retry.
+        if let Err(err) = self
+            .persister
+            .delete_record_and_artifacts(&sandbox_id)
+            .await
+        {
+            warn!(error = ?err, "failed to delete persisted sandbox state");
+            if let Err(restore_err) = self
+                .store
+                .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
+                .await
+            {
+                warn!(
+                    error = ?restore_err,
+                    "failed to restore sandbox state after persistence cleanup failure"
+                );
+            }
+            return Err(OrchestratorError::from(err));
+        }
+
         // Now the sandbox is successfully stopped, remove its metadata.
         let metadata = self.store.remove(&sandbox_id).await?;
         if let Some(metadata) = metadata {
@@ -927,13 +949,6 @@ where
                 metadata.id,
                 metadata.resources,
             );
-        }
-        if let Err(err) = self
-            .persister
-            .delete_record_and_artifacts(&sandbox_id)
-            .await
-        {
-            warn!(error = ?err, "failed to delete persisted sandbox state");
         }
         self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
             .await;
@@ -1996,7 +2011,13 @@ where
 
         if matches!(plan, LaunchPlan::Resume(_)) {
             if let Err(err) = self.persister.delete_record(&sandbox_id).await {
-                warn!(error = %format_args!("{err:#}"), "failed to delete persisted sandbox record after resume");
+                warn!(
+                    error = %format_args!("{err:#}"),
+                    "failed to delete persisted sandbox record after resume; rolling back"
+                );
+                self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
+                    .await;
+                return Err(OrchestratorError::from(err));
             }
         }
 

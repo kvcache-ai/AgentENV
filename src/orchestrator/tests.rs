@@ -3196,6 +3196,92 @@ async fn resume_marks_resuming_and_deletes_record_after_success() -> Result<()> 
 }
 
 #[tokio::test]
+async fn delete_sandbox_fails_when_persisted_state_cannot_be_removed() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "delete-persist-fail")]))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+    persister.clear_calls();
+    persister.fail_next(RecordingCall::DeleteRecordAndArtifacts);
+
+    let err = orchestrator
+        .delete_sandbox(created.id)
+        .await
+        .expect_err("delete must fail when durable paused state cannot be removed");
+
+    assert!(matches!(
+        err,
+        OrchestratorError::SandboxPersistenceFailed(_)
+    ));
+    assert_eq!(
+        persister.calls(),
+        vec![RecordingCall::DeleteRecordAndArtifacts]
+    );
+    let metadata = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("metadata must remain so delete can be retried");
+    assert_eq!(metadata.state, SandboxState::Paused);
+    assert!(metadata.paused_state.is_some());
+
+    // Retry succeeds once persistence cleanup works again.
+    orchestrator.delete_sandbox(created.id).await?;
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_delete_record_failure_rolls_back_to_paused() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "resume-delete-fail")]))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+    persister.clear_calls();
+    persister.fail_next(RecordingCall::DeleteRecord);
+
+    let err = orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await
+        .expect_err("resume must fail when the Resuming marker cannot be cleared");
+
+    assert!(matches!(
+        err,
+        OrchestratorError::SandboxPersistenceFailed(_)
+    ));
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::MarkResuming,
+            RecordingCall::DeleteRecord,
+            RecordingCall::RollbackResuming
+        ]
+    );
+    let metadata = orchestrator
+        .get_sandbox(&created.id)
+        .await?
+        .expect("metadata should remain after resume rollback");
+    assert_eq!(metadata.state, SandboxState::Paused);
+    assert!(metadata.paused_state.is_some());
+    assert_proxy_paused(&orchestrator, &created.id).await?;
+    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn resume_mark_resuming_failure_restores_paused_metadata() -> Result<()> {
     setup();
     let persister = RecordingPersister::default();
