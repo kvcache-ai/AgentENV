@@ -792,18 +792,28 @@ where
                 ProxyLookupResult::NotFound
             }
             Some(metadata) if metadata.state == SandboxState::Running => {
-                match self.proxy_routes.read().await.route(sandbox_id).cloned() {
-                    Some(route) => {
-                        trace!(
-                            version = route.version(),
-                            "resolved running proxy target from runtime table"
-                        );
-                        ProxyLookupResult::Ready(route.target().clone())
+                let route = self.proxy_routes.read().await.route(sandbox_id).cloned();
+                match self.store.get(sandbox_id).await? {
+                    None => ProxyLookupResult::NotFound,
+                    Some(current) if current.state == SandboxState::Running => match route {
+                        Some(route) => {
+                            trace!(
+                                version = route.version(),
+                                "resolved running proxy target from runtime table"
+                            );
+                            ProxyLookupResult::Ready(route.target().clone())
+                        }
+                        None => {
+                            warn!("running sandbox is missing a runtime proxy route");
+                            ProxyLookupResult::RouteMissing
+                        }
+                    },
+                    Some(current) if current.state == SandboxState::Paused => {
+                        ProxyLookupResult::Paused {
+                            auto_resume: current.auto_resume,
+                        }
                     }
-                    None => {
-                        warn!("running sandbox is missing a runtime proxy route");
-                        ProxyLookupResult::RouteMissing
-                    }
+                    Some(current) => ProxyLookupResult::Unavailable(current.state),
                 }
             }
             Some(metadata) if metadata.state == SandboxState::Paused => {

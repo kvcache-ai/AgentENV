@@ -156,6 +156,10 @@ enum StoreAction {
         started: Arc<Notify>,
         release: Arc<Notify>,
     },
+    BlockAfter {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    },
     Fail(StoreError),
 }
 
@@ -165,6 +169,7 @@ type StoreHookSlot = StdMutex<Option<StoreHook>>;
 #[derive(Default)]
 struct ScriptedStoreControl {
     add_actions: StdMutex<VecDeque<StoreAction>>,
+    get_actions: StdMutex<VecDeque<StoreAction>>,
     update_if_state_actions: StdMutex<VecDeque<StoreAction>>,
     remove_actions: StdMutex<VecDeque<StoreAction>>,
     on_add: StoreHookSlot,
@@ -182,6 +187,13 @@ impl ScriptedStoreControl {
         self.update_if_state_actions
             .lock()
             .expect("update_if_state actions mutex poisoned")
+            .push_back(action);
+    }
+
+    fn push_get_action(&self, action: StoreAction) {
+        self.get_actions
+            .lock()
+            .expect("get actions mutex poisoned")
             .push_back(action);
     }
 
@@ -236,6 +248,12 @@ impl MetadataStore for ScriptedStore {
                 release.notified().await;
                 self.inner.add(metadata).await
             }
+            StoreAction::BlockAfter { started, release } => {
+                let result = self.inner.add(metadata).await;
+                started.notify_one();
+                release.notified().await;
+                result
+            }
             StoreAction::Fail(err) => Err(err),
         }
     }
@@ -263,6 +281,15 @@ impl MetadataStore for ScriptedStore {
                     .update_state_if_state(sandbox_id, new_state, expected_states)
                     .await
             }
+            StoreAction::BlockAfter { started, release } => {
+                let result = self
+                    .inner
+                    .update_state_if_state(sandbox_id, new_state, expected_states)
+                    .await;
+                started.notify_one();
+                release.notified().await;
+                result
+            }
             StoreAction::Fail(err) => Err(err),
         }
     }
@@ -289,12 +316,35 @@ impl MetadataStore for ScriptedStore {
                     .update_if_state(sandbox_id, expected_states, update)
                     .await
             }
+            StoreAction::BlockAfter { started, release } => {
+                let result = self
+                    .inner
+                    .update_if_state(sandbox_id, expected_states, update)
+                    .await;
+                started.notify_one();
+                release.notified().await;
+                result
+            }
             StoreAction::Fail(err) => Err(err),
         }
     }
 
     async fn get(&self, sandbox_id: &SandboxId) -> StdResult<Option<SandboxMetadata>, StoreError> {
-        self.inner.get(sandbox_id).await
+        match ScriptedStoreControl::take_action(&self.control.get_actions) {
+            StoreAction::Delegate => self.inner.get(sandbox_id).await,
+            StoreAction::Block { started, release } => {
+                started.notify_one();
+                release.notified().await;
+                self.inner.get(sandbox_id).await
+            }
+            StoreAction::BlockAfter { started, release } => {
+                let result = self.inner.get(sandbox_id).await;
+                started.notify_one();
+                release.notified().await;
+                result
+            }
+            StoreAction::Fail(err) => Err(err),
+        }
     }
 
     async fn remove(
@@ -307,6 +357,12 @@ impl MetadataStore for ScriptedStore {
                 started.notify_one();
                 release.notified().await;
                 self.inner.remove(sandbox_id).await
+            }
+            StoreAction::BlockAfter { started, release } => {
+                let result = self.inner.remove(sandbox_id).await;
+                started.notify_one();
+                release.notified().await;
+                result
             }
             StoreAction::Fail(err) => Err(err),
         }
@@ -919,6 +975,66 @@ async fn proxy_target_for_only_returns_running_routes() {
         proxy_target_for(&orchestrator, &sandbox_id).await.unwrap(),
         Some(target)
     );
+}
+
+#[tokio::test]
+async fn proxy_lookup_revalidates_running_state_after_reading_route() -> Result<()> {
+    setup();
+    let store_control = Arc::new(ScriptedStoreControl::default());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&store_control)),
+        MockBackendFactory::new(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let first_read_started = Arc::new(Notify::new());
+    let allow_first_read = Arc::new(Notify::new());
+    store_control.push_get_action(StoreAction::BlockAfter {
+        started: Arc::clone(&first_read_started),
+        release: Arc::clone(&allow_first_read),
+    });
+
+    let lookup_task = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move { orchestrator.proxy_lookup_for(&created.id).await })
+    };
+    timeout(Duration::from_secs(1), first_read_started.notified())
+        .await
+        .expect("proxy lookup should complete its first metadata read");
+
+    let transition_started = Arc::new(Notify::new());
+    let allow_transition = Arc::new(Notify::new());
+    store_control.push_update_if_state_action(StoreAction::BlockAfter {
+        started: Arc::clone(&transition_started),
+        release: Arc::clone(&allow_transition),
+    });
+    let pause_task = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move { orchestrator.pause_sandbox(created.id).await })
+    };
+    timeout(Duration::from_secs(1), transition_started.notified())
+        .await
+        .expect("pause should persist Pausing before detaching the route");
+
+    allow_first_read.notify_one();
+    let lookup = timeout(Duration::from_secs(1), lookup_task)
+        .await
+        .expect("proxy lookup should finish after its first read is released")
+        .expect("proxy lookup task should not panic")?;
+    assert_eq!(
+        lookup,
+        ProxyLookupResult::Unavailable(SandboxState::Pausing),
+        "a route read against stale Running metadata must not remain proxyable"
+    );
+
+    allow_transition.notify_one();
+    pause_task
+        .await
+        .expect("pause task should not panic")
+        .expect("pause should succeed");
+    orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
 }
 
 #[tokio::test]
