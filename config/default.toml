@@ -153,6 +153,12 @@ p2p_enabled = true
 # endpoint = "https://oss-cn-beijing-internal.aliyuncs.com"
 # bucket = "agentenv-oss-validation"
 # region = "cn-beijing"
+# # Bucket addressing style. Leave unset to auto-detect (Alibaba OSS and
+# # bucket-in-endpoint hosts use virtual-host style; other endpoints default to
+# # path style). Set "virtual" for providers that require virtual-host
+# # addressing, e.g. AWS S3 new buckets, Cloudflare R2, or Tigris
+# # (endpoint = "https://t3.storage.dev", region = "auto").
+# addressing_style = "virtual"
 # prefix = "validation/"
 # credential_process = ""
 # cache_max_size_gb = 10

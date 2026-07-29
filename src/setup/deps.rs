@@ -11,7 +11,8 @@ use serde::Deserialize;
 use tracing::{debug, info};
 
 use crate::cfg::{
-    AppConfig, OssBackendConfig, OverlaybdDependencyConfig, SnapshotRepositoryBackendKind,
+    AppConfig, OssAddressingStyle, OssBackendConfig, OverlaybdDependencyConfig,
+    SnapshotRepositoryBackendKind,
 };
 use crate::digest::FileDigest;
 
@@ -663,6 +664,12 @@ fn overlaybd_runtime_oss_config(oss: &OssBackendConfig) -> Result<serde_json::Va
         "enable": true,
         "defaultRegion": region,
         "defaultEndpoint": endpoint,
+        // Empty string means the overlaybd runtime auto-detects the style per
+        // endpoint, matching the snapshot repository client's behavior.
+        "defaultAddressingStyle": oss
+            .addressing_style
+            .map(OssAddressingStyle::as_str)
+            .unwrap_or(""),
     });
 
     match credential_source {
@@ -724,6 +731,7 @@ mod tests {
             access_key_secret: Some(" sk ".to_string()),
             security_token: Some(" token ".to_string()),
             region: Some(" cn-hangzhou ".to_string()),
+            addressing_style: None,
             cache_max_size_gb: Some(4),
         }
     }
@@ -780,6 +788,18 @@ mod tests {
             config["defaultEndpoint"],
             "https://oss-cn-hangzhou.aliyuncs.com"
         );
+        assert_eq!(config["defaultAddressingStyle"], "");
+    }
+
+    #[test]
+    fn overlaybd_runtime_oss_config_propagates_addressing_style() {
+        use crate::cfg::OssAddressingStyle;
+
+        let mut oss = sample_oss_config();
+        oss.addressing_style = Some(OssAddressingStyle::Virtual);
+
+        let config = overlaybd_runtime_oss_config(&oss).expect("derive overlaybd oss config");
+        assert_eq!(config["defaultAddressingStyle"], "virtual");
     }
 
     #[test]

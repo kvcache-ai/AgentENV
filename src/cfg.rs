@@ -278,6 +278,29 @@ pub struct SnapshotImagePublishConfig {
     pub enabled: bool,
 }
 
+/// Bucket addressing style for the S3-compatible snapshot backend.
+///
+/// When unset, the backend auto-detects the style: Alibaba OSS and
+/// bucket-in-endpoint hosts use virtual-host addressing, and everything else
+/// falls back to path style. Set this explicitly for S3-compatible providers
+/// that require virtual-host addressing, such as AWS S3 buckets created after
+/// the path-style deprecation, Cloudflare R2, or Tigris.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OssAddressingStyle {
+    Path,
+    Virtual,
+}
+
+impl OssAddressingStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::Virtual => "virtual",
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct OssBackendConfig {
     pub endpoint: String,
@@ -289,6 +312,8 @@ pub struct OssBackendConfig {
     pub access_key_secret: Option<String>,
     pub security_token: Option<String>,
     pub region: Option<String>,
+    #[serde(alias = "addressingStyle", alias = "addressing-style")]
+    pub addressing_style: Option<OssAddressingStyle>,
     pub cache_max_size_gb: Option<u64>,
 }
 

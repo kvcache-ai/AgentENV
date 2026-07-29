@@ -14,6 +14,7 @@ fn backend(fixture: &MinioFixture) -> OssBackend {
         credential_process: String::new(),
         default_region: fixture.region.clone(),
         default_endpoint: fixture.endpoint.clone(),
+        default_addressing_style: String::new(),
         timeout_secs: 30,
         retry_count: 3,
     };
@@ -29,6 +30,7 @@ fn backend_with_bad_credentials(fixture: &MinioFixture) -> OssBackend {
         credential_process: String::new(),
         default_region: fixture.region.clone(),
         default_endpoint: fixture.endpoint.clone(),
+        default_addressing_style: String::new(),
         timeout_secs: 10,
         retry_count: 0,
     };

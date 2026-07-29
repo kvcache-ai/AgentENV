@@ -400,6 +400,7 @@ OSS-backed snapshot repository configuration. This section is required when `sna
 | `access_key_secret` | string | unset | Static OSS access key secret. Required when `credential_process` is not set |
 | `security_token` | string | unset | Optional session token paired with static access key credentials |
 | `region` | string | none | Region passed to the S3-compatible object-store client; required for current OSS backend |
+| `addressing_style` | string | auto-detect | Bucket addressing style, `"virtual"` or `"path"`. When unset, the backend auto-detects: Alibaba OSS and bucket-in-endpoint hosts use virtual-host style, other endpoints default to path style. Set `"virtual"` for S3-compatible providers that require virtual-host addressing, such as AWS S3 buckets created after the path-style deprecation, Cloudflare R2, or Tigris |
 | `cache_max_size_gb` | integer | `10` | Maximum size of the node-local OSS artifact cache in GiB |
 
 Notes:
@@ -407,6 +408,18 @@ Notes:
 - `credential_process` and static access key settings are mutually exclusive in practice; when `credential_process` is set, the backend ignores static credential fields.
 - `credential_process` should be written as a portable argv-style command line. Avoid `$VAR`, backticks, `$(...)`, pipes, and shell builtins.
 - Although the config section is still named `oss`, the runtime path is implemented via a shared S3-compatible client, so `region` must be configured.
+- Leave `addressing_style` unset for Alibaba OSS and MinIO. Set it to `"virtual"` for S3-compatible providers that only support virtual-host bucket addressing; path-style requests to those endpoints are rejected.
+- The setting covers both halves of the data path: the snapshot repository client (metadata and artifact upload/download) and the generated OverlayBD runtime config (`ossConfig.defaultAddressingStyle`), which the runtime uses when reading remote managed snapshot layers during sandbox restore.
+
+For an S3-compatible provider that requires virtual-host addressing — for example [Tigris](https://www.tigrisdata.com/docs/) — set `addressing_style` explicitly:
+
+```toml
+[backend.oss]
+endpoint = "https://t3.storage.dev"
+bucket = "agentenv-snapshots"
+region = "auto"
+addressing_style = "virtual"
+```
 
 Other path override:
 
