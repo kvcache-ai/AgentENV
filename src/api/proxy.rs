@@ -120,7 +120,11 @@ fn auto_resume_min_sandbox_timeout() -> Duration {
 pub(crate) fn build_proxy_client() -> ProxyClient {
     let mut connector = HttpConnector::new();
     connector.set_connect_timeout(Some(PROXY_CONNECT_TIMEOUT));
-    Client::builder(TokioExecutor::new()).build(connector)
+    // Interaction IPs are reused across sandbox runtime generations. Hyper keys
+    // its idle pool by authority, so a pooled connection can retain a stale VM flow.
+    Client::builder(TokioExecutor::new())
+        .pool_max_idle_per_host(0)
+        .build(connector)
 }
 
 pub(crate) fn router<I>(api_impl: I) -> Router
@@ -1149,6 +1153,7 @@ mod tests {
     };
     use futures::{stream, SinkExt, StreamExt};
     use serde_json::{json, Value};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tower::ServiceExt;
 
     use crate::{
@@ -1201,6 +1206,103 @@ mod tests {
 
         let bad_sandbox = "8080-not-a-sandbox.sandbox.example.invalid";
         assert!(parse_host_proxy_route(Some(bad_sandbox), &domains).is_err());
+    }
+
+    async fn read_http_request_head(stream: &mut tokio::net::TcpStream) {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let bytes_read = stream.read(&mut buffer).await.unwrap();
+            assert!(bytes_read > 0, "connection closed before request headers");
+            request.extend_from_slice(&buffer[..bytes_read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                return;
+            }
+        }
+    }
+
+    async fn respond_empty(stream: &mut tokio::net::TcpStream) {
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
+            .await
+            .unwrap();
+    }
+
+    async fn simulate_runtime_generation_change(listener: tokio::net::TcpListener) -> bool {
+        let (mut previous_runtime, _) = listener.accept().await.unwrap();
+        read_http_request_head(&mut previous_runtime).await;
+        respond_empty(&mut previous_runtime).await;
+
+        let mut stale_request = [0_u8; 1024];
+        tokio::select! {
+            read = previous_runtime.read(&mut stale_request) => {
+                match read.unwrap() {
+                    0 => {
+                        let (mut next_runtime, _) = timeout(
+                            Duration::from_secs(1),
+                            listener.accept(),
+                        )
+                        .await
+                        .expect("client did not connect to the next runtime generation")
+                        .unwrap();
+                        read_http_request_head(&mut next_runtime).await;
+                        respond_empty(&mut next_runtime).await;
+                        false
+                    }
+                    _ => {
+                        // The same address now belongs to another sandbox runtime. A packet on
+                        // the previous generation's flow receives the RST observed in production.
+                        previous_runtime.set_zero_linger().unwrap();
+                        true
+                    }
+                }
+            }
+            accepted = listener.accept() => {
+                let (mut next_runtime, _) = accepted.unwrap();
+                read_http_request_head(&mut next_runtime).await;
+                respond_empty(&mut next_runtime).await;
+                false
+            }
+        }
+    }
+
+    fn empty_proxy_request(address: SocketAddr) -> Request<Body> {
+        Request::builder()
+            .uri(format!("http://{address}/health"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn proxy_client_does_not_reuse_connections_across_runtime_generations() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let runtime = tokio::spawn(simulate_runtime_generation_change(listener));
+        let client = build_proxy_client();
+
+        let first_response = client.request(empty_proxy_request(address)).await.unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        first_response.into_body().collect().await.unwrap();
+
+        let (second_response, reused_previous_runtime) = tokio::join!(
+            timeout(
+                Duration::from_secs(5),
+                client.request(empty_proxy_request(address)),
+            ),
+            timeout(Duration::from_secs(5), runtime),
+        );
+        let second_response = second_response.expect("second proxy request timed out");
+        let reused_previous_runtime = reused_previous_runtime
+            .expect("runtime generation simulation timed out")
+            .unwrap();
+
+        assert!(
+            !reused_previous_runtime,
+            "proxy client reused an idle TCP connection after the runtime generation changed"
+        );
+        let second_response = second_response.expect("request to the next runtime should succeed");
+        assert_eq!(second_response.status(), StatusCode::OK);
+        second_response.into_body().collect().await.unwrap();
     }
 
     async fn spawn_upstream(router: axum::Router) -> SocketAddr {
