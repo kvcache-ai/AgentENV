@@ -21,6 +21,7 @@ pub enum ProxyLookupResult {
 pub(crate) struct ProxyRoute {
     target: ProxyTarget,
     version: u64,
+    ready: bool,
     updated_at: SystemTime,
 }
 
@@ -42,6 +43,16 @@ impl ProxyRoute {
         Self {
             target,
             version,
+            ready: true,
+            updated_at: SystemTime::now(),
+        }
+    }
+
+    pub fn pending_validation(target: ProxyTarget, version: u64) -> Self {
+        Self {
+            target,
+            version,
+            ready: false,
             updated_at: SystemTime::now(),
         }
     }
@@ -52,6 +63,14 @@ impl ProxyRoute {
 
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    pub fn mark_ready(&mut self) {
+        self.ready = true;
     }
 
     pub fn updated_at(&self) -> SystemTime {
@@ -71,8 +90,32 @@ impl ProxyRouteTable {
         route
     }
 
+    pub fn upsert_pending_validation(
+        &mut self,
+        sandbox_id: SandboxId,
+        target: ProxyTarget,
+        version: u64,
+    ) -> ProxyRoute {
+        let route = ProxyRoute::pending_validation(target, version);
+        self.routes.insert(sandbox_id, route.clone());
+        route
+    }
+
     pub fn remove(&mut self, sandbox_id: &SandboxId) -> Option<ProxyRoute> {
         self.routes.remove(sandbox_id)
+    }
+
+    pub fn mark_ready_if_version(
+        &mut self,
+        sandbox_id: &SandboxId,
+        expected_version: u64,
+    ) -> Option<ProxyRoute> {
+        let route = self.routes.get_mut(sandbox_id)?;
+        if route.version() != expected_version {
+            return None;
+        }
+        route.mark_ready();
+        Some(route.clone())
     }
 
     #[cfg(test)]
@@ -115,5 +158,23 @@ mod tests {
 
         assert!(!table.routes.contains_key(&sandbox_id));
         assert!(table.proxy_target(&sandbox_id).is_none());
+    }
+
+    #[test]
+    fn pending_route_becomes_ready_only_for_matching_version() {
+        let sandbox_id = SandboxId::new();
+        let target = ProxyTarget::new(Ipv4Addr::LOCALHOST);
+        let mut table = ProxyRouteTable::default();
+
+        table.upsert_pending_validation(sandbox_id, target.clone(), 7);
+        assert!(!table.route(&sandbox_id).unwrap().is_ready());
+        assert!(table.mark_ready_if_version(&sandbox_id, 6).is_none());
+        assert!(!table.route(&sandbox_id).unwrap().is_ready());
+
+        let route = table
+            .mark_ready_if_version(&sandbox_id, 7)
+            .expect("matching pending route should become ready");
+        assert!(route.is_ready());
+        assert_eq!(route.target(), &target);
     }
 }

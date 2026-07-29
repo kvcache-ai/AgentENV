@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc, Mutex as StdMutex,
@@ -815,6 +815,14 @@ where
     #[tracing::instrument(skip(self), fields(sandbox_id = %sandbox_id))]
     pub async fn proxy_lookup_for(&self, sandbox_id: &SandboxId) -> Result<ProxyLookupResult> {
         let route = self.proxy_routes.read().await.route(sandbox_id).cloned();
+        if let Some(route) = route.as_ref().filter(|route| route.is_ready()) {
+            trace!(
+                version = route.version(),
+                "resolved running proxy target from runtime table"
+            );
+            return Ok(ProxyLookupResult::Ready(route.target().clone()));
+        }
+
         let metadata = self.store.get(sandbox_id).await?;
         Ok(match metadata {
             None => {
@@ -822,12 +830,14 @@ where
                 ProxyLookupResult::NotFound
             }
             Some(metadata) if metadata.state == SandboxState::Running => {
-                let routes = self.proxy_routes.read().await;
-                match (route, routes.route(sandbox_id)) {
-                    (Some(route), Some(current)) if route.version() == current.version() => {
+                let mut routes = self.proxy_routes.write().await;
+                match route
+                    .and_then(|route| routes.mark_ready_if_version(sandbox_id, route.version()))
+                {
+                    Some(route) => {
                         trace!(
                             version = route.version(),
-                            "resolved running proxy target from runtime table"
+                            "validated recovered proxy target against Running metadata"
                         );
                         ProxyLookupResult::Ready(route.target().clone())
                     }
@@ -1076,7 +1086,8 @@ where
                 warn!(error = ?err, "failed to stop sandbox during delete");
                 if matches!(previous_state, SandboxState::Running | SandboxState::Paused) {
                     self.sandboxes.write().await.insert(sandbox_id, handle);
-                    self.restore_proxy_route(sandbox_id, removed_route).await;
+                    let restored_route_version =
+                        self.restore_proxy_route(sandbox_id, removed_route).await;
                     self.store
                         .update_state_if_state(
                             &sandbox_id,
@@ -1084,6 +1095,10 @@ where
                             &[SandboxState::Killing],
                         )
                         .await?;
+                    if previous_state == SandboxState::Running {
+                        self.mark_proxy_route_ready(sandbox_id, restored_route_version)
+                            .await;
+                    }
                 } else {
                     self.cleanup_handles
                         .write()
@@ -1209,6 +1224,7 @@ where
                     sandbox_id,
                     pause_handle.as_ref(),
                     removed_proxy_route,
+                    false,
                 )
                 .await;
                 return match actual_state {
@@ -1234,6 +1250,7 @@ where
                     sandbox_id,
                     pause_handle.as_ref(),
                     removed_proxy_route,
+                    false,
                 )
                 .await;
                 return Err(OrchestratorError::from(err));
@@ -1264,14 +1281,13 @@ where
                 .store
                 .update_state_if_state(&sandbox_id, SandboxState::Running, &[SandboxState::Pausing])
                 .await;
-            if rollback_result.is_ok() {
-                self.restore_invalidated_proxy_route(
-                    sandbox_id,
-                    pause_handle.as_ref(),
-                    removed_proxy_route,
-                )
-                .await;
-            }
+            self.restore_invalidated_proxy_route(
+                sandbox_id,
+                pause_handle.as_ref(),
+                removed_proxy_route,
+                rollback_result.is_ok(),
+            )
+            .await;
             return Err(error);
         }
 
@@ -1332,7 +1348,7 @@ where
                                     let version = self
                                         .next_proxy_route_version
                                         .fetch_add(1, Ordering::Relaxed);
-                                    self.proxy_routes.write().await.upsert(
+                                    self.proxy_routes.write().await.upsert_pending_validation(
                                         sandbox_id,
                                         route.target().clone(),
                                         version,
@@ -1351,6 +1367,10 @@ where
                                 )
                                 .await
                                 .map(|_| ());
+                            if restore_result.is_ok() {
+                                self.mark_proxy_route_ready(sandbox_id, restored_route_version)
+                                    .await;
+                            }
                             if restore_result.is_err() {
                                 let mut sandboxes = self.sandboxes.write().await;
                                 if sandboxes
@@ -1544,9 +1564,10 @@ where
                 }
             } else {
                 self.sandboxes.write().await.insert(sandbox_id, handle);
-                self.restore_proxy_route(sandbox_id, removed_proxy_route)
+                let restored_route_version = self
+                    .restore_proxy_route(sandbox_id, removed_proxy_route)
                     .await;
-                let _ = self
+                let restore_result = self
                     .store
                     .update_state_if_state(
                         &sandbox_id,
@@ -1554,6 +1575,10 @@ where
                         &[SandboxState::Pausing],
                     )
                     .await;
+                if restore_result.is_ok() {
+                    self.mark_proxy_route_ready(sandbox_id, restored_route_version)
+                        .await;
+                }
             }
             self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                 .await;
@@ -2594,12 +2619,31 @@ where
         true
     }
 
-    async fn restore_proxy_route(&self, sandbox_id: SandboxId, route: Option<ProxyRoute>) {
-        let Some(route) = route else {
+    async fn restore_proxy_route(
+        &self,
+        sandbox_id: SandboxId,
+        route: Option<ProxyRoute>,
+    ) -> Option<u64> {
+        let route = route?;
+        let version = self
+            .next_proxy_route_version
+            .fetch_add(1, Ordering::Relaxed);
+        self.proxy_routes.write().await.upsert_pending_validation(
+            sandbox_id,
+            route.target().clone(),
+            version,
+        );
+        Some(version)
+    }
+
+    async fn mark_proxy_route_ready(&self, sandbox_id: SandboxId, version: Option<u64>) {
+        let Some(version) = version else {
             return;
         };
-        self.upsert_proxy_route(sandbox_id, route.target().clone())
-            .await;
+        self.proxy_routes
+            .write()
+            .await
+            .mark_ready_if_version(&sandbox_id, version);
     }
 
     async fn remove_proxy_route(&self, sandbox_id: &SandboxId) -> Option<ProxyRoute> {
@@ -2615,6 +2659,7 @@ where
         sandbox_id: SandboxId,
         expected_handle: Option<&SandboxHandle>,
         route: Option<ProxyRoute>,
+        ready: bool,
     ) {
         let (Some(expected_handle), Some(route)) = (expected_handle, route) else {
             return;
@@ -2640,7 +2685,11 @@ where
         let version = self
             .next_proxy_route_version
             .fetch_add(1, Ordering::Relaxed);
-        routes.upsert(sandbox_id, route.target().clone(), version);
+        if ready {
+            routes.upsert(sandbox_id, route.target().clone(), version);
+        } else {
+            routes.upsert_pending_validation(sandbox_id, route.target().clone(), version);
+        }
         debug!(
             version,
             "restored runtime proxy route after failed pause transition"
@@ -2675,7 +2724,7 @@ where
                 .await
                 .keys()
                 .copied()
-                .collect::<Vec<_>>();
+                .collect::<HashSet<_>>();
             let sandboxes = self
                 .store
                 .list_filtered(SandboxListFilter {
@@ -2845,6 +2894,17 @@ where
 
     pub(crate) async fn remove_proxy_route_for_test(&self, sandbox_id: &SandboxId) {
         let _ = self.proxy_routes.write().await.remove(sandbox_id);
+    }
+
+    pub(crate) async fn mark_proxy_route_pending_for_test(&self, sandbox_id: &SandboxId) {
+        let mut routes = self.proxy_routes.write().await;
+        let route = routes
+            .remove(sandbox_id)
+            .expect("proxy route should exist before marking it pending");
+        let version = self
+            .next_proxy_route_version
+            .fetch_add(1, Ordering::Relaxed);
+        routes.upsert_pending_validation(*sandbox_id, route.target().clone(), version);
     }
 }
 

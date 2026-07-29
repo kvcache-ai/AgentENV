@@ -125,6 +125,40 @@ impl RuntimeImageRefs for RecordingRuntimeImageRefs {
     }
 }
 
+#[derive(Debug)]
+struct FailOnPinCallRuntimeImageRefs {
+    fail_on_call: usize,
+    pin_calls: AtomicUsize,
+}
+
+#[async_trait]
+impl RuntimeImageRefs for FailOnPinCallRuntimeImageRefs {
+    async fn pin(
+        &self,
+        _owner: RuntimeImageOwner,
+        _artifacts: RuntimeArtifactSet,
+    ) -> anyhow::Result<()> {
+        let call = self.pin_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if call == self.fail_on_call {
+            anyhow::bail!("forced image ref pin failure")
+        }
+        Ok(())
+    }
+
+    async fn unpin_best_effort(&self, _owner: RuntimeImageOwner) {}
+
+    async fn reconcile_paused(&self, _live_paused: &[SandboxId]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn maintain_running(
+        &self,
+        _running: Vec<(SandboxId, RuntimeArtifactSet)>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 async fn make_orchestrator() -> Arc<TestOrchestrator> {
     Orchestrator::new_inner(
         InMemoryMetadataStore::new(),
@@ -176,6 +210,24 @@ fn make_orchestrator_without_background_with_factory_and_persister<
     factory: F,
     persister: P,
 ) -> Arc<TestOrchestrator<S, F, P>> {
+    make_orchestrator_without_background_with_factory_persister_and_image_refs(
+        store,
+        factory,
+        persister,
+        test_runtime_image_refs(),
+    )
+}
+
+fn make_orchestrator_without_background_with_factory_persister_and_image_refs<
+    S: MetadataStore + 'static,
+    F: SandboxBackendFactory,
+    P: SandboxPersister + 'static,
+>(
+    store: S,
+    factory: F,
+    persister: P,
+    image_refs: Arc<dyn RuntimeImageRefs>,
+) -> Arc<TestOrchestrator<S, F, P>> {
     let (sandbox_event_tx, _sandbox_event_rx) =
         tokio::sync::broadcast::channel(SANDBOX_EVENT_CHANNEL_CAPACITY);
     Arc::new(Orchestrator {
@@ -194,7 +246,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         shutdown_outcome: tokio::sync::OnceCell::new(),
-        image_refs: test_runtime_image_refs(),
+        image_refs,
     })
 }
 
@@ -209,6 +261,7 @@ enum StoreAction {
         release: Arc<Notify>,
     },
     Fail(StoreError),
+    DelegateThenFail(StoreError),
 }
 
 type StoreHook = Arc<dyn Fn(&SandboxMetadata) + Send + Sync>;
@@ -308,6 +361,10 @@ impl MetadataStore for ScriptedStore {
                 result
             }
             StoreAction::Fail(err) => Err(err),
+            StoreAction::DelegateThenFail(err) => {
+                self.inner.add(metadata).await?;
+                Err(err)
+            }
         }
     }
 
@@ -344,6 +401,12 @@ impl MetadataStore for ScriptedStore {
                 result
             }
             StoreAction::Fail(err) => Err(err),
+            StoreAction::DelegateThenFail(err) => {
+                self.inner
+                    .update_state_if_state(sandbox_id, new_state, expected_states)
+                    .await?;
+                Err(err)
+            }
         }
     }
 
@@ -379,6 +442,12 @@ impl MetadataStore for ScriptedStore {
                 result
             }
             StoreAction::Fail(err) => Err(err),
+            StoreAction::DelegateThenFail(err) => {
+                self.inner
+                    .update_if_state(sandbox_id, expected_states, update)
+                    .await?;
+                Err(err)
+            }
         }
     }
 
@@ -398,6 +467,10 @@ impl MetadataStore for ScriptedStore {
                 result
             }
             StoreAction::Fail(err) => Err(err),
+            StoreAction::DelegateThenFail(err) => {
+                self.inner.get(sandbox_id).await?;
+                Err(err)
+            }
         }
     }
 
@@ -419,6 +492,10 @@ impl MetadataStore for ScriptedStore {
                 result
             }
             StoreAction::Fail(err) => Err(err),
+            StoreAction::DelegateThenFail(err) => {
+                self.inner.remove(sandbox_id).await?;
+                Err(err)
+            }
         }
     }
 
@@ -1003,7 +1080,7 @@ async fn assert_metrics_snapshot<S, F, P>(
 }
 
 #[tokio::test]
-async fn proxy_target_for_only_returns_running_routes() {
+async fn proxy_target_for_only_returns_validated_routes() {
     let orchestrator = make_orchestrator().await;
     let sandbox_id = SandboxId::new();
     let target = ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 42));
@@ -1014,6 +1091,9 @@ async fn proxy_target_for_only_returns_running_routes() {
         .unwrap();
     orchestrator
         .upsert_proxy_route(sandbox_id, target.clone())
+        .await;
+    orchestrator
+        .mark_proxy_route_pending_for_test(&sandbox_id)
         .await;
     assert_eq!(
         proxy_target_for(&orchestrator, &sandbox_id).await.unwrap(),
@@ -1042,6 +1122,9 @@ async fn proxy_lookup_rejects_route_replaced_during_metadata_read() -> Result<()
     let created = orchestrator
         .create_sandbox(create_request(Some(60), &[]))
         .await?;
+    orchestrator
+        .mark_proxy_route_pending_for_test(&created.id)
+        .await;
     let get_calls_before_lookup = store_control.get_calls();
     let first_read_started = Arc::new(Notify::new());
     let allow_first_read = Arc::new(Notify::new());
@@ -1094,6 +1177,34 @@ async fn proxy_lookup_rejects_route_replaced_during_metadata_read() -> Result<()
 }
 
 #[tokio::test]
+async fn proxy_lookup_ready_route_uses_in_memory_fast_path() -> Result<()> {
+    setup();
+    let store_control = Arc::new(ScriptedStoreControl::default());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&store_control)),
+        MockBackendFactory::new(),
+    );
+    let sandbox_id = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?
+        .id;
+    let get_calls_before_lookup = store_control.get_calls();
+
+    assert!(matches!(
+        orchestrator.proxy_lookup_for(&sandbox_id).await?,
+        ProxyLookupResult::Ready(_)
+    ));
+    assert_eq!(
+        store_control.get_calls(),
+        get_calls_before_lookup,
+        "ready proxy routes must not consult the metadata store"
+    );
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn proxy_lookup_rejects_route_when_pause_state_is_published() -> Result<()> {
     setup();
     let store_control = Arc::new(ScriptedStoreControl::default());
@@ -1105,6 +1216,9 @@ async fn proxy_lookup_rejects_route_when_pause_state_is_published() -> Result<()
         .create_sandbox(create_request(Some(60), &[]))
         .await?
         .id;
+    orchestrator
+        .mark_proxy_route_pending_for_test(&sandbox_id)
+        .await;
 
     let lookup_read_started = Arc::new(Notify::new());
     let allow_lookup_read = Arc::new(Notify::new());
@@ -1194,6 +1308,69 @@ async fn pause_transition_failure_restores_route_without_metadata_read() -> Resu
     assert_eq!(
         proxy_target_for(&orchestrator, &sandbox_id).await?,
         Some(target)
+    );
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ambiguous_pause_rollback_restores_route_for_validation() -> Result<()> {
+    setup();
+    let store_control = Arc::new(ScriptedStoreControl::default());
+    let orchestrator = make_orchestrator_without_background_with_factory_persister_and_image_refs(
+        ScriptedStore::new(Arc::clone(&store_control)),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        Arc::new(FailOnPinCallRuntimeImageRefs {
+            fail_on_call: 2,
+            pin_calls: AtomicUsize::new(0),
+        }),
+    );
+    let sandbox_id = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?
+        .id;
+    store_control.push_update_if_state_action(StoreAction::Delegate);
+    store_control.push_update_if_state_action(StoreAction::DelegateThenFail(StoreError::Backend {
+        source: anyhow::anyhow!("forced ambiguous Running rollback failure"),
+    }));
+
+    orchestrator
+        .pause_sandbox(sandbox_id)
+        .await
+        .expect_err("image ref protection should fail");
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("ambiguous rollback applied the Running state")
+            .state,
+        SandboxState::Running
+    );
+    assert!(
+        !orchestrator
+            .proxy_routes
+            .read()
+            .await
+            .route(&sandbox_id)
+            .expect("rollback must restore the invalidated route")
+            .is_ready(),
+        "an ambiguously restored route must require metadata validation"
+    );
+    assert!(matches!(
+        orchestrator.proxy_lookup_for(&sandbox_id).await?,
+        ProxyLookupResult::Ready(_)
+    ));
+    assert!(
+        orchestrator
+            .proxy_routes
+            .read()
+            .await
+            .route(&sandbox_id)
+            .expect("validated route should remain published")
+            .is_ready(),
+        "Running metadata should promote the matching pending route"
     );
 
     orchestrator.delete_sandbox(sandbox_id).await?;
@@ -2683,14 +2860,20 @@ async fn pause_waiting_for_failed_delete_retries_from_restored_running_state() -
     .await;
 
     allow_delete_transition.notify_one();
-    pause_task
-        .await
-        .expect("pause task should not panic")
-        .expect("pause should retry after delete restores Running");
-    let delete_error = delete_task
-        .await
-        .expect("delete task should not panic")
-        .expect_err("the scripted stop should make delete fail");
+    join_task_or_abort(
+        pause_task,
+        "pause should finish after the delete transition is released",
+    )
+    .await
+    .expect("pause task should not panic")
+    .expect("pause should retry after delete restores Running");
+    let delete_error = join_task_or_abort(
+        delete_task,
+        "delete should finish after its transition is released",
+    )
+    .await
+    .expect("delete task should not panic")
+    .expect_err("the scripted stop should make delete fail");
     assert!(matches!(
         delete_error,
         OrchestratorError::SandboxOperationFailed {
@@ -2999,8 +3182,12 @@ async fn concurrent_unknown_deletes_both_report_not_found() -> Result<()> {
     };
 
     allow_first_delete.notify_one();
-    for result in [first_delete.await, second_delete.await] {
-        let error = result
+    for (task, context) in [
+        (first_delete, "first unknown delete should finish"),
+        (second_delete, "second unknown delete should finish"),
+    ] {
+        let error = join_task_or_abort(task, context)
+            .await
             .expect("delete task should not panic")
             .expect_err("an unknown sandbox must not become idempotently deleted");
         assert!(matches!(error, OrchestratorError::SandboxNotFound(_)));
@@ -3822,10 +4009,13 @@ async fn pause_recovery_store_wait_does_not_block_other_sandbox_tables() -> Resu
     );
 
     allow_restore.notify_one();
-    pause_task
-        .await
-        .expect("pause task should not panic")
-        .expect_err("the scripted backend pause should fail");
+    join_task_or_abort(
+        pause_task,
+        "pause recovery should finish after the metadata restore is released",
+    )
+    .await
+    .expect("pause task should not panic")
+    .expect_err("the scripted backend pause should fail");
 
     orchestrator.delete_sandbox(recovering.id).await?;
     orchestrator.delete_sandbox(unaffected.id).await?;
