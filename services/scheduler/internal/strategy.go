@@ -139,7 +139,7 @@ func (s *GroupedRoundRobinStrategy) Select(nodes []RichNode, hint *schedulerv1.S
 	node := selectNext(ready, &s.lastGroupNodeID)
 	group := groupedRoundRobinGroup{nodeID: node.ID}
 	addToGroup(&group, request)
-	if groupCanRemainOpen(group, s.limits) {
+	if !groupIsFull(group, s.limits) {
 		s.putGroup(request.key, group)
 	}
 	return node, nil
@@ -254,10 +254,6 @@ func groupIsFull(group groupedRoundRobinGroup, limits GroupedRoundRobinLimits) b
 	return group.sandboxCount >= limits.MaxSandboxCount ||
 		(limits.MaxCPUCount > 0 && group.cpuCount >= uint64(limits.MaxCPUCount)) ||
 		(limits.MaxMemoryMB > 0 && group.memoryMB >= limits.MaxMemoryMB)
-}
-
-func groupCanRemainOpen(group groupedRoundRobinGroup, limits GroupedRoundRobinLimits) bool {
-	return !groupIsFull(group, limits)
 }
 
 type strategyOptions struct {
