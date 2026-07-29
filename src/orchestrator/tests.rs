@@ -48,6 +48,37 @@ fn test_runtime_image_refs() -> Arc<dyn RuntimeImageRefs> {
     local_image_services_from_global_config().runtime_refs
 }
 
+#[derive(Debug, Default)]
+struct RecordingRuntimeImageRefs {
+    unpinned: Mutex<Vec<RuntimeImageOwner>>,
+}
+
+#[async_trait]
+impl RuntimeImageRefs for RecordingRuntimeImageRefs {
+    async fn pin(
+        &self,
+        _owner: RuntimeImageOwner,
+        _artifacts: RuntimeArtifactSet,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn unpin_best_effort(&self, owner: RuntimeImageOwner) {
+        self.unpinned.lock().await.push(owner);
+    }
+
+    async fn reconcile_paused(&self, _live_paused: &[SandboxId]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn maintain_running(
+        &self,
+        _running: Vec<(SandboxId, RuntimeArtifactSet)>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
 async fn make_orchestrator() -> Arc<TestOrchestrator> {
     Orchestrator::new_inner(
         InMemoryMetadataStore::new(),
@@ -105,6 +136,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         store,
         factory,
         persister,
+        lifecycle_operations: Mutex::new(HashMap::new()),
         sandboxes: RwLock::new(HashMap::new()),
         proxy_routes: RwLock::new(ProxyRouteTable::default()),
         next_proxy_route_version: AtomicU64::new(1),
@@ -130,6 +162,7 @@ type StoreHookSlot = StdMutex<Option<StoreHook>>;
 struct ScriptedStoreControl {
     add_actions: StdMutex<VecDeque<StoreAction>>,
     update_if_state_actions: StdMutex<VecDeque<StoreAction>>,
+    remove_actions: StdMutex<VecDeque<StoreAction>>,
     on_add: StoreHookSlot,
 }
 
@@ -145,6 +178,13 @@ impl ScriptedStoreControl {
         self.update_if_state_actions
             .lock()
             .expect("update_if_state actions mutex poisoned")
+            .push_back(action);
+    }
+
+    fn push_remove_action(&self, action: StoreAction) {
+        self.remove_actions
+            .lock()
+            .expect("remove actions mutex poisoned")
             .push_back(action);
     }
 
@@ -238,7 +278,10 @@ impl MetadataStore for ScriptedStore {
         &self,
         sandbox_id: &SandboxId,
     ) -> StdResult<Option<SandboxMetadata>, StoreError> {
-        self.inner.remove(sandbox_id).await
+        match ScriptedStoreControl::take_action(&self.control.remove_actions) {
+            StoreAction::Delegate => self.inner.remove(sandbox_id).await,
+            StoreAction::Fail(err) => Err(err),
+        }
     }
 
     async fn list(&self) -> StdResult<Vec<SandboxMetadata>, StoreError> {
@@ -828,8 +871,22 @@ async fn proxy_target_for_only_returns_running_routes() {
     let target = ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 42));
 
     orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Pausing)
+        .await
+        .unwrap();
+    orchestrator
         .upsert_proxy_route(sandbox_id, target.clone())
         .await;
+    assert_eq!(
+        proxy_target_for(&orchestrator, &sandbox_id).await.unwrap(),
+        None,
+        "a pre-published route must remain unavailable until metadata is Running"
+    );
+    orchestrator
+        .store
+        .update_state_if_state(&sandbox_id, SandboxState::Running, &[SandboxState::Pausing])
+        .await
+        .unwrap();
     assert_eq!(
         proxy_target_for(&orchestrator, &sandbox_id).await.unwrap(),
         Some(target)
@@ -842,6 +899,10 @@ async fn restore_proxy_route_republishes_running_target() {
     let sandbox_id = SandboxId::new();
     let target = ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 77));
 
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Running)
+        .await
+        .unwrap();
     orchestrator
         .upsert_proxy_route(sandbox_id, target.clone())
         .await;
@@ -2911,6 +2972,7 @@ async fn pause_recovery_failure_stops_and_removes_sandbox() -> Result<()> {
         .pause_sandbox(sandbox_id)
         .await
         .expect_err("pause should fail when the backend cannot be resumed");
+    let message = format!("{err:#}");
     assert!(matches!(
         err,
         OrchestratorError::SandboxOperationFailed {
@@ -2918,6 +2980,8 @@ async fn pause_recovery_failure_stops_and_removes_sandbox() -> Result<()> {
             ..
         }
     ));
+    assert!(message.contains("forced pause failure"), "{message}");
+    assert!(message.contains("forced resume failure"), "{message}");
 
     assert!(
         orchestrator.get_sandbox(&sandbox_id).await?.is_none(),
@@ -2929,6 +2993,218 @@ async fn pause_recovery_failure_stops_and_removes_sandbox() -> Result<()> {
         1,
         "pause recovery failure should stop the backend"
     );
+    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_recovery_metadata_cleanup_failure_releases_paused_image_refs() -> Result<()> {
+    setup();
+    let store_control = Arc::new(ScriptedStoreControl::default());
+    store_control.push_remove_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("forced metadata cleanup failure"),
+    }));
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::Fail {
+            message: "forced pause failure".to_string(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::Resume,
+        MockAction::Fail {
+            message: "forced resume failure".to_string(),
+        },
+    );
+    let image_refs = Arc::new(RecordingRuntimeImageRefs::default());
+    let mut orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(store_control),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+    Arc::get_mut(&mut orchestrator)
+        .expect("orchestrator should be uniquely owned")
+        .image_refs = image_refs.clone();
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    image_refs.unpinned.lock().await.clear();
+
+    let err = orchestrator
+        .pause_sandbox(sandbox_id)
+        .await
+        .expect_err("pause recovery should report metadata cleanup failure");
+    let message = format!("{err:#}");
+    assert!(message.contains("forced pause failure"), "{message}");
+    assert!(message.contains("forced resume failure"), "{message}");
+    assert!(
+        message.contains("forced metadata cleanup failure"),
+        "{message}"
+    );
+    assert_eq!(behavior.stop_calls(), 1);
+    assert!(
+        orchestrator
+            .sandboxes
+            .read()
+            .await
+            .contains_key(&sandbox_id),
+        "stopped backend handle should remain owned while metadata cleanup is unresolved"
+    );
+    assert_eq!(
+        orchestrator.proxy_lookup_for(&sandbox_id).await?,
+        ProxyLookupResult::Unavailable(SandboxState::Killing)
+    );
+    assert!(
+        orchestrator
+            .proxy_routes
+            .read()
+            .await
+            .proxy_target(&sandbox_id)
+            .is_none(),
+        "proxy route should remain detached while metadata cleanup is unresolved"
+    );
+    assert_eq!(
+        image_refs.unpinned.lock().await.as_slice(),
+        &[RuntimeImageOwner::PausedSandbox(sandbox_id)]
+    );
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_recovery_stop_failure_allows_delete_retry() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::Fail {
+            message: "forced pause failure".to_string(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::Resume,
+        MockAction::Fail {
+            message: "forced resume failure".to_string(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::Fail {
+            message: "forced stop failure".to_string(),
+        },
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+
+    let err = orchestrator
+        .pause_sandbox(sandbox_id)
+        .await
+        .expect_err("pause should fail when recovery and cleanup fail");
+    let message = format!("{err:#}");
+    assert!(message.contains("forced pause failure"), "{message}");
+    assert!(message.contains("forced resume failure"), "{message}");
+    assert!(message.contains("forced stop failure"), "{message}");
+
+    let metadata = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("sandbox metadata should remain while backend cleanup is unresolved");
+    assert_eq!(metadata.state, SandboxState::Killing);
+    assert!(
+        orchestrator
+            .sandboxes
+            .read()
+            .await
+            .contains_key(&sandbox_id),
+        "backend handle should remain available for cleanup retry"
+    );
+    assert_eq!(
+        orchestrator.proxy_lookup_for(&sandbox_id).await?,
+        ProxyLookupResult::Unavailable(SandboxState::Killing)
+    );
+    assert!(
+        orchestrator
+            .proxy_routes
+            .read()
+            .await
+            .proxy_target(&sandbox_id)
+            .is_none(),
+        "proxy route should remain detached while cleanup is unresolved"
+    );
+    assert_eq!(behavior.stop_calls(), 1);
+    assert_metrics_values(
+        &orchestrator,
+        1,
+        0,
+        1,
+        0,
+        created.resources.cpu_count,
+        created.resources.memory_mib,
+    )
+    .await;
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    assert_eq!(
+        behavior.stop_calls(),
+        2,
+        "delete should retry the failed stop"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_running_state_restore_failure_stops_and_removes_sandbox() -> Result<()> {
+    setup();
+    let store_control = Arc::new(ScriptedStoreControl::default());
+    store_control.push_update_if_state_action(StoreAction::Delegate);
+    store_control.push_update_if_state_action(StoreAction::Delegate);
+    store_control.push_update_if_state_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("forced running state restore failure"),
+    }));
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::Fail {
+            message: "forced pause failure".to_string(),
+        },
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(store_control),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+
+    let err = orchestrator
+        .pause_sandbox(sandbox_id)
+        .await
+        .expect_err("pause recovery should fail when Running state cannot be restored");
+    let message = format!("{err:#}");
+    assert!(message.contains("forced pause failure"), "{message}");
+    assert!(
+        message.contains("forced running state restore failure"),
+        "{message}"
+    );
+
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    assert!(orchestrator.sandboxes.read().await.is_empty());
+    assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
+    assert_eq!(behavior.stop_calls(), 1);
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
     Ok(())
 }
