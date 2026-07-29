@@ -3504,7 +3504,9 @@ async fn pause_recovery_store_wait_does_not_block_other_sandbox_tables() -> Resu
         let orchestrator = Arc::clone(&orchestrator);
         tokio::spawn(async move { orchestrator.pause_sandbox(recovering.id).await })
     };
-    restore_started.notified().await;
+    timeout(Duration::from_secs(1), restore_started.notified())
+        .await
+        .expect("pause recovery should reach the blocked metadata restore");
 
     let unaffected_lookup = timeout(
         Duration::from_secs(1),
