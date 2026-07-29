@@ -27,6 +27,7 @@ pub fn run(args: Args) -> Result<()> {
         .with_context(|| format!("reading {}", args.dockerfile.display()))?;
     let alias = parse_alias(args.name.as_deref(), &args.dockerfile);
     let user_image = args.user_image.or_else(|| first_from_image(&dockerfile));
+    let build_plan = dockerfile_build_plan(&dockerfile)?;
 
     let req = CreateTemplateV3 {
         name: alias.to_string(),
@@ -35,7 +36,6 @@ pub fn run(args: Args) -> Result<()> {
         memory_mb: args.resources.memory_mb,
     };
     let resp = client.create_template_v3(&req)?;
-    let build_plan = dockerfile_build_plan(&dockerfile)?;
     client.start_template_build_v2(
         &resp.template_id,
         &resp.build_id,
