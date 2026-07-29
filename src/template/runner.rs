@@ -277,7 +277,8 @@ impl TemplateBuildRunner {
 /// entry), and an image where the account cannot be created (no useradd or
 /// adduser) keeps building with a warning rather than failing: such an image
 /// worked before this provisioning existed, and only envd calls that resolve
-/// the default user will fail.
+/// the default user will fail. Executor errors (envd unreachable, sandbox
+/// gone) are not downgraded — they fail the build.
 async fn ensure_default_user(
     sandbox: &impl SandboxExecutor,
     build_context: &CommandContext,
@@ -292,6 +293,19 @@ async fn ensure_default_user(
         || account == "root"
         || account.chars().all(|c| c.is_ascii_digit())
     {
+        return Ok(());
+    }
+    // Only provision names that are plausibly Unix accounts; anything else
+    // (e.g. a value starting with "-") would be misparsed as options by the
+    // tools below, so leave it alone.
+    let mut chars = account.chars();
+    let valid_name = matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
+    if !valid_name {
+        warn!(
+            user = account,
+            "template default user is not a valid account name; leaving it as-is"
+        );
         return Ok(());
     }
 
@@ -316,15 +330,11 @@ async fn ensure_default_user(
             );
             Ok(())
         }
-        Err(error) => {
-            warn!(
-                user = account,
-                error = %format_args!("{error:#}"),
-                "template default user is missing and could not be created; \
-                 envd operations that resolve this user will fail at runtime"
-            );
-            Ok(())
-        }
+        // A nonzero exit means the image cannot host the account (no
+        // useradd/adduser) — that image built fine before provisioning
+        // existed, so it stays a warning. An executor error is different:
+        // envd unreachable, sandbox gone — those must fail the build.
+        Err(error) => Err(error).context("provision template default user"),
     }
 }
 
@@ -713,6 +723,47 @@ mod tests {
         assert_eq!(scripts.len(), 1);
         assert!(scripts[0].contains("useradd -m app"));
         assert!(!scripts[0].contains("staff"));
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_skips_invalid_account_names() {
+        let sandbox = ScriptRecordingSandbox::with_exit_code(0);
+        ensure_default_user(&sandbox, &context_with_user(Some("-u")))
+            .await
+            .unwrap();
+        assert!(sandbox.scripts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_propagates_executor_errors() {
+        struct BrokenSandbox;
+
+        #[async_trait(?Send)]
+        impl SandboxExecutor for BrokenSandbox {
+            fn executor(&self) -> Result<Executor<'_>> {
+                Err(anyhow!("not used"))
+            }
+            async fn run_command_with_opts(
+                &self,
+                _cmd: &str,
+                _args: &[&str],
+                _opts: &ProcessOpts,
+            ) -> Result<ProcessOutput> {
+                Err(anyhow!("envd unreachable"))
+            }
+            async fn start_process(
+                &self,
+                _cmd: &str,
+                _args: &[&str],
+                _opts: &ProcessOpts,
+            ) -> Result<ProcessHandle> {
+                Err(anyhow!("not used"))
+            }
+        }
+
+        ensure_default_user(&BrokenSandbox, &context_with_user(Some("user")))
+            .await
+            .expect_err("infrastructure failures must fail the build");
     }
 
     #[tokio::test]
