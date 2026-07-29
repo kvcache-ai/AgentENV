@@ -36,6 +36,12 @@ use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
 type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LifecycleOperationKind {
+    Delete,
+    Pause,
+}
+
 /// Maximum time to wait for a sandbox to leave a transitional state.
 /// Guards against indefinite blocking when a sandbox's in-progress operation
 /// never completes (e.g. the task holding the state panics without rolling back).
@@ -94,7 +100,7 @@ pub struct Orchestrator<
     store: S,
     factory: F,
     persister: P,
-    lifecycle_operations: Mutex<HashMap<SandboxId, Arc<Mutex<()>>>>,
+    lifecycle_operations: Mutex<HashMap<SandboxId, Arc<Mutex<LifecycleOperationKind>>>>,
     sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
     proxy_routes: RwLock<ProxyRouteTable>,
     next_proxy_route_version: AtomicU64,
@@ -248,13 +254,34 @@ where
         })?
     }
 
-    async fn lifecycle_operation_lock(&self, sandbox_id: SandboxId) -> Arc<Mutex<()>> {
+    async fn lifecycle_operation_lock(
+        &self,
+        sandbox_id: SandboxId,
+        operation: LifecycleOperationKind,
+    ) -> (Arc<Mutex<LifecycleOperationKind>>, bool) {
         let mut operations = self.lifecycle_operations.lock().await;
-        Arc::clone(
+        let already_existed = operations.contains_key(&sandbox_id);
+        let operation_lock = Arc::clone(
             operations
                 .entry(sandbox_id)
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
-        )
+                .or_insert_with(|| Arc::new(Mutex::new(operation))),
+        );
+        (operation_lock, already_existed)
+    }
+
+    async fn retire_lifecycle_operation_lock(
+        &self,
+        sandbox_id: SandboxId,
+        operation_lock: &Arc<Mutex<LifecycleOperationKind>>,
+    ) {
+        let mut operations = self.lifecycle_operations.lock().await;
+        if Arc::strong_count(operation_lock) == 2
+            && operations
+                .get(&sandbox_id)
+                .is_some_and(|current| Arc::ptr_eq(current, operation_lock))
+        {
+            operations.remove(&sandbox_id);
+        }
     }
 
     async fn protect_image_refs(
@@ -275,22 +302,43 @@ where
         self.image_refs.unpin_best_effort(owner).await;
     }
 
+    async fn retain_sandbox_handle_for_cleanup(
+        &self,
+        sandbox_id: SandboxId,
+        handle: SandboxHandle,
+    ) -> std::result::Result<(), StoreError> {
+        match self
+            .store
+            .update_state_if_state(&sandbox_id, SandboxState::Killing, &[SandboxState::Pausing])
+            .await
+        {
+            Ok(_)
+            | Err(StoreError::StateConflict {
+                actual_state: SandboxState::Killing,
+                ..
+            }) => {
+                self.sandboxes.write().await.insert(sandbox_id, handle);
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     async fn remove_stopped_sandbox_or_retain_handle(
         &self,
         sandbox_id: SandboxId,
         handle: SandboxHandle,
-    ) -> Option<StoreError> {
-        let cleanup_error = self.store.remove(&sandbox_id).await.err();
-        if cleanup_error.is_some() {
-            // Killing is a stable, explicitly retryable cleanup state. A later
-            // delete can claim the retained handle and retry metadata removal.
-            let _ = self
-                .store
-                .update_state_if_state(&sandbox_id, SandboxState::Killing, &[SandboxState::Pausing])
-                .await;
-            self.sandboxes.write().await.insert(sandbox_id, handle);
+    ) -> Option<anyhow::Error> {
+        let cleanup_error = self.store.remove(&sandbox_id).await.err()?;
+        match self
+            .retain_sandbox_handle_for_cleanup(sandbox_id, handle)
+            .await
+        {
+            Ok(()) => Some(cleanup_error.into()),
+            Err(state_error) => Some(anyhow::anyhow!(
+                "metadata cleanup error: {cleanup_error}; cleanup state error: {state_error}"
+            )),
         }
-        cleanup_error
     }
 
     /// Snapshot the running set's local runtime artifacts for maintenance.
@@ -855,11 +903,28 @@ where
     async fn delete_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("deleting sandbox");
 
+        let (operation_lock, cleanup_already_in_flight) = self
+            .lifecycle_operation_lock(sandbox_id, LifecycleOperationKind::Delete)
+            .await;
+        let mut operation_guard = operation_lock.lock().await;
+        *operation_guard = LifecycleOperationKind::Delete;
+        let result = self
+            .delete_sandbox_owned_inner(sandbox_id, cleanup_already_in_flight)
+            .await;
+        drop(operation_guard);
+        self.retire_lifecycle_operation_lock(sandbox_id, &operation_lock)
+            .await;
+        result
+    }
+
+    async fn delete_sandbox_owned_inner(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        cleanup_already_in_flight: bool,
+    ) -> Result<()> {
         // Attempt to transition to Killing, retrying after waiting whenever we
         // find the sandbox in a transitional state.
-        let operation_lock = self.lifecycle_operation_lock(sandbox_id).await;
-        let (previous_state, operation_guard) = loop {
-            let operation_guard = operation_lock.lock().await;
+        let previous_state = loop {
             match self
                 .store
                 .update_state_if_state(
@@ -873,14 +938,14 @@ where
                 )
                 .await
             {
-                Ok(previous_state) => break (previous_state, operation_guard),
+                Ok(previous_state) => break previous_state,
                 Err(StoreError::StateConflict { actual_state, .. }) => match actual_state {
                     SandboxState::Killing => {
                         // Cleanup ownership for this sandbox is serialized.
                         // Reaching Killing here means a previous cleanup attempt
                         // completed and left retryable work.
                         debug!("retrying sandbox cleanup from killing state");
-                        break (SandboxState::Killing, operation_guard);
+                        break SandboxState::Killing;
                     }
                     SandboxState::Creating
                     | SandboxState::Snapshotting
@@ -893,7 +958,6 @@ where
                             state = ?actual_state,
                             "sandbox in transitional state, waiting before deletion"
                         );
-                        drop(operation_guard);
                         match self.wait_for_transition(sandbox_id, actual_state).await {
                             Ok(_) => {
                                 // Transition finished; retry the Killing CAS.
@@ -909,7 +973,6 @@ where
                         }
                     }
                     _ => {
-                        drop(operation_guard);
                         return Err(OrchestratorError::from(StoreError::StateConflict {
                             sandbox_id,
                             expected_states: vec![
@@ -921,8 +984,11 @@ where
                         }));
                     }
                 },
+                Err(StoreError::SandboxNotFound { .. }) if cleanup_already_in_flight => {
+                    info!("sandbox was deleted by a concurrent cleanup");
+                    return Ok(());
+                }
                 Err(err) => {
-                    drop(operation_guard);
                     return Err(OrchestratorError::from(err));
                 }
             }
@@ -977,8 +1043,6 @@ where
         }
         self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
             .await;
-        drop(operation_guard);
-        self.lifecycle_operations.lock().await.remove(&sandbox_id);
         info!("sandbox deleted");
 
         Ok(())
@@ -1031,6 +1095,34 @@ where
         fields(sandbox_id = %sandbox_id)
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        let (operation_lock, _) = self
+            .lifecycle_operation_lock(sandbox_id, LifecycleOperationKind::Pause)
+            .await;
+        let operation_guard = match operation_lock.try_lock() {
+            Ok(mut operation_guard) => {
+                *operation_guard = LifecycleOperationKind::Pause;
+                operation_guard
+            }
+            Err(_) => {
+                let mut operation_guard = operation_lock.lock().await;
+                if *operation_guard == LifecycleOperationKind::Pause {
+                    drop(operation_guard);
+                    self.retire_lifecycle_operation_lock(sandbox_id, &operation_lock)
+                        .await;
+                    return self.join_concurrent_pause(sandbox_id).await;
+                }
+                *operation_guard = LifecycleOperationKind::Pause;
+                operation_guard
+            }
+        };
+        let result = self.pause_sandbox_owned_inner(sandbox_id).await;
+        drop(operation_guard);
+        self.retire_lifecycle_operation_lock(sandbox_id, &operation_lock)
+            .await;
+        result
+    }
+
+    async fn pause_sandbox_owned_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("pausing sandbox");
         match self
             .store
@@ -1059,8 +1151,6 @@ where
             }
             Err(err) => return Err(OrchestratorError::from(err)),
         }
-        let operation_lock = self.lifecycle_operation_lock(sandbox_id).await;
-        let _operation_guard = operation_lock.lock().await;
 
         // Pin paused runtime artifacts before detaching from the running set.
         let runtime_artifacts = {
@@ -1137,34 +1227,54 @@ where
                             // Proxy lookup gates routes on Running metadata, and
                             // lifecycle operations for this sandbox are serialized,
                             // so the final CAS makes the restored runtime visible.
-                            let restore_result = {
+                            let restored_route_version = {
                                 let mut sandboxes = self.sandboxes.write().await;
-                                let mut proxy_routes = self.proxy_routes.write().await;
                                 sandboxes.insert(sandbox_id, Arc::clone(&handle));
+                                drop(sandboxes);
+
                                 if let Some(route) = removed_proxy_route.as_ref() {
                                     let version = self
                                         .next_proxy_route_version
                                         .fetch_add(1, Ordering::Relaxed);
-                                    proxy_routes.upsert(
+                                    self.proxy_routes.write().await.upsert(
                                         sandbox_id,
                                         route.target().clone(),
                                         version,
                                     );
+                                    Some(version)
+                                } else {
+                                    None
                                 }
-                                let result = self
-                                    .store
-                                    .update_state_if_state(
-                                        &sandbox_id,
-                                        SandboxState::Running,
-                                        &[SandboxState::Pausing],
-                                    )
-                                    .await;
-                                if result.is_err() {
-                                    sandboxes.remove(&sandbox_id);
-                                    proxy_routes.remove(&sandbox_id);
-                                }
-                                result.map(|_| ())
                             };
+                            let restore_result = self
+                                .store
+                                .update_state_if_state(
+                                    &sandbox_id,
+                                    SandboxState::Running,
+                                    &[SandboxState::Pausing],
+                                )
+                                .await
+                                .map(|_| ());
+                            if restore_result.is_err() {
+                                let mut sandboxes = self.sandboxes.write().await;
+                                if sandboxes
+                                    .get(&sandbox_id)
+                                    .is_some_and(|current| Arc::ptr_eq(current, &handle))
+                                {
+                                    sandboxes.remove(&sandbox_id);
+                                }
+                                drop(sandboxes);
+
+                                if let Some(version) = restored_route_version {
+                                    let mut proxy_routes = self.proxy_routes.write().await;
+                                    if proxy_routes
+                                        .route(&sandbox_id)
+                                        .is_some_and(|route| route.version() == version)
+                                    {
+                                        proxy_routes.remove(&sandbox_id);
+                                    }
+                                }
+                            }
 
                             match restore_result {
                                 Ok(()) => (err.into(), true),
@@ -1204,24 +1314,28 @@ where
                                                 error = ?stop_err,
                                                 "failed to stop sandbox after state recovery failure"
                                             );
-                                            self.sandboxes.write().await.insert(sandbox_id, handle);
-                                            let _ = self
-                                                .store
-                                                .update_state_if_state(
-                                                    &sandbox_id,
-                                                    SandboxState::Killing,
-                                                    &[SandboxState::Pausing],
+                                            let cleanup_state_error = self
+                                                .retain_sandbox_handle_for_cleanup(
+                                                    sandbox_id, handle,
                                                 )
                                                 .await;
-                                            (
-                                                anyhow::anyhow!(
+                                            let source = match cleanup_state_error {
+                                                Ok(()) => anyhow::anyhow!(
                                                     "pause failed, Running state could not be \
                                                      restored, and sandbox could not be stopped: \
                                                      pause error: {err}; state error: \
                                                      {restore_err}; stop error: {stop_err:#}"
                                                 ),
-                                                false,
-                                            )
+                                                Err(cleanup_state_err) => anyhow::anyhow!(
+                                                    "pause failed, Running state could not be \
+                                                     restored, sandbox could not be stopped, and \
+                                                     cleanup state could not be established: pause \
+                                                     error: {err}; state error: {restore_err}; stop \
+                                                     error: {stop_err}; cleanup state error: \
+                                                     {cleanup_state_err}"
+                                                ),
+                                            };
+                                            (source, false)
                                         }
                                     }
                                 }
@@ -1262,23 +1376,23 @@ where
                                     // The backend may still own live resources.
                                     // Keep its handle in a stable cleanup state so
                                     // a later delete can retry stopping it.
-                                    self.sandboxes.write().await.insert(sandbox_id, handle);
-                                    let _ = self
-                                        .store
-                                        .update_state_if_state(
-                                            &sandbox_id,
-                                            SandboxState::Killing,
-                                            &[SandboxState::Pausing],
-                                        )
+                                    let cleanup_state_error = self
+                                        .retain_sandbox_handle_for_cleanup(sandbox_id, handle)
                                         .await;
-                                    (
-                                        anyhow::anyhow!(
+                                    let source = match cleanup_state_error {
+                                        Ok(()) => anyhow::anyhow!(
                                             "pause failed, sandbox could not be resumed, and \
                                              sandbox could not be stopped: pause error: {err}; \
                                              resume error: {resume_err}; stop error: {stop_err:#}"
                                         ),
-                                        false,
-                                    )
+                                        Err(cleanup_state_err) => anyhow::anyhow!(
+                                            "pause failed, sandbox could not be resumed or stopped, \
+                                             and cleanup state could not be established: pause \
+                                             error: {err}; resume error: {resume_err}; stop error: \
+                                             {stop_err}; cleanup state error: {cleanup_state_err}"
+                                        ),
+                                    };
+                                    (source, false)
                                 }
                             }
                         }

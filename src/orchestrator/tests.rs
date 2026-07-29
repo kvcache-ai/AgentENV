@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use async_trait::async_trait;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
+use tokio::sync::{Mutex, Notify};
+use tokio::time::{sleep, timeout, Duration};
 use uuid::Uuid;
 
 use super::super::launch_plan::LaunchPlan;
@@ -152,6 +152,10 @@ fn make_orchestrator_without_background_with_factory_and_persister<
 
 enum StoreAction {
     Delegate,
+    Block {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    },
     Fail(StoreError),
 }
 
@@ -227,6 +231,11 @@ impl MetadataStore for ScriptedStore {
         ScriptedStoreControl::run_hook(&self.control.on_add, &metadata);
         match ScriptedStoreControl::take_action(&self.control.add_actions) {
             StoreAction::Delegate => self.inner.add(metadata).await,
+            StoreAction::Block { started, release } => {
+                started.notify_one();
+                release.notified().await;
+                self.inner.add(metadata).await
+            }
             StoreAction::Fail(err) => Err(err),
         }
     }
@@ -243,6 +252,13 @@ impl MetadataStore for ScriptedStore {
     ) -> StdResult<SandboxState, StoreError> {
         match ScriptedStoreControl::take_action(&self.control.update_if_state_actions) {
             StoreAction::Delegate => {
+                self.inner
+                    .update_state_if_state(sandbox_id, new_state, expected_states)
+                    .await
+            }
+            StoreAction::Block { started, release } => {
+                started.notify_one();
+                release.notified().await;
                 self.inner
                     .update_state_if_state(sandbox_id, new_state, expected_states)
                     .await
@@ -266,6 +282,13 @@ impl MetadataStore for ScriptedStore {
                     .update_if_state(sandbox_id, expected_states, update)
                     .await
             }
+            StoreAction::Block { started, release } => {
+                started.notify_one();
+                release.notified().await;
+                self.inner
+                    .update_if_state(sandbox_id, expected_states, update)
+                    .await
+            }
             StoreAction::Fail(err) => Err(err),
         }
     }
@@ -280,6 +303,11 @@ impl MetadataStore for ScriptedStore {
     ) -> StdResult<Option<SandboxMetadata>, StoreError> {
         match ScriptedStoreControl::take_action(&self.control.remove_actions) {
             StoreAction::Delegate => self.inner.remove(sandbox_id).await,
+            StoreAction::Block { started, release } => {
+                started.notify_one();
+                release.notified().await;
+                self.inner.remove(sandbox_id).await
+            }
             StoreAction::Fail(err) => Err(err),
         }
     }
@@ -1633,6 +1661,14 @@ async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
     );
     assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    assert!(
+        !orchestrator
+            .lifecycle_operations
+            .lock()
+            .await
+            .contains_key(&sandbox_id),
+        "terminal pause cleanup should retire lifecycle ownership"
+    );
     Ok(())
 }
 
@@ -2317,6 +2353,61 @@ async fn orchestrator_concurrent_delete_calls_are_idempotent() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn pause_waiting_for_failed_delete_retries_from_restored_running_state() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::FailAfter {
+            delay: Duration::from_millis(200),
+            message: "forced delete stop failure".to_string(),
+        },
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+
+    let delete_task = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move { orchestrator.delete_sandbox(sandbox_id).await })
+    };
+    wait_for_state(&orchestrator, &sandbox_id, SandboxState::Killing).await?;
+
+    orchestrator.pause_sandbox(sandbox_id).await?;
+    let delete_error = delete_task
+        .await
+        .expect("delete task should not panic")
+        .expect_err("the scripted stop should make delete fail");
+    assert!(matches!(
+        delete_error,
+        OrchestratorError::SandboxOperationFailed {
+            operation: SandboxOperation::Stop,
+            ..
+        }
+    ));
+
+    let metadata = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("sandbox should remain after the successful pause");
+    assert_eq!(metadata.state, SandboxState::Paused);
+    assert!(
+        !orchestrator
+            .lifecycle_operations
+            .lock()
+            .await
+            .contains_key(&sandbox_id),
+        "completed pause and delete should retire lifecycle ownership"
+    );
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
 /// `keep_alive_for` called concurrently with `resume_sandbox` must never
 /// surface transitional states to the caller.
 ///
@@ -2519,6 +2610,14 @@ async fn orchestrator_unknown_sandbox_behaviors() -> Result<()> {
         .await
         .expect_err("pause_sandbox should fail for unknown sandbox");
     assert!(matches!(pause_err, OrchestratorError::SandboxNotFound(_)));
+    assert!(
+        !orchestrator
+            .lifecycle_operations
+            .lock()
+            .await
+            .contains_key(&missing_id),
+        "unknown pause should not leave lifecycle ownership behind"
+    );
 
     let resume_err = orchestrator
         .resume_sandbox(missing_id, NewTimeout::None)
@@ -2532,6 +2631,20 @@ async fn orchestrator_unknown_sandbox_behaviors() -> Result<()> {
         .expect_err("deleting unknown sandbox should fail");
 
     assert!(matches!(err, OrchestratorError::SandboxNotFound(_)));
+    assert!(
+        !orchestrator
+            .lifecycle_operations
+            .lock()
+            .await
+            .contains_key(&missing_id),
+        "failed delete should retire lifecycle ownership"
+    );
+
+    let retry_err = orchestrator
+        .delete_sandbox(missing_id)
+        .await
+        .expect_err("repeated delete of unknown sandbox should still fail");
+    assert!(matches!(retry_err, OrchestratorError::SandboxNotFound(_)));
 
     Ok(())
 }
@@ -3073,6 +3186,138 @@ async fn pause_recovery_metadata_cleanup_failure_releases_paused_image_refs() ->
     orchestrator.delete_sandbox(sandbox_id).await?;
     assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_recovery_does_not_retain_handle_without_stable_cleanup_state() -> Result<()> {
+    setup();
+    let store_control = Arc::new(ScriptedStoreControl::default());
+    store_control.push_remove_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("forced metadata cleanup failure"),
+    }));
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::Fail {
+            message: "forced pause failure".to_string(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::Resume,
+        MockAction::Fail {
+            message: "forced resume failure".to_string(),
+        },
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&store_control)),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    store_control.push_update_if_state_action(StoreAction::Delegate);
+    store_control.push_update_if_state_action(StoreAction::Fail(StoreError::Backend {
+        source: anyhow::anyhow!("forced cleanup state failure"),
+    }));
+
+    let err = orchestrator
+        .pause_sandbox(sandbox_id)
+        .await
+        .expect_err("pause recovery should report both cleanup failures");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("forced metadata cleanup failure"),
+        "{message}"
+    );
+    assert!(
+        message.contains("forced cleanup state failure"),
+        "{message}"
+    );
+    assert!(
+        !orchestrator
+            .sandboxes
+            .read()
+            .await
+            .contains_key(&sandbox_id),
+        "a handle must not be published without a stable cleanup state"
+    );
+    assert_eq!(
+        orchestrator.proxy_lookup_for(&sandbox_id).await?,
+        ProxyLookupResult::Unavailable(SandboxState::Pausing)
+    );
+    assert!(
+        !orchestrator
+            .lifecycle_operations
+            .lock()
+            .await
+            .contains_key(&sandbox_id),
+        "failed recovery should retire lifecycle ownership"
+    );
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_recovery_store_wait_does_not_block_other_sandbox_tables() -> Result<()> {
+    setup();
+    let store_control = Arc::new(ScriptedStoreControl::default());
+    let restore_started = Arc::new(Notify::new());
+    let allow_restore = Arc::new(Notify::new());
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::Fail {
+            message: "forced pause failure".to_string(),
+        },
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(Arc::clone(&store_control)),
+        MockBackendFactory::with_behavior(behavior),
+    );
+    let recovering = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let unaffected = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let unaffected_target = proxy_target_for(&orchestrator, &unaffected.id)
+        .await?
+        .expect("running sandbox should have a proxy target");
+    store_control.push_update_if_state_action(StoreAction::Delegate);
+    store_control.push_update_if_state_action(StoreAction::Block {
+        started: Arc::clone(&restore_started),
+        release: Arc::clone(&allow_restore),
+    });
+
+    let pause_task = {
+        let orchestrator = Arc::clone(&orchestrator);
+        tokio::spawn(async move { orchestrator.pause_sandbox(recovering.id).await })
+    };
+    restore_started.notified().await;
+
+    let unaffected_lookup = timeout(
+        Duration::from_secs(1),
+        orchestrator.proxy_lookup_for(&unaffected.id),
+    )
+    .await
+    .expect("blocked recovery store call must not hold global sandbox tables")?;
+    assert_eq!(
+        unaffected_lookup,
+        ProxyLookupResult::Ready(unaffected_target)
+    );
+
+    allow_restore.notify_one();
+    pause_task
+        .await
+        .expect("pause task should not panic")
+        .expect_err("the scripted backend pause should fail");
+
+    orchestrator.delete_sandbox(recovering.id).await?;
+    orchestrator.delete_sandbox(unaffected.id).await?;
     Ok(())
 }
 
