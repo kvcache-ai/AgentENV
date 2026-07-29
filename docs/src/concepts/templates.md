@@ -59,7 +59,7 @@ Supported Dockerfile instructions:
 | `ENV` | Set an environment variable |
 | `ARG` | Set a build-time variable |
 | `WORKDIR` | Create the directory if needed and set it as the working directory |
-| `USER` | Set the default user |
+| `USER` | Set the default user (a missing named account is created at the end of the build) |
 | `ENTRYPOINT` | Becomes the template `startCmd` |
 | `CMD` | Becomes `startCmd` if no `ENTRYPOINT` is present |
 | `EXPOSE` / `VOLUME` / `LABEL` | Accepted but stored as metadata only |

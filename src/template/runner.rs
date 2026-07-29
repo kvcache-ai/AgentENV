@@ -4,9 +4,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use overlaybd::config::UpperMode;
+use shell_util::shell_quote;
 use tempfile::TempDir;
 use tokio::time::Instant;
-use tracing::{debug, Span};
+use tracing::{debug, warn, Span};
 
 use super::build_spec::TemplateBuildStep;
 use super::errors::{command_output_suffix, TemplateBuildFailure};
@@ -222,6 +223,7 @@ impl TemplateBuildRunner {
                         let build_context = step_executor
                             .execute(&sandbox, &steps, initial_context)
                             .await?;
+                        ensure_default_user(&sandbox, &build_context).await?;
                         let startup = prepare_startup(startup, override_startup, &build_context);
                         run_startup_commands(&sandbox, startup.as_ref()).await?;
                         let runtime_versions = SnapshotRuntimeVersions::probe(&sandbox).await?;
@@ -256,6 +258,70 @@ impl TemplateBuildRunner {
         match handle.join() {
             Ok(result) => result,
             Err(_) => bail!("snapshot build worker thread panicked"),
+        }
+    }
+}
+
+/// Provision the template's default user when the image does not have it.
+///
+/// envd resolves operations against the template's default user. E2B Cloud
+/// guarantees the account exists through its base images, and the e2b SDK
+/// bakes that convention in: `from_dockerfile` injects `USER user` whenever a
+/// Dockerfile does not set one. Arbitrary OCI images do not ship that
+/// account, so every SDK filesystem call against the resulting sandbox fails
+/// at runtime with envd's "invalid default user". Creating the missing
+/// account at build time aligns template builds with what E2B-compatible
+/// clients assume.
+///
+/// Numeric USER values are left alone (Docker allows a UID with no passwd
+/// entry), and an image where the account cannot be created (no useradd or
+/// adduser) keeps building with a warning rather than failing: such an image
+/// worked before this provisioning existed, and only envd calls that resolve
+/// the default user will fail.
+async fn ensure_default_user(
+    sandbox: &impl SandboxExecutor,
+    build_context: &CommandContext,
+) -> Result<()> {
+    let Some(user) = build_context.user.as_deref() else {
+        return Ok(());
+    };
+    // USER may be "name", "uid", "name:group", or "uid:gid" — the account is
+    // the part before the colon.
+    let account = user.split(':').next().unwrap_or_default().trim();
+    if account.is_empty()
+        || account == "root"
+        || account.chars().all(|c| c.is_ascii_digit())
+    {
+        return Ok(());
+    }
+
+    let quoted = shell_quote(account);
+    let script = format!(
+        "id -u {quoted} >/dev/null 2>&1 || useradd -m {quoted} 2>/dev/null || adduser -D {quoted}"
+    );
+    let result = sandbox
+        .run_command_with_opts("/bin/bash", &["-lc", &script], &ProcessOpts::default())
+        .await;
+    match result {
+        Ok(output) if output.exit_code == 0 => Ok(()),
+        Ok(output) => {
+            warn!(
+                user = account,
+                exit_code = output.exit_code,
+                "template default user is missing and could not be created; \
+                 envd operations that resolve this user will fail at runtime{}",
+                command_output_suffix(&output.stdout, &output.stderr)
+            );
+            Ok(())
+        }
+        Err(error) => {
+            warn!(
+                user = account,
+                error = %format_args!("{error:#}"),
+                "template default user is missing and could not be created; \
+                 envd operations that resolve this user will fail at runtime"
+            );
+            Ok(())
         }
     }
 }
@@ -458,7 +524,7 @@ mod tests {
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
 
-    use super::{prepare_startup, run_ready_command};
+    use super::{ensure_default_user, prepare_startup, run_ready_command};
     use crate::sandbox::{Executor, ProcessHandle, ProcessOpts, ProcessOutput, SandboxExecutor};
     use crate::snapshot::{CommandContext, StartupCommand};
 
@@ -546,6 +612,115 @@ mod tests {
             startup.context.env_vars.get("BASE").map(String::as_str),
             Some("1")
         );
+    }
+
+    /// Records the shell scripts the runner executes; reports a fixed exit code.
+    struct ScriptRecordingSandbox {
+        scripts: Mutex<Vec<String>>,
+        exit_code: i32,
+    }
+
+    impl ScriptRecordingSandbox {
+        fn with_exit_code(exit_code: i32) -> Self {
+            Self {
+                scripts: Mutex::new(Vec::new()),
+                exit_code,
+            }
+        }
+
+        fn scripts(&self) -> Vec<String> {
+            self.scripts
+                .lock()
+                .expect("scripts mutex should not be poisoned")
+                .clone()
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl SandboxExecutor for ScriptRecordingSandbox {
+        fn executor(&self) -> Result<Executor<'_>> {
+            Err(anyhow!("not used by this test"))
+        }
+
+        async fn run_command_with_opts(
+            &self,
+            _cmd: &str,
+            args: &[&str],
+            _opts: &ProcessOpts,
+        ) -> Result<ProcessOutput> {
+            self.scripts
+                .lock()
+                .expect("scripts mutex should not be poisoned")
+                .push(args.last().unwrap_or(&"").to_string());
+            Ok(ProcessOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                exit_code: self.exit_code,
+            })
+        }
+
+        async fn start_process(
+            &self,
+            _cmd: &str,
+            _args: &[&str],
+            _opts: &ProcessOpts,
+        ) -> Result<ProcessHandle> {
+            Err(anyhow!("not used by this test"))
+        }
+    }
+
+    fn context_with_user(user: Option<&str>) -> CommandContext {
+        CommandContext::default().with_user(user.map(str::to_string))
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_skips_absent_root_and_numeric_users() {
+        for user in [None, Some("root"), Some("1000"), Some("1000:1000")] {
+            let sandbox = ScriptRecordingSandbox::with_exit_code(0);
+            ensure_default_user(&sandbox, &context_with_user(user))
+                .await
+                .unwrap();
+            assert!(
+                sandbox.scripts().is_empty(),
+                "no provisioning should run for USER {user:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_creates_missing_named_user() {
+        let sandbox = ScriptRecordingSandbox::with_exit_code(0);
+        ensure_default_user(&sandbox, &context_with_user(Some("user")))
+            .await
+            .unwrap();
+        let scripts = sandbox.scripts();
+        assert_eq!(scripts.len(), 1);
+        // shell_quote leaves safe account names bare and quotes the rest.
+        assert!(scripts[0].contains("id -u user"));
+        assert!(scripts[0].contains("useradd -m user"));
+        assert!(scripts[0].contains("adduser -D user"));
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_targets_the_account_before_the_colon() {
+        let sandbox = ScriptRecordingSandbox::with_exit_code(0);
+        ensure_default_user(&sandbox, &context_with_user(Some("app:staff")))
+            .await
+            .unwrap();
+        let scripts = sandbox.scripts();
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].contains("useradd -m app"));
+        assert!(!scripts[0].contains("staff"));
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_failure_warns_but_keeps_the_build() {
+        // An image without useradd/adduser built fine before provisioning
+        // existed; a failed creation must not turn it into a build failure.
+        let sandbox = ScriptRecordingSandbox::with_exit_code(127);
+        ensure_default_user(&sandbox, &context_with_user(Some("user")))
+            .await
+            .expect("provisioning failure should not fail the build");
     }
 
     #[tokio::test]
