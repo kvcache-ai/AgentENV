@@ -47,8 +47,11 @@ pub fn run(args: Args) -> Result<()> {
     clap_complete::generate(ClapShell::from(args.shell), &mut cmd, "aenv", &mut script);
 
     let mut out = std::io::stdout().lock();
-    out.write_all(&script)?;
-    out.flush()?;
+    if let Err(err) = out.write_all(&script).and_then(|_| out.flush()) {
+        if err.kind() != std::io::ErrorKind::BrokenPipe {
+            return Err(err.into());
+        }
+    }
     Ok(())
 }
 
