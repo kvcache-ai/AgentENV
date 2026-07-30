@@ -250,6 +250,22 @@ impl SnapshotImageService {
                     .await
             }
             OverlaybdLayerRef::External(external) => {
+                // Committed snapshots record OSS-managed layers without a
+                // local file as external refs carrying the synthetic
+                // managed-layers s3 URL; their bytes live in the
+                // managed-layer store, addressed by digest.
+                if external.repo_blob_url.starts_with("s3://") {
+                    let managed = ManagedLayer {
+                        digest: external.digest.clone(),
+                        size: external.size,
+                        uuid: None,
+                    };
+                    let path = self.materialize_managed_layer(&managed, tempdir).await?;
+                    return self
+                        .regctl
+                        .blob_put(target_repository, layer_digest, &path)
+                        .await;
+                }
                 let source = SourceRegistryRepository::parse(&external.repo_blob_url)?;
                 let source_repository = format!("{}/{}", source.registry, source.repository);
                 if source.registry != target.registry {
@@ -542,6 +558,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn s3_external_layer_exports_from_managed_layer_store() {
+        let dir = TempDir::new().unwrap();
+        let service = posix_service(
+            dir.path().join("repository"),
+            install_fake_regctl(dir.path()),
+        );
+        let layer = external_ref(b"oss managed bytes", "s3://bucket/prefix/managed-layers");
+        let digest = layer_digest_size(&layer).0.to_string();
+        seed_posix_layer(
+            &dir.path().join("repository"),
+            &digest,
+            b"oss managed bytes",
+        );
+        let committed = committed_with_layers(vec![layer]);
+
+        let result = publish(&service, &committed).await.unwrap();
+
+        assert!(!result.reused);
+        assert_eq!(
+            fs::read(blob_path(dir.path(), TARGET_REPOSITORY, &digest)).unwrap(),
+            b"oss managed bytes"
+        );
+        let argv = argv_lines(dir.path());
+        assert!(argv.contains(&format!(
+            "argv:blob put {TARGET_REPOSITORY} --digest {digest}"
+        )));
+    }
+
+    #[tokio::test]
     async fn republish_is_reused_and_conflicting_ref_is_rejected() {
         let dir = TempDir::new().unwrap();
         let service = posix_service(
@@ -634,6 +679,22 @@ mod tests {
             source.image_ref(),
             format!("reg.example/team/app:snapshot-{snapshot_id}")
         );
+
+        // s3-marked OSS-managed layers are not registry sources.
+        committed.rootfs_layers = vec![
+            external_ref(b"a", SRC_URL),
+            external_ref(b"oss", "s3://bucket/prefix/managed-layers"),
+        ];
+        let mixed = resolve_snapshot_image_target(&snapshot_id, &committed, None, None).unwrap();
+        assert_eq!(
+            mixed.image_ref(),
+            format!("reg.example/team/app:snapshot-{snapshot_id}")
+        );
+        committed.rootfs_layers = vec![external_ref(b"oss", "s3://bucket/prefix/managed-layers")];
+        assert!(matches!(
+            resolve_snapshot_image_target(&snapshot_id, &committed, None, None),
+            Err(SnapshotImageTargetError::CannotInfer { .. })
+        ));
 
         for layers in [
             vec![managed_ref(b"managed")],
