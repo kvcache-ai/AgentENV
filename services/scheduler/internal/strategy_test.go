@@ -251,6 +251,92 @@ func TestLeastLoadedReconcilesReservationsFromHeartbeat(t *testing.T) {
 	}
 }
 
+func TestLeastLoadedKeepsResourcesReservedWhileSandboxIsStarting(t *testing.T) {
+	now := time.Unix(100, 0)
+	s := &LeastLoadedStrategy{now: func() time.Time { return now }}
+	node := richNode("a", 8, 0, 8_000, 0)
+	node.Snapshot.ReportedAtUnixMs = 1
+	hint := &schedulerv1.ScheduleRequestHint{
+		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+			NewColdSandbox: &schedulerv1.NewColdSandboxHint{
+				CpuCount: 2,
+				MemoryMb: 1,
+			},
+		},
+	}
+
+	if _, err := s.Select([]RichNode{node}, hint); err != nil {
+		t.Fatal(err)
+	}
+
+	node.Snapshot.ReportedAtUnixMs = 2
+	node.Snapshot.SandboxStartingCount = 1
+	pending := s.pendingResources(node)
+	if pending.count != 0 {
+		t.Fatalf("expected starting sandbox count to acknowledge pending count, got %d", pending.count)
+	}
+	if pending.cpu != 2 || pending.memoryBytes != 1024*1024 {
+		t.Fatalf(
+			"expected resources to remain reserved while starting, got cpu=%v memory=%v",
+			pending.cpu,
+			pending.memoryBytes,
+		)
+	}
+
+	node.Snapshot.ReportedAtUnixMs = 3
+	node.Snapshot.SandboxStartingCount = 0
+	node.Snapshot.SandboxCount = 1
+	node.Snapshot.AllocatedCpu = 2
+	node.Snapshot.AllocatedMemoryBytes = 1024 * 1024
+	if pending = s.pendingResources(node); pending != (pendingResources{}) {
+		t.Fatalf("expected running allocation to reconcile resources, got %+v", pending)
+	}
+	if _, exists := s.pendingByNode["a"]; exists {
+		t.Fatal("expected fully reconciled reservation state to be removed")
+	}
+}
+
+func TestLeastLoadedMatchesResourceDeltasInsteadOfConsumingFIFO(t *testing.T) {
+	now := time.Unix(100, 0)
+	s := &LeastLoadedStrategy{now: func() time.Time { return now }}
+	node := richNode("a", 8, 0, 8_000, 0)
+	node.Snapshot.ReportedAtUnixMs = 1
+	largeHint := &schedulerv1.ScheduleRequestHint{
+		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+			NewColdSandbox: &schedulerv1.NewColdSandboxHint{CpuCount: 4},
+		},
+	}
+	smallHint := &schedulerv1.ScheduleRequestHint{
+		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+			NewColdSandbox: &schedulerv1.NewColdSandboxHint{CpuCount: 1},
+		},
+	}
+
+	if _, err := s.Select([]RichNode{node}, largeHint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Select([]RichNode{node}, smallHint); err != nil {
+		t.Fatal(err)
+	}
+
+	node.Snapshot.ReportedAtUnixMs = 2
+	node.Snapshot.SandboxCount = 1
+	pending := s.pendingResources(node)
+	if pending.cpu != 5 || pending.count != 1 {
+		t.Fatalf("expected starting allocation to keep both resource reservations, got %+v", pending)
+	}
+
+	node.Snapshot.ReportedAtUnixMs = 3
+	node.Snapshot.AllocatedCpu = 1
+	pending = s.pendingResources(node)
+	if pending.cpu != 4 {
+		t.Fatalf("expected 1-CPU reservation to be reconciled, got pending CPU %v", pending.cpu)
+	}
+	if pending.count != 1 {
+		t.Fatalf("expected one sandbox count reservation to remain, got %d", pending.count)
+	}
+}
+
 func TestNewStrategyLeastLoaded(t *testing.T) {
 	if got := NewStrategy(" LEAST_LOADED ").Name(); got != "least_loaded" {
 		t.Fatalf("expected least_loaded, got %s", got)

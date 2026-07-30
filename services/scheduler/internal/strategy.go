@@ -68,17 +68,24 @@ type LeastLoadedStrategy struct {
 const defaultScheduleReservationTTL = 30 * time.Second
 
 type pendingReservation struct {
-	cpu         float64
-	memoryBytes float64
-	expiresAt   time.Time
+	cpu                   float64
+	memoryBytes           float64
+	countAcknowledged     bool
+	resourcesAcknowledged bool
+	expiresAt             time.Time
 }
 
 type pendingNodeReservations struct {
-	items             []pendingReservation
-	cpu               float64
-	memoryBytes       float64
-	reportedAtUnixMs  int64
-	observedSandboxes uint32
+	items                   []pendingReservation
+	cpu                     float64
+	memoryBytes             float64
+	pendingCount            uint32
+	reportedAtUnixMs        int64
+	observedSandboxes       uint32
+	observedAllocatedCPU    uint32
+	observedAllocatedMemory uint64
+	cpuCredit               float64
+	memoryCredit            float64
 }
 
 type pendingResources struct {
@@ -176,21 +183,29 @@ func (s *LeastLoadedStrategy) pendingResources(node RichNode) pendingResources {
 			snapshot.GetPausedSandboxCount()
 		if reportedAt > state.reportedAtUnixMs {
 			if observedSandboxes > state.observedSandboxes {
-				state.consume(observedSandboxes - state.observedSandboxes)
+				state.acknowledgeCounts(observedSandboxes - state.observedSandboxes)
 			}
+			state.updateResourceCredits(
+				snapshot.GetAllocatedCpu(),
+				snapshot.GetAllocatedMemoryBytes(),
+			)
+			state.acknowledgeResources()
+			state.compactAcknowledged()
 			state.reportedAtUnixMs = reportedAt
 			state.observedSandboxes = observedSandboxes
+			state.observedAllocatedCPU = snapshot.GetAllocatedCpu()
+			state.observedAllocatedMemory = snapshot.GetAllocatedMemoryBytes()
 		}
 	}
 
-	if len(state.items) == 0 {
+	if len(state.items) == 0 && state.pendingCount == 0 {
 		delete(s.pendingByNode, node.ID)
 		return pendingResources{}
 	}
 	return pendingResources{
 		cpu:         state.cpu,
 		memoryBytes: state.memoryBytes,
-		count:       uint32(len(state.items)),
+		count:       state.pendingCount,
 	}
 }
 
@@ -211,6 +226,8 @@ func (s *LeastLoadedStrategy) reserve(
 			state.observedSandboxes = snapshot.GetSandboxStartingCount() +
 				snapshot.GetSandboxCount() +
 				snapshot.GetPausedSandboxCount()
+			state.observedAllocatedCPU = snapshot.GetAllocatedCpu()
+			state.observedAllocatedMemory = snapshot.GetAllocatedMemoryBytes()
 		}
 		s.pendingByNode[node.ID] = state
 	}
@@ -219,34 +236,132 @@ func (s *LeastLoadedStrategy) reserve(
 		ttl = defaultScheduleReservationTTL
 	}
 	state.items = append(state.items, pendingReservation{
-		cpu:         cpu,
-		memoryBytes: memoryBytes,
-		expiresAt:   now.Add(ttl),
+		cpu:                   cpu,
+		memoryBytes:           memoryBytes,
+		resourcesAcknowledged: cpu == 0 && memoryBytes == 0,
+		expiresAt:             now.Add(ttl),
 	})
 	state.cpu += cpu
 	state.memoryBytes += memoryBytes
+	state.pendingCount++
 }
 
 func (s *pendingNodeReservations) pruneExpired(now time.Time) {
 	expired := 0
 	for expired < len(s.items) && !s.items[expired].expiresAt.After(now) {
-		s.cpu -= s.items[expired].cpu
-		s.memoryBytes -= s.items[expired].memoryBytes
+		reservation := s.items[expired]
+		if !reservation.resourcesAcknowledged {
+			s.cpu -= reservation.cpu
+			s.memoryBytes -= reservation.memoryBytes
+		}
+		if !reservation.countAcknowledged {
+			s.pendingCount--
+		}
 		expired++
 	}
 	s.items = s.items[expired:]
+	if s.cpu == 0 && s.memoryBytes == 0 {
+		s.cpuCredit = 0
+		s.memoryCredit = 0
+	}
 }
 
-func (s *pendingNodeReservations) consume(count uint32) {
-	consume := int(count)
-	if consume > len(s.items) {
-		consume = len(s.items)
+func (s *pendingNodeReservations) acknowledgeCounts(count uint32) {
+	for i := range s.items {
+		if count == 0 {
+			return
+		}
+		if s.items[i].countAcknowledged {
+			continue
+		}
+		s.items[i].countAcknowledged = true
+		s.pendingCount--
+		count--
 	}
-	for _, reservation := range s.items[:consume] {
-		s.cpu -= reservation.cpu
-		s.memoryBytes -= reservation.memoryBytes
+}
+
+func (s *pendingNodeReservations) updateResourceCredits(cpu uint32, memoryBytes uint64) {
+	if cpu >= s.observedAllocatedCPU {
+		s.cpuCredit += float64(cpu - s.observedAllocatedCPU)
+	} else {
+		s.cpuCredit = math.Max(0, s.cpuCredit-float64(s.observedAllocatedCPU-cpu))
 	}
-	s.items = s.items[consume:]
+	if memoryBytes >= s.observedAllocatedMemory {
+		s.memoryCredit += float64(memoryBytes - s.observedAllocatedMemory)
+	} else {
+		s.memoryCredit = math.Max(
+			0,
+			s.memoryCredit-float64(s.observedAllocatedMemory-memoryBytes),
+		)
+	}
+}
+
+func (s *pendingNodeReservations) acknowledgeResources() {
+	for {
+		best := -1
+		bestScore := -1.0
+		for i := range s.items {
+			item := &s.items[i]
+			if item.resourcesAcknowledged ||
+				item.cpu > s.cpuCredit ||
+				item.memoryBytes > s.memoryCredit {
+				continue
+			}
+			if !item.countAcknowledged && s.countAcknowledgedDonor(i) < 0 {
+				continue
+			}
+			score := 0.0
+			if s.cpuCredit > 0 {
+				score += item.cpu / s.cpuCredit
+			}
+			if s.memoryCredit > 0 {
+				score += item.memoryBytes / s.memoryCredit
+			}
+			if score > bestScore {
+				best = i
+				bestScore = score
+			}
+		}
+		if best < 0 {
+			break
+		}
+		item := &s.items[best]
+		if !item.countAcknowledged {
+			donor := s.countAcknowledgedDonor(best)
+			s.items[donor].countAcknowledged = false
+			item.countAcknowledged = true
+		}
+		item.resourcesAcknowledged = true
+		s.cpu -= item.cpu
+		s.memoryBytes -= item.memoryBytes
+		s.cpuCredit -= item.cpu
+		s.memoryCredit -= item.memoryBytes
+	}
+	if s.cpu == 0 && s.memoryBytes == 0 {
+		s.cpuCredit = 0
+		s.memoryCredit = 0
+	}
+}
+
+func (s *pendingNodeReservations) countAcknowledgedDonor(exclude int) int {
+	for i := range s.items {
+		if i != exclude &&
+			s.items[i].countAcknowledged &&
+			!s.items[i].resourcesAcknowledged {
+			return i
+		}
+	}
+	return -1
+}
+
+func (s *pendingNodeReservations) compactAcknowledged() {
+	kept := s.items[:0]
+	for _, item := range s.items {
+		if !item.countAcknowledged || !item.resourcesAcknowledged {
+			kept = append(kept, item)
+		}
+	}
+	s.items = kept
 }
 
 func (s *LeastLoadedStrategy) Name() string {

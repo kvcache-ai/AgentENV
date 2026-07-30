@@ -117,8 +117,9 @@ have the same projected load, it distributes those candidates round-robin.
 Selections also create short-lived projected reservations under the strategy
 lock, so concurrent requests cannot all choose the same uniquely least-loaded
 node before its next heartbeat. A newer heartbeat reconciles reservations when
-the observed sandbox count increases; failed placements age out after 30
-seconds.
+the observed sandbox count and running CPU/memory allocations increase.
+Starting sandboxes acknowledge the pending count without releasing their
+resource reservation early; failed placements age out after 30 seconds.
 
 ### Node resource limit
 
