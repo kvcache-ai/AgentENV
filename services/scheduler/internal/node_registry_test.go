@@ -48,6 +48,38 @@ func TestNodeRegistryHeartbeatRejectsUnknownNode(t *testing.T) {
 	}
 }
 
+func TestNodeRegistryObservationGenerationFollowsReceiptOrder(t *testing.T) {
+	registry := NewAtomicNodeRegistry(
+		[]Node{{ID: "node-a", Endpoint: "http://node-a"}},
+		defaultObservedReportTTL,
+	)
+	heartbeat := func(reportedAt int64) {
+		t.Helper()
+		_, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+			NodeId:            "node-a",
+			ClusterId:         "cluster-a",
+			ServiceInstanceId: "svc-a",
+			Snapshot: &schedulerv1.NodeSnapshot{
+				ReportedAtUnixMs: reportedAt,
+			},
+		}, time.UnixMilli(100))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	heartbeat(10)
+	_, first := registry.PeekObservedWithGeneration("node-a")
+	heartbeat(10)
+	_, second := registry.PeekObservedWithGeneration("node-a")
+	heartbeat(1)
+	_, third := registry.PeekObservedWithGeneration("node-a")
+
+	if first == 0 || second <= first || third <= second {
+		t.Fatalf("expected monotonic receipt generations, got %d, %d, %d", first, second, third)
+	}
+}
+
 func TestObservedNodeBecomesUnhealthyAfterTTL(t *testing.T) {
 	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, time.Second)
 	start := time.Unix(100, 0)

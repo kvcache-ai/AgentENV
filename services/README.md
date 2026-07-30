@@ -118,10 +118,11 @@ Sandbox-creation selections also create short-lived projected reservations
 under the strategy lock, so concurrent creates cannot all choose the same
 uniquely least-loaded node before its next heartbeat. Read/list and other
 requests without a creation hint do not reserve capacity. A newer heartbeat
-reconciles reservations when the observed sandbox count and running CPU/memory
-allocations increase. Starting sandboxes acknowledge the pending count without
-releasing their resource reservation early; failed placements age out after 30
-seconds.
+reconciles the projected count from the monotonic `create_successes` counter
+and resources from compatible running CPU/memory allocation deltas. Heartbeats
+are ordered by a scheduler-local receipt generation rather than the node wall
+clock. Starting sandboxes keep both count and resources reserved until success;
+failed or otherwise unconfirmed placements age out after 30 seconds.
 
 Cold-sandbox projections use CPU and memory only when the request explicitly
 provides them. If either field is omitted, the node applies its local configured

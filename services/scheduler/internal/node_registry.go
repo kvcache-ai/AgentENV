@@ -26,6 +26,10 @@ type NodeRegistry interface {
 	// and returns only the raw snapshot suitable for scheduling decisions.
 	// Returns nil if the node has never sent a heartbeat.
 	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
+	// PeekObservedWithGeneration also returns a scheduler-local, monotonically
+	// increasing receipt sequence. Strategies use it instead of node wall-clock
+	// timestamps to detect a newer heartbeat.
+	PeekObservedWithGeneration(nodeID string) (*schedulerv1.NodeSnapshot, uint64)
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
 }
 
@@ -39,6 +43,7 @@ type observedNodeRecord struct {
 	node        *schedulerv1.ObservedNode
 	p2pEndpoint *schedulerv1.P2PEndpoint
 	reportTTL   time.Duration
+	generation  uint64
 }
 
 type AtomicNodeRegistry struct {
@@ -49,6 +54,7 @@ type AtomicNodeRegistry struct {
 	observed         map[string]observedNodeRecord
 	cpuIntersection  map[string]string
 	intersectionSent map[string]bool
+	nextGeneration   uint64
 }
 
 func NewAtomicNodeRegistry(nodes []Node, observedTTL time.Duration) *AtomicNodeRegistry {
@@ -173,6 +179,8 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 		p2pEndpoint: cloneP2PEndpoint(req.GetP2PEndpoint()),
 		reportTTL:   r.observedTTL,
 	}
+	r.nextGeneration++
+	record.generation = r.nextGeneration
 	if record.node.Snapshot.GetReportedAtUnixMs() == 0 {
 		record.node.Snapshot.ReportedAtUnixMs = nowMs
 	}
@@ -332,17 +340,22 @@ func (r *AtomicNodeRegistry) GetObserved(nodeID string, clusterID string, now ti
 }
 
 func (r *AtomicNodeRegistry) PeekObserved(nodeID string) *schedulerv1.NodeSnapshot {
+	snapshot, _ := r.PeekObservedWithGeneration(nodeID)
+	return snapshot
+}
+
+func (r *AtomicNodeRegistry) PeekObservedWithGeneration(nodeID string) (*schedulerv1.NodeSnapshot, uint64) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	record, ok := r.observed[nodeID]
 	if !ok || record.node == nil {
-		return nil
+		return nil, 0
 	}
 	snapshot := record.node.GetSnapshot()
 	if snapshot == nil {
-		return nil
+		return nil, 0
 	}
-	return cloneSnapshot(snapshot)
+	return cloneSnapshot(snapshot), record.generation
 }
 
 func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID string) error {

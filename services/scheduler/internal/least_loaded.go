@@ -36,12 +36,10 @@ type pendingNodeReservations struct {
 	cpu                     float64
 	memoryBytes             float64
 	pendingCount            uint32
-	reportedAtUnixMs        int64
-	observedSandboxes       uint32
+	observedGeneration      uint64
+	observedCreateSuccesses uint64
 	observedAllocatedCPU    uint32
 	observedAllocatedMemory uint64
-	cpuCredit               float64
-	memoryCredit            float64
 }
 
 type pendingResources struct {
@@ -137,22 +135,27 @@ func (s *LeastLoadedStrategy) pendingResources(node RichNode) pendingResources {
 	}
 
 	if snapshot := node.Snapshot; snapshot != nil {
-		reportedAt := snapshot.GetReportedAtUnixMs()
-		observedSandboxes := snapshot.GetSandboxStartingCount() +
-			snapshot.GetSandboxCount() +
-			snapshot.GetPausedSandboxCount()
-		if reportedAt > state.reportedAtUnixMs {
-			if observedSandboxes > state.observedSandboxes {
-				state.acknowledgeCounts(observedSandboxes - state.observedSandboxes)
+		if node.SnapshotGeneration > state.observedGeneration {
+			if snapshot.GetCreateSuccesses() > state.observedCreateSuccesses {
+				state.acknowledgeCounts(
+					uint32(min(
+						snapshot.GetCreateSuccesses()-state.observedCreateSuccesses,
+						uint64(^uint32(0)),
+					)),
+				)
 			}
-			state.updateResourceCredits(
+			cpuDelta := positiveUint32Delta(
 				snapshot.GetAllocatedCpu(),
-				snapshot.GetAllocatedMemoryBytes(),
+				state.observedAllocatedCPU,
 			)
-			state.acknowledgeResources()
+			memoryDelta := positiveUint64Delta(
+				snapshot.GetAllocatedMemoryBytes(),
+				state.observedAllocatedMemory,
+			)
+			state.acknowledgeResources(float64(cpuDelta), float64(memoryDelta))
 			state.compactAcknowledged()
-			state.reportedAtUnixMs = reportedAt
-			state.observedSandboxes = observedSandboxes
+			state.observedGeneration = node.SnapshotGeneration
+			state.observedCreateSuccesses = snapshot.GetCreateSuccesses()
 			state.observedAllocatedCPU = snapshot.GetAllocatedCpu()
 			state.observedAllocatedMemory = snapshot.GetAllocatedMemoryBytes()
 		}
@@ -182,10 +185,8 @@ func (s *LeastLoadedStrategy) reserve(
 	if state == nil {
 		state = &pendingNodeReservations{}
 		if snapshot := node.Snapshot; snapshot != nil {
-			state.reportedAtUnixMs = snapshot.GetReportedAtUnixMs()
-			state.observedSandboxes = snapshot.GetSandboxStartingCount() +
-				snapshot.GetSandboxCount() +
-				snapshot.GetPausedSandboxCount()
+			state.observedGeneration = node.SnapshotGeneration
+			state.observedCreateSuccesses = snapshot.GetCreateSuccesses()
 			state.observedAllocatedCPU = snapshot.GetAllocatedCpu()
 			state.observedAllocatedMemory = snapshot.GetAllocatedMemoryBytes()
 		}
@@ -220,10 +221,6 @@ func (s *pendingNodeReservations) pruneExpired(now time.Time) {
 		expired++
 	}
 	s.items = s.items[expired:]
-	if s.cpu == 0 && s.memoryBytes == 0 {
-		s.cpuCredit = 0
-		s.memoryCredit = 0
-	}
 }
 
 func (s *pendingNodeReservations) acknowledgeCounts(count uint32) {
@@ -240,42 +237,40 @@ func (s *pendingNodeReservations) acknowledgeCounts(count uint32) {
 	}
 }
 
-func (s *pendingNodeReservations) updateResourceCredits(cpu uint32, memoryBytes uint64) {
-	if cpu >= s.observedAllocatedCPU {
-		s.cpuCredit += float64(cpu - s.observedAllocatedCPU)
-	} else {
-		s.cpuCredit = math.Max(0, s.cpuCredit-float64(s.observedAllocatedCPU-cpu))
+func positiveUint32Delta(current, previous uint32) uint32 {
+	if current <= previous {
+		return 0
 	}
-	if memoryBytes >= s.observedAllocatedMemory {
-		s.memoryCredit += float64(memoryBytes - s.observedAllocatedMemory)
-	} else {
-		s.memoryCredit = math.Max(
-			0,
-			s.memoryCredit-float64(s.observedAllocatedMemory-memoryBytes),
-		)
-	}
+	return current - previous
 }
 
-func (s *pendingNodeReservations) acknowledgeResources() {
+func positiveUint64Delta(current, previous uint64) uint64 {
+	if current <= previous {
+		return 0
+	}
+	return current - previous
+}
+
+func (s *pendingNodeReservations) acknowledgeResources(cpuCredit, memoryCredit float64) {
 	for {
 		best := -1
 		bestScore := -1.0
 		for i := range s.items {
 			item := &s.items[i]
 			if item.resourcesAcknowledged ||
-				item.cpu > s.cpuCredit ||
-				item.memoryBytes > s.memoryCredit {
+				item.cpu > cpuCredit ||
+				item.memoryBytes > memoryCredit {
 				continue
 			}
 			if !item.countAcknowledged && s.countAcknowledgedDonor(i) < 0 {
 				continue
 			}
 			score := 0.0
-			if s.cpuCredit > 0 {
-				score += item.cpu / s.cpuCredit
+			if cpuCredit > 0 {
+				score += item.cpu / cpuCredit
 			}
-			if s.memoryCredit > 0 {
-				score += item.memoryBytes / s.memoryCredit
+			if memoryCredit > 0 {
+				score += item.memoryBytes / memoryCredit
 			}
 			if score > bestScore {
 				best = i
@@ -294,12 +289,8 @@ func (s *pendingNodeReservations) acknowledgeResources() {
 		item.resourcesAcknowledged = true
 		s.cpu -= item.cpu
 		s.memoryBytes -= item.memoryBytes
-		s.cpuCredit -= item.cpu
-		s.memoryCredit -= item.memoryBytes
-	}
-	if s.cpu == 0 && s.memoryBytes == 0 {
-		s.cpuCredit = 0
-		s.memoryCredit = 0
+		cpuCredit -= item.cpu
+		memoryCredit -= item.memoryBytes
 	}
 }
 

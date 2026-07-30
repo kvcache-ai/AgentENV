@@ -11,7 +11,8 @@ type Node struct {
 // Strategy implementations can use Snapshot for load-aware scheduling.
 type RichNode struct {
 	Node
-	Snapshot *schedulerv1.NodeSnapshot // nil if no heartbeat received yet
+	Snapshot           *schedulerv1.NodeSnapshot // nil if no heartbeat received yet
+	SnapshotGeneration uint64                    // scheduler-local heartbeat receipt sequence
 }
 
 func (n Node) ToProto() *schedulerv1.Node {
