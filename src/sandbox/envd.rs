@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, trace};
 
+use envd::filesystem::FilesystemClient;
 use envd::http_client::apis::{configuration::Configuration, default_api};
 use envd::http_client::models::InitPostRequest;
 use envd::process::ProcessClient;
@@ -39,11 +40,22 @@ impl EnvdInstance {
     #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
     pub(crate) async fn process_client(&self) -> Result<ProcessClient> {
         trace!(grpc_address = %self.grpc_address, "connecting envd process client");
-        let result = ProcessClient::connect(&self.grpc_address)
+        let client = ProcessClient::connect(&self.grpc_address)
             .await
-            .map_err(|e| anyhow!("failed to connect process client: {e}"));
+            .context("failed to connect process client")?;
         trace!("connected to envd process client");
-        result
+        Ok(client)
+    }
+
+    /// Create a new gRPC `FilesystemClient` connected to the envd daemon.
+    #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
+    pub(crate) async fn filesystem_client(&self) -> Result<FilesystemClient> {
+        trace!(grpc_address = %self.grpc_address, "connecting envd filesystem client");
+        let client = FilesystemClient::connect(&self.grpc_address)
+            .await
+            .context("failed to connect filesystem client")?;
+        trace!("connected to envd filesystem client");
+        Ok(client)
     }
 
     #[tracing::instrument(skip(self))]

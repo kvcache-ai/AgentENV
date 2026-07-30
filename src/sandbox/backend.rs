@@ -346,6 +346,24 @@ pub trait SandboxExecutor: Send {
             .await
     }
 
+    /// Create a directory (and any missing parents) inside the sandbox.
+    ///
+    /// Goes through envd's filesystem service rather than exec'ing a binary,
+    /// so it works in images that ship no userland (scratch, distroless).
+    /// An already-existing directory is not an error.
+    ///
+    /// # Example
+    /// ```no_run
+    /// use agentenv::sandbox::SandboxExecutor;
+    /// # async fn example(sandbox: &impl SandboxExecutor) -> anyhow::Result<()> {
+    /// sandbox.create_dir_all("/home/user/work").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    async fn create_dir_all(&self, path: &str) -> Result<()> {
+        self.executor()?.create_dir_all(path).await
+    }
+
     /// Start a long-running process and return a handle.
     ///
     /// # Example

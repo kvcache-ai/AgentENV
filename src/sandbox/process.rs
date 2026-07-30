@@ -5,6 +5,7 @@ use futures::StreamExt;
 use tokio::time::Duration;
 use tonic::Request;
 
+use envd::filesystem::MakeDirRequest;
 use envd::process::{
     process_event, process_input, process_selector, ProcessClient, ProcessConfig, ProcessInput,
     ProcessSelector, SendInputRequest, SendSignalRequest, Signal, StartRequest, StartResponse,
@@ -216,6 +217,26 @@ impl<'a> Executor<'a> {
         opts: &ProcessOpts,
     ) -> Result<ProcessHandle> {
         self.start_process_inner(cmd, args, opts, true).await
+    }
+
+    /// Create a directory (and any missing parents) inside the sandbox via
+    /// envd's filesystem service, so no binary from the guest image is
+    /// involved. An already-existing directory is not an error, matching
+    /// `mkdir -p` semantics.
+    pub async fn create_dir_all(&self, path: &str) -> Result<()> {
+        let mut client = self.envd_instance.filesystem_client().await?;
+        match client
+            .make_dir(Request::new(MakeDirRequest {
+                path: path.to_string(),
+            }))
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == tonic::Code::AlreadyExists => Ok(()),
+            Err(status) => {
+                Err(status).with_context(|| format!("failed to create directory {path} via envd"))
+            }
+        }
     }
 
     /// Start a process via the envd gRPC client and return a [`ProcessHandle`].

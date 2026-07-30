@@ -36,7 +36,7 @@ impl TemplateStepExecutor {
                 }
                 TemplateBuildStepKind::Workdir { path } => {
                     let resolved = resolve_workdir(&context.workdir, &path.to_string_lossy());
-                    self.ensure_workdir(sandbox, &context, &resolved).await?;
+                    self.ensure_workdir(sandbox, &resolved).await?;
                     context = context.with_workdir(resolved);
                 }
                 TemplateBuildStepKind::User { value } => {
@@ -76,35 +76,14 @@ impl TemplateStepExecutor {
     /// Dockerfile front-ends (`aenv build` and the e2b SDK's `from_dockerfile`,
     /// which also injects a default `WORKDIR /home/user`) map WORKDIR to this
     /// step — so it must materialize the directory, not only record metadata.
-    async fn ensure_workdir(
-        &self,
-        sandbox: &impl SandboxExecutor,
-        context: &CommandContext,
-        path: &str,
-    ) -> Result<()> {
-        let opts = ProcessOpts {
-            envs: context.env_vars.clone(),
-            cwd: (!context.workdir.is_empty()).then(|| context.workdir.clone()),
-            ..ProcessOpts::default()
-        };
-
-        // mkdir directly, not through a shell: Docker creates WORKDIR without
-        // one, and minimal images may not ship bash.
-        let output = sandbox
-            .run_command_with_opts("/bin/mkdir", &["-p", "--", path], &opts)
-            .await
-            .with_context(|| {
-                TemplateBuildFailure::with_step("build step failed", format!("WORKDIR {path}"))
-            })?;
-        if output.exit_code != 0 {
-            let message = format!(
-                "build step failed: command exited with status {}{}",
-                output.exit_code,
-                command_output_suffix(&output.stdout, &output.stderr)
-            );
-            return Err(TemplateBuildFailure::with_step(message, format!("WORKDIR {path}")).into());
-        }
-        Ok(())
+    /// Creation goes through envd's filesystem service rather than exec'ing
+    /// `mkdir`: minimal images (scratch, distroless, Nix-style) may ship no
+    /// userland at all, and Docker itself creates WORKDIR without consulting
+    /// the image.
+    async fn ensure_workdir(&self, sandbox: &impl SandboxExecutor, path: &str) -> Result<()> {
+        sandbox.create_dir_all(path).await.with_context(|| {
+            TemplateBuildFailure::with_step("build step failed", format!("WORKDIR {path}"))
+        })
     }
 
     async fn run_step(
@@ -175,10 +154,10 @@ mod tests {
     use async_trait::async_trait;
 
     use super::TemplateStepExecutor;
-    use crate::template::errors::TemplateBuildFailure;
     use crate::sandbox::{Executor, ProcessHandle, ProcessOpts, ProcessOutput, SandboxExecutor};
     use crate::snapshot::CommandContext;
     use crate::template::build_spec::TemplateBuildStep;
+    use crate::template::errors::TemplateBuildFailure;
 
     struct NoopSandbox;
 
@@ -205,9 +184,12 @@ mod tests {
         }
     }
 
-    /// Records every command the executor runs and reports success for all.
+    /// One recorded executor call: (operation, args, cwd).
+    type RecordedCall = (String, Vec<String>, Option<String>);
+
+    /// Records every command and directory creation the executor performs.
     struct RecordingSandbox {
-        commands: Mutex<Vec<(String, Vec<String>, Option<String>)>>,
+        commands: Mutex<Vec<RecordedCall>>,
         exit_code: i32,
     }
 
@@ -226,7 +208,7 @@ mod tests {
             }
         }
 
-        fn commands(&self) -> Vec<(String, Vec<String>, Option<String>)> {
+        fn commands(&self) -> Vec<RecordedCall> {
             self.commands
                 .lock()
                 .expect("commands mutex should not be poisoned")
@@ -258,6 +240,17 @@ mod tests {
                 stderr: String::new(),
                 exit_code: self.exit_code,
             })
+        }
+        async fn create_dir_all(&self, path: &str) -> Result<()> {
+            self.commands
+                .lock()
+                .expect("commands mutex should not be poisoned")
+                .push(("create_dir_all".to_string(), vec![path.to_string()], None));
+            if self.exit_code == 0 {
+                Ok(())
+            } else {
+                Err(anyhow!("permission denied"))
+            }
         }
         async fn start_process(
             &self,
@@ -363,10 +356,12 @@ mod tests {
             .unwrap();
         let commands = sandbox.commands();
         assert_eq!(commands.len(), 1);
-        let (cmd, args, cwd) = &commands[0];
-        assert_eq!(cmd, "/bin/mkdir");
-        assert_eq!(args, &["-p", "--", "/app"]);
-        assert_eq!(cwd.as_deref(), Some("/")); // the default context workdir
+        let (op, args, _) = &commands[0];
+        // The directory is created through envd's filesystem service, never
+        // by exec'ing a binary from the image (which scratch/distroless
+        // images legitimately do not ship).
+        assert_eq!(op, "create_dir_all");
+        assert_eq!(args, &["/app"]);
     }
 
     #[tokio::test]
@@ -388,7 +383,7 @@ mod tests {
         assert_eq!(ctx.workdir, "/base/nested");
         let commands = sandbox.commands();
         assert_eq!(commands.len(), 2);
-        assert_eq!(commands[1].1, vec!["-p", "--", "/base/nested"]);
+        assert_eq!(commands[1].1, vec!["/base/nested"]);
     }
 
     #[tokio::test]
@@ -407,7 +402,7 @@ mod tests {
             .unwrap();
         // Docker records the normalized path, not /base/deep/../app.
         assert_eq!(ctx.workdir, "/base/app");
-        assert_eq!(sandbox.commands()[1].1, vec!["-p", "--", "/base/app"]);
+        assert_eq!(sandbox.commands()[1].1, vec!["/base/app"]);
     }
 
     #[tokio::test]
@@ -420,7 +415,7 @@ mod tests {
                 CommandContext::default(),
             )
             .await
-            .expect_err("a failed mkdir should fail the build");
+            .expect_err("a failed directory creation should fail the build");
         let failure = error
             .downcast_ref::<TemplateBuildFailure>()
             .expect("the error should be a TemplateBuildFailure");
