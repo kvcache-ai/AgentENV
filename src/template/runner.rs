@@ -279,6 +279,10 @@ impl TemplateBuildRunner {
 /// worked before this provisioning existed, and only envd calls that resolve
 /// the default user will fail. Executor errors (envd unreachable, sandbox
 /// gone) are not downgraded — they fail the build.
+///
+/// A `USER name:group` value names the account and the group independently
+/// (Docker resolves the two separately and requires no membership), so a
+/// missing named group is provisioned the same way as a missing account.
 async fn ensure_default_user(
     sandbox: &impl SandboxExecutor,
     build_context: &CommandContext,
@@ -286,34 +290,79 @@ async fn ensure_default_user(
     let Some(user) = build_context.user.as_deref() else {
         return Ok(());
     };
-    // USER may be "name", "uid", "name:group", or "uid:gid" — the account is
-    // the part before the colon.
-    let account = user.split(':').next().unwrap_or_default().trim();
-    if account.is_empty()
-        || account == "root"
-        || account.chars().all(|c| c.is_ascii_digit())
-    {
+    // USER may be "name", "uid", "name:group", or "uid:gid".
+    let (account, group) = match user.split_once(':') {
+        Some((account, group)) => (account.trim(), Some(group.trim())),
+        None => (user.trim(), None),
+    };
+
+    // The group first: if a future change binds the account to it (useradd
+    // -g), the group must already exist.
+    if let Some(group) = group {
+        ensure_entity(
+            sandbox,
+            ProvisionEntity {
+                kind: "group",
+                name: group,
+                exists_probe: "getent group",
+                create: "groupadd",
+                create_fallback: "addgroup",
+            },
+        )
+        .await?;
+    }
+    ensure_entity(
+        sandbox,
+        ProvisionEntity {
+            kind: "user",
+            name: account,
+            exists_probe: "id -u",
+            create: "useradd -m",
+            create_fallback: "adduser -D",
+        },
+    )
+    .await
+}
+
+/// One passwd/group entity the template's USER value names.
+struct ProvisionEntity<'a> {
+    kind: &'static str,
+    name: &'a str,
+    exists_probe: &'static str,
+    create: &'static str,
+    create_fallback: &'static str,
+}
+
+async fn ensure_entity(sandbox: &impl SandboxExecutor, entity: ProvisionEntity<'_>) -> Result<()> {
+    let ProvisionEntity {
+        kind,
+        name,
+        exists_probe,
+        create,
+        create_fallback,
+    } = entity;
+    if name.is_empty() || name == "root" || name.chars().all(|c| c.is_ascii_digit()) {
         return Ok(());
     }
-    // Only provision names that are plausibly Unix accounts; anything else
-    // (e.g. a value starting with "-") would be misparsed as options by the
-    // tools below, so leave it alone.
-    let mut chars = account.chars();
+    // Only provision names that are plausibly Unix accounts/groups; anything
+    // else (e.g. a value starting with "-") would be misparsed as options by
+    // the tools below, so leave it alone.
+    let mut chars = name.chars();
     let valid_name = matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-');
     if !valid_name {
         warn!(
-            user = account,
-            "template default user is not a valid account name; leaving it as-is"
+            entity = name,
+            kind, "template default {kind} is not a valid name; leaving it as-is"
         );
         return Ok(());
     }
 
-    let quoted = shell_quote(account);
+    let quoted = shell_quote(name);
     let script = format!(
-        "id -u {quoted} >/dev/null 2>&1 || useradd -m {quoted} 2>/dev/null || adduser -D {quoted}"
+        "{exists_probe} {quoted} >/dev/null 2>&1 || {create} {quoted} 2>/dev/null || {create_fallback} {quoted}"
     );
-    // /bin/sh, not bash: the images most likely to be missing the account
+    // /bin/sh, not bash: the images most likely to be missing the entry
     // (Alpine/BusyBox) are also the ones without bash, and the script is POSIX.
     let result = sandbox
         .run_command_with_opts("/bin/sh", &["-c", &script], &ProcessOpts::default())
@@ -322,19 +371,21 @@ async fn ensure_default_user(
         Ok(output) if output.exit_code == 0 => Ok(()),
         Ok(output) => {
             warn!(
-                user = account,
+                entity = name,
+                kind,
                 exit_code = output.exit_code,
-                "template default user is missing and could not be created; \
-                 envd operations that resolve this user will fail at runtime{}",
+                "template default {kind} is missing and could not be created; \
+                 envd operations that resolve it will fail at runtime{}",
                 command_output_suffix(&output.stdout, &output.stderr)
             );
             Ok(())
         }
-        // A nonzero exit means the image cannot host the account (no
-        // useradd/adduser) — that image built fine before provisioning
-        // existed, so it stays a warning. An executor error is different:
-        // envd unreachable, sandbox gone — those must fail the build.
-        Err(error) => Err(error).context("provision template default user"),
+        // A nonzero exit means the image cannot host the entry (no
+        // useradd/groupadd tooling) — that image built fine before
+        // provisioning existed, so it stays a warning. An executor error is
+        // different: envd unreachable, sandbox gone — those must fail the
+        // build.
+        Err(error) => Err(error).with_context(|| format!("provision template default {kind}")),
     }
 }
 
@@ -714,15 +765,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_user_provisioning_targets_the_account_before_the_colon() {
+    async fn default_user_provisioning_creates_the_named_group_too() {
         let sandbox = ScriptRecordingSandbox::with_exit_code(0);
         ensure_default_user(&sandbox, &context_with_user(Some("app:staff")))
             .await
             .unwrap();
         let scripts = sandbox.scripts();
+        assert_eq!(scripts.len(), 2);
+        // The group is provisioned first so a future account→group binding
+        // would find it, with the same probe-then-create fallbacks.
+        assert!(scripts[0].contains("getent group staff"));
+        assert!(scripts[0].contains("groupadd staff"));
+        assert!(scripts[0].contains("addgroup staff"));
+        assert!(scripts[1].contains("useradd -m app"));
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_leaves_numeric_gids_alone() {
+        let sandbox = ScriptRecordingSandbox::with_exit_code(0);
+        ensure_default_user(&sandbox, &context_with_user(Some("app:1000")))
+            .await
+            .unwrap();
+        let scripts = sandbox.scripts();
         assert_eq!(scripts.len(), 1);
         assert!(scripts[0].contains("useradd -m app"));
-        assert!(!scripts[0].contains("staff"));
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_skips_invalid_group_names() {
+        let sandbox = ScriptRecordingSandbox::with_exit_code(0);
+        ensure_default_user(&sandbox, &context_with_user(Some("app:-g")))
+            .await
+            .unwrap();
+        let scripts = sandbox.scripts();
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].contains("useradd -m app"));
     }
 
     #[tokio::test]
