@@ -38,7 +38,6 @@ func TestLeastLoadedUsesProjectedAllocation(t *testing.T) {
 		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
 			NewColdSandbox: &schedulerv1.NewColdSandboxHint{
 				CpuCount: 10,
-				MemoryMb: 1,
 			},
 		},
 	}
@@ -101,7 +100,7 @@ func TestLeastLoadedPrefersObservedCapacity(t *testing.T) {
 
 func TestLeastLoadedRequiresCapacityForRequestedResources(t *testing.T) {
 	s := &LeastLoadedStrategy{}
-	fullyObserved := richNode("fully-observed", 8, 7, 1_000, 900)
+	fullyObserved := richNode("fully-observed", 8, 7, 8*1024*1024, 0)
 
 	missingMemory := richNode("missing-memory", 8, 1, 0, 0)
 	memoryHint := &schedulerv1.ScheduleRequestHint{
@@ -132,6 +131,69 @@ func TestLeastLoadedRequiresCapacityForRequestedResources(t *testing.T) {
 	}
 }
 
+func TestLeastLoadedUsesCountsWhenRequestedCapacityIsUnknown(t *testing.T) {
+	s := &LeastLoadedStrategy{}
+	busy := richNode("busy", 8, 1, 0, 0)
+	busy.Snapshot.SandboxStartingCount = 10
+	quieter := richNode("quieter", 8, 1, 0, 0)
+	quieter.Snapshot.SandboxStartingCount = 1
+	hint := &schedulerv1.ScheduleRequestHint{
+		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+			NewColdSandbox: &schedulerv1.NewColdSandboxHint{MemoryMb: 1},
+		},
+	}
+
+	got, err := s.Select([]RichNode{busy, quieter}, hint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != quieter.ID {
+		t.Fatalf("expected unknown-pressure fallback to preserve sandbox counts, got %s", got.ID)
+	}
+}
+
+func TestLeastLoadedRejectsProjectedCapacityOverflow(t *testing.T) {
+	s := &LeastLoadedStrategy{}
+	full := richNode("full", 8, 8, 8_000, 8_000)
+	fit := richNode("fit", 8, 6, 8_000, 6_000)
+	hint := &schedulerv1.ScheduleRequestHint{
+		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+			NewColdSandbox: &schedulerv1.NewColdSandboxHint{
+				CpuCount: 2,
+			},
+		},
+	}
+
+	got, err := s.Select([]RichNode{full, fit}, hint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != fit.ID {
+		t.Fatalf("expected node with projected capacity, got %s", got.ID)
+	}
+
+	if _, err := s.Select([]RichNode{full}, hint); !errors.Is(err, ErrNoNodes) {
+		t.Fatalf("expected ErrNoNodes when every candidate is full, got %v", err)
+	}
+}
+
+func TestLeastLoadedRejectsOverflowFromPendingReservations(t *testing.T) {
+	s := &LeastLoadedStrategy{}
+	node := richNode("a", 8, 0, 8_000, 0)
+	hint := &schedulerv1.ScheduleRequestHint{
+		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+			NewColdSandbox: &schedulerv1.NewColdSandboxHint{CpuCount: 8},
+		},
+	}
+
+	if _, err := s.Select([]RichNode{node}, hint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Select([]RichNode{node}, hint); !errors.Is(err, ErrNoNodes) {
+		t.Fatalf("expected pending reservation to exhaust capacity, got %v", err)
+	}
+}
+
 func TestLeastLoadedRoundRobinsEqualCandidates(t *testing.T) {
 	s := &LeastLoadedStrategy{}
 	nodes := []RichNode{
@@ -150,8 +212,8 @@ func TestLeastLoadedRoundRobinsEqualCandidates(t *testing.T) {
 func TestLeastLoadedReservesConcurrentSelections(t *testing.T) {
 	s := &LeastLoadedStrategy{}
 	nodes := []RichNode{
-		richNode("a", 8, 0, 8_000, 0),
-		richNode("b", 8, 0, 8_000, 0),
+		richNode("a", 32, 0, 8_000, 0),
+		richNode("b", 32, 0, 8_000, 0),
 	}
 	hint := &schedulerv1.ScheduleRequestHint{
 		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
@@ -206,7 +268,7 @@ func TestLeastLoadedDoesNotReserveNonPlacementRequests(t *testing.T) {
 
 func TestLeastLoadedReservesNewSandboxWithoutResourceHint(t *testing.T) {
 	s := &LeastLoadedStrategy{}
-	node := richNode("a", 8, 0, 8_000, 0)
+	node := richNode("a", 8, 0, 8*1024*1024, 0)
 	hint := &schedulerv1.ScheduleRequestHint{
 		Kind: &schedulerv1.ScheduleRequestHint_NewSandbox{
 			NewSandbox: &schedulerv1.NewSandboxHint{},
@@ -254,7 +316,7 @@ func TestLeastLoadedExpiresFailedReservations(t *testing.T) {
 func TestLeastLoadedReconcilesReservationsFromHeartbeat(t *testing.T) {
 	now := time.Unix(100, 0)
 	s := &LeastLoadedStrategy{now: func() time.Time { return now }}
-	node := richNode("a", 8, 0, 8_000, 0)
+	node := richNode("a", 8, 0, 8*1024*1024, 0)
 	node.SnapshotGeneration = 1
 	node.Snapshot.ReportedAtUnixMs = 1
 	hint := &schedulerv1.ScheduleRequestHint{
@@ -285,7 +347,7 @@ func TestLeastLoadedReconcilesReservationsFromHeartbeat(t *testing.T) {
 func TestLeastLoadedKeepsResourcesReservedWhileSandboxIsStarting(t *testing.T) {
 	now := time.Unix(100, 0)
 	s := &LeastLoadedStrategy{now: func() time.Time { return now }}
-	node := richNode("a", 8, 0, 8_000, 0)
+	node := richNode("a", 8, 0, 8*1024*1024, 0)
 	node.SnapshotGeneration = 1
 	node.Snapshot.ReportedAtUnixMs = 1
 	hint := &schedulerv1.ScheduleRequestHint{
@@ -433,7 +495,7 @@ func TestLeastLoadedReleasesOldestUnconfirmedReservationOnCreateFailure(t *testi
 func TestLeastLoadedReconcilesResourceDimensionsWithoutStaleCredit(t *testing.T) {
 	now := time.Unix(100, 0)
 	s := &LeastLoadedStrategy{now: func() time.Time { return now }}
-	node := richNode("a", 8, 0, 8_000, 0)
+	node := richNode("a", 8, 0, 8*1024*1024, 0)
 	node.SnapshotGeneration = 1
 	hint := &schedulerv1.ScheduleRequestHint{
 		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
@@ -501,8 +563,8 @@ func TestLeastLoadedReducesPeakPressureOnHeterogeneousNodes(t *testing.T) {
 		},
 	}
 
-	roundRobinNodes := replayAssignments(t, &RoundRobinStrategy{}, nodes, hint, 300)
-	leastLoadedNodes := replayAssignments(t, &LeastLoadedStrategy{}, nodes, hint, 300)
+	roundRobinNodes := replayAssignments(t, &RoundRobinStrategy{}, nodes, hint, 100)
+	leastLoadedNodes := replayAssignments(t, &LeastLoadedStrategy{}, nodes, hint, 100)
 	roundRobinPeak := peakPressure(roundRobinNodes)
 	leastLoadedPeak := peakPressure(leastLoadedNodes)
 
@@ -590,6 +652,8 @@ func replayAssignments(
 			nodes[i].Snapshot.AllocatedCpu += cold.GetCpuCount()
 			nodes[i].Snapshot.AllocatedMemoryBytes += cold.GetMemoryMb() * 1024 * 1024
 			nodes[i].Snapshot.SandboxCount++
+			nodes[i].Snapshot.CreateSuccesses++
+			nodes[i].SnapshotGeneration++
 			break
 		}
 	}

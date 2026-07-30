@@ -117,6 +117,11 @@ The strategy interface receives `RichNode` values that carry the node identity (
 `least_loaded` prefers nodes with observed capacity over nodes without a usable
 heartbeat snapshot. If all candidates are unobserved, or if multiple candidates
 have the same projected load, it distributes those candidates round-robin.
+For sandbox creation, candidates whose active+paused allocation plus the
+request and pending reservations exceeds advertised CPU or memory capacity are
+excluded; scheduling returns no nodes if every observed candidate is full.
+Partial snapshots still retain their sandbox counts for fallback ranking even
+when requested-resource pressure is unknown.
 Sandbox-creation selections also create short-lived projected reservations
 under the strategy lock, so concurrent creates cannot all choose the same
 uniquely least-loaded node before its next heartbeat. Read/list and other

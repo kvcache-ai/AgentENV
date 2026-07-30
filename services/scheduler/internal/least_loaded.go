@@ -84,10 +84,16 @@ func (s *LeastLoadedStrategy) Select(nodes []RichNode, hint *schedulerv1.Schedul
 	bestCount := 0
 	for _, node := range nodes {
 		reserved := s.pendingResources(node)
+		projectedCPU := requestedCPU + reserved.cpu
+		projectedMemory := requestedMemoryBytes + reserved.memoryBytes
+		if isSandboxCreation(hint) &&
+			!fitsProjectedCapacity(node.Snapshot, projectedCPU, projectedMemory) {
+			continue
+		}
 		load := projectedNodeLoad(
 			node.Snapshot,
-			requestedCPU+reserved.cpu,
-			requestedMemoryBytes+reserved.memoryBytes,
+			projectedCPU,
+			projectedMemory,
 		)
 		load.starting += reserved.count
 		if !bestFound || lessLoaded(load, best) {
@@ -101,15 +107,24 @@ func (s *LeastLoadedStrategy) Select(nodes []RichNode, hint *schedulerv1.Schedul
 			bestCount++
 		}
 	}
+	if !bestFound {
+		return RichNode{}, ErrNoNodes
+	}
 
 	target := s.next % uint64(bestCount)
 	s.next++
 	for _, node := range nodes {
 		reserved := s.pendingResources(node)
+		projectedCPU := requestedCPU + reserved.cpu
+		projectedMemory := requestedMemoryBytes + reserved.memoryBytes
+		if isSandboxCreation(hint) &&
+			!fitsProjectedCapacity(node.Snapshot, projectedCPU, projectedMemory) {
+			continue
+		}
 		load := projectedNodeLoad(
 			node.Snapshot,
-			requestedCPU+reserved.cpu,
-			requestedMemoryBytes+reserved.memoryBytes,
+			projectedCPU,
+			projectedMemory,
 		)
 		load.starting += reserved.count
 		if !equalLoad(load, best) {
@@ -325,9 +340,14 @@ func projectedNodeLoad(snapshot *schedulerv1.NodeSnapshot, requestedCPU, request
 	if snapshot == nil {
 		return nodeLoad{}
 	}
+	load := nodeLoad{
+		starting: snapshot.GetSandboxStartingCount(),
+		running:  snapshot.GetSandboxCount(),
+		paused:   snapshot.GetPausedSandboxCount(),
+	}
 	if (requestedCPU > 0 && snapshot.GetCpuCount() == 0) ||
 		(requestedMemoryBytes > 0 && snapshot.GetMemoryTotalBytes() == 0) {
-		return nodeLoad{}
+		return load
 	}
 
 	pressure := 0.0
@@ -352,13 +372,32 @@ func projectedNodeLoad(snapshot *schedulerv1.NodeSnapshot, requestedCPU, request
 		)
 	}
 
-	return nodeLoad{
-		known:    known,
-		pressure: pressure,
-		starting: snapshot.GetSandboxStartingCount(),
-		running:  snapshot.GetSandboxCount(),
-		paused:   snapshot.GetPausedSandboxCount(),
+	load.known = known
+	load.pressure = pressure
+	return load
+}
+
+func fitsProjectedCapacity(
+	snapshot *schedulerv1.NodeSnapshot,
+	projectedCPU,
+	projectedMemoryBytes float64,
+) bool {
+	if snapshot == nil {
+		return true
 	}
+	if snapshot.GetCpuCount() > 0 &&
+		float64(snapshot.GetAllocatedCpu())+
+			float64(snapshot.GetPausedAllocatedCpu())+
+			projectedCPU > float64(snapshot.GetCpuCount()) {
+		return false
+	}
+	if snapshot.GetMemoryTotalBytes() > 0 &&
+		float64(snapshot.GetAllocatedMemoryBytes())+
+			float64(snapshot.GetPausedAllocatedMemoryBytes())+
+			projectedMemoryBytes > float64(snapshot.GetMemoryTotalBytes()) {
+		return false
+	}
+	return true
 }
 
 func requestedResources(hint *schedulerv1.ScheduleRequestHint) (cpu, memoryBytes float64) {
