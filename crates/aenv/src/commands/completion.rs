@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use clap::Args as ClapArgs;
 use clap::CommandFactory;
@@ -37,22 +38,27 @@ pub struct Args {
 /// stdout. The command tree is rebuilt from the live `Cli` derive spec via
 /// `crate::Cli::command()` so completion can never drift from the real CLI.
 pub fn run(args: Args) -> Result<()> {
-    let mut cmd = crate::Cli::command();
-    // Generate into memory first: clap_complete's generators panic on write
-    // errors (`Generator::generate` calls `.expect`), so writing straight to
-    // stdout would turn a closed downstream pipe into a panic. A `Vec` cannot
-    // fail, so generation is infallible here; only the explicit stdout write
-    // below can, and it propagates cleanly via `?`.
-    let mut script = Vec::new();
-    clap_complete::generate(ClapShell::from(args.shell), &mut cmd, "aenv", &mut script);
+    write_completion(args.shell, &mut std::io::stdout().lock())
+}
 
-    let mut out = std::io::stdout().lock();
-    if let Err(err) = out.write_all(&script).and_then(|_| out.flush()) {
-        if err.kind() != std::io::ErrorKind::BrokenPipe {
-            return Err(err.into());
-        }
+/// Generate the completion script for `shell` and write it to `out`.
+///
+/// Generation goes through an in-memory buffer first: clap_complete's
+/// generators panic on write errors (`Generator::generate` calls `.expect`),
+/// so writing straight to `out` would turn a closed downstream pipe into a
+/// panic. The buffer cannot fail, so generation is infallible; only the
+/// explicit write below can. A `BrokenPipe` there (e.g. `aenv completion bash
+/// | head`) is normal and treated as success; any other error propagates with
+/// context. Split out from `run` so the write branches are unit-testable.
+fn write_completion<W: Write>(shell: Shell, out: &mut W) -> Result<()> {
+    let mut cmd = crate::Cli::command();
+    let mut script = Vec::new();
+    clap_complete::generate(ClapShell::from(shell), &mut cmd, "aenv", &mut script);
+    match out.write_all(&script).and_then(|_| out.flush()) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(err) => Err(err).context("writing completion script to stdout"),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -60,10 +66,22 @@ mod tests {
     use super::*;
 
     fn generate_for(shell: Shell) -> String {
-        let mut cmd = crate::Cli::command();
         let mut buf = Vec::new();
-        clap_complete::generate(ClapShell::from(shell), &mut cmd, "aenv", &mut buf);
+        write_completion(shell, &mut buf).expect("writing to a Vec cannot fail");
         String::from_utf8(buf).expect("completion output is valid UTF-8")
+    }
+
+    /// Writer that always fails with a configured error kind, for exercising
+    /// `write_completion`'s error branches.
+    struct FailingWriter(std::io::ErrorKind);
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(self.0))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::from(self.0))
+        }
     }
 
     #[test]
@@ -140,6 +158,37 @@ mod tests {
         assert!(
             names.contains(&"table") && names.contains(&"json"),
             "--output should offer table and json; got {names:?}"
+        );
+    }
+
+    #[test]
+    fn write_completion_succeeds_into_buffer() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_completion(Shell::Bash, &mut buf).expect("Vec write succeeds");
+        assert!(
+            !buf.is_empty(),
+            "a completion script should have been written"
+        );
+    }
+
+    #[test]
+    fn broken_pipe_is_treated_as_success() {
+        // `aenv completion bash | head` closes the pipe early; that must exit
+        // cleanly rather than error or panic.
+        let mut out = FailingWriter(std::io::ErrorKind::BrokenPipe);
+        write_completion(Shell::Bash, &mut out)
+            .expect("BrokenPipe during completion output should not error");
+    }
+
+    #[test]
+    fn other_io_error_propagates() {
+        let mut out = FailingWriter(std::io::ErrorKind::Other);
+        let err = write_completion(Shell::Bash, &mut out)
+            .expect_err("non-BrokenPipe I/O errors should propagate");
+        assert!(
+            err.to_string()
+                .contains("writing completion script to stdout"),
+            "error should carry completion context; got: {err}"
         );
     }
 }
