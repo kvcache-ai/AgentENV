@@ -922,12 +922,15 @@ mod tests {
         use std::io::Write;
         use std::os::unix::fs::PermissionsExt;
 
-        let argv_path = dir.join("argv");
         let stdout_path = dir.join("stdout");
         let stderr_path = dir.join("stderr");
         std::fs::write(&stdout_path, stdout).expect("write stdout fixture");
         std::fs::write(&stderr_path, stderr).expect("write stderr fixture");
 
+        // The script locates its fixtures relative to `$0` rather than
+        // embedding absolute paths, so a TMPDIR containing shell
+        // metacharacters cannot break or inject into the generated script.
+        //
         // Staged write + rename so the binary is never observed half-written or
         // non-executable, matching how the real dependency installer stages
         // downloads.
@@ -937,10 +940,7 @@ mod tests {
             let mut file = std::fs::File::create(&staged).expect("create fake regctl");
             write!(
                 file,
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{argv}'\ncat '{stdout}'\ncat '{stderr}' >&2\nexit {exit_code}\n",
-                argv = argv_path.display(),
-                stdout = stdout_path.display(),
-                stderr = stderr_path.display(),
+                "#!/bin/sh\ndir=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nprintf '%s\\n' \"$@\" > \"$dir/argv\"\ncat \"$dir/stdout\"\ncat \"$dir/stderr\" >&2\nexit {exit_code}\n",
             )
             .expect("write fake regctl");
             file.sync_all().expect("sync fake regctl");
