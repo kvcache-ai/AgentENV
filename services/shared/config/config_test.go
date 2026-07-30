@@ -76,6 +76,35 @@ func TestLoadAppliesSchedulerPlacementReservationTTLEnv(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsNonPositiveSchedulerPlacementReservationTTL(t *testing.T) {
+	for _, value := range []string{"0s", "-1s"} {
+		t.Run(value, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			path := filepath.Join(tmpDir, "config.json")
+			content := fmt.Sprintf(`{
+				"scheduler": {
+					"placement_reservation_ttl": %q
+				}
+			}`, value)
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatalf("write config file failed: %v", err)
+			}
+
+			if _, err := Load(path, "scheduler"); err == nil {
+				t.Fatalf("expected placement reservation ttl %s to fail", value)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsNonPositiveSchedulerPlacementReservationTTLEnv(t *testing.T) {
+	t.Setenv("SCHEDULER_PLACEMENT_RESERVATION_TTL", "0s")
+
+	if _, err := Load("", "scheduler"); err == nil {
+		t.Fatal("expected zero placement reservation ttl environment value to fail")
+	}
+}
+
 func TestLoadSchedulerAllowsQueryOnlyWithRedisWithoutNodes(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "config.json")

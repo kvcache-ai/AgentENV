@@ -383,6 +383,37 @@ func TestLeastLoadedUsesCreateSuccessWhenNetSandboxCountIsUnchanged(t *testing.T
 	}
 }
 
+func TestLeastLoadedReleasesOldestUnconfirmedReservationOnCreateFailure(t *testing.T) {
+	now := time.Unix(100, 0)
+	s := &LeastLoadedStrategy{now: func() time.Time { return now }}
+	node := richNode("a", 8, 0, 8_000, 0)
+	node.SnapshotGeneration = 1
+	largeHint := &schedulerv1.ScheduleRequestHint{
+		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+			NewColdSandbox: &schedulerv1.NewColdSandboxHint{CpuCount: 4},
+		},
+	}
+	smallHint := &schedulerv1.ScheduleRequestHint{
+		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
+			NewColdSandbox: &schedulerv1.NewColdSandboxHint{CpuCount: 1},
+		},
+	}
+
+	if _, err := s.Select([]RichNode{node}, largeHint); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Select([]RichNode{node}, smallHint); err != nil {
+		t.Fatal(err)
+	}
+
+	node.SnapshotGeneration = 2
+	node.Snapshot.CreateFails = 1
+	pending := s.pendingResources(node)
+	if pending.cpu != 1 || pending.count != 1 {
+		t.Fatalf("expected oldest failed reservation to be released, got %+v", pending)
+	}
+}
+
 func TestLeastLoadedDiscardsUnmatchedResourceCreditPerHeartbeat(t *testing.T) {
 	now := time.Unix(100, 0)
 	s := &LeastLoadedStrategy{now: func() time.Time { return now }}

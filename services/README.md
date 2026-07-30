@@ -125,7 +125,9 @@ reconciles the projected count from the monotonic `create_successes` counter
 and resources from compatible running CPU/memory allocation deltas. Heartbeats
 are ordered by a scheduler-local receipt generation rather than the node wall
 clock. Starting sandboxes keep both count and resources reserved until success;
-failed or otherwise unconfirmed placements age out after 30 seconds.
+an increase in `create_fails` immediately releases the oldest unconfirmed
+reservation. Placements with no observed outcome use the configurable stale
+fallback below.
 
 Cold-sandbox projections use CPU and memory only when the request explicitly
 provides them. If either field is omitted, the node applies its local configured

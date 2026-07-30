@@ -414,9 +414,6 @@ func (c *Config) applyDefaults() {
 	if c.Scheduler.BindingTTL <= 0 {
 		c.Scheduler.BindingTTL = 30 * time.Second
 	}
-	if c.Scheduler.PlacementReservationTTL <= 0 {
-		c.Scheduler.PlacementReservationTTL = 10 * time.Minute
-	}
 	if strings.TrimSpace(c.Scheduler.Discovery.Mode) == "" {
 		c.Scheduler.Discovery.Mode = "static"
 	}

@@ -38,6 +38,7 @@ type pendingNodeReservations struct {
 	pendingCount            uint32
 	observedGeneration      uint64
 	observedCreateSuccesses uint64
+	observedCreateFails     uint64
 	observedAllocatedCPU    uint32
 	observedAllocatedMemory uint64
 }
@@ -136,6 +137,14 @@ func (s *LeastLoadedStrategy) pendingResources(node RichNode) pendingResources {
 
 	if snapshot := node.Snapshot; snapshot != nil {
 		if node.SnapshotGeneration > state.observedGeneration {
+			if snapshot.GetCreateFails() > state.observedCreateFails {
+				state.acknowledgeFailures(
+					uint32(min(
+						snapshot.GetCreateFails()-state.observedCreateFails,
+						uint64(^uint32(0)),
+					)),
+				)
+			}
 			if snapshot.GetCreateSuccesses() > state.observedCreateSuccesses {
 				state.acknowledgeCounts(
 					uint32(min(
@@ -156,6 +165,7 @@ func (s *LeastLoadedStrategy) pendingResources(node RichNode) pendingResources {
 			state.compactAcknowledged()
 			state.observedGeneration = node.SnapshotGeneration
 			state.observedCreateSuccesses = snapshot.GetCreateSuccesses()
+			state.observedCreateFails = snapshot.GetCreateFails()
 			state.observedAllocatedCPU = snapshot.GetAllocatedCpu()
 			state.observedAllocatedMemory = snapshot.GetAllocatedMemoryBytes()
 		}
@@ -187,6 +197,7 @@ func (s *LeastLoadedStrategy) reserve(
 		if snapshot := node.Snapshot; snapshot != nil {
 			state.observedGeneration = node.SnapshotGeneration
 			state.observedCreateSuccesses = snapshot.GetCreateSuccesses()
+			state.observedCreateFails = snapshot.GetCreateFails()
 			state.observedAllocatedCPU = snapshot.GetAllocatedCpu()
 			state.observedAllocatedMemory = snapshot.GetAllocatedMemoryBytes()
 		}
@@ -235,6 +246,26 @@ func (s *pendingNodeReservations) acknowledgeCounts(count uint32) {
 		s.pendingCount--
 		count--
 	}
+}
+
+func (s *pendingNodeReservations) acknowledgeFailures(count uint32) {
+	if count == 0 {
+		return
+	}
+	kept := s.items[:0]
+	for _, item := range s.items {
+		if count > 0 && !item.countAcknowledged {
+			if !item.resourcesAcknowledged {
+				s.cpu -= item.cpu
+				s.memoryBytes -= item.memoryBytes
+			}
+			s.pendingCount--
+			count--
+			continue
+		}
+		kept = append(kept, item)
+	}
+	s.items = kept
 }
 
 func positiveUint32Delta(current, previous uint32) uint32 {
