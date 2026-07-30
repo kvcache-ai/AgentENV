@@ -38,8 +38,16 @@ pub struct Args {
 /// `crate::Cli::command()` so completion can never drift from the real CLI.
 pub fn run(args: Args) -> Result<()> {
     let mut cmd = crate::Cli::command();
-    let mut out = std::io::stdout();
-    clap_complete::generate(ClapShell::from(args.shell), &mut cmd, "aenv", &mut out);
+    // Generate into memory first: clap_complete's generators panic on write
+    // errors (`Generator::generate` calls `.expect`), so writing straight to
+    // stdout would turn a closed downstream pipe into a panic. A `Vec` cannot
+    // fail, so generation is infallible here; only the explicit stdout write
+    // below can, and it propagates cleanly via `?`.
+    let mut script = Vec::new();
+    clap_complete::generate(ClapShell::from(args.shell), &mut cmd, "aenv", &mut script);
+
+    let mut out = std::io::stdout().lock();
+    out.write_all(&script)?;
     out.flush()?;
     Ok(())
 }
@@ -84,37 +92,35 @@ mod tests {
 
     #[test]
     fn includes_alias_cn() {
-        // `cn` is a visible alias for `connect`; clap_complete emits visible
-        // aliases, so it must appear in the generated script. (None of the
-        // canonical command names contain the substring "cn", so its presence is
-        // a clean signal that aliases flow through.)
+        // Assert a bash-specific dispatch fragment rather than a bare substring:
+        // the `aenv,cn)` arm exists only because `cn` is a registered alias for
+        // the top-level `connect` command.
         let s = generate_for(Shell::Bash);
         assert!(
-            s.contains("cn"),
-            "completion should reference the `cn` alias for connect; got:\n{s}"
+            s.contains("aenv,cn)"),
+            "completion should dispatch the `cn` alias; got:\n{s}"
         );
     }
 
     #[test]
     fn includes_subcommands() {
-        // Subcommand groups flow through from the derive spec: `snapshot`
-        // exposes a `create` child, so both must appear in the script. (`create`
-        // is unique to `snapshot create` — no top-level command uses it.)
+        // This hierarchical dispatch key exists only when `create` is emitted as
+        // a child of `snapshot`.
         let s = generate_for(Shell::Bash);
         assert!(
-            s.contains("snapshot") && s.contains("create"),
-            "completion should reference the `snapshot` command and its `create` \
-             subcommand; got:\n{s}"
+            s.contains("aenv__subcmd__snapshot__subcmd__create"),
+            "completion should register `snapshot create` as a subcommand; got:\n{s}"
         );
     }
 
     #[test]
     fn includes_output_enum_table_json() {
-        // Proves the `--output` Format ValueEnum (Table/Json) flows through.
+        // The `--output` enum is emitted as a bash `compgen -W` word list; this
+        // fragment exists only for that option's possible values.
         let s = generate_for(Shell::Bash);
         assert!(
-            s.contains("table") && s.contains("json"),
-            "completion should enumerate the --output values (table, json); got:\n{s}"
+            s.contains("compgen -W \"table json\""),
+            "completion should offer the --output values (table, json); got:\n{s}"
         );
     }
 }
