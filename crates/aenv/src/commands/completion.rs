@@ -94,36 +94,52 @@ mod tests {
     }
 
     #[test]
-    fn includes_alias_cn() {
-        // Assert a bash-specific dispatch fragment rather than a bare substring:
-        // the `aenv,cn)` arm exists only because `cn` is a registered alias for
-        // the top-level `connect` command.
-        let s = generate_for(Shell::Bash);
+    fn connect_exposes_cn_alias() {
+        // Assert on the Command tree, not on clap_complete's generated bash
+        // dispatch format: the internal `aenv,cn)` / `__subcmd__` naming is an
+        // implementation detail a compatible clap_complete upgrade could rename
+        // even though completion still works. If `connect` declares `cn` as a
+        // visible alias, clap_complete emits it — that contract is ours.
+        let cmd = crate::Cli::command();
+        let connect = cmd
+            .find_subcommand("connect")
+            .expect("`connect` command exists");
         assert!(
-            s.contains("aenv,cn)"),
-            "completion should dispatch the `cn` alias; got:\n{s}"
+            connect.get_visible_aliases().any(|a| a == "cn"),
+            "`connect` should declare `cn` as a visible alias"
         );
     }
 
     #[test]
-    fn includes_subcommands() {
-        // This hierarchical dispatch key exists only when `create` is emitted as
-        // a child of `snapshot`.
-        let s = generate_for(Shell::Bash);
+    fn snapshot_exposes_create_subcommand() {
+        // See `connect_exposes_cn_alias`: assert on the Command tree, not on
+        // clap_complete's internal bash helper naming.
+        let cmd = crate::Cli::command();
+        let snapshot = cmd
+            .find_subcommand("snapshot")
+            .expect("`snapshot` command exists");
         assert!(
-            s.contains("aenv__subcmd__snapshot__subcmd__create"),
-            "completion should register `snapshot create` as a subcommand; got:\n{s}"
+            snapshot.find_subcommand("create").is_some(),
+            "`snapshot` should expose a `create` subcommand"
         );
     }
 
     #[test]
-    fn includes_output_enum_table_json() {
-        // The `--output` enum is emitted as a bash `compgen -W` word list; this
-        // fragment exists only for that option's possible values.
-        let s = generate_for(Shell::Bash);
+    fn output_arg_offers_table_and_json() {
+        // Assert on the argument metadata: the exact `compgen -W "table json"`
+        // string is clap_complete's bash formatting, which a compatible upgrade
+        // could change. The possible values are defined on the `--output` arg.
+        let cmd = crate::Cli::command();
+        let list = cmd.find_subcommand("list").expect("`list` command exists");
+        let output = list
+            .get_arguments()
+            .find(|a| a.get_long() == Some("output"))
+            .expect("`list` should declare an --output argument");
+        let possible = output.get_possible_values();
+        let names: Vec<&str> = possible.iter().map(|v| v.get_name()).collect();
         assert!(
-            s.contains("compgen -W \"table json\""),
-            "completion should offer the --output values (table, json); got:\n{s}"
+            names.contains(&"table") && names.contains(&"json"),
+            "--output should offer table and json; got {names:?}"
         );
     }
 }
