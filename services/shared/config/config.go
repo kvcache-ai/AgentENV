@@ -63,6 +63,7 @@ type SchedulerConfig struct {
 	Strategy                string                   `json:"strategy"`
 	ReportTTL               time.Duration            `json:"report_ttl"`
 	BindingTTL              time.Duration            `json:"binding_ttl"`
+	PlacementReservationTTL time.Duration            `json:"placement_reservation_ttl"`
 	RedisAddr               string                   `json:"redis_addr"`
 	ArtifactStoreCapacity   int                      `json:"artifact_store_capacity"`
 	ArtifactLookupNodeLimit int                      `json:"artifact_lookup_node_limit"`
@@ -78,6 +79,7 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		Strategy                *string                   `json:"strategy"`
 		ReportTTL               json.RawMessage           `json:"report_ttl"`
 		BindingTTL              json.RawMessage           `json:"binding_ttl"`
+		PlacementReservationTTL json.RawMessage           `json:"placement_reservation_ttl"`
 		RedisAddr               *string                   `json:"redis_addr"`
 		ArtifactStoreCapacity   *int                      `json:"artifact_store_capacity"`
 		ArtifactLookupNodeLimit *int                      `json:"artifact_lookup_node_limit"`
@@ -132,6 +134,16 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		s.BindingTTL = d
+	}
+	if len(bytes.TrimSpace(parsed.PlacementReservationTTL)) > 0 {
+		d, err := parseSchedulerDuration(
+			parsed.PlacementReservationTTL,
+			"scheduler.placement_reservation_ttl",
+		)
+		if err != nil {
+			return err
+		}
+		s.PlacementReservationTTL = d
 	}
 
 	return nil
@@ -285,6 +297,7 @@ func defaultConfig(service string) Config {
 			Strategy:                "round_robin",
 			ReportTTL:               30 * time.Second,
 			BindingTTL:              30 * time.Second,
+			PlacementReservationTTL: 10 * time.Minute,
 			ArtifactStoreCapacity:   defaultSchedulerArtifactStoreCapacity,
 			ArtifactLookupNodeLimit: 0,
 			Nodes: []Node{
@@ -335,6 +348,13 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid SCHEDULER_BINDING_TTL %q: %w", v, err)
 		}
 		cfg.Scheduler.BindingTTL = d
+	}
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_PLACEMENT_RESERVATION_TTL")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_PLACEMENT_RESERVATION_TTL %q: %w", v, err)
+		}
+		cfg.Scheduler.PlacementReservationTTL = d
 	}
 
 	if v := strings.TrimSpace(os.Getenv("SCHEDULER_ARTIFACT_STORE_CAPACITY")); v != "" {
@@ -394,6 +414,9 @@ func (c *Config) applyDefaults() {
 	if c.Scheduler.BindingTTL <= 0 {
 		c.Scheduler.BindingTTL = 30 * time.Second
 	}
+	if c.Scheduler.PlacementReservationTTL <= 0 {
+		c.Scheduler.PlacementReservationTTL = 10 * time.Minute
+	}
 	if strings.TrimSpace(c.Scheduler.Discovery.Mode) == "" {
 		c.Scheduler.Discovery.Mode = "static"
 	}
@@ -436,6 +459,9 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 		if c.Scheduler.BindingTTL <= 0 {
 			return errors.New("scheduler.binding_ttl must be greater than zero")
+		}
+		if c.Scheduler.PlacementReservationTTL <= 0 {
+			return errors.New("scheduler.placement_reservation_ttl must be greater than zero")
 		}
 		if schedulerQueryOnly {
 			if strings.TrimSpace(c.Scheduler.RedisAddr) == "" {

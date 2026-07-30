@@ -21,7 +21,7 @@ type LeastLoadedStrategy struct {
 	reservationTTL time.Duration
 }
 
-const defaultScheduleReservationTTL = 30 * time.Second
+const defaultScheduleReservationTTL = 10 * time.Minute
 
 type pendingReservation struct {
 	cpu                   float64
@@ -252,39 +252,13 @@ func positiveUint64Delta(current, previous uint64) uint64 {
 }
 
 func (s *pendingNodeReservations) acknowledgeResources(cpuCredit, memoryCredit float64) {
-	for {
-		best := -1
-		bestScore := -1.0
-		for i := range s.items {
-			item := &s.items[i]
-			if item.resourcesAcknowledged ||
-				item.cpu > cpuCredit ||
-				item.memoryBytes > memoryCredit {
-				continue
-			}
-			if !item.countAcknowledged && s.countAcknowledgedDonor(i) < 0 {
-				continue
-			}
-			score := 0.0
-			if cpuCredit > 0 {
-				score += item.cpu / cpuCredit
-			}
-			if memoryCredit > 0 {
-				score += item.memoryBytes / memoryCredit
-			}
-			if score > bestScore {
-				best = i
-				bestScore = score
-			}
-		}
-		if best < 0 {
-			break
-		}
-		item := &s.items[best]
-		if !item.countAcknowledged {
-			donor := s.countAcknowledgedDonor(best)
-			s.items[donor].countAcknowledged = false
-			item.countAcknowledged = true
+	for i := range s.items {
+		item := &s.items[i]
+		if !item.countAcknowledged ||
+			item.resourcesAcknowledged ||
+			item.cpu > cpuCredit ||
+			item.memoryBytes > memoryCredit {
+			continue
 		}
 		item.resourcesAcknowledged = true
 		s.cpu -= item.cpu
@@ -292,17 +266,6 @@ func (s *pendingNodeReservations) acknowledgeResources(cpuCredit, memoryCredit f
 		cpuCredit -= item.cpu
 		memoryCredit -= item.memoryBytes
 	}
-}
-
-func (s *pendingNodeReservations) countAcknowledgedDonor(exclude int) int {
-	for i := range s.items {
-		if i != exclude &&
-			s.items[i].countAcknowledged &&
-			!s.items[i].resourcesAcknowledged {
-			return i
-		}
-	}
-	return -1
 }
 
 func (s *pendingNodeReservations) compactAcknowledged() {

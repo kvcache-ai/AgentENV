@@ -29,6 +29,9 @@ func TestDefaultSchedulerDiscoveryModeIsStatic(t *testing.T) {
 	if got := cfg.Scheduler.BindingTTL; got != 30*time.Second {
 		t.Fatalf("expected scheduler binding ttl 30s, got %s", got)
 	}
+	if got := cfg.Scheduler.PlacementReservationTTL; got != 10*time.Minute {
+		t.Fatalf("expected scheduler placement reservation ttl 10m, got %s", got)
+	}
 	if got := cfg.Scheduler.MetricsListenAddr; got != ":9101" {
 		t.Fatalf("expected scheduler metrics listen addr :9101, got %q", got)
 	}
@@ -37,6 +40,39 @@ func TestDefaultSchedulerDiscoveryModeIsStatic(t *testing.T) {
 	}
 	if got := cfg.Scheduler.ArtifactLookupNodeLimit; got != 0 {
 		t.Fatalf("expected scheduler artifact lookup node limit 0, got %d", got)
+	}
+}
+
+func TestLoadParsesSchedulerPlacementReservationTTL(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"scheduler": {
+			"placement_reservation_ttl": "15m"
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	cfg, err := Load(path, "scheduler")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if got := cfg.Scheduler.PlacementReservationTTL; got != 15*time.Minute {
+		t.Fatalf("expected placement reservation ttl 15m, got %s", got)
+	}
+}
+
+func TestLoadAppliesSchedulerPlacementReservationTTLEnv(t *testing.T) {
+	t.Setenv("SCHEDULER_PLACEMENT_RESERVATION_TTL", "20m")
+
+	cfg, err := Load("", "scheduler")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if got := cfg.Scheduler.PlacementReservationTTL; got != 20*time.Minute {
+		t.Fatalf("expected placement reservation ttl 20m, got %s", got)
 	}
 }
 

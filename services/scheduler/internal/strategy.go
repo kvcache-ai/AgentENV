@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
 )
@@ -49,12 +50,30 @@ func (s *RandomStrategy) Name() string {
 	return "random"
 }
 
-func NewStrategy(name string) Strategy {
+type strategyConfig struct {
+	placementReservationTTL time.Duration
+}
+
+type StrategyOption func(*strategyConfig)
+
+func WithPlacementReservationTTL(ttl time.Duration) StrategyOption {
+	return func(cfg *strategyConfig) {
+		if ttl > 0 {
+			cfg.placementReservationTTL = ttl
+		}
+	}
+}
+
+func NewStrategy(name string, opts ...StrategyOption) Strategy {
+	cfg := strategyConfig{placementReservationTTL: defaultScheduleReservationTTL}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "random":
 		return NewRandomStrategy()
 	case "least_loaded":
-		return &LeastLoadedStrategy{}
+		return &LeastLoadedStrategy{reservationTTL: cfg.placementReservationTTL}
 	case "round_robin":
 		fallthrough
 	default:

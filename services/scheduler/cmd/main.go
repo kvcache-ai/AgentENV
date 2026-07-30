@@ -69,7 +69,10 @@ func main() {
 		svc := scheduler.NewService(
 			logger,
 			registry,
-			scheduler.NewStrategy(cfg.Scheduler.Strategy),
+			scheduler.NewStrategy(
+				cfg.Scheduler.Strategy,
+				scheduler.WithPlacementReservationTTL(cfg.Scheduler.PlacementReservationTTL),
+			),
 			store,
 			scheduler.WithArtifactStore(scheduler.NewInMemoryArtifactStore(
 				cfg.Scheduler.ArtifactStoreCapacity,

@@ -315,7 +315,7 @@ func TestLeastLoadedKeepsResourcesReservedWhileSandboxIsStarting(t *testing.T) {
 	}
 }
 
-func TestLeastLoadedMatchesResourceDeltasInsteadOfConsumingFIFO(t *testing.T) {
+func TestLeastLoadedKeepsAmbiguousDifferentlySizedReservations(t *testing.T) {
 	now := time.Unix(100, 0)
 	s := &LeastLoadedStrategy{now: func() time.Time { return now }}
 	node := richNode("a", 8, 0, 8_000, 0)
@@ -350,8 +350,8 @@ func TestLeastLoadedMatchesResourceDeltasInsteadOfConsumingFIFO(t *testing.T) {
 	node.Snapshot.CreateSuccesses = 1
 	node.Snapshot.AllocatedCpu = 1
 	pending = s.pendingResources(node)
-	if pending.cpu != 4 {
-		t.Fatalf("expected 1-CPU reservation to be reconciled, got pending CPU %v", pending.cpu)
+	if pending.cpu != 5 {
+		t.Fatalf("expected ambiguous resource reservations to remain projected, got pending CPU %v", pending.cpu)
 	}
 	if pending.count != 1 {
 		t.Fatalf("expected one sandbox count reservation to remain, got %d", pending.count)
@@ -422,6 +422,20 @@ func TestLeastLoadedDiscardsUnmatchedResourceCreditPerHeartbeat(t *testing.T) {
 func TestNewStrategyLeastLoaded(t *testing.T) {
 	if got := NewStrategy(" LEAST_LOADED ").Name(); got != "least_loaded" {
 		t.Fatalf("expected least_loaded, got %s", got)
+	}
+}
+
+func TestNewStrategyAppliesPlacementReservationTTL(t *testing.T) {
+	strategy := NewStrategy(
+		"least_loaded",
+		WithPlacementReservationTTL(15*time.Minute),
+	)
+	leastLoaded, ok := strategy.(*LeastLoadedStrategy)
+	if !ok {
+		t.Fatalf("expected LeastLoadedStrategy, got %T", strategy)
+	}
+	if got := leastLoaded.reservationTTL; got != 15*time.Minute {
+		t.Fatalf("expected 15m reservation TTL, got %s", got)
 	}
 }
 

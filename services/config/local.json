@@ -7,6 +7,7 @@
     "strategy": "round_robin",
     "report_ttl": "30s",
     "binding_ttl": "30s",
+    "placement_reservation_ttl": "10m",
     "redis_addr": "",
     "nodes": [
       {
