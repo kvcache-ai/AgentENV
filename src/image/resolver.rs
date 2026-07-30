@@ -772,13 +772,16 @@ mod tests {
     #[test]
     fn parse_overlaybd_referrer_selects_first_of_acr_per_platform_referrers() {
         // Captured from `regctl artifact list --format body` against a real ACR
-        // registry for a multi-arch tag, with the generic
+        // registry, using a multi-arch *tag* as the subject, with the generic
         // `org.opencontainers.image.*` annotations elided for readability.
         //
-        // ACR attaches one streaming referrer per platform, all sharing the
-        // same artifactType, so a multi-arch subject legitimately yields
-        // several matches and the "multiple referrers" path is the normal case
-        // rather than an oddity. Selection stays first-match.
+        // ACR attaches one streaming referrer per platform, all sharing the same
+        // artifactType, so an index subject yields several matches. The resolver
+        // never passes an index: `resolve_fetched_manifest` hands
+        // `FetchedManifest::selected_image_ref` to discovery, which is already
+        // pinned to the platform-resolved manifest digest, and such a subject
+        // carries exactly one referrer. This multi-match shape is therefore a
+        // defensive lock on first-match selection rather than the common path.
         let body = json!({
             "schemaVersion": 2,
             "mediaType": "application/vnd.oci.image.index.v1+json",
