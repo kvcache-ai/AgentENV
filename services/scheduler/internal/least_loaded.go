@@ -24,11 +24,12 @@ type LeastLoadedStrategy struct {
 const defaultScheduleReservationTTL = 10 * time.Minute
 
 type pendingReservation struct {
-	cpu                   float64
-	memoryBytes           float64
-	countAcknowledged     bool
-	resourcesAcknowledged bool
-	expiresAt             time.Time
+	cpu                float64
+	memoryBytes        float64
+	countAcknowledged  bool
+	cpuAcknowledged    bool
+	memoryAcknowledged bool
+	expiresAt          time.Time
 }
 
 type pendingNodeReservations struct {
@@ -208,10 +209,11 @@ func (s *LeastLoadedStrategy) reserve(
 		ttl = defaultScheduleReservationTTL
 	}
 	state.items = append(state.items, pendingReservation{
-		cpu:                   cpu,
-		memoryBytes:           memoryBytes,
-		resourcesAcknowledged: cpu == 0 && memoryBytes == 0,
-		expiresAt:             now.Add(ttl),
+		cpu:                cpu,
+		memoryBytes:        memoryBytes,
+		cpuAcknowledged:    cpu == 0,
+		memoryAcknowledged: memoryBytes == 0,
+		expiresAt:          now.Add(ttl),
 	})
 	state.cpu += cpu
 	state.memoryBytes += memoryBytes
@@ -222,8 +224,10 @@ func (s *pendingNodeReservations) pruneExpired(now time.Time) {
 	expired := 0
 	for expired < len(s.items) && !s.items[expired].expiresAt.After(now) {
 		reservation := s.items[expired]
-		if !reservation.resourcesAcknowledged {
+		if !reservation.cpuAcknowledged {
 			s.cpu -= reservation.cpu
+		}
+		if !reservation.memoryAcknowledged {
 			s.memoryBytes -= reservation.memoryBytes
 		}
 		if !reservation.countAcknowledged {
@@ -255,8 +259,10 @@ func (s *pendingNodeReservations) acknowledgeFailures(count uint32) {
 	kept := s.items[:0]
 	for _, item := range s.items {
 		if count > 0 && !item.countAcknowledged {
-			if !item.resourcesAcknowledged {
+			if !item.cpuAcknowledged {
 				s.cpu -= item.cpu
+			}
+			if !item.memoryAcknowledged {
 				s.memoryBytes -= item.memoryBytes
 			}
 			s.pendingCount--
@@ -285,24 +291,26 @@ func positiveUint64Delta(current, previous uint64) uint64 {
 func (s *pendingNodeReservations) acknowledgeResources(cpuCredit, memoryCredit float64) {
 	for i := range s.items {
 		item := &s.items[i]
-		if !item.countAcknowledged ||
-			item.resourcesAcknowledged ||
-			item.cpu > cpuCredit ||
-			item.memoryBytes > memoryCredit {
+		if !item.countAcknowledged {
 			continue
 		}
-		item.resourcesAcknowledged = true
-		s.cpu -= item.cpu
-		s.memoryBytes -= item.memoryBytes
-		cpuCredit -= item.cpu
-		memoryCredit -= item.memoryBytes
+		if !item.cpuAcknowledged && item.cpu <= cpuCredit {
+			item.cpuAcknowledged = true
+			s.cpu -= item.cpu
+			cpuCredit -= item.cpu
+		}
+		if !item.memoryAcknowledged && item.memoryBytes <= memoryCredit {
+			item.memoryAcknowledged = true
+			s.memoryBytes -= item.memoryBytes
+			memoryCredit -= item.memoryBytes
+		}
 	}
 }
 
 func (s *pendingNodeReservations) compactAcknowledged() {
 	kept := s.items[:0]
 	for _, item := range s.items {
-		if !item.countAcknowledged || !item.resourcesAcknowledged {
+		if !item.countAcknowledged || !item.cpuAcknowledged || !item.memoryAcknowledged {
 			kept = append(kept, item)
 		}
 	}
@@ -328,14 +336,18 @@ func projectedNodeLoad(snapshot *schedulerv1.NodeSnapshot, requestedCPU, request
 		known = true
 		pressure = math.Max(
 			pressure,
-			(float64(snapshot.GetAllocatedCpu())+requestedCPU)/float64(snapshot.GetCpuCount()),
+			(float64(snapshot.GetAllocatedCpu())+
+				float64(snapshot.GetPausedAllocatedCpu())+
+				requestedCPU)/float64(snapshot.GetCpuCount()),
 		)
 	}
 	if snapshot.GetMemoryTotalBytes() > 0 {
 		known = true
 		pressure = math.Max(
 			pressure,
-			(float64(snapshot.GetAllocatedMemoryBytes())+requestedMemoryBytes)/
+			(float64(snapshot.GetAllocatedMemoryBytes())+
+				float64(snapshot.GetPausedAllocatedMemoryBytes())+
+				requestedMemoryBytes)/
 				float64(snapshot.GetMemoryTotalBytes()),
 		)
 	}

@@ -110,7 +110,7 @@ General config notes:
 |---|---|
 | `round_robin` (default) | Cycles through eligible nodes in stable order |
 | `random` | Picks a uniformly random eligible node |
-| `least_loaded` | Minimizes projected CPU/memory allocation pressure using heartbeat data; uses starting/running/paused counts as tie-breakers and round-robins equal candidates |
+| `least_loaded` | Minimizes projected active+paused CPU/memory allocation pressure using heartbeat data; uses starting/running/paused counts as tie-breakers and round-robins equal candidates |
 
 The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). `least_loaded` uses the snapshot and, for cold sandbox creation, the requested CPU and memory scheduling hint. The other built-in strategies ignore the snapshot.
 
@@ -124,7 +124,9 @@ requests without a creation hint do not reserve capacity. A newer heartbeat
 reconciles the projected count from the monotonic `create_successes` counter
 and resources from compatible running CPU/memory allocation deltas. Heartbeats
 are ordered by a scheduler-local receipt generation rather than the node wall
-clock. Starting sandboxes keep both count and resources reserved until success;
+clock. CPU and memory acknowledgements are independent, so fields that become
+consistent in different heartbeats release only their corresponding dimension.
+Starting sandboxes keep both count and resources reserved until success;
 an increase in `create_fails` immediately releases the oldest unconfirmed
 reservation. Placements with no observed outcome use the configurable stale
 fallback below.

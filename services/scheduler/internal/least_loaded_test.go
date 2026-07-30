@@ -67,6 +67,22 @@ func TestLeastLoadedUsesStartingAndSandboxCountsAsTieBreakers(t *testing.T) {
 	}
 }
 
+func TestLeastLoadedIncludesPausedResourcesInPressure(t *testing.T) {
+	s := &LeastLoadedStrategy{}
+	paused := richNode("paused-heavy", 8, 0, 1_000, 0)
+	paused.Snapshot.PausedAllocatedCpu = 6
+	paused.Snapshot.PausedAllocatedMemoryBytes = 750
+	active := richNode("active", 8, 4, 1_000, 500)
+
+	got, err := s.Select([]RichNode{paused, active}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != active.ID {
+		t.Fatalf("expected node with lower active+paused pressure, got %s", got.ID)
+	}
+}
+
 func TestLeastLoadedPrefersObservedCapacity(t *testing.T) {
 	s := &LeastLoadedStrategy{}
 	nodes := []RichNode{
@@ -414,7 +430,7 @@ func TestLeastLoadedReleasesOldestUnconfirmedReservationOnCreateFailure(t *testi
 	}
 }
 
-func TestLeastLoadedDiscardsUnmatchedResourceCreditPerHeartbeat(t *testing.T) {
+func TestLeastLoadedReconcilesResourceDimensionsWithoutStaleCredit(t *testing.T) {
 	now := time.Unix(100, 0)
 	s := &LeastLoadedStrategy{now: func() time.Time { return now }}
 	node := richNode("a", 8, 0, 8_000, 0)
@@ -435,8 +451,8 @@ func TestLeastLoadedDiscardsUnmatchedResourceCreditPerHeartbeat(t *testing.T) {
 	node.Snapshot.CreateSuccesses = 1
 	node.Snapshot.AllocatedCpu = 1
 	pending := s.pendingResources(node)
-	if pending.cpu != 1 || pending.memoryBytes != 1024*1024 {
-		t.Fatalf("expected incomplete resource delta to remain pending, got %+v", pending)
+	if pending.cpu != 0 || pending.memoryBytes != 1024*1024 {
+		t.Fatalf("expected only CPU dimension to reconcile, got %+v", pending)
 	}
 
 	if _, err := s.Select([]RichNode{node}, hint); err != nil {
@@ -445,8 +461,8 @@ func TestLeastLoadedDiscardsUnmatchedResourceCreditPerHeartbeat(t *testing.T) {
 	node.SnapshotGeneration = 3
 	node.Snapshot.AllocatedMemoryBytes = 1024 * 1024
 	pending = s.pendingResources(node)
-	if pending.cpu != 2 || pending.memoryBytes != 2*1024*1024 {
-		t.Fatalf("expected stale CPU credit not to acknowledge a later reservation, got %+v", pending)
+	if pending.cpu != 1 || pending.memoryBytes != 1024*1024 || pending.count != 1 {
+		t.Fatalf("expected first reservation to finish without credit leaking to the second, got %+v", pending)
 	}
 }
 
