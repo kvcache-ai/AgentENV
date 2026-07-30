@@ -114,12 +114,20 @@ The strategy interface receives `RichNode` values that carry the node identity (
 `least_loaded` prefers nodes with observed capacity over nodes without a usable
 heartbeat snapshot. If all candidates are unobserved, or if multiple candidates
 have the same projected load, it distributes those candidates round-robin.
-Selections also create short-lived projected reservations under the strategy
-lock, so concurrent requests cannot all choose the same uniquely least-loaded
-node before its next heartbeat. A newer heartbeat reconciles reservations when
-the observed sandbox count and running CPU/memory allocations increase.
-Starting sandboxes acknowledge the pending count without releasing their
-resource reservation early; failed placements age out after 30 seconds.
+Sandbox-creation selections also create short-lived projected reservations
+under the strategy lock, so concurrent creates cannot all choose the same
+uniquely least-loaded node before its next heartbeat. Read/list and other
+requests without a creation hint do not reserve capacity. A newer heartbeat
+reconciles reservations when the observed sandbox count and running CPU/memory
+allocations increase. Starting sandboxes acknowledge the pending count without
+releasing their resource reservation early; failed placements age out after 30
+seconds.
+
+Cold-sandbox projections use CPU and memory only when the request explicitly
+provides them. If either field is omitted, the node applies its local configured
+default, which is not currently included in `NodeSnapshot`; the scheduler
+therefore reserves the sandbox count but cannot project that default resource
+dimension until the reporting protocol exposes it.
 
 ### Node resource limit
 
