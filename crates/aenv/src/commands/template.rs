@@ -20,13 +20,13 @@ pub struct Args {
 #[derive(Subcommand)]
 enum Sub {
     /// List all templates
-    #[command(alias = "ls")]
+    #[command(visible_alias = "ls")]
     List {
         #[arg(long, value_enum)]
         output: Option<Format>,
     },
     /// Delete a template by ID or name
-    #[command(alias = "rm")]
+    #[command(visible_alias = "rm")]
     Delete { template: String },
     /// Watch a template build until it succeeds or fails
     Watch { template: String },

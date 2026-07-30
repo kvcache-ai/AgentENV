@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod build;
+pub mod completion;
 pub mod connect;
 pub mod delete;
 pub mod download;

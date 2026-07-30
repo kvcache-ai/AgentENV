@@ -12,6 +12,7 @@ anyhow = "1"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 crossterm = "0.28"
 directories = "5"
 envd = { path = "../../thirdparty/envd" }

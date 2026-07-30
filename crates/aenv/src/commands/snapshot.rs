@@ -27,7 +27,7 @@ enum Sub {
         name: Option<String>,
     },
     /// List persistent snapshots
-    #[command(alias = "ls")]
+    #[command(visible_alias = "ls")]
     List {
         /// Filter snapshots by source sandbox ID
         #[arg(long = "sandbox-id")]
