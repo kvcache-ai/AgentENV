@@ -102,6 +102,5 @@ sandbox.kill()
 AgentENV is compatible with the E2B CLI, but we recommend using the
 [aenv CLI](../getting-started/aenv-cli.md) for AgentENV workflows.
 
-For edit–sync–run loops from a local checkout (agents, CI, maintainers),
-use [Crabbox](./crabbox.md). Its `e2b` provider requires AgentENV's optional
-host-based sandbox proxy domain in addition to the control-plane API URL.
+For sync-and-run loops from a local checkout, [Crabbox](./crabbox.md) is a
+third-party client that speaks the same API.

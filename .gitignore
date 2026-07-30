@@ -63,9 +63,6 @@ Temporary Items
 env/
 .env
 
-# Local openclaw/crabbox project config (copy from config/crabbox.example.yaml)
-.crabbox.yaml
-
 # OpenAPI Generator
 .openapi-generator/
 
