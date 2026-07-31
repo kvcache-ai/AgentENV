@@ -2,6 +2,8 @@
 
 > **Use this guide when standard KVM is unavailable**, which commonly happens on cloud VMs where nested virtualization is not exposed. If standard KVM already works, use the [Quick Start](../getting-started/quickstart.md) instead.
 
+> This feature is **EXPERIMENTAL**. The PVM feature has not yet been merged into the mainline Linux kernel, and the forked kernel may not receive the same level of testing and security updates as the mainline kernel.
+
 PVM, originally proposed in the paper [*PVM: Efficient Shadow Paging for Deploying Secure Containers in Cloud-native Environment*](https://dl.acm.org/doi/10.1145/3600006.3613158), is an alternative virtualization mode that can provide the KVM-compatible interface required by AgentENV without relying on conventional nested virtualization. After the PVM host environment is installed, AgentENV still uses `/dev/kvm` to create Firecracker microVMs.
 
 Compared with a normal KVM deployment, a PVM deployment adds two host-level steps:
