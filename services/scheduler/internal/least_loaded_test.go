@@ -461,7 +461,7 @@ func TestLeastLoadedUsesCreateSuccessWhenNetSandboxCountIsUnchanged(t *testing.T
 	}
 }
 
-func TestLeastLoadedReleasesOldestUnconfirmedReservationOnCreateFailure(t *testing.T) {
+func TestLeastLoadedDoesNotAttributeAggregateCreateFailure(t *testing.T) {
 	now := time.Unix(100, 0)
 	s := &LeastLoadedStrategy{now: func() time.Time { return now }}
 	node := richNode("a", 8, 0, 8_000, 0)
@@ -487,8 +487,26 @@ func TestLeastLoadedReleasesOldestUnconfirmedReservationOnCreateFailure(t *testi
 	node.SnapshotGeneration = 2
 	node.Snapshot.CreateFails = 1
 	pending := s.pendingResources(node)
-	if pending.cpu != 1 || pending.count != 1 {
-		t.Fatalf("expected oldest failed reservation to be released, got %+v", pending)
+	if pending.cpu != 5 || pending.count != 2 {
+		t.Fatalf("expected uncorrelated failure to leave reservations intact, got %+v", pending)
+	}
+}
+
+func TestLeastLoadedRejectsUnknownTemplateResourcesAtKnownCapacity(t *testing.T) {
+	s := &LeastLoadedStrategy{}
+	hint := &schedulerv1.ScheduleRequestHint{
+		Kind: &schedulerv1.ScheduleRequestHint_NewSandbox{
+			NewSandbox: &schedulerv1.NewSandboxHint{},
+		},
+	}
+
+	for _, node := range []RichNode{
+		richNode("cpu-full", 8, 8, 8_000, 0),
+		richNode("memory-full", 8, 0, 8_000, 8_000),
+	} {
+		if _, err := s.Select([]RichNode{node}, hint); err != ErrNoNodes {
+			t.Fatalf("expected %s to reject unknown template resources, got %v", node.ID, err)
+		}
 	}
 }
 

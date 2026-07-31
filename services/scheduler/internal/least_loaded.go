@@ -39,7 +39,6 @@ type pendingNodeReservations struct {
 	pendingCount            uint32
 	observedGeneration      uint64
 	observedCreateSuccesses uint64
-	observedCreateFails     uint64
 	observedAllocatedCPU    uint32
 	observedAllocatedMemory uint64
 }
@@ -67,6 +66,7 @@ func (s *LeastLoadedStrategy) Select(nodes []RichNode, hint *schedulerv1.Schedul
 	defer s.mu.Unlock()
 
 	requestedCPU, requestedMemoryBytes := requestedResources(hint)
+	resourcesUnknown := isTemplateSandboxCreation(hint)
 	now := time.Now()
 	if s.now != nil {
 		now = s.now()
@@ -87,7 +87,12 @@ func (s *LeastLoadedStrategy) Select(nodes []RichNode, hint *schedulerv1.Schedul
 		projectedCPU := requestedCPU + reserved.cpu
 		projectedMemory := requestedMemoryBytes + reserved.memoryBytes
 		if isSandboxCreation(hint) &&
-			!fitsProjectedCapacity(node.Snapshot, projectedCPU, projectedMemory) {
+			!fitsProjectedCapacity(
+				node.Snapshot,
+				projectedCPU,
+				projectedMemory,
+				resourcesUnknown,
+			) {
 			continue
 		}
 		load := projectedNodeLoad(
@@ -118,7 +123,12 @@ func (s *LeastLoadedStrategy) Select(nodes []RichNode, hint *schedulerv1.Schedul
 		projectedCPU := requestedCPU + reserved.cpu
 		projectedMemory := requestedMemoryBytes + reserved.memoryBytes
 		if isSandboxCreation(hint) &&
-			!fitsProjectedCapacity(node.Snapshot, projectedCPU, projectedMemory) {
+			!fitsProjectedCapacity(
+				node.Snapshot,
+				projectedCPU,
+				projectedMemory,
+				resourcesUnknown,
+			) {
 			continue
 		}
 		load := projectedNodeLoad(
@@ -153,14 +163,6 @@ func (s *LeastLoadedStrategy) pendingResources(node RichNode) pendingResources {
 
 	if snapshot := node.Snapshot; snapshot != nil {
 		if node.SnapshotGeneration > state.observedGeneration {
-			if snapshot.GetCreateFails() > state.observedCreateFails {
-				state.acknowledgeFailures(
-					uint32(min(
-						snapshot.GetCreateFails()-state.observedCreateFails,
-						uint64(^uint32(0)),
-					)),
-				)
-			}
 			if snapshot.GetCreateSuccesses() > state.observedCreateSuccesses {
 				state.acknowledgeCounts(
 					uint32(min(
@@ -181,7 +183,6 @@ func (s *LeastLoadedStrategy) pendingResources(node RichNode) pendingResources {
 			state.compactAcknowledged()
 			state.observedGeneration = node.SnapshotGeneration
 			state.observedCreateSuccesses = snapshot.GetCreateSuccesses()
-			state.observedCreateFails = snapshot.GetCreateFails()
 			state.observedAllocatedCPU = snapshot.GetAllocatedCpu()
 			state.observedAllocatedMemory = snapshot.GetAllocatedMemoryBytes()
 		}
@@ -213,7 +214,6 @@ func (s *LeastLoadedStrategy) reserve(
 		if snapshot := node.Snapshot; snapshot != nil {
 			state.observedGeneration = node.SnapshotGeneration
 			state.observedCreateSuccesses = snapshot.GetCreateSuccesses()
-			state.observedCreateFails = snapshot.GetCreateFails()
 			state.observedAllocatedCPU = snapshot.GetAllocatedCpu()
 			state.observedAllocatedMemory = snapshot.GetAllocatedMemoryBytes()
 		}
@@ -265,28 +265,6 @@ func (s *pendingNodeReservations) acknowledgeCounts(count uint32) {
 		s.pendingCount--
 		count--
 	}
-}
-
-func (s *pendingNodeReservations) acknowledgeFailures(count uint32) {
-	if count == 0 {
-		return
-	}
-	kept := s.items[:0]
-	for _, item := range s.items {
-		if count > 0 && !item.countAcknowledged {
-			if !item.cpuAcknowledged {
-				s.cpu -= item.cpu
-			}
-			if !item.memoryAcknowledged {
-				s.memoryBytes -= item.memoryBytes
-			}
-			s.pendingCount--
-			count--
-			continue
-		}
-		kept = append(kept, item)
-	}
-	s.items = kept
 }
 
 func positiveUint32Delta(current, previous uint32) uint32 {
@@ -381,21 +359,28 @@ func fitsProjectedCapacity(
 	snapshot *schedulerv1.NodeSnapshot,
 	projectedCPU,
 	projectedMemoryBytes float64,
+	resourcesUnknown bool,
 ) bool {
 	if snapshot == nil {
 		return true
 	}
-	if snapshot.GetCpuCount() > 0 &&
-		float64(snapshot.GetAllocatedCpu())+
-			float64(snapshot.GetPausedAllocatedCpu())+
-			projectedCPU > float64(snapshot.GetCpuCount()) {
-		return false
+	if snapshot.GetCpuCount() > 0 {
+		projectedAllocatedCPU := float64(snapshot.GetAllocatedCpu()) +
+			float64(snapshot.GetPausedAllocatedCpu()) +
+			projectedCPU
+		if projectedAllocatedCPU > float64(snapshot.GetCpuCount()) ||
+			resourcesUnknown && projectedAllocatedCPU >= float64(snapshot.GetCpuCount()) {
+			return false
+		}
 	}
-	if snapshot.GetMemoryTotalBytes() > 0 &&
-		float64(snapshot.GetAllocatedMemoryBytes())+
-			float64(snapshot.GetPausedAllocatedMemoryBytes())+
-			projectedMemoryBytes > float64(snapshot.GetMemoryTotalBytes()) {
-		return false
+	if snapshot.GetMemoryTotalBytes() > 0 {
+		projectedAllocatedMemory := float64(snapshot.GetAllocatedMemoryBytes()) +
+			float64(snapshot.GetPausedAllocatedMemoryBytes()) +
+			projectedMemoryBytes
+		if projectedAllocatedMemory > float64(snapshot.GetMemoryTotalBytes()) ||
+			resourcesUnknown && projectedAllocatedMemory >= float64(snapshot.GetMemoryTotalBytes()) {
+			return false
+		}
 	}
 	return true
 }
@@ -416,6 +401,11 @@ func isSandboxCreation(hint *schedulerv1.ScheduleRequestHint) bool {
 	default:
 		return false
 	}
+}
+
+func isTemplateSandboxCreation(hint *schedulerv1.ScheduleRequestHint) bool {
+	_, ok := hint.GetKind().(*schedulerv1.ScheduleRequestHint_NewSandbox)
+	return ok
 }
 
 func lessLoaded(a, b nodeLoad) bool {
