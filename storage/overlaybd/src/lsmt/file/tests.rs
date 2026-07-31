@@ -479,11 +479,33 @@ async fn rejects_sealed_index_offset_out_of_bounds() {
 }
 
 #[tokio::test]
+async fn rejects_sealed_index_offset_before_header() {
+    let temp_dir = TempDir::new().unwrap();
+    let data = create_sealed_layer(&temp_dir, "index-before-header", 8192, &[(0, 0x12)]).await;
+
+    update_trailer(&data, |trailer| {
+        trailer.index_offset = U64::new(HEADER_SIZE - 1);
+    })
+    .await;
+
+    let err = open_file_ro(data as Arc<dyn VirtualFile>)
+        .await
+        .err()
+        .expect("index offset inside the header should be rejected");
+    assert_err_contains(&err, "index offset");
+}
+
+#[tokio::test]
 async fn rejects_sealed_index_size_out_of_bounds() {
     let temp_dir = TempDir::new().unwrap();
     let data = create_sealed_layer(&temp_dir, "bad-index-size", 8192, &[(0, 0x22)]).await;
     let file_size = data.size().await.unwrap();
-    let bad_index_size = file_size / size_of::<DiskSegmentMapping>() as u64 + 1;
+    let trailer = verify_ht(&(data.clone() as Arc<dyn VirtualFile>), true, file_size)
+        .await
+        .unwrap();
+    let stride = size_of::<DiskSegmentMapping>() as u64;
+    let remaining = file_size - HEADER_SIZE - trailer.index_offset.get();
+    let bad_index_size = remaining / stride + 1;
 
     update_trailer(&data, |trailer| {
         trailer.index_size = U64::new(bad_index_size);
