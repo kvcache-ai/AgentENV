@@ -1065,7 +1065,7 @@ fn push_compact_segment(
     zero_detected: bool,
     segment: &mut SegmentMapping,
     index: &mut Vec<SegmentMapping>,
-) {
+) -> Result<()> {
     if zero_detected {
         segment.zeroed = true;
     } else {
@@ -1075,6 +1075,9 @@ fn push_compact_segment(
     }
 
     *prev_end_blocks += segment.length() as usize;
+    index
+        .try_reserve_exact(1)
+        .context("failed to reserve zero-detection compact mapping")?;
     index.push(*segment);
 
     let next_moffset = segment.mend();
@@ -1083,6 +1086,7 @@ fn push_compact_segment(
     segment.segment.offset = next_offset;
     segment.segment.length = 0;
     segment.moffset = next_moffset;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1114,8 +1118,41 @@ struct CompactChunk {
     /// Total data bytes in this chunk (sum of entry lengths).
     /// Always `<= writer.buffer_size()`.
     total_len: usize,
-    /// Insertion order so parallel results can be merged correctly.
-    order: usize,
+}
+
+pub(super) fn validate_compaction_memory(
+    input_mappings: usize,
+    output_mappings: usize,
+    active_buffers: usize,
+    buffer_size: usize,
+) -> Result<()> {
+    let input_bytes = input_mappings
+        .checked_mul(size_of::<SegmentMapping>())
+        .context("compaction input memory size overflow")?;
+    // Conservatively assume one chunk per output mapping. Charge twice the
+    // chunk and entry storage because `try_reserve` may grow those vectors
+    // geometrically, then include a pending result mapping, the final compact
+    // mapping, and its serialized form even though some lifetimes do not
+    // overlap.
+    let output_bytes_per_mapping = 2 * size_of::<CompactChunkEntry>()
+        + 2 * size_of::<CompactChunk>()
+        + 2 * size_of::<SegmentMapping>()
+        + size_of::<DiskSegmentMapping>();
+    let output_bytes = output_mappings
+        .checked_mul(output_bytes_per_mapping)
+        .context("compaction output memory size overflow")?;
+    let buffer_bytes = active_buffers
+        .checked_mul(buffer_size)
+        .context("compaction buffer memory size overflow")?;
+    let peak_bytes = input_bytes
+        .checked_add(output_bytes)
+        .and_then(|bytes| bytes.checked_add(buffer_bytes))
+        .context("compaction peak memory size overflow")?;
+    ensure!(
+        peak_bytes <= MAX_INDEX_MEMORY_BYTES,
+        "compaction peak index memory {peak_bytes} exceeds limit {MAX_INDEX_MEMORY_BYTES}"
+    );
+    Ok(())
 }
 
 /// Read all entries in `chunk` into a single writer-provided buffer and
@@ -1130,7 +1167,10 @@ async fn compact_copy_chunk(
     let mut buf = writer.alloc_buffer().await?;
     let buf_slice = buf.as_mut().as_mut();
     let mut buf_offset = 0usize;
-    let mut index = Vec::with_capacity(chunk.entries.len());
+    let mut index = Vec::new();
+    index
+        .try_reserve_exact(chunk.entries.len())
+        .context("failed to reserve compact chunk result mappings")?;
 
     for entry in &chunk.entries {
         let layer_idx = entry.tag as usize;
@@ -1200,7 +1240,9 @@ async fn compact_copy_mapping_with_zero_detection(
 
     let mut index = Vec::new();
     let mut segment = SegmentMapping::new(mapping.offset(), 0, moffset, false, mapping.tag);
-    let mut data = Vec::with_capacity(buf_size);
+    let mut data = Vec::new();
+    data.try_reserve_exact(buf_size)
+        .context("failed to reserve zero-detection compact buffer")?;
 
     while remaining > 0 {
         let step = min(remaining as usize, buf_size);
@@ -1231,7 +1273,7 @@ async fn compact_copy_mapping_with_zero_detection(
                         false,
                         &mut segment,
                         &mut index,
-                    );
+                    )?;
                 }
                 segment.segment.length += 1;
                 zero_detected = true;
@@ -1247,7 +1289,7 @@ async fn compact_copy_mapping_with_zero_detection(
                     true,
                     &mut segment,
                     &mut index,
-                );
+                )?;
             }
             segment.segment.length += 1;
             zero_detected = false;
@@ -1262,7 +1304,7 @@ async fn compact_copy_mapping_with_zero_detection(
                 have_detection && zero_detected,
                 &mut segment,
                 &mut index,
-            );
+            )?;
         }
 
         if !data.is_empty() {
@@ -1331,8 +1373,16 @@ pub async fn compact_to(
 
     let writer = commit_args.writer;
     let concurrency = commit_args.concurrency.max(1);
+    let buf_size = writer.buffer_size();
+    ensure!(
+        buf_size.is_multiple_of(ALIGNMENT_USIZE),
+        "CompactWriter buffer size {buf_size} not aligned"
+    );
 
     validate_index_memory(mappings.len() as u64)?;
+    // `compact_index` reserves this capacity immediately below, so include it
+    // in the working set before allocating.
+    validate_compaction_memory(mappings.len(), mappings.len(), 0, buf_size)?;
     let mut compact_index: Vec<SegmentMapping> = Vec::new();
     reserve_compact_index(&mut compact_index, mappings.len())?;
 
@@ -1344,12 +1394,35 @@ pub async fn compact_to(
         // per mapping, so we cannot pre-chunk or pre-compute offsets.
         for m in mappings {
             if m.zeroed {
+                let output_mappings = compact_index
+                    .len()
+                    .checked_add(1)
+                    .context("compaction output mapping count overflow")?;
+                validate_compaction_memory(
+                    mappings.len(),
+                    output_mappings.max(mappings.len()),
+                    0,
+                    buf_size,
+                )?;
                 let mut zero = *m;
                 zero.moffset = dest_moffset;
                 reserve_compact_index(&mut compact_index, 1)?;
                 compact_index.push(zero);
                 continue;
             }
+            // Zero detection can emit at most one run per logical block.
+            let max_entries = usize::try_from(m.length())
+                .context("zero-detection mapping length does not fit usize")?;
+            let max_output_mappings = compact_index
+                .len()
+                .checked_add(max_entries)
+                .context("compaction output mapping count overflow")?;
+            validate_compaction_memory(
+                mappings.len(),
+                max_output_mappings.max(mappings.len()),
+                1,
+                buf_size,
+            )?;
             let (written_blocks, entries) = compact_copy_mapping_with_zero_detection(
                 src_layers,
                 writer.as_ref(),
@@ -1370,17 +1443,21 @@ pub async fn compact_to(
         //
         // Zeroed mappings don't consume destination space — they are recorded
         // directly in `compact_index` and skipped during chunking.
-        let buf_size = writer.buffer_size();
-        ensure!(
-            buf_size.is_multiple_of(ALIGNMENT_USIZE),
-            "CompactWriter buffer size {buf_size} not aligned"
-        );
         let mut chunks: Vec<CompactChunk> = Vec::new();
         let mut current_chunk: Option<CompactChunk> = None;
-        let mut chunk_order = 0usize;
+        let mut planned_output_mappings = 0usize;
 
         for m in mappings {
             if m.zeroed {
+                planned_output_mappings = planned_output_mappings
+                    .checked_add(1)
+                    .context("compaction output mapping count overflow")?;
+                validate_compaction_memory(
+                    mappings.len(),
+                    planned_output_mappings.max(mappings.len()),
+                    concurrency.min(chunks.len() + usize::from(current_chunk.is_some())),
+                    buf_size,
+                )?;
                 let mut zero = *m;
                 zero.moffset = dest_moffset;
                 reserve_compact_index(&mut compact_index, 1)?;
@@ -1395,20 +1472,28 @@ pub async fn compact_to(
             let mut logical_off = m.offset();
 
             while remaining > 0 {
-                let chunk = current_chunk.get_or_insert_with(|| {
-                    let c = CompactChunk {
-                        entries: Vec::new(),
-                        dest_moffset,
-                        total_len: 0,
-                        order: chunk_order,
-                    };
-                    chunk_order += 1;
-                    c
+                let chunk = current_chunk.get_or_insert_with(|| CompactChunk {
+                    entries: Vec::new(),
+                    dest_moffset,
+                    total_len: 0,
                 });
 
                 let space = buf_size - chunk.total_len;
                 let take = remaining.min(space);
 
+                planned_output_mappings = planned_output_mappings
+                    .checked_add(1)
+                    .context("compaction output mapping count overflow")?;
+                validate_compaction_memory(
+                    mappings.len(),
+                    planned_output_mappings.max(mappings.len()),
+                    concurrency.min(chunks.len() + 1),
+                    buf_size,
+                )?;
+                chunk
+                    .entries
+                    .try_reserve(1)
+                    .context("failed to reserve compact chunk entry")?;
                 chunk.entries.push(CompactChunkEntry {
                     tag: m.tag,
                     src_offset: src_off,
@@ -1424,12 +1509,18 @@ pub async fn compact_to(
                 dest_moffset += blocks_taken;
 
                 if chunk.total_len >= buf_size {
+                    chunks
+                        .try_reserve(1)
+                        .context("failed to reserve compact chunk")?;
                     chunks.push(current_chunk.take().unwrap());
                 }
             }
         }
         // Flush remaining partial chunk.
         if let Some(chunk) = current_chunk.take() {
+            chunks
+                .try_reserve(1)
+                .context("failed to reserve compact chunk")?;
             chunks.push(chunk);
         }
 
@@ -1443,7 +1534,7 @@ pub async fn compact_to(
         } else {
             let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
             let src_layers: Arc<[Arc<dyn VirtualFile>]> = Arc::from(src_layers.to_vec());
-            let mut results: Vec<(usize, Vec<SegmentMapping>)> = stream::iter(chunks)
+            let mut results = stream::iter(chunks)
                 .map(|chunk| {
                     let sem = semaphore.clone();
                     let writer = writer.clone();
@@ -1451,16 +1542,12 @@ pub async fn compact_to(
                     async move {
                         let _permit = sem.acquire().await.context("semaphore closed")?;
                         let entries = compact_copy_chunk(&layers, writer.as_ref(), &chunk).await?;
-                        Ok::<_, anyhow::Error>((chunk.order, entries))
+                        Ok::<_, anyhow::Error>(entries)
                     }
                 })
-                .buffer_unordered(concurrency)
-                .collect::<Vec<_>>()
-                .await
-                .into_iter()
-                .collect::<Result<Vec<_>>>()?;
-            results.sort_by_key(|(order, _)| *order);
-            for (_, entries) in results {
+                .buffered(concurrency);
+            while let Some(entries) = results.next().await {
+                let entries = entries?;
                 reserve_compact_index(&mut compact_index, entries.len())?;
                 compact_index.extend(entries);
             }

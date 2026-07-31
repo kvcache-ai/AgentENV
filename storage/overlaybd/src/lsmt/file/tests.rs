@@ -580,6 +580,15 @@ fn stack_index_budget_includes_merge_working_set() {
     assert!(stack_index_memory_bytes(count).unwrap() > index_memory_bytes(count).unwrap());
 }
 
+#[test]
+fn compaction_budget_includes_coexisting_working_sets() {
+    validate_compaction_memory(1, 1, 1, ALIGNMENT_USIZE).unwrap();
+
+    let err = validate_compaction_memory(0, usize::MAX, 1, ALIGNMENT_USIZE)
+        .expect_err("unbounded compaction output should be rejected");
+    assert_err_contains(&err, "compaction output memory size overflow");
+}
+
 async fn open_sparse_lsmt_env(
     data_file: Arc<LocalFile>,
     lower_layers: Vec<Arc<dyn VirtualFile>>,
