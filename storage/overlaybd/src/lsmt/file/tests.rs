@@ -524,9 +524,14 @@ async fn rejects_index_count_overflow_before_allocation() {
     let temp_dir = TempDir::new().unwrap();
     let data = create_sealed_layer(&temp_dir, "overflow-index", 8192, &[]).await;
     let count = u64::MAX / size_of::<DiskSegmentMapping>() as u64 + 1;
-    let err = load_index_and_reset_tags(&(data as Arc<dyn VirtualFile>), HEADER_SIZE, count)
+    update_trailer(&data, |trailer| {
+        trailer.index_size = U64::new(count);
+    })
+    .await;
+    let err = open_file_ro(data as Arc<dyn VirtualFile>)
         .await
-        .expect_err("overflowing index count should be rejected");
+        .err()
+        .expect("overflowing trailer index count should be rejected");
     let message = err.to_string();
     assert!(
         message.contains("overflow") || message.contains("does not fit usize"),

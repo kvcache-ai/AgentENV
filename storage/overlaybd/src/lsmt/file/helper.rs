@@ -868,6 +868,20 @@ pub(super) fn validate_index_memory(count: u64) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn reserve_compact_index(
+    index: &mut Vec<SegmentMapping>,
+    additional: usize,
+) -> Result<()> {
+    let new_len = index
+        .len()
+        .checked_add(additional)
+        .context("compact index mapping count overflow")?;
+    validate_index_memory(new_len as u64)?;
+    index
+        .try_reserve_exact(additional)
+        .context("failed to reserve compact index mappings")
+}
+
 async fn load_readonly_layer_metadata(file: Arc<dyn VirtualFile>) -> Result<ReadOnlyLayerMetadata> {
     let file_size = file.size().await?;
     let header = verify_ht(&file, false, file_size).await?;
@@ -1275,9 +1289,11 @@ pub async fn compact_to(
     let writer = commit_args.writer;
     let concurrency = commit_args.concurrency.max(1);
 
-    writer.write_all_at(&header_buf, 0).await?;
+    validate_index_memory(mappings.len() as u64)?;
+    let mut compact_index: Vec<SegmentMapping> = Vec::new();
+    reserve_compact_index(&mut compact_index, mappings.len())?;
 
-    let mut compact_index: Vec<SegmentMapping> = Vec::with_capacity(mappings.len());
+    writer.write_all_at(&header_buf, 0).await?;
     let mut dest_moffset = HEADER_SIZE / ALIGNMENT;
 
     if COMPACT_ZERO_DETECTION_ENABLED {
@@ -1287,6 +1303,7 @@ pub async fn compact_to(
             if m.zeroed {
                 let mut zero = *m;
                 zero.moffset = dest_moffset;
+                reserve_compact_index(&mut compact_index, 1)?;
                 compact_index.push(zero);
                 continue;
             }
@@ -1297,6 +1314,7 @@ pub async fn compact_to(
                 dest_moffset,
             )
             .await?;
+            reserve_compact_index(&mut compact_index, entries.len())?;
             compact_index.extend(entries);
             dest_moffset += written_blocks;
         }
@@ -1322,6 +1340,7 @@ pub async fn compact_to(
             if m.zeroed {
                 let mut zero = *m;
                 zero.moffset = dest_moffset;
+                reserve_compact_index(&mut compact_index, 1)?;
                 compact_index.push(zero);
                 // NOTE: no need to advance dest_moffset, as this is a zero segement,
                 // does not occupy space in dset file.
@@ -1375,6 +1394,7 @@ pub async fn compact_to(
         if concurrency == 1 {
             for chunk in &chunks {
                 let entries = compact_copy_chunk(src_layers, writer.as_ref(), chunk).await?;
+                reserve_compact_index(&mut compact_index, entries.len())?;
                 compact_index.extend(entries);
             }
         } else {
@@ -1398,6 +1418,7 @@ pub async fn compact_to(
                 .collect::<Result<Vec<_>>>()?;
             results.sort_by_key(|(order, _)| *order);
             for (_, entries) in results {
+                reserve_compact_index(&mut compact_index, entries.len())?;
                 compact_index.extend(entries);
             }
         }

@@ -880,6 +880,7 @@ impl LSMTFile {
             if m.tag as usize == self.rw_tag {
                 let mut cm = m;
                 cm.tag = 0;
+                reserve_compact_index(&mut compact_index, 1)?;
                 compact_index.push(cm);
             }
         }
