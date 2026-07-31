@@ -845,21 +845,25 @@ mod tests {
         let current = Arc::new(AtomicUsize::new(0));
         let maximum = Arc::new(AtomicUsize::new(0));
         let first_window_ready = Arc::new(Barrier::new(5));
+        let release_first_window = Arc::new(Barrier::new(5));
 
         let lookup = tokio::spawn({
             let current = current.clone();
             let maximum = maximum.clone();
             let first_window_ready = first_window_ready.clone();
+            let release_first_window = release_first_window.clone();
             async move {
                 first_some_buffered_in_order(0..8, 4, move |candidate| {
                     let current = current.clone();
                     let maximum = maximum.clone();
                     let first_window_ready = first_window_ready.clone();
+                    let release_first_window = release_first_window.clone();
                     async move {
                         let active = current.fetch_add(1, Ordering::SeqCst) + 1;
                         maximum.fetch_max(active, Ordering::SeqCst);
                         if candidate < 4 {
                             first_window_ready.wait().await;
+                            release_first_window.wait().await;
                         }
                         current.fetch_sub(1, Ordering::SeqCst);
                         None::<()>
@@ -871,6 +875,7 @@ mod tests {
 
         first_window_ready.wait().await;
         assert_eq!(current.load(Ordering::SeqCst), 4);
+        release_first_window.wait().await;
         assert_eq!(lookup.await.expect("lookup task"), None);
         assert_eq!(maximum.load(Ordering::SeqCst), 4);
     }
