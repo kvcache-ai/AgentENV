@@ -118,8 +118,7 @@ impl LSMTFile {
                 }
 
                 let count = mapping_area_size / stride;
-                let mappings =
-                    load_index_and_reset_tags(idx_file, HEADER_SIZE, count as usize).await?;
+                let mappings = load_index_and_reset_tags(idx_file, HEADER_SIZE, count).await?;
 
                 for m in mappings {
                     mutable_index.insert(m);

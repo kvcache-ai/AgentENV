@@ -79,14 +79,9 @@ async fn merge_readonly_indexes(
             .enumerate(),
     )
     .map(|(layer_index, (file, metadata))| async move {
-        let index_size = usize::try_from(metadata.index_size)
-            .context("readonly layer index size does not fit usize");
-        let result = match index_size {
-            Ok(index_size) => load_index_and_reset_tags(&file, metadata.index_offset, index_size)
-                .await
-                .map(ReadOnlyIndex::new),
-            Err(err) => Err(err),
-        };
+        let result = load_index_and_reset_tags(&file, metadata.index_offset, metadata.index_size)
+            .await
+            .map(ReadOnlyIndex::new);
         (layer_index, result)
     })
     .buffer_unordered(files.len().min(PARALLEL_LOAD_INDEX))
@@ -304,12 +299,9 @@ pub async fn stack_files(
 pub async fn open_file_index(file: Arc<dyn VirtualFile>) -> Result<ReadOnlyIndex> {
     let file_size = file.size().await?;
     let trailer = verify_ht(&file, true, file_size).await?;
-    let mappings = load_index_and_reset_tags(
-        &file,
-        trailer.index_offset.get(),
-        trailer.index_size.get() as usize,
-    )
-    .await?;
+    let mappings =
+        load_index_and_reset_tags(&file, trailer.index_offset.get(), trailer.index_size.get())
+            .await?;
     Ok(ReadOnlyIndex::new(mappings))
 }
 

@@ -820,8 +820,37 @@ pub(super) async fn verify_ht(
             ht.verify_magic() && ht.is_trailer() && ht.is_data_file() && ht.is_sealed(),
             "trailer magic, trailer type, file type or sealedness doesn't match"
         );
+        validate_index_bounds(
+            ht.index_offset.get(),
+            ht.index_size.get(),
+            file_size,
+            HEADER_SIZE,
+        )?;
         Ok(ht)
     }
+}
+
+fn validate_index_bounds(offset: u64, count: u64, file_size: u64, trailer_size: u64) -> Result<()> {
+    let index_limit = file_size
+        .checked_sub(trailer_size)
+        .context("index file boundary underflow")?;
+    let index_size = count
+        .checked_mul(size_of::<DiskSegmentMapping>() as u64)
+        .context("index byte length overflow")?;
+
+    ensure!(
+        offset >= HEADER_SIZE,
+        "index offset {offset} is before the file header"
+    );
+    ensure!(
+        offset <= index_limit,
+        "index offset {offset} is out of bounds for file limit {index_limit}"
+    );
+    ensure!(
+        index_size <= index_limit - offset,
+        "index size {count} is out of bounds at offset {offset}"
+    );
+    Ok(())
 }
 
 async fn load_readonly_layer_metadata(file: Arc<dyn VirtualFile>) -> Result<ReadOnlyLayerMetadata> {
@@ -874,22 +903,29 @@ pub(super) async fn load_readonly_layers_metadata(
 async fn load_index(
     file: &Arc<dyn VirtualFile>,
     offset: u64,
-    count: usize,
+    count: u64,
     reset_tag: bool,
 ) -> Result<Vec<SegmentMapping>> {
-    if count == 0 {
+    let count_usize = usize::try_from(count).context("index mapping count does not fit usize")?;
+    let size_bytes = count_usize
+        .checked_mul(size_of::<DiskSegmentMapping>())
+        .context("index allocation size overflow")?;
+
+    let file_size = file.size().await?;
+    validate_index_bounds(offset, count, file_size, 0)?;
+
+    if count_usize == 0 {
         return Ok(Vec::new());
     }
 
-    let size_bytes = count * size_of::<DiskSegmentMapping>();
     let mut raw_bytes = vec![0u8; size_bytes];
     let read = file.read_at_into(offset, &mut raw_bytes).await?;
     ensure!(read >= size_bytes, "Index file too short");
 
-    let mut mappings = Vec::with_capacity(count);
+    let mut mappings = Vec::with_capacity(count_usize);
     let stride = size_of::<DiskSegmentMapping>();
 
-    for i in 0..count {
+    for i in 0..count_usize {
         let start = i * stride;
         let end = start + stride;
         let dm = DiskSegmentMapping::read_from_bytes(&raw_bytes[start..end])
@@ -911,7 +947,7 @@ async fn load_index(
 pub(super) async fn load_index_and_reset_tags(
     file: &Arc<dyn VirtualFile>,
     offset: u64,
-    count: usize,
+    count: u64,
 ) -> Result<Vec<SegmentMapping>> {
     load_index(file, offset, count, true).await
 }

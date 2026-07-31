@@ -446,6 +446,72 @@ async fn create_sealed_layer(
     data
 }
 
+async fn update_trailer(file: &Arc<LocalFile>, update: impl FnOnce(&mut HeaderTrailer)) {
+    let file_size = file.size().await.unwrap();
+    let trailer_offset = file_size - HEADER_SIZE;
+    let bytes = file
+        .read_at(trailer_offset, size_of::<HeaderTrailer>())
+        .await
+        .unwrap();
+    let mut trailer = HeaderTrailer::read_from_bytes(&bytes).unwrap();
+    update(&mut trailer);
+    file.write_at(trailer_offset, trailer.as_bytes())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn rejects_sealed_index_offset_out_of_bounds() {
+    let temp_dir = TempDir::new().unwrap();
+    let data = create_sealed_layer(&temp_dir, "bad-index-offset", 8192, &[(0, 0x11)]).await;
+    let file_size = data.size().await.unwrap();
+
+    update_trailer(&data, |trailer| {
+        trailer.index_offset = U64::new(file_size);
+    })
+    .await;
+
+    let err = open_file_ro(data as Arc<dyn VirtualFile>)
+        .await
+        .err()
+        .expect("malformed index offset should be rejected");
+    assert_err_contains(&err, "index offset");
+}
+
+#[tokio::test]
+async fn rejects_sealed_index_size_out_of_bounds() {
+    let temp_dir = TempDir::new().unwrap();
+    let data = create_sealed_layer(&temp_dir, "bad-index-size", 8192, &[(0, 0x22)]).await;
+    let file_size = data.size().await.unwrap();
+    let bad_index_size = file_size / size_of::<DiskSegmentMapping>() as u64 + 1;
+
+    update_trailer(&data, |trailer| {
+        trailer.index_size = U64::new(bad_index_size);
+    })
+    .await;
+
+    let err = open_file_ro(data as Arc<dyn VirtualFile>)
+        .await
+        .err()
+        .expect("malformed index size should be rejected");
+    assert_err_contains(&err, "index size");
+}
+
+#[tokio::test]
+async fn rejects_index_count_overflow_before_allocation() {
+    let temp_dir = TempDir::new().unwrap();
+    let data = create_sealed_layer(&temp_dir, "overflow-index", 8192, &[]).await;
+    let count = u64::MAX / size_of::<DiskSegmentMapping>() as u64 + 1;
+    let err = load_index_and_reset_tags(&(data as Arc<dyn VirtualFile>), HEADER_SIZE, count)
+        .await
+        .expect_err("overflowing index count should be rejected");
+    let message = err.to_string();
+    assert!(
+        message.contains("overflow") || message.contains("does not fit usize"),
+        "expected an overflow or conversion error, got {message}"
+    );
+}
+
 async fn open_sparse_lsmt_env(
     data_file: Arc<LocalFile>,
     lower_layers: Vec<Arc<dyn VirtualFile>>,
@@ -471,7 +537,7 @@ async fn load_base_index(data_file: Arc<LocalFile>) -> ReadOnlyIndex {
     let mappings = load_index_and_reset_tags(
         &(data_file as Arc<dyn VirtualFile>),
         trailer.index_offset.get(),
-        trailer.index_size.get() as usize,
+        trailer.index_size.get(),
     )
     .await
     .expect("Failed to load mappings");
