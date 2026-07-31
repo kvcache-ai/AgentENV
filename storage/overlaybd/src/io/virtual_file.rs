@@ -59,6 +59,14 @@ pub trait VirtualFile: Send + Sync {
         self.write_at(offset, &data).await
     }
 
+    /// Optional downcast handle for concrete-type fast paths. The default
+    /// returns `None`; implementations that want to expose their concrete
+    /// type (e.g. `LocalFile` for the zfile sync-pwrite fast path) override
+    /// this to return `Some(self)`.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
     /// Context-aware read. Default forwards to [`Self::read_at`], ignoring
     /// `ctx`. Implementations that can submit IO directly via the provided
     /// io_uring (e.g. `LocalFile`) override this and any layer that wants

@@ -107,6 +107,8 @@ impl LocalFileBuilder {
             file: Mutex::new(file),
             direct_io: self.direct_io,
             io_ring: self.io_ring,
+            #[cfg(test)]
+            write_calls: std::sync::atomic::AtomicU64::new(0),
         })
     }
 }
@@ -116,6 +118,10 @@ pub struct LocalFile {
     file: Mutex<File>,
     direct_io: bool,
     io_ring: IoRingHandle,
+    /// Test-only probe counting synchronous pwrite submissions (the
+    /// buffered small-write fast path plus explicit sync-pwrite calls).
+    #[cfg(test)]
+    write_calls: std::sync::atomic::AtomicU64,
 }
 
 impl fmt::Debug for LocalFile {
@@ -162,6 +168,14 @@ impl LocalFile {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Test-only probe: number of synchronous pwrite submissions issued
+    /// through the buffered small-write fast path and
+    /// [`Self::write_at_sync_pwrite`].
+    #[cfg(test)]
+    pub fn write_calls(&self) -> u64 {
+        self.write_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn to_off_t(offset: u64) -> Result<libc::off_t> {
@@ -232,6 +246,33 @@ impl LocalFile {
             written += usize::try_from(ret).context("pwrite byte count overflow")?;
         }
         Ok(written)
+    }
+
+    /// Write the whole buffer with one synchronous `pwrite`, bypassing
+    /// io_uring.
+    ///
+    /// This intentionally blocks the current thread for the duration of the
+    /// syscall. The caller guarantees all of the following:
+    /// - exclusive access to the file (no concurrent operations through this
+    ///   `LocalFile`), so the file mutex is always uncontended;
+    /// - the file lives on local storage backed by page cache (buffered, not
+    ///   O_DIRECT, not a network filesystem), so the syscall returns quickly;
+    /// - blocking the calling thread (typically a Tokio `LocalSet` thread)
+    ///   for one syscall is acceptable.
+    ///
+    /// For large buffered local writes this is cheaper than the io_uring
+    /// submit/completion round trip; slow storage can still stall the
+    /// thread, which is why the entry point is explicit rather than part of
+    /// the async `write_at` path.
+    pub fn write_at_sync_pwrite(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        #[cfg(test)]
+        self.write_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let file = self
+            .file
+            .try_lock()
+            .context("write_at_sync_pwrite requires exclusive access to the file")?;
+        Self::pwrite_all(file.as_raw_fd(), offset, buf)
     }
 
     fn align_down(value: u64, alignment: u64) -> u64 {
@@ -417,6 +458,9 @@ impl LocalFile {
             // Tradeoff: this is a synchronous syscall inside async code. It avoids
             // io_uring submit/completion overhead for 4 KiB data writes and tiny
             // index appends, while direct I/O and larger writes stay on io_uring.
+            #[cfg(test)]
+            self.write_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return Self::pwrite_all(fd, offset, buf);
         }
 
@@ -428,6 +472,10 @@ impl LocalFile {
 impl VirtualFile for LocalFile {
     async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
         self.read_at_via(&self.io_ring, offset, len).await
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 
     async fn read_at_into(&self, offset: u64, dst: &mut [u8]) -> Result<usize> {

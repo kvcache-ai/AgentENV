@@ -983,7 +983,7 @@ struct CompactChunkEntry {
 
 /// A group of source reads whose data collectively fills one
 /// [`CompactWriter`] buffer. Produced by the chunking phase in
-/// [`compact_to`] and consumed by [`compact_copy_chunk`].
+/// [`compact_to`] and consumed by [`compact_read_chunk`].
 #[derive(Clone)]
 struct CompactChunk {
     /// Ordered read operations. Each fills a portion of the buffer.
@@ -997,18 +997,23 @@ struct CompactChunk {
     order: usize,
 }
 
-/// Read all entries in `chunk` into a single writer-provided buffer and
-/// write it to the destination in one call.
-///
-/// Returns the output index entries for this chunk.
-async fn compact_copy_chunk(
+struct PreparedCompactChunk {
+    order: usize,
+    destination_offset: u64,
+    len: usize,
+    buffer: Box<dyn storage_util::CompactBuffer>,
+    index: Vec<SegmentMapping>,
+}
+
+/// Read all entries in `chunk` into a single writer-provided buffer.
+async fn compact_read_chunk(
     src_layers: &[Arc<dyn VirtualFile>],
     writer: &dyn CompactWriter,
-    chunk: &CompactChunk,
-) -> Result<Vec<SegmentMapping>> {
-    let mut buf = writer.alloc_buffer().await?;
-    let buf_slice = buf.as_mut().as_mut();
-    let mut buf_offset = 0usize;
+    chunk: CompactChunk,
+) -> Result<PreparedCompactChunk> {
+    let mut buffer = writer.alloc_buffer().await?;
+    let buffer_slice = buffer.as_mut().as_mut();
+    let mut buffer_offset = 0usize;
     let mut index = Vec::with_capacity(chunk.entries.len());
 
     for entry in &chunk.entries {
@@ -1018,7 +1023,7 @@ async fn compact_copy_chunk(
         let got = src_layers[layer_idx]
             .read_at_into(
                 entry.src_offset,
-                &mut buf_slice[buf_offset..buf_offset + entry.len],
+                &mut buffer_slice[buffer_offset..buffer_offset + entry.len],
             )
             .await?;
         ensure!(
@@ -1031,7 +1036,7 @@ async fn compact_copy_chunk(
         );
 
         let block_len = (entry.len / ALIGNMENT_USIZE) as u32;
-        let dest_phys = chunk.dest_moffset + (buf_offset / ALIGNMENT_USIZE) as u64;
+        let dest_phys = chunk.dest_moffset + (buffer_offset / ALIGNMENT_USIZE) as u64;
         index.push(SegmentMapping::new(
             entry.logical_offset,
             block_len,
@@ -1040,14 +1045,35 @@ async fn compact_copy_chunk(
             entry.tag,
         ));
 
-        buf_offset += entry.len;
+        buffer_offset += entry.len;
     }
 
-    writer
-        .write(buf, chunk.dest_moffset * ALIGNMENT, chunk.total_len)
-        .await?;
+    Ok(PreparedCompactChunk {
+        order: chunk.order,
+        destination_offset: chunk.dest_moffset * ALIGNMENT,
+        len: chunk.total_len,
+        buffer,
+        index,
+    })
+}
 
-    Ok(index)
+async fn compact_write_chunk(
+    writer: &dyn CompactWriter,
+    prepared: PreparedCompactChunk,
+) -> Result<(usize, Vec<SegmentMapping>)> {
+    writer
+        .write(prepared.buffer, prepared.destination_offset, prepared.len)
+        .await?;
+    Ok((prepared.order, prepared.index))
+}
+
+async fn compact_copy_chunk(
+    src_layers: &[Arc<dyn VirtualFile>],
+    writer: &dyn CompactWriter,
+    chunk: CompactChunk,
+) -> Result<(usize, Vec<SegmentMapping>)> {
+    let prepared = compact_read_chunk(src_layers, writer, chunk).await?;
+    compact_write_chunk(writer, prepared).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,8 +1210,10 @@ async fn compact_copy_mapping_with_zero_detection(
 ///
 /// # Returns
 ///
-/// `Ok(())` once the header and all compacted data blocks have been flushed to
-/// the destination. Returns an error on any read or write failure.
+/// `Ok(())` once the complete logical format, including the trailer, has been
+/// written and the destination writer has been finalized. Finalization does not
+/// imply that the output has been synced to stable storage. Returns an error on
+/// any read, write, or finalization failure.
 pub async fn compact_to(
     src_layers: &[Arc<dyn VirtualFile>],
     mappings: &[SegmentMapping],
@@ -1247,7 +1275,7 @@ pub async fn compact_to(
         // directly in `compact_index` and skipped during chunking.
         let buf_size = writer.buffer_size();
         ensure!(
-            buf_size.is_multiple_of(ALIGNMENT_USIZE),
+            buf_size >= ALIGNMENT_USIZE && buf_size.is_multiple_of(ALIGNMENT_USIZE),
             "CompactWriter buffer size {buf_size} not aligned"
         );
         let mut chunks: Vec<CompactChunk> = Vec::new();
@@ -1281,7 +1309,9 @@ pub async fn compact_to(
                 });
 
                 let space = buf_size - chunk.total_len;
-                let take = remaining.min(space);
+                let take = remaining
+                    .min(space)
+                    .min(Segment::MAX_LENGTH as usize * ALIGNMENT_USIZE);
 
                 chunk.entries.push(CompactChunkEntry {
                     tag: m.tag,
@@ -1309,23 +1339,33 @@ pub async fn compact_to(
 
         // Phase 2: Copy data blocks, potentially in parallel.
         if concurrency == 1 {
-            for chunk in &chunks {
-                let entries = compact_copy_chunk(src_layers, writer.as_ref(), chunk).await?;
+            for chunk in chunks {
+                let (_, entries) = compact_copy_chunk(src_layers, writer.as_ref(), chunk).await?;
+                compact_index.extend(entries);
+            }
+        } else if writer.requires_ordered_writes() {
+            let src_layers: Arc<[Arc<dyn VirtualFile>]> = Arc::from(src_layers.to_vec());
+            let mut prepared = stream::iter(chunks)
+                .map(|chunk| {
+                    let layers = src_layers.clone();
+                    let writer = writer.clone();
+                    async move { compact_read_chunk(&layers, writer.as_ref(), chunk).await }
+                })
+                .buffered(concurrency);
+
+            while let Some(chunk) = prepared.next().await {
+                let (_, entries) = compact_write_chunk(writer.as_ref(), chunk?).await?;
                 compact_index.extend(entries);
             }
         } else {
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+            // `buffer_unordered` already caps in-flight chunk copies at
+            // `concurrency`, so no extra semaphore is needed here.
             let src_layers: Arc<[Arc<dyn VirtualFile>]> = Arc::from(src_layers.to_vec());
             let mut results: Vec<(usize, Vec<SegmentMapping>)> = stream::iter(chunks)
                 .map(|chunk| {
-                    let sem = semaphore.clone();
                     let writer = writer.clone();
                     let layers = src_layers.clone();
-                    async move {
-                        let _permit = sem.acquire().await.context("semaphore closed")?;
-                        let entries = compact_copy_chunk(&layers, writer.as_ref(), &chunk).await?;
-                        Ok::<_, anyhow::Error>((chunk.order, entries))
-                    }
+                    async move { compact_copy_chunk(&layers, writer.as_ref(), chunk).await }
                 })
                 .buffer_unordered(concurrency)
                 .collect::<Vec<_>>()
@@ -1340,6 +1380,10 @@ pub async fn compact_to(
     }
 
     // Phase 3: Write the index and trailer.
+    // Zeroed mappings were pushed in phase 1 while data entries arrive in
+    // phase 2; restore logical-offset order before compressing so that
+    // partition_point lookups in ReadOnlyIndex see a sorted index.
+    compact_index.sort_unstable();
     compress_raw_index(&mut compact_index);
 
     let index_offset = dest_moffset * ALIGNMENT;
@@ -1380,6 +1424,7 @@ pub async fn compact_to(
     let trailer_bytes_enc = trailer.as_bytes();
     trailer_buf[..trailer_bytes_enc.len()].copy_from_slice(trailer_bytes_enc);
     writer.write_all_at(&trailer_buf, trailer_offset).await?;
+    writer.finalize().await?;
 
     Ok(())
 }
