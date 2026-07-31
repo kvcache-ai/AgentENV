@@ -889,6 +889,7 @@ impl LSMTFile {
         // HEADER_SIZE + virtual_size; punching the last virtual block ends
         // exactly at this boundary, so index bytes cannot overlap virtual data.
         let index_offset = data_file_size;
+        validate_index_memory(compact_index.len() as u64)?;
 
         let mut index_bytes =
             Vec::with_capacity(compact_index.len() * size_of::<DiskSegmentMapping>());

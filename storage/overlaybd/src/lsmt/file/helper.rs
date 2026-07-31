@@ -852,6 +852,22 @@ pub(super) fn validate_index_bounds(
     Ok(())
 }
 
+pub(super) fn index_memory_bytes(count: u64) -> Result<usize> {
+    let count = usize::try_from(count).context("index mapping count does not fit usize")?;
+    count
+        .checked_mul(size_of::<DiskSegmentMapping>() + size_of::<SegmentMapping>())
+        .context("index memory size overflow")
+}
+
+pub(super) fn validate_index_memory(count: u64) -> Result<()> {
+    let memory_bytes = index_memory_bytes(count)?;
+    ensure!(
+        memory_bytes <= MAX_INDEX_MEMORY_BYTES,
+        "index memory {memory_bytes} exceeds per-layer limit {MAX_INDEX_MEMORY_BYTES}"
+    );
+    Ok(())
+}
+
 async fn load_readonly_layer_metadata(file: Arc<dyn VirtualFile>) -> Result<ReadOnlyLayerMetadata> {
     let file_size = file.size().await?;
     let header = verify_ht(&file, false, file_size).await?;
@@ -912,14 +928,10 @@ async fn load_index(
     reset_tag: bool,
 ) -> Result<Vec<SegmentMapping>> {
     let count_usize = usize::try_from(count).context("index mapping count does not fit usize")?;
+    validate_index_memory(count)?;
     let size_bytes = count_usize
         .checked_mul(size_of::<DiskSegmentMapping>())
         .context("index allocation size overflow")?;
-    ensure!(
-        size_bytes <= MAX_INDEX_BYTES,
-        "index byte length {size_bytes} exceeds limit {MAX_INDEX_BYTES}"
-    );
-
     let file_size = file.size().await?;
     validate_index_bounds(offset, count, file_size, 0)?;
 
@@ -1395,12 +1407,6 @@ pub async fn compact_to(
     compress_raw_index(&mut compact_index);
 
     let index_offset = dest_moffset * ALIGNMENT;
-    let mut index_bytes = Vec::with_capacity(compact_index.len() * size_of::<DiskSegmentMapping>());
-    for m in &compact_index {
-        let dm = DiskSegmentMapping::from_memory(m);
-        index_bytes.extend_from_slice(dm.as_bytes());
-    }
-
     let n_per_block = 4096 / size_of::<DiskSegmentMapping>();
     let remainder = compact_index.len() % n_per_block;
     let padding_count = if remainder > 0 {
@@ -1408,12 +1414,19 @@ pub async fn compact_to(
     } else {
         0
     };
+    let index_size = compact_index.len() as u64 + padding_count as u64;
+    validate_index_memory(index_size)?;
+
+    let mut index_bytes = Vec::with_capacity(compact_index.len() * size_of::<DiskSegmentMapping>());
+    for m in &compact_index {
+        let dm = DiskSegmentMapping::from_memory(m);
+        index_bytes.extend_from_slice(dm.as_bytes());
+    }
 
     append_invalid_index_padding(&mut index_bytes, padding_count);
 
     writer.write_all_at(&index_bytes, index_offset).await?;
 
-    let index_size = compact_index.len() as u64 + padding_count as u64;
     let mut trailer_offset = index_offset + index_bytes.len() as u64;
 
     if !trailer_offset.is_multiple_of(4096) {

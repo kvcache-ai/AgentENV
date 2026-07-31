@@ -535,14 +535,16 @@ async fn rejects_index_count_overflow_before_allocation() {
 }
 
 #[tokio::test]
-async fn rejects_index_larger_than_allocation_limit() {
+async fn rejects_index_exceeding_decoded_memory_budget() {
     let temp_dir = TempDir::new().unwrap();
     let data = create_sealed_layer(&temp_dir, "oversized-index", 8192, &[]).await;
-    let count = MAX_INDEX_BYTES as u64 / size_of::<DiskSegmentMapping>() as u64 + 1;
+    let bytes_per_mapping =
+        size_of::<DiskSegmentMapping>() as u64 + size_of::<SegmentMapping>() as u64;
+    let count = MAX_INDEX_MEMORY_BYTES as u64 / bytes_per_mapping + 1;
     let err = load_index_and_reset_tags(&(data as Arc<dyn VirtualFile>), HEADER_SIZE, count)
         .await
-        .expect_err("oversized index should be rejected before allocation");
-    assert_err_contains(&err, "exceeds limit");
+        .expect_err("decoded index exceeding the memory budget should be rejected");
+    assert_err_contains(&err, "exceeds per-layer limit");
 }
 
 async fn open_sparse_lsmt_env(

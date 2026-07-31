@@ -61,6 +61,15 @@ async fn merge_readonly_indexes(
         files.len() == metadata.len(),
         "readonly files/metadata length mismatch"
     );
+    let total_index_memory = metadata.iter().try_fold(0usize, |total, layer| {
+        total
+            .checked_add(index_memory_bytes(layer.index_size)?)
+            .context("stack index memory size overflow")
+    })?;
+    ensure!(
+        total_index_memory <= MAX_STACK_INDEX_MEMORY_BYTES,
+        "stack index memory {total_index_memory} exceeds limit {MAX_STACK_INDEX_MEMORY_BYTES}"
+    );
 
     // `buffer_unordered` returns a stream whose `Future` implementation the
     // compiler cannot prove is `Send`, even though every input is `Send`.
