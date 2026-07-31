@@ -274,11 +274,15 @@ impl TemplateBuildRunner {
 /// clients assume.
 ///
 /// Numeric USER values are left alone (Docker allows a UID with no passwd
-/// entry), and an image where the account cannot be created (no useradd or
-/// adduser) keeps building with a warning rather than failing: such an image
-/// worked before this provisioning existed, and only envd calls that resolve
-/// the default user will fail. Executor errors (envd unreachable, sandbox
-/// gone) are not downgraded — they fail the build.
+/// entry). An image with no account-management tooling at all (neither
+/// useradd/groupadd nor adduser/addgroup) keeps building with a warning
+/// rather than failing: such an image worked before this provisioning
+/// existed, and only envd calls that resolve the default user will fail.
+/// Any other failure aborts the build — a creation tool that is present but
+/// fails (permission denied, read-only filesystem, corrupt passwd database)
+/// leaves the template with a default identity known not to resolve, and
+/// executor errors (envd unreachable, sandbox gone) are infrastructure
+/// failures.
 ///
 /// A `USER name:group` value names the account and the group independently
 /// (Docker resolves the two separately and requires no membership), so a
@@ -338,6 +342,10 @@ struct ProvisionEntity<'a> {
 /// would wedge the build worker.
 const PROVISION_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Exit code the provisioning script reserves for "this image ships no
+/// account-management tooling" — the one failure that stays a warning.
+const PROVISION_MISSING_TOOLING_EXIT: i32 = 66;
+
 async fn ensure_entity(sandbox: &impl SandboxExecutor, entity: ProvisionEntity<'_>) -> Result<()> {
     let ProvisionEntity {
         kind,
@@ -364,8 +372,20 @@ async fn ensure_entity(sandbox: &impl SandboxExecutor, entity: ProvisionEntity<'
     }
 
     let quoted = shell_quote(name);
+    let create_bin = create.split_whitespace().next().unwrap_or(create);
+    let fallback_bin = create_fallback
+        .split_whitespace()
+        .next()
+        .unwrap_or(create_fallback);
+    // Dispatch on which creation tool the image ships instead of chaining
+    // fallbacks: a chained `useradd || adduser` would mask a real failure of
+    // the present tool behind the fallback's "command not found", and its
+    // exit code could not be told apart from "no tooling at all".
     let script = format!(
-        "{exists_probe} {quoted} >/dev/null 2>&1 || {create} {quoted} 2>/dev/null || {create_fallback} {quoted}"
+        "{exists_probe} {quoted} >/dev/null 2>&1 && exit 0; \
+         command -v {create_bin} >/dev/null 2>&1 && exec {create} {quoted}; \
+         command -v {fallback_bin} >/dev/null 2>&1 && exec {create_fallback} {quoted}; \
+         exit {PROVISION_MISSING_TOOLING_EXIT}"
     );
     // /bin/sh, not bash: the images most likely to be missing the entry
     // (Alpine/BusyBox) are also the ones without bash, and the script is POSIX.
@@ -375,22 +395,29 @@ async fn ensure_entity(sandbox: &impl SandboxExecutor, entity: ProvisionEntity<'
         .await;
     match result {
         Ok(output) if output.exit_code == 0 => Ok(()),
-        Ok(output) => {
+        // An image with no account-management tooling built fine before this
+        // provisioning existed, so it keeps building; only envd calls that
+        // resolve the default user will fail at runtime.
+        Ok(output) if output.exit_code == PROVISION_MISSING_TOOLING_EXIT => {
             warn!(
                 entity = name,
                 kind,
-                exit_code = output.exit_code,
-                "template default {kind} is missing and could not be created; \
-                 envd operations that resolve it will fail at runtime{}",
-                command_output_suffix(&output.stdout, &output.stderr)
+                "image has neither {create_bin} nor {fallback_bin}; template default {kind} \
+                 left unprovisioned, and envd operations that resolve it will fail at runtime"
             );
             Ok(())
         }
-        // A nonzero exit means the image cannot host the entry (no
-        // useradd/groupadd tooling) — that image built fine before
-        // provisioning existed, so it stays a warning. An executor error is
-        // different: envd unreachable, sandbox gone — those must fail the
-        // build.
+        // A present tool that fails (permission denied, read-only filesystem,
+        // corrupt passwd database) leaves the template with a default identity
+        // known not to resolve — fail the build now rather than at every later
+        // SDK call against the published template.
+        Ok(output) => bail!(
+            "failed to provision template default {kind} {name}: exit status {}{}",
+            output.exit_code,
+            command_output_suffix(&output.stdout, &output.stderr)
+        ),
+        // Executor errors are infrastructure failures: envd unreachable,
+        // sandbox gone — those must fail the build too.
         Err(error) => Err(error).with_context(|| format!("provision template default {kind}")),
     }
 }
@@ -593,7 +620,10 @@ mod tests {
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
 
-    use super::{ensure_default_user, prepare_startup, run_ready_command, PROVISION_TIMEOUT};
+    use super::{
+        ensure_default_user, prepare_startup, run_ready_command, PROVISION_MISSING_TOOLING_EXIT,
+        PROVISION_TIMEOUT,
+    };
     use crate::sandbox::{Executor, ProcessHandle, ProcessOpts, ProcessOutput, SandboxExecutor};
     use crate::snapshot::{CommandContext, StartupCommand};
 
@@ -866,13 +896,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_user_provisioning_failure_warns_but_keeps_the_build() {
+    async fn default_user_provisioning_without_tooling_warns_but_keeps_the_build() {
         // An image without useradd/adduser built fine before provisioning
-        // existed; a failed creation must not turn it into a build failure.
-        let sandbox = ScriptRecordingSandbox::with_exit_code(127);
+        // existed; missing tooling must not turn it into a build failure.
+        let sandbox = ScriptRecordingSandbox::with_exit_code(PROVISION_MISSING_TOOLING_EXIT);
         ensure_default_user(&sandbox, &context_with_user(Some("user")))
             .await
-            .expect("provisioning failure should not fail the build");
+            .expect("missing tooling should not fail the build");
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_tool_failure_fails_the_build() {
+        // A present tool that fails (permission denied, read-only filesystem)
+        // leaves the template's default identity unresolvable — that must
+        // surface at build time, not at every later SDK call.
+        let sandbox = ScriptRecordingSandbox::with_exit_code(1);
+        ensure_default_user(&sandbox, &context_with_user(Some("user")))
+            .await
+            .expect_err("a failing creation tool must fail the build");
     }
 
     #[tokio::test]
