@@ -63,7 +63,7 @@ async fn merge_readonly_indexes(
     );
     let total_index_memory = metadata.iter().try_fold(0usize, |total, layer| {
         total
-            .checked_add(index_memory_bytes(layer.index_size)?)
+            .checked_add(stack_index_memory_bytes(layer.index_size)?)
             .context("stack index memory size overflow")
     })?;
     ensure!(

@@ -552,6 +552,34 @@ async fn rejects_index_exceeding_decoded_memory_budget() {
     assert_err_contains(&err, "exceeds per-layer limit");
 }
 
+#[test]
+fn compact_index_reservation_grows_geometrically_within_budget() {
+    let mut index = Vec::new();
+    reserve_compact_index(&mut index, 1).unwrap();
+    index.push(SegmentMapping::default());
+    reserve_compact_index(&mut index, 1).unwrap();
+    index.push(SegmentMapping::default());
+    reserve_compact_index(&mut index, 1).unwrap();
+
+    assert!(index.capacity() >= 3);
+    assert!(index.capacity() > index.len());
+    validate_index_memory(index.capacity() as u64).unwrap();
+}
+
+#[test]
+fn serialized_index_reserves_space_for_padding() {
+    let mappings = [SegmentMapping::new(0, 1, 8, false, 0)];
+    let bytes = serialize_index_with_padding(&mappings, 2).unwrap();
+
+    assert_eq!(bytes.len(), 3 * size_of::<DiskSegmentMapping>());
+}
+
+#[test]
+fn stack_index_budget_includes_merge_working_set() {
+    let count = 1024;
+    assert!(stack_index_memory_bytes(count).unwrap() > index_memory_bytes(count).unwrap());
+}
+
 async fn open_sparse_lsmt_env(
     data_file: Arc<LocalFile>,
     lower_layers: Vec<Arc<dyn VirtualFile>>,

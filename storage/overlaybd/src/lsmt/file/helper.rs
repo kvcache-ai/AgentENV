@@ -859,6 +859,17 @@ pub(super) fn index_memory_bytes(count: u64) -> Result<usize> {
         .context("index memory size overflow")
 }
 
+pub(super) fn stack_index_memory_bytes(count: u64) -> Result<usize> {
+    let count = usize::try_from(count).context("index mapping count does not fit usize")?;
+    // During a stack merge the decoded layer vectors remain live while mappings
+    // are copied into a BTreeSet and then into the final output vector. Budget
+    // two SegmentMapping-sized units per BTree entry for payload and node
+    // overhead, in addition to the decoded and output copies.
+    count
+        .checked_mul(size_of::<DiskSegmentMapping>() + 4 * size_of::<SegmentMapping>())
+        .context("stack index memory size overflow")
+}
+
 pub(super) fn validate_index_memory(count: u64) -> Result<()> {
     let memory_bytes = index_memory_bytes(count)?;
     ensure!(
@@ -877,9 +888,41 @@ pub(super) fn reserve_compact_index(
         .checked_add(additional)
         .context("compact index mapping count overflow")?;
     validate_index_memory(new_len as u64)?;
+    if new_len <= index.capacity() {
+        return Ok(());
+    }
+
+    let max_capacity =
+        MAX_INDEX_MEMORY_BYTES / (size_of::<DiskSegmentMapping>() + size_of::<SegmentMapping>());
+    let doubled = index.capacity().saturating_mul(2).max(1);
+    let target_capacity = new_len.max(doubled.min(max_capacity));
     index
-        .try_reserve_exact(additional)
+        .try_reserve_exact(target_capacity - index.len())
         .context("failed to reserve compact index mappings")
+}
+
+pub(super) fn serialize_index_with_padding(
+    compact_index: &[SegmentMapping],
+    padding_count: usize,
+) -> Result<Vec<u8>> {
+    let index_entries = compact_index
+        .len()
+        .checked_add(padding_count)
+        .context("padded index mapping count overflow")?;
+    validate_index_memory(index_entries as u64)?;
+    let index_bytes_len = index_entries
+        .checked_mul(size_of::<DiskSegmentMapping>())
+        .context("padded index byte length overflow")?;
+    let mut index_bytes = Vec::new();
+    index_bytes
+        .try_reserve_exact(index_bytes_len)
+        .context("failed to reserve serialized index buffer")?;
+    for mapping in compact_index {
+        let disk_mapping = DiskSegmentMapping::from_memory(mapping);
+        index_bytes.extend_from_slice(disk_mapping.as_bytes());
+    }
+    append_invalid_index_padding(&mut index_bytes, padding_count);
+    Ok(index_bytes)
 }
 
 async fn load_readonly_layer_metadata(file: Arc<dyn VirtualFile>) -> Result<ReadOnlyLayerMetadata> {
@@ -1436,15 +1479,7 @@ pub async fn compact_to(
         0
     };
     let index_size = compact_index.len() as u64 + padding_count as u64;
-    validate_index_memory(index_size)?;
-
-    let mut index_bytes = Vec::with_capacity(compact_index.len() * size_of::<DiskSegmentMapping>());
-    for m in &compact_index {
-        let dm = DiskSegmentMapping::from_memory(m);
-        index_bytes.extend_from_slice(dm.as_bytes());
-    }
-
-    append_invalid_index_padding(&mut index_bytes, padding_count);
+    let index_bytes = serialize_index_with_padding(&compact_index, padding_count)?;
 
     writer.write_all_at(&index_bytes, index_offset).await?;
 
