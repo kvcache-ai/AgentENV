@@ -730,12 +730,15 @@ where
     F: FnMut(I) -> Fut,
     Fut: Future<Output = Option<T>>,
 {
-    stream::iter(items)
+    let mut results = stream::iter(items)
         .map(lookup)
-        .buffered(concurrency.max(1))
-        .filter_map(|result| async move { result })
-        .next()
-        .await
+        .buffered(concurrency.max(1));
+    while let Some(result) = results.next().await {
+        if result.is_some() {
+            return result;
+        }
+    }
+    None
 }
 
 fn resolve_remote_local_providers(
