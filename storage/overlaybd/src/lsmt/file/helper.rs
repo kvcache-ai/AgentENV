@@ -847,7 +847,7 @@ pub(super) fn validate_index_bounds(
     );
     ensure!(
         index_size <= index_limit - offset,
-        "index size {count} is out of bounds at offset {offset}"
+        "index byte length {index_size} for {count} mappings is out of bounds at offset {offset}"
     );
     Ok(())
 }
@@ -915,6 +915,10 @@ async fn load_index(
     let size_bytes = count_usize
         .checked_mul(size_of::<DiskSegmentMapping>())
         .context("index allocation size overflow")?;
+    ensure!(
+        size_bytes <= MAX_INDEX_BYTES,
+        "index byte length {size_bytes} exceeds limit {MAX_INDEX_BYTES}"
+    );
 
     let file_size = file.size().await?;
     validate_index_bounds(offset, count, file_size, 0)?;
@@ -923,11 +927,18 @@ async fn load_index(
         return Ok(Vec::new());
     }
 
-    let mut raw_bytes = vec![0u8; size_bytes];
+    let mut raw_bytes = Vec::new();
+    raw_bytes
+        .try_reserve_exact(size_bytes)
+        .context("failed to reserve index byte buffer")?;
+    raw_bytes.resize(size_bytes, 0);
     let read = file.read_at_into(offset, &mut raw_bytes).await?;
     ensure!(read >= size_bytes, "Index file too short");
 
-    let mut mappings = Vec::with_capacity(count_usize);
+    let mut mappings = Vec::new();
+    mappings
+        .try_reserve_exact(count_usize)
+        .context("failed to reserve decoded index mappings")?;
     let stride = size_of::<DiskSegmentMapping>();
 
     for i in 0..count_usize {

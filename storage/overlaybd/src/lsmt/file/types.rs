@@ -12,6 +12,7 @@ pub(super) const ALIGNMENT: u64 = 512;
 pub(super) const ALIGNMENT_USIZE: usize = 512;
 pub(super) const HEADER_SIZE: u64 = 4096;
 pub(super) const MAX_IO_SIZE: usize = 4 * 1024 * 1024; // 4MB
+pub(super) const MAX_INDEX_BYTES: usize = 1024 * 1024 * 1024; // 1 GiB
 pub(super) const ALIGNMENT_4K: usize = 4096;
 pub(super) const INVALID_SEGMENT_OFFSET: u64 = (1 << 50) - 1;
 pub(super) const COMPACT_ZERO_DETECTION_ENABLED: bool = false;

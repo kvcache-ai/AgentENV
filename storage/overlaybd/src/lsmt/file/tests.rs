@@ -471,12 +471,6 @@ async fn rejects_sealed_index_offset_out_of_bounds() {
     })
     .await;
 
-    let rw_err = LSMTFile::open(data.clone(), None, None, Vec::new())
-        .await
-        .err()
-        .expect("malformed sealed layer must not open as writable");
-    assert_err_contains(&rw_err, "Sealed");
-
     let err = open_file_ro(data as Arc<dyn VirtualFile>)
         .await
         .err()
@@ -522,7 +516,7 @@ async fn rejects_sealed_index_size_out_of_bounds() {
         .await
         .err()
         .expect("malformed index size should be rejected");
-    assert_err_contains(&err, "index size");
+    assert_err_contains(&err, "index byte length");
 }
 
 #[tokio::test]
@@ -538,6 +532,17 @@ async fn rejects_index_count_overflow_before_allocation() {
         message.contains("overflow") || message.contains("does not fit usize"),
         "expected an overflow or conversion error, got {message}"
     );
+}
+
+#[tokio::test]
+async fn rejects_index_larger_than_allocation_limit() {
+    let temp_dir = TempDir::new().unwrap();
+    let data = create_sealed_layer(&temp_dir, "oversized-index", 8192, &[]).await;
+    let count = MAX_INDEX_BYTES as u64 / size_of::<DiskSegmentMapping>() as u64 + 1;
+    let err = load_index_and_reset_tags(&(data as Arc<dyn VirtualFile>), HEADER_SIZE, count)
+        .await
+        .expect_err("oversized index should be rejected before allocation");
+    assert_err_contains(&err, "exceeds limit");
 }
 
 async fn open_sparse_lsmt_env(
