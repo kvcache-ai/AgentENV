@@ -21,7 +21,9 @@ use crate::cfg::ResolvedImageCacheConfig;
 use crate::image::cache::test_support::{
     test_local_image_services_from_service, ImageCacheService,
 };
-use crate::image::cache::{local_image_services_from_global_config, RuntimeImageRefs};
+use crate::image::cache::{
+    local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
+};
 use crate::sandbox::mock::{
     MockAction, MockBackendFactory, MockBehavior, MockOperation, MockSandboxBackend, MockSnapshot,
 };
@@ -46,6 +48,54 @@ fn setup() {
 
 fn test_runtime_image_refs() -> Arc<dyn RuntimeImageRefs> {
     local_image_services_from_global_config().runtime_refs
+}
+
+#[derive(Debug, Default)]
+struct RecordingRuntimeImageRefs {
+    pinned: StdMutex<Vec<RuntimeImageOwner>>,
+    unpinned: StdMutex<Vec<RuntimeImageOwner>>,
+}
+
+impl RecordingRuntimeImageRefs {
+    fn unpinned(&self) -> Vec<RuntimeImageOwner> {
+        self.unpinned
+            .lock()
+            .expect("unpinned refs mutex poisoned")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl RuntimeImageRefs for RecordingRuntimeImageRefs {
+    async fn pin(
+        &self,
+        owner: RuntimeImageOwner,
+        _artifacts: RuntimeArtifactSet,
+    ) -> anyhow::Result<()> {
+        self.pinned
+            .lock()
+            .expect("pinned refs mutex poisoned")
+            .push(owner);
+        Ok(())
+    }
+
+    async fn unpin_best_effort(&self, owner: RuntimeImageOwner) {
+        self.unpinned
+            .lock()
+            .expect("unpinned refs mutex poisoned")
+            .push(owner);
+    }
+
+    async fn reconcile_paused(&self, _live_paused: &[SandboxId]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn maintain_running(
+        &self,
+        _running: Vec<(SandboxId, RuntimeArtifactSet)>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 async fn make_orchestrator() -> Arc<TestOrchestrator> {
@@ -1692,6 +1742,81 @@ async fn pause_persistence_failure_rolls_back_to_running() -> Result<()> {
         created.resources.memory_mib,
     )
     .await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_artifact_root_allocation_failure_restores_running_for_retry() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    persister.fail_next(RecordingCall::AllocateArtifactRoot);
+    let mut orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let image_refs = Arc::new(RecordingRuntimeImageRefs::default());
+    Arc::get_mut(&mut orchestrator)
+        .expect("orchestrator should be uniquely owned")
+        .image_refs = image_refs.clone();
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "pause-allocate-fail")]))
+        .await?;
+    let sandbox_id = created.id;
+
+    let err = orchestrator
+        .pause_sandbox(sandbox_id)
+        .await
+        .expect_err("pause should fail when artifact-root allocation fails");
+    assert!(matches!(
+        err,
+        OrchestratorError::SandboxPersistenceFailed(_)
+    ));
+
+    let running = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("metadata should remain after allocation failure");
+    assert_eq!(running.state, SandboxState::Running);
+    assert!(running.paused_state.is_none());
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+    assert!(
+        orchestrator
+            .sandboxes
+            .read()
+            .await
+            .contains_key(&sandbox_id),
+        "allocation failure should restore the runtime handle"
+    );
+    assert_eq!(
+        image_refs.unpinned(),
+        vec![
+            RuntimeImageOwner::StartingSandbox(sandbox_id),
+            RuntimeImageOwner::PausedSandbox(sandbox_id),
+        ]
+    );
+    assert_eq!(persister.calls(), vec![RecordingCall::AllocateArtifactRoot]);
+
+    // The failed allocation must leave the sandbox retryable.  The next pause
+    // gets past the one-shot failure and follows the normal paused path.
+    orchestrator.pause_sandbox(sandbox_id).await?;
+    let paused = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("metadata should remain after retry");
+    assert_eq!(paused.state, SandboxState::Paused);
+    assert_proxy_paused(&orchestrator, &sandbox_id).await?;
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::AllocateArtifactRoot,
+            RecordingCall::AllocateArtifactRoot,
+            RecordingCall::PersistPaused,
+        ]
+    );
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
     Ok(())
 }
 

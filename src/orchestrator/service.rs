@@ -1056,7 +1056,35 @@ where
         };
 
         // Pause the sandbox and capture the paused state for resuming later.
-        let artifact_root = self.persister.allocate_artifact_root(&sandbox_id).await?;
+        let artifact_root = match self.persister.allocate_artifact_root(&sandbox_id).await {
+            Ok(artifact_root) => artifact_root,
+            Err(err) => {
+                warn!(error = ?err, "failed to allocate paused sandbox artifact root");
+                self.sandboxes.write().await.insert(sandbox_id, handle);
+                self.restore_proxy_route(sandbox_id, removed_proxy_route)
+                    .await;
+                let restore_result = self
+                    .store
+                    .update_state_if_state(
+                        &sandbox_id,
+                        SandboxState::Running,
+                        &[SandboxState::Pausing],
+                    )
+                    .await;
+                self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                    .await;
+                if let Err(restore_err) = restore_result {
+                    warn!(
+                        error = ?restore_err,
+                        "failed to restore sandbox metadata after artifact-root allocation failure"
+                    );
+                    return Err(OrchestratorError::InternalError(format!(
+                        "failed to allocate paused sandbox artifact root: {err:#}; failed to restore Running state: {restore_err:#}"
+                    )));
+                }
+                return Err(OrchestratorError::from(err));
+            }
+        };
 
         let paused_state_result = {
             let mut sandbox = handle.lock().await;
