@@ -1045,21 +1045,41 @@ where
             return Err(error);
         }
 
+        // `run_lifecycle_operation` owns this future in a detached task, so
+        // cancellation of the request cannot interrupt the await/rollback
+        // sequence after the runtime is detached.
         let (handle, removed_proxy_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
 
         let Some(handle) = handle else {
             warn!("sandbox handle not found while pausing, removing from store");
             self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                 .await;
+            // This operation owns Pausing. Delete and the other lifecycle
+            // entrypoints wait for transitional states, so none can claim
+            // Killing or remove this metadata until pause reaches a stable
+            // state or removes it here.
+            // Remove metadata first. If that fails, retaining persistence is
+            // intentional: it avoids deleting durable state for a sandbox that
+            // is still discoverable in the metadata store.
             self.store.remove(&sandbox_id).await?;
+            if let Err(error) = self
+                .persister
+                .delete_record_and_artifacts(&sandbox_id)
+                .await
+            {
+                warn!(error = ?error, "failed to clean up persisted state for missing sandbox handle");
+            }
             return Err(OrchestratorError::SandboxNotFound(sandbox_id));
         };
 
-        // Pause the sandbox and capture the paused state for resuming later.
         let artifact_root = match self.persister.allocate_artifact_root(&sandbox_id).await {
             Ok(artifact_root) => artifact_root,
             Err(err) => {
                 warn!(error = ?err, "failed to allocate paused sandbox artifact root");
+                // While metadata is Pausing, delete waits rather than claiming
+                // Killing. Restore the detached runtime and route before
+                // publishing Running so clients cannot observe Running without
+                // a routable handle.
                 self.sandboxes.write().await.insert(sandbox_id, handle);
                 self.restore_proxy_route(sandbox_id, removed_proxy_route)
                     .await;
@@ -1074,10 +1094,7 @@ where
                 self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                     .await;
                 if let Err(restore_err) = restore_result {
-                    warn!(
-                        error = ?restore_err,
-                        "failed to restore sandbox metadata after artifact-root allocation failure"
-                    );
+                    warn!(error = ?restore_err, "failed to restore sandbox metadata after artifact-root allocation failure");
                     return Err(OrchestratorError::InternalError(format!(
                         "failed to allocate paused sandbox artifact root: {err:#}; failed to restore Running state: {restore_err:#}"
                     )));
@@ -1086,6 +1103,7 @@ where
             }
         };
 
+        // Pause the sandbox and capture the paused state for resuming later.
         let paused_state_result = {
             let mut sandbox = handle.lock().await;
             sandbox.pause(artifact_root.as_deref()).await

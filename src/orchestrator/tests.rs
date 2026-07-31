@@ -52,11 +52,18 @@ fn test_runtime_image_refs() -> Arc<dyn RuntimeImageRefs> {
 
 #[derive(Debug, Default)]
 struct RecordingRuntimeImageRefs {
-    pinned: StdMutex<Vec<RuntimeImageOwner>>,
+    pinned: StdMutex<Vec<(RuntimeImageOwner, RuntimeArtifactSet)>>,
     unpinned: StdMutex<Vec<RuntimeImageOwner>>,
 }
 
 impl RecordingRuntimeImageRefs {
+    fn pinned(&self) -> Vec<(RuntimeImageOwner, RuntimeArtifactSet)> {
+        self.pinned
+            .lock()
+            .expect("pinned refs mutex poisoned")
+            .clone()
+    }
+
     fn unpinned(&self) -> Vec<RuntimeImageOwner> {
         self.unpinned
             .lock()
@@ -70,12 +77,12 @@ impl RuntimeImageRefs for RecordingRuntimeImageRefs {
     async fn pin(
         &self,
         owner: RuntimeImageOwner,
-        _artifacts: RuntimeArtifactSet,
+        artifacts: RuntimeArtifactSet,
     ) -> anyhow::Result<()> {
         self.pinned
             .lock()
             .expect("pinned refs mutex poisoned")
-            .push(owner);
+            .push((owner, artifacts));
         Ok(())
     }
 
@@ -1628,7 +1635,12 @@ async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
 #[tokio::test]
 async fn pause_removes_handle_less_running_sandbox_and_releases_metrics() -> Result<()> {
     setup();
-    let orchestrator = make_orchestrator().await;
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
     let created = orchestrator
         .create_sandbox(create_request(Some(60), &[("team", "missing-handle")]))
         .await?;
@@ -1664,6 +1676,10 @@ async fn pause_removes_handle_less_running_sandbox_and_releases_metrics() -> Res
     );
     assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+    assert_eq!(
+        persister.calls(),
+        vec![RecordingCall::DeleteRecordAndArtifacts]
+    );
 
     Ok(())
 }
@@ -1750,9 +1766,16 @@ async fn pause_artifact_root_allocation_failure_restores_running_for_retry() -> 
     setup();
     let persister = RecordingPersister::default();
     persister.fail_next(RecordingCall::AllocateArtifactRoot);
+    let runtime_artifacts =
+        RuntimeArtifactSet::from_overlaybd_image_configs(vec![PathBuf::from("runtime/image.json")]);
+    let backend_control = Arc::new(MockBehavior::new());
+    backend_control.set_runtime_info(SandboxRuntimeInfo {
+        runtime_artifacts: runtime_artifacts.clone(),
+        ..Default::default()
+    });
     let mut orchestrator = make_orchestrator_without_background_with_factory_and_persister(
         InMemoryMetadataStore::new(),
-        MockBackendFactory::new(),
+        MockBackendFactory::with_behavior(backend_control),
         persister.clone(),
     );
     let image_refs = Arc::new(RecordingRuntimeImageRefs::default());
@@ -1790,6 +1813,19 @@ async fn pause_artifact_root_allocation_failure_restores_running_for_retry() -> 
         "allocation failure should restore the runtime handle"
     );
     assert_eq!(
+        image_refs.pinned(),
+        vec![
+            (
+                RuntimeImageOwner::StartingSandbox(sandbox_id),
+                RuntimeArtifactSet::empty(),
+            ),
+            (
+                RuntimeImageOwner::PausedSandbox(sandbox_id),
+                runtime_artifacts.clone(),
+            ),
+        ]
+    );
+    assert_eq!(
         image_refs.unpinned(),
         vec![
             RuntimeImageOwner::StartingSandbox(sandbox_id),
@@ -1808,6 +1844,23 @@ async fn pause_artifact_root_allocation_failure_restores_running_for_retry() -> 
     assert_eq!(paused.state, SandboxState::Paused);
     assert_proxy_paused(&orchestrator, &sandbox_id).await?;
     assert_eq!(
+        image_refs.pinned(),
+        vec![
+            (
+                RuntimeImageOwner::StartingSandbox(sandbox_id),
+                RuntimeArtifactSet::empty(),
+            ),
+            (
+                RuntimeImageOwner::PausedSandbox(sandbox_id),
+                runtime_artifacts.clone(),
+            ),
+            (
+                RuntimeImageOwner::PausedSandbox(sandbox_id),
+                runtime_artifacts,
+            ),
+        ]
+    );
+    assert_eq!(
         persister.calls(),
         vec![
             RecordingCall::AllocateArtifactRoot,
@@ -1817,6 +1870,14 @@ async fn pause_artifact_root_allocation_failure_restores_running_for_retry() -> 
     );
 
     orchestrator.delete_sandbox(sandbox_id).await?;
+    assert_eq!(
+        image_refs.unpinned(),
+        vec![
+            RuntimeImageOwner::StartingSandbox(sandbox_id),
+            RuntimeImageOwner::PausedSandbox(sandbox_id),
+            RuntimeImageOwner::PausedSandbox(sandbox_id),
+        ]
+    );
     Ok(())
 }
 
