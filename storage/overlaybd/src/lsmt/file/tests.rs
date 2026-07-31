@@ -471,6 +471,12 @@ async fn rejects_sealed_index_offset_out_of_bounds() {
     })
     .await;
 
+    let rw_err = LSMTFile::open(data.clone(), None, None, Vec::new())
+        .await
+        .err()
+        .expect("malformed sealed layer must not open as writable");
+    assert_err_contains(&rw_err, "Sealed");
+
     let err = open_file_ro(data as Arc<dyn VirtualFile>)
         .await
         .err()

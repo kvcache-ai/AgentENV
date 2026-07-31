@@ -299,6 +299,12 @@ pub async fn stack_files(
 pub async fn open_file_index(file: Arc<dyn VirtualFile>) -> Result<ReadOnlyIndex> {
     let file_size = file.size().await?;
     let trailer = verify_ht(&file, true, file_size).await?;
+    validate_index_bounds(
+        trailer.index_offset.get(),
+        trailer.index_size.get(),
+        file_size,
+        HEADER_SIZE,
+    )?;
     let mappings =
         load_index_and_reset_tags(&file, trailer.index_offset.get(), trailer.index_size.get())
             .await?;

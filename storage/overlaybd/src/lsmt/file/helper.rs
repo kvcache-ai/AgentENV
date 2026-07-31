@@ -820,17 +820,16 @@ pub(super) async fn verify_ht(
             ht.verify_magic() && ht.is_trailer() && ht.is_data_file() && ht.is_sealed(),
             "trailer magic, trailer type, file type or sealedness doesn't match"
         );
-        validate_index_bounds(
-            ht.index_offset.get(),
-            ht.index_size.get(),
-            file_size,
-            HEADER_SIZE,
-        )?;
         Ok(ht)
     }
 }
 
-fn validate_index_bounds(offset: u64, count: u64, file_size: u64, trailer_size: u64) -> Result<()> {
+pub(super) fn validate_index_bounds(
+    offset: u64,
+    count: u64,
+    file_size: u64,
+    trailer_size: u64,
+) -> Result<()> {
     let index_limit = file_size
         .checked_sub(trailer_size)
         .context("index file boundary underflow")?;
@@ -857,6 +856,12 @@ async fn load_readonly_layer_metadata(file: Arc<dyn VirtualFile>) -> Result<Read
     let file_size = file.size().await?;
     let header = verify_ht(&file, false, file_size).await?;
     let trailer = verify_ht(&file, true, file_size).await?;
+    validate_index_bounds(
+        trailer.index_offset.get(),
+        trailer.index_size.get(),
+        file_size,
+        HEADER_SIZE,
+    )?;
     Ok(ReadOnlyLayerMetadata {
         uuid: parse_uuid_field(&trailer.uuid).unwrap_or_else(Uuid::nil),
         file_size,
