@@ -730,9 +730,7 @@ where
     F: FnMut(I) -> Fut,
     Fut: Future<Output = Option<T>>,
 {
-    let mut results = stream::iter(items)
-        .map(lookup)
-        .buffered(concurrency.max(1));
+    let mut results = stream::iter(items).map(lookup).buffered(concurrency.max(1));
     while let Some(result) = results.next().await {
         if result.is_some() {
             return result;
