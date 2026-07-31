@@ -556,14 +556,17 @@ async fn rejects_index_exceeding_decoded_memory_budget() {
 fn compact_index_reservation_grows_geometrically_within_budget() {
     let mut index = Vec::new();
     reserve_compact_index(&mut index, 1).unwrap();
-    index.push(SegmentMapping::default());
-    reserve_compact_index(&mut index, 1).unwrap();
-    index.push(SegmentMapping::default());
+    let previous_capacity = index.capacity();
+    index.resize(previous_capacity, SegmentMapping::default());
     reserve_compact_index(&mut index, 1).unwrap();
 
-    assert!(index.capacity() >= 3);
-    assert!(index.capacity() > index.len());
+    assert!(index.capacity() >= previous_capacity * 2);
     validate_index_memory(index.capacity() as u64).unwrap();
+
+    let max_capacity =
+        MAX_INDEX_MEMORY_BYTES / (size_of::<DiskSegmentMapping>() + size_of::<SegmentMapping>());
+    reserve_compact_index(&mut Vec::new(), max_capacity + 1)
+        .expect_err("reservation beyond the index budget should be rejected");
 }
 
 #[test]

@@ -1234,8 +1234,8 @@ async fn compact_copy_mapping_with_zero_detection(
     let mut written_bytes = 0u64;
     let buf_size = writer.buffer_size();
     ensure!(
-        buf_size.is_multiple_of(ALIGNMENT_USIZE),
-        "CompactWriter buffer size {buf_size} not aligned"
+        buf_size > 0 && buf_size.is_multiple_of(ALIGNMENT_USIZE),
+        "CompactWriter buffer size {buf_size} must be non-zero and aligned"
     );
 
     let mut index = Vec::new();
@@ -1375,8 +1375,8 @@ pub async fn compact_to(
     let concurrency = commit_args.concurrency.max(1);
     let buf_size = writer.buffer_size();
     ensure!(
-        buf_size.is_multiple_of(ALIGNMENT_USIZE),
-        "CompactWriter buffer size {buf_size} not aligned"
+        buf_size > 0 && buf_size.is_multiple_of(ALIGNMENT_USIZE),
+        "CompactWriter buffer size {buf_size} must be non-zero and aligned"
     );
 
     validate_index_memory(mappings.len() as u64)?;
