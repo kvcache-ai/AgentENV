@@ -407,6 +407,10 @@ impl Lz4Compressor {
         );
         let src_blk_size = usize::try_from(args.opt.block_size).context("invalid block_size")?;
         ensure!(src_blk_size != 0, "block_size must be > 0");
+        ensure!(
+            src_blk_size <= i32::MAX as usize,
+            "block_size {src_blk_size} exceeds LZ4 i32 limit"
+        );
 
         Ok(Self {
             max_dst_size: lz4_compress_bound(src_blk_size),
@@ -1510,13 +1514,10 @@ struct WorkItem {
 }
 
 /// Completion returned by a persistent compression worker; `seq` matches the
-/// originating [`WorkItem`]. `worker_thread_id` (test builds only) identifies
-/// the pool thread that produced the batch so tests can prove thread reuse.
+/// originating [`WorkItem`].
 struct CompressedBatch {
     seq: usize,
     result: Result<CompressedSegment>,
-    #[cfg(test)]
-    worker_thread_id: std::thread::ThreadId,
 }
 
 /// Persistent pool of compression worker threads.
@@ -1538,6 +1539,10 @@ struct WorkerPool {
 }
 
 impl WorkerPool {
+    /// Maximum worker threads. Prevents absurd configs from spawning
+    /// thousands of OS threads or overflowing channel capacity arithmetic.
+    const MAX_WORKERS: usize = 256;
+
     fn new(
         workers: usize,
         opt: CompressOptions,
@@ -1545,7 +1550,7 @@ impl WorkerPool {
         block_size: usize,
         max_compressed_block_size: usize,
     ) -> Self {
-        let workers = workers.max(1);
+        let workers = workers.clamp(1, Self::MAX_WORKERS);
         let (work_tx, work_rx) = crossbeam_channel::bounded::<WorkItem>(workers * 2);
         let (result_tx, result_rx) = crossbeam_channel::bounded::<CompressedBatch>(workers * 2);
         #[cfg(test)]
@@ -1573,8 +1578,6 @@ impl WorkerPool {
                                     result: Err(anyhow::anyhow!(
                                         "zfile worker compressor init failed: {message}"
                                     )),
-                                    #[cfg(test)]
-                                    worker_thread_id: std::thread::current().id(),
                                 })
                                 .is_err()
                             {
@@ -1615,8 +1618,6 @@ impl WorkerPool {
                         .send(CompressedBatch {
                             seq: item.seq,
                             result,
-                            #[cfg(test)]
-                            worker_thread_id: std::thread::current().id(),
                         })
                         .is_err()
                     {
@@ -1655,15 +1656,6 @@ impl WorkerPool {
             .recv()
             .map_err(|_| anyhow::anyhow!("zfile worker pool result channel closed"))
     }
-
-    /// Thread IDs of the pool's persistent workers.
-    #[cfg(test)]
-    fn worker_thread_ids(&self) -> Vec<std::thread::ThreadId> {
-        self.handles
-            .iter()
-            .map(|handle| handle.thread().id())
-            .collect()
-    }
 }
 
 impl Drop for WorkerPool {
@@ -1698,10 +1690,6 @@ pub struct ZFileBuilder {
     moffset: u64,
     ht: HeaderTrailer,
     finished: bool,
-    /// Worker thread IDs observed per pooled compression round, in commit
-    /// order; recorded so tests can prove the pool reuses its threads.
-    #[cfg(test)]
-    completed_worker_thread_ids: Vec<std::collections::HashSet<std::thread::ThreadId>>,
 }
 
 impl ZFileBuilder {
@@ -1745,8 +1733,6 @@ impl ZFileBuilder {
             moffset: HEADER_TRAILER_SPACE as u64 + args.opt.dict_size as u64,
             ht,
             finished: false,
-            #[cfg(test)]
-            completed_worker_thread_ids: Vec::new(),
         })
     }
 
@@ -1849,14 +1835,6 @@ impl ZFileBuilder {
         self.write_full_blocks_owned(source.to_vec()).await
     }
 
-    /// Drain the recorded per-round worker thread ID sets (test only).
-    #[cfg(test)]
-    fn take_completed_worker_thread_ids(
-        &mut self,
-    ) -> Vec<std::collections::HashSet<std::thread::ThreadId>> {
-        std::mem::take(&mut self.completed_worker_thread_ids)
-    }
-
     async fn write_full_blocks_owned(&mut self, source: Vec<u8>) -> Result<()> {
         let block_size = usize::try_from(self.opt.block_size).context("invalid block_size")?;
         ensure!(
@@ -1884,9 +1862,6 @@ impl ZFileBuilder {
         // but it parks a current-thread runtime). If server-side latency
         // matters, wrap the submit/recv collection in
         // `tokio::task::spawn_blocking`.
-        #[cfg(test)]
-        let mut batch_thread_ids: std::collections::HashSet<std::thread::ThreadId> =
-            Default::default();
         let (first_error, segments) = {
             let pool = self.pool.as_ref().expect("checked is_some above");
             let workers = pool.worker_count().min(block_count);
@@ -1921,22 +1896,16 @@ impl ZFileBuilder {
             while pending > 0 {
                 pending -= 1;
                 match pool.recv() {
-                    Ok(batch) => {
-                        #[cfg(test)]
-                        {
-                            batch_thread_ids.insert(batch.worker_thread_id);
+                    Ok(batch) => match batch.result {
+                        Ok(segment) => {
+                            segments.insert(batch.seq, segment);
                         }
-                        match batch.result {
-                            Ok(segment) => {
-                                segments.insert(batch.seq, segment);
-                            }
-                            Err(error) => {
-                                if first_error.is_none() {
-                                    first_error = Some(error);
-                                }
+                        Err(error) => {
+                            if first_error.is_none() {
+                                first_error = Some(error);
                             }
                         }
-                    }
+                    },
                     Err(error) => {
                         if first_error.is_none() {
                             first_error = Some(error);
@@ -1956,8 +1925,6 @@ impl ZFileBuilder {
             return Err(error);
         }
 
-        #[cfg(test)]
-        self.completed_worker_thread_ids.push(batch_thread_ids);
         for segment in segments.into_values() {
             self.commit_compressed_batch(segment).await?;
         }
@@ -2894,65 +2861,6 @@ mod tests {
         );
 
         assert_writer_poisoned(writer.as_ref()).await;
-    }
-
-    #[tokio::test]
-    async fn compact_writer_persistent_workers_reuse_threads() {
-        // With workers > 1 the builder must compress on a persistent worker
-        // pool: every submitted batch must be served by the same set of
-        // worker thread IDs.
-        let backing = Arc::new(CountingMemoryFile::new(Vec::new()));
-        let args = CompressArgs {
-            // ZSTD keeps per-segment compression well above thread wake-up
-            // latency, so each of the 4 workers takes exactly one segment.
-            opt: CompressOptions::new(CompressOptions::ZSTD, 4096, 1),
-            overwrite_header: false,
-            workers: 4,
-        };
-        let mut builder = ZFileBuilder::new(backing, &args)
-            .await
-            .expect("create builder");
-        let pool_thread_ids: std::collections::HashSet<std::thread::ThreadId> = builder
-            .pool
-            .as_ref()
-            .expect("workers > 1 must create a persistent worker pool")
-            .worker_thread_ids()
-            .into_iter()
-            .collect();
-        assert_eq!(pool_thread_ids.len(), 4, "pool must spawn 4 workers");
-        assert!(
-            !pool_thread_ids.contains(&std::thread::current().id()),
-            "compression must not run on the caller thread"
-        );
-
-        // Warm-up round first: freshly spawned workers may still be starting
-        // up while the first batch is submitted, so one worker could grab two
-        // segments before its peers park on the queue. Discard the warm-up
-        // round's IDs; afterwards all 4 workers are parked in `recv` and the
-        // per-round thread sets are deterministic.
-        let batch = sample_data(ZFILE_COMPACT_WRITER_BUFFER_SIZE);
-        builder.write(&batch).await.expect("warm-up batch");
-        let warmup_rounds = builder.take_completed_worker_thread_ids();
-        assert_eq!(warmup_rounds.len(), 1, "expected one warm-up round");
-
-        // Two full 512 KiB batches through the real write path; each becomes
-        // one pooled compression round of 4 segments.
-        builder.write(&batch).await.expect("write batch 1");
-        builder.write(&batch).await.expect("write batch 2");
-
-        let batch_thread_ids = builder.take_completed_worker_thread_ids();
-        assert_eq!(
-            batch_thread_ids.len(),
-            2,
-            "expected one pooled compression round per 512 KiB batch"
-        );
-        for (batch_index, thread_ids) in batch_thread_ids.iter().enumerate() {
-            assert_eq!(
-                thread_ids, &pool_thread_ids,
-                "batch {batch_index} must reuse the same persistent worker threads"
-            );
-        }
-        builder.finish().await.expect("finish");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

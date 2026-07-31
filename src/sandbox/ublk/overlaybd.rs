@@ -9,6 +9,7 @@ use overlaybd::virtual_file::VirtualFile;
 use overlaybd::zfile::{CompressArgs, CompressOptions, ZFileCompactWriter};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
+use uuid::Uuid;
 
 use super::device::UblkDevice;
 use crate::cfg::{MemorySnapshotCompressionAlgorithm, MemorySnapshotConfig};
@@ -124,7 +125,7 @@ pub(crate) async fn compact_layers(
         src_files.push(switched);
     }
 
-    let lower_tmp = output_path.with_extension("commit.tmp");
+    let lower_tmp = output_path.with_extension(format!("commit.{}.tmp", Uuid::now_v7()));
     let build_result: Result<()> = async {
         let output_file: Arc<dyn VirtualFile> = Arc::new(
             LocalFile::new(&lower_tmp, io_ring)
