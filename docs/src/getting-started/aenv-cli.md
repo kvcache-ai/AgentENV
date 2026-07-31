@@ -274,3 +274,48 @@ aenv snapshot list --sandbox-id <sandbox-id>
 The table output includes an `IMAGE REF` column (`-` when no image was published); JSON output includes the optional `imageRef` field.
 
 To delete a snapshot, use `aenv template delete <snapshot-id>` or `aenv template delete <name>` — snapshots share the same underlying store as templates and are deleted through the same command.
+
+---
+
+## Shell completion
+
+`aenv completion <shell>` prints a shell-completion script to stdout. The script is rebuilt from the live CLI definition on every run, so it always matches the installed `aenv` — top-level commands, nested subcommands (e.g. `aenv snapshot create`), visible aliases (`cn`, `ls`, `rm`, `snap`, `templates`), flags, the `--output table|json` enum, and local path arguments such as the Dockerfile passed to `aenv build`.
+
+Three shells are supported; elvish and powershell are explicit non-goals.
+
+### Generate a script
+
+```bash
+aenv completion bash
+aenv completion zsh
+aenv completion fish
+```
+
+Each command writes the matching script to stdout, so redirect it wherever your shell expects:
+
+```bash
+aenv completion bash > ~/.local/share/aenv-completion.bash
+aenv completion zsh  > ~/.config/aenv/_aenv
+aenv completion fish > ~/.config/fish/completions/aenv.fish
+```
+
+### Activate it
+
+For a one-session test, evaluate the script in the current shell:
+
+```bash
+source <(aenv completion bash)        # bash
+eval "$(aenv completion zsh)"         # zsh
+aenv completion fish | source         # fish
+```
+
+To make completion persistent, add the matching line to your shell's rc file (`~/.bashrc` or `~/.bash_profile`, `~/.zshrc`, `~/.config/fish/config.fish`) and restart the shell or re-source the file.
+
+Once loaded, completion covers the static CLI surface:
+
+```bash
+aenv <TAB>                       # top-level commands
+aenv snapshot <TAB>              # nested subcommands (create, list, ...)
+aenv list --output <TAB>         # enum values: table, json
+aenv build ./<TAB>               # local path arguments
+```
