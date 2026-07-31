@@ -108,6 +108,30 @@ pub async fn package_ext4_as_overlaybd(
     build_result
 }
 
+/// Compact a raw file into the destination owned by `commit_args`.
+pub async fn package_raw_as_overlaybd_with_args(
+    source: &Path,
+    commit_args: CommitArgs,
+) -> Result<()> {
+    let virtual_size = tokio::fs::metadata(source)
+        .await
+        .with_context(|| format!("stat source raw file failed: {}", source.display()))?
+        .len();
+    let io_ring = shared_transient_io_ring();
+    let source_file: Arc<dyn VirtualFile> = Arc::new(
+        LocalFile::open_ro(source, io_ring)
+            .await
+            .with_context(|| format!("open source raw file failed: {}", source.display()))?,
+    );
+    let mappings = create_mappings_from_sparse(&source_file, 0)
+        .await
+        .with_context(|| format!("scan sparse raw file failed: {}", source.display()))?;
+    let src_layers = vec![source_file];
+    compact_to(&src_layers, &mappings, virtual_size, commit_args)
+        .await
+        .with_context(|| format!("compact raw file as overlaybd failed: {}", source.display()))
+}
+
 /// Package a raw file as a sealed overlaybd lower layer.
 pub async fn package_raw_as_overlaybd(source: &Path, output: &Path) -> Result<()> {
     let parent = output
@@ -118,33 +142,16 @@ pub async fn package_raw_as_overlaybd(source: &Path, output: &Path) -> Result<()
         .with_context(|| format!("create output directory failed: {}", parent.display()))?;
 
     let lower_tmp = output.with_extension("commit.tmp");
-    let io_ring = shared_transient_io_ring();
     let build_result = async {
-        let virtual_size = tokio::fs::metadata(source)
-            .await
-            .with_context(|| format!("stat source raw file failed: {}", source.display()))?
-            .len();
-        let source_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_ro(source, io_ring.clone())
-                .await
-                .with_context(|| format!("open source raw file failed: {}", source.display()))?,
-        );
+        let io_ring = shared_transient_io_ring();
         let output_file: Arc<dyn VirtualFile> = Arc::new(
             LocalFile::new(&lower_tmp, io_ring)
                 .await
                 .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
         );
-        let mappings = create_mappings_from_sparse(&source_file, 0)
-            .await
-            .with_context(|| format!("scan sparse raw file failed: {}", source.display()))?;
-        let src_layers = vec![source_file];
         let mut commit_args = CommitArgs::new(output_file);
         commit_args.concurrency = 32;
-        compact_to(&src_layers, &mappings, virtual_size, commit_args)
-            .await
-            .with_context(|| {
-                format!("compact raw file as overlaybd failed: {}", source.display())
-            })?;
+        package_raw_as_overlaybd_with_args(source, commit_args).await?;
         tokio::fs::rename(&lower_tmp, output)
             .await
             .with_context(|| {

@@ -145,6 +145,11 @@ fill_concurrency = 4
 # Experimental: create memory overlaybd layers directly from Firecracker dirty
 # ranges via process_vm_readv, skipping the intermediate mem.bin file.
 direct_overlaybd = true
+compression_enabled = false
+compression_algorithm = "lz4"
+# Blocking threads used to compress memory-layer blocks. 1 = sequential;
+# higher values parallelize compression across CPU cores (identical layout).
+compression_workers = 1
 
 [memory_snapshot.background_download]
 enable = true

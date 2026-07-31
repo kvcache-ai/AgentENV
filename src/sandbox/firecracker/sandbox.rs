@@ -43,8 +43,8 @@ use crate::sandbox::extra_drive::{
 use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
 use crate::sandbox::process::Executor;
 use crate::sandbox::ublk::{
-    OverlaybdConfig, OverlaybdRuntimeHandle, SharedMemDevice, UblkBackend, UblkCreateSpec,
-    UblkDeviceManager,
+    OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, SharedMemDevice, UblkBackend,
+    UblkCreateSpec, UblkDeviceManager,
 };
 use crate::sandbox::SandboxLaunchConfig;
 use crate::snapshot::RunnableSnapshot;
@@ -573,8 +573,11 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
+        let memory_output = OverlaybdCompactOutput::from_memory_snapshot_config(
+            &ConfigManager::global_config().memory_snapshot,
+        );
         let (mem_layer_path, mem_virtual_size) = self
-            .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir)
+            .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, memory_output)
             .await?;
 
         // Build the memory image config: collect parent layers, make runtime
@@ -590,6 +593,7 @@ impl FirecrackerSandbox {
             resume_mem_image_config_path,
             &mem_layer_path,
             snapshot_dir,
+            memory_output,
         )
         .await?;
         let mem_image_config_path = snapshot_dir.join("mem_image.json");
@@ -713,6 +717,7 @@ impl FirecrackerSandbox {
         &self,
         vm_state_path: &Path,
         snapshot_dir: &Path,
+        memory_output: OverlaybdCompactOutput,
     ) -> Result<(PathBuf, u64)> {
         let mem_overlaybd_dir = snapshot_dir.join("mem_overlaybd");
         if ConfigManager::global_config()
@@ -727,9 +732,14 @@ impl FirecrackerSandbox {
             // error aborts this direct snapshot attempt and is propagated to
             // the lifecycle caller for recovery.
             let dirty_ranges = self.fc_instance.get_dirty_memory_ranges().await?;
-            convert_dirty_memory_to_overlaybd(firecracker_pid, &dirty_ranges, &mem_overlaybd_dir)
-                .await
-                .context("convert dirty memory ranges to overlaybd layer")
+            convert_dirty_memory_to_overlaybd(
+                firecracker_pid,
+                &dirty_ranges,
+                &mem_overlaybd_dir,
+                memory_output,
+            )
+            .await
+            .context("convert dirty memory ranges to overlaybd layer")
         } else {
             let mem_path = snapshot_dir.join("mem.bin");
             self.fc_instance
@@ -741,9 +751,10 @@ impl FirecrackerSandbox {
                 .await
                 .with_context(|| format!("stat mem snapshot: {}", mem_path.display()))?
                 .len();
-            let mem_layer_path = convert_sparse_mem_to_overlaybd(&mem_path, &mem_overlaybd_dir)
-                .await
-                .context("convert mem snapshot to overlaybd layer")?;
+            let mem_layer_path =
+                convert_sparse_mem_to_overlaybd(&mem_path, &mem_overlaybd_dir, memory_output)
+                    .await
+                    .context("convert mem snapshot to overlaybd layer")?;
             Ok((mem_layer_path, mem_virtual_size))
         }
     }

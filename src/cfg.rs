@@ -356,12 +356,28 @@ pub struct UblkOverlaybdTomlConfig {
     pub p2p_fetch_range_timeout_ms: u64,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySnapshotCompressionAlgorithm {
+    #[default]
+    Lz4,
+    Zstd,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct MemorySnapshotConfig {
     #[config(default = "$AENV_HOME/overlaybd/mem-overlaybd-global.json")]
     pub overlaybd_global_config_path: PathBuf,
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_DIRECT_OVERLAYBD", default = true)]
     pub direct_overlaybd: bool,
+    #[config(default = false)]
+    pub compression_enabled: bool,
+    #[config(default = "lz4")]
+    pub compression_algorithm: MemorySnapshotCompressionAlgorithm,
+    /// Number of blocking threads used to compress 4KiB blocks within a
+    /// memory layer. 1 = sequential (identical output layout at any value).
+    #[config(default = 1)]
+    pub compression_workers: usize,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }
@@ -1082,6 +1098,54 @@ impl SandboxProxyConfig {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn memory_snapshot_compression_config_is_valid() -> Result<()> {
+        let default = MemorySnapshotConfig::default();
+        assert!(!default.compression_enabled);
+        assert_eq!(
+            default.compression_algorithm,
+            MemorySnapshotCompressionAlgorithm::Lz4
+        );
+        assert_eq!(default.compression_workers, 1);
+
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        for relative in ["config/default.toml", "config/oss_default.toml"] {
+            let config = ConfigManager::new_from_path(&workspace.join(relative))?;
+            assert!(!config.config().memory_snapshot.compression_enabled);
+            assert_eq!(
+                config.config().memory_snapshot.compression_algorithm,
+                MemorySnapshotCompressionAlgorithm::Lz4,
+                "unexpected compression default in {relative}"
+            );
+            assert_eq!(
+                config.config().memory_snapshot.compression_workers,
+                1,
+                "unexpected compression_workers default in {relative}"
+            );
+        }
+
+        let temp = tempdir()?;
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[memory_snapshot]\ncompression_enabled = true\ncompression_algorithm = \"zstd\"\ncompression_workers = 4\n",
+        )?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert!(config.config().memory_snapshot.compression_enabled);
+        assert_eq!(
+            config.config().memory_snapshot.compression_algorithm,
+            MemorySnapshotCompressionAlgorithm::Zstd
+        );
+        assert_eq!(config.config().memory_snapshot.compression_workers, 4);
+
+        std::fs::write(
+            &path,
+            "[memory_snapshot]\ncompression_enabled = true\ncompression_algorithm = \"snappy\"\n",
+        )?;
+        assert!(ConfigManager::new_from_path(&path).is_err());
+        Ok(())
+    }
 
     #[test]
     fn memory_snapshot_background_download_defaults() {

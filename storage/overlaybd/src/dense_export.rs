@@ -97,6 +97,10 @@ impl CompactWriter for DigestCompactWriter {
         self.buf_size
     }
 
+    fn requires_ordered_writes(&self) -> bool {
+        true
+    }
+
     async fn write(&self, buf: Box<dyn CompactBuffer>, offset: u64, len: usize) -> Result<()> {
         let data = AsRef::<[u8]>::as_ref(buf.as_ref());
         if len > data.len() {

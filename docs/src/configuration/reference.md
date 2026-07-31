@@ -484,6 +484,8 @@ the default path on every startup.
 |-----|------|---------|-------------|
 | `overlaybd_global_config_path` | string | `"$AENV_HOME/overlaybd/mem-overlaybd-global.json"` | Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file. |
 | `direct_overlaybd` | bool | `true` | Create memory overlaybd layers directly from Firecracker dirty memory ranges via `process_vm_readv`, skipping the intermediate `mem.bin` file. Set `AGENTENV_MEMORY_SNAPSHOT_DIRECT_OVERLAYBD=false` to force the legacy `mem.bin` conversion path. |
+| `compression_enabled` | bool | `false` | Enable compression for memory snapshot layers. When disabled, `compression_algorithm` is still parsed but has no effect. This setting affects only memory layers; the physical file name remains `overlaybd.commit`. |
+| `compression_algorithm` | string | `"lz4"` | Compression algorithm for memory snapshot layers. Valid values are only `lz4` and `zstd`. |
 
 ## `[memory_snapshot.background_download]`
 

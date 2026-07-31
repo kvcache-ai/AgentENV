@@ -18,7 +18,7 @@ use nix::unistd::Pid;
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::{ImageConfig, LayerConfig};
 use overlaybd::index::{Segment, SegmentMapping};
-use overlaybd::index_file::{compact_to, CommitArgs};
+use overlaybd::index_file::compact_to;
 use overlaybd::transient_io_ring::shared_transient_io_ring;
 use overlaybd::virtual_file::VirtualFile;
 use tracing::{debug, warn};
@@ -27,7 +27,9 @@ use super::process_vm_reader::ProcessVmReader;
 use super::sandbox::managed_snapshot_base;
 use crate::cfg::ConfigManager;
 use crate::sandbox::ublk::UblkDevice;
-use crate::sandbox::ublk::{compact_layers, UblkDeviceManager};
+use crate::sandbox::ublk::{
+    compact_layers, create_commit_args, OverlaybdCompactOutput, UblkDeviceManager,
+};
 use crate::sandbox::SandboxCaptureError;
 
 /// Default maximum number of overlaybd snapshot layers before compaction triggers.
@@ -373,6 +375,8 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         output_dir,
         appended_layer,
         MANAGED_BASE_LAYER_FILE,
+        // Rootfs layers must stay raw: only memory snapshots may be compressed.
+        OverlaybdCompactOutput::Raw,
     )
     .await?;
     image_config.lowers = rewritten_lowers;
@@ -391,6 +395,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
     output_dir: &Path,
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
+    compaction_output: OverlaybdCompactOutput,
 ) -> Result<Vec<LayerConfig>> {
     rewrite_lowers_with_runtime_roots(
         existing_lowers,
@@ -398,6 +403,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
         appended_layer,
         compaction_output_name,
         canonicalized_runtime_owned_roots(),
+        compaction_output,
     )
     .await
 }
@@ -408,6 +414,7 @@ async fn rewrite_lowers_with_runtime_roots(
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
     runtime_owned_roots: &[PathBuf],
+    compaction_output: OverlaybdCompactOutput,
 ) -> Result<Vec<LayerConfig>> {
     let (mut lowers, mut runtime_owned_lowers) =
         split_runtime_suffix(existing_lowers, runtime_owned_roots);
@@ -425,8 +432,12 @@ async fn rewrite_lowers_with_runtime_roots(
         if runtime_suffix.iter().any(|lower| lower.file.is_empty()) {
             anyhow::bail!("cannot compact runtime-owned overlaybd suffix with remote lowers");
         }
-        if let Some(compacted_path) =
-            compact_layers(&runtime_suffix, &output_dir.join(compaction_output_name)).await?
+        if let Some(compacted_path) = compact_layers(
+            &runtime_suffix,
+            &output_dir.join(compaction_output_name),
+            compaction_output,
+        )
+        .await?
         {
             lowers.push(local_layer_config(&compacted_path));
         }
@@ -549,6 +560,7 @@ pub(super) async fn build_mem_snapshot_image_config(
     resume_mem_image_config_path: Option<&Path>,
     new_layer_path: &Path,
     output_dir: &Path,
+    memory_output: OverlaybdCompactOutput,
 ) -> Result<ImageConfig> {
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
@@ -558,6 +570,7 @@ pub(super) async fn build_mem_snapshot_image_config(
         output_dir,
         Some(new_layer),
         "mem_compacted.commit",
+        memory_output,
     )
     .await?;
 
@@ -616,35 +629,104 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
     .await
 }
 
+async fn publish_memory_overlaybd_layer(
+    src_layers: &[Arc<dyn VirtualFile>],
+    mappings: &[SegmentMapping],
+    virtual_size: u64,
+    output_path: &Path,
+    mode: OverlaybdCompactOutput,
+    concurrency: usize,
+) -> Result<()> {
+    let lower_tmp = output_path.with_extension("commit.tmp");
+    let build_result = async {
+        let io_ring = shared_transient_io_ring();
+        let output_file: Arc<dyn VirtualFile> = Arc::new(
+            LocalFile::new(&lower_tmp, io_ring)
+                .await
+                .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
+        );
+        let commit_args = create_commit_args(output_file, mode, concurrency).await?;
+        compact_to(src_layers, mappings, virtual_size, commit_args)
+            .await
+            .context("compact memory layer")?;
+        tokio::fs::rename(&lower_tmp, output_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "move sealed memory lower into place failed: {}",
+                    output_path.display()
+                )
+            })?;
+        Ok(())
+    }
+    .await;
+
+    if build_result.is_err() {
+        let _ = tokio::fs::remove_file(&lower_tmp).await;
+    }
+    build_result
+}
+
 /// Convert a sparse memory snapshot file into a sealed overlaybd layer.
 ///
 /// The sparse file is produced by Firecracker's diff snapshot
 /// (`SnapshotType::Diff`), where only dirty pages contain data and untouched
-/// pages are holes. `package_raw_as_overlaybd` scans the file with
+/// pages are holes. The parameterized raw packaging path scans the file with
 /// `seek_data`/`seek_hole` and compacts only the data extents.
 ///
-/// Deletes the input sparse file after the layer has been committed.
+/// The input sparse file is removed only after the final layer rename succeeds.
 ///
 /// Returns the path to the created overlaybd layer file.
 pub(crate) async fn convert_sparse_mem_to_overlaybd(
     sparse_mem_path: &Path,
     output_dir: &Path,
+    mode: OverlaybdCompactOutput,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
         .with_context(|| format!("create mem overlaybd dir: {}", output_dir.display()))?;
 
     let data_path = output_dir.join("overlaybd.commit");
-    overlaybd::tools::package_raw_as_overlaybd(sparse_mem_path, &data_path)
-        .await
-        .context("convert sparse mem.bin to overlaybd layer")?;
-    if let Err(error) = tokio::fs::remove_file(sparse_mem_path).await {
-        warn!(
-            mem_path = %sparse_mem_path.display(),
-            error = %error,
-            "failed to remove sparse mem snapshot after overlaybd commit"
+    let lower_tmp = data_path.with_extension("commit.tmp");
+    let build_result: Result<()> = async {
+        let io_ring = shared_transient_io_ring();
+        let output_file: Arc<dyn VirtualFile> = Arc::new(
+            LocalFile::new(&lower_tmp, io_ring)
+                .await
+                .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
         );
+        let commit_args = create_commit_args(
+            output_file,
+            mode,
+            DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY,
+        )
+        .await?;
+        overlaybd::tools::package_raw_as_overlaybd_with_args(sparse_mem_path, commit_args)
+            .await
+            .context("convert sparse mem.bin to overlaybd layer")?;
+        tokio::fs::rename(&lower_tmp, &data_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "move sealed sparse memory lower into place failed: {}",
+                    data_path.display()
+                )
+            })?;
+        if let Err(error) = tokio::fs::remove_file(sparse_mem_path).await {
+            warn!(
+                mem_path = %sparse_mem_path.display(),
+                error = %error,
+                "failed to remove sparse mem snapshot after overlaybd commit"
+            );
+        }
+        Ok(())
     }
+    .await;
+
+    if build_result.is_err() {
+        let _ = tokio::fs::remove_file(&lower_tmp).await;
+    }
+    build_result?;
 
     Ok(data_path)
 }
@@ -738,45 +820,26 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
     firecracker_pid: Pid,
     dirty_ranges: &DirtyMemoryRanges,
     output_dir: &Path,
+    mode: OverlaybdCompactOutput,
 ) -> Result<(PathBuf, u64)> {
     tokio::fs::create_dir_all(output_dir)
         .await
         .with_context(|| format!("create mem overlaybd dir: {}", output_dir.display()))?;
 
     let data_path = output_dir.join("overlaybd.commit");
-    let lower_tmp = data_path.with_extension("commit.tmp");
     let (mappings, memory_size) = dirty_ranges_to_segment_mappings(dirty_ranges)?;
-    let io_ring = shared_transient_io_ring();
-
-    let build_result: Result<()> = async {
-        let source_file: Arc<dyn VirtualFile> = Arc::new(ProcessVmReader::new(firecracker_pid));
-        let output_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&lower_tmp, io_ring)
-                .await
-                .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
-        );
-        let src_layers = vec![source_file];
-        let mut commit_args = CommitArgs::new(output_file);
-        commit_args.concurrency = DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY;
-        compact_to(&src_layers, &mappings, memory_size, commit_args)
-            .await
-            .context("compact dirty memory ranges as overlaybd layer")?;
-        tokio::fs::rename(&lower_tmp, &data_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "move sealed dirty memory lower into place failed: {}",
-                    data_path.display()
-                )
-            })?;
-        Ok(())
-    }
-    .await;
-
-    if build_result.is_err() {
-        let _ = tokio::fs::remove_file(&lower_tmp).await;
-    }
-    build_result?;
+    let source_file: Arc<dyn VirtualFile> = Arc::new(ProcessVmReader::new(firecracker_pid));
+    let src_layers = vec![source_file];
+    publish_memory_overlaybd_layer(
+        &src_layers,
+        &mappings,
+        memory_size,
+        &data_path,
+        mode,
+        DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY,
+    )
+    .await
+    .context("compact dirty memory ranges as overlaybd layer")?;
 
     Ok((data_path, memory_size))
 }
@@ -786,8 +849,12 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
 
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use firecracker_client::models::DirtyMemoryRange;
+    use overlaybd::index_file::{CommitArgs, LSMTReadOnlyFile};
     use serde_json::json;
+    use uuid::Uuid;
 
     #[test]
     fn dirty_ranges_to_segment_mappings_splits_large_ranges() {
@@ -961,6 +1028,7 @@ mod tests {
             None,
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
         )
         .await
         .expect("rewrite inherited runtime layers");
@@ -1066,10 +1134,14 @@ mod tests {
         let new_layer = temp.path().join("mem_overlaybd").join("overlaybd.commit");
         std::fs::create_dir_all(new_layer.parent().unwrap()).expect("create mem layer dir");
         std::fs::write(&new_layer, b"memory delta").expect("write mem layer");
-        let image_config =
-            build_mem_snapshot_image_config(Some(&parent_config_path), &new_layer, temp.path())
-                .await
-                .expect("build memory image config");
+        let image_config = build_mem_snapshot_image_config(
+            Some(&parent_config_path),
+            &new_layer,
+            temp.path(),
+            OverlaybdCompactOutput::Raw,
+        )
+        .await
+        .expect("build memory image config");
 
         assert_eq!(image_config.repo_blob_url, repo_blob_url);
         assert_eq!(
@@ -1085,5 +1157,308 @@ mod tests {
         assert!(latest.digest.is_empty());
         assert_eq!(latest.size, 0);
         assert!(image_config.download_override.is_none());
+    }
+
+    struct FailingSource;
+
+    #[async_trait]
+    impl VirtualFile for FailingSource {
+        async fn read_at(&self, _offset: u64, _len: usize) -> Result<Bytes> {
+            anyhow::bail!("injected memory source read failure")
+        }
+
+        async fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("injected memory source write failure")
+        }
+
+        async fn size(&self) -> Result<u64> {
+            Ok(OVERLAYBD_ALIGNMENT)
+        }
+    }
+
+    fn one_page_mapping() -> Vec<SegmentMapping> {
+        vec![SegmentMapping::new(0, 1, 0, false, 0)]
+    }
+
+    #[tokio::test]
+    async fn publish_memory_layer_failure_removes_temp_and_preserves_final() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("memory.commit");
+        let lower_tmp = output.with_extension("commit.tmp");
+        let existing = b"existing final";
+        tokio::fs::write(&output, existing)
+            .await
+            .expect("write existing final");
+        let source: Arc<dyn VirtualFile> = Arc::new(FailingSource);
+        publish_memory_overlaybd_layer(
+            &[source],
+            &one_page_mapping(),
+            OVERLAYBD_ALIGNMENT,
+            &output,
+            OverlaybdCompactOutput::Raw,
+            1,
+        )
+        .await
+        .expect_err("copy failure should be returned");
+
+        assert!(!lower_tmp.exists());
+        assert_eq!(
+            tokio::fs::read(&output).await.expect("read final"),
+            existing
+        );
+    }
+
+    #[tokio::test]
+    async fn convert_sparse_mem_supports_all_outputs_and_failure_cleanup() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let expected: Vec<u8> = (0..8192).map(|offset| (offset / 4096) as u8).collect();
+
+        for (name, mode, algorithm) in [
+            ("raw", OverlaybdCompactOutput::Raw, None),
+            (
+                "lz4",
+                OverlaybdCompactOutput::ZFile {
+                    algorithm: crate::cfg::MemorySnapshotCompressionAlgorithm::Lz4,
+                    workers: 1,
+                },
+                Some(overlaybd::zfile::CompressOptions::LZ4),
+            ),
+            (
+                "zstd",
+                OverlaybdCompactOutput::ZFile {
+                    algorithm: crate::cfg::MemorySnapshotCompressionAlgorithm::Zstd,
+                    workers: 1,
+                },
+                Some(overlaybd::zfile::CompressOptions::ZSTD),
+            ),
+        ] {
+            let source = temp.path().join(format!("{name}.mem.bin"));
+            tokio::fs::write(&source, &expected)
+                .await
+                .expect("write memory source");
+            let output_dir = temp.path().join(name);
+            let output = convert_sparse_mem_to_overlaybd(&source, &output_dir, mode)
+                .await
+                .expect("publish memory layer");
+
+            let file: Arc<dyn VirtualFile> = Arc::new(
+                LocalFile::open_ro(&output, shared_transient_io_ring())
+                    .await
+                    .expect("open output"),
+            );
+            let file = if let Some(expected_algorithm) = algorithm {
+                let zfile = overlaybd::zfile::zfile_open_ro(file, false)
+                    .await
+                    .expect("open zfile reader");
+                assert_eq!(zfile.options().algo, expected_algorithm);
+                assert_eq!(zfile.options().block_size, 4096);
+                assert_eq!(zfile.options().verify, 0);
+                Arc::new(zfile) as Arc<dyn VirtualFile>
+            } else {
+                file
+            };
+            let layer = LSMTReadOnlyFile::open(file)
+                .await
+                .expect("open logical overlaybd layer");
+            assert_eq!(layer.read_at(0, expected.len()).await.unwrap(), expected);
+            assert!(!source.exists());
+            assert!(!output.with_extension("commit.tmp").exists());
+        }
+
+        let failing_source = temp.path().join("failing.mem.bin");
+        tokio::fs::create_dir(&failing_source)
+            .await
+            .expect("create failing source directory");
+        let output_dir = temp.path().join("failure");
+        convert_sparse_mem_to_overlaybd(&failing_source, &output_dir, OverlaybdCompactOutput::Raw)
+            .await
+            .expect_err("directory source should not package");
+        let output = output_dir.join("overlaybd.commit");
+        assert!(failing_source.exists());
+        assert!(!output.exists());
+        assert!(!output.with_extension("commit.tmp").exists());
+    }
+
+    async fn create_tiny_raw_layer(dir: &Path, name: &str, writes: &[(u64, u8)]) -> PathBuf {
+        let io_ring = shared_transient_io_ring();
+        let data = Arc::new(
+            LocalFile::new(dir.join(format!("{name}.data")), io_ring.clone())
+                .await
+                .expect("create layer data file"),
+        );
+        let index = Arc::new(
+            LocalFile::new(dir.join(format!("{name}.index")), io_ring.clone())
+                .await
+                .expect("create layer index file"),
+        );
+        let layer = overlaybd::index_file::LSMTFile::create(data, Some(index), 2 * 4096, false)
+            .await
+            .expect("create layer");
+        for (offset, byte) in writes {
+            layer
+                .write_at(*offset, &[*byte; 4096])
+                .await
+                .expect("write layer page");
+        }
+        let commit_path = dir.join(format!("{name}.commit"));
+        let output: Arc<dyn VirtualFile> = Arc::new(
+            LocalFile::new(&commit_path, io_ring)
+                .await
+                .expect("create layer commit output"),
+        );
+        layer
+            .commit_with_args(CommitArgs::new(output))
+            .await
+            .expect("commit raw layer");
+        commit_path
+    }
+
+    async fn read_sealed_layer(path: &Path, len: usize) -> (i32, Vec<u8>) {
+        let local: Arc<dyn VirtualFile> = Arc::new(
+            LocalFile::open_ro(path, shared_transient_io_ring())
+                .await
+                .expect("open sealed layer"),
+        );
+        let zfile_flag = overlaybd::zfile::is_zfile(local.clone())
+            .await
+            .expect("probe zfile header");
+        let display = path.display().to_string();
+        let tar_adapted = overlaybd::backend::tar::new_tar_file_adaptor(local)
+            .await
+            .expect("tar adaptor");
+        let switched =
+            overlaybd::backend::switch::new_switch_file(tar_adapted, true, Some(&display))
+                .await
+                .expect("switch file");
+        let layer = LSMTReadOnlyFile::open(switched)
+            .await
+            .expect("open sealed layer as LSMT");
+        let data = layer.read_at(0, len).await.expect("read sealed layer");
+        (zfile_flag, data.to_vec())
+    }
+
+    fn expected_compacted_pages() -> Vec<u8> {
+        let mut expected = vec![0u8; 2 * 4096];
+        expected[..4096].fill(0xEE);
+        expected[4096..].fill(0xAB);
+        expected
+    }
+
+    #[tokio::test]
+    async fn memory_runtime_suffix_compaction_uses_configured_compression() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = managed_snapshot_base().join(format!("compact-test-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        let result = async {
+            let mut inherited = Vec::new();
+            for index in 0..DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS {
+                let path = create_tiny_raw_layer(
+                    &runtime_root,
+                    &format!("inherited-{index:02}"),
+                    &[(0, index as u8 + 1)],
+                )
+                .await;
+                inherited.push(json!({ "file": path, "digest": "", "size": 0 }));
+            }
+            let parent_config_path = temp.path().join("parent-mem-image.json");
+            std::fs::write(
+                &parent_config_path,
+                serde_json::to_vec_pretty(&json!({
+                    "repoBlobUrl": "",
+                    "lowers": inherited,
+                    "upper": {},
+                    "resultFile": "",
+                    "download": {}
+                }))
+                .expect("serialize parent image config"),
+            )
+            .expect("write parent image config");
+
+            let new_layer =
+                create_tiny_raw_layer(temp.path(), "mem-delta", &[(0, 0xEE), (4096, 0xAB)]).await;
+            let image_config = build_mem_snapshot_image_config(
+                Some(&parent_config_path),
+                &new_layer,
+                temp.path(),
+                OverlaybdCompactOutput::ZFile {
+                    algorithm: crate::cfg::MemorySnapshotCompressionAlgorithm::Lz4,
+                    workers: 1,
+                },
+            )
+            .await
+            .expect("build memory image config");
+
+            // Compaction must publish exactly one lower: the final sealed
+            // layer, compressed with the configured algorithm.
+            assert_eq!(image_config.lowers.len(), 1);
+            let compacted = temp.path().join("mem_compacted.commit");
+            assert_eq!(PathBuf::from(&image_config.lowers[0].file), compacted);
+            assert!(!compacted.with_extension("commit.tmp").exists());
+
+            let (zfile_flag, data) = read_sealed_layer(&compacted, 2 * 4096).await;
+            assert_eq!(zfile_flag, 1);
+            assert_eq!(data, expected_compacted_pages());
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&runtime_root);
+        result
+    }
+
+    #[tokio::test]
+    async fn rootfs_runtime_suffix_compaction_remains_raw() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = managed_snapshot_base().join(format!("compact-test-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        let result = async {
+            let mut lowers = Vec::new();
+            for index in 0..=DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS {
+                // The top (last) layer wins page 0 and owns page 1.
+                let writes: &[(u64, u8)] = if index == DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS {
+                    &[(0, 0xEE), (4096, 0xAB)]
+                } else {
+                    &[(0, index as u8 + 1)]
+                };
+                let path =
+                    create_tiny_raw_layer(&runtime_root, &format!("rootfs-{index:02}"), writes)
+                        .await;
+                lowers.push(json!({ "file": path, "digest": "", "size": 0 }));
+            }
+            let live_dir = temp.path().join("live");
+            std::fs::create_dir_all(&live_dir).expect("create live dir");
+            let live_config_path = live_dir.join("image.json");
+            std::fs::write(
+                &live_config_path,
+                serde_json::to_vec_pretty(&json!({
+                    "lowers": lowers,
+                    "upper": {},
+                    "resultFile": live_dir.join("result.txt"),
+                    "download": {}
+                }))
+                .expect("serialize live image config"),
+            )
+            .expect("write live image config");
+
+            let output_dir = temp.path().join("out");
+            let staged_path =
+                stage_overlaybd_snapshot_from_live_runtime(&live_config_path, &output_dir, None)
+                    .await
+                    .expect("stage rootfs snapshot");
+            let staged =
+                overlaybd::config::load_image_config(&staged_path).expect("load staged config");
+
+            // Rootfs compaction must stay raw regardless of the memory
+            // snapshot compression policy.
+            assert_eq!(staged.lowers.len(), 1);
+            let compacted = output_dir.join(MANAGED_BASE_LAYER_FILE);
+            assert_eq!(PathBuf::from(&staged.lowers[0].file), compacted);
+            assert!(!compacted.with_extension("commit.tmp").exists());
+
+            let (zfile_flag, data) = read_sealed_layer(&compacted, 2 * 4096).await;
+            assert_eq!(zfile_flag, 0);
+            assert_eq!(data, expected_compacted_pages());
+        }
+        .await;
+        let _ = std::fs::remove_dir_all(&runtime_root);
+        result
     }
 }
