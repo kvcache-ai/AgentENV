@@ -333,6 +333,11 @@ struct ProvisionEntity<'a> {
     create_fallback: &'static str,
 }
 
+/// Bound on one provisioning command: the probes can wait on NSS providers
+/// and useradd/groupadd on passwd/group locks, and an unbounded hang here
+/// would wedge the build worker.
+const PROVISION_TIMEOUT: Duration = Duration::from_secs(60);
+
 async fn ensure_entity(sandbox: &impl SandboxExecutor, entity: ProvisionEntity<'_>) -> Result<()> {
     let ProvisionEntity {
         kind,
@@ -364,8 +369,9 @@ async fn ensure_entity(sandbox: &impl SandboxExecutor, entity: ProvisionEntity<'
     );
     // /bin/sh, not bash: the images most likely to be missing the entry
     // (Alpine/BusyBox) are also the ones without bash, and the script is POSIX.
+    let opts = ProcessOpts::default().with_timeout(PROVISION_TIMEOUT);
     let result = sandbox
-        .run_command_with_opts("/bin/sh", &["-c", &script], &ProcessOpts::default())
+        .run_command_with_opts("/bin/sh", &["-c", &script], &opts)
         .await;
     match result {
         Ok(output) if output.exit_code == 0 => Ok(()),
@@ -587,7 +593,7 @@ mod tests {
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
 
-    use super::{ensure_default_user, prepare_startup, run_ready_command};
+    use super::{ensure_default_user, prepare_startup, run_ready_command, PROVISION_TIMEOUT};
     use crate::sandbox::{Executor, ProcessHandle, ProcessOpts, ProcessOutput, SandboxExecutor};
     use crate::snapshot::{CommandContext, StartupCommand};
 
@@ -734,6 +740,22 @@ mod tests {
 
     fn context_with_user(user: Option<&str>) -> CommandContext {
         CommandContext::default().with_user(user.map(str::to_string))
+    }
+
+    #[tokio::test]
+    async fn default_user_provisioning_runs_under_a_bounded_timeout() {
+        let sandbox = RecordingSandbox {
+            timeouts: Mutex::new(Vec::new()),
+        };
+        ensure_default_user(&sandbox, &context_with_user(Some("user")))
+            .await
+            .unwrap();
+        let timeouts = sandbox
+            .timeouts
+            .lock()
+            .expect("timeouts mutex should not be poisoned")
+            .clone();
+        assert_eq!(timeouts, vec![Some(PROVISION_TIMEOUT)]);
     }
 
     #[tokio::test]
