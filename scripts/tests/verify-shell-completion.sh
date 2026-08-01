@@ -47,8 +47,8 @@ assert_absent() { # path
     [[ ! -e "$1" ]] || fail "expected $1 to be absent, but it exists"
 }
 assert_rc_clean() { # rc-file
-    [[ ! -f "$1" ]] || ! grep -q '^# >>> aenv completion >>>$' "$1" \
-        || fail "expected no aenv marker block in $1"
+    [[ ! -f "$1" ]] || ! grep -Eq '^# (>>> aenv completion >>>|<<< aenv completion <<<)$' "$1" \
+        || fail "expected no aenv markers in $1"
 }
 marker_count() { # rc-file -> count
     if [[ -f "$1" ]]; then
