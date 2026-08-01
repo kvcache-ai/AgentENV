@@ -76,6 +76,8 @@ jobs:
     # Static + functional checks for the shell-completion installer helpers and
     # the standalone installers. No Rust toolchain needed.
     runs-on: ubuntu-22.04
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
       - name: Install shellcheck
