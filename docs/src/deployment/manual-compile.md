@@ -30,7 +30,11 @@ make release
 
 ## Start the Server
 
+Generate one API key and keep the same value when restarting the server:
+
 ```bash
+export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
+
 # Debug build
 API_ADDR=0.0.0.0:8000 make start-server
 
@@ -44,7 +48,11 @@ The server auto-downloads runtime assets (Firecracker binary, kernel, rootfs) on
 
 ```bash
 curl http://127.0.0.1:8000/health
+curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8000/sandboxes
 ```
+
+HTTP does not protect the key in transit. Use a trusted network, VPN, or
+TLS-terminating reverse proxy for remote clients.
 
 ## Configuration
 

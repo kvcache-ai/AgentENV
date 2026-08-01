@@ -21,9 +21,9 @@ AgentENV runtime nodes:
 | Runtime node A | `10.0.0.21:8000` | Runs Firecracker sandboxes as `node-a` |
 | Runtime node B | `10.0.0.22:8000` | Runs Firecracker sandboxes as `node-b` |
 
-Use private addresses or an otherwise trusted network. AgentENV does not
-currently provide an authentication boundary suitable for exposing these
-services directly to the public Internet.
+AgentENV authenticates HTTP requests but does not encrypt them. Use private
+addresses, a VPN, or TLS termination before traffic crosses an untrusted
+network.
 
 ## Prerequisites
 
@@ -54,11 +54,18 @@ an external metrics collector needs them.
 
 ## 1. Install the runtime nodes
 
-Run the installation on each runtime node:
+Generate one API key, deliver it through your normal secret-management channel,
+and use the same value on every runtime node and the Gateway:
+
+```bash
+export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
+```
+
+Run the installation on each runtime node with that value:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install.sh \
-  | sudo bash
+  | sudo AENV_API_KEY="${AENV_API_KEY}" bash
 ```
 
 Edit `/etc/default/aenv` on each machine without removing the paths written by
@@ -102,6 +109,17 @@ sudo install -m 0755 services/bin/scheduler /usr/local/bin/agentenv-scheduler
 sudo install -m 0755 services/bin/gateway /usr/local/bin/agentenv-gateway
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin agentenv-control
 sudo install -d -o root -g agentenv-control -m 0750 /etc/agentenv
+```
+
+Create `/etc/agentenv/auth.env` with the same key used on the runtime nodes:
+
+```bash
+sudo install -o root -g agentenv-control -m 0640 /dev/null /etc/agentenv/auth.env
+sudoedit /etc/agentenv/auth.env
+```
+
+```text
+AENV_API_KEY=<same shared key>
 ```
 
 If the `agentenv-control` account already exists, the `useradd` command reports
@@ -189,6 +207,7 @@ After=network-online.target agentenv-scheduler.service
 [Service]
 User=agentenv-control
 Group=agentenv-control
+EnvironmentFile=/etc/agentenv/auth.env
 ExecStart=/usr/local/bin/agentenv-gateway -config /etc/agentenv/control-plane.json
 Restart=on-failure
 RestartSec=5
@@ -216,7 +235,8 @@ curl http://10.0.0.22:8000/health
 curl http://127.0.0.1:8080/health
 
 # Wait for node heartbeats, then inspect the cluster through the Gateway
-curl http://127.0.0.1:8080/nodes
+export AENV_API_KEY="$(sudo sed -n 's/^AENV_API_KEY=//p' /etc/agentenv/auth.env)"
+curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8080/nodes
 ```
 
 The node list should contain `node-a` and `node-b`. Point clients at the
@@ -225,7 +245,7 @@ Gateway, not directly at a runtime node:
 ```bash
 aenv auth
 # AENV server URL: http://10.0.0.10:8080
-# API key: dummy
+# API key: <the same shared key>
 ```
 
 Sandbox create, list, lifecycle, and data-plane requests can then be routed

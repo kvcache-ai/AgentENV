@@ -40,6 +40,7 @@ SERVICE_GROUP="${AENV_SERVICE_GROUP:-aenv}"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 ENV_FILE="/etc/default/${SERVICE_NAME}"
 RUNTIME_DIR="/run/aenv"
+API_KEY_OVERRIDE_SET="${AENV_API_KEY+x}"
 
 ARCH="$(uname -m)"
 case "$ARCH" in
@@ -86,6 +87,23 @@ for command in curl jq sha256sum realpath; do
         exit 1
     fi
 done
+
+if [[ "$API_KEY_OVERRIDE_SET" == "x" ]]; then
+    API_KEY_VALUE="${AENV_API_KEY}"
+elif [[ -f "$ENV_FILE" ]]; then
+    API_KEY_VALUE="$(sudo sed -n 's/^AENV_API_KEY=//p' "$ENV_FILE" | tail -n 1)"
+    API_KEY_VALUE="${API_KEY_VALUE#\"}"
+    API_KEY_VALUE="${API_KEY_VALUE%\"}"
+    if [[ -z "$API_KEY_VALUE" ]]; then
+        API_KEY_VALUE="e2b_$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')"
+    fi
+else
+    API_KEY_VALUE="e2b_$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')"
+fi
+if [[ ! "$API_KEY_VALUE" =~ ^[A-Za-z0-9._~-]{32,}$ ]]; then
+    echo "error: AENV_API_KEY must contain at least 32 URL-safe characters" >&2
+    exit 1
+fi
 
 if [[ ! "$SERVICE_USER" =~ ^[a-z_][a-z0-9_-]*$ || ! "$SERVICE_GROUP" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
     echo "error: invalid AgentENV service user or group" >&2
@@ -229,30 +247,32 @@ sudo install -d -o root -g "$SERVICE_GROUP" -m 0750 "$(dirname "$CONFIG_PATH")"
 sudo chown root:"$SERVICE_GROUP" "$CONFIG_PATH"
 sudo chmod 0640 "$CONFIG_PATH"
 
+if [[ "$CONFIG_PATH" == *$'\n'* || "$CONFIG_PATH" == *$'\r'* ||
+      "$DATA_DIR" == *$'\n'* || "$DATA_DIR" == *$'\r'* ]]; then
+    echo "error: AgentENV paths must not contain newlines" >&2
+    exit 1
+fi
+escaped_config="${CONFIG_PATH//\\/\\\\}"
+escaped_config="${escaped_config//\"/\\\"}"
+escaped_data="${DATA_DIR//\\/\\\\}"
+escaped_data="${escaped_data//\"/\\\"}"
+
 # ---------------------------------------------------------------------------
 # 3. Configure systemd
 # ---------------------------------------------------------------------------
 if [[ -d /run/systemd/system ]]; then
     ENV_FILE_STATUS="exists"
     if [[ ! -f "$ENV_FILE" ]]; then
+        sudo install -o root -g "$SERVICE_GROUP" -m 0640 /dev/null "$ENV_FILE"
         sudo tee "$ENV_FILE" > /dev/null <<EOF
 API_ADDR="127.0.0.1:8000"
 AENV_CONFIG_PATH="${CONFIG_PATH}"
 AENV_HOME_PATH="${DATA_DIR}"
 AENV_RUNTIME_PATH="${RUNTIME_DIR}"
+AENV_API_KEY=${API_KEY_VALUE}
 EOF
         ENV_FILE_STATUS="written"
     else
-        if [[ "$CONFIG_PATH" == *$'\n'* || "$CONFIG_PATH" == *$'\r'* ||
-              "$DATA_DIR" == *$'\n'* || "$DATA_DIR" == *$'\r'* ]]; then
-            echo "error: AgentENV paths must not contain newlines" >&2
-            exit 1
-        fi
-
-        escaped_config="${CONFIG_PATH//\\/\\\\}"
-        escaped_config="${escaped_config//\"/\\\"}"
-        escaped_data="${DATA_DIR//\\/\\\\}"
-        escaped_data="${escaped_data//\"/\\\"}"
         current_env="$(mktemp)"
         tmp_env="$(mktemp)"
         # sudo is needed for the read; the redirect intentionally targets the
@@ -262,8 +282,17 @@ EOF
         found_config=0
         found_home=0
         found_runtime=0
+        found_api_key=0
         while IFS= read -r line || [[ -n "$line" ]]; do
             case "$line" in
+                AENV_API_KEY=*)
+                    if [[ "$API_KEY_OVERRIDE_SET" == "x" ]]; then
+                        printf 'AENV_API_KEY=%s\n' "$API_KEY_VALUE" >> "$tmp_env"
+                    else
+                        printf '%s\n' "$line" >> "$tmp_env"
+                    fi
+                    found_api_key=1
+                    ;;
                 AENV_CONFIG_PATH=*)
                     printf 'AENV_CONFIG_PATH="%s"\n' "$escaped_config" >> "$tmp_env"
                     found_config=1
@@ -290,7 +319,10 @@ EOF
         if [[ "$found_runtime" == "0" ]]; then
             printf 'AENV_RUNTIME_PATH="%s"\n' "$RUNTIME_DIR" >> "$tmp_env"
         fi
-        sudo install -m 0644 "$tmp_env" "$ENV_FILE"
+        if [[ "$found_api_key" == "0" ]]; then
+            printf 'AENV_API_KEY=%s\n' "$API_KEY_VALUE" >> "$tmp_env"
+        fi
+        sudo install -o root -g "$SERVICE_GROUP" -m 0640 "$tmp_env" "$ENV_FILE"
         rm -f "$current_env" "$tmp_env"
         ENV_FILE_STATUS="updated"
     fi
@@ -328,6 +360,20 @@ EOF
 
     sudo systemctl daemon-reload
     sudo systemctl enable "${SERVICE_NAME}"
+else
+    if [[ -f "$ENV_FILE" ]]; then
+        ENV_FILE_STATUS="updated"
+    else
+        ENV_FILE_STATUS="written"
+    fi
+    tmp_env="$(mktemp)"
+    printf 'API_ADDR="127.0.0.1:8000"\n' > "$tmp_env"
+    printf 'AENV_CONFIG_PATH="%s"\n' "$escaped_config" >> "$tmp_env"
+    printf 'AENV_HOME_PATH="%s"\n' "$escaped_data" >> "$tmp_env"
+    printf 'AENV_RUNTIME_PATH="%s"\n' "$RUNTIME_DIR" >> "$tmp_env"
+    printf 'AENV_API_KEY=%s\n' "$API_KEY_VALUE" >> "$tmp_env"
+    sudo install -o root -g "$SERVICE_GROUP" -m 0640 "$tmp_env" "$ENV_FILE"
+    rm -f "$tmp_env"
 fi
 
 # ---------------------------------------------------------------------------
@@ -340,14 +386,15 @@ echo "  CLI    : ${INSTALL_DIR}/aenv"
 echo "  Server : ${INSTALL_DIR}/server"
 echo "  Data   : ${DATA_DIR}"
 echo "  Config : ${CONFIG_PATH}"
+if [[ "$ENV_FILE_STATUS" == "written" ]]; then
+    echo "  Env    : ${ENV_FILE}"
+else
+    echo "  Env    : ${ENV_FILE} (${ENV_FILE_STATUS})"
+fi
 if [[ -d /run/systemd/system ]]; then
-    if [[ "$ENV_FILE_STATUS" == "written" ]]; then
-        echo "  Env    : ${ENV_FILE}"
-    else
-        echo "  Env    : ${ENV_FILE} (${ENV_FILE_STATUS})"
-    fi
     echo "  Service: ${SERVICE_FILE}"
 fi
+echo "  API key: stored in ${ENV_FILE} (read with sudo)"
 echo ""
 if [[ -d /run/systemd/system ]]; then
     echo "Start the server:"
@@ -361,11 +408,10 @@ if [[ -d /run/systemd/system ]]; then
     echo "  sudo journalctl -u ${SERVICE_NAME} -f"
 else
     echo "systemd not detected. Start the server manually:"
-    echo "  sudo setpriv --reuid=${SERVICE_USER} --regid=${SERVICE_GROUP} --init-groups \\"
+    echo "  sudo bash -c 'set -a; source ${ENV_FILE}; set +a; exec setpriv \\"
+    echo "    --reuid=${SERVICE_USER} --regid=${SERVICE_GROUP} --init-groups \\"
     echo "    --inh-caps=+net_admin,+sys_admin --ambient-caps=+net_admin,+sys_admin \\"
-    echo "    --bounding-set=-all,+net_admin,+sys_admin --nnp \\"
-    echo "    env AENV_CONFIG_PATH=${CONFIG_PATH} AENV_HOME_PATH=${DATA_DIR} AENV_RUNTIME_PATH=${RUNTIME_DIR} \\"
-    echo "    API_ADDR=127.0.0.1:8000 ${INSTALL_DIR}/server"
+    echo "    --bounding-set=-all,+net_admin,+sys_admin --nnp ${INSTALL_DIR}/server'"
 fi
 echo ""
 echo "For aenv CLI:"

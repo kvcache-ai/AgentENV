@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -37,6 +38,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config failed: %v", err)
 	}
+	apiKey := strings.TrimSpace(os.Getenv("AENV_API_KEY"))
+	if apiKey == "" {
+		log.Fatal("AENV_API_KEY must be set when starting the gateway")
+	}
 
 	logger, err := logging.New(cfg.LogLevel, cfg.LogFormat)
 	if err != nil {
@@ -65,6 +70,7 @@ func main() {
 	s, err := gateway.NewServer(logger, schedulerClient, gateway.ServerOptions{
 		RequestTimeout:           cfg.Gateway.RequestTimeout,
 		MaxResponseSize:          cfg.Gateway.ForwardResponseSize,
+		APIKey:                   apiKey,
 		DebugMode:                cfg.Gateway.DebugMode,
 		SandboxProxyDomains:      cfg.Gateway.SandboxProxyDomains,
 		QueryOnlySchedulerClient: queryOnlySchedulerClient,

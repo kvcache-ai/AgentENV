@@ -12,9 +12,12 @@ Set environment variables to point at your AgentENV server. See [Environment Var
 # Single-node example
 export E2B_API_URL=http://127.0.0.1:8000
 export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=e2b_000000
-export E2B_ACCESS_TOKEN=dummy
+export E2B_API_KEY=${AENV_API_KEY}
 ```
+
+No `E2B_ACCESS_TOKEN` is needed. AgentENV returns a sandbox-scoped token in
+API responses, and the SDK uses it for sandbox traffic automatically. This is
+transport data, not the deprecated user-supplied `E2B_ACCESS_TOKEN`.
 
 ### TypeScript SDK
 

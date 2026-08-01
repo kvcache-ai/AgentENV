@@ -7,6 +7,12 @@ CARGO ?= cargo
 DOCKER ?= docker
 DOCKER_COMPOSE ?= docker compose
 DEPLOY_COMPOSE_FILE ?= deploy/docker-compose.yml
+AENV_AUTH_ENV_FILE ?= /etc/aenv/auth.env
+DEPLOY_AUTH = if [[ -z "$${AENV_API_KEY:-}" ]]; then \
+  [[ -r "$(AENV_AUTH_ENV_FILE)" ]] || { echo "error: run scripts/docker-setup.sh first or set AENV_API_KEY" >&2; exit 1; }; \
+  set -a; source "$(AENV_AUTH_ENV_FILE)"; set +a; \
+fi;
+
 APT_MIRROR_BASE ?=
 KUBECTL ?= kubectl
 K8S_NAMESPACE ?= agentenv-system
@@ -216,22 +222,22 @@ start-server-release:
 	$(CAPABILITY_RUNNER) $(CARGO) run --release --bin server
 
 deploy-up:
-	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" $(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) up --build -d
+	@$(DEPLOY_AUTH) APT_MIRROR_BASE="$(APT_MIRROR_BASE)" $(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) up --build -d
 
 deploy-build:
-	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" $(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) build
+	@$(DEPLOY_AUTH) APT_MIRROR_BASE="$(APT_MIRROR_BASE)" $(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) build
 
 deploy-up-no-build:
-	$(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) up -d
+	@$(DEPLOY_AUTH) $(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) up -d
 
 deploy-down:
-	$(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) down --remove-orphans
+	@$(DEPLOY_AUTH) $(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) down --remove-orphans
 
 deploy-logs:
-	$(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) logs -f
+	@$(DEPLOY_AUTH) $(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) logs -f
 
 deploy-ps:
-	$(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) ps
+	@$(DEPLOY_AUTH) $(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) ps
 
 k8s-build:
 	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) -f deploy/docker/Dockerfile.agentenv -t $(K8S_RUNTIME_IMAGE) .

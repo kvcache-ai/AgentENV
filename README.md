@@ -33,9 +33,9 @@ AgentENV (AENV) is a platform for running agent environments at scale, powering 
 ## ⚡ Quick Start (Single Node)
 
 > [!WARNING]
-> **AgentENV currently does not support authorization.** Do not expose the AgentENV
-> API to the public network. Run it only on a trusted network or behind an
-> authorization proxy with appropriate network controls.
+> AgentENV authenticates requests but does not encrypt HTTP traffic. Keep it on
+> loopback or a trusted private network, use a VPN, or terminate HTTPS at a
+> reverse proxy before exposing it outside that boundary.
 
 **1. Install and start the server**
 
@@ -55,7 +55,9 @@ Set up the server:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/docker-setup.sh | sudo bash
 docker pull ghcr.io/kvcache-ai/aenv-server:latest
-docker run -d --privileged -v /dev:/dev -p 8000:8000 ghcr.io/kvcache-ai/aenv-server:latest
+docker run -d --privileged -v /dev:/dev -p 8000:8000 \
+  --env-file /etc/aenv/auth.env \
+  ghcr.io/kvcache-ai/aenv-server:latest
 ```
 
 The server is accessible at `http://127.0.0.1:8000` by default.
@@ -72,10 +74,20 @@ curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/in
 
 **3. Authenticate**
 
+The installer generates the API key once. Read it from
+`/etc/default/aenv` for a native install or `/etc/aenv/auth.env` for Docker:
+
+```bash
+# Native
+sudo sed -n 's/^AENV_API_KEY=//p' /etc/default/aenv
+# Docker
+sudo sed -n 's/^AENV_API_KEY=//p' /etc/aenv/auth.env
+```
+
 ```bash
 aenv auth
 # AENV server URL [http://localhost:8000]: http://127.0.0.1:8000
-# API key: dummy
+# API key: <paste the generated key>
 ```
 
 **4. Pull a template and run a sandbox**

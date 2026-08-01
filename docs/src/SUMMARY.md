@@ -17,6 +17,7 @@
 
 # Configuration
 
+- [Authentication](./configuration/authentication.md)
 - [Configuration Reference](./configuration/reference.md)
 - [Environment Variables](./configuration/env-vars.md)
 

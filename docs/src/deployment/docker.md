@@ -40,12 +40,17 @@ docker build \
 
 ```bash
 docker run --rm -it \
+  --env-file /etc/aenv/auth.env \
   --device /dev/kvm --privileged -v /dev:/dev \
   -p 8000:8000 \
   ghcr.io/kvcache-ai/aenv-server:latest   # or aenv:latest if built from source
 ```
 
 The `--privileged` flag is required for Firecracker's network namespace operations (veth pairs, iptables). The server auto-downloads runtime assets on first start and is accessible at `http://127.0.0.1:8000` once ready.
+
+`docker-setup.sh` generates the shared API key once in
+`/etc/aenv/auth.env`. The `--env-file` option passes it to the container
+without placing the key directly in the command line.
 
 ## Verify
 

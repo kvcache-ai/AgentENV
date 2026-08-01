@@ -3,6 +3,7 @@ x-agentenv-base: &agentenv-base
   init: true
   working_dir: /workspace
   environment: &agentenv-environment
+    AENV_API_KEY: "${AENV_API_KEY:?run scripts/docker-setup.sh first}"
     AENV_CONFIG_PATH: /workspace/config/default.toml
     API_ADDR: 0.0.0.0:8000
     AENV_UBLK_DAEMON_BINARY_PATH: /usr/local/bin/uvm-ublk-daemon
@@ -70,6 +71,7 @@ services:
         condition: service_healthy
     volumes: *control-plane-config-volume
     environment:
+      AENV_API_KEY: "${AENV_API_KEY:?run scripts/docker-setup.sh first}"
       GATEWAY_HTTP_LISTEN_ADDR: :8080
       GATEWAY_SCHEDULER_ADDR: scheduler:9090
       GATEWAY_SANDBOX_PROXY_DOMAINS: ${SANDBOX_PROXY_DOMAINS:-}

@@ -7,7 +7,7 @@ use axum::{
             rejection::WebSocketUpgradeRejection, CloseFrame, Message as WebSocketMessage,
             WebSocket, WebSocketUpgrade,
         },
-        FromRequestParts, Request, State,
+        FromRequestParts, MatchedPath, Request, State,
     },
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri},
     middleware::Next,
@@ -35,7 +35,7 @@ use tokio_tungstenite::{
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    api::ApiImpl,
+    api::{impls::auth::API_KEY_HEADER, ApiImpl},
     cfg::ConfigManager,
     observability::prometheus::HttpRouteSource,
     orchestrator::{NewTimeout, OrchestratorError, ProxyLookupResult, ProxyTarget, SandboxState},
@@ -136,6 +136,49 @@ where
         .route("/proxy/{*proxy_path}", any(proxy_via_prefix::<I>))
         .fallback(proxy_via_fallback::<I>)
         .with_state(api_impl)
+}
+
+pub(crate) fn is_sandbox_proxy_request(request: &Request, domains: &[String]) -> bool {
+    let path = request.uri().path();
+    if path == PROXY_ROUTE || path.starts_with("/proxy/") {
+        return true;
+    }
+
+    match parse_host_proxy_route(request_host(request), domains) {
+        Ok(Some(_)) | Err(_) => true,
+        Ok(None) => {
+            request.extensions().get::<MatchedPath>().is_none()
+                && has_routing_header(request.headers())
+        }
+    }
+}
+
+pub(crate) fn sandbox_id_for_proxy_auth(request: &Request, domains: &[String]) -> Option<String> {
+    match parse_host_proxy_route(request_host(request), domains) {
+        Ok(Some(route)) => return Some(route.sandbox_id.to_string()),
+        Err(_) => return None,
+        Ok(None) => {}
+    }
+
+    first_header_value(
+        request.headers(),
+        &[SANDBOX_ID_HEADER, E2B_SANDBOX_ID_HEADER],
+    )
+    .and_then(|value| SandboxId::parse_str(value).ok())
+    .map(|sandbox_id| sandbox_id.to_string())
+}
+
+fn request_host(request: &Request) -> Option<&str> {
+    request
+        .headers()
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+        })
 }
 
 pub(crate) async fn sandbox_proxy_classifier<I>(
@@ -920,6 +963,7 @@ fn sanitize_request_headers(headers: &mut HeaderMap) {
     headers.remove(E2B_SANDBOX_ID_HEADER);
     headers.remove(TARGET_PORT_HEADER);
     headers.remove(E2B_TARGET_PORT_HEADER);
+    headers.remove(API_KEY_HEADER);
     headers.remove(header::HOST);
     remove_hop_by_hop_headers(headers);
 }
@@ -1339,6 +1383,13 @@ mod tests {
                 "e2b_sandbox_header_seen": headers.get(E2B_SANDBOX_ID_HEADER).is_some(),
                 "target_port_header_seen": headers.get(TARGET_PORT_HEADER).is_some(),
                 "e2b_target_port_header_seen": headers.get(E2B_TARGET_PORT_HEADER).is_some(),
+                "api_key_header_seen": headers.get(API_KEY_HEADER).is_some(),
+                "access_token": headers
+                    .get("x-access-token")
+                    .and_then(|value| value.to_str().ok()),
+                "authorization": headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok()),
                 "forwarded_host": headers
                     .get("x-forwarded-host")
                     .and_then(|value| value.to_str().ok()),
@@ -1569,6 +1620,7 @@ mod tests {
             image_resolver,
             None,
             domains,
+            "test-key".to_string(),
         ))
     }
 
@@ -1595,6 +1647,21 @@ mod tests {
             false,
         )
         .await
+    }
+
+    async fn proxy_app_with_access_token_for_sandbox(
+        sandbox_id: &SandboxId,
+    ) -> (axum::Router, String) {
+        let api = build_api().await;
+        let access_token = api.sandbox_access_token(&sandbox_id.to_string());
+        api.orchestrator()
+            .set_proxy_target_for_test(
+                *sandbox_id,
+                ProxyTarget::new(Ipv4Addr::LOCALHOST),
+                crate::orchestrator::SandboxState::Running,
+            )
+            .await;
+        (server::new(api), access_token)
     }
 
     async fn proxy_app_for_sandbox_with_domains(
@@ -1731,6 +1798,76 @@ mod tests {
 
         assert!(is_send_request_failure_text(&SendRequestError));
         assert!(!is_send_request_failure_text(&"client error (Connect)"));
+    }
+
+    #[tokio::test]
+    async fn server_requires_exact_api_key_and_leaves_health_public() {
+        let app = server::new(build_api().await);
+
+        for request in [
+            Request::builder()
+                .uri("/nonexistent/path")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/nonexistent/path")
+                .header(header::AUTHORIZATION, "Bearer test-key")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/nonexistent/path")
+                .header(API_KEY_HEADER, "wrong-key")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/nonexistent/path")
+                .header(API_KEY_HEADER, "test-key")
+                .header(API_KEY_HEADER, "test-key")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/nonexistent/path")
+                    .header(API_KEY_HEADER, "test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::HOST, "localhost")
+                    .header(SANDBOX_ID_HEADER, SandboxId::new().to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]
@@ -1915,6 +2052,7 @@ mod tests {
                     .uri("/proxy/echo/test?foo=bar".to_string())
                     .header("host", "client.example")
                     .header("x-api-key", "test-key")
+                    .header(header::AUTHORIZATION, "Bearer application-token")
                     .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
                     .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
                     .body(Body::empty())
@@ -1934,6 +2072,8 @@ mod tests {
         assert_eq!(payload["target_port_header_seen"], false);
         assert_eq!(payload["e2b_target_port_header_seen"], false);
         assert_eq!(payload["forwarded_host"], "client.example");
+        assert_eq!(payload["api_key_header_seen"], false);
+        assert_eq!(payload["authorization"], "Bearer application-token");
     }
 
     #[tokio::test]
@@ -2167,6 +2307,7 @@ mod tests {
                 Request::builder()
                     .method(Method::GET)
                     .uri("/health?foo=bar")
+                    .header("x-api-key", "test-key")
                     .header(
                         "host",
                         format!(
@@ -2199,6 +2340,7 @@ mod tests {
                         upstream_addr.port(),
                         sandbox_id
                     ))
+                    .header("x-api-key", "test-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2221,6 +2363,7 @@ mod tests {
                 Request::builder()
                     .method(Method::GET)
                     .uri("/proxy/health")
+                    .header("x-api-key", "test-key")
                     .header(
                         "host",
                         format!(
@@ -2242,6 +2385,7 @@ mod tests {
                 Request::builder()
                     .method(Method::GET)
                     .uri("/proxy/health")
+                    .header("x-api-key", "test-key")
                     .header(
                         "host",
                         format!(
@@ -2268,14 +2412,15 @@ mod tests {
     async fn proxy_accepts_e2b_compatible_headers() {
         let upstream_addr = start_upstream_server().await;
         let sandbox_id = SandboxId::new();
-        let app = proxy_app_for_sandbox(&sandbox_id).await;
+        let (app, access_token) = proxy_app_with_access_token_for_sandbox(&sandbox_id).await;
+        let expected_access_token = access_token.clone();
 
         let response = app
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
                     .uri("/proxy/e2b/health")
-                    .header("x-api-key", "test-key")
+                    .header("x-access-token", access_token)
                     .header(E2B_SANDBOX_ID_HEADER, sandbox_id.to_string())
                     .header(E2B_TARGET_PORT_HEADER, upstream_addr.port().to_string())
                     .body(Body::empty())
@@ -2293,6 +2438,7 @@ mod tests {
         assert_eq!(payload["e2b_sandbox_header_seen"], false);
         assert_eq!(payload["target_port_header_seen"], false);
         assert_eq!(payload["e2b_target_port_header_seen"], false);
+        assert_eq!(payload["access_token"], expected_access_token);
     }
 
     #[tokio::test]

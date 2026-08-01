@@ -35,6 +35,10 @@ sudo bash scripts/docker-setup.sh
 make deploy-up
 ```
 
+`docker-setup.sh` generates `/etc/aenv/auth.env` once. The Makefile reads
+that protected file and Compose passes the same key to the gateway and both
+runtime nodes.
+
 To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when starting the stack:
 
@@ -53,8 +57,9 @@ usually through wildcard DNS for `*.sandbox.example.com`.
 # Health check via gateway
 curl http://127.0.0.1:8080/health
 
-# Cluster node snapshots via gateway
-curl http://127.0.0.1:8080/nodes
+# Authenticated cluster node snapshots via gateway
+export AENV_API_KEY="$(sudo sed -n 's/^AENV_API_KEY=//p' /etc/aenv/auth.env)"
+curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8080/nodes
 
 # Direct health check on a backend node
 curl http://127.0.0.1:8001/health

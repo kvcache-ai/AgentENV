@@ -85,6 +85,8 @@ headers = "0.4"
 http = "1"
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
+hmac = "0.12"
+subtle = "2"
 url = "2.5"
 clap = { version = "4", features = ["derive"] }
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }

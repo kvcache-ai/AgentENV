@@ -1,6 +1,6 @@
 mod admin;
 mod attached_drives;
-mod auth;
+pub(crate) mod auth;
 mod pagination;
 mod sandbox;
 mod snapshots;
@@ -33,6 +33,7 @@ pub struct ApiImpl {
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
+    api_key: String,
 }
 
 impl ApiImpl {
@@ -43,6 +44,7 @@ impl ApiImpl {
         image_resolver: Arc<ImageResolver>,
         observability: Option<Arc<ObservabilityService>>,
         sandbox_proxy_domains: Vec<String>,
+        api_key: String,
     ) -> Self {
         Self {
             orchestrator,
@@ -52,6 +54,7 @@ impl ApiImpl {
             observability,
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
+            api_key,
         }
     }
 

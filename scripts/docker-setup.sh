@@ -16,6 +16,9 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+AUTH_ENV_FILE="${AENV_AUTH_ENV_FILE:-/etc/aenv/auth.env}"
+API_KEY_OVERRIDE_SET="${AENV_API_KEY+x}"
+
 # ---------------------------------------------------------------------------
 # 1. ublk_drv kernel module
 # ---------------------------------------------------------------------------
@@ -70,5 +73,38 @@ apply_sysctl kernel.pid_max 4194304
 apply_sysctl fs.inotify.max_user_instances 8192
 
 echo "  kernel parameters written to $SYSCTL_CONF and applied"
+
+# ---------------------------------------------------------------------------
+# 3. Authentication
+# ---------------------------------------------------------------------------
+if [[ -L "$AUTH_ENV_FILE" ]]; then
+    echo "error: refusing symlinked auth file: $AUTH_ENV_FILE" >&2
+    exit 1
+fi
+
+if [[ "$API_KEY_OVERRIDE_SET" == "x" ]]; then
+    API_KEY_VALUE="${AENV_API_KEY}"
+elif [[ -f "$AUTH_ENV_FILE" ]]; then
+    API_KEY_VALUE="$(sed -n 's/^AENV_API_KEY=//p' "$AUTH_ENV_FILE" | tail -n 1)"
+else
+    API_KEY_VALUE="e2b_$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')"
+fi
+if [[ ! "$API_KEY_VALUE" =~ ^[A-Za-z0-9._~-]{32,}$ ]]; then
+    echo "error: AENV_API_KEY must contain at least 32 URL-safe characters" >&2
+    exit 1
+fi
+
+auth_tmp="$(mktemp)"
+trap 'rm -f "$auth_tmp"' EXIT
+printf 'AENV_API_KEY=%s\n' "$API_KEY_VALUE" > "$auth_tmp"
+install -d -o root -g root -m 0750 "$(dirname "$AUTH_ENV_FILE")"
+if getent group docker >/dev/null 2>&1; then
+    install -o root -g docker -m 0640 "$auth_tmp" "$AUTH_ENV_FILE"
+else
+    install -o root -g root -m 0600 "$auth_tmp" "$AUTH_ENV_FILE"
+fi
+rm -f "$auth_tmp"
+
 echo ""
 echo "Host setup complete."
+echo "AgentENV API key stored in $AUTH_ENV_FILE."

@@ -21,6 +21,11 @@ spec:
           image: agentenv-runtime:latest
           imagePullPolicy: IfNotPresent
           env:
+            - name: AENV_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agentenv-auth
+                  key: AENV_API_KEY
             - name: AENV_CONFIG_PATH
               value: /workspace/config/agentenv.toml
             - name: API_ADDR
@@ -68,7 +73,7 @@ spec:
                   - |
                     echo "preStop: waiting for sandboxes to drain..."
                     while true; do
-                      count=$(curl -sf -H 'X-API-Key: preStop' http://localhost:8000/sandboxes | jq 'length') || count=""
+                      count=$(curl -sf -H "X-API-Key: ${AENV_API_KEY}" http://localhost:8000/sandboxes | jq 'length') || count=""
                       if [ -z "$count" ]; then
                         echo "preStop: failed to query sandbox count, retrying..."
                         sleep 3

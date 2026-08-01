@@ -52,6 +52,19 @@ make k8s-render
 make k8s-apply
 ```
 
+`make k8s-apply` generates a 256-bit API key on the first deployment and
+stores it in `Secret/agentenv-auth`. Later applies reuse that key. Read it
+locally when configuring clients:
+
+```bash
+kubectl -n agentenv-system get secret agentenv-auth \
+  -o go-template='{{index .data "AENV_API_KEY" | base64decode}}{{"\n"}}'
+```
+
+Set `AENV_API_KEY` when applying to supply your own key instead. A standalone
+`make k8s-render` uses a temporary generated value because it does not modify
+or read cluster state.
+
 To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when rendering or applying manifests:
 

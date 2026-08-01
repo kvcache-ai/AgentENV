@@ -6,32 +6,15 @@ info:
 servers:
   - url: https://api.e2b.app
 
+security:
+  - ApiKeyAuth: []
+
 components:
   securitySchemes:
     ApiKeyAuth:
       type: apiKey
       in: header
       name: X-API-Key
-    # AuthProviderBearerAuth / AuthProviderTeamAuth: B before T in the name
-    # so Bearer is validated before Team.
-    AuthProviderBearerAuth:
-      type: http
-      scheme: bearer
-      bearerFormat: access_token
-    AuthProviderTeamAuth:
-      type: apiKey
-      in: header
-      name: X-Team-ID
-    # AdminApiKeyAuth / AdminTeamAuth: alphabetical names ensure token
-    # validation runs before team context population.
-    AdminApiKeyAuth:
-      type: apiKey
-      in: header
-      name: X-Admin-Token
-    AdminTeamAuth:
-      type: apiKey
-      in: header
-      name: X-Team-ID
 
   parameters:
     templateID:
@@ -1284,6 +1267,7 @@ paths:
     get:
       summary: Health check
       description: Health check
+      security: []
       responses:
         "204":
           description: The service is healthy
@@ -1296,12 +1280,6 @@ paths:
       description: List all running sandboxes. Use GET /v2/sandboxes instead.
       deprecated: true
       tags: [sandboxes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - name: metadata
           in: query
@@ -1331,12 +1309,6 @@ paths:
         POST /sandboxes-cold to create a sandbox directly from an external OCI
         image.
       tags: [sandboxes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       requestBody:
         required: true
         content:
@@ -1370,12 +1342,6 @@ paths:
         and can take tens of seconds; clients should use a long HTTP timeout
         for this path.
       tags: [sandboxes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       requestBody:
         required: true
         content:
@@ -1406,12 +1372,6 @@ paths:
       summary: List sandboxes (v2)
       description: List all sandboxes
       tags: [sandboxes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - name: metadata
           in: query
@@ -1457,12 +1417,6 @@ paths:
       summary: Sandbox
       description: Get a sandbox by id
       tags: [sandboxes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/sandboxID"
       responses:
@@ -1483,12 +1437,6 @@ paths:
       summary: Kill sandbox
       description: Kill a sandbox
       tags: [sandboxes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/sandboxID"
       responses:
@@ -1507,12 +1455,6 @@ paths:
       summary: Pause sandbox
       description: Pause the sandbox
       tags: [sandboxes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/sandboxID"
       responses:
@@ -1533,12 +1475,6 @@ paths:
       deprecated: true
       description: Resume the sandbox
       tags: [sandboxes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/sandboxID"
       requestBody:
@@ -1575,12 +1511,6 @@ paths:
         prevented it from starting. A non-201 status means the request failed
         before any fork was attempted.
       tags: [sandboxes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/sandboxID"
       requestBody:
@@ -1616,12 +1546,6 @@ paths:
       summary: Connect sandbox
       description: Returns sandbox details. If the sandbox is paused, it will be resumed. TTL is only extended.
       tags: [sandboxes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/sandboxID"
       requestBody:
@@ -1656,12 +1580,6 @@ paths:
     post:
       summary: Set sandbox timeout
       description: Set the timeout for the sandbox. The sandbox will expire x seconds from the time of the request. Calling this method multiple times overwrites the TTL, each time using the current timestamp as the starting point to measure the timeout duration.
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       tags: [sandboxes]
       requestBody:
         content:
@@ -1684,12 +1602,6 @@ paths:
     put:
       summary: Update sandbox network
       description: Update the network configuration for a running sandbox. Replaces the current egress rules with the provided configuration. Omitting field clears it.
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       tags: [sandboxes]
       requestBody:
         required: true
@@ -1718,12 +1630,6 @@ paths:
       description: >
         Get the current custom extension params of the sandbox. Returns an
         empty object when no params are set.
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       tags: [sandboxes]
       parameters:
         - $ref: "#/components/parameters/sandboxID"
@@ -1750,12 +1656,6 @@ paths:
         the custom extension to be configured on the server. Concurrent
         patches to the same sandbox are not serialized; non-commutative
         patch semantics must be handled by the extension.
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       tags: [sandboxes]
       requestBody:
         required: true
@@ -1792,12 +1692,6 @@ paths:
     post:
       summary: Refresh sandbox
       description: Refresh the sandbox extending its time to live
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       tags: [sandboxes]
       requestBody:
         content:
@@ -1821,12 +1715,6 @@ paths:
       summary: Create snapshot
       description: Create a persistent snapshot from the sandbox's current state. Snapshots can be used to create new sandboxes and persist beyond the original sandbox's lifetime.
       tags: [sandboxes]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/sandboxID"
       requestBody:
@@ -1856,12 +1744,6 @@ paths:
       summary: List snapshots
       description: List all snapshots for the team
       tags: [snapshots]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - name: sandboxID
           in: query
@@ -1902,13 +1784,6 @@ paths:
     get:
       description: Get information about a single snapshot by its ID or alias
       tags: [snapshots]
-      security:
-        - ApiKeyAuth: []
-        - AccessTokenAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/snapshotID"
       responses:
@@ -1930,12 +1805,6 @@ paths:
       summary: Create template (v3)
       description: Create a new template
       tags: [templates]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       requestBody:
         required: true
         content:
@@ -1962,13 +1831,6 @@ paths:
       summary: List templates (v2)
       description: List all templates
       tags: [templates]
-      security:
-        - ApiKeyAuth: []
-        - AccessTokenAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - in: query
           required: false
@@ -2007,13 +1869,6 @@ paths:
       description: List all templates
       deprecated: true
       tags: [templates]
-      security:
-        - ApiKeyAuth: []
-        - AccessTokenAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - in: query
           required: false
@@ -2040,12 +1895,6 @@ paths:
       summary: List template builds
       description: List all builds for a template
       tags: [templates]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/templateID"
         - $ref: "#/components/parameters/paginationNextToken"
@@ -2067,13 +1916,6 @@ paths:
       summary: Delete template
       description: Delete a template
       tags: [templates]
-      security:
-        - ApiKeyAuth: []
-        - AccessTokenAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/templateID"
       responses:
@@ -2089,12 +1931,6 @@ paths:
       summary: Start template build (v2)
       description: Start the build
       tags: [templates]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/templateID"
         - $ref: "#/components/parameters/buildID"
@@ -2121,13 +1957,6 @@ paths:
       summary: Template build status
       description: Get template build info
       tags: [templates]
-      security:
-        - AccessTokenAuth: []
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/templateID"
         - $ref: "#/components/parameters/buildID"
@@ -2152,12 +1981,6 @@ paths:
       summary: Check template alias
       description: Check if template with given alias exists
       tags: [templates]
-      security:
-        - ApiKeyAuth: []
-        - AuthProviderBearerAuth: []
-          AuthProviderTeamAuth: []
-        - AdminApiKeyAuth: []
-          AdminTeamAuth: []
       parameters:
         - name: alias
           in: path
@@ -2186,8 +2009,6 @@ paths:
       summary: List nodes
       description: List all nodes
       tags: [admin]
-      security:
-        - AdminApiKeyAuth: []
       parameters:
         - in: query
           name: clusterID
@@ -2215,8 +2036,6 @@ paths:
       summary: Node info
       description: Get node info
       tags: [admin]
-      security:
-        - AdminApiKeyAuth: []
       parameters:
         - $ref: "#/components/parameters/nodeID"
         - in: query

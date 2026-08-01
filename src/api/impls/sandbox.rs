@@ -215,6 +215,9 @@ impl From<SandboxMetadata> for models::SandboxDetail {
 impl ApiImpl {
     fn sandbox_model(&self, metadata: SandboxMetadata) -> models::Sandbox {
         let mut sandbox = models::Sandbox::from(metadata);
+        let access_token = self.sandbox_access_token(&sandbox.sandbox_id);
+        sandbox.envd_access_token = Some(access_token.clone());
+        sandbox.traffic_access_token = Some(Nullable::Present(access_token));
         sandbox.domain = self
             .sandbox_proxy_domains()
             .first()
@@ -224,6 +227,7 @@ impl ApiImpl {
 
     fn sandbox_detail_model(&self, metadata: SandboxMetadata) -> models::SandboxDetail {
         let mut sandbox = models::SandboxDetail::from(metadata);
+        sandbox.envd_access_token = Some(self.sandbox_access_token(&sandbox.sandbox_id));
         sandbox.domain = self
             .sandbox_proxy_domains()
             .first()

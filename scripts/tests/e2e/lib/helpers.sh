@@ -5,8 +5,7 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
   E2E_HELPERS_SH_LOADED=1
 
   : "${AENV_URL:?AENV_URL must be set}"
-  : "${AENV_API_KEY:=e2e-test-key}"
-  : "${AENV_ADMIN_TOKEN:=e2e-admin-token}"
+  : "${AENV_API_KEY:=e2b_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
   : "${AENV_TEMPLATE_ID:=ubuntu}"
   : "${AENV_PROXY_URL:=${AENV_URL}/proxy}"
   : "${E2E_MODE:=single-node}"
@@ -124,7 +123,7 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
   api_admin_get() {
     local path="$1"
     _curl_do -s \
-      -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" \
+      -H "X-API-Key: ${AENV_API_KEY}" \
       "${AENV_URL}${path}"
   }
 
@@ -132,7 +131,7 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
     local base_url="$1"
     local path="$2"
     _curl_do -s \
-      -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" \
+      -H "X-API-Key: ${AENV_API_KEY}" \
       "${base_url}${path}"
   }
 
@@ -140,7 +139,7 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
     local path="$1"
     [[ -z "$_E2E_HEADERS" ]] && _E2E_HEADERS=$(mktemp)
     curl -s -o "$_E2E_BODY" -D "$_E2E_HEADERS" -w '%{http_code}' \
-      -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" \
+      -H "X-API-Key: ${AENV_API_KEY}" \
       "${AENV_URL}${path}" > "$_E2E_STATUS" 2>/dev/null || true
     HTTP_STATUS=$(<"$_E2E_STATUS")
     HTTP_BODY=$(<"$_E2E_BODY")
@@ -152,7 +151,7 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
     local path="$2"
     [[ -z "$_E2E_HEADERS" ]] && _E2E_HEADERS=$(mktemp)
     curl -s -o "$_E2E_BODY" -D "$_E2E_HEADERS" -w '%{http_code}' \
-      -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" \
+      -H "X-API-Key: ${AENV_API_KEY}" \
       "${base_url}${path}" > "$_E2E_STATUS" 2>/dev/null || true
     HTTP_STATUS=$(<"$_E2E_STATUS")
     HTTP_BODY=$(<"$_E2E_BODY")

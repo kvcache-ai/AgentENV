@@ -12,6 +12,7 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `AENV_API_KEY` | required | Shared single-tenant API key. Use the same value on the gateway and every runtime node. |
 | `API_ADDR` | `0.0.0.0:8000` | Address and port the API server listens on |
 | `AENV_CONFIG_PATH` | `config/default.toml` | Path to the TOML configuration file |
 | `AENV_LOG_FORMAT` | `compact` | Server log output format: `compact`, `pretty`, or `json` |
@@ -44,8 +45,7 @@ These variables configure the E2B SDK and CLI to point at an AgentENV server. Va
 |----------|-------------|
 | `E2B_API_URL` | AgentENV server API base URL |
 | `E2B_SANDBOX_URL` | Sandbox proxy URL (for WebSocket and process interaction) |
-| `E2B_API_KEY` | API key for authentication |
-| `E2B_ACCESS_TOKEN` | Access token (used by `e2b template` commands) |
+| `E2B_API_KEY` | Set to the deployment's `AENV_API_KEY` |
 
 ### Values by Deployment Mode
 
@@ -54,8 +54,7 @@ These variables configure the E2B SDK and CLI to point at an AgentENV server. Va
 ```bash
 export E2B_API_URL=http://127.0.0.1:8000
 export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=e2b_000000
-export E2B_ACCESS_TOKEN=dummy
+export E2B_API_KEY=${AENV_API_KEY}
 ```
 
 **Docker Compose / Kubernetes (multi-node)**:
@@ -63,15 +62,14 @@ export E2B_ACCESS_TOKEN=dummy
 ```bash
 export E2B_API_URL=http://127.0.0.1:8080
 export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=e2b_000000
-export E2B_ACCESS_TOKEN=dummy
+export E2B_API_KEY=${AENV_API_KEY}
 ```
 
 > In both modes, sandbox data-plane requests can use routing headers with
 > `E2B_SANDBOX_URL=${E2B_API_URL}`. The explicit `/proxy` prefix
 > (`${E2B_API_URL}/proxy`) is still accepted for back-compat.
 
-> For local development, any non-empty value works for `E2B_API_KEY` and `E2B_ACCESS_TOKEN` because the server only checks that the auth header is present.
+See [Authentication](./authentication.md) for key generation and storage.
 
 ## Gateway and Scheduler
 

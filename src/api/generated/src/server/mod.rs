@@ -30,10 +30,6 @@ where
         + apis::snapshots::Snapshots<E, Claims = C>
         + apis::templates::Templates<E, Claims = C>
         + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
         + Send
         + Sync
         + 'static,
@@ -147,7 +143,7 @@ where
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Admin-Token")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
     let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
@@ -281,7 +277,7 @@ where
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Admin-Token")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
     let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
@@ -509,23 +505,15 @@ async fn sandboxes_cold_post<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -679,23 +667,15 @@ async fn sandboxes_get<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -835,23 +815,15 @@ async fn sandboxes_post<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -1022,23 +994,15 @@ async fn sandboxes_sandbox_id_connect_post<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -1211,23 +1175,15 @@ async fn sandboxes_sandbox_id_custom_extension_params_get<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -1384,23 +1340,15 @@ async fn sandboxes_sandbox_id_custom_extension_params_patch<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -1577,23 +1525,15 @@ async fn sandboxes_sandbox_id_delete<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -1732,23 +1672,15 @@ async fn sandboxes_sandbox_id_fork_post<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -1918,23 +1850,15 @@ async fn sandboxes_sandbox_id_get<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -2084,23 +2008,15 @@ async fn sandboxes_sandbox_id_network_put<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -2257,23 +2173,15 @@ async fn sandboxes_sandbox_id_pause_post<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -2431,23 +2339,15 @@ async fn sandboxes_sandbox_id_refreshes_post<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -2585,23 +2485,15 @@ async fn sandboxes_sandbox_id_resume_post<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -2770,23 +2662,15 @@ async fn sandboxes_sandbox_id_snapshots_post<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -2957,23 +2841,15 @@ async fn sandboxes_sandbox_id_timeout_post<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -3094,23 +2970,15 @@ async fn v2_sandboxes_get<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::sandboxes::Sandboxes<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -3264,23 +3132,15 @@ async fn snapshots_get<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::snapshots::Snapshots<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::snapshots::Snapshots<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -3434,23 +3294,15 @@ async fn snapshots_snapshot_id_get<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::snapshots::Snapshots<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::snapshots::Snapshots<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -3583,23 +3435,15 @@ async fn templates_aliases_alias_get<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::templates::Templates<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::templates::Templates<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -3750,23 +3594,15 @@ async fn templates_get<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::templates::Templates<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::templates::Templates<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -3888,23 +3724,15 @@ async fn templates_template_id_builds_build_id_status_get<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::templates::Templates<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::templates::Templates<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -4062,23 +3890,15 @@ async fn templates_template_id_delete<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::templates::Templates<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::templates::Templates<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -4189,23 +4009,15 @@ async fn templates_template_id_get<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::templates::Templates<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::templates::Templates<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -4346,23 +4158,15 @@ async fn v2_templates_get<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::templates::Templates<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::templates::Templates<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -4551,23 +4355,15 @@ async fn v2_templates_template_id_builds_build_id_post<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::templates::Templates<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::templates::Templates<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
@@ -4721,23 +4517,15 @@ async fn v3_templates_post<I, A, E, C>(
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
-    A: apis::templates::Templates<E, Claims = C>
-        + apis::ApiKeyAuthHeader<Claims = C>
-        + apis::ApiAuthBasic<Claims = C>
-        + Send
-        + Sync,
+    A: apis::templates::Templates<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
     E: std::fmt::Debug + Send + Sync + 'static,
 {
     // Authentication
     let claims_in_header = api_impl
         .as_ref()
-        .extract_claims_from_header(&headers, "X-Team-ID")
+        .extract_claims_from_header(&headers, "X-API-Key")
         .await;
-    let claims_in_auth_header = api_impl
-        .as_ref()
-        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
-        .await;
-    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let claims = None.or(claims_in_header);
     let Some(claims) = claims else {
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };

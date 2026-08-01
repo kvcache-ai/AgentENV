@@ -65,6 +65,11 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let api_key = std::env::var("AENV_API_KEY")
+        .map_err(|_| anyhow::anyhow!("AENV_API_KEY must be set when starting the API server"))?;
+    let api_key = api_key.trim().to_owned();
+    anyhow::ensure!(!api_key.is_empty(), "AENV_API_KEY must not be empty");
+
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
@@ -136,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
         image_resolver,
         observability,
         config.sandbox_proxy.domains.clone(),
+        api_key,
     ));
     let app = server::new(api_impl);
     let shutdown_orchestrator = Arc::clone(&orchestrator);
