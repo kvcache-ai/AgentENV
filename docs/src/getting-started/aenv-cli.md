@@ -283,6 +283,16 @@ To delete a snapshot, use `aenv template delete <snapshot-id>` or `aenv template
 
 Three shells are supported; elvish and powershell are explicit non-goals.
 
+### Installed automatically
+
+The installers set up **regenerating** completion loaders for you, so the completion is always generated from the currently installed `aenv` and never goes stale across upgrades:
+
+- `make install-aenv` / `make uninstall-aenv` — installs/removes the loaders (set `AENV_INSTALL_COMPLETION=0` to skip). User-local installs (`AENV_INSTALL_PREFIX=~/.local`) write per-user loaders and an `~/.zshrc` snippet; system installs write under `<prefix>/share`.
+- `scripts/install-cli.sh` — installs loaders into the matching user-local or system directories based on the install location.
+- `scripts/install.sh` (full installer) — installs system-wide loaders under `/usr/local/share`.
+
+After install, open a new shell (or re-source your rc) and the loaders take effect. If you installed with one of the methods above, you can skip the manual steps below — they remain as a fallback for users who skipped the installer or want to customize the location.
+
 ### Generate a script
 
 ```bash

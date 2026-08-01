@@ -10,10 +10,14 @@ on:
       - "**/Cargo.lock"
       - "rust-toolchain.toml"
       - "scripts/install.sh"
+      - "scripts/install-cli.sh"
+      - "scripts/shell-completion.sh"
+      - "scripts/check-completion-sync.sh"
       - "scripts/run-with-capabilities.sh"
       - "scripts/tests/setup-ublk-access.sh"
       - "scripts/tests/verify-capability-runner.sh"
       - "scripts/tests/verify-install-service.sh"
+      - "scripts/tests/verify-shell-completion.sh"
       - ".github/actions/**"
       - ".github/workflows/ci.yml"
   push:
@@ -24,10 +28,14 @@ on:
       - "**/Cargo.lock"
       - "rust-toolchain.toml"
       - "scripts/install.sh"
+      - "scripts/install-cli.sh"
+      - "scripts/shell-completion.sh"
+      - "scripts/check-completion-sync.sh"
       - "scripts/run-with-capabilities.sh"
       - "scripts/tests/setup-ublk-access.sh"
       - "scripts/tests/verify-capability-runner.sh"
       - "scripts/tests/verify-install-service.sh"
+      - "scripts/tests/verify-shell-completion.sh"
       - ".github/actions/**"
       - ".github/workflows/ci.yml"
 
@@ -63,3 +71,24 @@ jobs:
         run: sudo scripts/tests/setup-ublk-access.sh "$(id -un)" "$(id -gn)"
       - name: Unit tests
         run: make test-unit PROFILE=debug
+
+  shell-scripts:
+    # Static + functional checks for the shell-completion installer helpers and
+    # the standalone installers. No Rust toolchain needed.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends shellcheck
+      - name: Shellcheck
+        run: |
+          shellcheck -s bash \
+            scripts/shell-completion.sh \
+            scripts/check-completion-sync.sh \
+            scripts/install-cli.sh \
+            scripts/install.sh \
+            scripts/tests/verify-shell-completion.sh
+      - name: Completion-loader drift check
+        run: bash scripts/check-completion-sync.sh
+      - name: Completion-loader functional test
+        run: bash scripts/tests/verify-shell-completion.sh
