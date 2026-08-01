@@ -28,6 +28,16 @@ EOF
 chmod +x "$fake_bin/aenv"
 export PATH="$fake_bin:$PATH"
 
+# A PATH containing only the utilities the helper needs and NO aenv, so the
+# "aenv missing" case is hermetic regardless of what is installed on the host
+# (no reliance on /usr/bin/aenv or /bin/aenv existing or not). `bash` is
+# included so the test can launch the helper under this restricted PATH.
+hermetic_bin="$tmp_root/hermetic-bin"
+mkdir -p "$hermetic_bin"
+for u in bash mkdir grep awk tail od tr mktemp cat chmod rm mv; do
+    ln -s "$(command -v "$u")" "$hermetic_bin/$u"
+done
+
 fail() { echo "FAIL: $*" >&2; exit 1; }
 assert_contains() { # file needle
     [[ -f "$1" ]] || fail "expected file $1 to exist"
@@ -129,12 +139,12 @@ rm -f "$malformed"
 # still writes the bash/fish stubs (graceful degradation, non-fatal).
 # ---------------------------------------------------------------------------
 echo "==> system mode without aenv on PATH skips only the static zsh file"
-# A PATH that contains neither the fake aenv nor any other aenv.
-HOME="$fake_home" PATH="/usr/bin:/bin" bash "$helper" install --prefix="$sys_prefix" 2>/dev/null
+# Hermetic PATH: only the utilities the helper needs, no aenv anywhere.
+HOME="$fake_home" PATH="$hermetic_bin" bash "$helper" install --prefix="$sys_prefix" 2>/dev/null
 assert_contains "$sys_prefix/share/bash-completion/completions/aenv" 'source <(aenv completion bash)'
 assert_contains "$sys_prefix/share/fish/vendor_completions.d/aenv.fish" 'aenv completion fish | source'
 assert_absent "$sys_prefix/share/zsh/site-functions/_aenv"
-HOME="$fake_home" PATH="/usr/bin:/bin" bash "$helper" uninstall --prefix="$sys_prefix"
+HOME="$fake_home" PATH="$hermetic_bin" bash "$helper" uninstall --prefix="$sys_prefix"
 assert_absent "$sys_prefix/share/bash-completion/completions/aenv"
 
 # ---------------------------------------------------------------------------
@@ -148,5 +158,47 @@ env -u HOME bash "$helper" install --prefix="$sys_prefix" >/dev/null 2>&1 \
 assert_contains "$sys_prefix/share/bash-completion/completions/aenv" 'source <(aenv completion bash)'
 env -u HOME bash "$helper" uninstall --prefix="$sys_prefix" >/dev/null 2>&1
 assert_absent "$sys_prefix/share/bash-completion/completions/aenv"
+
+# ---------------------------------------------------------------------------
+# Test 8: a failing `aenv completion zsh` must not truncate an existing valid
+# static file (atomic temp+rename), and must not leave temp files behind.
+# ---------------------------------------------------------------------------
+echo "==> failing aenv completion zsh leaves the existing _aenv intact"
+mkdir -p "$sys_prefix/bin" "$sys_prefix/share/zsh/site-functions"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$sys_prefix/bin/aenv"
+chmod +x "$sys_prefix/bin/aenv"
+echo '# pre-existing valid zsh completion' > "$sys_prefix/share/zsh/site-functions/_aenv"
+HOME="$fake_home" PATH="$hermetic_bin" bash "$helper" install --prefix="$sys_prefix" 2>/dev/null \
+    || fail "helper aborted when aenv completion zsh exits nonzero"
+assert_contains "$sys_prefix/share/zsh/site-functions/_aenv" '# pre-existing valid zsh completion'
+# Exactly one file in the site-functions dir (no leftover .XXXXXX temp).
+leftovers=( "$sys_prefix/share/zsh/site-functions"/* )
+[[ "${#leftovers[@]}" -eq 1 ]] || fail "expected no temp leftovers, found: ${leftovers[*]}"
+rm -rf "${sys_prefix:?}/bin" "${sys_prefix:?}/share/zsh/site-functions"
+
+# ---------------------------------------------------------------------------
+# Test 9: unrelated user lines around the managed block survive install+uninstall
+# (a regression that truncates the rc while removing a balanced block must fail).
+# ---------------------------------------------------------------------------
+echo "==> unrelated rc content survives install and uninstall"
+home_surround="$tmp_root/home-surround"
+mkdir -p "$home_surround"
+zsrc="$home_surround/.zshrc"
+printf 'alias-before=1\n' > "$zsrc"
+HOME="$home_surround" bash "$helper" install --user
+printf 'alias-after=2\n' >> "$zsrc"
+HOME="$home_surround" bash "$helper" uninstall --user
+assert_contains "$zsrc" 'alias-before=1'
+assert_contains "$zsrc" 'alias-after=2'
+assert_rc_clean "$zsrc"
+
+# ---------------------------------------------------------------------------
+# Test 10: user mode requested with HOME unset warns and skips (no abort under
+# set -u); closes the non-fatal contract for the user-mode destination paths.
+# ---------------------------------------------------------------------------
+echo "==> user mode with unset HOME warns and skips without aborting"
+env -u HOME bash "$helper" install --user >/tmp/aenv_tc_out 2>&1 \
+    || fail "helper aborted with --user under unset HOME"
+grep -q 'HOME is unset' /tmp/aenv_tc_out || fail "expected a HOME-unset warning"
 
 echo "==> all shell-completion checks passed"

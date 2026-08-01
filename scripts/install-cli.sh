@@ -89,13 +89,33 @@ _aenv_cc_put() {
     chmod "$mode" "$path" 2>/dev/null || true
 }
 
-# Append the regenerating zsh rc-snippet to ~/.zshrc, idempotently.
+# Return 0 (exit status) if $1's aenv marker blocks — if any — are well-formed:
+# strictly alternating start/end pairs with no nesting, reordering, or
+# unterminated start at EOF. Returns 1 otherwise. Used to gate both install
+# idempotency and removal so a corrupted/partial block is never silently
+# truncated and never auto-repaired at the cost of unrelated rc content.
+_aenv_cc_rc_well_formed() {
+    awk '
+        BEGIN { in_block = 0 }
+        /^# >>> aenv completion >>>$/ { if (in_block) exit 1; in_block = 1; next }
+        /^# <<< aenv completion <<<$/ { if (!in_block) exit 1; in_block = 0; next }
+        END { if (in_block) exit 1 }
+    ' "$1" 2>/dev/null
+}
+
+# Append the regenerating zsh rc-snippet, idempotently. A complete, well-formed
+# block already present => no-op. A partial/corrupted block => warn and leave it
+# for the user (auto-repair could delete unrelated rc lines). No block => append.
 #   $1 rc file path
 _aenv_cc_put_zsh_rc() {
     local rc="$1"
     local dir="${rc%/*}"
-    if [[ -f "$rc" ]] && grep -q '^# >>> aenv completion >>>$' "$rc"; then
-        return 0 # already installed
+    if [[ -f "$rc" ]] && grep -q '^# >>> aenv completion >>>$' "$rc" 2>/dev/null; then
+        if _aenv_cc_rc_well_formed "$rc"; then
+            return 0 # idempotent: a complete managed block already exists
+        fi
+        printf 'warn: aenv completion: malformed marker block already in %s; leaving it untouched (remove it manually to regenerate)\n' "$rc" >&2
+        return 0
     fi
     if ! mkdir -p "$dir" 2>/dev/null; then
         printf 'warn: aenv completion: could not create directory %s\n' "$dir" >&2
@@ -121,55 +141,62 @@ _aenv_cc_put_zsh_rc() {
     fi
 }
 
-# Generate the static zsh completion from the installed aenv into a
-# site-functions dir. Skipped (with a warning) if `aenv` is not on PATH, e.g.
-# when installing into a prefix that is not yet on PATH; re-running the
-# installer after fixing PATH regenerates it.
+# Generate the static zsh completion into a site-functions dir. $2 is the
+# just-installed aenv binary (preferred over whatever is on PATH, which may be
+# stale or absent). Generation goes to a temp file in the destination dir and
+# is atomically renamed on success, so a failure never truncates an existing
+# valid completion file.
 #   $1 destination _aenv path
+#   $2 aenv binary to invoke (default: aenv from PATH)
 _aenv_cc_put_zsh_static() {
-    local path="$1"
+    local path="$1" aenv_bin="${2:-aenv}"
     local dir="${path%/*}"
     if ! mkdir -p "$dir" 2>/dev/null; then
         printf 'warn: aenv completion: could not create directory %s\n' "$dir" >&2
         return 0
     fi
-    if ! command -v aenv >/dev/null 2>&1; then
-        printf 'warn: aenv completion: aenv not on PATH; skipping static zsh file %s\n' "$path" >&2
+    local gen=()
+    if [[ -x "$aenv_bin" ]]; then
+        gen=("$aenv_bin" completion zsh)
+    elif command -v aenv >/dev/null 2>&1; then
+        gen=(aenv completion zsh)
+    else
+        printf 'warn: aenv completion: aenv not found (%s not executable and aenv not on PATH); skipping static zsh file %s\n' "$aenv_bin" "$path" >&2
         return 0
     fi
-    if ! aenv completion zsh > "$path" 2>/dev/null; then
-        # shellcheck disable=SC2016 # backticks are literal text in a warning
-        printf 'warn: aenv completion: `aenv completion zsh` failed; skipping %s\n' "$path" >&2
-        return 0
+    local tmp
+    tmp="$(mktemp "${path}.XXXXXX" 2>/dev/null)" || tmp="$(mktemp)"
+    if "${gen[@]}" > "$tmp" 2>/dev/null; then
+        chmod 0644 "$tmp" 2>/dev/null || true
+        if mv -f "$tmp" "$path" 2>/dev/null; then
+            return 0
+        fi
     fi
-    chmod 0644 "$path" 2>/dev/null || true
+    rm -f "$tmp" 2>/dev/null || true
+    # shellcheck disable=SC2016 # backticks are literal text in a warning
+    printf 'warn: aenv completion: `aenv completion zsh` failed; skipping %s\n' "$path" >&2
 }
 
-# Remove the zsh rc-snippet block from ~/.zshrc. Only acts on a balanced
-# marker pair; an unbalanced pair is left untouched to avoid truncating the
-# user's rc file.
+# Remove every well-formed aenv marker block from ~/.zshrc. Refuses to touch a
+# file with a malformed (partial/nested/reordered) block. The rewrite is done
+# in place (cat onto the rc) so the rc's inode, mode, ownership, and — for a
+# symlinked rc — the link target are preserved.
 #   $1 rc file path
 _aenv_cc_rm_zsh_rc() {
     local rc="$1"
     [[ -f "$rc" ]] || return 0
-    local starts ends tmp
-    starts=$(grep -c '^# >>> aenv completion >>>$' "$rc" 2>/dev/null || true)
-    ends=$(grep -c '^# <<< aenv completion <<<$' "$rc" 2>/dev/null || true)
-    starts="${starts:-0}"
-    ends="${ends:-0}"
-    [[ "$starts" =~ ^[0-9]+$ ]] || starts=0
-    [[ "$ends" =~ ^[0-9]+$ ]] || ends=0
-    [[ "$starts" -gt 0 ]] || return 0
-    if [[ "$starts" -ne "$ends" ]]; then
-        printf 'warn: aenv completion: unbalanced markers in %s; leaving it untouched\n' "$rc" >&2
+    grep -q '^# >>> aenv completion >>>$' "$rc" 2>/dev/null || return 0
+    if ! _aenv_cc_rc_well_formed "$rc"; then
+        printf 'warn: aenv completion: malformed marker block in %s; leaving it untouched\n' "$rc" >&2
         return 0
     fi
+    local tmp
     tmp="$(mktemp)"
-    if awk '
-        /^# >>> aenv completion >>>$/ { skip=1; next }
-        /^# <<< aenv completion <<<$/ { skip=0; next }
-        !skip { print }
-    ' "$rc" > "$tmp" && mv -f "$tmp" "$rc" 2>/dev/null; then
+    awk '/^# >>> aenv completion >>>$/,/^# <<< aenv completion <<<$/ { next } { print }' "$rc" > "$tmp" 2>/dev/null
+    # In-place rewrite preserves inode/mode/ownership and writes through a
+    # symlinked rc rather than replacing the link itself.
+    if cat "$tmp" > "$rc" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null || true
         return 0
     fi
     rm -f "$tmp" 2>/dev/null || true
@@ -199,22 +226,27 @@ aenv_completion_install() {
         return 0
     fi
 
+    # Capture $HOME once, safely (set -u safe). It drives both mode detection
+    # and the user-mode destination paths, and must not be dereferenced bare.
+    local home="${HOME:-}"
+
     # Auto-select user mode for a bare invocation or a prefix under $HOME.
-    # Guard $HOME: if it is unset/empty, the "$prefix" == "$HOME"/* pattern
-    # would collapse to "/*" and match any absolute path, and the bare $HOME
-    # reference would abort under `set -u`. Capture it once, safely.
     if [[ $user_mode -eq 0 ]]; then
-        local home="${HOME:-}"
         if [[ -z "$prefix" || ( -n "$home" && ( "$prefix" == "$home" || "$prefix" == "$home"/* ) ) ]]; then
             user_mode=1
         fi
     fi
 
+    if [[ $user_mode -eq 1 && -z "$home" ]]; then
+        printf 'warn: aenv completion: user mode requested but HOME is unset; skipping\n' >&2
+        return 0
+    fi
+
     local bash_file fish_file zsh_file zsh_kind
     if [[ $user_mode -eq 1 ]]; then
-        bash_file="${HOME}/.local/share/bash-completion/completions/aenv"
-        fish_file="${HOME}/.config/fish/completions/aenv.fish"
-        zsh_file="${HOME}/.zshrc"
+        bash_file="${home}/.local/share/bash-completion/completions/aenv"
+        fish_file="${home}/.config/fish/completions/aenv.fish"
+        zsh_file="${home}/.zshrc"
         zsh_kind="rc"
     else
         bash_file="${prefix}/share/bash-completion/completions/aenv"
@@ -229,7 +261,7 @@ aenv_completion_install() {
         if [[ "$zsh_kind" == "rc" ]]; then
             _aenv_cc_put_zsh_rc "$zsh_file"
         else
-            _aenv_cc_put_zsh_static "$zsh_file"
+            _aenv_cc_put_zsh_static "$zsh_file" "${prefix}/bin/aenv"
         fi
     else
         rm -f "$bash_file" "$fish_file" 2>/dev/null || true
