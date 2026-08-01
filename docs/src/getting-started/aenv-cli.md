@@ -291,12 +291,19 @@ aenv completion zsh
 aenv completion fish
 ```
 
-Each command writes the matching script to stdout, so redirect it wherever your shell expects:
+Each command writes the matching script to stdout, so redirect it into the standard per-user completion directory for your shell:
 
 ```bash
-aenv completion bash > ~/.local/share/aenv-completion.bash
-aenv completion zsh  > ~/.config/aenv/_aenv
+aenv completion bash > ~/.local/share/bash-completion/completions/aenv
+aenv completion zsh  > ~/.local/share/zsh/site-functions/_aenv
 aenv completion fish > ~/.config/fish/completions/aenv.fish
+```
+
+bash and fish auto-load from these directories (bash sources files named after the command from `~/.local/share/bash-completion/completions/`; fish sources `~/.config/fish/completions/`). zsh autoloads `_cmdname` functions from directories on `fpath` — `~/.local/share/zsh/site-functions` is not on `fpath` by default, so if completion does not load, add it before `compinit` in your `~/.zshrc`:
+
+```bash
+fpath+=(~/.local/share/zsh/site-functions)
+autoload -Uz compinit && compinit
 ```
 
 ### Activate it
