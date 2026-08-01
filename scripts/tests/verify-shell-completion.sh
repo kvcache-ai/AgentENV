@@ -197,8 +197,9 @@ assert_rc_clean "$zsrc"
 # set -u); closes the non-fatal contract for the user-mode destination paths.
 # ---------------------------------------------------------------------------
 echo "==> user mode with unset HOME warns and skips without aborting"
-env -u HOME bash "$helper" install --user >/tmp/aenv_tc_out 2>&1 \
+home_unset_out="$tmp_root/home-unset.out"
+env -u HOME bash "$helper" install --user >"$home_unset_out" 2>&1 \
     || fail "helper aborted with --user under unset HOME"
-grep -q 'HOME is unset' /tmp/aenv_tc_out || fail "expected a HOME-unset warning"
+grep -q 'HOME is unset' "$home_unset_out" || fail "expected a HOME-unset warning"
 
 echo "==> all shell-completion checks passed"
