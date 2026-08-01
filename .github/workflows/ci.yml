@@ -77,7 +77,8 @@ jobs:
     # the standalone installers. No Rust toolchain needed.
     runs-on: ubuntu-22.04
     permissions:
-      contents: read
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
       - name: Install shellcheck
