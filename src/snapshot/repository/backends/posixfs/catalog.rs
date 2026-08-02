@@ -432,18 +432,19 @@ impl PosixFsCatalogStore {
 
     fn write_commit_marker(&self, id: &SnapshotId) -> RepositoryResult<()> {
         let path = self.commit_marker_path(id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                RepositoryError::backend(format!("create '{}'", parent.display()), error)
-            })?;
-        }
-        let mut temp =
-            tempfile::NamedTempFile::new_in(path.parent().unwrap()).map_err(|error| {
-                RepositoryError::backend(
-                    format!("create temp commit marker in '{}'", path.display()),
-                    error,
-                )
-            })?;
+        let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
+            message: format!("resolve parent for '{}'", path.display()),
+            source: None,
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            RepositoryError::backend(format!("create '{}'", parent.display()), error)
+        })?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+            RepositoryError::backend(
+                format!("create temp commit marker in '{}'", path.display()),
+                error,
+            )
+        })?;
         temp.write_all(b"committed").map_err(|error| {
             RepositoryError::backend(
                 format!("write commit marker '{}'", temp.path().display()),
