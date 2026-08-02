@@ -66,8 +66,48 @@ curl_get() {
 # BEGIN aenv_completion_install
 # (keep in sync across scripts/shell-completion.sh, scripts/install-cli.sh,
 # scripts/install.sh — verified by scripts/check-completion-sync.sh)
+#
+# All filesystem writes flow through ONE atomic-commit primitive
+# (`_aenv_cc_commit`): the new content is staged to a temp file created IN the
+# destination directory (same filesystem => an atomic rename), the destination's
+# symlink is resolved (so the link is preserved, not replaced) and its mode is
+# copied. This guarantees every write site shares the same atomicity / symlink /
+# metadata properties, so the pattern cannot drift between functions.
 
-# Write a single completion loader file. Non-fatal on I/O errors.
+# Portable octal mode of an existing file (e.g. 644); defaults to 0644 when the
+# mode cannot be read (e.g. the file does not yet exist). GNU stat uses -c,
+# BSD/macOS stat uses -f.
+_aenv_cc_mode_octal() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null || printf '0644'
+}
+
+# Resolve $1 to the real file path it refers to when it is a symlink, so writes
+# land on the target and preserve the link rather than replacing it. Falls back
+# to $1 when readlink is unavailable or $1 is not a symlink.
+_aenv_cc_resolve() {
+    if [[ -L "$1" ]]; then
+        readlink -f "$1" 2>/dev/null || printf '%s' "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# Atomically publish a staged temp file as <dest>.
+#   $1 temp file path — MUST live in the same directory as <dest> (caller's job)
+#      so the final rename is atomic and not a cross-filesystem copy+delete.
+#   $2 destination path (possibly a symlink; its target is replaced, the link
+#      itself is preserved). The destination's current mode is copied onto the
+#      temp first (0644 default for a new file).
+# Returns nonzero on failure; the caller is responsible for cleaning up the temp.
+_aenv_cc_commit() {
+    local tmp="$1" dest="$2"
+    local target
+    target="$(_aenv_cc_resolve "$dest")"
+    chmod "$(_aenv_cc_mode_octal "$target")" "$tmp" 2>/dev/null || chmod 0644 "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$target" 2>/dev/null
+}
+
+# Write a single completion loader file atomically. Non-fatal on I/O errors.
 #   $1 destination path
 #   $2 file mode (e.g. 0644)
 #   $3 loader content (single line; the loaders are one-liners by design)
@@ -78,11 +118,17 @@ _aenv_cc_put() {
         printf 'warn: aenv completion: could not create directory %s\n' "$dir" >&2
         return 0
     fi
-    if ! printf '%s\n' "$content" > "$path" 2>/dev/null; then
-        printf 'warn: aenv completion: could not write %s\n' "$path" >&2
+    local tmp
+    tmp="$(mktemp "${path}.XXXXXX" 2>/dev/null)" || {
+        printf 'warn: aenv completion: could not create temp file near %s\n' "$path" >&2
+        return 0
+    }
+    if printf '%s\n' "$content" > "$tmp" 2>/dev/null && _aenv_cc_commit "$tmp" "$path"; then
+        chmod "$mode" "$path" 2>/dev/null || true
         return 0
     fi
-    chmod "$mode" "$path" 2>/dev/null || true
+    rm -f "$tmp" 2>/dev/null || true
+    printf 'warn: aenv completion: could not write %s\n' "$path" >&2
 }
 
 # Return 0 (exit status) if $1's aenv marker blocks — if any — are well-formed:
@@ -99,10 +145,13 @@ _aenv_cc_rc_well_formed() {
     ' "$1" 2>/dev/null
 }
 
-# Append the regenerating zsh rc-snippet, idempotently. A complete, well-formed
-# block already present => no-op. Any marker present but malformed => warn and
-# leave it for the user (auto-repair could delete unrelated rc lines). No
-# markers => append. The appended block is guarded by `command -v aenv` so a
+# Append the regenerating zsh rc-snippet, idempotently and atomically. A
+# complete, well-formed block already present => no-op. Any marker present but
+# malformed => warn and leave it for the user (auto-repair could delete
+# unrelated rc lines). No markers => append. The full new rc (existing content
+# + managed block) is staged to a same-directory temp and committed by an atomic
+# rename, so an interruption or I/O failure never leaves a partial/malformed
+# block in the live rc. The appended block is guarded by `command -v aenv` so a
 # missing/broken aenv never emits errors on every shell start.
 #   $1 rc file path
 _aenv_cc_put_zsh_rc() {
@@ -119,16 +168,21 @@ _aenv_cc_put_zsh_rc() {
         printf 'warn: aenv completion: could not create directory %s\n' "$dir" >&2
         return 0
     fi
-    # Start the block on its own line only when the rc file is non-empty and
-    # does not already end with a newline; this avoids leaving a stray blank
-    # line behind after uninstall.
-    local leader="" last_byte
-    if [[ -s "$rc" ]]; then
-        last_byte=$(tail -c 1 "$rc" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n') || last_byte=""
-        [[ "$last_byte" == "0a" ]] || leader=$'\n'
+    local target tmp last_byte
+    target="$(_aenv_cc_resolve "$rc")"
+    tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || {
+        printf 'warn: aenv completion: could not create temp file near %s\n' "$rc" >&2
+        return 0
+    }
+    # Stage existing content first (guarded), then add a separating newline if
+    # the existing content did not end in one, then the managed block. Each step
+    # returns nonzero on I/O failure so we never commit a partial result.
+    if [[ -s "$target" ]]; then
+        cat "$target" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; printf 'warn: aenv completion: could not stage %s\n' "$rc" >&2; return 0; }
+        last_byte=$(tail -c 1 "$tmp" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n') || last_byte=""
+        [[ "$last_byte" == "0a" ]] || printf '\n' >> "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; printf 'warn: aenv completion: could not stage %s\n' "$rc" >&2; return 0; }
     fi
     if ! {
-        printf '%s' "$leader"
         printf '# >>> aenv completion >>>\n'
         printf 'if command -v aenv >/dev/null 2>&1; then\n'
         printf 'autoload -Uz compinit && compinit\n'
@@ -136,16 +190,21 @@ _aenv_cc_put_zsh_rc() {
         printf 'eval "$(aenv completion zsh)"\n'
         printf 'fi\n'
         printf '# <<< aenv completion <<<\n'
-    } >> "$rc" 2>/dev/null; then
-        printf 'warn: aenv completion: could not append to %s\n' "$rc" >&2
+    } >> "$tmp" 2>/dev/null; then
+        rm -f "$tmp" 2>/dev/null
+        printf 'warn: aenv completion: could not stage %s\n' "$rc" >&2
+        return 0
     fi
+    _aenv_cc_commit "$tmp" "$rc" || {
+        rm -f "$tmp" 2>/dev/null
+        printf 'warn: aenv completion: could not update %s\n' "$rc" >&2
+    }
 }
 
 # Generate the static zsh completion into a site-functions dir. $2 is the
 # just-installed aenv binary (preferred over whatever is on PATH, which may be
-# stale or absent). Generation goes to a temp file in the destination dir and
-# is atomically renamed on success, so a failure never truncates an existing
-# valid completion file.
+# stale or absent). Generation goes through `_aenv_cc_commit`, so a failure or
+# empty output never replaces an existing valid completion file.
 #   $1 destination _aenv path
 #   $2 aenv binary to invoke (default: aenv from PATH)
 _aenv_cc_put_zsh_static() {
@@ -165,26 +224,27 @@ _aenv_cc_put_zsh_static() {
         return 0
     fi
     local tmp
-    tmp="$(mktemp "${path}.XXXXXX" 2>/dev/null)" || tmp="$(mktemp 2>/dev/null)" || {
-        printf 'warn: aenv completion: mktemp failed; skipping static zsh file %s\n' "$path" >&2
+    tmp="$(mktemp "${path}.XXXXXX" 2>/dev/null)" || {
+        printf 'warn: aenv completion: could not create temp file near %s; skipping static zsh\n' "$path" >&2
         return 0
     }
-    if "${gen[@]}" > "$tmp" 2>/dev/null; then
-        chmod 0644 "$tmp" 2>/dev/null || true
-        if mv -f "$tmp" "$path" 2>/dev/null; then
-            return 0
-        fi
+    # Require non-empty output: a broken aenv that exits 0 with no bytes must not
+    # erase a working completion via the atomic rename.
+    if "${gen[@]}" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]] && _aenv_cc_commit "$tmp" "$path"; then
+        chmod 0644 "$path" 2>/dev/null || true
+        return 0
     fi
     rm -f "$tmp" 2>/dev/null || true
     # shellcheck disable=SC2016 # backticks are literal text in a warning
-    printf 'warn: aenv completion: `aenv completion zsh` failed; skipping %s\n' "$path" >&2
+    printf 'warn: aenv completion: `aenv completion zsh` failed or produced no output; skipping %s\n' "$path" >&2
 }
 
 # Remove every well-formed aenv marker block from ~/.zshrc. Refuses to touch a
-# file with a malformed (partial/nested/reordered/orphan) block. The awk output
-# is validated and the rc rewritten in place (cat onto the rc) so the rc's
-# inode, mode, ownership, and — for a symlinked rc — the link target are
-# preserved; a failed/partial awk never reaches the live rc.
+# file with a malformed (partial/nested/reordered/orphan) block. The rewrite is
+# staged to a same-directory temp and committed by an atomic rename via
+# `_aenv_cc_commit`, so the rc's inode/mode/ownership and (for a symlinked rc)
+# the link itself are preserved and a failed/partial awk never reaches the live
+# file.
 #   $1 rc file path
 _aenv_cc_rm_zsh_rc() {
     local rc="$1"
@@ -194,13 +254,17 @@ _aenv_cc_rm_zsh_rc() {
         printf 'warn: aenv completion: malformed marker block in %s; leaving it untouched\n' "$rc" >&2
         return 0
     fi
-    local tmp
-    tmp="$(mktemp 2>/dev/null)" || {
-        printf 'warn: aenv completion: mktemp failed; leaving %s untouched\n' "$rc" >&2
+    local target tmp
+    target="$(_aenv_cc_resolve "$rc")"
+    # Temp in the rc's own directory so the rename is atomic (same filesystem).
+    tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || {
+        printf 'warn: aenv completion: could not create temp file near %s; leaving it untouched\n' "$rc" >&2
         return 0
     }
-    if awk '/^# >>> aenv completion >>>$/,/^# <<< aenv completion <<<$/ { next } { print }' "$rc" > "$tmp" 2>/dev/null && cat "$tmp" > "$rc" 2>/dev/null; then
-        rm -f "$tmp" 2>/dev/null || true
+    # awk's exit status is the signal: on success its output (possibly empty if
+    # the rc held only the managed block) is the correct new content; on failure
+    # (read/parse error) it is left partial and we never commit it.
+    if awk '/^# >>> aenv completion >>>$/,/^# <<< aenv completion <<<$/ { next } { print }' "$target" > "$tmp" 2>/dev/null && _aenv_cc_commit "$tmp" "$rc"; then
         return 0
     fi
     rm -f "$tmp" 2>/dev/null || true
@@ -260,8 +324,11 @@ aenv_completion_install() {
     fi
 
     if [[ "$action" == "install" ]]; then
-        _aenv_cc_put "$bash_file" 0644 'source <(aenv completion bash)'
-        _aenv_cc_put "$fish_file" 0644 'aenv completion fish | source'
+        # bash/fish loaders guard on aenv presence so a missing/uninstalled aenv
+        # is silent rather than erroring on every shell start (matches the zsh
+        # rc-snippet's `command -v aenv` guard).
+        _aenv_cc_put "$bash_file" 0644 'command -v aenv >/dev/null 2>&1 && source <(aenv completion bash)'
+        _aenv_cc_put "$fish_file" 0644 'type -q aenv; and aenv completion fish | source'
         if [[ "$zsh_kind" == "rc" ]]; then
             _aenv_cc_put_zsh_rc "$zsh_file"
         else
