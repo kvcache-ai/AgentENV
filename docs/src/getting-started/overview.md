@@ -32,7 +32,6 @@ AgentENV exposes an HTTP API. There are four ways to use it:
 |--------|----------|
 | **[aenv CLI](./aenv-cli.md)** | Interactive use, scripting, local development |
 | **[E2B](../integration/e2b.md)** | Application code — existing E2B-based applications work with AgentENV without modification |
-| **[Crabbox](../integration/crabbox.md)** | Third-party client for repo sync plus remote command execution |
 | **[HTTP API](../api/index.md)** | Direct control, other languages, automation |
 
 ## Where to Go Next

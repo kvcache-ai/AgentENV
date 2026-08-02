@@ -101,9 +101,6 @@ server and use the standard E2B Python / TypeScript SDK without any code
 changes. See 📖 [E2B integration](https://kvcache-ai.github.io/AgentENV/integration/e2b.html)
 for setup details.
 
-Crabbox's `e2b` provider also works when host-based sandbox routing is
-configured — see 📖 [Crabbox integration](https://kvcache-ai.github.io/AgentENV/integration/crabbox.html).
-
 ---
 
 ## 🛠 aenv CLI reference
