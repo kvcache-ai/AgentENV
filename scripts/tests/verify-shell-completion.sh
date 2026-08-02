@@ -197,9 +197,55 @@ leftovers=( "$sys_prefix/share/zsh/site-functions"/* )
 rm -rf "${sys_prefix:?}/bin" "${sys_prefix:?}/share/zsh/site-functions"
 
 # ---------------------------------------------------------------------------
-# Test 9: unrelated user lines around the managed block survive install+uninstall
-# (a regression that truncates the rc while removing a balanced block must fail).
+# Test 8b: a zero-exit-but-empty `aenv completion zsh` must NOT replace a valid
+# existing _aenv (the installer rejects an empty generated temp before rename).
 # ---------------------------------------------------------------------------
+echo "==> empty aenv completion zsh output leaves the existing _aenv intact"
+mkdir -p "$sys_prefix/bin" "$sys_prefix/share/zsh/site-functions"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$sys_prefix/bin/aenv"
+chmod +x "$sys_prefix/bin/aenv"
+echo '# pre-existing valid zsh completion' > "$sys_prefix/share/zsh/site-functions/_aenv"
+cp "$sys_prefix/share/zsh/site-functions/_aenv" "$tmp_root/_aenv8b.orig"
+HOME="$fake_home" PATH="$hermetic_bin" bash "$helper" install --prefix="$sys_prefix" 2>/dev/null \
+    || fail "helper aborted on empty completion output"
+cmp -s "$sys_prefix/share/zsh/site-functions/_aenv" "$tmp_root/_aenv8b.orig" \
+    || fail "empty output replaced a valid _aenv"
+rm -rf "${sys_prefix:?}/bin" "${sys_prefix:?}/share/zsh/site-functions"
+
+# ---------------------------------------------------------------------------
+# Test 8c: the static zsh file keeps #compdef on line 1 (the ownership marker
+# is appended, not prepended, so zsh still loads the function) and carries the
+# ownership marker so a later uninstall can recognize it.
+# ---------------------------------------------------------------------------
+echo "==> static zsh keeps #compdef first-line and carries the ownership marker"
+mkdir -p "$sys_prefix/bin" "$sys_prefix/share/zsh/site-functions"
+# shellcheck disable=SC2016 # ${1:-} is literal text for the stub script, not this shell
+printf '#!/usr/bin/env bash\ncase "${1:-}" in completion) echo "#compdef aenv"; echo "echo body";; esac\n' > "$sys_prefix/bin/aenv"
+chmod +x "$sys_prefix/bin/aenv"
+HOME="$fake_home" bash "$helper" install --prefix="$sys_prefix" >/dev/null 2>&1
+[[ "$(head -1 "$sys_prefix/share/zsh/site-functions/_aenv")" == "#compdef aenv" ]] \
+    || fail "static zsh #compdef must be the first line"
+grep -qF -- "# managed by aenv-installer" "$sys_prefix/share/zsh/site-functions/_aenv" \
+    || fail "static zsh must carry the ownership marker"
+HOME="$fake_home" bash "$helper" uninstall --prefix="$sys_prefix" >/dev/null 2>&1
+assert_absent "$sys_prefix/share/zsh/site-functions/_aenv"
+rm -rf "${sys_prefix:?}/bin"
+
+# ---------------------------------------------------------------------------
+# Test 8d: uninstall will NOT delete a completion file the installer did not
+# create (no ownership marker) — a hand-maintained or package-manager file at
+# the conventional path is left untouched with a warning.
+# ---------------------------------------------------------------------------
+echo "==> uninstall leaves a non-aenv-owned completion file untouched"
+mkdir -p "$sys_prefix/share/bash-completion/completions" "$sys_prefix/share/fish/vendor_completions.d"
+printf '# my hand-written aenv completion\n' > "$sys_prefix/share/bash-completion/completions/aenv"
+printf '# my fish completion\n' > "$sys_prefix/share/fish/vendor_completions.d/aenv.fish"
+HOME="$fake_home" bash "$helper" uninstall --prefix="$sys_prefix" 2>/dev/null
+assert_contains "$sys_prefix/share/bash-completion/completions/aenv" 'my hand-written'
+assert_contains "$sys_prefix/share/fish/vendor_completions.d/aenv.fish" 'my fish completion'
+rm -rf "${sys_prefix:?}/share"
+
+
 echo "==> unrelated rc content survives install and uninstall"
 home_surround="$tmp_root/home-surround"
 mkdir -p "$home_surround"
