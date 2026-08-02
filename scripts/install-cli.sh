@@ -106,24 +106,26 @@ _aenv_cc_mode_octal() {
 #     would replace the symlink itself, silently breaking the "preserve the
 #     link" guarantee this whole module advertises.
 _aenv_cc_resolve() {
-    if [[ -L "$1" ]]; then
-        local resolved
-        if resolved="$(readlink -f "$1" 2>/dev/null)" && [[ -n "$resolved" ]]; then
-            printf '%s' "$resolved"
-            return 0
+    local p="$1" link hops=0
+    # Walk the symlink chain portably with a bound (cycle detection), so
+    # multi-hop chains resolve on BSD/macOS (no `readlink -f`) as well as GNU.
+    # Returns failure on an unreadable or broken symlink, so callers never mv
+    # over an intermediate link. A plain (non-symlink) path is returned as-is
+    # even when it does not yet exist, so first-install (which creates the file)
+    # is not blocked.
+    while [[ -L "$p" ]]; do
+        if ! link=$(readlink "$p" 2>/dev/null) || [[ -z "$link" ]]; then
+            return 1
         fi
-        # Portable one-hop fallback for platforms without GNU `readlink -f`
-        # (e.g. some BSD/macOS readlink builds). Only handles a single-level
-        # symlink, which covers the common case; anything more exotic
-        # (relative multi-hop chains) is treated as unresolvable.
-        if resolved="$(readlink "$1" 2>/dev/null)" && [[ -n "$resolved" ]]; then
-            [[ "$resolved" = /* ]] || resolved="${1%/*}/$resolved"
-            printf '%s' "$resolved"
-            return 0
-        fi
-        return 1
-    fi
-    printf '%s' "$1"
+        [[ "$link" = /* ]] || link="${p%/*}/$link"
+        p="$link"
+        hops=$((hops + 1))
+        [[ "$hops" -lt 40 ]] || return 1
+    done
+    # If we followed at least one hop and landed on a non-existent path, the
+    # link chain is broken — refuse rather than mv into nothing.
+    [[ "$hops" -gt 0 && ! -e "$p" ]] && return 1
+    printf '%s' "$p"
     return 0
 }
 
@@ -144,8 +146,15 @@ _aenv_cc_commit() {
         return 1
     fi
     chmod "$(_aenv_cc_mode_octal "$target")" "$tmp" 2>/dev/null || chmod 0644 "$tmp" 2>/dev/null || true
+    # Preserve ownership when running as root. `chown --reference` is GNU-only,
+    # so read uid:gid portably (GNU `stat -c`, BSD/macOS `stat -f`) and chown
+    # explicitly; do NOT silently commit a root-owned temp over a user file.
     if [[ $EUID -eq 0 && -e "$target" ]]; then
-        chown --reference="$target" "$tmp" 2>/dev/null || true
+        local ids
+        ids=$(stat -c '%u:%g' "$target" 2>/dev/null || stat -f '%u:%g' "$target" 2>/dev/null || true)
+        if [[ -n "$ids" ]] && ! chown "$ids" "$tmp" 2>/dev/null; then
+            return 1
+        fi
     fi
     mv -f "$tmp" "$target" 2>/dev/null
 }
@@ -171,6 +180,12 @@ _aenv_cc_put() {
     local target_dir="${target%/*}"
     if ! mkdir -p "$target_dir" 2>/dev/null; then
         printf 'warn: aenv completion: could not create directory %s\n' "$target_dir" >&2
+        return 0
+    fi
+    # Do not overwrite a pre-existing file we did not create (a hand-written or
+    # package-manager completion). Symmetric with _aenv_cc_rm_owned.
+    if [[ -e "$target" ]] && ! _aenv_cc_owns "$target"; then
+        printf 'warn: aenv completion: %s already exists and is not aenv-managed; leaving it untouched\n' "$path" >&2
         return 0
     fi
     local tmp
@@ -239,14 +254,17 @@ _aenv_cc_zsh_block_current() {
 #   $2... function name + args to run inside the lock
 _aenv_cc_with_zsh_lock() {
     local rc="$1"; shift
-    if command -v flock >/dev/null 2>&1; then
+    # Lock the rc's OWN fd (read-only open: no truncation, and no sidecar lock
+    # file in the user's directory that a privileged run could be tricked into
+    # following as a symlink). Best-effort: fall back to unlocked where flock is
+    # missing or the rc does not yet exist (first install).
+    if command -v flock >/dev/null 2>&1 && [[ -e "$rc" ]]; then
         (
-            flock -w 10 200 || {
-                printf 'warn: aenv completion: could not lock %s (timed out); skipping\n' "$rc" >&2
-                exit 0
-            }
+            exec 200<"$rc" 2>/dev/null || { "$@"; exit; }
+            flock -w 10 200 2>/dev/null || \
+                printf 'warn: aenv completion: could not lock %s (timed out); proceeding unlocked\n' "$rc" >&2
             "$@"
-        ) 200>"${rc}.aenv-lock" 2>&2
+        )
     else
         "$@"
     fi
@@ -371,6 +389,10 @@ _aenv_cc_put_zsh_static() {
         printf 'warn: aenv completion: %s is a symlink that could not be resolved; skipping\n' "$path" >&2
         return 0
     fi
+    if [[ -e "$target" ]] && ! _aenv_cc_owns "$target"; then
+        printf 'warn: aenv completion: %s already exists and is not aenv-managed; leaving it untouched\n' "$path" >&2
+        return 0
+    fi
     local tmp
     tmp="$(mktemp "${target}.XXXXXX" 2>/dev/null)" || {
         printf 'warn: aenv completion: could not create temp file near %s; skipping static zsh\n' "$path" >&2
@@ -387,7 +409,12 @@ _aenv_cc_put_zsh_static() {
         printf 'warn: aenv completion: `aenv completion zsh` failed or produced no output; skipping %s\n' "$path" >&2
         return 0
     fi
-    printf '%s\n' "$_AENV_CC_MARKER" >> "$tmp" 2>/dev/null || {
+    # Ensure a newline separates the completion body from the marker comment so
+    # a generator that omits a trailing newline does not fuse the marker onto
+    # the last shell statement.
+    local last_byte
+    last_byte=$(tail -c 1 "$tmp" 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n') || last_byte=""
+    { [[ "$last_byte" == "0a" ]] || printf '\n'; printf '%s\n' "$_AENV_CC_MARKER"; } >> "$tmp" 2>/dev/null || {
         rm -f "$tmp" 2>/dev/null || true
         printf 'warn: aenv completion: could not stage ownership marker for %s\n' "$path" >&2
         return 0
@@ -414,12 +441,19 @@ _aenv_cc_owns() {
 
 # Remove $1 only if we own it (see _aenv_cc_owns); otherwise warn and leave it
 # untouched so a user's own completion file, or one now owned by a package
-# manager, is never silently deleted.
+# manager, is never silently deleted. Resolves symlinks before both the
+# ownership check and the removal so an install/uninstall cycle through a
+# symlinked completion path removes the managed TARGET we wrote, not the link.
 _aenv_cc_rm_owned() {
     local path="$1"
     [[ -e "$path" ]] || return 0
-    if _aenv_cc_owns "$path"; then
-        rm -f "$path" 2>/dev/null || printf 'warn: aenv completion: could not remove %s\n' "$path" >&2
+    local target
+    if ! target="$(_aenv_cc_resolve "$path")" || [[ -z "$target" ]]; then
+        printf 'warn: aenv completion: %s is an unresolvable symlink; leaving it untouched\n' "$path" >&2
+        return 0
+    fi
+    if _aenv_cc_owns "$target"; then
+        rm -f "$target" 2>/dev/null || printf 'warn: aenv completion: could not remove %s\n' "$path" >&2
     else
         printf 'warn: aenv completion: %s was not installed by aenv (no ownership marker); leaving it untouched\n' "$path" >&2
     fi

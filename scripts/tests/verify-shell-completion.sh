@@ -176,41 +176,61 @@ assert_absent "$sys_prefix/share/bash-completion/completions/aenv"
 # Test 8: a failing `aenv completion zsh` must not truncate an existing valid
 # static file (atomic temp+rename), and must not leave temp files behind.
 # ---------------------------------------------------------------------------
-echo "==> failing aenv completion zsh leaves the existing _aenv intact"
+echo "==> failing aenv completion zsh leaves the existing managed _aenv intact"
 mkdir -p "$sys_prefix/bin" "$sys_prefix/share/zsh/site-functions"
 invoked="$tmp_root/failing-aenv-invoked"
+# Seed a managed _aenv with a working aenv first, so the install-side ownership
+# guard permits a later re-install attempt; then swap to a failing aenv.
+# shellcheck disable=SC2016 # ${1:-} is literal stub text
+printf '#!/usr/bin/env bash\ncase "${1:-}" in completion) echo "#compdef aenv"; echo "echo body";; esac\n' > "$sys_prefix/bin/aenv"
+chmod +x "$sys_prefix/bin/aenv"
+HOME="$fake_home" bash "$helper" install --prefix="$sys_prefix" >/dev/null 2>&1
+assert_contains "$sys_prefix/share/zsh/site-functions/_aenv" '#compdef aenv'
+cp "$sys_prefix/share/zsh/site-functions/_aenv" "$tmp_root/_aenv.orig"
 printf '#!/usr/bin/env bash\nprintf x > "%s"\nexit 1\n' "$invoked" > "$sys_prefix/bin/aenv"
 chmod +x "$sys_prefix/bin/aenv"
-echo '# pre-existing valid zsh completion' > "$sys_prefix/share/zsh/site-functions/_aenv"
+rm -f "$invoked"
 HOME="$fake_home" PATH="$hermetic_bin" bash "$helper" install --prefix="$sys_prefix" 2>/dev/null \
     || fail "helper aborted when aenv completion zsh exits nonzero"
-[[ -f "$invoked" ]] || fail "prefix-local aenv stub was not invoked (regression: fell back to PATH/no-aenv branch)"
-cp "$sys_prefix/share/zsh/site-functions/_aenv" "$tmp_root/_aenv.orig"
-HOME="$fake_home" PATH="$hermetic_bin" bash "$helper" install --prefix="$sys_prefix" 2>/dev/null \
-    || fail "helper aborted when aenv completion zsh exits nonzero"
-[[ -f "$invoked" ]] || fail "prefix-local aenv stub was not invoked (regression: fell back to PATH/no-aenv branch)"
+[[ -f "$invoked" ]] || fail "prefix-local aenv stub was not invoked on re-install"
 cmp -s "$sys_prefix/share/zsh/site-functions/_aenv" "$tmp_root/_aenv.orig" \
     || fail "failed generation modified the existing _aenv"
-# Exactly one file in the site-functions dir (no leftover .XXXXXX temp).
 leftovers=( "$sys_prefix/share/zsh/site-functions"/* )
 [[ "${#leftovers[@]}" -eq 1 ]] || fail "expected no temp leftovers, found: ${leftovers[*]}"
-rm -rf "${sys_prefix:?}/bin" "${sys_prefix:?}/share/zsh/site-functions"
+rm -rf "${sys_prefix:?}/bin" "${sys_prefix:?}/share"
+
+# ---------------------------------------------------------------------------
+# Test 8e: install must NOT overwrite an existing completion file the installer
+# did not create (install-side ownership guard, symmetric with uninstall).
+# ---------------------------------------------------------------------------
+echo "==> install leaves an existing non-aenv-owned completion file untouched"
+mkdir -p "$sys_prefix/share/bash-completion/completions" "$sys_prefix/share/fish/vendor_completions.d"
+printf '# my hand-written bash completion\n' > "$sys_prefix/share/bash-completion/completions/aenv"
+printf '# my fish completion\n' > "$sys_prefix/share/fish/vendor_completions.d/aenv.fish"
+HOME="$fake_home" bash "$helper" install --prefix="$sys_prefix" 2>/dev/null
+assert_contains "$sys_prefix/share/bash-completion/completions/aenv" 'my hand-written'
+assert_contains "$sys_prefix/share/fish/vendor_completions.d/aenv.fish" 'my fish completion'
+rm -rf "${sys_prefix:?}/share"
 
 # ---------------------------------------------------------------------------
 # Test 8b: a zero-exit-but-empty `aenv completion zsh` must NOT replace a valid
 # existing _aenv (the installer rejects an empty generated temp before rename).
 # ---------------------------------------------------------------------------
-echo "==> empty aenv completion zsh output leaves the existing _aenv intact"
+echo "==> empty aenv completion zsh output leaves the existing managed _aenv intact"
 mkdir -p "$sys_prefix/bin" "$sys_prefix/share/zsh/site-functions"
+# Seed managed _aenv (working aenv), then swap to an aenv that exits 0 with no bytes.
+# shellcheck disable=SC2016 # ${1:-} is literal stub text
+printf '#!/usr/bin/env bash\ncase "${1:-}" in completion) echo "#compdef aenv"; echo "echo body";; esac\n' > "$sys_prefix/bin/aenv"
+chmod +x "$sys_prefix/bin/aenv"
+HOME="$fake_home" bash "$helper" install --prefix="$sys_prefix" >/dev/null 2>&1
+cp "$sys_prefix/share/zsh/site-functions/_aenv" "$tmp_root/_aenv8b.orig"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$sys_prefix/bin/aenv"
 chmod +x "$sys_prefix/bin/aenv"
-echo '# pre-existing valid zsh completion' > "$sys_prefix/share/zsh/site-functions/_aenv"
-cp "$sys_prefix/share/zsh/site-functions/_aenv" "$tmp_root/_aenv8b.orig"
 HOME="$fake_home" PATH="$hermetic_bin" bash "$helper" install --prefix="$sys_prefix" 2>/dev/null \
     || fail "helper aborted on empty completion output"
 cmp -s "$sys_prefix/share/zsh/site-functions/_aenv" "$tmp_root/_aenv8b.orig" \
     || fail "empty output replaced a valid _aenv"
-rm -rf "${sys_prefix:?}/bin" "${sys_prefix:?}/share/zsh/site-functions"
+rm -rf "${sys_prefix:?}/bin" "${sys_prefix:?}/share"
 
 # ---------------------------------------------------------------------------
 # Test 8c: the static zsh file keeps #compdef on line 1 (the ownership marker

@@ -183,14 +183,14 @@ mod tests {
     fn broken_pipe_is_treated_as_success() {
         // `aenv completion bash | head` closes the pipe early; that must exit
         // cleanly rather than error or panic.
-        let mut out = FailingWriter(std::io::ErrorKind::BrokenPipe);
+        let mut out = FailingWriter { kind: std::io::ErrorKind::BrokenPipe, fail_on_flush: false };
         write_completion(Shell::Bash, &mut out)
             .expect("BrokenPipe during completion output should not error");
     }
 
     #[test]
     fn other_io_error_propagates() {
-        let mut out = FailingWriter(std::io::ErrorKind::Other);
+        let mut out = FailingWriter { kind: std::io::ErrorKind::Other, fail_on_flush: false };
         let err = write_completion(Shell::Bash, &mut out)
             .expect_err("non-BrokenPipe I/O errors should propagate");
         assert!(
