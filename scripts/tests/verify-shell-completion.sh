@@ -214,7 +214,10 @@ assert_rc_clean "$zsrc"
 echo "==> user mode with unset HOME warns and skips without aborting"
 home_unset_out="$tmp_root/home-unset.out"
 env -u HOME bash "$helper" install --user >"$home_unset_out" 2>&1 \
-    || fail "helper aborted with --user under unset HOME"
-grep -q 'HOME is unset' "$home_unset_out" || fail "expected a HOME-unset warning"
+    || fail "helper aborted during install --user with HOME unset"
+grep -q 'HOME is unset' "$home_unset_out" || fail "expected a HOME-unset warning during install"
+env -u HOME bash "$helper" uninstall --user >"$home_unset_out" 2>&1 \
+    || fail "helper aborted during uninstall --user with HOME unset"
+grep -q 'HOME is unset' "$home_unset_out" || fail "expected a HOME-unset warning during uninstall"
 
 echo "==> all shell-completion checks passed"
