@@ -185,7 +185,12 @@ echo '# pre-existing valid zsh completion' > "$sys_prefix/share/zsh/site-functio
 HOME="$fake_home" PATH="$hermetic_bin" bash "$helper" install --prefix="$sys_prefix" 2>/dev/null \
     || fail "helper aborted when aenv completion zsh exits nonzero"
 [[ -f "$invoked" ]] || fail "prefix-local aenv stub was not invoked (regression: fell back to PATH/no-aenv branch)"
-assert_contains "$sys_prefix/share/zsh/site-functions/_aenv" '# pre-existing valid zsh completion'
+cp "$sys_prefix/share/zsh/site-functions/_aenv" "$tmp_root/_aenv.orig"
+HOME="$fake_home" PATH="$hermetic_bin" bash "$helper" install --prefix="$sys_prefix" 2>/dev/null \
+    || fail "helper aborted when aenv completion zsh exits nonzero"
+[[ -f "$invoked" ]] || fail "prefix-local aenv stub was not invoked (regression: fell back to PATH/no-aenv branch)"
+cmp -s "$sys_prefix/share/zsh/site-functions/_aenv" "$tmp_root/_aenv.orig" \
+    || fail "failed generation modified the existing _aenv"
 # Exactly one file in the site-functions dir (no leftover .XXXXXX temp).
 leftovers=( "$sys_prefix/share/zsh/site-functions"/* )
 [[ "${#leftovers[@]}" -eq 1 ]] || fail "expected no temp leftovers, found: ${leftovers[*]}"
