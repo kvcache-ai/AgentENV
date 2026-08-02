@@ -73,14 +73,22 @@ mod tests {
 
     /// Writer that always fails with a configured error kind, for exercising
     /// `write_completion`'s error branches.
-    struct FailingWriter(std::io::ErrorKind);
+    struct FailingWriter {
+        kind: std::io::ErrorKind,
+        fail_on_flush: bool,
+    }
 
     impl std::io::Write for FailingWriter {
-        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
-            Err(std::io::Error::from(self.0))
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.fail_on_flush {
+                Ok(buf.len())
+            } else {
+                Err(std::io::Error::from(self.kind))
+            }
         }
+
         fn flush(&mut self) -> std::io::Result<()> {
-            Err(std::io::Error::from(self.0))
+            Err(std::io::Error::from(self.kind))
         }
     }
 
