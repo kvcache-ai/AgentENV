@@ -64,6 +64,14 @@ for f in "$cli" "$full"; do
         diff -u "$tmp_dir/canonical" "$tmp_dir/cand" >&2 || true
         rc=1
     fi
+    # The block being present is not enough: each installer must also actually
+    # invoke the helper exactly once (a deleted/broken call site would otherwise
+    # leave the install silently broken while the blocks stay "in sync").
+    calls=$(grep -cE '^aenv_completion_install (install|uninstall) ' "$f" || true)
+    if [[ "$calls" -ne 1 ]]; then
+        echo "error: expected exactly one aenv_completion_install invocation in $f (found $calls)" >&2
+        rc=1
+    fi
 done
 
 if [[ $rc -eq 0 ]]; then

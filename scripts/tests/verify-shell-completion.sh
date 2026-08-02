@@ -122,17 +122,29 @@ HOME="$fake_home" bash "$helper" uninstall --user
 HOME="$fake_home" bash "$helper" uninstall --prefix="$sys_prefix"
 
 # ---------------------------------------------------------------------------
-# Test 5: an unbalanced marker block is left untouched (never truncate a rc)
+# Test 5: every malformed marker layout is left byte-for-byte untouched by both
+# install and uninstall (orphan start/end, reversed, nested). Install must not
+# append onto a malformed state; uninstall must not truncate it.
 # ---------------------------------------------------------------------------
-echo "==> unbalanced markers are left untouched on uninstall"
-malformed="$fake_home/.zshrc"
-printf 'user-line-before\n# >>> aenv completion >>>\nautoload -Uz compinit\nuser-line-after\n' > "$malformed"
-HOME="$fake_home" bash "$helper" uninstall --user 2>/dev/null
-# Nothing is removed: both user lines and the orphan start marker remain.
-assert_contains "$malformed" 'user-line-before'
-assert_contains "$malformed" 'user-line-after'
-assert_contains "$malformed" '# >>> aenv completion >>>'
-rm -f "$malformed"
+echo "==> malformed marker layouts are untouched by install and uninstall"
+home_mal="$tmp_root/home-mal"; mkdir -p "$home_mal"
+layouts=(
+    'orphan-start|user-before\n# >>> aenv completion >>>\nuser-after\n'
+    'orphan-end|user-before\n# <<< aenv completion <<<\nuser-after\n'
+    'reversed|# <<< aenv completion <<<\nuser-mid\n# >>> aenv completion >>>\n'
+    'nested|# >>> aenv completion >>>\n# >>> aenv completion >>>\nx\n# <<< aenv completion <<<\n# <<< aenv completion <<<\n'
+)
+for entry in "${layouts[@]}"; do
+    name="${entry%%|*}"; body="${entry#*|}"
+    rc="$home_mal/.zshrc"
+    printf '%b' "$body" > "$rc"
+    cp "$rc" "$rc.orig"
+    HOME="$home_mal" bash "$helper" install --user 2>/dev/null
+    cmp -s "$rc" "$rc.orig" || fail "install mutated malformed ($name) rc"
+    HOME="$home_mal" bash "$helper" uninstall --user 2>/dev/null
+    cmp -s "$rc" "$rc.orig" || fail "uninstall mutated malformed ($name) rc"
+    rm -f "$rc" "$rc.orig"
+done
 
 # ---------------------------------------------------------------------------
 # Test 6: system mode skips the static zsh file when aenv is not on PATH but
@@ -146,6 +158,7 @@ assert_contains "$sys_prefix/share/fish/vendor_completions.d/aenv.fish" 'aenv co
 assert_absent "$sys_prefix/share/zsh/site-functions/_aenv"
 HOME="$fake_home" PATH="$hermetic_bin" bash "$helper" uninstall --prefix="$sys_prefix"
 assert_absent "$sys_prefix/share/bash-completion/completions/aenv"
+assert_absent "$sys_prefix/share/fish/vendor_completions.d/aenv.fish"
 
 # ---------------------------------------------------------------------------
 # Test 7: a missing $HOME must not abort the helper (set -u) and must not make
@@ -165,11 +178,13 @@ assert_absent "$sys_prefix/share/bash-completion/completions/aenv"
 # ---------------------------------------------------------------------------
 echo "==> failing aenv completion zsh leaves the existing _aenv intact"
 mkdir -p "$sys_prefix/bin" "$sys_prefix/share/zsh/site-functions"
-printf '#!/usr/bin/env bash\nexit 1\n' > "$sys_prefix/bin/aenv"
+invoked="$tmp_root/failing-aenv-invoked"
+printf '#!/usr/bin/env bash\nprintf x > "%s"\nexit 1\n' "$invoked" > "$sys_prefix/bin/aenv"
 chmod +x "$sys_prefix/bin/aenv"
 echo '# pre-existing valid zsh completion' > "$sys_prefix/share/zsh/site-functions/_aenv"
 HOME="$fake_home" PATH="$hermetic_bin" bash "$helper" install --prefix="$sys_prefix" 2>/dev/null \
     || fail "helper aborted when aenv completion zsh exits nonzero"
+[[ -f "$invoked" ]] || fail "prefix-local aenv stub was not invoked (regression: fell back to PATH/no-aenv branch)"
 assert_contains "$sys_prefix/share/zsh/site-functions/_aenv" '# pre-existing valid zsh completion'
 # Exactly one file in the site-functions dir (no leftover .XXXXXX temp).
 leftovers=( "$sys_prefix/share/zsh/site-functions"/* )

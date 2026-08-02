@@ -86,9 +86,9 @@ _aenv_cc_put() {
 }
 
 # Return 0 (exit status) if $1's aenv marker blocks — if any — are well-formed:
-# strictly alternating start/end pairs with no nesting, reordering, or
-# unterminated start at EOF. Returns 1 otherwise. Used to gate both install
-# idempotency and removal so a corrupted/partial block is never silently
+# strictly alternating start/end pairs with no nesting, reordering, orphan
+# markers, or unterminated start at EOF. Returns 1 otherwise. Used to gate both
+# install idempotency and removal so a corrupted/partial block is never silently
 # truncated and never auto-repaired at the cost of unrelated rc content.
 _aenv_cc_rc_well_formed() {
     awk '
@@ -100,13 +100,15 @@ _aenv_cc_rc_well_formed() {
 }
 
 # Append the regenerating zsh rc-snippet, idempotently. A complete, well-formed
-# block already present => no-op. A partial/corrupted block => warn and leave it
-# for the user (auto-repair could delete unrelated rc lines). No block => append.
+# block already present => no-op. Any marker present but malformed => warn and
+# leave it for the user (auto-repair could delete unrelated rc lines). No
+# markers => append. The appended block is guarded by `command -v aenv` so a
+# missing/broken aenv never emits errors on every shell start.
 #   $1 rc file path
 _aenv_cc_put_zsh_rc() {
     local rc="$1"
     local dir="${rc%/*}"
-    if [[ -f "$rc" ]] && grep -q '^# >>> aenv completion >>>$' "$rc" 2>/dev/null; then
+    if [[ -f "$rc" ]] && grep -qE '^# (>>> aenv completion >>>|<<< aenv completion <<<)$' "$rc" 2>/dev/null; then
         if _aenv_cc_rc_well_formed "$rc"; then
             return 0 # idempotent: a complete managed block already exists
         fi
@@ -128,9 +130,11 @@ _aenv_cc_put_zsh_rc() {
     if ! {
         printf '%s' "$leader"
         printf '# >>> aenv completion >>>\n'
+        printf 'if command -v aenv >/dev/null 2>&1; then\n'
         printf 'autoload -Uz compinit && compinit\n'
         # shellcheck disable=SC2016 # $(...) is literal text for zsh to eval, not bash
         printf 'eval "$(aenv completion zsh)"\n'
+        printf 'fi\n'
         printf '# <<< aenv completion <<<\n'
     } >> "$rc" 2>/dev/null; then
         printf 'warn: aenv completion: could not append to %s\n' "$rc" >&2
@@ -161,7 +165,10 @@ _aenv_cc_put_zsh_static() {
         return 0
     fi
     local tmp
-    tmp="$(mktemp "${path}.XXXXXX" 2>/dev/null)" || tmp="$(mktemp)"
+    tmp="$(mktemp "${path}.XXXXXX" 2>/dev/null)" || tmp="$(mktemp 2>/dev/null)" || {
+        printf 'warn: aenv completion: mktemp failed; skipping static zsh file %s\n' "$path" >&2
+        return 0
+    }
     if "${gen[@]}" > "$tmp" 2>/dev/null; then
         chmod 0644 "$tmp" 2>/dev/null || true
         if mv -f "$tmp" "$path" 2>/dev/null; then
@@ -174,24 +181,25 @@ _aenv_cc_put_zsh_static() {
 }
 
 # Remove every well-formed aenv marker block from ~/.zshrc. Refuses to touch a
-# file with a malformed (partial/nested/reordered) block. The rewrite is done
-# in place (cat onto the rc) so the rc's inode, mode, ownership, and — for a
-# symlinked rc — the link target are preserved.
+# file with a malformed (partial/nested/reordered/orphan) block. The awk output
+# is validated and the rc rewritten in place (cat onto the rc) so the rc's
+# inode, mode, ownership, and — for a symlinked rc — the link target are
+# preserved; a failed/partial awk never reaches the live rc.
 #   $1 rc file path
 _aenv_cc_rm_zsh_rc() {
     local rc="$1"
     [[ -f "$rc" ]] || return 0
-    grep -q '^# >>> aenv completion >>>$' "$rc" 2>/dev/null || return 0
+    grep -qE '^# (>>> aenv completion >>>|<<< aenv completion <<<)$' "$rc" 2>/dev/null || return 0
     if ! _aenv_cc_rc_well_formed "$rc"; then
         printf 'warn: aenv completion: malformed marker block in %s; leaving it untouched\n' "$rc" >&2
         return 0
     fi
     local tmp
-    tmp="$(mktemp)"
-    awk '/^# >>> aenv completion >>>$/,/^# <<< aenv completion <<<$/ { next } { print }' "$rc" > "$tmp" 2>/dev/null
-    # In-place rewrite preserves inode/mode/ownership and writes through a
-    # symlinked rc rather than replacing the link itself.
-    if cat "$tmp" > "$rc" 2>/dev/null; then
+    tmp="$(mktemp 2>/dev/null)" || {
+        printf 'warn: aenv completion: mktemp failed; leaving %s untouched\n' "$rc" >&2
+        return 0
+    }
+    if awk '/^# >>> aenv completion >>>$/,/^# <<< aenv completion <<<$/ { next } { print }' "$rc" > "$tmp" 2>/dev/null && cat "$tmp" > "$rc" 2>/dev/null; then
         rm -f "$tmp" 2>/dev/null || true
         return 0
     fi
