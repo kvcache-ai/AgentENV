@@ -55,7 +55,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	mutants coverage \
 	test test-unit test-integration prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
 	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all \
-	bench bench-snapshot bench-ublk bench-orchestrator-store \
+	bench bench-snapshot bench-ublk bench-orchestrator-store bench-api \
 	ci-deps ci-deps-protoc \
 	firecracker-client envd-http-client agentenv-server custom-extension-client start-server start-server-release \
 	services gateway scheduler \
@@ -176,6 +176,13 @@ bench-orchestrator-store:
 OCI_IMAGE ?=
 bench-oci-conversion:
 	$(if $(OCI_IMAGE),AGENTENV_BENCH_OCI_IMAGE="$(OCI_IMAGE)") $(CARGO) bench -p agentenv-benchmarks --bench oci_conversion_pipeline
+
+# API-level lifecycle benchmark against an already running server. Configure the
+# target with AENV_API_URL / AENV_API_KEY / AENV_TEMPLATE_ID / AENV_METRICS_URL.
+BENCH_API_SCENARIO ?= create
+BENCH_API_ARGS ?= -c 1 -n 20 -w 1
+bench-api:
+	python3 scripts/bench.py $(BENCH_API_SCENARIO) $(BENCH_API_ARGS)
 
 ci-deps:
 	$(MAKE) ci-deps-protoc
