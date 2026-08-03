@@ -24,6 +24,9 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 assert_file() { [[ -f "$1" ]] || fail "expected file $1"; }
 assert_absent() { [[ ! -e "$1" ]] || fail "expected $1 to be absent"; }
 assert_contains() { grep -Fq -- "$2" "$1" || fail "expected $1 to contain: $2"; }
+file_mode() {
+    stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"
+}
 
 echo '==> user install creates standard loaders'
 HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1" >/dev/null
@@ -33,18 +36,40 @@ assert_file "$fish_file"
 assert_contains "$bash_file" "$marker"
 assert_contains "$zsh_file" '#compdef aenv'
 [[ "$(sed -n '1p' "$zsh_file")" == '#compdef aenv' ]] || fail 'zsh #compdef must remain first'
+[[ "$(file_mode "$bash_file")" == 644 ]] || fail 'Bash loader mode must be 0644'
+[[ "$(file_mode "$zsh_file")" == 644 ]] || fail 'Zsh loader mode must be 0644'
+[[ "$(file_mode "$fish_file")" == 644 ]] || fail 'Fish loader mode must be 0644'
 [[ ! -e "$home/.zshrc" ]] || fail 'installer must not create .zshrc'
+
+if command -v zsh >/dev/null 2>&1; then
+    zsh -n "$zsh_file"
+fi
+if command -v fish >/dev/null 2>&1; then
+    fish -n "$fish_file"
+fi
+bash -n "$bash_file"
 
 echo '==> unmanaged files are preserved'
 printf '# user completion\n' > "$bash_file"
+printf '# user zsh completion\n' > "$zsh_file"
+printf '# user fish completion\n' > "$fish_file"
 HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v2" >/dev/null
 assert_contains "$bash_file" '# user completion'
+assert_contains "$zsh_file" '# user zsh completion'
+assert_contains "$fish_file" '# user fish completion'
+
+echo '==> uninstall preserves unmanaged files'
+HOME="$home" bash "$helper" uninstall --prefix="$home/.local" --binary="$bin/aenv-v2" >/dev/null
+assert_contains "$bash_file" '# user completion'
+assert_contains "$zsh_file" '# user zsh completion'
+assert_contains "$fish_file" '# user fish completion'
 
 echo '==> managed files are upgraded'
-rm -f "$bash_file"
+rm -f "$bash_file" "$zsh_file" "$fish_file"
 HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1" >/dev/null
 HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v2" >/dev/null
 assert_contains "$bash_file" "$bin/aenv-v2"
+[[ "$(file_mode "$bash_file")" == 644 ]] || fail 'upgraded loader mode must be 0644'
 
 echo '==> uninstall removes only managed files'
 HOME="$home" bash "$helper" uninstall --prefix="$home/.local" --binary="$bin/aenv-v2" >/dev/null
@@ -60,6 +85,20 @@ HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-
 [[ -L "$bash_file" ]] || fail 'completion symlink was replaced'
 assert_contains "$symlink_target" '# user target'
 rm -f "$bash_file"
+
+echo '==> staging failures leave no temporary files'
+fake_tools="$tmp_root/fake-tools"
+mkdir -p "$fake_tools"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$fake_tools/mktemp"
+chmod 0755 "$fake_tools/mktemp"
+HOME="$home" PATH="$fake_tools:$PATH" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1" >/dev/null
+shopt -s nullglob
+leftovers=(
+    "$home/.local/share/bash-completion/completions"/.aenv-completion.*
+    "$home/.local/share/zsh/site-functions"/.aenv-completion.*
+    "$home/.config/fish/completions"/.aenv-completion.*
+)
+[[ "${#leftovers[@]}" -eq 0 ]] || fail 'staging failure left a temporary completion file'
 
 echo '==> system paths use the prefix share directories'
 HOME="$home" bash "$helper" install --prefix="$prefix" --binary="$bin/aenv-v1" >/dev/null
