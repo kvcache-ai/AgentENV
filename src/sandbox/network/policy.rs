@@ -5,9 +5,7 @@ use std::{
     net::{IpAddr, Ipv4Addr},
 };
 
-use super::iptables_util::{
-    apply_iptables_commands, flush_table_chain, IptablesRestoreCommand, OpenFailurePolicy,
-};
+use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
 use crate::cfg::network::normalize_dns_name;
 
 pub const ALL_INTERNET_TRAFFIC_CIDR: &str = "0.0.0.0/0";
@@ -117,8 +115,7 @@ pub(super) fn set_namespace_egress_policy(policy: Option<&SandboxNetworkPolicy>)
         );
     }
 
-    let commands = build_user_egress_commands(policy);
-    flush_table_chain("filter", USER_EGRESS_CHAIN)?;
+    let commands = build_user_egress_commands(policy, true);
     apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)
 }
 
@@ -197,8 +194,18 @@ fn build_static_egress_commands(
     commands
 }
 
-fn build_user_egress_commands(policy: &SandboxNetworkPolicy) -> Vec<IptablesRestoreCommand> {
-    let mut commands = Vec::new();
+fn build_user_egress_commands(
+    policy: &SandboxNetworkPolicy,
+    replace: bool,
+) -> Vec<IptablesRestoreCommand> {
+    let mut commands = if replace {
+        vec![IptablesRestoreCommand::FlushChain {
+            table: "filter",
+            chain: USER_EGRESS_CHAIN,
+        }]
+    } else {
+        Vec::new()
+    };
 
     for cidr in policy.egress.allowed_cidrs.iter().map(String::as_str) {
         commands.push(append_user_egress_command(format!(
@@ -344,7 +351,7 @@ mod tests {
             },
         };
 
-        let commands = build_user_egress_commands(&policy);
+        let commands = build_user_egress_commands(&policy, false);
 
         let allow_pos = commands
             .iter()
@@ -359,6 +366,49 @@ mod tests {
             })
             .unwrap();
         assert!(allow_pos < deny_pos);
+    }
+
+    #[test]
+    fn build_policy_replacement_flushes_before_installing_rules() {
+        let policy = SandboxNetworkPolicy {
+            base_policy: BaseSandboxNetworkPolicy::Deny,
+            egress: SandboxNetworkEgressPolicy {
+                allowed_cidrs: vec!["8.8.8.8/32".to_string()],
+                denied_cidrs: vec!["203.0.113.0/24".to_string()],
+                allowed_domains: Vec::new(),
+            },
+        };
+
+        let commands = build_user_egress_commands(&policy, true);
+
+        assert!(matches!(
+            commands.first(),
+            Some(IptablesRestoreCommand::FlushChain {
+                table: "filter",
+                chain: USER_EGRESS_CHAIN,
+            })
+        ));
+        assert_eq!(
+            commands.iter().filter_map(append_rule).collect::<Vec<_>>(),
+            [
+                "-i tap0 -o vpeer -d 8.8.8.8/32 -j ACCEPT",
+                "-i tap0 -o vpeer -d 203.0.113.0/24 -j REJECT",
+                "-i tap0 -o vpeer -d 0.0.0.0/0 -j REJECT",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_default_policy_replacement_only_flushes_user_chain() {
+        let commands = build_user_egress_commands(&SandboxNetworkPolicy::default(), true);
+
+        assert!(matches!(
+            commands.as_slice(),
+            [IptablesRestoreCommand::FlushChain {
+                table: "filter",
+                chain: USER_EGRESS_CHAIN,
+            }]
+        ));
     }
 
     #[test]

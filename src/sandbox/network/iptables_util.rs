@@ -200,13 +200,6 @@ fn is_missing_iptables_rule_error(error: &str) -> bool {
         || contains_ci("rule does not exist")
 }
 
-pub(super) fn flush_table_chain(table: &'static str, chain: &'static str) -> Result<()> {
-    apply_iptables_commands(
-        &[IptablesRestoreCommand::FlushChain { table, chain }],
-        OpenFailurePolicy::ReturnErr,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
