@@ -84,6 +84,12 @@ services:
       dockerfile: deploy/docker/Dockerfile.agentenv
       args:
         APT_MIRROR_BASE: ${APT_MIRROR_BASE:-}
+        # Forwarded from the caller's shell so the `--setup-only` dependency
+        # downloads can use a proxy; empty values are ignored by BuildKit.
+        HTTP_PROXY: ${HTTP_PROXY:-${http_proxy:-}}
+        HTTPS_PROXY: ${HTTPS_PROXY:-${https_proxy:-}}
+        ALL_PROXY: ${ALL_PROXY:-${all_proxy:-}}
+        NO_PROXY: ${NO_PROXY:-${no_proxy:-}}
     container_name: agentenv-a
     environment:
       <<: *agentenv-environment

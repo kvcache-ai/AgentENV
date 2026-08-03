@@ -15,6 +15,23 @@ K8S_GATEWAY_IMAGE ?= agentenv-gateway:latest
 K8S_SCHEDULER_IMAGE ?= agentenv-scheduler:latest
 K3S_CTR ?= sudo k3s ctr
 
+# Optional build-time proxy for the image builds. The `--setup-only` layer of
+# Dockerfile.agentenv downloads regctl, firecracker, the kernel, the overlaybd
+# package and the ghcr.io tools image, which is the slowest part of a cold
+# build behind a restricted network. Export HTTPS_PROXY (socks5:// is
+# supported) before `make k8s-build` and it is forwarded to every stage.
+HTTP_PROXY ?= $(http_proxy)
+HTTPS_PROXY ?= $(https_proxy)
+ALL_PROXY ?= $(all_proxy)
+NO_PROXY ?= $(no_proxy)
+# Both cases are passed because Go and Rust HTTP clients differ in which
+# spelling they look up.
+DOCKER_PROXY_ARGS := \
+	$(if $(HTTP_PROXY),--build-arg HTTP_PROXY="$(HTTP_PROXY)" --build-arg http_proxy="$(HTTP_PROXY)",) \
+	$(if $(HTTPS_PROXY),--build-arg HTTPS_PROXY="$(HTTPS_PROXY)" --build-arg https_proxy="$(HTTPS_PROXY)",) \
+	$(if $(ALL_PROXY),--build-arg ALL_PROXY="$(ALL_PROXY)" --build-arg all_proxy="$(ALL_PROXY)",) \
+	$(if $(NO_PROXY),--build-arg NO_PROXY="$(NO_PROXY)" --build-arg no_proxy="$(NO_PROXY)",)
+
 # aenv home path.
 AENV_HOME_PATH ?= /var/lib/aenv
 export AENV_HOME_PATH
@@ -234,9 +251,9 @@ deploy-ps:
 	$(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) ps
 
 k8s-build:
-	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) -f deploy/docker/Dockerfile.agentenv -t $(K8S_RUNTIME_IMAGE) .
-	$(DOCKER) build -f deploy/docker/Dockerfile.gateway -t $(K8S_GATEWAY_IMAGE) .
-	$(DOCKER) build -f deploy/docker/Dockerfile.scheduler -t $(K8S_SCHEDULER_IMAGE) .
+	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) $(DOCKER_PROXY_ARGS) -f deploy/docker/Dockerfile.agentenv -t $(K8S_RUNTIME_IMAGE) .
+	$(DOCKER) build $(DOCKER_PROXY_ARGS) -f deploy/docker/Dockerfile.gateway -t $(K8S_GATEWAY_IMAGE) .
+	$(DOCKER) build $(DOCKER_PROXY_ARGS) -f deploy/docker/Dockerfile.scheduler -t $(K8S_SCHEDULER_IMAGE) .
 
 k8s-redeploy:
 	$(KUBECTL) rollout restart deploy/agentenv-gateway -n $(K8S_NAMESPACE)

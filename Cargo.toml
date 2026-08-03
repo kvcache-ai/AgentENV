@@ -42,7 +42,9 @@ firecracker_client = { version = "1.15.1", path = "thirdparty/firecracker-client
 envd = { version = "0.1.0", path = "thirdparty/envd" }
 custom_extension_client = { version = "0.1.0", path = "src/custom_extension_api/generated" }
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.13", features = ["json", "stream"] }
+# `socks` lets dependency downloads honour socks5:// values in the standard
+# proxy environment variables; without it reqwest silently ignores them.
+reqwest = { version = "0.13", features = ["json", "stream", "socks"] }
 opendal = { version = "0.55.0", features = ["services-s3"] }
 object-store-operator = { path = "crates/object-store-operator" }
 hyper = { version = "1", features = ["full"] }
