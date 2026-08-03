@@ -33,6 +33,8 @@ enum Cmd {
     Upload(commands::upload::Args),
     /// Download a file from a sandbox
     Download(commands::download::Args),
+    /// Generate shell completion scripts
+    Completion(commands::completion::Args),
     /// Attach an interactive shell to a running sandbox
     #[command(visible_alias = "cn")]
     Connect(commands::connect::Args),
@@ -54,8 +56,6 @@ enum Cmd {
     /// Template operations
     #[command(visible_alias = "templates")]
     Template(commands::template::Args),
-    /// Generate shell completion scripts
-    Completion(commands::completion::Args),
 }
 
 fn main() -> Result<()> {
@@ -68,6 +68,7 @@ fn main() -> Result<()> {
         Cmd::Exec(a) => commands::exec::run(a),
         Cmd::Upload(a) => commands::upload::run(a),
         Cmd::Download(a) => commands::download::run(a),
+        Cmd::Completion(a) => commands::completion::run(a),
         Cmd::Connect(a) => commands::connect::run(a),
         Cmd::Pause(a) => commands::pause::run(a),
         Cmd::Resume(a) => commands::resume::run(a),
@@ -76,6 +77,5 @@ fn main() -> Result<()> {
         Cmd::Timeout(a) => commands::timeout::run(a),
         Cmd::Snapshot(a) => commands::snapshot::run(a),
         Cmd::Template(a) => commands::template::run(a),
-        Cmd::Completion(a) => commands::completion::run(a),
     }
 }

@@ -8,8 +8,6 @@ use std::io::Write;
 
 /// Shell to generate completion for.
 ///
-/// Limited to bash/zsh/fish per issue #37; elvish and powershell are explicit
-/// non-goals.
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum Shell {
     Bash,
@@ -34,9 +32,7 @@ pub struct Args {
     pub shell: Shell,
 }
 
-/// Generate a static completion script for the requested shell and write it to
-/// stdout. The command tree is rebuilt from the live `Cli` derive spec via
-/// `crate::Cli::command()` so completion can never drift from the real CLI.
+/// Generate a completion script for the requested shell and write it to stdout.
 pub fn run(args: Args) -> Result<()> {
     write_completion(args.shell, &mut std::io::stdout().lock())
 }
@@ -183,14 +179,20 @@ mod tests {
     fn broken_pipe_is_treated_as_success() {
         // `aenv completion bash | head` closes the pipe early; that must exit
         // cleanly rather than error or panic.
-        let mut out = FailingWriter { kind: std::io::ErrorKind::BrokenPipe, fail_on_flush: false };
+        let mut out = FailingWriter {
+            kind: std::io::ErrorKind::BrokenPipe,
+            fail_on_flush: false,
+        };
         write_completion(Shell::Bash, &mut out)
             .expect("BrokenPipe during completion output should not error");
     }
 
     #[test]
     fn other_io_error_propagates() {
-        let mut out = FailingWriter { kind: std::io::ErrorKind::Other, fail_on_flush: false };
+        let mut out = FailingWriter {
+            kind: std::io::ErrorKind::Other,
+            fail_on_flush: false,
+        };
         let err = write_completion(Shell::Bash, &mut out)
             .expect_err("non-BrokenPipe I/O errors should propagate");
         assert!(

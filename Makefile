@@ -28,11 +28,6 @@ AENV_INSTALL_DIR := $(AENV_INSTALL_PREFIX)/bin
 # /usr/local; override to empty (AENV_INSTALL_SUDO=) for a user-local prefix.
 AENV_INSTALL_SUDO ?= sudo
 
-# Set AENV_INSTALL_COMPLETION=0 to skip shell-completion loader setup on
-# install/uninstall. The loaders regenerate completion code from the installed
-# aenv at shell start, so they never go stale across upgrades.
-AENV_INSTALL_COMPLETION ?= 1
-
 # Script entrypoints
 TEST_SCRIPTS_DIR := ./scripts/tests
 
@@ -56,7 +51,6 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	build-snapshot-image \
 	build-aenv build-aenv-release install-aenv uninstall-aenv \
 	build-ublk install-ublk \
-	check-shell-completion \
 	fmt clippy \
 	mutants coverage \
 	test test-unit test-integration prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
@@ -98,32 +92,10 @@ install-aenv: build-aenv-release
 	$(AENV_INSTALL_SUDO) install -d "$(AENV_INSTALL_DIR)"
 	$(AENV_INSTALL_SUDO) install -m 0755 "$${CARGO_TARGET_DIR:-$$(pwd)/target}/release/aenv" "$(AENV_INSTALL_DIR)/aenv"
 	@echo "Installed aenv to $(AENV_INSTALL_DIR)/aenv"
-ifeq ($(AENV_INSTALL_COMPLETION),1)
-	$(AENV_INSTALL_SUDO) ./scripts/shell-completion.sh install --prefix="$(AENV_INSTALL_PREFIX)"
-endif
 
 uninstall-aenv:
-ifeq ($(AENV_INSTALL_COMPLETION),1)
-	$(AENV_INSTALL_SUDO) ./scripts/shell-completion.sh uninstall --prefix="$(AENV_INSTALL_PREFIX)"
-endif
 	$(AENV_INSTALL_SUDO) rm -f "$(AENV_INSTALL_DIR)/aenv"
 	@echo "Removed $(AENV_INSTALL_DIR)/aenv"
-
-# Verify the shell-completion installer helper and its inlined copies stay in
-# sync. Run from CI and before relying on the installers.
-check-shell-completion:
-	bash scripts/check-completion-sync.sh
-	bash scripts/tests/verify-shell-completion.sh
-	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck -s bash \
-			scripts/shell-completion.sh \
-			scripts/check-completion-sync.sh \
-			scripts/install-cli.sh \
-			scripts/install.sh \
-			scripts/tests/verify-shell-completion.sh; \
-	else \
-		echo "shellcheck not installed; skipping shellcheck"; \
-	fi
 
 fmt:
 	$(CARGO) fmt --all -- --check

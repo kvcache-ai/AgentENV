@@ -279,19 +279,7 @@ To delete a snapshot, use `aenv template delete <snapshot-id>` or `aenv template
 
 ## Shell completion
 
-`aenv completion <shell>` prints a shell-completion script to stdout. The script is rebuilt from the live CLI definition on every run, so it always matches the installed `aenv` — top-level commands, nested subcommands (e.g. `aenv snapshot create`), visible aliases (`cn`, `ls`, `rm`, `snap`, `templates`), flags, the `--output table|json` enum, and local path arguments such as the Dockerfile passed to `aenv build`.
-
-Three shells are supported; elvish and powershell are explicit non-goals.
-
-### Installed automatically
-
-The installers set up **regenerating** completion loaders for you, so the completion is always generated from the currently installed `aenv` and never goes stale across upgrades:
-
-- `make install-aenv` / `make uninstall-aenv` — installs/removes the loaders (set `AENV_INSTALL_COMPLETION=0` to skip). User-local installs (`AENV_INSTALL_PREFIX=~/.local`) write per-user loaders and an `~/.zshrc` snippet; system installs write under `<prefix>/share`.
-- `scripts/install-cli.sh` — installs loaders into the matching user-local or system directories based on the install location.
-- `scripts/install.sh` (full installer) — installs system-wide loaders under `/usr/local/share`.
-
-After install, open a new shell (or re-source your rc) and the loaders take effect. If you installed with one of the methods above, you can skip the manual steps below — they remain as a fallback for users who skipped the installer or want to customize the location.
+`aenv completion <shell>` prints a shell-completion script for the `aenv` CLI to stdout.
 
 ### Generate a script
 
@@ -309,11 +297,12 @@ aenv completion zsh  > ~/.local/share/zsh/site-functions/_aenv
 aenv completion fish > ~/.config/fish/completions/aenv.fish
 ```
 
-bash and fish auto-load from these directories (bash sources files named after the command from `~/.local/share/bash-completion/completions/`; fish sources `~/.config/fish/completions/`). zsh autoloads `_cmdname` functions from directories on `fpath` — `~/.local/share/zsh/site-functions` is not on `fpath` by default, so if completion does not load, add it before `compinit` in your `~/.zshrc`:
+bash and fish auto-load completions from those directories. zsh autoloads `_cmdname` functions from directories on `fpath`; `~/.local/share/zsh/site-functions` is not on `fpath` by default, so if completion does not load, add the directory to `fpath` before `compinit`:
 
 ```bash
-fpath+=(~/.local/share/zsh/site-functions)
-autoload -Uz compinit && compinit
+fpath=(~/.local/share/zsh/site-functions $fpath)
+autoload -Uz compinit
+compinit
 ```
 
 ### Activate it
@@ -326,9 +315,7 @@ eval "$(aenv completion zsh)"         # zsh
 aenv completion fish | source         # fish
 ```
 
-To make completion persistent, add the matching line to your shell's rc file (`~/.bashrc` or `~/.bash_profile`, `~/.zshrc`, `~/.config/fish/config.fish`) and restart the shell or re-source the file.
-
-Once loaded, completion covers the static CLI surface:
+Once loaded, completion covers the CLI surface:
 
 ```bash
 aenv <TAB>                       # top-level commands
