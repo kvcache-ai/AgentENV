@@ -211,9 +211,17 @@ install_completion_files() {
             return 0
         }
         if [[ "$path" == "$zsh_path" ]]; then
-            printf '%s\n%s\n' "$body" "$marker" | "${runner[@]}" tee "$tmp" >/dev/null
+            if ! printf '%s\n%s\n' "$body" "$marker" | "${runner[@]}" tee "$tmp" >/dev/null; then
+                "${runner[@]}" rm -f "$tmp"
+                echo "warning: could not stage ${path}" >&2
+                return 0
+            fi
         else
-            printf '%s\n%s\n' "$marker" "$body" | "${runner[@]}" tee "$tmp" >/dev/null
+            if ! printf '%s\n%s\n' "$marker" "$body" | "${runner[@]}" tee "$tmp" >/dev/null; then
+                "${runner[@]}" rm -f "$tmp"
+                echo "warning: could not stage ${path}" >&2
+                return 0
+            fi
         fi
         if ! "${runner[@]}" chmod 0644 "$tmp" || ! "${runner[@]}" mv -f "$tmp" "$path"; then
             "${runner[@]}" rm -f "$tmp"

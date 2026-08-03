@@ -69,9 +69,17 @@ write_loader() {
         return 0
     }
     if [[ "$path" == "$zsh_path" ]]; then
-        printf '%s\n%s\n' "$body" "$MARKER" >"$tmp"
+        if ! printf '%s\n%s\n' "$body" "$MARKER" >"$tmp"; then
+            rm -f "$tmp"
+            printf 'warning: could not stage completion file %s\n' "$path" >&2
+            return 0
+        fi
     else
-        printf '%s\n%s\n' "$MARKER" "$body" >"$tmp"
+        if ! printf '%s\n%s\n' "$MARKER" "$body" >"$tmp"; then
+            rm -f "$tmp"
+            printf 'warning: could not stage completion file %s\n' "$path" >&2
+            return 0
+        fi
     fi
     if ! { chmod 0644 "$tmp" && mv -f "$tmp" "$path"; }; then
         rm -f "$tmp"

@@ -52,6 +52,15 @@ assert_absent "$bash_file"
 assert_absent "$zsh_file"
 assert_absent "$fish_file"
 
+echo '==> symlink destinations are preserved'
+symlink_target="$tmp_root/user-completion"
+printf '# user target\n' > "$symlink_target"
+ln -s "$symlink_target" "$bash_file"
+HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1" >/dev/null
+[[ -L "$bash_file" ]] || fail 'completion symlink was replaced'
+assert_contains "$symlink_target" '# user target'
+rm -f "$bash_file"
+
 echo '==> system paths use the prefix share directories'
 HOME="$home" bash "$helper" install --prefix="$prefix" --binary="$bin/aenv-v1" >/dev/null
 assert_file "$prefix/share/bash-completion/completions/aenv"

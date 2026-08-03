@@ -195,9 +195,17 @@ install_completion_files() {
             return 0
         }
         if [[ "$path" == "$zsh_path" ]]; then
-            printf '%s\n%s\n' "$body" "$marker" | sudo tee "$tmp" >/dev/null
+            if ! printf '%s\n%s\n' "$body" "$marker" | sudo tee "$tmp" >/dev/null; then
+                sudo rm -f "$tmp"
+                echo "warning: could not stage ${path}" >&2
+                return 0
+            fi
         else
-            printf '%s\n%s\n' "$marker" "$body" | sudo tee "$tmp" >/dev/null
+            if ! printf '%s\n%s\n' "$marker" "$body" | sudo tee "$tmp" >/dev/null; then
+                sudo rm -f "$tmp"
+                echo "warning: could not stage ${path}" >&2
+                return 0
+            fi
         fi
         if ! sudo chmod 0644 "$tmp" || ! sudo mv -f "$tmp" "$path"; then
             sudo rm -f "$tmp"
