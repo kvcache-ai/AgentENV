@@ -1211,9 +1211,12 @@ impl FirecrackerSandbox {
         // valid DNS server IP in the 8th field. See that method for format details.
         let ip_config = slot.build_ip_boot_arg();
         let netns = slot.namespace_path();
-        slot.set_egress_policy(config.common.network_policy.as_ref())
-            .context("Failed to configure sandbox egress policy")?;
         self.network_slot = Some(slot);
+        self.network_slot
+            .as_ref()
+            .expect("network slot was just assigned")
+            .set_egress_policy(config.common.network_policy.as_ref())
+            .context("Failed to configure sandbox egress policy")?;
         boot_args = Some(match boot_args.take() {
             Some(existing) => format!("{existing} {ip_config}"),
             None => ip_config,
