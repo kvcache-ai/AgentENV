@@ -1,6 +1,6 @@
 [package]
 name = "agentenv"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 
@@ -26,6 +26,9 @@ members = [
     "storage/ublk",
     "storage/ublk-daemon",
 ]
+
+[workspace.package]
+version = "0.1.1"
 
 [lib]
 path = "src/lib.rs"

@@ -6,8 +6,46 @@ on:
       - "v*"
 
 jobs:
+  validate-version:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify tag matches package versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - "${RELEASE_TAG#v}" <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          release_version = sys.argv[1]
+          metadata = json.loads(
+              subprocess.check_output(
+                  ["cargo", "metadata", "--no-deps", "--format-version", "1"],
+                  text=True,
+              )
+          )
+          package_versions = {
+              package["name"]: package["version"] for package in metadata["packages"]
+          }
+
+          for package_name in ("agentenv", "aenv"):
+              package_version = package_versions[package_name]
+              if package_version != release_version:
+                  raise SystemExit(
+                      f"{package_name} version {package_version} does not match "
+                      f"release tag v{release_version}"
+                  )
+          PY
+
   build-aenv:
     name: Build aenv (${{ matrix.asset_name }})
+    needs: validate-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -62,6 +100,7 @@ jobs:
 
   build-server:
     name: Build server (linux-x86_64)
+    needs: validate-version
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
