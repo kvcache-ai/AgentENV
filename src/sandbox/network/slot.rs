@@ -60,6 +60,11 @@ pub(crate) struct Slot {
     address_plan: NetworkAddressPlan,
     netns_dir: PathBuf,
     cleanup_armed: AtomicBool,
+    /// Whether the namespace's user egress chain currently holds rules. A
+    /// freshly created namespace starts with an empty chain, and slots are
+    /// recycled through the warm pool without their rules being cleared, so
+    /// this tracks what the next tenant has to undo.
+    user_egress_rules_present: AtomicBool,
 }
 
 struct NamespaceSetup {
@@ -104,6 +109,7 @@ impl Slot {
             address_plan,
             netns_dir,
             cleanup_armed: AtomicBool::new(false),
+            user_egress_rules_present: AtomicBool::new(false),
         })
     }
 
@@ -449,6 +455,14 @@ impl Slot {
     }
 
     pub(crate) fn set_egress_policy(&self, policy: Option<&SandboxNetworkPolicy>) -> Result<()> {
+        let wants_rules = policy.is_some_and(SandboxNetworkPolicy::has_runtime_egress_rules);
+        // Programming an empty policy into an already empty chain is a no-op,
+        // and the `iptables-restore` it would spawn is the single most
+        // expensive step of an otherwise pooled sandbox start.
+        if !wants_rules && !self.user_egress_rules_present.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         let netns_path = self.namespace_path();
         let policy = policy.cloned();
         let handle = thread::spawn(move || -> Result<()> {
@@ -460,10 +474,15 @@ impl Slot {
             set_namespace_egress_policy(policy.as_ref())
         });
 
-        match handle.join() {
+        let result = match handle.join() {
             Ok(result) => result,
             Err(e) => Err(anyhow!("egress policy setup thread panicked: {:?}", e)),
-        }
+        };
+        // A failed apply may have flushed the chain and stopped partway, so
+        // assume rules are present unless the whole batch succeeded.
+        self.user_egress_rules_present
+            .store(result.is_err() || wants_rules, Ordering::Release);
+        result
     }
 
     /// Configures iptables rules inside the namespace for VM traffic routing.
@@ -950,6 +969,28 @@ mod tests {
             .find(|idx| !host_veth_exists(*idx))
             .and_then(|idx| test_slot(idx, address_plan).ok())
             .expect("failed to find an unused high-numbered network test slot")
+    }
+
+    #[test]
+    fn empty_egress_policy_on_a_clean_slot_is_a_no_op() {
+        let slot = test_slot(1, NetworkAddressPlan::default()).expect("Slot 1 should be valid");
+
+        // No namespace was ever created for this slot, so any path other than
+        // the fast one would fail entering it.
+        slot.set_egress_policy(None)
+            .expect("an empty policy on an untouched chain must not run iptables");
+        assert!(!slot.user_egress_rules_present.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn empty_egress_policy_still_clears_rules_a_previous_tenant_left() {
+        let slot = test_slot(1, NetworkAddressPlan::default()).expect("Slot 1 should be valid");
+        slot.user_egress_rules_present
+            .store(true, Ordering::Release);
+
+        // The clear cannot succeed without a namespace; the point is that it
+        // was attempted rather than skipped.
+        assert!(slot.set_egress_policy(None).is_err());
     }
 
     #[test]
