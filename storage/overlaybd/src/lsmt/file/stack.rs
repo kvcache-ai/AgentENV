@@ -61,6 +61,15 @@ async fn merge_readonly_indexes(
         files.len() == metadata.len(),
         "readonly files/metadata length mismatch"
     );
+    let total_index_memory = metadata.iter().try_fold(0usize, |total, layer| {
+        total
+            .checked_add(stack_index_memory_bytes(layer.index_size)?)
+            .context("stack index memory size overflow")
+    })?;
+    ensure!(
+        total_index_memory <= MAX_STACK_INDEX_MEMORY_BYTES,
+        "stack index memory {total_index_memory} exceeds limit {MAX_STACK_INDEX_MEMORY_BYTES}"
+    );
 
     // `buffer_unordered` returns a stream whose `Future` implementation the
     // compiler cannot prove is `Send`, even though every input is `Send`.
@@ -79,14 +88,9 @@ async fn merge_readonly_indexes(
             .enumerate(),
     )
     .map(|(layer_index, (file, metadata))| async move {
-        let index_size = usize::try_from(metadata.index_size)
-            .context("readonly layer index size does not fit usize");
-        let result = match index_size {
-            Ok(index_size) => load_index_and_reset_tags(&file, metadata.index_offset, index_size)
-                .await
-                .map(ReadOnlyIndex::new),
-            Err(err) => Err(err),
-        };
+        let result = load_index_and_reset_tags(&file, metadata.index_offset, metadata.index_size)
+            .await
+            .map(ReadOnlyIndex::new);
         (layer_index, result)
     })
     .buffer_unordered(files.len().min(PARALLEL_LOAD_INDEX))
@@ -304,12 +308,15 @@ pub async fn stack_files(
 pub async fn open_file_index(file: Arc<dyn VirtualFile>) -> Result<ReadOnlyIndex> {
     let file_size = file.size().await?;
     let trailer = verify_ht(&file, true, file_size).await?;
-    let mappings = load_index_and_reset_tags(
-        &file,
+    validate_index_bounds(
         trailer.index_offset.get(),
-        trailer.index_size.get() as usize,
-    )
-    .await?;
+        trailer.index_size.get(),
+        file_size,
+        HEADER_SIZE,
+    )?;
+    let mappings =
+        load_index_and_reset_tags(&file, trailer.index_offset.get(), trailer.index_size.get())
+            .await?;
     Ok(ReadOnlyIndex::new(mappings))
 }
 

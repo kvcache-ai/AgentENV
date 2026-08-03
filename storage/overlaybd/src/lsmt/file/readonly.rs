@@ -30,13 +30,16 @@ impl LSMTReadOnlyFile {
         let _header = verify_ht(&file, false, file_size).await?;
 
         let trailer = verify_ht(&file, true, file_size).await?;
-
-        let mappings = load_index_and_reset_tags(
-            &file,
+        validate_index_bounds(
             trailer.index_offset.get(),
-            trailer.index_size.get() as usize,
-        )
-        .await?;
+            trailer.index_size.get(),
+            file_size,
+            HEADER_SIZE,
+        )?;
+
+        let mappings =
+            load_index_and_reset_tags(&file, trailer.index_offset.get(), trailer.index_size.get())
+                .await?;
 
         let index = Arc::new(ReadOnlyIndex::new(mappings));
         let uuid = parse_uuid_field(&trailer.uuid).unwrap_or_else(Uuid::nil);

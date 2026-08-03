@@ -122,8 +122,7 @@ impl LSMTFile {
                 }
 
                 let count = mapping_area_size / stride;
-                let mappings =
-                    load_index_and_reset_tags(idx_file, HEADER_SIZE, count as usize).await?;
+                let mappings = load_index_and_reset_tags(idx_file, HEADER_SIZE, count).await?;
 
                 for m in mappings {
                     mutable_index.insert(m);
@@ -883,7 +882,12 @@ impl LSMTFile {
             idx.lookup(query, &mut mappings);
         }
 
+        let compact_len = mappings
+            .iter()
+            .filter(|mapping| mapping.tag as usize == self.rw_tag)
+            .count();
         let mut compact_index: Vec<SegmentMapping> = Vec::new();
+        reserve_compact_index(&mut compact_index, compact_len)?;
         for m in mappings {
             if m.tag as usize == self.rw_tag {
                 let mut cm = m;
@@ -897,19 +901,14 @@ impl LSMTFile {
         // HEADER_SIZE + virtual_size; punching the last virtual block ends
         // exactly at this boundary, so index bytes cannot overlap virtual data.
         let index_offset = data_file_size;
-
-        let mut index_bytes =
-            Vec::with_capacity(compact_index.len() * size_of::<DiskSegmentMapping>());
-        for m in &compact_index {
-            let dm = DiskSegmentMapping::from_memory(m);
-            index_bytes.extend_from_slice(dm.as_bytes());
-        }
-
-        let remainder = index_bytes.len() % ALIGNMENT_USIZE;
-        if remainder != 0 {
-            let pad = ALIGNMENT_USIZE - remainder;
-            index_bytes.extend(vec![0xff; pad]);
-        }
+        let mappings_per_block = ALIGNMENT_USIZE / size_of::<DiskSegmentMapping>();
+        let remainder = compact_index.len() % mappings_per_block;
+        let padding_count = if remainder == 0 {
+            0
+        } else {
+            mappings_per_block - remainder
+        };
+        let index_bytes = serialize_index_with_padding(&compact_index, padding_count)?;
 
         self.rw_data_file
             .write_at(index_offset, &index_bytes)

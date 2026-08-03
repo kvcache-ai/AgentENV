@@ -446,6 +446,152 @@ async fn create_sealed_layer(
     data
 }
 
+async fn update_trailer(file: &Arc<LocalFile>, update: impl FnOnce(&mut HeaderTrailer)) {
+    let file_size = file.size().await.unwrap();
+    let trailer_offset = file_size - HEADER_SIZE;
+    let bytes = file
+        .read_at(trailer_offset, size_of::<HeaderTrailer>())
+        .await
+        .unwrap();
+    let mut trailer = HeaderTrailer::read_from_bytes(&bytes).unwrap();
+    update(&mut trailer);
+    file.write_at(trailer_offset, trailer.as_bytes())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn rejects_sealed_index_offset_out_of_bounds() {
+    let temp_dir = TempDir::new().unwrap();
+    let data = create_sealed_layer(&temp_dir, "bad-index-offset", 8192, &[(0, 0x11)]).await;
+    let file_size = data.size().await.unwrap();
+
+    update_trailer(&data, |trailer| {
+        trailer.index_offset = U64::new(file_size);
+    })
+    .await;
+
+    let err = open_file_ro(data as Arc<dyn VirtualFile>)
+        .await
+        .err()
+        .expect("malformed index offset should be rejected");
+    assert_err_contains(&err, "index offset");
+}
+
+#[tokio::test]
+async fn rejects_sealed_index_offset_before_header() {
+    let temp_dir = TempDir::new().unwrap();
+    let data = create_sealed_layer(&temp_dir, "index-before-header", 8192, &[(0, 0x12)]).await;
+
+    update_trailer(&data, |trailer| {
+        trailer.index_offset = U64::new(HEADER_SIZE - 1);
+    })
+    .await;
+
+    let err = open_file_ro(data as Arc<dyn VirtualFile>)
+        .await
+        .err()
+        .expect("index offset inside the header should be rejected");
+    assert_err_contains(&err, "index offset");
+}
+
+#[tokio::test]
+async fn rejects_sealed_index_size_out_of_bounds() {
+    let temp_dir = TempDir::new().unwrap();
+    let data = create_sealed_layer(&temp_dir, "bad-index-size", 8192, &[(0, 0x22)]).await;
+    let file_size = data.size().await.unwrap();
+    let trailer = verify_ht(&(data.clone() as Arc<dyn VirtualFile>), true, file_size)
+        .await
+        .unwrap();
+    let stride = size_of::<DiskSegmentMapping>() as u64;
+    let remaining = file_size - HEADER_SIZE - trailer.index_offset.get();
+    let bad_index_size = remaining / stride + 1;
+
+    update_trailer(&data, |trailer| {
+        trailer.index_size = U64::new(bad_index_size);
+    })
+    .await;
+
+    let err = open_file_ro(data as Arc<dyn VirtualFile>)
+        .await
+        .err()
+        .expect("malformed index size should be rejected");
+    assert_err_contains(&err, "index byte length");
+}
+
+#[tokio::test]
+async fn rejects_index_count_overflow_before_allocation() {
+    let temp_dir = TempDir::new().unwrap();
+    let data = create_sealed_layer(&temp_dir, "overflow-index", 8192, &[]).await;
+    let count = u64::MAX / size_of::<DiskSegmentMapping>() as u64 + 1;
+    update_trailer(&data, |trailer| {
+        trailer.index_size = U64::new(count);
+    })
+    .await;
+    let err = open_file_ro(data as Arc<dyn VirtualFile>)
+        .await
+        .err()
+        .expect("overflowing trailer index count should be rejected");
+    let message = err.to_string();
+    assert!(
+        message.contains("overflow") || message.contains("does not fit usize"),
+        "expected an overflow or conversion error, got {message}"
+    );
+}
+
+#[tokio::test]
+async fn rejects_index_exceeding_decoded_memory_budget() {
+    let temp_dir = TempDir::new().unwrap();
+    let data = create_sealed_layer(&temp_dir, "oversized-index", 8192, &[]).await;
+    let bytes_per_mapping =
+        size_of::<DiskSegmentMapping>() as u64 + size_of::<SegmentMapping>() as u64;
+    let count = MAX_INDEX_MEMORY_BYTES as u64 / bytes_per_mapping + 1;
+    let err = load_index_and_reset_tags(&(data as Arc<dyn VirtualFile>), HEADER_SIZE, count)
+        .await
+        .expect_err("decoded index exceeding the memory budget should be rejected");
+    assert_err_contains(&err, "exceeds per-layer limit");
+}
+
+#[test]
+fn compact_index_reservation_grows_geometrically_within_budget() {
+    let mut index = Vec::new();
+    reserve_compact_index(&mut index, 1).unwrap();
+    let previous_capacity = index.capacity();
+    index.resize(previous_capacity, SegmentMapping::default());
+    reserve_compact_index(&mut index, 1).unwrap();
+
+    assert!(index.capacity() >= previous_capacity * 2);
+    validate_index_memory(index.capacity() as u64).unwrap();
+
+    let max_capacity =
+        MAX_INDEX_MEMORY_BYTES / (size_of::<DiskSegmentMapping>() + size_of::<SegmentMapping>());
+    reserve_compact_index(&mut Vec::new(), max_capacity + 1)
+        .expect_err("reservation beyond the index budget should be rejected");
+}
+
+#[test]
+fn serialized_index_reserves_space_for_padding() {
+    let mappings = [SegmentMapping::new(0, 1, 8, false, 0)];
+    let bytes = serialize_index_with_padding(&mappings, 2).unwrap();
+
+    assert_eq!(bytes.len(), 3 * size_of::<DiskSegmentMapping>());
+}
+
+#[test]
+fn stack_index_budget_includes_merge_working_set() {
+    let count = 1024;
+    assert!(stack_index_memory_bytes(count).unwrap() > index_memory_bytes(count).unwrap());
+}
+
+#[test]
+fn compaction_budget_includes_coexisting_working_sets() {
+    validate_compaction_memory(1, 1, 1, ALIGNMENT_USIZE).unwrap();
+
+    let err = validate_compaction_memory(0, usize::MAX, 1, ALIGNMENT_USIZE)
+        .expect_err("unbounded compaction output should be rejected");
+    assert_err_contains(&err, "compaction output memory size overflow");
+}
+
 async fn open_sparse_lsmt_env(
     data_file: Arc<LocalFile>,
     lower_layers: Vec<Arc<dyn VirtualFile>>,
@@ -471,7 +617,7 @@ async fn load_base_index(data_file: Arc<LocalFile>) -> ReadOnlyIndex {
     let mappings = load_index_and_reset_tags(
         &(data_file as Arc<dyn VirtualFile>),
         trailer.index_offset.get(),
-        trailer.index_size.get() as usize,
+        trailer.index_size.get(),
     )
     .await
     .expect("Failed to load mappings");
