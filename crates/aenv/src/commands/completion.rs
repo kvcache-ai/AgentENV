@@ -188,6 +188,16 @@ mod tests {
     }
 
     #[test]
+    fn broken_pipe_on_flush_is_treated_as_success() {
+        let mut out = FailingWriter {
+            kind: std::io::ErrorKind::BrokenPipe,
+            fail_on_flush: true,
+        };
+        write_completion(Shell::Bash, &mut out)
+            .expect("BrokenPipe during completion flush should not error");
+    }
+
+    #[test]
     fn other_io_error_propagates() {
         let mut out = FailingWriter {
             kind: std::io::ErrorKind::Other,
@@ -195,6 +205,21 @@ mod tests {
         };
         let err = write_completion(Shell::Bash, &mut out)
             .expect_err("non-BrokenPipe I/O errors should propagate");
+        assert!(
+            err.to_string()
+                .contains("writing completion script to stdout"),
+            "error should carry completion context; got: {err}"
+        );
+    }
+
+    #[test]
+    fn other_io_error_on_flush_propagates() {
+        let mut out = FailingWriter {
+            kind: std::io::ErrorKind::Other,
+            fail_on_flush: true,
+        };
+        let err =
+            write_completion(Shell::Bash, &mut out).expect_err("flush errors should propagate");
         assert!(
             err.to_string()
                 .contains("writing completion script to stdout"),
