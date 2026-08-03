@@ -28,7 +28,29 @@ fi
 
 home="${HOME:-}"
 user_mode=0
-if [[ -n "$home" && ( "$prefix" == "$home" || "$prefix" == "$home"/* ) ]]; then
+canonical_dir() {
+    local path="$1" parent name
+    [[ "$path" == /* ]] || path="$PWD/$path"
+    if [[ -d "$path" ]]; then
+        (cd "$path" && pwd -P)
+        return
+    fi
+    parent="${path%/*}"
+    name="${path##*/}"
+    [[ "$parent" == "$path" ]] && parent="."
+    parent="$(cd "$parent" 2>/dev/null && pwd -P)" || return 1
+    printf '%s/%s\n' "$parent" "$name"
+}
+
+prefix_real="$(canonical_dir "$prefix")" || {
+    printf 'warning: could not resolve completion prefix %s; skipping\n' "$prefix" >&2
+    exit 0
+}
+home_real=""
+if [[ -n "$home" ]]; then
+    home_real="$(canonical_dir "$home")" || home_real=""
+fi
+if [[ -n "$home_real" && ( "$prefix_real" == "$home_real" || "$prefix_real" == "$home_real"/* ) ]]; then
     user_mode=1
 fi
 

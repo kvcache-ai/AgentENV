@@ -69,4 +69,13 @@ assert_file "$prefix/share/fish/vendor_completions.d/aenv.fish"
 HOME="$home" bash "$helper" uninstall --prefix="$prefix" --binary="$bin/aenv-v1" >/dev/null
 assert_absent "$prefix/share/bash-completion/completions/aenv"
 
+echo '==> path traversal cannot select user mode'
+outside="$tmp_root/outside"
+mkdir -p "$outside"
+HOME="$home" bash "$helper" install --prefix="$home/../outside" --binary="$bin/aenv-v1" >/dev/null
+assert_file "$outside/share/bash-completion/completions/aenv"
+assert_absent "$home/.local/share/bash-completion/completions/aenv"
+HOME="$home" bash "$helper" uninstall --prefix="$home/../outside" --binary="$bin/aenv-v1" >/dev/null
+assert_absent "$outside/share/bash-completion/completions/aenv"
+
 echo '==> completion installation checks passed'
