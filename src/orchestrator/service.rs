@@ -218,7 +218,7 @@ where
         Ok(orchestrator)
     }
 
-    async fn run_lifecycle_operation<T>(
+    async fn run_cancellation_safe<T>(
         self: &Arc<Self>,
         operation: &'static str,
         sandbox_id: SandboxId,
@@ -234,14 +234,14 @@ where
                 debug!(
                     sandbox_id = %sandbox_id,
                     operation,
-                    "lifecycle operation completed after caller stopped waiting"
+                    "operation completed after caller stopped waiting"
                 );
             }
         });
 
         rx.await.map_err(|err| {
             OrchestratorError::InternalError(format!(
-                "lifecycle operation task ended before reporting result: {err}"
+                "operation task ended before reporting result: {err}"
             ))
         })?
     }
@@ -322,7 +322,7 @@ where
     ) -> Result<SandboxMetadata> {
         let sandbox_id = SandboxId::new();
         let this = Arc::clone(self);
-        self.run_lifecycle_operation("create", sandbox_id, async move {
+        self.run_cancellation_safe("create", sandbox_id, async move {
             this.create_sandbox_inner(sandbox_id, request).await
         })
         .await
@@ -476,7 +476,7 @@ where
         new_timeout: NewTimeout,
     ) -> Result<Vec<SandboxForkOutcome>> {
         let this = Arc::clone(self);
-        self.run_lifecycle_operation("fork", source_sandbox_id, async move {
+        self.run_cancellation_safe("fork", source_sandbox_id, async move {
             this.fork_sandbox_inner(source_sandbox_id, count, new_timeout)
                 .await
         })
@@ -809,7 +809,7 @@ where
     /// races where an ongoing operation might overwrite the `Killing` state.
     pub async fn delete_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         let this = Arc::clone(self);
-        self.run_lifecycle_operation("delete", sandbox_id, async move {
+        self.run_cancellation_safe("delete", sandbox_id, async move {
             this.delete_sandbox_inner(sandbox_id).await
         })
         .await
@@ -977,7 +977,7 @@ where
     /// returns the outcome rather than duplicating the work.
     pub async fn pause_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         let this = Arc::clone(self);
-        self.run_lifecycle_operation("pause", sandbox_id, async move {
+        self.run_cancellation_safe("pause", sandbox_id, async move {
             this.pause_sandbox_inner(sandbox_id).await
         })
         .await
@@ -1208,7 +1208,7 @@ where
         timeout: NewTimeout,
     ) -> Result<SandboxMetadata> {
         let this = Arc::clone(self);
-        self.run_lifecycle_operation("resume", sandbox_id, async move {
+        self.run_cancellation_safe("resume", sandbox_id, async move {
             this.resume_sandbox_inner(sandbox_id, timeout).await
         })
         .await
@@ -1330,7 +1330,7 @@ where
         sandbox_id: SandboxId,
     ) -> Result<SnapshotCaptureResult> {
         let this = Arc::clone(self);
-        self.run_lifecycle_operation("snapshot", sandbox_id, async move {
+        self.run_cancellation_safe("snapshot", sandbox_id, async move {
             this.capture_snapshot_inner(sandbox_id).await
         })
         .await
@@ -1444,8 +1444,25 @@ where
         })
     }
 
-    #[tracing::instrument(skip(self, network_policy), fields(sandbox_id = %sandbox_id))]
     pub async fn replace_sandbox_network_policy(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        network_policy: SandboxNetworkPolicy,
+    ) -> Result<()> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("update_network", sandbox_id, async move {
+            this.replace_sandbox_network_policy_inner(sandbox_id, network_policy)
+                .await
+        })
+        .await
+    }
+
+    #[tracing::instrument(
+        name = "replace_sandbox_network_policy",
+        skip(self, network_policy),
+        fields(sandbox_id = %sandbox_id))
+    ]
+    async fn replace_sandbox_network_policy_inner(
         &self,
         sandbox_id: SandboxId,
         network_policy: SandboxNetworkPolicy,
@@ -1499,8 +1516,25 @@ where
     /// On hook failure the sandbox keeps its previous params and the
     /// metadata store is left untouched. Returns the new full params (`None`
     /// means empty params).
-    #[tracing::instrument(skip(self, patch), fields(sandbox_id = %sandbox_id))]
     pub async fn patch_sandbox_custom_extension_params(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        patch: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<CustomExtensionParams>> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("patch_custom_extension_params", sandbox_id, async move {
+            this.patch_sandbox_custom_extension_params_inner(sandbox_id, patch)
+                .await
+        })
+        .await
+    }
+
+    #[tracing::instrument(
+        name = "patch_sandbox_custom_extension_params",
+        skip(self, patch),
+        fields(sandbox_id = %sandbox_id))
+    ]
+    async fn patch_sandbox_custom_extension_params_inner(
         &self,
         sandbox_id: SandboxId,
         patch: serde_json::Map<String, serde_json::Value>,
