@@ -10,6 +10,9 @@ on:
       - "**/Cargo.lock"
       - "rust-toolchain.toml"
       - "scripts/install.sh"
+      - "scripts/install-cli.sh"
+      - "scripts/install-completions.sh"
+      - "scripts/tests/verify-completion-install.sh"
       - "scripts/run-with-capabilities.sh"
       - "scripts/tests/setup-ublk-access.sh"
       - "scripts/tests/verify-capability-runner.sh"
@@ -24,6 +27,9 @@ on:
       - "**/Cargo.lock"
       - "rust-toolchain.toml"
       - "scripts/install.sh"
+      - "scripts/install-cli.sh"
+      - "scripts/install-completions.sh"
+      - "scripts/tests/verify-completion-install.sh"
       - "scripts/run-with-capabilities.sh"
       - "scripts/tests/setup-ublk-access.sh"
       - "scripts/tests/verify-capability-runner.sh"
@@ -63,3 +69,16 @@ jobs:
         run: sudo scripts/tests/setup-ublk-access.sh "$(id -un)" "$(id -gn)"
       - name: Unit tests
         run: make test-unit PROFILE=debug
+
+  completion-install:
+    name: Completion installer checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Shell syntax
+        run: bash -n scripts/install-completions.sh scripts/install-cli.sh scripts/install.sh scripts/tests/verify-completion-install.sh
+      - name: Functional checks
+        run: bash scripts/tests/verify-completion-install.sh
