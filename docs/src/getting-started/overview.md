@@ -18,7 +18,7 @@ The repository is available at <https://github.com/kvcache-ai/AgentENV>.
 - **Snapshot-backed template builder** for publishing reusable, pre-configured sandbox runtimes
 - **E2B-compatible API** so existing E2B SDKs and CLIs work out of the box
 - **Reverse proxy** to reach services running inside sandboxes via HTTP and WebSocket
-- **Multi-node scaling** with a gateway + scheduler control plane (prototype)
+- **Multi-node scaling** with a gateway + scheduler control plane
 
 ## Who Is This For
 

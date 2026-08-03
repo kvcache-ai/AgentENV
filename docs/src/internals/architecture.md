@@ -1,6 +1,6 @@
 # AgentENV Architecture
 
-AgentENV runs AI agents inside isolated, snapshot-capable Firecracker microVMs. Its core is a **storage subsystem** that provides layered block devices mountable into VMs and ublk-backed memory snapshot restore. The system also includes a per-node **orchestrator** managing sandbox lifecycle, and a prototype **distributed control plane** (gateway + scheduler) for multi-node routing.
+AgentENV runs AI agents inside isolated, snapshot-capable Firecracker microVMs. Its core is a **storage subsystem** that provides layered block devices mountable into VMs and ublk-backed memory snapshot restore. The system also includes a per-node **orchestrator** managing sandbox lifecycle, and a **distributed control plane** (gateway + scheduler) for multi-node routing.
 
 ## System Overview
 
@@ -212,9 +212,9 @@ See [P2P Artifact Transport](./p2p-design.md) for the detailed design.
 - `ANY /proxy`, `ANY /proxy/{path}`, routing-header fallback, and configured
   sandbox proxy hosts reverse proxy to sandbox services
 
-## Distributed Control Plane (prototype)
+## Distributed Control Plane
 
-The multi-node control plane in `services/` is a prototype. It routes client traffic across multiple AgentENV backend nodes.
+The multi-node control plane in `services/` routes client traffic across multiple AgentENV backend nodes.
 
 ```
     Client ──HTTP──> Gateway (:8080) ──gRPC──> Scheduler (:9090)
@@ -320,7 +320,7 @@ src/
 ├── template/                   # user-facing template builder over snapshots
 └── cfg.rs                      # TOML config
 
-services/                       # prototype distributed control plane (Go)
+services/                       # distributed control plane (Go)
 ├── gateway/                    # HTTP reverse proxy
 ├── scheduler/                  # gRPC node selection + binding
 ├── api/proto/                  # protobuf contracts
