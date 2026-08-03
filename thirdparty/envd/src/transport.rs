@@ -105,6 +105,14 @@ impl Service<http::Request<TonicBoxBody>> for DualClient {
     }
 }
 
+/// envd exchanges small RPC frames, so Nagle only ever trades latency for a
+/// coalescing win that never materializes here.
+fn nodelay_connector() -> HttpConnector {
+    let mut connector = HttpConnector::new();
+    connector.set_nodelay(true);
+    connector
+}
+
 /// Creates a channel compatible with both HTTP/1.1 and HTTP/2.
 ///
 /// The channel automatically probes the server to determine supported protocol (H2 or H1).
@@ -113,12 +121,12 @@ pub fn new_channel(addr: &str) -> anyhow::Result<Channel> {
 
     let h1 = Client::builder(TokioExecutor::new())
         .http2_only(false)
-        .build(HttpConnector::new());
+        .build(nodelay_connector());
 
     // H2 with Prior Knowledge for cleartext
     let h2 = Client::builder(TokioExecutor::new())
         .http2_only(true)
-        .build(HttpConnector::new());
+        .build(nodelay_connector());
 
     let service = DualClient {
         h1,

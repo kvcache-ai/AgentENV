@@ -9,6 +9,7 @@ use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
+use axum::serve::ListenerExt;
 use clap::Parser;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
@@ -141,7 +142,14 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_orchestrator = Arc::clone(&orchestrator);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    // envd streams a command's lifecycle as a burst of tiny Connect-RPC frames.
+    // With Nagle left on, the frame after the first one waits for the client's
+    // delayed ACK, adding a ~40ms floor to every short-lived command.
+    let listener = tokio::net::TcpListener::bind(&addr).await?.tap_io(|stream| {
+        if let Err(err) = stream.set_nodelay(true) {
+            warn!(target: "agentenv", error = %err, "failed to set TCP_NODELAY on incoming connection");
+        }
+    });
     info!(target: "agentenv", addr = %addr, "API server listening");
 
     let shutdown_cleanup = tokio::spawn(async move {

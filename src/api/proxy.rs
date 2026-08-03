@@ -119,6 +119,9 @@ fn auto_resume_min_sandbox_timeout() -> Duration {
 
 pub(crate) fn build_proxy_client() -> ProxyClient {
     let mut connector = HttpConnector::new();
+    // Proxied requests and responses are small, so Nagle only ever adds a
+    // delayed-ACK wait to them.
+    connector.set_nodelay(true);
     connector.set_connect_timeout(Some(PROXY_CONNECT_TIMEOUT));
     // Interaction IPs are reused across sandbox runtime generations. Hyper keys
     // its idle pool by authority, so a pooled connection can retain a stale VM flow.
