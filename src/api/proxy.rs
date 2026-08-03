@@ -89,6 +89,10 @@ const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+const PROXY_TCP_KEEPALIVE: Duration = Duration::from_secs(3);
+const PROXY_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
+const PROXY_TCP_KEEPALIVE_RETRIES: u32 = 2;
+
 #[cfg(test)]
 const PROXY_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
@@ -123,6 +127,12 @@ pub(crate) fn build_proxy_client() -> ProxyClient {
     // delayed-ACK wait to them.
     connector.set_nodelay(true);
     connector.set_connect_timeout(Some(PROXY_CONNECT_TIMEOUT));
+    // Tearing down a VM never delivers FIN/RST to the host socket, so keepalive
+    // probes are what turn a connection to a sandbox that is already gone into
+    // a prompt error instead of a request that hangs until a higher timeout.
+    connector.set_keepalive(Some(PROXY_TCP_KEEPALIVE));
+    connector.set_keepalive_interval(Some(PROXY_TCP_KEEPALIVE_INTERVAL));
+    connector.set_keepalive_retries(Some(PROXY_TCP_KEEPALIVE_RETRIES));
     // Interaction IPs are reused across sandbox runtime generations. Hyper keys
     // its idle pool by authority, so a pooled connection can retain a stale VM flow.
     Client::builder(TokioExecutor::new())
