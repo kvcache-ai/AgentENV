@@ -1045,6 +1045,27 @@ where
             return Err(error);
         }
 
+        // Allocate persistence space while the running handle and route are
+        // still attached. Allocation does not mutate the backend, so failure
+        // only needs to restore metadata and release the temporary image refs.
+        let artifact_root = match self.persister.allocate_artifact_root(&sandbox_id).await {
+            Ok(artifact_root) => artifact_root,
+            Err(err) => {
+                warn!(error = ?err, "failed to allocate paused sandbox artifact root");
+                self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+                    .await;
+                let _ = self
+                    .store
+                    .update_state_if_state(
+                        &sandbox_id,
+                        SandboxState::Running,
+                        &[SandboxState::Pausing],
+                    )
+                    .await;
+                return Err(OrchestratorError::from(err));
+            }
+        };
+
         let (handle, removed_proxy_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
 
         let Some(handle) = handle else {
@@ -1056,8 +1077,6 @@ where
         };
 
         // Pause the sandbox and capture the paused state for resuming later.
-        let artifact_root = self.persister.allocate_artifact_root(&sandbox_id).await?;
-
         let paused_state_result = {
             let mut sandbox = handle.lock().await;
             sandbox.pause(artifact_root.as_deref()).await

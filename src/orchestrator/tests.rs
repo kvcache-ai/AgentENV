@@ -19,9 +19,11 @@ use super::super::types::SandboxLaunchSource;
 use super::*;
 use crate::cfg::ResolvedImageCacheConfig;
 use crate::image::cache::test_support::{
-    test_local_image_services_from_service, ImageCacheService,
+    test_local_image_services_from_service, ImageCacheService, RecordingRuntimeImageRefs,
 };
-use crate::image::cache::{local_image_services_from_global_config, RuntimeImageRefs};
+use crate::image::cache::{
+    local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
+};
 use crate::sandbox::mock::{
     MockAction, MockBackendFactory, MockBehavior, MockOperation, MockSandboxBackend, MockSnapshot,
 };
@@ -1692,6 +1694,110 @@ async fn pause_persistence_failure_rolls_back_to_running() -> Result<()> {
         created.resources.memory_mib,
     )
     .await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_artifact_root_allocation_failure_restores_running_for_retry() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    persister.fail_next(RecordingCall::AllocateArtifactRoot);
+    let runtime_artifacts =
+        RuntimeArtifactSet::from_overlaybd_image_configs(vec![PathBuf::from("runtime/image.json")]);
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_runtime_info(SandboxRuntimeInfo {
+        runtime_artifacts: runtime_artifacts.clone(),
+        ..Default::default()
+    });
+    let mut orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        persister.clone(),
+    );
+    let image_refs = Arc::new(RecordingRuntimeImageRefs::default());
+    Arc::get_mut(&mut orchestrator)
+        .expect("orchestrator should be uniquely owned")
+        .image_refs = image_refs.clone();
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "pause-allocate-fail")]))
+        .await?;
+    let sandbox_id = created.id;
+
+    let err = orchestrator
+        .pause_sandbox(sandbox_id)
+        .await
+        .expect_err("pause should fail when artifact-root allocation fails");
+    assert!(matches!(
+        err,
+        OrchestratorError::SandboxPersistenceFailed(_)
+    ));
+
+    let running = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("metadata should remain after allocation failure");
+    assert_eq!(running.state, SandboxState::Running);
+    assert!(running.paused_state.is_none());
+    assert!(
+        orchestrator
+            .sandboxes
+            .read()
+            .await
+            .contains_key(&sandbox_id),
+        "allocation failure must not detach the runtime handle"
+    );
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+    assert_metrics_values(
+        &orchestrator,
+        1,
+        0,
+        1,
+        0,
+        created.resources.cpu_count,
+        created.resources.memory_mib,
+    )
+    .await;
+    assert_eq!(
+        image_refs.pinned(),
+        vec![
+            (
+                RuntimeImageOwner::StartingSandbox(sandbox_id),
+                RuntimeArtifactSet::empty(),
+            ),
+            (
+                RuntimeImageOwner::PausedSandbox(sandbox_id),
+                runtime_artifacts.clone(),
+            ),
+        ]
+    );
+    assert_eq!(
+        image_refs.unpinned(),
+        vec![
+            RuntimeImageOwner::StartingSandbox(sandbox_id),
+            RuntimeImageOwner::PausedSandbox(sandbox_id),
+        ]
+    );
+    assert_eq!(persister.calls(), vec![RecordingCall::AllocateArtifactRoot]);
+
+    orchestrator.pause_sandbox(sandbox_id).await?;
+    let paused = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("metadata should remain after retry");
+    assert_eq!(paused.state, SandboxState::Paused);
+    assert!(paused.paused_state.is_some());
+    assert_proxy_paused(&orchestrator, &sandbox_id).await?;
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::AllocateArtifactRoot,
+            RecordingCall::AllocateArtifactRoot,
+            RecordingCall::PersistPaused,
+        ]
+    );
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
     Ok(())
 }
 
