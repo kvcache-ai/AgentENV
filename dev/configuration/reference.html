@@ -1,0 +1,877 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Configuration Reference - AgentENV Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-d6f92df9.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-795efd7f.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">AgentENV Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kvcache-ai/AgentENV" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kvcache-ai/AgentENV/edit/main/docs/src/configuration/reference.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="configuration-reference"><a class="header" href="#configuration-reference">Configuration Reference</a></h1>
+<p>AgentENV reads configuration from a TOML file. The default path is <code>config/default.toml</code>. Override it with:</p>
+<pre><code class="language-bash">export AENV_CONFIG_PATH=/path/to/config.toml
+# or
+cargo run --bin server -- --config /path/to/config.toml
+</code></pre>
+<h2 id="global-settings"><a class="header" href="#global-settings">Global Settings</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>home_path</code></td><td>string</td><td><code>"/var/lib/aenv"</code></td><td>Base directory for local AgentENV state. Overridden by <code>AENV_HOME_PATH</code></td></tr>
+<tr><td><code>runtime_path</code></td><td>string</td><td><code>"/run/aenv"</code></td><td>Base directory for transient namespace and daemon-socket state. Overridden by <code>AENV_RUNTIME_PATH</code></td></tr>
+<tr><td><code>deps_path</code></td><td>string</td><td><code>"$AENV_HOME/deps"</code></td><td>Root directory for auto-downloaded runtime assets. Overridden by <code>AENV_DEPS_PATH</code></td></tr>
+<tr><td><code>virtualization_mode</code></td><td><code>"kvm"</code> or <code>"pvm"</code></td><td><code>"kvm"</code></td><td>Virtualization mode for this node. Keep the default unless following the <a href="../deployment/pvm.html">PVM Deployment</a> guide. Overridden by <code>AENV_VIRTUALIZATION_MODE</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Snapshots and paused sandboxes can only be restored in the mode in which they
+were created.</p>
+<p><code>$AENV_HOME</code> is a literal placeholder in state-path values, not a shell
+environment variable. AgentENV replaces it with the resolved <code>home_path</code> after
+applying <code>AENV_HOME_PATH</code>; <code>ublk.daemon_socket_path</code> additionally supports
+<code>$AENV_RUNTIME</code>, which resolves to <code>runtime_path</code>. Relative paths without these
+placeholders are resolved against the directory containing the configuration
+file.</p>
+<p>Packaged runtime dependency versions and download URLs live in
+<code>config/deps_manifest.toml</code>. Only the dependencies for the selected mode are
+installed. User configuration should contain runtime behavior and explicit
+local path overrides, not the default dependency catalog.</p>
+<h2 id="firecracker"><a class="header" href="#firecracker"><code>[firecracker]</code></a></h2>
+<p>Firecracker VM binary and boot configuration.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>version</code></td><td>string</td><td>manifest value</td><td>Optional Firecracker release override for auto-download</td></tr>
+<tr><td><code>url</code></td><td>string</td><td>manifest value</td><td>Optional download URL template override with <code>{version}</code> and <code>{arch}</code> placeholders</td></tr>
+<tr><td><code>binary_path</code></td><td>string</td><td>derived from manifest/config version</td><td>Explicit path to a local <code>firecracker</code> binary. Setup skips the Firecracker download and requires this to be a readable, non-empty, executable regular file</td></tr>
+<tr><td><code>boot_args</code></td><td>string</td><td><code>"console=ttyS0 reboot=k panic=1 pci=off init=/init …"</code></td><td>Kernel command line arguments. The shipped default also includes DAMON memory-reclaim parameters; see <code>config/default.toml</code> for the full value.</td></tr>
+<tr><td><code>allowed_extra_boot_args_prefixes</code></td><td>array of strings</td><td><code>[]</code></td><td>Allowed prefixes for <code>extraBootArgs</code> on cold-start sandboxes. If empty, no request-provided extra boot args are appended</td></tr>
+<tr><td><code>socket_timeout_secs</code></td><td>integer</td><td><code>3</code></td><td>Max seconds to wait for the Firecracker API socket</td></tr>
+<tr><td><code>socket_poll_ms</code></td><td>integer</td><td><code>1</code></td><td>Poll interval (ms) for checking socket availability</td></tr>
+<tr><td><code>work_dir</code></td><td>string</td><td><code>"$AENV_HOME/firecracker-work"</code></td><td>Parent directory for per-sandbox Firecracker work directories. These dirs contain runtime sockets, symlinks, local logs, and writable OverlayBD upper layer data such as <code>overlaybd/upper.data</code> and <code>overlaybd/upper.index</code></td></tr>
+<tr><td><code>serial_dir</code></td><td>string</td><td><code>"$AENV_HOME/logs/serial"</code></td><td>Directory for persistent Firecracker serial output (per-sandbox subdirectories)</td></tr>
+<tr><td><code>log_level</code></td><td>string</td><td>unset (disabled)</td><td>Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>, <code>Debug</code>, <code>Trace</code>, case-insensitive). When set to a non-empty value, Firecracker’s own logging is enabled and written to a <code>firecracker.log</code> file in each sandbox’s log directory (alongside the serial output). Empty/unset disables it</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="kernel"><a class="header" href="#kernel"><code>[kernel]</code></a></h2>
+<p>Linux kernel image for microVMs.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>version</code></td><td>string</td><td>manifest value</td><td>Optional kernel version override for auto-download</td></tr>
+<tr><td><code>url</code></td><td>string</td><td>manifest value</td><td>Optional download URL template override with <code>{version}</code> placeholder</td></tr>
+<tr><td><code>image_path</code></td><td>string</td><td>derived from manifest/config version</td><td>Explicit path to a local <code>vmlinux.bin</code>. Setup skips the kernel download and requires this to be a readable, non-empty regular file</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="tools"><a class="header" href="#tools"><code>[tools]</code></a></h2>
+<p>Tools drive image used to boot the AgentENV control plane inside each microVM.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>version</code></td><td>string</td><td>manifest value</td><td>Immutable SemVer release of the complete tools drive; custom distributions should use a unique prerelease such as <code>0.1.0-custom.1</code></td></tr>
+<tr><td><code>url</code></td><td>string</td><td>manifest value</td><td>Optional OCI image URL template override with a <code>{version}</code> placeholder; requires an explicit <code>version</code> when set</td></tr>
+<tr><td><code>drive_path</code></td><td>string</td><td>unset</td><td>Local tools ext4 source imported into the versioned dependency directory; requires an explicit <code>version</code></td></tr>
+<tr><td><code>control_plane_port</code></td><td>integer</td><td><code>49983</code></td><td>Port used by envd inside the guest</td></tr>
+</tbody>
+</table>
+</div>
+<p>Snapshots and paused sandboxes keep using the tools drive version they were
+created with. Launch does not download missing releases: operators must install
+the recorded version under <code>&lt;deps_path&gt;/tools/&lt;version&gt;/tools.ext4</code> before
+restore. Setup retains previously installed versions until they are removed
+manually.</p>
+<h2 id="template-rootfs-images"><a class="header" href="#template-rootfs-images">Template Rootfs Images</a></h2>
+<p>User-visible rootfs images are selected at the template API layer.
+<code>POST /v2/templates/{templateID}/builds/{buildID}</code> accepts an optional
+<code>fromImage</code> field:</p>
+<ul>
+<li>omitted: use <code>[image.resolver].default_image</code></li>
+<li>full OCI reference: use the supplied image</li>
+<li>short name: normalize standard Docker Hub forms such as <code>ubuntu:24.04</code>
+and <code>node:20</code></li>
+</ul>
+<h2 id="imageresolver"><a class="header" href="#imageresolver"><code>[image.resolver]</code></a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>default_image</code></td><td>string</td><td><code>ubuntu:24.04</code></td><td>Image used when template builds omit <code>fromImage</code></td></tr>
+<tr><td><code>search_registries</code></td><td>array of strings</td><td><code>["docker.io", "ghcr.io"]</code></td><td>Registries tried when resolving short image references</td></tr>
+<tr><td><code>allowed_registries</code></td><td>array of strings</td><td>unset (no restriction)</td><td>Whitelist of registry hosts (e.g. <code>docker.io</code>, <code>registry.example.com:5000</code>). <strong>Omitting the key</strong> imposes no restriction; an <strong>explicit empty list <code>[]</code></strong> denies every registry. When set to a non-empty list, only references whose registry host is in the list resolve; any other host is rejected as a client (4xx, <code>ImageReferenceError</code>) error. See <em>How the three registry settings interact</em> below.</td></tr>
+<tr><td><code>try_referrers_overlaybd_prefixes</code></td><td>array of strings</td><td><code>[]</code></td><td>Image reference prefixes for which AgentENV tries OCI Referrers API via <code>regctl</code> for an overlaybd-native artifact before converting a standard OCI image locally. Prefixes are matched with simple <code>starts_with</code>; include the trailing slash yourself, for example <code>registry.example.com/</code> or <code>registry.example.com/team/</code>. Requires <code>regctl</code> on <code>PATH</code>; lookup failures fall back to the source image.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="how-the-three-registry-settings-interact"><a class="header" href="#how-the-three-registry-settings-interact">How the three registry settings interact</a></h3>
+<p>Image resolution runs in two phases, and the three keys act at different points:</p>
+<ol>
+<li>
+<p><strong><code>search_registries</code> — completion.</strong> Only used for <em>short / unqualified</em>
+references (e.g. <code>ubuntu</code>). Each entry is prefixed to the name to build a
+list of fully-qualified candidates (<code>docker.io/library/ubuntu:latest</code>,
+<code>ghcr.io/ubuntu:latest</code>, …). Fully-qualified references skip this step.</p>
+</li>
+<li>
+<p><strong><code>allowed_registries</code> — gating.</strong> Applied right after candidates are built,
+to <em>both</em> fully-qualified references and the candidates expanded from
+<code>search_registries</code>. Candidates whose registry host is not whitelisted are
+dropped; if none remain, the reference is rejected with a 4xx error. In
+effect the resolvable set of short-name hosts is the <strong>intersection</strong> of
+<code>search_registries</code> and <code>allowed_registries</code> — e.g. searching <code>docker.io</code>
+and <code>ghcr.io</code> while only allowing <code>ghcr.io</code> resolves short names to
+<code>ghcr.io</code> only.</p>
+</li>
+<li>
+<p><strong><code>try_referrers_overlaybd_prefixes</code> — per-candidate optimization.</strong> Runs
+later, while resolving an <em>already-permitted</em> candidate: after its manifest
+is fetched, AgentENV may query the OCI Referrers API on the <strong>same</strong>
+registry/repository for an overlaybd-native artifact. Because referrer
+lookups never leave the source image’s own host, they are implicitly
+covered by <code>allowed_registries</code> — no separate whitelist entry is needed for
+referrers.</p>
+<p>Two referrer <code>artifactType</code>s are recognized, in this order:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th><code>artifactType</code></th><th>Produced by</th></tr>
+</thead>
+<tbody>
+<tr><td><code>application/vnd.containerd.overlaybd.native.v1+json</code></td><td>accelerated-container-image (<code>obdconv</code>)</td></tr>
+<tr><td><code>application/vnd.azure.artifact.streaming.v1</code></td><td>Azure Container Registry artifact streaming (<code>az acr artifact-streaming create</code>)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Both point at an overlaybd-native manifest; only the discovery label
+differs. The referrer manifest is re-validated after it is fetched, so a
+referrer that is not actually overlaybd-native is rejected rather than
+used. Turbo-OCI referrers
+(<code>application/vnd.containerd.overlaybd.turbo.v1+json</code>) are never selected —
+AgentENV’s overlaybd runtime does not implement the turbo read path.</p>
+<p>To stream from ACR, add your registry (with the trailing slash) to the
+list, e.g. <code>try_referrers_overlaybd_prefixes = ["myregistry.azurecr.io/"]</code>.</p>
+</li>
+</ol>
+<h2 id="imagecache"><a class="header" href="#imagecache"><code>[image.cache]</code></a></h2>
+<p>Node-local cache root for resolved and converted user images.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>root_dir</code></td><td>string</td><td><code>"$AENV_HOME/image-cache"</code></td><td>Root directory for AgentENV image-cache artifacts</td></tr>
+<tr><td><code>capacity_gb</code></td><td>integer</td><td><code>100</code></td><td>Budget for capacity-driven eviction of local commit bytes. Enforced only when <code>[image.cache.gc].enabled</code> is <code>true</code>: the background GC evicts least-recently-used source configs once usage crosses the high watermark, down to the low watermark. Unset = no capacity cap.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="imagecachegc"><a class="header" href="#imagecachegc"><code>[image.cache.gc]</code></a></h2>
+<p>Background hard-commit garbage collection for the image cache. When enabled,
+each pass reconciles metadata from the on-disk source configs and then deletes
+hard-commit objects that are no longer rooted by source configs, held by
+image-cache leases, or referenced by the in-process running set. Committed
+snapshots are durable SnapshotRepository state and do not pin ImageCache
+commits. With <code>capacity_gb</code> set, GC first evicts least-recently-used source
+configs over the high watermark so hard-commit GC can reclaim what they unrooted.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>bool</td><td><code>true</code></td><td>Enable the background image-cache GC task</td></tr>
+<tr><td><code>interval_secs</code></td><td>integer</td><td><code>1800</code></td><td>Seconds between GC passes (a value <code>&lt;= 0</code> falls back to the default)</td></tr>
+<tr><td><code>min_age_secs</code></td><td>integer</td><td><code>600</code></td><td>Minimum time since last use before a source config is eligible for capacity eviction (the LRU floor)</td></tr>
+<tr><td><code>high_watermark_ratio</code></td><td>float</td><td><code>0.95</code></td><td>Begin capacity eviction once local commit bytes exceed <code>capacity_gb</code> × this ratio. Clamped to <code>(0, 1]</code></td></tr>
+<tr><td><code>low_watermark_ratio</code></td><td>float</td><td><code>0.70</code></td><td>Evict down to <code>capacity_gb</code> × this ratio once the high watermark trips. Clamped to <code>(0, high_watermark_ratio]</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Capacity-driven eviction runs only when <code>[image.cache].capacity_gb</code> is set;
+otherwise the GC still reclaims unreachable commits but performs no watermark
+eviction.</p>
+<h2 id="imagecacheremote_blocks"><a class="header" href="#imagecacheremote_blocks"><code>[image.cache.remote_blocks]</code></a></h2>
+<p>Overlaybd registryfs_v2 remote block cache settings. The directory is always
+<code>&lt;image.cache.root_dir&gt;/remote-blocks</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_size_gb</code></td><td>integer</td><td><code>10</code></td><td>Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd <code>cacheConfig.cacheSizeGB</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Resolved image data is cached under:</p>
+<pre><code class="language-text">&lt;image.cache.root_dir&gt;/
+  commits/
+    &lt;sha256-commit-digest&gt;/
+      overlaybd.commit
+                  # full overlaybd commit store shared by OCI conversion and download
+  indexes/        # OCI layer + conversion context -&gt; overlaybd commit descriptor
+  remote-blocks/  # overlaybd-native remote block cache
+  configs/         # resolved image configs
+    &lt;slug&gt;-&lt;hash&gt;-image.json
+</code></pre>
+<h2 id="sandbox_proxy"><a class="header" href="#sandbox_proxy"><code>[sandbox_proxy]</code></a></h2>
+<p>Optional host-based data-plane routing for sandbox services.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>domains</code></td><td>array of strings</td><td><code>[]</code></td><td>DNS domains accepted by the server for host-based proxy URLs shaped like <code>{port}-{sandboxID}.{domain}</code>. The first configured domain is returned in sandbox create/detail responses as <code>domain</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<p>When <code>domains</code> is empty, the server still supports <code>/proxy</code> and routing-header
+proxy requests, but does not classify requests by <code>Host</code>. Domains are normalized
+to lowercase, deduplicated, and must be valid DNS names. The configured order is
+preserved because <code>domains[0]</code> is the advertised sandbox domain.</p>
+<p>Environment variable override:</p>
+<ul>
+<li><code>AENV_SANDBOX_PROXY_DOMAINS</code></li>
+</ul>
+<h2 id="networkegress"><a class="header" href="#networkegress"><code>[network.egress]</code></a></h2>
+<p>Node-level sandbox egress guardrails. These rules are installed before
+per-sandbox <code>allowOut</code> / <code>denyOut</code> rules, so sandbox API requests cannot
+override them.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>always_denied_cidrs</code></td><td>array of IPv4 CIDR strings</td><td><code>["10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16"]</code></td><td>Destination CIDRs that are always rejected from sandboxes before user egress policy is evaluated. Deployments can remove selected RFC1918 ranges when sandbox egress to those destinations is required.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="networkinternal"><a class="header" href="#networkinternal"><code>[network.internal]</code></a></h2>
+<p>AgentENV-internal sandbox address plan. Change these only when the defaults
+overlap with host or deployment network ranges.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>host_interaction_cidr</code></td><td>IPv4 CIDR</td><td><code>10.11.0.0/16</code></td><td>Per-slot host interaction address pool. Must contain at least 32768 addresses.</td></tr>
+<tr><td><code>veth_cidr</code></td><td>IPv4 CIDR</td><td><code>10.12.0.0/16</code></td><td>Per-slot namespace veth pair pool. Must contain at least 65536 addresses.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The two configured CIDRs must not overlap each other or AgentENV’s fixed VM tap
+link <code>169.254.0.20/30</code>. These networks are also treated as reserved sandbox
+egress destinations regardless of <code>always_denied_cidrs</code>.</p>
+<h2 id="machine"><a class="header" href="#machine"><code>[machine]</code></a></h2>
+<p>Default VM resources for sandboxes.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>mem_size_mib</code></td><td>integer</td><td><code>1024</code></td><td>Guest RAM in MiB</td></tr>
+<tr><td><code>vcpu_count</code></td><td>integer</td><td><code>2</code></td><td>Number of virtual CPUs</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="envd"><a class="header" href="#envd"><code>[envd]</code></a></h2>
+<p>In-guest <code>envd</code> daemon settings.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>version</code></td><td>string</td><td><code>"0.5.15"</code></td><td>Expected envd version baked into the tools drive image</td></tr>
+<tr><td><code>init_timeout_secs</code></td><td>integer</td><td><code>60</code></td><td>Max seconds to wait for envd to become ready after VM start</td></tr>
+<tr><td><code>poll_ms</code></td><td>integer</td><td><code>3</code></td><td>Poll interval (ms) for envd health check retries</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="orchestrator"><a class="header" href="#orchestrator"><code>[orchestrator]</code></a></h2>
+<p>Sandbox lifecycle management.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>auto_evict_interval_ms</code></td><td>integer</td><td><code>1000</code></td><td>Poll interval (ms) for background timeout eviction</td></tr>
+<tr><td><code>default_sandbox_timeout_secs</code></td><td>integer</td><td><code>15</code></td><td>Default keep-alive timeout for sandboxes</td></tr>
+<tr><td><code>auto_resume_min_sandbox_timeout_secs</code></td><td>integer</td><td><code>300</code></td><td>When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration</td></tr>
+<tr><td><code>persisted_sandbox_store_path</code></td><td>string</td><td><code>"$AENV_HOME/persisted-sandboxes"</code></td><td>Directory for persisted sandbox state</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="pool"><a class="header" href="#pool"><code>[pool]</code></a></h2>
+<p>Shared process-wide warm-pool defaults used by network slots, block devices, and pre-spawned Firecracker processes. Pools prewarm to the low watermark, then grow the refill target geometrically toward the high watermark when real acquisitions drain the pool.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>low_watermark</code></td><td>integer</td><td><code>2</code></td><td>Initial lower bound for all enabled warm-resource pools</td></tr>
+<tr><td><code>high_watermark</code></td><td>integer</td><td><code>64</code></td><td>Maximum idle target for all enabled warm-resource pools</td></tr>
+</tbody>
+</table>
+</div>
+<p>Component sections:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Section</th><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>[pool.network]</code></td><td><code>maintenance_enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable the background network-slot maintenance worker</td></tr>
+<tr><td><code>[pool.block]</code></td><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable the ublk overlaybd warm-device pool</td></tr>
+<tr><td><code>[pool.block]</code></td><td><code>startup_prewarm</code></td><td>boolean</td><td><code>true</code></td><td>Prewarm block devices after the first reusable image shape is known</td></tr>
+<tr><td><code>[pool.firecracker]</code></td><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable pre-spawned Firecracker processes for snapshot resume</td></tr>
+<tr><td><code>[pool.firecracker]</code></td><td><code>maintenance_enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable the background Firecracker process maintenance worker</td></tr>
+<tr><td><code>[pool.firecracker]</code></td><td><code>startup_prewarm</code></td><td>boolean</td><td><code>true</code></td><td>Spawn warm Firecracker entries up to the low watermark during server startup</td></tr>
+<tr><td><code>[pool.firecracker]</code></td><td><code>fill_concurrency</code></td><td>integer</td><td><code>4</code></td><td>Maximum number of warm Firecracker processes created concurrently by one maintenance refill batch</td></tr>
+</tbody>
+</table>
+</div>
+<p>Validation rules:</p>
+<ul>
+<li><code>low_watermark &lt;= high_watermark</code></li>
+<li><code>[pool.firecracker].fill_concurrency &gt; 0</code></li>
+</ul>
+<h2 id="node_identity"><a class="header" href="#node_identity"><code>[node_identity]</code></a></h2>
+<p>Stable identity fields for this node. These values appear in node API responses
+and scheduler heartbeats.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>node_id</code></td><td>string</td><td>hostname-derived</td><td>Stable node identifier returned by the admin/node APIs</td></tr>
+<tr><td><code>cluster_id</code></td><td>string (UUID)</td><td>nil UUID</td><td>Logical cluster identifier included in node snapshots</td></tr>
+<tr><td><code>service_instance_id</code></td><td>string</td><td>generated UUID</td><td>Unique process/service instance identifier for the current node runtime</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="observability"><a class="header" href="#observability"><code>[observability]</code></a></h2>
+<p>Node-level observability and host metrics collection.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable the node/admin observability service. When disabled, <code>/nodes</code> returns an empty list and <code>/nodes/{nodeID}</code> returns <code>404</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>When observability is enabled, host CPU/memory/disk metrics are collected at request time. CPU percent is computed from two samples; the first node metrics request waits about 100ms to return a measured value.</p>
+<h2 id="observabilityscheduler_report"><a class="header" href="#observabilityscheduler_report"><code>[observability.scheduler_report]</code></a></h2>
+<p>Optional scheduler heartbeat reporting for multi-node control plane integration.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>boolean</td><td><code>false</code></td><td>Enable periodic scheduler heartbeat reporting. Requires <code>[cluster].scheduler_endpoint</code></td></tr>
+<tr><td><code>interval_secs</code></td><td>integer</td><td><code>5</code></td><td>Heartbeat report interval in seconds</td></tr>
+</tbody>
+</table>
+</div>
+<p>Environment variable overrides:</p>
+<ul>
+<li><code>AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED</code></li>
+<li><code>AENV_OBSERVABILITY_SCHEDULER_ENDPOINT</code></li>
+<li><code>AENV_OBSERVABILITY_REPORT_INTERVAL_SECS</code></li>
+</ul>
+<p><code>AENV_OBSERVABILITY_SCHEDULER_ENDPOINT</code> overrides <code>[cluster].scheduler_endpoint</code> for the reporter process only.</p>
+<h2 id="cluster"><a class="header" href="#cluster"><code>[cluster]</code></a></h2>
+<p>Shared cluster-level service endpoints.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>scheduler_endpoint</code></td><td>string</td><td>unset</td><td>gRPC endpoint for the scheduler, for example <code>"http://127.0.0.1:9090"</code>. Used by scheduler heartbeat reporting and P2P peer discovery.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="p2p"><a class="header" href="#p2p"><code>[p2p]</code></a></h2>
+<p>Project-wide artifact transport configuration. The transport is disabled by default. When enabled, it is used by the overlaybd P2P HTTP facade and by snapshot publication/runtime resolution as an optional artifact visibility and acceleration path.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>boolean</td><td><code>false</code></td><td>Enable the P2P artifact transport. When false, AgentENV uses <code>DisabledP2pTransport</code>, so lookups miss and publishes are no-ops.</td></tr>
+<tr><td><code>transport</code></td><td>string</td><td><code>"iroh"</code></td><td>Transport backend. Supported values are <code>"disabled"</code> and <code>"iroh"</code>. Ignored while <code>enabled = false</code>.</td></tr>
+<tr><td><code>store_dir</code></td><td>string</td><td><code>"$AENV_HOME/p2p/store"</code></td><td>Local store used by the transport backend. Relative explicit paths are resolved against the config file directory.</td></tr>
+<tr><td><code>listen_addr</code></td><td>string</td><td><code>"0.0.0.0:0"</code></td><td>Optional local listen address for the embedded transport endpoint. Port <code>0</code> lets the OS choose a free port.</td></tr>
+<tr><td><code>lookup_timeout_ms</code></td><td>integer</td><td><code>5000</code></td><td>Timeout for one artifact catalog lookup against a peer.</td></tr>
+<tr><td><code>fetch_timeout_ms</code></td><td>integer</td><td><code>30000</code></td><td>Timeout for fetching one artifact from a peer.</td></tr>
+<tr><td><code>peer_discovery_refresh_interval_secs</code></td><td>integer</td><td><code>5</code></td><td>Interval for refreshing peer endpoints from scheduler. Values below one second are clamped to one second.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="custom_extension"><a class="header" href="#custom_extension"><code>[custom_extension]</code></a></h2>
+<p>Custom extension service configuration. When <code>url</code> is unset, the integration is fully disabled. See <a href="../concepts/custom-extension.html">Custom Extension</a>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>url</code></td><td>string</td><td>unset</td><td>HTTP base URL of the custom extension service. When set, AgentENV invokes sandbox lifecycle hooks under <code>POST {url}/sandbox-hook/*</code>.</td></tr>
+<tr><td><code>timeout_ms</code></td><td>integer</td><td><code>5000</code></td><td>Timeout for each custom extension HTTP call, in milliseconds.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="snapshot"><a class="header" href="#snapshot"><code>[snapshot]</code></a></h2>
+<p>Snapshot storage/build configuration.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>local_cache_path</code></td><td>string</td><td><code>"$AENV_HOME/snapshot-local-cache"</code></td><td>Manager-owned node-local snapshot artifact/cache root. Relative explicit paths are resolved against the config file directory.</td></tr>
+<tr><td><code>repository_backend</code></td><td>string</td><td><code>"posix_fs"</code></td><td>Snapshot repository backend. Supported values: <code>"posix_fs"</code> and <code>"oss"</code></td></tr>
+<tr><td><code>p2p_enabled</code></td><td>boolean</td><td><code>true</code></td><td>When enabled, the snapshot manager publishes committed snapshots to the P2P transport and attempts to resolve from it before falling back to the repository backend.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Environment variable overrides:</p>
+<ul>
+<li><code>AENV_SNAPSHOT_LOCAL_CACHE_PATH</code></li>
+</ul>
+<h2 id="snapshotimage_publish"><a class="header" href="#snapshotimage_publish"><code>[snapshot.image_publish]</code></a></h2>
+<p>Source-registry image publication. Only takes effect when <code>snapshot.repository_backend = "oss"</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>boolean</td><td><code>false</code></td><td>When enabled, publishing a snapshot also pushes its rootfs as an OverlayBD-native OCI image tag <code>agentenv-snapshot-{snapshot_id}</code> to the original source registry. Requires source images to be OverlayBD-native in that registry and push credentials in the Docker config (<code>~/.docker/config.json</code>). Existing remote layers are referenced by digest; only new delta layers are uploaded. The published reference is exposed as <code>imageRef</code> in snapshot APIs. Memory and VM-state artifacts always remain in the snapshot repository.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="backendposix_fs"><a class="header" href="#backendposix_fs"><code>[backend.posix_fs]</code></a></h2>
+<p>POSIX filesystem-backed snapshot repository configuration. This section is used when <code>snapshot.repository_backend = "posix_fs"</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>snapshot_store</code></td><td>string</td><td><code>"$AENV_HOME/snapshot-store"</code></td><td>Root directory for durable committed snapshot repository state. Relative explicit paths are resolved against the config file directory.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Environment variable overrides:</p>
+<ul>
+<li><code>AENV_SNAPSHOT_STORE</code></li>
+</ul>
+<h2 id="backendoss"><a class="header" href="#backendoss"><code>[backend.oss]</code></a></h2>
+<p>OSS-backed snapshot repository configuration. This section is required when <code>snapshot.repository_backend = "oss"</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>endpoint</code></td><td>string</td><td>none</td><td>OSS endpoint URL, for example <code>"https://oss-cn-hangzhou.aliyuncs.com"</code></td></tr>
+<tr><td><code>bucket</code></td><td>string</td><td>none</td><td>OSS bucket name used for committed snapshot state</td></tr>
+<tr><td><code>prefix</code></td><td>string</td><td>empty</td><td>Optional object key prefix under the bucket</td></tr>
+<tr><td><code>credential_process</code></td><td>string</td><td>unset</td><td>External command used to fetch OSS credentials. Use a plain executable-plus-args form without shell expansion, pipes, or command substitution so it behaves consistently across AgentENV and overlaybd credential consumers</td></tr>
+<tr><td><code>access_key_id</code></td><td>string</td><td>unset</td><td>Static OSS access key ID. Required when <code>credential_process</code> is not set</td></tr>
+<tr><td><code>access_key_secret</code></td><td>string</td><td>unset</td><td>Static OSS access key secret. Required when <code>credential_process</code> is not set</td></tr>
+<tr><td><code>security_token</code></td><td>string</td><td>unset</td><td>Optional session token paired with static access key credentials</td></tr>
+<tr><td><code>region</code></td><td>string</td><td>none</td><td>Region passed to the S3-compatible object-store client; required for current OSS backend</td></tr>
+<tr><td><code>cache_max_size_gb</code></td><td>integer</td><td><code>10</code></td><td>Maximum size of the node-local OSS artifact cache in GiB</td></tr>
+</tbody>
+</table>
+</div>
+<p>Notes:</p>
+<ul>
+<li><code>credential_process</code> and static access key settings are mutually exclusive in practice; when <code>credential_process</code> is set, the backend ignores static credential fields.</li>
+<li><code>credential_process</code> should be written as a portable argv-style command line. Avoid <code>$VAR</code>, backticks, <code>$(...)</code>, pipes, and shell builtins.</li>
+<li>Although the config section is still named <code>oss</code>, the runtime path is implemented via a shared S3-compatible client, so <code>region</code> must be configured.</li>
+</ul>
+<p>Other path override:</p>
+<ul>
+<li><code>AENV_DEPS_PATH</code></li>
+</ul>
+<p>Setup sysctl tuning is host-level setup. It is skipped before reading <code>/proc/sys</code>
+when the server detects that it is running inside a container. Set
+<code>AENV_FORCE_SYSCTL_TUNING=1</code> only for a privileged container with writable
+host sysctls; otherwise configure these kernel parameters on the host.</p>
+<h2 id="protoc"><a class="header" href="#protoc"><code>[protoc]</code></a></h2>
+<p>Protobuf compiler metadata for code generation lives in
+<code>config/deps_manifest.toml</code>, not <code>config.toml</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>version</code></td><td>string</td><td><code>"33.4"</code></td><td>protoc release version</td></tr>
+<tr><td><code>url</code></td><td>string</td><td>GitHub release URL</td><td>Download URL template with <code>{version}</code> and <code>{platform}</code> placeholders</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="ublk"><a class="header" href="#ublk"><code>[ublk]</code></a></h2>
+<p>Optional userspace block device configuration. When enabled, rootfs is served through a ublk device instead of a plain file, managed by <code>uvm-ublk-daemon</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable ublk-backed rootfs</td></tr>
+<tr><td><code>daemon_binary_path</code></td><td>string</td><td><code>"$AENV_HOME/ublk/uvm-ublk-daemon"</code></td><td>Path to the <code>uvm-ublk-daemon</code> binary</td></tr>
+<tr><td><code>daemon_socket_path</code></td><td>string</td><td><code>"$AENV_RUNTIME/ublk-daemon.sock"</code></td><td>Unix socket path used by the daemon</td></tr>
+<tr><td><code>daemon_log_path</code></td><td>string</td><td><code>"$AENV_HOME/logs/ublk-daemon.log"</code></td><td>File path for daemon logs; deployments are responsible for rotation and retention</td></tr>
+<tr><td><code>daemon_metrics_listen_addr</code></td><td>string</td><td><code>"0.0.0.0:9103"</code></td><td>HTTP listen address for daemon Prometheus metrics; empty string disables it</td></tr>
+<tr><td><code>device_type</code></td><td>string</td><td><code>"overlaybd"</code></td><td><code>"cow"</code> (copy-on-write) or <code>"overlaybd"</code> (layered image)</td></tr>
+</tbody>
+</table>
+</div>
+<p>Environment variable override:</p>
+<ul>
+<li><code>AENV_UBLK_DAEMON_BINARY_PATH</code></li>
+<li><code>AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR</code></li>
+</ul>
+<h2 id="ublkoverlaybd"><a class="header" href="#ublkoverlaybd"><code>[ublk.overlaybd]</code></a></h2>
+<p>Overlaybd-specific configuration used when <code>ublk.device_type = "overlaybd"</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>global_config_path</code></td><td>string</td><td><code>"$AENV_HOME/overlaybd/overlaybd-global.json"</code></td><td>Path to overlaybd global config JSON (see note below). Relative explicit paths are resolved against the config file directory.</td></tr>
+<tr><td><code>read_only</code></td><td>boolean</td><td><code>false</code></td><td>When set to <code>true</code>, materializes the rootfs without a writable upper</td></tr>
+<tr><td><code>runtime_upper_mode</code></td><td>string</td><td><code>"hybridLogStructured"</code></td><td>Runtime upper format for newly materialized writable rootfs OverlayBD images. Supported values are <code>"logStructured"</code>, <code>"hybridLogStructured"</code>, and <code>"sparse"</code>. Existing source uppers keep their own mode</td></tr>
+<tr><td><code>allow_shrink</code></td><td>boolean</td><td><code>false</code></td><td>Allows an explicit cold-start <code>diskSizeMB</code> smaller than the source rootfs. Explicit sizes use MiB and must be divisible by 1024. Growth is always allowed; snapshot resume never resizes.</td></tr>
+<tr><td><code>resize_timeout_secs</code></td><td>integer</td><td><code>120</code></td><td>Timeout in seconds for the cold-start OverlayBD resize tool. Must be greater than zero.</td></tr>
+<tr><td><code>download_enable</code></td><td>boolean</td><td><code>false</code></td><td>Enables overlaybd layer-level background download for remote layers</td></tr>
+<tr><td><code>p2p_lookup_timeout_ms</code></td><td>integer</td><td><code>300</code></td><td>Timeout for one foreground Overlaybd descriptor lookup through the localhost P2P HTTP facade. Timeout is treated as a cacheable miss.</td></tr>
+<tr><td><code>p2p_fetch_range_timeout_ms</code></td><td>integer</td><td><code>2000</code></td><td>Timeout for one foreground Overlaybd range fetch through the localhost P2P HTTP facade before falling back to the origin registry.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="global_config_path-and-auto-generated-config"><a class="header" href="#global_config_path-and-auto-generated-config"><code>global_config_path</code> and auto-generated config</a></h3>
+<p>The file at the configured default path
+<code>$AENV_HOME/overlaybd/overlaybd-global.json</code> is <strong>auto-generated</strong> by the server
+at startup. The generated JSON incorporates several TOML settings —
+<code>[image.cache].root_dir</code>, <code>[image.cache.remote_blocks].max_size_gb</code>,
+<code>download_enable</code>, <code>[backend.oss]</code> credentials, and Docker registry credentials
+detected from <code>~/.docker/config.json</code> — into a single overlaybd runtime config
+file.</p>
+<p>The server regenerates the file at <code>global_config_path</code> on every startup, so
+these TOML settings always take effect automatically — any manual edits to the
+generated file are overwritten on the next startup. To keep customizations,
+make them through the TOML settings, not by editing the generated JSON.</p>
+<h2 id="memory_snapshot"><a class="header" href="#memory_snapshot"><code>[memory_snapshot]</code></a></h2>
+<p>Memory snapshot overlaybd configuration. The server auto-generates the file at
+the default path on every startup.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>overlaybd_global_config_path</code></td><td>string</td><td><code>"$AENV_HOME/overlaybd/mem-overlaybd-global.json"</code></td><td>Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file.</td></tr>
+<tr><td><code>direct_overlaybd</code></td><td>bool</td><td><code>true</code></td><td>Create memory overlaybd layers directly from Firecracker dirty memory ranges via <code>process_vm_readv</code>, skipping the intermediate <code>mem.bin</code> file. Set <code>AGENTENV_MEMORY_SNAPSHOT_DIRECT_OVERLAYBD=false</code> to force the legacy <code>mem.bin</code> conversion path.</td></tr>
+<tr><td><code>compression_enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable compression for memory snapshot layers. When disabled, <code>compression_algorithm</code> is still parsed but has no effect. This setting affects only memory layers; the physical file name remains <code>overlaybd.commit</code>.</td></tr>
+<tr><td><code>compression_algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm for memory snapshot layers. Valid values are only <code>lz4</code> and <code>zstd</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="memory_snapshotbackground_download"><a class="header" href="#memory_snapshotbackground_download"><code>[memory_snapshot.background_download]</code></a></h2>
+<p>Background download settings dedicated to remote memory-snapshot OverlayBD layers.
+They do not change the general rootfs or attached-drive defaults. All fields are
+serialized into the generated memory OverlayBD global config. Each remote layer
+is downloaded block by block: a sequential sparse-file scan collects the pending
+blocks, then at most <code>concurrency</code> block tasks fetch non-overlapping ranges in
+parallel on a dedicated multi-thread runtime. Layer files are still processed
+one at a time. Downloads of a sandbox-bound device start only after envd is
+ready (plus <code>delay</code>), with a 20s fallback if the ready signal is lost; while
+foreground remote reads are in flight, background block reads yield to a small
+guaranteed floor instead of competing at full speed. The generated memory
+config leaves throttling off (<code>maxMBps = 0</code>); image configs that carry a positive
+<code>maxMBps</code> keep their historical shared rate limit across the block tasks.
+Completed layers are switched to the local file only after a full-file digest
+check; a failed or canceled block never switches.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>enable</code></td><td>boolean</td><td><code>true</code></td><td>Enables background download for remote memory-snapshot layers.</td></tr>
+<tr><td><code>delay</code></td><td>integer</td><td><code>0</code></td><td>Delay in seconds after envd is ready before background download begins (downloads never start before envd readiness; a 20s fallback applies if the ready signal is lost).</td></tr>
+<tr><td><code>delay_extra</code></td><td>integer</td><td><code>1</code></td><td>Exclusive upper bound for random extra delay. The default <code>1</code> ensures <code>delay = 0</code> adds no jitter.</td></tr>
+<tr><td><code>try_cnt</code></td><td>integer</td><td><code>5</code></td><td>Retry count, with the same semantics as OverlayBD <code>DownloadConfig.tryCnt</code>.</td></tr>
+<tr><td><code>block_size</code></td><td>integer</td><td><code>16777216</code></td><td>Download block size in bytes (16 MiB). Peak scratch memory per active layer download is <code>block_size * concurrency</code>.</td></tr>
+<tr><td><code>concurrency</code></td><td>integer</td><td><code>4</code></td><td>Maximum number of in-flight block remote reads within a single remote layer. <code>1</code> keeps the historical serial behavior. Must be greater than zero.</td></tr>
+<tr><td><code>max_inflight_blocks</code></td><td>integer</td><td><code>16</code></td><td>Process-wide cap on in-flight download blocks shared by every concurrent layer download; bounds total scratch memory to <code>max_inflight_blocks * block_size</code>. Must be greater than zero.</td></tr>
+</tbody>
+</table>
+</div>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../deployment/pvm.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../configuration/env-vars.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../deployment/pvm.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../configuration/env-vars.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/version-selector-067fd7db.js"></script>
+
+
+
+    </div>
+    </body>
+</html>
