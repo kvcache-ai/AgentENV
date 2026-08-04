@@ -4,7 +4,7 @@ SHELL := /usr/bin/env bash
 
 REPO_ROOT := ..
 TOOLS_VERSION ?= 0.1.0
-ENVD_REF ?= 2026.16
+ENVD_REF ?= 2026.17
 ENVD_UPSTREAM_REPO ?= https://github.com/e2b-dev/infra.git
 HOST_MACHINE := $(shell uname -m)
 ifeq ($(HOST_MACHINE),x86_64)
@@ -51,7 +51,7 @@ check-publish-image:
 		*/*) ;; \
 		*) \
 			echo "IMAGE must include a registry/repository for publish, got '$(IMAGE)'." >&2; \
-			echo "Example: make publish IMAGE=ghcr.io/zlzgithub-0801/agentenv-tools:$(TOOLS_VERSION)" >&2; \
+			echo "Example: make publish IMAGE=ghcr.io/kvcache-ai/agentenv-tools:$(TOOLS_VERSION)" >&2; \
 			exit 1; \
 		;; \
 	esac

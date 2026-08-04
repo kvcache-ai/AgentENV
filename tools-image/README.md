@@ -87,7 +87,7 @@ The build accepts these Make variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `TOOLS_VERSION` | `0.1.0` | Immutable SemVer release of the complete tools drive |
-| `ENVD_REF` | `2026.16` | Tag, branch, or fetchable commit to build from the envd upstream repository |
+| `ENVD_REF` | `2026.17` | Tag, branch, or fetchable commit to build from the envd upstream repository |
 | `ENVD_UPSTREAM_REPO` | `https://github.com/e2b-dev/infra.git` | Repository containing `packages/envd` |
 | `ARCH` | host architecture, normalized to `amd64` or `arm64` | Target architecture |
 | `PUBLISH_PLATFORMS` | `linux/amd64,linux/arm64` | Platforms included in the published OCI image |
@@ -99,12 +99,12 @@ The build accepts these Make variables:
 Examples:
 
 ```bash
-make TOOLS_VERSION=0.1.0 ENVD_REF=2026.16 ARCH=amd64
+make TOOLS_VERSION=0.1.0 ENVD_REF=2026.17 ARCH=amd64
 
 make \
   ENVD_UPSTREAM_REPO=https://github.com/e2b-dev/infra.git \
   TOOLS_VERSION=0.1.0 \
-  ENVD_REF=2026.16 \
+  ENVD_REF=2026.17 \
   ARCH=amd64
 ```
 
@@ -119,12 +119,12 @@ tags to prevent concurrent or external publishers from replacing a release.
 ```bash
 make publish \
   TOOLS_VERSION=0.1.0 \
-  ENVD_REF=2026.16 \
-  IMAGE=ghcr.io/zlzgithub-0801/agentenv-tools:0.1.0
+  ENVD_REF=2026.17 \
+  IMAGE=ghcr.io/kvcache-ai/agentenv-tools:0.1.0
 
 make publish \
   TOOLS_VERSION=0.1.0-custom.1 \
-  ENVD_REF=2026.16 \
+  ENVD_REF=2026.17 \
   IMAGE=registry.example.com/custom/agentenv-tools:0.1.0-custom.1
 ```
 

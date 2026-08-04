@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{
     CapturedSandboxSnapshot, FirecrackerSandbox, SandboxBackend, SandboxExecutor,
     SandboxLaunchConfig,
@@ -21,7 +22,9 @@ fn sample_runtime_versions() -> SnapshotRuntimeVersions {
         kernel_version: "kernel".to_string(),
         firecracker_version: "fc".to_string(),
         envd_version: "envd".to_string(),
-        tools_drive_version: "0.1.0".to_string(),
+        tools_drive_version: ConfigManager::global_config()
+            .resolved_tools_version()
+            .to_string(),
     }
 }
 
