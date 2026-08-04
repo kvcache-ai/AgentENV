@@ -23,6 +23,7 @@ struct DualClient {
     h2: Client<HttpConnector, TonicBoxBody>,
     protocol: Arc<Mutex<Option<Protocol>>>,
     uri: Uri,
+    access_token: Option<http::HeaderValue>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +51,7 @@ impl Service<http::Request<TonicBoxBody>> for DualClient {
         let h2 = self.h2.clone();
         let protocol = self.protocol.clone();
         let uri = self.uri.clone();
+        let access_token = self.access_token.clone();
 
         Box::pin(async move {
             // Determine protocol if unknown
@@ -77,6 +79,10 @@ impl Service<http::Request<TonicBoxBody>> for DualClient {
                     }
                 }
                 *protocol.lock().await = proto;
+            }
+
+            if let Some(access_token) = access_token {
+                req.headers_mut().insert("x-access-token", access_token);
             }
 
             // Prepare the actual request
@@ -116,8 +122,16 @@ fn nodelay_connector() -> HttpConnector {
 /// Creates a channel compatible with both HTTP/1.1 and HTTP/2.
 ///
 /// The channel automatically probes the server to determine supported protocol (H2 or H1).
-pub fn new_channel(addr: &str) -> anyhow::Result<Channel> {
+pub fn new_channel(addr: &str, access_token: Option<&str>) -> anyhow::Result<Channel> {
     let uri: Uri = addr.parse().context("Invalid URI")?;
+    let access_token = access_token
+        .map(|token| {
+            let mut token = http::HeaderValue::from_str(token)?;
+            token.set_sensitive(true);
+            Ok::<_, http::header::InvalidHeaderValue>(token)
+        })
+        .transpose()
+        .context("Invalid envd access token")?;
 
     let h1 = Client::builder(TokioExecutor::new())
         .http2_only(false)
@@ -133,6 +147,7 @@ pub fn new_channel(addr: &str) -> anyhow::Result<Channel> {
         h2,
         protocol: Arc::new(Mutex::new(None)),
         uri,
+        access_token,
     };
 
     Ok(tower::util::BoxCloneService::new(service))

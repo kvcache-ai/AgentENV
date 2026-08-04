@@ -21,6 +21,9 @@ pub struct Args {
     /// Start directly from an external OCI image instead of a template/snapshot
     #[arg(long)]
     cold: bool,
+    /// Require an envd access token for sandbox control communication
+    #[arg(long)]
+    secure: bool,
     /// Sandbox TTL in seconds
     #[arg(long, default_value_t = super::DEFAULT_TIMEOUT_SECS)]
     timeout: u32,
@@ -46,20 +49,22 @@ fn parse_disk_size_mb(value: &str) -> std::result::Result<u32, String> {
 
 pub fn run(args: Args) -> Result<()> {
     let client = Client::from_env()?;
-    let sandbox_id = if args.cold {
+    let sandbox = if args.cold {
         client.create_cold_sandbox(
             &args.target,
             Some(args.timeout),
             args.resources.cpu_count,
             args.resources.memory_mb,
             args.disk_size_mb,
+            args.secure,
         )?
     } else {
         if args.resources.is_set() || args.disk_size_mb.is_some() {
             anyhow::bail!("--cpu-count, --memory-mb, and --disk-size-mb require --cold");
         }
-        client.create_sandbox(&args.target, Some(args.timeout))?
+        client.create_sandbox(&args.target, Some(args.timeout), args.secure)?
     };
+    let sandbox_id = sandbox.sandbox_id;
 
     if args.detach {
         println!("{}", sandbox_id);
@@ -68,18 +73,29 @@ pub fn run(args: Args) -> Result<()> {
 
     println!("Started sandbox {}", sandbox_id);
     let rt = super::tokio_rt()?;
-    rt.block_on(wait_for_envd(&client, &sandbox_id))?;
+    rt.block_on(wait_for_envd(
+        &client,
+        &sandbox_id,
+        sandbox.envd_access_token.as_deref(),
+    ))?;
     let code = rt.block_on(super::connect::attach(&client, &sandbox_id))?;
     std::process::exit(code);
 }
 
-async fn wait_for_envd(client: &Client, sandbox_id: &str) -> Result<()> {
+async fn wait_for_envd(
+    client: &Client,
+    sandbox_id: &str,
+    envd_access_token: Option<&str>,
+) -> Result<()> {
     let deadline = Instant::now() + ENVD_READY_TIMEOUT;
     while Instant::now() < deadline {
         if matches!(
-            client
-                .envd_ready_with_timeout(sandbox_id, ENVD_READY_PROBE_TIMEOUT)
-                .await,
+            tokio::time::timeout(
+                ENVD_READY_PROBE_TIMEOUT,
+                client.transport(sandbox_id, envd_access_token)?.ready(),
+            )
+            .await
+            .map(|result| result.is_ok()),
             Ok(true)
         ) {
             return Ok(());

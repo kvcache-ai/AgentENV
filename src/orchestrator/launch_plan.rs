@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use super::store::{NewTimeout, SandboxMetadata};
 use super::types::SandboxState;
-use crate::sandbox::{FreshSandboxBuildSpec, PausedSandboxState, SandboxLaunchConfig};
+use crate::sandbox::{
+    EnvdAccessToken, FreshSandboxBuildSpec, PausedSandboxState, SandboxLaunchConfig,
+};
 use crate::snapshot::RunnableSnapshot;
 use crate::types::{SandboxId, SandboxResources};
 
@@ -28,6 +30,7 @@ pub(super) struct ResumeLaunchPlan {
     pub paused_state: Arc<dyn PausedSandboxState>,
     pub timeout: NewTimeout,
     pub resources: SandboxResources,
+    pub envd_access_token: Option<EnvdAccessToken>,
 }
 
 pub(super) enum LaunchPlan {
@@ -75,12 +78,14 @@ impl LaunchPlan {
         paused_state: Arc<dyn PausedSandboxState>,
         timeout: NewTimeout,
         resources: SandboxResources,
+        envd_access_token: Option<EnvdAccessToken>,
     ) -> Self {
         Self::Resume(Box::new(ResumeLaunchPlan {
             sandbox_id,
             paused_state,
             timeout,
             resources,
+            envd_access_token,
         }))
     }
 

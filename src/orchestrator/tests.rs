@@ -50,6 +50,18 @@ fn test_runtime_image_refs() -> Arc<dyn RuntimeImageRefs> {
     local_image_services_from_global_config().runtime_refs
 }
 
+fn test_access_tokens() -> Arc<SandboxAccessTokenGenerator> {
+    Arc::new(
+        SandboxAccessTokenGenerator::new(
+            ConfigManager::global_config()
+                .sandbox
+                .access_token_hash_seed()
+                .unwrap(),
+        )
+        .unwrap(),
+    )
+}
+
 async fn make_orchestrator() -> Arc<TestOrchestrator> {
     Orchestrator::new_inner(
         InMemoryMetadataStore::new(),
@@ -117,6 +129,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         shutdown_tx: tokio::sync::watch::channel(false).0,
         shutdown_outcome: tokio::sync::OnceCell::new(),
         image_refs: test_runtime_image_refs(),
+        access_tokens: test_access_tokens(),
     })
 }
 
@@ -731,6 +744,7 @@ fn resume_launch_plan(sandbox_id: SandboxId) -> LaunchPlan {
         Arc::clone(test_paused_state()),
         NewTimeout::None,
         SandboxResources::default(),
+        None,
     )
 }
 
@@ -1075,6 +1089,7 @@ fn create_request(
         network_policy: SandboxNetworkPolicy::default(),
         custom_extension_params: None,
         auto_resume: false,
+        secure: false,
     }
 }
 
@@ -1136,6 +1151,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
             auto_resume: false,
+            secure: false,
         })
         .await?;
 
@@ -4435,9 +4451,13 @@ async fn fork_sandbox_creates_running_children_from_one_source() -> Result<()> {
     let orchestrator =
         make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
             .await;
-    let source = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "batch-fork-source")]))
-        .await?;
+    let mut request = create_request(Some(60), &[("team", "batch-fork-source")]);
+    request.secure = true;
+    let source = orchestrator.create_sandbox(request).await?;
+    assert!(source.secure);
+    let source_token = orchestrator
+        .get_envd_access_token(&source)
+        .expect("secure source has a token");
     behavior.push_action(
         MockOperation::Build,
         MockAction::Fail {
@@ -4451,12 +4471,20 @@ async fn fork_sandbox_creates_running_children_from_one_source() -> Result<()> {
     let children = outcomes.into_iter().collect::<StdResult<Vec<_>, _>>()?;
 
     assert_eq!(children.len(), 3);
+    let mut child_tokens = Vec::with_capacity(children.len());
     for child in &children {
         assert_ne!(child.id, source.id);
         assert_eq!(child.state, SandboxState::Running);
         assert_eq!(child.snapshot_id, source.snapshot_id);
         assert_eq!(child.user_metadata, source.user_metadata);
         assert_eq!(child.timeout, source.timeout);
+        assert!(child.secure);
+        let child_token = orchestrator
+            .get_envd_access_token(child)
+            .expect("secure child has a token");
+        assert_ne!(child_token, source_token);
+        assert!(!child_tokens.contains(&child_token));
+        child_tokens.push(child_token);
         assert_proxy_ready(&orchestrator, &child.id).await?;
     }
     let source_after = orchestrator

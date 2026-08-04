@@ -449,6 +449,7 @@ mod tests {
             &self,
             _sandbox_id: SandboxId,
             _state: &dyn PausedSandboxState,
+            _envd_access_token: Option<crate::sandbox::EnvdAccessToken>,
         ) -> Result<Box<dyn SandboxBackend>> {
             unreachable!("persister tests only decode state")
         }

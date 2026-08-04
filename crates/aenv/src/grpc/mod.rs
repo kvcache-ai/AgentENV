@@ -56,16 +56,23 @@ pub struct Transport {
     base_url: String,
     api_key: String,
     sandbox_id: String,
+    envd_access_token: Option<String>,
 }
 
 impl Transport {
-    pub fn new(base_url: &str, api_key: &str, sandbox_id: &str) -> Result<Self> {
+    pub fn new(
+        base_url: &str,
+        api_key: &str,
+        sandbox_id: &str,
+        envd_access_token: Option<&str>,
+    ) -> Result<Self> {
         let http = Self::http_client(base_url).context("building Connect-RPC HTTP client")?;
         Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.to_string(),
             sandbox_id: sandbox_id.to_string(),
+            envd_access_token: envd_access_token.map(str::to_owned),
         })
     }
 
@@ -94,11 +101,15 @@ impl Transport {
     }
 
     fn auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        builder
+        let builder = builder
             .header("X-API-Key", &self.api_key)
             .header("x-agentenv-sandbox-id", &self.sandbox_id)
             .header("x-agentenv-target-port", ENVD_PORT_STR)
-            .header("Connect-Protocol-Version", "1")
+            .header("Connect-Protocol-Version", "1");
+        match &self.envd_access_token {
+            Some(token) => builder.header("X-Access-Token", token),
+            None => builder,
+        }
     }
 
     fn unary_request(
@@ -497,7 +508,7 @@ mod tests {
 
     #[test]
     fn unary_user_is_sent_as_basic_auth() {
-        let transport = Transport::new("http://127.0.0.1", "api-key", "sandbox-id").unwrap();
+        let transport = Transport::new("http://127.0.0.1", "api-key", "sandbox-id", None).unwrap();
         let request = transport
             .unary_request("filesystem.Filesystem", "Stat", Some("app"))
             .build()
@@ -513,5 +524,26 @@ mod tests {
             .build()
             .unwrap();
         assert!(!request.headers().contains_key(AUTHORIZATION));
+    }
+
+    #[test]
+    fn envd_access_token_is_sent_on_connect_requests() {
+        let transport = Transport::new(
+            "http://127.0.0.1",
+            "api-key",
+            "sandbox-id",
+            Some("envd-token"),
+        )
+        .unwrap();
+
+        let request = transport
+            .unary_request("process.Process", "List", None)
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request.headers().get("x-access-token").unwrap(),
+            "envd-token"
+        );
     }
 }

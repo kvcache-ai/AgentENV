@@ -11,7 +11,7 @@ use common::TEST_ENVD_ADDR;
 /// Verifies filesystem operations: MakeDir, Stat, Move, ListDir, Remove.
 #[tokio::test]
 async fn test_filesystem_lifecycle() -> Result<()> {
-    let mut client = FilesystemClient::connect(TEST_ENVD_ADDR).await?;
+    let mut client = FilesystemClient::connect(TEST_ENVD_ADDR, None).await?;
 
     let tmp = tempfile::TempDir::new()?;
     let base_path = tmp

@@ -187,6 +187,11 @@ init_timeout_secs = 60
 # envd readiness polling interval in milliseconds.
 poll_ms = 3
 
+[sandbox]
+# Shared secret used to derive per-sandbox envd access tokens. All nodes in a
+# cluster must use the same value. Prefer AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED.
+# access_token_hash_seed = "replace-with-a-secret"
+
 [orchestrator]
 # Expired-sandbox eviction interval in milliseconds (1000 = 1 second).
 auto_evict_interval_ms = 1000

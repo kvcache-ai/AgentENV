@@ -54,6 +54,10 @@ pub struct SandboxMetadata {
     /// unless overridden at create time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<CustomExtensionParams>,
+    /// Whether envd requires the access token derived from this sandbox's ID.
+    /// Older records deserialize as non-secure sandboxes.
+    #[serde(default)]
+    pub secure: bool,
     /// Paused state produced by the sandbox backend during `pause`.
     /// Passed back to the backend factory when `resume_sandbox` is called.
     #[serde(skip)]
@@ -86,6 +90,7 @@ impl Default for SandboxMetadata {
             user_metadata: None,
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
+            secure: false,
             paused_state: None,
         }
     }

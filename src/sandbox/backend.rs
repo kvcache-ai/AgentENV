@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    Executor, FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput,
+    EnvdAccessToken, Executor, FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput,
     SandboxLaunchConfig, SandboxNetworkPolicy,
 };
 use crate::sandbox::CustomExtensionParams;
@@ -79,6 +79,12 @@ impl From<anyhow::Error> for SandboxCaptureError {
 
 pub type SandboxCaptureResult<T> = std::result::Result<T, SandboxCaptureError>;
 pub type SandboxForkResult = anyhow::Result<Box<dyn SandboxBackend>>;
+
+#[derive(Clone, Debug)]
+pub struct SandboxForkSpec {
+    pub sandbox_id: SandboxId,
+    pub envd_access_token: Option<EnvdAccessToken>,
+}
 
 /// Opaque set of local runtime artifacts a sandbox needs while it is alive.
 ///
@@ -218,7 +224,7 @@ pub trait SandboxBackend: Send + 'static {
     ///
     /// The outer error is reserved for failures before child startup begins.
     /// After the source has been restored, implementations must attempt every
-    /// child concurrently and return one result per `child_ids` entry in the
+    /// child concurrently and return one result per `spec` entry in the
     /// same order. Successful children stay running when a sibling fails.
     ///
     /// [`SandboxCaptureError::Terminal`] indicates the fork attempt mutated the
@@ -227,7 +233,7 @@ pub trait SandboxBackend: Send + 'static {
     /// recovery belong in the corresponding [`SandboxForkResult`].
     async fn fork(
         &mut self,
-        child_ids: &[SandboxId],
+        spec: &[SandboxForkSpec],
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>>;
 
     /// Stop the sandbox and release all associated system resources.
@@ -287,6 +293,7 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         &self,
         sandbox_id: crate::types::SandboxId,
         state: &dyn PausedSandboxState,
+        envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>>;
 }
 

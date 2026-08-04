@@ -17,6 +17,9 @@ use crate::virtualization::VirtualizationMode;
 
 const ENV_CONFIG_PATH: &str = "AENV_CONFIG_PATH";
 
+#[cfg(test)]
+const TEST_ACCESS_TOKEN_HASH_SEED: &str = "agentenv-unit-test-access-token-seed";
+
 #[derive(Debug, Deserialize)]
 struct SetupDependencyManifest {
     firecracker: ManifestVirtualizationDownloads,
@@ -106,6 +109,8 @@ pub struct AppConfig {
     pub backend: BackendConfig,
     #[config(nested)]
     pub envd: EnvdConfig,
+    #[config(nested)]
+    pub sandbox: SandboxConfig,
     #[config(nested)]
     pub orchestrator: OrchestratorConfig,
     #[config(nested)]
@@ -263,6 +268,42 @@ pub struct EnvdConfig {
     pub init_timeout_secs: u64,
     #[config(default = 3u64)]
     pub poll_ms: u64,
+}
+
+#[derive(Clone, Config)]
+pub struct SandboxConfig {
+    #[config(
+        env = "AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED",
+        parse_env = parse_trimmed_string
+    )]
+    pub access_token_hash_seed: Option<String>,
+}
+
+impl std::fmt::Debug for SandboxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxConfig")
+            .field(
+                "access_token_hash_seed",
+                &self.access_token_hash_seed.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl SandboxConfig {
+    pub(crate) fn access_token_hash_seed(&self) -> Result<&str> {
+        let seed = self.access_token_hash_seed.as_deref().ok_or_else(|| {
+            anyhow!("[sandbox].access_token_hash_seed must be configured and non-empty")
+        })?;
+        if seed.trim().is_empty() {
+            bail!("[sandbox].access_token_hash_seed must be configured and non-empty");
+        }
+        Ok(seed)
+    }
+
+    pub fn validate_access_token_hash_seed(&self) -> Result<()> {
+        self.access_token_hash_seed().map(|_| ())
+    }
 }
 
 #[derive(Debug, Config, Clone)]
@@ -1113,6 +1154,16 @@ impl ConfigManager {
     }
 
     fn set_global(manager: Self) -> Result<&'static Self> {
+        #[cfg(test)]
+        let manager = {
+            let mut manager = manager;
+            manager
+                .config
+                .sandbox
+                .access_token_hash_seed
+                .get_or_insert_with(|| TEST_ACCESS_TOKEN_HASH_SEED.to_string());
+            manager
+        };
         let _ = GLOBAL_CONFIG_MANAGER.set(manager);
         GLOBAL_CONFIG_MANAGER
             .get()
@@ -1291,6 +1342,21 @@ mod tests {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
         Ok(())
+    }
+
+    #[test]
+    fn sandbox_access_token_seed_is_required_for_serving() {
+        let mut config = SandboxConfig {
+            access_token_hash_seed: None,
+        };
+        assert!(config.validate_access_token_hash_seed().is_err());
+
+        config.access_token_hash_seed = Some("   ".to_string());
+        assert!(config.validate_access_token_hash_seed().is_err());
+
+        config.access_token_hash_seed = Some("cluster-secret".to_string());
+        assert!(config.validate_access_token_hash_seed().is_ok());
+        assert!(!format!("{config:?}").contains("cluster-secret"));
     }
 
     #[test]

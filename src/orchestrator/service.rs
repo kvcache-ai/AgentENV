@@ -14,9 +14,10 @@ use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
 use crate::sandbox::{
-    CustomExtensionClient, CustomExtensionParams, FirecrackerSandboxFactory, FreshSandboxBuildSpec,
-    PausedSandboxState, RuntimeArtifactSet, SandboxBackend, SandboxBackendFactory,
-    SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerSandboxFactory,
+    FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator,
+    SandboxBackend, SandboxBackendFactory, SandboxForkSpec, SandboxLaunchConfig,
+    SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
@@ -104,6 +105,7 @@ pub struct Orchestrator<
     shutdown_tx: watch::Sender<bool>,
     shutdown_outcome: OnceCell<ShutdownOutcome>,
     image_refs: Arc<dyn RuntimeImageRefs>,
+    access_tokens: Arc<SandboxAccessTokenGenerator>,
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
@@ -151,6 +153,9 @@ where
         image_refs: Arc<dyn RuntimeImageRefs>,
     ) -> Result<Arc<Self>> {
         let app_config = ConfigManager::global_config();
+        let access_tokens = Arc::new(SandboxAccessTokenGenerator::new(
+            app_config.sandbox.access_token_hash_seed()?,
+        )?);
         let config = &app_config.orchestrator;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (sandbox_event_tx, _sandbox_event_rx) =
@@ -187,6 +192,7 @@ where
             shutdown_tx,
             shutdown_outcome: OnceCell::new(),
             image_refs,
+            access_tokens,
         });
 
         // Start the auto-evict task.
@@ -353,7 +359,9 @@ where
             auto_resume,
             network_policy,
             custom_extension_params,
+            secure,
         } = request;
+        let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
         info!(timeout = ?timeout, "creating sandbox");
 
         let result = match source {
@@ -370,6 +378,10 @@ where
                     });
                 }
                 let launch_image_configs = committed.image_configs.clone();
+                let mut extra_mmds = serde_json::Map::new();
+                if !launch_image_configs.is_empty() {
+                    extra_mmds.insert("imageConfigs".to_string(), launch_image_configs.to_value());
+                };
                 // Effective custom config: a launch-provided value overrides the
                 // one persisted in the source snapshot; otherwise inherit it.
                 // Store the effective value so publishing a snapshot from this
@@ -377,11 +389,15 @@ where
                 let effective_custom_extension_params = custom_extension_params
                     .clone()
                     .or_else(|| committed.custom_extension_params.clone());
-                let mut launch_config = SandboxLaunchConfig::new(sandbox_id, record.id.to_string());
-                launch_config.env_vars = env_vars;
-                launch_config.network = network_policy.runtime_policy();
-                launch_config.custom_extension_params = effective_custom_extension_params.clone();
-                let launch_config = launch_config.with_image_configs(&launch_image_configs);
+                let launch_config = SandboxLaunchConfig {
+                    sandbox_id,
+                    snapshot_id: record.id.to_string(),
+                    env_vars,
+                    network: network_policy.runtime_policy(),
+                    extra_mmds,
+                    custom_extension_params: effective_custom_extension_params.clone(),
+                    envd_access_token: envd_access_token.clone(),
+                };
 
                 let transitional_metadata = SandboxMetadata {
                     id: sandbox_id,
@@ -398,6 +414,7 @@ where
                     user_metadata,
                     network_policy,
                     custom_extension_params: effective_custom_extension_params,
+                    secure,
                     ..Default::default()
                 };
 
@@ -422,11 +439,19 @@ where
                 let context = *context;
                 let resources = resources.unwrap_or_else(default_fresh_sandbox_resources);
                 let launch_image_configs = *image_configs;
-                let mut launch_config = SandboxLaunchConfig::new(sandbox_id, image_ref.clone());
-                launch_config.env_vars = env_vars;
-                launch_config.network = network_policy.runtime_policy();
-                launch_config.custom_extension_params = custom_extension_params.clone();
-                let launch_config = launch_config.with_image_configs(&launch_image_configs);
+                let mut extra_mmds = serde_json::Map::new();
+                if !launch_image_configs.is_empty() {
+                    extra_mmds.insert("imageConfigs".to_string(), launch_image_configs.to_value());
+                };
+                let launch_config = SandboxLaunchConfig {
+                    sandbox_id,
+                    snapshot_id: image_ref.clone(),
+                    env_vars,
+                    network: network_policy.runtime_policy(),
+                    extra_mmds,
+                    custom_extension_params: custom_extension_params.clone(),
+                    envd_access_token,
+                };
                 let build_spec = FreshSandboxBuildSpec {
                     image_config_path: overlaybd_config_path,
                     context: context.clone(),
@@ -449,6 +474,7 @@ where
                     user_metadata,
                     network_policy,
                     custom_extension_params,
+                    secure,
                     ..Default::default()
                 };
 
@@ -534,13 +560,23 @@ where
             })?
             .previous;
 
-        let child_ids = (0..count).map(|_| SandboxId::new()).collect::<Vec<_>>();
+        let children_spec = (0..count)
+            .map(|_| {
+                let sandbox_id = SandboxId::new();
+                SandboxForkSpec {
+                    sandbox_id,
+                    envd_access_token: source_metadata
+                        .secure
+                        .then(|| self.access_tokens.generate(sandbox_id)),
+                }
+            })
+            .collect::<Vec<_>>();
 
         // Start to fork the sandbox.
         // This is a single operation that will return a list of results for each child sandbox.
         let fork_result = {
             let mut sandbox = source_handle.lock().await;
-            sandbox.fork(&child_ids).await
+            sandbox.fork(&children_spec).await
         };
         let forked_backends = match fork_result {
             Ok(forked_backends) => forked_backends,
@@ -587,10 +623,11 @@ where
         }
 
         // Register each forked sandbox in the store and runtime, and publish events.
-        let mut outcomes = Vec::with_capacity(child_ids.len());
+        let mut outcomes = Vec::with_capacity(children_spec.len());
         let mut successes = 0u64;
         let now = SystemTime::now();
-        for (sandbox_id, backend) in child_ids.into_iter().zip(forked_backends) {
+        for (child, backend) in children_spec.into_iter().zip(forked_backends) {
+            let sandbox_id = child.sandbox_id;
             let backend = match backend {
                 Ok(backend) => backend,
                 Err(err) => {
@@ -688,6 +725,16 @@ where
         filter: SandboxListFilter,
     ) -> Result<Vec<SandboxMetadata>> {
         Ok(self.store.list_filtered(filter).await?)
+    }
+
+    pub fn get_envd_access_token(&self, metadata: &SandboxMetadata) -> Option<EnvdAccessToken> {
+        metadata
+            .secure
+            .then(|| self.access_tokens.generate(metadata.id))
+    }
+
+    pub fn validate_envd_access_token(&self, sandbox_id: SandboxId, candidate: &str) -> bool {
+        self.access_tokens.matches(sandbox_id, candidate)
     }
 
     /// Resolves the current proxyability of a sandbox without touching the sandbox mutex.
@@ -1331,6 +1378,9 @@ where
                 Arc::clone(paused_state),
                 timeout,
                 metadata.resources,
+                metadata
+                    .secure
+                    .then(|| self.access_tokens.generate(metadata.id)),
             ))
             .await;
         if let Ok(metadata) = resumed.as_ref() {
@@ -2088,9 +2138,11 @@ where
                     .factory
                     .build((**build_spec).clone(), plan.launch_config.clone()),
             },
-            LaunchPlan::Resume(plan) => self
-                .factory
-                .build_from_paused_state(plan.sandbox_id, plan.paused_state.as_ref()),
+            LaunchPlan::Resume(plan) => self.factory.build_from_paused_state(
+                plan.sandbox_id,
+                plan.paused_state.as_ref(),
+                plan.envd_access_token.clone(),
+            ),
         };
         build_result.map_err(|source| {
             warn!(error = %format_args!("{source:#}"), "failed to build sandbox");
@@ -2454,6 +2506,19 @@ where
         metadata.auto_resume = auto_resume_enabled;
         self.store.update(metadata).await?;
 
+        Ok(())
+    }
+
+    pub(crate) async fn set_secure_for_test(
+        &self,
+        sandbox_id: &SandboxId,
+        secure: bool,
+    ) -> Result<()> {
+        let Some(mut metadata) = self.store.get(sandbox_id).await? else {
+            return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
+        };
+        metadata.secure = secure;
+        self.store.update(metadata).await?;
         Ok(())
     }
 

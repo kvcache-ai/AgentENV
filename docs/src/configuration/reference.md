@@ -251,6 +251,16 @@ In-guest `envd` daemon settings.
 | `init_timeout_secs` | integer | `60` | Max seconds to wait for envd to become ready after VM start |
 | `poll_ms` | integer | `3` | Poll interval (ms) for envd health check retries |
 
+## `[sandbox]`
+
+Sandbox control communication settings.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `access_token_hash_seed` | string | required | Cluster-wide secret used to derive secure sandbox envd access tokens. All nodes must use the same value. Prefer the `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` environment variable. Normal server startup fails when it is missing or empty; setup-only and host setup do not require it. |
+
+Changing the seed invalidates access tokens for existing secure sandboxes. Rotate it with a coordinated restart of every node.
+
 ## `[orchestrator]`
 
 Sandbox lifecycle management.

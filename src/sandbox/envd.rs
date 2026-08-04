@@ -5,8 +5,12 @@ use anyhow::{anyhow, Context, Result};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, trace};
 
+use crate::sandbox::EnvdAccessToken;
 use envd::filesystem::FilesystemClient;
-use envd::http_client::apis::{configuration::Configuration, default_api};
+use envd::http_client::apis::{
+    configuration::{ApiKey, Configuration},
+    default_api,
+};
 use envd::http_client::models::InitPostRequest;
 use envd::process::ProcessClient;
 use envd::reqwest::Client;
@@ -25,10 +29,11 @@ static ENVD_BOOTSTRAP_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
 pub(crate) struct EnvdInstance {
     config: Configuration,
     grpc_address: String,
+    access_token: Option<EnvdAccessToken>,
 }
 
 impl EnvdInstance {
-    pub(crate) fn new(base_path: String) -> Self {
+    pub(crate) fn new(base_path: String, access_token: Option<EnvdAccessToken>) -> Self {
         let grpc_address = base_path.clone();
         Self {
             // Share client configuration without retaining bootstrap TCP
@@ -40,9 +45,13 @@ impl EnvdInstance {
                 basic_auth: None,
                 oauth_access_token: None,
                 bearer_access_token: None,
-                api_key: None,
+                api_key: access_token.as_ref().map(|token| ApiKey {
+                    prefix: None,
+                    key: token.expose().to_owned(),
+                }),
             },
             grpc_address,
+            access_token,
         }
     }
 
@@ -50,9 +59,12 @@ impl EnvdInstance {
     #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
     pub(crate) async fn process_client(&self) -> Result<ProcessClient> {
         trace!(grpc_address = %self.grpc_address, "connecting envd process client");
-        let client = ProcessClient::connect(&self.grpc_address)
-            .await
-            .context("failed to connect process client")?;
+        let client = ProcessClient::connect(
+            &self.grpc_address,
+            self.access_token.as_ref().map(EnvdAccessToken::expose),
+        )
+        .await
+        .context("failed to connect process client")?;
         trace!("connected to envd process client");
         Ok(client)
     }
@@ -61,9 +73,12 @@ impl EnvdInstance {
     #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
     pub(crate) async fn filesystem_client(&self) -> Result<FilesystemClient> {
         trace!(grpc_address = %self.grpc_address, "connecting envd filesystem client");
-        let client = FilesystemClient::connect(&self.grpc_address)
-            .await
-            .context("failed to connect filesystem client")?;
+        let client = FilesystemClient::connect(
+            &self.grpc_address,
+            self.access_token.as_ref().map(EnvdAccessToken::expose),
+        )
+        .await
+        .context("failed to connect filesystem client")?;
         trace!("connected to envd filesystem client");
         Ok(client)
     }
@@ -124,6 +139,10 @@ impl EnvdInstance {
         debug!(has_env_vars = env_vars.is_some(), "initializing envd");
         let now = chrono::Utc::now().fixed_offset();
         let init_post_request = InitPostRequest {
+            access_token: self
+                .access_token
+                .as_ref()
+                .map(|token| token.expose().to_owned()),
             env_vars,
             default_workdir,
             default_user,
@@ -140,9 +159,46 @@ impl EnvdInstance {
 mod tests {
     use std::time::Instant;
 
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::Value;
     use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
 
     use super::*;
+
+    async fn capture_init_request(
+        State(sender): State<mpsc::Sender<(HeaderMap, Value)>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> StatusCode {
+        sender.send((headers, body)).await.unwrap();
+        StatusCode::NO_CONTENT
+    }
+
+    #[tokio::test]
+    async fn init_sends_access_token_in_header_and_body() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (sender, mut receiver) = mpsc::channel(1);
+        let app = Router::new()
+            .route("/init", post(capture_init_request))
+            .with_state(sender);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let token = crate::sandbox::SandboxAccessTokenGenerator::new("envd-init-test-seed")?
+            .generate(crate::types::SandboxId::new());
+        let envd = EnvdInstance::new(format!("http://{address}"), Some(token.clone()));
+
+        envd.init(None, None, None).await?;
+
+        let (headers, body) = receiver.recv().await.expect("captured init request");
+        assert_eq!(headers["x-access-token"], token.expose());
+        assert_eq!(body["accessToken"], token.expose());
+        server.abort();
+        Ok(())
+    }
 
     #[tokio::test]
     async fn readiness_deadline_bounds_a_hung_health_probe() -> Result<()> {
@@ -154,7 +210,7 @@ mod tests {
             #[allow(unreachable_code)]
             Ok::<_, anyhow::Error>(())
         });
-        let envd = EnvdInstance::new(format!("http://{address}"));
+        let envd = EnvdInstance::new(format!("http://{address}"), None);
         let deadline = Duration::from_millis(50);
         let started = Instant::now();
 

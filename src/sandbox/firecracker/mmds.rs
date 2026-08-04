@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 
+use crate::sandbox::EnvdAccessToken;
 use crate::types::SandboxId;
 
 const EMPTY_ACCESS_TOKEN: &str = "";
@@ -28,7 +29,6 @@ impl MmdsMetadata {
             sandbox_id: sandbox_id.to_string(),
             snapshot_id: snapshot_id.into(),
             logs_collector_address: String::new(),
-            // Access token is currently not supported.
             access_token_hash: hash_access_token(EMPTY_ACCESS_TOKEN),
             extra: serde_json::Map::new(),
         }
@@ -38,6 +38,15 @@ impl MmdsMetadata {
     pub fn with_extra(mut self, extra: serde_json::Map<String, serde_json::Value>) -> Self {
         self.extra.extend(extra);
         self
+    }
+
+    pub(crate) fn with_access_token(mut self, token: Option<&EnvdAccessToken>) -> Self {
+        self.set_access_token(token);
+        self
+    }
+
+    pub(crate) fn set_access_token(&mut self, token: Option<&EnvdAccessToken>) {
+        self.access_token_hash = hash_access_token(token.map_or("", EnvdAccessToken::expose));
     }
 }
 
@@ -68,6 +77,23 @@ mod tests {
                 "accessTokenHash": hash_access_token(""),
             })
         );
+    }
+
+    #[test]
+    fn hashes_secure_access_token_with_sha512() {
+        let sandbox_id = SandboxId::from_uuid(Uuid::nil());
+        let token = crate::sandbox::SandboxAccessTokenGenerator::new("mmds-test-seed")
+            .unwrap()
+            .generate(sandbox_id);
+
+        let metadata =
+            MmdsMetadata::new(sandbox_id, "snapshot-123").with_access_token(Some(&token));
+
+        assert_eq!(
+            metadata.access_token_hash,
+            hash_access_token(token.expose())
+        );
+        assert!(!metadata.access_token_hash.contains(token.expose()));
     }
 
     #[test]

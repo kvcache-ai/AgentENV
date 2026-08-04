@@ -114,6 +114,8 @@ dependencies = [
  "flate2",
  "futures",
  "headers",
+ "hex",
+ "hmac",
  "http 1.4.0",
  "http-body-util",
  "hyper 1.9.0",

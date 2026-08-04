@@ -2519,6 +2519,11 @@ pub struct NewColdSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_resume: Option<models::SandboxAutoResumeConfig>,
 
+    /// Secure all system communication with sandbox
+    #[serde(rename = "secure")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secure: Option<bool>,
+
     /// Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut to 0.0.0.0/0 in the network config.
     #[serde(rename = "allowInternetAccess")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2584,6 +2589,7 @@ impl NewColdSandbox {
             timeout: Some(15),
             auto_pause: Some(true),
             auto_resume: None,
+            secure: None,
             allow_internet_access: None,
             network: None,
             metadata: None,
@@ -2613,6 +2619,9 @@ impl std::fmt::Display for NewColdSandbox {
                 .as_ref()
                 .map(|auto_pause| ["autoPause".to_string(), auto_pause.to_string()].join(",")),
             // Skipping autoResume in query parameter serialization
+            self.secure
+                .as_ref()
+                .map(|secure| ["secure".to_string(), secure.to_string()].join(",")),
             self.allow_internet_access
                 .as_ref()
                 .map(|allow_internet_access| {
@@ -2668,6 +2677,7 @@ impl std::str::FromStr for NewColdSandbox {
             pub timeout: Vec<u32>,
             pub auto_pause: Vec<bool>,
             pub auto_resume: Vec<models::SandboxAutoResumeConfig>,
+            pub secure: Vec<bool>,
             pub allow_internet_access: Vec<bool>,
             pub network: Vec<models::SandboxNetworkConfig>,
             pub metadata: Vec<std::collections::HashMap<String, String>>,
@@ -2716,6 +2726,10 @@ impl std::str::FromStr for NewColdSandbox {
                     "autoResume" => intermediate_rep.auto_resume.push(
                         <models::SandboxAutoResumeConfig as std::str::FromStr>::from_str(val)
                             .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "secure" => intermediate_rep.secure.push(
+                        <bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
                     "allowInternetAccess" => intermediate_rep.allow_internet_access.push(
@@ -2788,6 +2802,7 @@ impl std::str::FromStr for NewColdSandbox {
             timeout: intermediate_rep.timeout.into_iter().next(),
             auto_pause: intermediate_rep.auto_pause.into_iter().next(),
             auto_resume: intermediate_rep.auto_resume.into_iter().next(),
+            secure: intermediate_rep.secure.into_iter().next(),
             allow_internet_access: intermediate_rep.allow_internet_access.into_iter().next(),
             network: intermediate_rep.network.into_iter().next(),
             metadata: intermediate_rep.metadata.into_iter().next(),

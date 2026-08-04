@@ -51,10 +51,10 @@ pub fn run(args: Args) -> Result<()> {
 }
 
 pub(crate) async fn attach(client: &Client, sandbox_id: &str) -> Result<i32> {
-    client.connect_sandbox(sandbox_id, DEFAULT_TIMEOUT_SECS)?;
+    let sandbox = client.connect_sandbox(sandbox_id, DEFAULT_TIMEOUT_SECS)?;
 
     let (cols, rows) = terminal_size();
-    let transport = Arc::new(client.transport(sandbox_id)?);
+    let transport = Arc::new(client.transport(sandbox_id, sandbox.envd_access_token.as_deref())?);
     let mut last_error = None;
     let mut started = None;
     for shell in ["/bin/bash", "/bin/sh"] {
@@ -116,10 +116,11 @@ pub(crate) async fn attach(client: &Client, sandbox_id: &str) -> Result<i32> {
         reconnect_rx,
         reconnect_ack_tx,
     );
-    let resize_task = resize_loop(transport, selector, state.clone());
+    let resize_task = resize_loop(transport.clone(), selector, state.clone());
     let watchdog_task = watchdog_loop(
         client.clone(),
         sandbox_id.to_string(),
+        transport,
         state.clone(),
         reconnect_tx,
         reconnect_ack_rx,
@@ -681,6 +682,7 @@ async fn resize_loop(
 async fn watchdog_loop(
     client: Client,
     sandbox_id: String,
+    transport: Arc<Transport>,
     state: SessionState,
     reconnect_tx: mpsc::UnboundedSender<()>,
     mut reconnect_ack_rx: mpsc::UnboundedReceiver<()>,
@@ -722,7 +724,7 @@ async fn watchdog_loop(
             });
         }
 
-        match envd_ready_probe(client.clone(), sandbox_id.clone()).await {
+        match envd_ready_probe(Arc::clone(&transport)).await {
             Ok(true) => {
                 unhealthy_since = None;
                 if matches!(previous_health, ProbeStatus::Unhealthy) {
@@ -809,10 +811,11 @@ fn request_reconnect_once(
     *recovered_health = false;
 }
 
-async fn envd_ready_probe(client: Client, sandbox_id: String) -> Result<bool> {
-    client
-        .envd_ready_with_timeout(&sandbox_id, RECONNECT_PROBE_TIMEOUT)
-        .await
+async fn envd_ready_probe(transport: Arc<Transport>) -> Result<bool> {
+    match tokio::time::timeout(RECONNECT_PROBE_TIMEOUT, transport.ready()).await {
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(_)) | Err(_) => Ok(false),
+    }
 }
 
 fn should_refresh_session_keepalive(state: &SessionState, last_activity: &mut u64) -> bool {

@@ -585,6 +585,9 @@ components:
           description: Automatically pauses the sandbox after the timeout
         autoResume:
           $ref: "#/components/schemas/SandboxAutoResumeConfig"
+        secure:
+          type: boolean
+          description: Secure all system communication with sandbox
         allowInternetAccess:
           type: boolean
           description:
