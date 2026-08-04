@@ -2,7 +2,7 @@
 header = ""
 body = """
 {% for group, commits in commits | group_by(attribute="group") %}\
-### {{ group | upper_first }}
+### {{ group | striptags | trim | upper_first }}
 
 {% for commit in commits %}\
 - {% if commit.scope %}**{{ commit.scope }}**: {% endif %}\
@@ -20,11 +20,11 @@ conventional_commits = true
 filter_unconventional = true
 filter_commits = false
 commit_parsers = [
-    { message = "^feat", group = "Features" },
-    { message = "^fix", group = "Bug Fixes" },
-    { message = "^refactor", group = "Improvements" },
-    { message = "^perf", group = "Performance" },
-    { message = "^docs?", group = "Documentation" },
+    { message = "^feat", group = "<!-- 0 -->Features" },
+    { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
+    { message = "^refactor", group = "<!-- 2 -->Improvements" },
+    { message = "^perf", group = "<!-- 3 -->Performance" },
+    { message = "^docs?", group = "<!-- 4 -->Documentation" },
     { message = "^ci", skip = true },
     { message = "^chore", skip = true },
     { message = "^style", skip = true },

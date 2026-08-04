@@ -204,6 +204,20 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPO: ${{ github.repository }}
 
+      - name: Prepend documentation links
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          {
+            printf '📖 Documentation for this release: '
+            printf 'https://kvcache-ai.github.io/AgentENV/%s/\n' "$RELEASE_TAG"
+            printf '\n---\n\n'
+            cat CHANGES.md
+          } > CHANGES.md.tmp
+          mv CHANGES.md.tmp CHANGES.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
