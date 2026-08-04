@@ -4,11 +4,20 @@
     <img src="assets/heading-logo.svg" alt="AgentENV" />
   </picture>
   <p><strong>Running agent environments at scale</strong></p>
+  <p>
+    <a href="https://github.com/kvcache-ai/AgentENV/actions/workflows/coverage.yml">
+      <img src="https://github.com/kvcache-ai/AgentENV/actions/workflows/coverage.yml/badge.svg?branch=main&event=push" alt="Coverage workflow status">
+    </a>
+    <a href="https://github.com/kvcache-ai/AgentENV/blob/coverage-data/coverage/coverage.json">
+      <img src="https://github.com/kvcache-ai/AgentENV/blob/coverage-data/coverage/badge.svg?raw=1" alt="Latest coverage report">
+    </a>
+  </p>
+  <p>
+    📖 Full documentation:
+    <a href="https://kvcache-ai.github.io/AgentENV/latest/">Stable</a> |
+    <a href="https://kvcache-ai.github.io/AgentENV/dev/">Dev</a>
+  </p>
 </div>
-
-[![Coverage workflow status](https://github.com/kvcache-ai/AgentENV/actions/workflows/coverage.yml/badge.svg?branch=main&event=push)](https://github.com/kvcache-ai/AgentENV/actions/workflows/coverage.yml)
-[![Latest coverage report](https://github.com/kvcache-ai/AgentENV/blob/coverage-data/coverage/badge.svg?raw=1)](https://github.com/kvcache-ai/AgentENV/blob/coverage-data/coverage/coverage.json)
-📖 [Full documentation](https://kvcache-ai.github.io/AgentENV/)
 
 AgentENV (AENV) is a platform for running agent environments at scale, powering agentic RL training for **Kimi K3**.
 
@@ -28,7 +37,7 @@ AgentENV (AENV) is a platform for running agent environments at scale, powering 
 - **Linux kernel 6.8+**; the install script additionally requires **Ubuntu 24.04** (see *Quick Start* below for installation options)
 - `/dev/kvm` access for Firecracker microVM execution
 
-If your server does not support standard KVM, see the [PVM deployment guide](https://kvcache-ai.github.io/AgentENV/deployment/pvm.html) before installing.
+If your server does not support standard KVM, see the [PVM deployment guide](https://kvcache-ai.github.io/AgentENV/dev/deployment/pvm.html) before installing.
 
 ---
 
@@ -50,7 +59,7 @@ curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/in
 sudo systemctl start aenv
 ```
 
-If this installation fails because standard KVM is unavailable, follow the [PVM deployment guide](https://kvcache-ai.github.io/AgentENV/deployment/pvm.html) instead.
+If this installation fails because standard KVM is unavailable, follow the [PVM deployment guide](https://kvcache-ai.github.io/AgentENV/dev/deployment/pvm.html) instead.
 
 *Option B — Docker*
 
@@ -94,7 +103,7 @@ aenv start ubuntu            # starts a sandbox and attaches an interactive shel
 ## 🗂 Deployment
 
 For Docker Compose / Kubernetes cluster deployment and build-from-source instructions,
-see 📖 [Deployment](https://kvcache-ai.github.io/AgentENV/deployment/manual-compile.html).
+see 📖 [Deployment](https://kvcache-ai.github.io/AgentENV/latest/deployment/manual-compile.html).
 
 ---
 
@@ -102,7 +111,7 @@ see 📖 [Deployment](https://kvcache-ai.github.io/AgentENV/deployment/manual-co
 
 AgentENV exposes an E2B-compatible HTTP API. Point `E2B_API_URL` at your
 server and use the standard E2B Python / TypeScript SDK without any code
-changes. See 📖 [E2B integration](https://kvcache-ai.github.io/AgentENV/integration/e2b.html)
+changes. See 📖 [E2B integration](https://kvcache-ai.github.io/AgentENV/latest/integration/e2b.html)
 for setup details.
 
 ---
