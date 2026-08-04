@@ -1,0 +1,462 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Persistence Artifact Inventory - AgentENV Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-c89d6cb6.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-9a36fd67.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">AgentENV Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kvcache-ai/AgentENV" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kvcache-ai/AgentENV/edit/main/docs/src/internals/persistence-artifact-inventory.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="persistence-artifact-inventory"><a class="header" href="#persistence-artifact-inventory">Persistence Artifact Inventory</a></h1>
+<p>This document lists AgentENV artifacts that can remain on disk or in object storage beyond a single function call. It is organized by the module that owns each artifact’s lifecycle.</p>
+<h2 id="path-roots"><a class="header" href="#path-roots">Path Roots</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Root</th><th>Default</th><th>Owner</th><th>Notes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>home_path</code></td><td><code>/var/lib/aenv</code></td><td><code>src/cfg.rs</code></td><td>Base for paths containing the literal <code>$AENV_HOME</code> placeholder. <code>AENV_HOME_PATH</code> overrides it before placeholder expansion.</td></tr>
+<tr><td><code>runtime_path</code></td><td><code>/run/aenv</code></td><td><code>src/cfg.rs</code>, <code>src/sandbox/network/*</code></td><td>Base for transient namespace mount points and daemon sockets. <code>AENV_RUNTIME_PATH</code> overrides it.</td></tr>
+<tr><td><code>deps_path</code></td><td><code>$AENV_HOME/deps</code></td><td><code>src/cfg.rs</code>, <code>src/setup/*</code></td><td>Base for downloaded runtime dependencies. <code>AENV_DEPS_PATH</code> can place these rebuildable assets outside <code>home_path</code>.</td></tr>
+<tr><td>Firecracker sandbox work dirs</td><td><code>$AENV_HOME/firecracker-work</code> with <code>agentenv-fc-</code> children</td><td><code>src/sandbox/firecracker/*</code></td><td>Per-sandbox runtime directories for sockets, symlinks, ublk runtime dirs, local logs, and writable OverlayBD upper layer data (<code>overlaybd/upper.data</code>, <code>overlaybd/upper.index</code>). An explicit <code>[firecracker].work_dir</code> overrides the root.</td></tr>
+<tr><td><code>firecracker.serial_dir</code></td><td><code>$AENV_HOME/logs/serial</code></td><td><code>src/sandbox/firecracker/*</code></td><td>Durable Firecracker stdout/stderr root, grouped by sandbox ID. An explicit <code>[firecracker].serial_dir</code> overrides the root.</td></tr>
+<tr><td><code>managed_snapshot_root</code></td><td><code>&lt;firecracker-work-base&gt;/managed-snapshots</code></td><td><code>src/sandbox/firecracker/*</code></td><td>In-process live snapshot artifact root used to keep captured snapshots alive until publish or drop.</td></tr>
+<tr><td><code>persisted_sandbox_store_path</code></td><td><code>$AENV_HOME/persisted-sandboxes</code></td><td><code>src/orchestrator/persistence/*</code></td><td>Durable paused sandbox records and artifacts.</td></tr>
+<tr><td><code>snapshot_store</code></td><td><code>$AENV_HOME/snapshot-store</code></td><td><code>src/snapshot/repository/*</code></td><td>Durable committed snapshot repository root. The configured backend uses <code>&lt;snapshot_store&gt;/repository</code>. Relative explicit paths are resolved against the config file directory.</td></tr>
+<tr><td><code>snapshot.local_cache_path</code></td><td><code>$AENV_HOME/snapshot-local-cache</code></td><td><code>src/snapshot/artifact_cache.rs</code>, runtime resolvers</td><td>Node-local cache for materialized runtime artifacts. Relative explicit paths are resolved against the config file directory.</td></tr>
+<tr><td><code>image.cache.root_dir</code></td><td><code>$AENV_HOME/image-cache</code></td><td><code>src/image/*</code>, overlaybd runtime</td><td>Node-local image cache root. Contains <code>configs/</code>, <code>indexes/</code>, <code>commits/</code>, and <code>remote-blocks/</code>.</td></tr>
+<tr><td><code>p2p.store_dir</code></td><td><code>$AENV_HOME/p2p/store</code></td><td><code>src/p2p/*</code>, <code>src/cfg.rs</code></td><td>Local store for P2P artifact transport backends. Relative explicit paths are resolved against the config file directory.</td></tr>
+<tr><td><code>image.cache.remote_blocks</code></td><td><code>&lt;image.cache.root_dir&gt;/remote-blocks</code></td><td>overlaybd runtime config</td><td>Remote block cache root. Overlaybd also stores <code>premerged-index/</code> under this cache dir. Its size limit comes from <code>image.cache.remote_blocks.max_size_gb</code>.</td></tr>
+<tr><td><code>ublk.daemon_socket_path</code></td><td><code>$AENV_RUNTIME/ublk-daemon.sock</code></td><td><code>src/sandbox/ublk/*</code>, <code>storage/ublk-daemon/*</code></td><td>Unix socket used for server-to-daemon IPC.</td></tr>
+<tr><td><code>ublk.daemon_log_path</code></td><td><code>$AENV_HOME/logs/ublk-daemon.log</code></td><td><code>storage/ublk-daemon/*</code></td><td>Daemon log file supplied during config normalization. An explicit path overrides the default.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="setup-and-config"><a class="header" href="#setup-and-config">Setup And Config</a></h2>
+<p>Owned by <code>src/setup/*</code> and <code>src/cfg.rs</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Artifact</th><th>Location</th><th>Contents</th><th>Purpose</th><th>Lifecycle</th></tr>
+</thead>
+<tbody>
+<tr><td>Firecracker binary</td><td><code>&lt;deps_path&gt;/firecracker/{version}/firecracker</code></td><td>Firecracker executable</td><td>VM process runtime</td><td>Created during setup when missing. Old versions are retained until manually removed.</td></tr>
+<tr><td>CPU template helper</td><td><code>&lt;deps_path&gt;/firecracker/{version}/cpu-template-helper</code></td><td>Optional Firecracker helper executable</td><td>Detects host CPU config for cluster-wide CPU intersection</td><td>Extracted from Firecracker package when present.</td></tr>
+<tr><td>Kernel image</td><td><code>&lt;deps_path&gt;/kernel/{version}/vmlinux.bin</code></td><td>Guest kernel</td><td>VM boot source</td><td>Downloaded during setup. Old versions are retained until manually removed.</td></tr>
+<tr><td>Tools drive</td><td><code>&lt;deps_path&gt;/tools/{version}/tools.ext4</code></td><td>Read-only ext4 image with envd/tools</td><td>Firecracker root drive shared by sandboxes and pinned by snapshots through its immutable release version</td><td>Extracted from OCI or imported from <code>tools.drive_path</code> during setup. Old versions are retained until manually removed.</td></tr>
+<tr><td>Overlaybd tools</td><td><code>&lt;deps_path&gt;/overlaybd/bin/*</code>, <code>&lt;deps_path&gt;/overlaybd/lib/*</code></td><td><code>overlaybd-create</code>, <code>overlaybd-apply</code>, <code>overlaybd-commit</code>, <code>overlaybd-resize</code>, libraries</td><td>OCI-to-overlaybd conversion and packaging</td><td>Installed during setup when release metadata does not match.</td></tr>
+<tr><td>Overlaybd release metadata</td><td><code>&lt;deps_path&gt;/overlaybd/tools-release.json</code></td><td>Installed overlaybd release identifier</td><td>Detects whether tools need reinstalling</td><td>Rewritten on setup when release changes.</td></tr>
+<tr><td>Overlaybd package downloads</td><td><code>&lt;deps_path&gt;/overlaybd/downloads/*</code></td><td>Downloaded package archives</td><td>Setup cache for overlaybd release packages</td><td>Kept after install; no automatic GC.</td></tr>
+<tr><td>Generated overlaybd config</td><td><code>$AENV_HOME/overlaybd/overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/mem-overlaybd-global.json</code></td><td>Runtime global config, cache path, credentials config</td><td>Configures overlaybd runtime and memory snapshot overlaybd access</td><td>Rewritten during setup/startup.</td></tr>
+<tr><td>Overlaybd runtime log</td><td><code>&lt;deps_path&gt;/overlaybd/overlaybd.log</code></td><td>Overlaybd runtime logs</td><td>Debugging</td><td>Appended by overlaybd runtime; no automatic GC.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="firecracker-sandbox"><a class="header" href="#firecracker-sandbox">Firecracker Sandbox</a></h2>
+<h3 id="runtime"><a class="header" href="#runtime">Runtime</a></h3>
+<p>Owned by <code>src/sandbox/firecracker/*</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Artifact</th><th>Location</th><th>Contents</th><th>Purpose</th><th>Lifecycle</th><th>Rebuildable</th></tr>
+</thead>
+<tbody>
+<tr><td>Managed live snapshot root</td><td><code>&lt;firecracker-work-base&gt;/managed-snapshots/{sandbox_id}/{uuid}/...</code></td><td>Firecracker snapshot artifacts kept alive in-process</td><td>Holds captured running-sandbox snapshots until publish, and supports in-process pause state</td><td>Created by <code>FirecrackerSandbox::pause()</code> or <code>snapshot()</code>. Removed when <code>PersistentSnapshotRootGuard</code> drops.</td><td>No.</td></tr>
+<tr><td>Snapshot VM state</td><td>snapshot artifact dir <code>vm_state.bin</code></td><td>Firecracker VM state</td><td>Pause/resume and snapshot publish input</td><td>Created by Firecracker <code>create_snapshot</code>. Owner depends on caller: persister, managed root, or repository publish input.</td><td>No.</td></tr>
+<tr><td>Raw memory diff</td><td>snapshot artifact dir <code>mem.bin</code></td><td>Sparse Firecracker diff memory dump</td><td>Input to memory overlaybd conversion and source for virtual memory size</td><td>Created by Firecracker <code>create_snapshot</code>. Removed best-effort after the memory overlaybd layer is committed.</td><td>Temporary input only; not reconstructed after cleanup.</td></tr>
+<tr><td>Memory overlaybd layer</td><td>snapshot artifact dir <code>mem_overlaybd/overlaybd.commit</code></td><td>Sealed overlaybd layer for memory pages</td><td>Runtime memory restore and publish input</td><td>Created by packaging <code>mem.bin</code>. Imported into repository managed layers during publish.</td><td>No, unless raw <code>mem.bin</code> is still present.</td></tr>
+<tr><td>Memory image config</td><td>snapshot artifact dir <code>mem_image.json</code></td><td>Overlaybd image config stacking memory layers</td><td>Resume paused sandbox and publish memory layers</td><td>Written after memory conversion. Later repository resolvers regenerate runtime memory configs from committed layers.</td><td>Yes after publish; no for paused sandbox unless layers are known.</td></tr>
+<tr><td>Rootfs snapshot config</td><td>snapshot artifact dir <code>rootfs/image.json</code></td><td>Overlaybd image config for captured rootfs state</td><td>Resume paused sandbox and publish rootfs layers</td><td>Staged from live runtime config after restack/seal.</td><td>Yes only from associated layers and metadata.</td></tr>
+<tr><td>Rootfs snapshot layer</td><td>snapshot artifact dir <code>rootfs/snapshot.commit</code></td><td>Sealed writable upper from live rootfs</td><td>Captures disk writes since previous lower stack</td><td>Created by ublk daemon restack for writable overlaybd rootfs.</td><td>No.</td></tr>
+<tr><td>Inherited runtime layers</td><td>snapshot artifact dir <code>rootfs/inherited-layers/{index}/{source-file}</code></td><td>Snapshot-owned hard links or copies of inherited runtime-created lower suffixes</td><td>Removes dependence on previous managed snapshot or persisted sandbox artifact roots</td><td>Created during pause when inherited lowers come from the managed snapshot root or another sandbox/generation under the same persisted <code>artifacts</code> root.</td><td>No.</td></tr>
+<tr><td>Attached-drive snapshot dirs</td><td>snapshot artifact dir <code>drives/{drive_id}/...</code></td><td>Per-drive image config and snapshot layer</td><td>Captures writable attached-drive state</td><td>Created alongside rootfs snapshot for each drive.</td><td>No.</td></tr>
+<tr><td>Firecracker work dir</td><td>configured work root, or consumed pool tempfile dir</td><td>API socket, symlinks, runtime dirs, local logs</td><td>Firecracker CWD for a sandbox</td><td>Created when sandbox handle is built, or moved from a warm pool entry; removed by owning <code>TempDir</code>.</td><td>Yes, except live state.</td></tr>
+<tr><td>Firecracker serial logs</td><td><code>firecracker.serial_dir/{sandbox_id}/*</code>, or warm pool work dir logs</td><td>Firecracker stdout/stderr</td><td>Debugging</td><td>Opened on spawn and appended. Warm logs are relocated when a warm process is consumed. Configured serial output is not automatically GC’d.</td><td>No, but disposable.</td></tr>
+<tr><td>Firecracker logger output</td><td><code>firecracker.log</code> in the same per-sandbox log directory as the serial logs</td><td>Firecracker internal logger (<code>PUT /logger</code>)</td><td>Debugging</td><td>Only created when <code>firecracker.log_level</code> is set to a non-empty level. Written by Firecracker itself; not automatically GC’d.</td><td>No, but disposable.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="firecracker-pool"><a class="header" href="#firecracker-pool">Firecracker Pool</a></h3>
+<p>Owned by <code>src/sandbox/firecracker/pool.rs</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Artifact</th><th>Location</th><th>Contents</th><th>Purpose</th><th>Lifecycle</th></tr>
+</thead>
+<tbody>
+<tr><td>Warm pool work dir</td><td>system tempfile dir</td><td>Firecracker socket and warm process logs</td><td>Pre-spawned Firecracker process CWD</td><td>Created by pool maintenance as a <code>TempDir</code>. Removed when warm entry is cleaned up, or moved into the consuming sandbox and later dropped there.</td></tr>
+<tr><td>Warm pool logs</td><td>warm pool work dir <code>firecracker-stdout.log</code>, <code>firecracker-stderr.log</code></td><td>Firecracker output before the warm process is consumed</td><td>Debugging warm startup</td><td>Created on warm spawn. Relocated into sandbox log path when consumed if no explicit stdout/stderr override.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="extra-drives"><a class="header" href="#extra-drives">Extra Drives</a></h2>
+<p>Owned by <code>src/sandbox/extra_drive.rs</code> and Firecracker snapshot code.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Artifact</th><th>Location</th><th>Contents</th><th>Purpose</th><th>Lifecycle</th><th>Rebuildable</th></tr>
+</thead>
+<tbody>
+<tr><td>Extra-drive runtime dir</td><td>sandbox work dir <code>extra-drive-runtime-{drive_id}/</code></td><td>Runtime <code>image.json</code>, upper files, result file</td><td>ublk runtime for attached drive</td><td>Created when preparing extra drives. Released on rollback/stop; work dir cleanup removes files.</td><td>Not while running; otherwise unnecessary.</td></tr>
+<tr><td>Extra-drive symlink</td><td>sandbox work dir <code>extra-drive-{drive_id}</code></td><td>Symlink to <code>/dev/ublkbN</code> device path</td><td>Firecracker drive attachment path</td><td>Created after ublk runtime device creation. Removed on rollback or work dir cleanup.</td><td>Yes.</td></tr>
+<tr><td>Extra-drive snapshot artifact</td><td>snapshot artifact dir <code>drives/{drive_id}/...</code></td><td>Captured drive overlaybd config and commit layer</td><td>Preserve attached-drive writable state across pause/resume/publish</td><td>Created during sandbox snapshot/pause. Later owned by persister, managed root, or repository publish flow.</td><td>No.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="image-resolver"><a class="header" href="#image-resolver">Image Resolver</a></h2>
+<p>Owned by <code>src/image/*</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Artifact</th><th>Location</th><th>Contents</th><th>Purpose</th><th>Lifecycle</th></tr>
+</thead>
+<tbody>
+<tr><td>Image config cache</td><td><code>&lt;image.cache.root_dir&gt;/configs/*-image.json</code></td><td>Digest-qualified overlaybd image configs for resolved user images</td><td>Avoids repeating OCI manifest classification and config generation</td><td>Written on image resolve. Regenerated if invalid or if referenced local lowers are missing. No unified GC today.</td></tr>
+<tr><td>Image metadata sidecar</td><td><code>&lt;image.cache.root_dir&gt;/configs/*.metadata.json</code></td><td>Base env/workdir metadata from OCI image config</td><td>Preserves image launch context beside cached image config</td><td>Written after image config. Rebuilt if missing while image config is usable.</td></tr>
+<tr><td>Overlaybd commit cache</td><td><code>&lt;image.cache.root_dir&gt;/commits/{digest-slug}/overlaybd.commit</code></td><td>Content-addressed overlaybd commit layers from standard OCI conversion, and target dirs for remote overlaybd-native layers</td><td>Node-local reusable layer store for user image layers</td><td>Standard OCI conversion writes commits. Remote overlaybd-native configs point <code>dir</code> here for runtime population. No unified GC today.</td></tr>
+<tr><td>OCI conversion index</td><td><code>&lt;image.cache.root_dir&gt;/indexes/{source-digest}/...json</code></td><td>Mapping from OCI source layer/context to overlaybd commit digest and size</td><td>Skips repeated layer conversion when converted commits exist</td><td>Written after successful standard OCI conversion. No unified GC today.</td></tr>
+<tr><td>Temporary OCI pull/conversion work</td><td>process temp dir</td><td>OCI layout and per-layer conversion workspace</td><td>Intermediate input for standard OCI conversion</td><td>Owned by <code>TempDir</code>; removed after conversion scope exits.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="snapshot-repository"><a class="header" href="#snapshot-repository">Snapshot Repository</a></h2>
+<p>Owned by <code>src/snapshot/repository/*</code> and <code>src/snapshot/types/*</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Artifact</th><th>Location</th><th>Contents</th><th>Purpose</th><th>Lifecycle</th><th>Rebuildable</th></tr>
+</thead>
+<tbody>
+<tr><td>Snapshot records</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/catalog/records/{id}.json</code>; OSS: <code>catalog/records/{id}.json</code></td><td>Snapshot ID, alias, source, resources, build status, committed logical metadata</td><td>Durable user-visible snapshot/template metadata</td><td>Created before template build or at publish. Updated when committed or errored. Deleted by snapshot delete.</td><td>No.</td></tr>
+<tr><td>Snapshot aliases</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/catalog/aliases/{alias}</code>; OSS: <code>catalog/aliases/{alias}.json</code></td><td>Alias-to-snapshot binding</td><td>Name lookup for templates/snapshots</td><td>Bound during create/publish with conflict checks. Deleted with record cleanup.</td><td>Partially, from records if aliases are still recorded.</td></tr>
+<tr><td>Firecracker manifest</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/snapshots/{id}/firecracker-manifest.json</code>; OSS: <code>artifacts/{id}/firecracker-manifest.json</code></td><td>Firecracker snapshot shape, virtual sizes, attached-drive metadata; path fields are hydrated at runtime</td><td>Runtime manifest template for launching committed snapshots</td><td>Persisted during publish. Removed with per-snapshot artifacts.</td><td>Partially, but kept as durable artifact.</td></tr>
+<tr><td>VM state</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/snapshots/{id}/vm_state.bin</code>; OSS: <code>artifacts/{id}/vm_state.bin</code></td><td>Firecracker VM state snapshot</td><td>Required to resume committed snapshots</td><td>Copied/uploaded during publish. Removed with per-snapshot artifacts.</td><td>No.</td></tr>
+<tr><td>Managed snapshot layers</td><td>POSIX: <code>&lt;snapshot_store&gt;/repository/managed-layers/{digest}.overlaybd.commit</code>; OSS: <code>managed-layers/{digest}</code></td><td>Content-addressed rootfs, attached-drive, and memory overlaybd commit layers</td><td>Shared immutable layer storage for committed snapshots</td><td>Imported during publish by descriptor or by hashing local descriptor-less layers. Usually not removed with a single snapshot.</td><td>Not from metadata alone; can be re-fetched only if source still exists.</td></tr>
+<tr><td>Source-registry publications</td><td><code>SnapshotRecord.committed.disk_publications</code> plus remote OCI registry objects</td><td>Published rootfs/attached-drive image refs and manifest digests</td><td>Lets compatible snapshot deltas live in their source registry</td><td>Created during OSS publish when image publishing is enabled. Rolled back on failure or delete when possible.</td><td>Registry-owned; record is required to locate.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Repository records are the logical source of truth for committed snapshots. Build-time and runtime <code>image.json</code> files should not become committed truth unless they contain data that cannot be derived from committed metadata.</p>
+<h2 id="snapshot-runtime-resolution"><a class="header" href="#snapshot-runtime-resolution">Snapshot Runtime Resolution</a></h2>
+<p>Owned by <code>src/snapshot/artifact_cache.rs</code>, <code>src/snapshot/runtime_support.rs</code>, and backend runtime resolvers.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Artifact</th><th>Location</th><th>Contents</th><th>Purpose</th><th>Lifecycle</th><th>Rebuildable</th></tr>
+</thead>
+<tbody>
+<tr><td>Runtime rootfs config</td><td><code>&lt;snapshot_local_cache_path&gt;/runtime/{snapshot_id}/rootfs/image.json</code></td><td>Node-local overlaybd config for committed rootfs layers</td><td>Launch committed snapshot on the current node</td><td>Materialized during snapshot resolve and pinned by <code>RunnableSnapshot</code> lease. LRU-evictable after unpinned.</td><td>Yes.</td></tr>
+<tr><td>Runtime memory config</td><td><code>&lt;snapshot_local_cache_path&gt;/runtime/{snapshot_id}/memory/image.json</code></td><td>Node-local overlaybd config for committed memory layers</td><td>Provides memory backend image to Firecracker resume</td><td>Materialized during snapshot resolve and pinned by lease. LRU-evictable after unpinned.</td><td>Yes.</td></tr>
+<tr><td>Runtime attached-drive configs</td><td><code>&lt;snapshot_local_cache_path&gt;/runtime/{snapshot_id}/drives/{drive_id}/image.json</code></td><td>Node-local overlaybd configs for attached drives</td><td>Launch committed snapshot with attached drives</td><td>Materialized during snapshot resolve and pinned by lease. LRU-evictable after unpinned.</td><td>Yes.</td></tr>
+<tr><td>OSS cached VM state</td><td><code>&lt;snapshot_local_cache_path&gt;/artifacts/{id}/vm_state.bin</code></td><td>Downloaded VM state object</td><td>Avoids repeated object-store download while pinned/cached</td><td>Downloaded by OSS resolver through <code>LocalArtifactCache</code>. LRU-evictable after unpinned.</td><td>Yes, by downloading again.</td></tr>
+<tr><td>POSIX VM state reference</td><td>Repository <code>vm_state.bin</code> path</td><td>Direct path into POSIX repository</td><td>Avoids copying VM state into local runtime cache</td><td>Checked during resolve. Lifetime follows repository artifact.</td><td>No; repository artifact is source.</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>LocalArtifactCache</code> owns pinning, in-flight materialization deduplication, and LRU eviction for files it manages. It does not own the durable snapshot repository.</p>
+<h2 id="orchestrator-persistence"><a class="header" href="#orchestrator-persistence">Orchestrator Persistence</a></h2>
+<p>Owned by <code>src/orchestrator/persistence/*</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Artifact</th><th>Location</th><th>Contents</th><th>Purpose</th><th>Lifecycle</th></tr>
+</thead>
+<tbody>
+<tr><td>Paused sandbox record DB</td><td><code>&lt;persisted_sandbox_store_path&gt;/records.db</code></td><td>RocksDB keyed by sandbox ID; values are compact JSON records containing version, lifecycle, sandbox metadata, artifact root, and backend state</td><td>Restores paused sandboxes after server restart</td><td>Record written after pause succeeds. Marked <code>resuming</code> before resume. Rolled back on resume failure. Deleted on resume/delete.</td></tr>
+<tr><td>Paused sandbox artifact generation</td><td><code>&lt;persisted_sandbox_store_path&gt;/artifacts/{sandbox_id}/{uuid}/...</code></td><td>Firecracker snapshot artifacts generated by <code>pause_to_dir</code></td><td>Durable artifacts for one paused sandbox generation</td><td>Allocated before pause, populated by backend, referenced by paused record. Removed during explicit delete or <code>load_all</code> orphan cleanup.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Paused sandbox artifacts are not committed snapshot repository artifacts. They are owned by the sandbox persister and should not be shared as snapshot truth.</p>
+<h2 id="p2p-artifact-transport"><a class="header" href="#p2p-artifact-transport">P2P Artifact Transport</a></h2>
+<p>Owned by <code>src/p2p/*</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Artifact</th><th>Location</th><th>Contents</th><th>Purpose</th><th>Lifecycle</th></tr>
+</thead>
+<tbody>
+<tr><td>Iroh blob store</td><td><code>&lt;p2p.store_dir&gt;/iroh</code></td><td><code>iroh-blobs</code> content-addressed data and internal metadata</td><td>Local store for published artifacts and cached fetches</td><td>Created on P2P transport init, grows on publish and successful remote fetch. These blobs are collected by GC after unpublish removes those tags.</td></tr>
+<tr><td>P2P catalog DB</td><td><code>&lt;p2p.store_dir&gt;/iroh/catalog.db</code></td><td>RocksDB keyed by artifact key; values are compact JSON artifact descriptors</td><td>Lets peers resolve stable keys into descriptors for this node</td><td>Loaded on startup. Individual entries are upserted on publish and after successful remote fetch, and deleted on unpublish.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Snapshot publication writes best-effort P2P catalog entries after repository commit:</p>
+<ul>
+<li><code>snapshot/v1/artifacts/{snapshot_id}/vm_state.bin</code></li>
+<li><code>snapshot/v1/artifacts/{snapshot_id}/firecracker-manifest.json</code></li>
+<li><code>overlaybd-layer/v1/sha256:&lt;digest&gt;</code> for referenced rootfs, memory, and attached-drive overlaybd commit layers</li>
+</ul>
+<p>Those P2P entries are optional copies, not committed snapshot truth. Clearing <code>&lt;p2p.store_dir&gt;</code> can reduce peer-to-peer availability and force peers back to OSS or origin-registry reads, but it must not make a committed snapshot invalid by itself.</p>
+<h2 id="ublk-daemon-runtime"><a class="header" href="#ublk-daemon-runtime">Ublk Daemon Runtime</a></h2>
+<p>Owned by <code>storage/ublk-daemon/*</code> and <code>src/sandbox/ublk/*</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Artifact</th><th>Location</th><th>Contents</th><th>Purpose</th><th>Lifecycle</th><th>Rebuildable</th></tr>
+</thead>
+<tbody>
+<tr><td>Overlaybd runtime image config</td><td>caller-provided runtime dir <code>image.json</code></td><td>Rewritten overlaybd config with runtime-relative lower and upper paths</td><td>Opens ublk overlaybd target</td><td>Materialized during <code>CreateOverlaybdRuntimeDevice</code>. Removed during rollback or work dir cleanup.</td><td>Yes from source image config while not running.</td></tr>
+<tr><td>Runtime upper data</td><td>runtime dir <code>upper.data</code></td><td>Writable overlaybd upper data file</td><td>Stores live writes for writable devices</td><td>Created for writable runtime if source config has no existing upper. Restacked into snapshot layer on pause/snapshot.</td><td>No while running.</td></tr>
+<tr><td>Runtime upper index</td><td>runtime dir <code>upper.index</code></td><td>Log-structured upper index</td><td>Resolves writes in <code>upper.data</code></td><td>Created with log-structured writable upper. Restacked into sealed snapshot layer.</td><td>No while running.</td></tr>
+<tr><td>Runtime result file</td><td>runtime dir <code>result.txt</code></td><td>Overlaybd result file path</td><td>Overlaybd runtime convention</td><td>Created/used by overlaybd runtime. Removed during cleanup.</td><td>Yes.</td></tr>
+<tr><td>Ublk daemon socket</td><td>default <code>$AENV_RUNTIME/ublk-daemon.sock</code></td><td>Unix socket</td><td>IPC between AgentENV server and ublk daemon</td><td>Created when daemon starts; removed/replaced by process lifecycle.</td><td>Yes.</td></tr>
+<tr><td>Ublk daemon log</td><td>configured <code>ublk.daemon_log_path</code>, default <code>$AENV_HOME/logs/ublk-daemon.log</code></td><td>Daemon logs</td><td>Debugging</td><td>Appended by the daemon; the deployment owns rotation and retention.</td><td>No, but disposable.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="overlaybd-storage"><a class="header" href="#overlaybd-storage">Overlaybd Storage</a></h2>
+<p>Owned by <code>storage/overlaybd/*</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Artifact</th><th>Location</th><th>Contents</th><th>Purpose</th><th>Lifecycle</th><th>Rebuildable</th></tr>
+</thead>
+<tbody>
+<tr><td>Remote block cache</td><td>configured <code>cacheConfig.cacheDir</code>, derived from <code>&lt;image.cache.root_dir&gt;/remote-blocks</code></td><td>Cached registryfs_v2 block ranges</td><td>Speeds remote overlaybd-native layer reads</td><td>Managed by overlaybd cache settings.</td><td>Yes.</td></tr>
+<tr><td>Premerged index cache</td><td><code>cacheConfig.cacheDir/premerged-index/*.pmidx</code></td><td>Serialized merged read-only lower index</td><td>Speeds opening repeated lower stacks</td><td>Written asynchronously on read-only open. Pruned by size limit derived from cache size.</td><td>Yes.</td></tr>
+<tr><td>Sealed overlaybd commit files</td><td>Various owner paths: image cache, snapshot dirs, repository managed layers</td><td>Overlaybd layer data and index trailer</td><td>Immutable lower layers for block devices and memory images</td><td>Lifecycle is owned by the module that stores the file. Overlaybd only defines the format and open/merge behavior.</td><td>Depends on owner.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="ownership-rules"><a class="header" href="#ownership-rules">Ownership Rules</a></h2>
+<ul>
+<li>Snapshot repository artifacts are durable user-visible state. Do not delete them from node-local GC code.</li>
+<li>Paused sandbox artifacts are durable only for the paused sandbox that owns them. Do not treat them as committed snapshots.</li>
+<li>Runtime <code>image.json</code> files under snapshot local cache or ublk runtime dirs are derived artifacts. They should be rebuildable from committed metadata or source image configs.</li>
+<li>Node-local <code>image-cache</code> artifacts are disposable cache, but content-addressed commits may be expensive to regenerate. The metadata-backed GC only reclaims commits no longer rooted by on-disk source configs, held by image-cache leases, or referenced by the in-process running set. Committed snapshots are durable SnapshotRepository state and do not pin ImageCache commits. See <code>[image.cache.gc]</code> in the configuration reference for scheduling.</li>
+<li>P2P store contents are node-local and optional. Unpublish removes the local catalog entry and related blobs; clearing the store only affects peer-to-peer sharing and may require republishing or refetching artifacts.</li>
+<li>Logs and dependency downloads are operational artifacts. They are not part of sandbox or snapshot correctness, but may require separate retention policy outside image-cache GC.</li>
+</ul>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../internals/template-builder-testing.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../internals/proxy-design.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../internals/template-builder-testing.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../internals/proxy-design.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>

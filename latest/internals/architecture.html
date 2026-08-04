@@ -1,0 +1,519 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>System Architecture - AgentENV Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-c89d6cb6.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-9a36fd67.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">AgentENV Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kvcache-ai/AgentENV" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kvcache-ai/AgentENV/edit/main/docs/src/internals/architecture.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="agentenv-architecture"><a class="header" href="#agentenv-architecture">AgentENV Architecture</a></h1>
+<p>AgentENV runs AI agents inside isolated, snapshot-capable Firecracker microVMs. Its core is a <strong>storage subsystem</strong> that provides layered block devices mountable into VMs and ublk-backed memory snapshot restore. The system also includes a per-node <strong>orchestrator</strong> managing sandbox lifecycle, and a prototype <strong>distributed control plane</strong> (gateway + scheduler) for multi-node routing.</p>
+<h2 id="system-overview"><a class="header" href="#system-overview">System Overview</a></h2>
+<pre><code>                    ┌───────────────────────────────────────────────────────────┐
+                    │                       AgentENV Node                       │
+                    │                                                           │
+                    │  ┌──────────┐   ┌──────────────┐                          │
+                    │  │ API      │──&gt;│ Orchestrator │                          │
+                    │  │ (Axum)   │   │ (lifecycle)  │                          │
+                    │  └──────────┘   └──────┬───────┘                          │
+                    │                        │                                  │
+                    │              ┌─────────▼───────────┐                      │
+                    │              │  Firecracker VM     │                      │
+                    │              │                     │                      │
+                    │              │  /dev/vda (rootfs)  │                      │
+                    │              │  /dev/vdb (extra)───┼───┐                  │
+                    │              │  VM memory ─────────┼───┼──┐               │
+                    │              │                     │   │  │               │
+                    │              └─────────────────────┘   │  │               │
+                    │                                        │  │               │
+                    │    Block device path:                  │  │               │
+                    │              ┌────────────────────────▼──┐│               │
+                    │              │  ublk (/dev/ublkbN)       ││               │
+                    │              │  userspace block device   ││               │
+                    │              └────────────┬──────────────┘│               │
+                    │                           │               │               │
+                    │              ┌─────────────▼─────────────┐│               │
+                    │              │  overlaybd                ││               │
+                    │              │  ┌───────┐ ┌───────┐      ││               │
+                    │              │  │ upper │ │layer 0│ ...  ││               │
+                    │              │  │ (r/w) │ │(r/o)  │      ││               │
+                    │              │  └───────┘ └───────┘      ││               │
+                    │              └───────────────────────────┘│               │
+                    │                                           │               │
+                    │    Memory restore path:                   │               │
+                    │              ┌────────────────────────────▼───┐           │
+                    │              │  ublk (/dev/ublkbM)            │           │
+                    │              │  read-only memory block device │           │
+                    │              │  (shared across same-snapshot  │           │
+                    │              │   sandboxes via refcounting)   │           │
+                    │              └────────────┬───────────────────┘           │
+                    │                           │                               │
+                    │              ┌─────────────▼──────────────┐               │
+                    │              │  overlaybd (mem layers)    │               │
+                    │              │  ┌───────┐ ┌───────┐       │               │
+                    │              │  │snap N │ │snap 0 │ ...   │               │
+                    │              │  │(r/o)  │ │(r/o)  │       │               │
+                    │              │  └───────┘ └───────┘       │               │
+                    │              └────────────────────────────┘               │
+                    └───────────────────────────────────────────────────────────┘
+</code></pre>
+<h2 id="storage"><a class="header" href="#storage">Storage</a></h2>
+<p>The storage subsystem turns layered image files into block devices mountable by VMs, and provides ublk-backed memory snapshot restore for snapshot resume. Four crates compose the active subsystem:</p>
+<h3 id="overlaybd-storageoverlaybd"><a class="header" href="#overlaybd-storageoverlaybd">overlaybd (<code>storage/overlaybd/</code>)</a></h3>
+<p>LSMT (Log Structured Merge Tree) based layered image format.</p>
+<p><strong>Image structure</strong>: Each layer file has a <code>HeaderTrailer</code> (magic <code>LSMT\0\1\2</code>, UUID, flags, index/data offsets) and an array of <code>DiskSegmentMapping</code> entries (16 bytes each, bit-packed: 50-bit offset, 14-bit length, 55-bit physical offset, zeroed flag, layer tag). Layers are stacked: immutable compressed read-only layers at the bottom, a single writable upper layer on top.</p>
+<p><strong>Read path</strong>: <code>ImageFile</code> resolves a read request by searching layers top-down via the segment index. The first layer containing a mapping for the requested block range serves the data. Unmapped ranges in upper layers fall through to lower layers.</p>
+<p><strong>Write path</strong>: All writes append to the upper layer. The upper layer’s index is updated in memory and flushed on sync.</p>
+<p><strong>Backends</strong> (pluggable via <code>VirtualFile</code> trait):</p>
+<ul>
+<li><code>LocalFile</code>: io_uring pread/pwrite with optional O_DIRECT</li>
+<li><code>registryfs_v2</code>: OCI registry (remote layer download)</li>
+<li><code>tar</code>: tar archive reading</li>
+<li>Optional cache layer for decompressed block caching</li>
+</ul>
+<p><strong>Compression</strong>: zstd (level 3) with random-access jump tables and CRC32C checksums.</p>
+<p><strong>Snapshot</strong>: <code>snapshot_runtime()</code> copies upper layer data/index to a snapshot directory using reflink (CoW) where the filesystem supports it.</p>
+<p><strong>Key files</strong>: <code>image_file.rs</code> (high-level image), <code>index_file.rs</code> (LSMT stacking: <code>LSMTReadOnlyFile</code>, <code>LSMTFile</code>), <code>format.rs</code> (binary format), <code>index.rs</code> (segment mapping), <code>zfile.rs</code> (compression), <code>snapshot.rs</code>.</p>
+<h3 id="ublk-storageublk"><a class="header" href="#ublk-storageublk">ublk (<code>storage/ublk/</code>)</a></h3>
+<p>Async userspace block device server using Linux’s ublk kernel driver. Exposes overlaybd images (or raw CoW files) as <code>/dev/ublkbN</code> block devices.</p>
+<p><strong>Device lifecycle</strong>:</p>
+<ol>
+<li><code>UVMUblkCtrlBuilder</code> sends <code>ADD</code> to <code>/dev/ublk-control</code> via io_uring <code>UringCmd</code></li>
+<li>Kernel allocates device ID, creates <code>/dev/ublkcN</code> (control) and <code>/dev/ublkbN</code> (block)</li>
+<li>Per-queue worker threads start, each with a thread-local <code>AsyncIoRing</code> and slab-allocated I/O slots</li>
+<li>Kernel dispatches block I/O to mmap’d <code>ublksrv_io_desc</code> arrays; userspace processes them asynchronously</li>
+<li><code>delete_dev()</code> tears down the device</li>
+</ol>
+<p><strong>Target implementations</strong> (<code>UVMUblkTarget</code> trait):</p>
+<ul>
+<li><code>OverlaybdTarget</code>: wraps <code>ImageFile</code> for full layered image I/O</li>
+<li><code>BasicCowTarget</code>: chunk-based copy-on-write over a read-only origin file. Per-chunk <code>AtomicU8</code> state tracking (Origin -&gt; Copying -&gt; Cow) prevents duplicate copies. Coalesces adjacent reads.</li>
+</ul>
+<p><strong>I/O buffers</strong>: <code>AutoRegBuffer</code> (zero-copy via sparse buffer table, kernel 6.8+) or <code>UserBuffer</code> (traditional allocation).</p>
+<p><strong>Key files</strong>: <code>lib.rs</code> (public API), <code>ctrl.rs</code> (device controller), <code>dev.rs</code> (device + queue management), <code>queue.rs</code> (I/O descriptor handling), <code>io_buffer.rs</code>, <code>impls/cow.rs</code>, <code>impls/overlaybd_target.rs</code>.</p>
+<h3 id="ublk-daemon-storageublk-daemon"><a class="header" href="#ublk-daemon-storageublk-daemon">ublk-daemon (<code>storage/ublk-daemon/</code>)</a></h3>
+<p>Long-running daemon process (<code>uvm-ublk-daemon</code>) that manages all ublk devices in one process and communicates with the AgentENV node over a Unix domain socket.</p>
+<ul>
+<li>Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD/COW device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.</li>
+<li><code>UblkDaemonClient</code> spawns and monitors the daemon process from the node runtime.</li>
+<li><code>UblkDeviceManager</code> (<code>src/sandbox/ublk/device.rs</code>) is the node-facing singleton that delegates lifecycle operations to the daemon client; device IDs are allocated in the daemon.</li>
+</ul>
+<p>This separation keeps ublk device ownership and io_uring control in a dedicated process while the node server orchestrates lifecycle state.</p>
+<h3 id="storage-util-storageutil"><a class="header" href="#storage-util-storageutil">storage-util (<code>storage/util/</code>)</a></h3>
+<p>Shared io_uring abstractions used by both ublk and overlaybd.</p>
+<ul>
+<li><code>AsyncIoRing&lt;S&gt;</code>: generic async io_uring wrapper with slab-based <code>RingFuture</code> for CQE delivery. Supports standard (64B) and extended (128B) SQE types.</li>
+<li><code>IoRingWorker</code>: spawns dedicated worker threads with thread-local io_uring instances. MPSC channel submission eliminates cross-thread locking.</li>
+<li><code>ReloadableIDAllocator</code>: O(1) bitmap-based ID allocation/recycling with free list. Supports reloading pre-occupied IDs on restart.</li>
+</ul>
+<h3 id="sandbox-integration-srcsandboxublk--srcsandboxextra_drivers"><a class="header" href="#sandbox-integration-srcsandboxublk--srcsandboxextra_drivers">Sandbox integration (<code>src/sandbox/ublk/</code> + <code>src/sandbox/extra_drive.rs</code>)</a></h3>
+<ul>
+<li><code>device.rs</code>: owns the process-wide <code>UblkDeviceManager</code>, which talks to <code>uvm-ublk-daemon</code> and creates / deletes / snapshots all runtime ublk devices.</li>
+<li><code>overlaybd.rs</code>: materializes runtime configs (rewrites paths, creates symlinks to layer files) for rootfs and attached drives.</li>
+<li><code>extra_drive.rs</code>: prepares user-specified extra block drives with rollback on failure. Read-only and writable drives now follow the same per-sandbox device lifecycle; the only semantic difference is whether overlaybd materializes a writable upper.</li>
+</ul>
+<h3 id="memory-snapshot-restore"><a class="header" href="#memory-snapshot-restore">Memory Snapshot Restore</a></h3>
+<p>Memory snapshot restore uses ublk-backed overlaybd devices rather than userfaultfd. On resume, a read-only ublk device is created from the stacked memory overlaybd layers and passed to Firecracker as a <code>BackendType::File</code> memory backend. Firecracker mmaps the block device and COWs pages into anonymous memory on first write, so the underlying device is never modified.</p>
+<p><strong>Sharing</strong>: Multiple sandboxes booting from the same snapshot template share a single memory ublk device via reference counting. This allows the Linux page cache to be reused across all sandboxes using the same memory image, significantly reducing I/O for concurrent launches from the same template.</p>
+<p><strong>Memory snapshot creation</strong>: On pause, Firecracker’s native diff snapshot (<code>SnapshotType::Diff</code>) produces a sparse <code>mem.bin</code> (using mincore internally to find present pages). This sparse file is then packaged into an overlaybd layer via <code>convert_sparse_mem_to_overlaybd</code>. Parent layers from previous snapshots are stacked, forming the full layered memory image.</p>
+<blockquote>
+<p><strong>Note</strong>: <code>storage/uffd-core/</code> contains an alternative userfaultfd-based memory restore implementation that is retained for reference but excluded from the workspace build.</p>
+</blockquote>
+<h2 id="per-node-subsystems"><a class="header" href="#per-node-subsystems">Per-Node Subsystems</a></h2>
+<p>Each node is an AgentENV server binary (<code>src/bin/server.rs</code>) on a Linux host with <code>/dev/kvm</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Subsystem</th><th>Location</th><th>Responsibility</th></tr>
+</thead>
+<tbody>
+<tr><td>API layer</td><td><code>src/api/</code></td><td>Axum HTTP server, OpenAPI endpoints, reverse proxy to sandbox services, node/admin APIs</td></tr>
+<tr><td>Orchestrator</td><td><code>src/orchestrator/</code></td><td>Sandbox lifecycle state machine (Creating, Running, Pausing, Paused, Resuming, Killing), auto-eviction, incremental runtime metrics, paused-sandbox persistence across restarts</td></tr>
+<tr><td>Observability</td><td><code>src/observability/</code></td><td>Node identity, machine info, request-time host metrics collection, node snapshot projection for admin APIs, optional scheduler heartbeat reporting</td></tr>
+<tr><td>Sandbox</td><td><code>src/sandbox/</code></td><td>Firecracker VM management, network namespaces, rootfs, envd communication, ublk devices (rootfs + memory), warm network/block/Firecracker pools</td></tr>
+<tr><td>Snapshot + Template Builder</td><td><code>src/snapshot/</code>, <code>src/template/</code></td><td><code>src/snapshot/</code> owns committed snapshot storage/runtime resolution; <code>src/template/</code> provides the user-facing builder that publishes snapshots</td></tr>
+<tr><td>P2P artifact transport</td><td><code>src/p2p/</code></td><td>Optional project-wide artifact lookup, publish, and fetch layer with disabled and iroh-backed transports</td></tr>
+<tr><td>Config</td><td><code>src/cfg.rs</code></td><td>TOML config for firecracker paths, machine specs, timeouts, shared pool tuning, observability metadata, P2P, and scheduler-report settings</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="sandbox-networking"><a class="header" href="#sandbox-networking">Sandbox Networking</a></h3>
+<p>Sandbox networking is managed by a process-wide <code>NetworkManager</code> (<code>src/sandbox/network/manager.rs</code>) plus per-slot <code>Slot</code> objects (<code>src/sandbox/network/slot.rs</code>).</p>
+<ul>
+<li>Each slot owns a stable index-derived address bundle from <code>[network.internal]</code> (defaulting to <code>10.11.0.0/16</code> and <code>10.12.0.0/16</code>) plus the fixed VM tap link <code>169.254.0.20/30</code>, together with the host veth name, namespace path, and iptables rules for one sandbox network namespace.</li>
+<li>Network policy supports base allow/deny plus explicit egress rules. The <code>/sandboxes/{sandboxID}/network</code> endpoint replaces per-sandbox <code>allowOut</code> (CIDR/IP/domain patterns) and <code>denyOut</code> (CIDR/IP only) rules at runtime; allow rules always take precedence.</li>
+<li><code>allocate_any()</code> first tries a warm-slot pool and falls back to creating a new namespace/veth/tap/iptables setup on demand.</li>
+<li>Warm-pool maintenance uses a single Condvar-driven background worker with low/high watermarks.</li>
+<li><code>release()</code> enqueues slots back to the warm pool; when maintenance is enabled, even releases above high watermark are first enqueued and then drained asynchronously by the worker.</li>
+<li><code>[pool]</code> provides shared watermarks and <code>[pool.network].maintenance_enabled</code> controls network worker behavior.</li>
+<li>Because the manager is a process-wide singleton, orchestrator shutdown explicitly calls <code>NetworkManager::shutdown()</code> after deleting remaining sandboxes so cached slots are drained and no new allocations race with teardown.</li>
+<li>Although calling <code>NetworkManager::shutdown()</code> on exit is recommended for clean teardown, the manager also has a <code>Drop</code> and <code>libc::atexit</code> handler to best-effort cleanup of any remaining namespaces and veth interfaces on unexpected shutdown and during testing.</li>
+</ul>
+<p>Snapshot resume can also use <code>[pool.firecracker]</code> to pre-spawn <code>(network slot, Firecracker process)</code> pairs. A warm entry transfers its network slot, process, and Firecracker CWD to the resumed sandbox, which avoids the spawn and API-socket wait in the resume critical path. <code>[pool.block]</code> controls the ublk daemon’s overlaybd warm-device pool; it shares the same top-level watermarks but performs async refill from request paths because reusable block devices are image/size-specific.</p>
+<h3 id="observability-data-flow"><a class="header" href="#observability-data-flow">Observability Data Flow</a></h3>
+<p>The node observability path combines request-time host collection with request-time projection:</p>
+<ul>
+<li><code>src/orchestrator/metrics.rs</code> maintains incremental runtime counters during lifecycle operations, including running sandbox count, starting sandbox count, allocated CPU/memory, and create success/failure totals.</li>
+<li><code>src/orchestrator/service.rs</code> publishes those counters through a <code>tokio::sync::watch</code> channel whenever lifecycle state changes affect the node’s runtime accounting.</li>
+<li><code>src/observability/identity.rs</code> resolves stable node identity fields such as node ID, cluster ID, service instance ID, package version, and build-time commit.</li>
+<li><code>src/observability/machine.rs</code> captures static machine descriptors from <code>/proc/cpuinfo</code>.</li>
+<li><code>src/observability/host.rs</code> collects host CPU, memory, and disk usage each time a node snapshot is requested. CPU percent is derived from two <code>/proc/stat</code> samples; on the first request it takes both samples with a 100ms window to avoid returning a synthetic zero.</li>
+<li><code>src/observability/service.rs</code> merges the latest orchestrator counters, identity, machine info, request-time host metrics, and current sandbox ID roster into a <code>NodeSnapshot</code> returned by the admin endpoints and reused by heartbeat reporting.</li>
+<li><code>src/observability/reporter.rs</code> optionally sends periodic heartbeat reports to scheduler over gRPC (<code>Heartbeat</code>) and performs best-effort <code>UnregisterNode</code> on shutdown.</li>
+<li>Scheduler report config can be provided from TOML (<code>[observability.scheduler_report]</code>) and uses <code>[cluster].scheduler_endpoint</code> as the shared scheduler address. The reporter enable flag, address, and interval can be overridden by env vars (<code>AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED</code>, <code>AENV_OBSERVABILITY_SCHEDULER_ENDPOINT</code>, <code>AENV_OBSERVABILITY_REPORT_INTERVAL_SECS</code>).</li>
+<li>If a P2P transport exposes a local endpoint, the reporter includes it in the scheduler heartbeat so other nodes can discover it.</li>
+</ul>
+<p>This keeps node requests lightweight on orchestrator data: they avoid re-listing and sorting all sandboxes on every API call while still returning fresh host metrics.</p>
+<p>The observability subsystem has two configuration-controlled scopes:</p>
+<ul>
+<li><code>observability.enabled</code>: controls whether the node observability service is constructed at all. When disabled, node/admin observability endpoints degrade rather than trying to synthesize partial snapshots.</li>
+<li><code>observability.scheduler_report.enabled</code>: controls optional scheduler heartbeat reporting. It can be overridden by <code>AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED</code>. When enabled, reporting requires <code>[cluster].scheduler_endpoint</code> or <code>AENV_OBSERVABILITY_SCHEDULER_ENDPOINT</code>.</li>
+</ul>
+<h3 id="p2p-artifact-transport"><a class="header" href="#p2p-artifact-transport">P2P Artifact Transport</a></h3>
+<p><code>src/p2p/</code> provides a project-wide artifact transport abstraction for modules that need to exchange validated files between runtime nodes. Consumers depend on the <code>P2pTransport</code> trait, whose main operations are <code>lookup</code>, <code>lookup_with_hints</code>, <code>fetch</code>, <code>publish</code>, <code>unpublish</code>, <code>local_endpoint</code>, and <code>shutdown</code>.</p>
+<p>The default <code>DisabledP2pTransport</code> keeps the feature inert: lookups return no descriptor, publish is a no-op, and fetch fails with <code>TransportDisabled</code>. The <code>IrohBlobsP2pTransport</code> backend starts an embedded <code>iroh</code> endpoint, serves artifact bytes through <code>iroh-blobs</code>, and serves a small AgentENV catalog protocol over the same endpoint to map stable artifact keys to transport-neutral descriptors.</p>
+<p>One P2P artifact key represents one logical artifact. Lookup returns at most one descriptor, selected from the local catalog first and then from discovered peers in order. Artifact descriptors contain the stable key, provider node ID, optional provider endpoint, backend-specific locator string, and module-defined JSON metadata. Backend locators stay opaque to callers; for iroh the locator is the <code>iroh-blobs</code> hash used for content-addressed fetch.</p>
+<p>A successful remote fetch also best-effort advertises the fetched blob from the local node. This makes the fetching node a provider for later peers and lets artifacts spread through the cluster.</p>
+<p>Peer discovery is decoupled behind <code>P2pPeerDiscovery</code>. In normal multi-node deployments, <code>SchedulerPeerDiscovery</code> periodically calls scheduler <code>ListP2pPeers</code>, filters by backend and cluster, and excludes the local node. <code>StaticP2pPeerDiscovery</code> and <code>NoopP2pPeerDiscovery</code> cover tests and disabled/local-only operation.</p>
+<p>Snapshot publishing also uses the P2P layer as a best-effort acceleration path. After a snapshot repository commit succeeds, <code>SnapshotManager</code> advertises the fixed Firecracker artifacts and overlaybd layers. OSS-backed snapshot resolution tries P2P before object storage for fixed artifacts; POSIX-backed resolution does not consume P2P because the POSIX repository path is already the committed artifact source. Overlaybd layer reads are accelerated by the overlaybd P2P HTTP facade rather than by snapshot resolvers.</p>
+<p>See <a href="./p2p-design.html">P2P Artifact Transport</a> for the detailed design.</p>
+<p><strong>Node API endpoints</strong> (E2B-compatible):</p>
+<ul>
+<li><code>POST /sandboxes</code> create a sandbox</li>
+<li><code>GET /sandboxes</code> list sandboxes</li>
+<li><code>GET /sandboxes/{id}</code> get sandbox metadata</li>
+<li><code>DELETE /sandboxes/{id}</code> delete a sandbox</li>
+<li><code>POST /sandboxes/{id}/pause</code> pause (snapshot) a sandbox</li>
+<li><code>POST /sandboxes/{id}/resume</code> resume from snapshot</li>
+<li><code>GET /nodes</code> return node-level observability snapshots</li>
+<li><code>GET /nodes/{id}</code> return node details plus currently running sandboxes</li>
+<li><code>ANY /proxy</code>, <code>ANY /proxy/{path}</code>, routing-header fallback, and configured
+sandbox proxy hosts reverse proxy to sandbox services</li>
+</ul>
+<h2 id="distributed-control-plane-prototype"><a class="header" href="#distributed-control-plane-prototype">Distributed Control Plane (prototype)</a></h2>
+<p>The multi-node control plane in <code>services/</code> is a prototype. It routes client traffic across multiple AgentENV backend nodes.</p>
+<pre><code>    Client ──HTTP──&gt; Gateway (:8080) ──gRPC──&gt; Scheduler (:9090)
+                        │                          │
+                        │    ┌─────────────────────┘
+                        │    │ node selection / lookup
+                        ▼    ▼
+                   Node A (:8000)    Node B (:8000)
+</code></pre>
+<p><strong>Gateway</strong> (<code>services/gateway/</code>): HTTP reverse proxy. Extracts sandbox data-plane routes from headers (<code>x-agentenv-sandbox-id</code> / <code>e2b-sandbox-id</code>) or configured host-based proxy domains (<code>{port}-{sandboxID}.{domain}</code>). Host-based routes are only enabled for explicit <code>gateway.sandbox_proxy_domains</code> entries, require RFC 952/1123 DNS-label-compatible sandbox IDs, and require the full <code>{port}-{sandboxID}</code> label to fit the 63-character DNS label limit. Runtime nodes have their own <code>[sandbox_proxy].domains</code> setting for the same host-based URL shape and return the first configured domain in sandbox metadata. In multi-node deployments, repository helpers can apply one <code>SANDBOX_PROXY_DOMAINS</code> value to both gateway and runtime node configuration. Sandbox control-plane routes such as <code>/sandboxes/{id}/pause</code> are routed by sandbox ID from the URL path; sandbox data-plane traffic is not inferred from URL path alone. For new sandboxes, calls <code>Schedule()</code> to pick a node. For existing sandboxes, calls <code>LookupNode()</code>. After sandbox creation, calls <code>RecordAssignment()</code> to seed a sandbox-to-node binding. Without explicit routing headers, it also handles cluster aggregation of <code>GET /sandboxes</code>, <code>GET /v2/sandboxes</code>, <code>GET /nodes</code>, and resolves <code>GET /nodes/{id}</code> via scheduler before proxying to the resolved node.</p>
+<p><strong>Scheduler</strong> (<code>services/scheduler/</code>): gRPC service with pluggable node discovery and in-memory sandbox-to-node bindings, plus observed-node snapshots reported by runtime nodes. RPCs include <code>Schedule</code>, <code>LookupNode</code>, <code>RecordAssignment</code>, <code>Heartbeat</code>, <code>ListObservedNodes</code>, <code>ListP2pPeers</code>, <code>GetNode</code>, and <code>UnregisterNode</code>. Strategies: round_robin (default), random. Proto contract: <code>services/api/proto/scheduler.proto</code>. For P2P, scheduler stores and returns opaque peer endpoints from heartbeat records; artifact catalog lookup and byte transfer stay node-to-node.</p>
+<p>Binding lifecycle:</p>
+<ul>
+<li><code>RecordAssignment</code> creates the initial binding immediately after sandbox creation succeeds.</li>
+<li>Runtime heartbeats include the node’s full sandbox ID roster. Scheduler treats that roster as the source of truth for that node and removes bindings missing from the latest heartbeat.</li>
+<li><code>binding_ttl</code> is a freshness TTL for routing information, not a copy of sandbox timeout. If a binding stops being refreshed by gateway or heartbeats, scheduler drops it on the next lookup or roster reconcile.</li>
+<li><code>UnregisterNode</code> removes the observed node record and proactively clears bindings owned by that node.</li>
+</ul>
+<p>Discovery modes:</p>
+<ul>
+<li><code>static</code>: explicit <code>scheduler.nodes</code> list from config</li>
+<li><code>kubernetes</code>: EndpointSlice watch over the headless <code>agentenv-nodes</code> Service, using ready DaemonSet Pod IPs as backend endpoints</li>
+</ul>
+<p><strong>Limitations</strong>: All bindings are in-memory (lost on scheduler restart). After a scheduler restart, bindings are rebuilt from new sandbox creations plus the next heartbeat roster from each runtime node. Kubernetes discovery updates the schedulable node set dynamically, but binding persistence is still not replicated.</p>
+<p><strong>Deployment</strong>:</p>
+<pre><code class="language-bash"># local dev (single node)
+make start-server &amp;&amp; make -C services run-scheduler &amp;&amp; make -C services run-gateway
+
+# docker compose (multi-node)
+make deploy-up     # gateway + scheduler + 2 backend nodes
+make deploy-down   # teardown
+
+# kubernetes (gateway + scheduler + daemonset runtime nodes)
+make k8s-render
+make k8s-apply
+</code></pre>
+<p>In Kubernetes deployments, AgentENV runtime nodes run as a privileged DaemonSet
+so each host gets exactly one runtime Pod with access to <code>/dev/kvm</code>,
+iptables/network-namespace operations, and a hostPath-backed workspace cache.
+The deployment helpers materialize the DaemonSet ConfigMap from <code>config/default.toml</code>
+at render/apply time so AgentENV runtime config remains single-sourced.</p>
+<h2 id="directory-structure"><a class="header" href="#directory-structure">Directory Structure</a></h2>
+<pre><code>storage/
+├── overlaybd/src/              # layered image format (core)
+│   ├── image_file.rs           # high-level image abstraction
+│   ├── index_file.rs           # LSMT layer stacking
+│   ├── format.rs               # binary format (HeaderTrailer, DiskSegmentMapping)
+│   ├── index.rs                # segment mapping
+│   ├── zfile.rs                # zstd compression + jump tables
+│   ├── snapshot.rs             # snapshot capture
+│   ├── local.rs                # LocalFile backend (io_uring)
+│   └── registryfs_v2.rs        # OCI registry backend
+├── ublk/src/                   # userspace block device server
+│   ├── lib.rs                  # public API
+│   ├── ctrl.rs                 # /dev/ublk-control interface
+│   ├── dev.rs                  # device + queue management
+│   ├── queue.rs                # I/O descriptor handling
+│   ├── io_buffer.rs            # zero-copy + traditional buffers
+│   └── impls/                  # target implementations
+│       ├── cow.rs              # BasicCowTarget
+│       └── overlaybd_target.rs # OverlaybdTarget
+├── ublk-daemon/src/            # ublk daemon (unix socket RPC)
+│   ├── client.rs               # daemon client used by node runtime
+│   ├── server.rs               # daemon server + request loop
+│   └── protocol.rs             # RPC message types
+├── util/src/                   # shared io_uring abstractions
+│   ├── io_ring/                # AsyncIoRing, IoRingWorker
+│   └── id_allocator.rs         # bitmap-based ID allocation
+└── uffd-core/src/              # userfaultfd memory restore (excluded from workspace, retained for reference)
+    ├── handler.rs              # UffdHandle, page fault event loop
+    ├── backend.rs              # MemoryImageBackend trait
+    ├── overlaybd.rs            # OverlaybdMemoryImage backend
+    ├── process_vm_reader.rs    # ProcessVmReader (process_vm_readv)
+    └── scm.rs                  # SCM_RIGHTS fd passing
+
+src/
+├── bin/server.rs               # node binary entrypoint
+├── api/                        # HTTP API layer
+├── orchestrator/               # sandbox lifecycle
+├── observability/              # node identity + host/runtime metrics projection
+├── sandbox/                    # Firecracker VM management
+│   ├── extra_drive.rs          # extra drive preparation
+│   └── ublk/                   # storage integration
+│       ├── device.rs           # daemon-backed ublk device lifecycle
+│       └── overlaybd.rs        # runtime config materialization
+├── snapshot/                   # committed snapshot model, repository backends, runtime resolution
+├── template/                   # user-facing template builder over snapshots
+└── cfg.rs                      # TOML config
+
+services/                       # prototype distributed control plane (Go)
+├── gateway/                    # HTTP reverse proxy
+├── scheduler/                  # gRPC node selection + binding
+├── api/proto/                  # protobuf contracts
+└── shared/                     # config, logging
+</code></pre>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../troubleshooting/common-issues.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../internals/sandbox-testing.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../troubleshooting/common-issues.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../internals/sandbox-testing.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+
+
+
+    </div>
+    </body>
+</html>
