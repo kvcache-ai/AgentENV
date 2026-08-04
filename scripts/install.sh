@@ -183,6 +183,58 @@ echo "Downloading aenv CLI ..."
 download_release_asset "aenv-linux-${ARCH_TAG}" "$tmp_cli"
 sudo install -m 0755 "$tmp_cli" "${INSTALL_DIR}/aenv"
 
+install_completion_files() {
+    local marker='# managed by aenv completion installer'
+    local binary="${INSTALL_DIR}/aenv" quoted_binary
+    local bash_path="/usr/local/share/bash-completion/completions/aenv"
+    local zsh_path="/usr/local/share/zsh/site-functions/_aenv"
+    local fish_path="/usr/local/share/fish/vendor_completions.d/aenv.fish"
+    quoted_binary="'$binary'"
+
+    put_loader() {
+        local path="$1" body="$2" dir tmp
+        dir="${path%/*}"
+        if [[ -L "$path" ]]; then
+            echo "warning: refusing to replace symlink ${path}" >&2
+            return 0
+        fi
+        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
+            echo "warning: leaving unmanaged completion file ${path} untouched" >&2
+            return 0
+        fi
+        sudo mkdir -p "$dir" || { echo "warning: could not create ${dir}" >&2; return 0; }
+        tmp="$(sudo mktemp "$dir/.aenv-completion.XXXXXX")" || {
+            echo "warning: could not stage ${path}" >&2
+            return 0
+        }
+        if [[ "$path" == "$zsh_path" ]]; then
+            if ! printf '%s\n%s\n' "$body" "$marker" | sudo tee "$tmp" >/dev/null; then
+                sudo rm -f "$tmp"
+                echo "warning: could not stage ${path}" >&2
+                return 0
+            fi
+        else
+            if ! printf '%s\n%s\n' "$marker" "$body" | sudo tee "$tmp" >/dev/null; then
+                sudo rm -f "$tmp"
+                echo "warning: could not stage ${path}" >&2
+                return 0
+            fi
+        fi
+        if ! sudo chmod 0644 "$tmp" || ! sudo mv -f "$tmp" "$path"; then
+            sudo rm -f "$tmp"
+            echo "warning: could not install ${path}" >&2
+        fi
+    }
+
+    put_loader "$bash_path" "if [[ -x $quoted_binary ]]; then source <($quoted_binary completion bash); fi"
+    zsh_body="#compdef aenv
+if [[ -x $quoted_binary ]]; then eval \"\$($quoted_binary completion zsh)\"; fi"
+    put_loader "$zsh_path" "$zsh_body"
+    put_loader "$fish_path" "if test -x $quoted_binary; $quoted_binary completion fish | source; end"
+}
+
+install_completion_files
+
 # ---------------------------------------------------------------------------
 # 2. Install the server
 # ---------------------------------------------------------------------------

@@ -274,3 +274,15 @@ aenv snapshot list --sandbox-id <sandbox-id>
 The table output includes an `IMAGE REF` column (`-` when no image was published); JSON output includes the optional `imageRef` field.
 
 To delete a snapshot, use `aenv template delete <snapshot-id>` or `aenv template delete <name>` — snapshots share the same underlying store as templates and are deleted through the same command.
+
+## Automatic shell completion installation
+
+The CLI installers install completion loaders into standard shell completion directories. `make install-aenv`, `scripts/install-cli.sh`, and the full `scripts/install.sh` installer manage only the completion files and never modify `.bashrc`, `.zshrc`, or Fish configuration files. `make uninstall-aenv` removes files created by the Make-based install while preserving unmanaged files.
+
+For a user-local Make install, use `AENV_INSTALL_PREFIX=~/.local AENV_INSTALL_SUDO= make install-aenv`. If Zsh does not find the installed user completion directory, add this before `compinit`:
+
+```zsh
+fpath=(~/.local/share/zsh/site-functions $fpath)
+autoload -Uz compinit
+compinit
+```

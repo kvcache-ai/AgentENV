@@ -50,6 +50,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	build-server build-server-release \
 	build-snapshot-image \
 	build-aenv build-aenv-release install-aenv uninstall-aenv \
+	check-completion-install \
 	build-ublk install-ublk \
 	fmt clippy \
 	mutants coverage \
@@ -91,11 +92,16 @@ build-aenv-release:
 install-aenv: build-aenv-release
 	$(AENV_INSTALL_SUDO) install -d "$(AENV_INSTALL_DIR)"
 	$(AENV_INSTALL_SUDO) install -m 0755 "$${CARGO_TARGET_DIR:-$$(pwd)/target}/release/aenv" "$(AENV_INSTALL_DIR)/aenv"
+	$(AENV_INSTALL_SUDO) scripts/install-completions.sh install --prefix="$(AENV_INSTALL_PREFIX)" --binary="$(AENV_INSTALL_DIR)/aenv"
 	@echo "Installed aenv to $(AENV_INSTALL_DIR)/aenv"
 
 uninstall-aenv:
+	$(AENV_INSTALL_SUDO) scripts/install-completions.sh uninstall --prefix="$(AENV_INSTALL_PREFIX)" --binary="$(AENV_INSTALL_DIR)/aenv"
 	$(AENV_INSTALL_SUDO) rm -f "$(AENV_INSTALL_DIR)/aenv"
 	@echo "Removed $(AENV_INSTALL_DIR)/aenv"
+
+check-completion-install:
+	bash scripts/tests/verify-completion-install.sh
 
 fmt:
 	$(CARGO) fmt --all -- --check
@@ -119,6 +125,7 @@ test-unit:
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib
 	bash scripts/tests/verify-capability-runner.sh
 	bash scripts/tests/verify-install-service.sh
+	bash scripts/tests/verify-completion-install.sh
 
 test-integration: test-agent-integration test-envd test-ublk
 
