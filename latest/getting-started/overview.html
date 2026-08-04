@@ -35,10 +35,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-c89d6cb6.js";
+            window.path_to_searchindex_js = "../searchindex-e49023df.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-9a36fd67.js"></script>
+        <script src="../toc-07f6774b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -185,9 +185,10 @@
 The repository is available at <a href="https://github.com/kvcache-ai/AgentENV">https://github.com/kvcache-ai/AgentENV</a>.</p>
 <h2 id="why-agentenv"><a class="header" href="#why-agentenv">Why AgentENV</a></h2>
 <ul>
-<li><strong>Sub-50 ms sandbox boot, massive concurrency</strong> — Sandboxes boot from a template snapshot in ~49 ms. Sandboxes forked from the same template share a single mmap’d memory device; memory pages are fetched lazily via copy-on-write, so per-sandbox overhead stays low and many sandboxes can run concurrently on a single host.</li>
-<li><strong>Efficient snapshots</strong> — Snapshot creation completes in ~133 ms. Firecracker diff snapshots capture only dirty pages, and each delta is compressed and stacked as a new overlaybd layer. Snapshots are first-class primitives — pause, fork, and restore any running sandbox at any point.</li>
-<li><strong>On-demand image pull</strong> — Images are never fully downloaded upfront. The runtime reads blocks directly from the OCI registry on demand, so sandboxes start immediately without waiting for a full image pull.</li>
+<li><strong>Scale across diverse environments</strong>: AENV runs massive numbers of Firecracker environments across machines and diverse OCI-compatible images, loaded on demand via overlaybd. Local disk acts as a bounded cache, retaining hot data and evicting cold, so images can exceed disk capacity while startup stays fast cluster-wide, without pre-warming every host.</li>
+<li><strong>Make idle environments inexpensive</strong>: Snapshot-backed environments boot or resume in under 50 ms and pause in under 100 ms. Idle environments can quickly release CPU and memory, then return when new work arrives.</li>
+<li><strong>Native snapshot and fork support</strong>: AENV snapshots memory and filesystem changes incrementally, completing in under 100 ms even under heavy disk modification. A running environment can fork into multiple independent sandboxes for parallel agent workflows. Snapshots persist to S3-compatible object storage or a shared distributed filesystem to prevent data loss.</li>
+<li><strong>Preserve performance and density over time</strong>: AENV delivers high-performance I/O via ublk while sharing the host page cache across storage and memory-snapshot data. Memory ballooning returns reclaimable guest memory to the host, sustaining high overcommit as environments run longer and diverge.</li>
 </ul>
 <h2 id="features"><a class="header" href="#features">Features</a></h2>
 <ul>
@@ -197,7 +198,7 @@ The repository is available at <a href="https://github.com/kvcache-ai/AgentENV">
 <li><strong>Snapshot-backed template builder</strong> for publishing reusable, pre-configured sandbox runtimes</li>
 <li><strong>E2B-compatible API</strong> so existing E2B SDKs and CLIs work out of the box</li>
 <li><strong>Reverse proxy</strong> to reach services running inside sandboxes via HTTP and WebSocket</li>
-<li><strong>Multi-node scaling</strong> with a gateway + scheduler control plane (prototype)</li>
+<li><strong>Multi-node scaling</strong> with a gateway + scheduler control plane</li>
 </ul>
 <h2 id="who-is-this-for"><a class="header" href="#who-is-this-for">Who Is This For</a></h2>
 <p>AgentENV is built for teams running AI agents that need isolated execution environments: code interpreters, tool-use agents, autonomous coding agents, or any workload where you want a fresh (or cached) Linux environment per task.</p>
@@ -210,8 +211,7 @@ The repository is available at <a href="https://github.com/kvcache-ai/AgentENV">
 </thead>
 <tbody>
 <tr><td><strong><a href="./aenv-cli.html">aenv CLI</a></strong></td><td>Interactive use, scripting, local development</td></tr>
-<tr><td><strong><a href="../integration/e2b-cli.html">E2B CLI</a></strong></td><td>E2B-familiar workflows from the terminal</td></tr>
-<tr><td><strong><a href="../integration/e2b-sdk.html">E2B SDK</a></strong></td><td>Application code — the existing E2B SDK works against AgentENV without modification</td></tr>
+<tr><td><strong><a href="../integration/e2b.html">E2B</a></strong></td><td>Application code — existing E2B-based applications work with AgentENV without modification</td></tr>
 <tr><td><strong><a href="../api/index.html">HTTP API</a></strong></td><td>Direct control, other languages, automation</td></tr>
 </tbody>
 </table>
