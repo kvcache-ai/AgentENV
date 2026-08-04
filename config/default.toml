@@ -116,7 +116,6 @@ vcpu_count = 2
 # bandwidth_burst_bytes = 10485760      # 10 MB burst
 # iops = 3000
 # iops_burst = 500
-# refill_time_ms = 1000
 
 [envd]
 version = "0.5.15"

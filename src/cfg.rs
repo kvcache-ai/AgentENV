@@ -273,9 +273,6 @@ pub struct DiskRateLimitConfig {
     /// One-time burst allowance in operations above the sustained IOPS.
     #[config(default = 0u64)]
     pub iops_burst: u64,
-    /// Token bucket refill period in milliseconds.
-    #[config(default = 1000u64)]
-    pub refill_time_ms: u64,
 }
 
 #[derive(Debug, Config, Clone)]
