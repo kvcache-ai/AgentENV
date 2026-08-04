@@ -1,6 +1,6 @@
 [firecracker.kvm]
 version = "1.15.1-patch-v1"
-url = "https://pub-4ee15c400f554ab7a9eac3f5bc8f53de.r2.dev/firecracker-{version}-{arch}.tgz"
+url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/firecracker-{version}-{arch}.tgz"
 
 [firecracker.pvm]
 version = "v1.17.0-next.1"
@@ -8,7 +8,7 @@ url = "https://github.com/kvcache-ai/firecracker-next/releases/download/{version
 
 [kernel.kvm]
 version = "vmlinux-6.1.175"
-url = "https://pub-4ee15c400f554ab7a9eac3f5bc8f53de.r2.dev/{version}"
+url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/{version}-{arch}"
 
 [kernel.pvm]
 version = "6.12.33-pvm"
@@ -16,7 +16,7 @@ url = "https://github.com/kvcache-ai/linux/releases/download/pvm-kernel-6.12.33/
 
 [tools]
 version = "0.1.0"
-url = "ghcr.io/zlzgithub-0801/agentenv-tools:{version}"
+url = "ghcr.io/kvcache-ai/agentenv-tools:{version}"
 
 [overlaybd]
 version = "v1.0.18"

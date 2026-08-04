@@ -20,7 +20,7 @@ uses a dedicated `aenv` system account with `CAP_NET_ADMIN` and
 
 ### 1. Install and start the server
 
-**Option A — Install Script (Linux x86_64)**
+**Option A — Install Script (Ubuntu 24.04)**
 
 The script installs both the server and the `aenv` CLI. Set `AENV_HOME_PATH` to
 choose the data directory; if it is not set, AENV stores runtime dependencies

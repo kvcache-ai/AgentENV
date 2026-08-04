@@ -52,7 +52,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 FROM ubuntu:24.04 AS runtime-base
 ARG APT_MIRROR_BASE
-ARG TARGETARCH=amd64
+ARG TARGETARCH
 # Optional extra runtime packages, specified as a whitespace- or comma-separated build arg.
 ARG EXTRA_RUNTIME_PACKAGES=""
 COPY deploy/docker/apply_apt_mirror.sh /usr/local/bin/apply_apt_mirror.sh
