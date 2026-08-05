@@ -5,6 +5,7 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime};
 
+use anyhow::Context;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
@@ -105,7 +106,7 @@ pub struct Orchestrator<
     shutdown_tx: watch::Sender<bool>,
     shutdown_outcome: OnceCell<ShutdownOutcome>,
     image_refs: Arc<dyn RuntimeImageRefs>,
-    access_tokens: Arc<SandboxAccessTokenGenerator>,
+    access_tokens: SandboxAccessTokenGenerator,
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
@@ -153,9 +154,6 @@ where
         image_refs: Arc<dyn RuntimeImageRefs>,
     ) -> Result<Arc<Self>> {
         let app_config = ConfigManager::global_config();
-        let access_tokens = Arc::new(SandboxAccessTokenGenerator::new(
-            app_config.sandbox.access_token_hash_seed()?,
-        )?);
         let config = &app_config.orchestrator;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (sandbox_event_tx, _sandbox_event_rx) =
@@ -164,6 +162,12 @@ where
         // Restore persisted sandboxes from the previous run, keeping the paused
         // ones (with their state) for the paused-protection reconcile below.
         let persisted = persister.load_all(&factory).await?;
+        let managed_seed_must_exist = persisted.iter().any(|metadata| metadata.secure);
+        let access_tokens = tokio::task::spawn_blocking(move || {
+            SandboxAccessTokenGenerator::load_or_create(app_config, managed_seed_must_exist)
+        })
+        .await
+        .context("join envd access-token seed loader")??;
         let restored_paused: Vec<(SandboxId, Arc<dyn PausedSandboxState>)> = persisted
             .iter()
             .filter(|metadata| metadata.state == SandboxState::Paused)

@@ -290,22 +290,6 @@ impl std::fmt::Debug for SandboxConfig {
     }
 }
 
-impl SandboxConfig {
-    pub(crate) fn access_token_hash_seed(&self) -> Result<&str> {
-        let seed = self.access_token_hash_seed.as_deref().ok_or_else(|| {
-            anyhow!("[sandbox].access_token_hash_seed must be configured and non-empty")
-        })?;
-        if seed.trim().is_empty() {
-            bail!("[sandbox].access_token_hash_seed must be configured and non-empty");
-        }
-        Ok(seed)
-    }
-
-    pub fn validate_access_token_hash_seed(&self) -> Result<()> {
-        self.access_token_hash_seed().map(|_| ())
-    }
-}
-
 #[derive(Debug, Config, Clone)]
 pub struct MachineConfig {
     #[config(default = 2u32)]
@@ -626,6 +610,7 @@ impl_config_default!(
     ToolsConfig,
     SandboxProxyConfig,
     EnvdConfig,
+    SandboxConfig,
     MachineConfig,
     SnapshotConfig,
     SnapshotImagePublishConfig,
@@ -1345,17 +1330,10 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_access_token_seed_is_required_for_serving() {
-        let mut config = SandboxConfig {
-            access_token_hash_seed: None,
+    fn sandbox_access_token_seed_is_redacted() {
+        let config = SandboxConfig {
+            access_token_hash_seed: Some("cluster-secret".to_string()),
         };
-        assert!(config.validate_access_token_hash_seed().is_err());
-
-        config.access_token_hash_seed = Some("   ".to_string());
-        assert!(config.validate_access_token_hash_seed().is_err());
-
-        config.access_token_hash_seed = Some("cluster-secret".to_string());
-        assert!(config.validate_access_token_hash_seed().is_ok());
         assert!(!format!("{config:?}").contains("cluster-secret"));
     }
 

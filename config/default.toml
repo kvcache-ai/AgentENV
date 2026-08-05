@@ -188,8 +188,9 @@ init_timeout_secs = 60
 poll_ms = 3
 
 [sandbox]
-# Shared secret used to derive per-sandbox envd access tokens. All nodes in a
-# cluster must use the same value. Prefer AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED.
+# Optional secret used to derive per-sandbox envd access tokens. When unset,
+# AgentENV creates a node-local seed under $AENV_HOME/secrets. Configure the
+# same explicit value on every node before enabling cross-node sandbox recovery.
 # access_token_hash_seed = "replace-with-a-secret"
 
 [orchestrator]

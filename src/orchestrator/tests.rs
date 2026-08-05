@@ -50,18 +50,6 @@ fn test_runtime_image_refs() -> Arc<dyn RuntimeImageRefs> {
     local_image_services_from_global_config().runtime_refs
 }
 
-fn test_access_tokens() -> Arc<SandboxAccessTokenGenerator> {
-    Arc::new(
-        SandboxAccessTokenGenerator::new(
-            ConfigManager::global_config()
-                .sandbox
-                .access_token_hash_seed()
-                .unwrap(),
-        )
-        .unwrap(),
-    )
-}
-
 async fn make_orchestrator() -> Arc<TestOrchestrator> {
     Orchestrator::new_inner(
         InMemoryMetadataStore::new(),
@@ -129,7 +117,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         shutdown_tx: tokio::sync::watch::channel(false).0,
         shutdown_outcome: tokio::sync::OnceCell::new(),
         image_refs: test_runtime_image_refs(),
-        access_tokens: test_access_tokens(),
+        access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
     })
 }
 

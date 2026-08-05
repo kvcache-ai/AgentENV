@@ -257,9 +257,11 @@ Sandbox control communication settings.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `access_token_hash_seed` | string | required | Cluster-wide secret used to derive secure sandbox envd access tokens. All nodes must use the same value. Prefer the `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` environment variable. Normal server startup fails when it is missing or empty; setup-only and host setup do not require it. |
+| `access_token_hash_seed` | string | auto-generated | Optional override for the secret used to derive secure sandbox envd access tokens. When unset, normal server startup creates and reuses `$AENV_HOME/secrets/sandbox-access-token-hash-seed`. |
 
-Changing the seed invalidates access tokens for existing secure sandboxes. Rotate it with a coordinated restart of every node.
+The managed seed is node-local persistent state and must be included in backups of `$AENV_HOME`. AgentENV refuses to generate a replacement when persisted secure sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates access tokens for existing secure sandboxes.
+
+Configure `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` with the same value on every node to enable cross-node recovery of the same sandbox.
 
 ## `[orchestrator]`
 

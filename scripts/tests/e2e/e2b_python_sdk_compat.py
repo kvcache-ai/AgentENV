@@ -109,6 +109,7 @@ def main() -> int:
             api_key=api_key,
             sandbox_url=sandbox_url,
             request_timeout=60,
+            secure=True,
         )
         require(sandbox.sandbox_id, "sandbox create returned an empty sandbox_id")
         log(f"sandbox created: {sandbox.sandbox_id}")
@@ -228,6 +229,7 @@ def main() -> int:
                 api_key=api_key,
                 sandbox_url=sandbox_url,
                 request_timeout=60,
+                secure=True,
             )
             require(
                 derived_sandbox.sandbox_id,
