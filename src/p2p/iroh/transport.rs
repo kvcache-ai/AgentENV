@@ -829,15 +829,25 @@ mod tests {
             }
         });
 
-        first_started.notified().await;
-        second_finished.notified().await;
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            first_started.notified().await;
+            second_finished.notified().await;
+        })
+        .await
+        .expect("initial buffered lookups should complete");
         assert!(
             !lookup.is_finished(),
             "a lower-priority result must wait for earlier candidates"
         );
 
         release_first.notify_one();
-        assert_eq!(lookup.await.expect("lookup task"), Some("first"));
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, lookup)
+                .await
+                .expect("ordered lookup should complete")
+                .expect("lookup task"),
+            Some("first")
+        );
     }
 
     #[tokio::test]
@@ -873,10 +883,20 @@ mod tests {
             }
         });
 
-        first_window_ready.wait().await;
+        tokio::time::timeout(TEST_TIMEOUT, first_window_ready.wait())
+            .await
+            .expect("initial concurrency window should fill");
         assert_eq!(current.load(Ordering::SeqCst), 4);
-        release_first_window.wait().await;
-        assert_eq!(lookup.await.expect("lookup task"), None);
+        tokio::time::timeout(TEST_TIMEOUT, release_first_window.wait())
+            .await
+            .expect("initial concurrency window should be released");
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, lookup)
+                .await
+                .expect("bounded lookup should complete")
+                .expect("lookup task"),
+            None
+        );
         assert_eq!(maximum.load(Ordering::SeqCst), 4);
     }
 
