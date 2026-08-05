@@ -1321,7 +1321,8 @@ impl FirecrackerSandbox {
         self.configure_microvm(&config, boot_args.as_deref(), &extra_drive_attachments)
             .await?;
         self.fc_instance.start().await?;
-        self.apply_disk_rate_limiter(false).await?;
+        self.apply_disk_rate_limiter(&config.disk_rate_limit, false)
+            .await?;
         debug!("fresh sandbox started");
         Ok(())
     }
@@ -1538,7 +1539,11 @@ impl FirecrackerSandbox {
         // A restored snapshot may carry a previously configured limiter, so
         // reconcile against the node's current config, clearing any inherited
         // limiter when disk rate limiting is now disabled.
-        self.apply_disk_rate_limiter(true).await?;
+        self.apply_disk_rate_limiter(
+            &ConfigManager::global_config().machine.disk_rate_limit,
+            true,
+        )
+        .await?;
 
         debug!("sandbox restored from snapshot config");
         Ok(())
@@ -1709,16 +1714,22 @@ impl FirecrackerSandbox {
         Ok(())
     }
 
-    /// Applies the node's configured disk rate limiter to the user rootfs drive
-    /// via a post-boot PATCH, unifying the fresh-boot and resume paths.
+    /// Applies the given disk rate limiter config to the user rootfs drive via a
+    /// post-boot PATCH, unifying the fresh-boot and resume paths. Fresh boot passes
+    /// the sandbox's own launch config so the configuration used to construct the
+    /// sandbox is the one applied; resume intentionally passes the node's current
+    /// global config to reconcile a restored snapshot against present settings.
     ///
     /// When limiting is disabled, `clear_inherited` controls behavior: resume
     /// passes `true` to overwrite any limiter a restored snapshot inherited with
     /// an effectively-unlimited one (Firecracker cannot remove a limiter via
     /// PATCH; see `unlimited_rate_limiter`), while a fresh boot passes `false`
     /// and skips the PATCH entirely since its device model starts clean.
-    async fn apply_disk_rate_limiter(&self, clear_inherited: bool) -> Result<()> {
-        let cfg = &ConfigManager::global_config().machine.disk_rate_limit;
+    async fn apply_disk_rate_limiter(
+        &self,
+        cfg: &crate::cfg::DiskRateLimitConfig,
+        clear_inherited: bool,
+    ) -> Result<()> {
         let rl = match build_disk_rate_limiter(cfg)? {
             Some(rl) => rl,
             None if clear_inherited => unlimited_rate_limiter(),
