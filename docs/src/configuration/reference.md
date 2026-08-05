@@ -497,17 +497,29 @@ the default path on every startup.
 Background download settings dedicated to remote memory-snapshot OverlayBD layers.
 They do not change the general rootfs or attached-drive defaults. All fields are
 serialized into the generated memory OverlayBD global config. Each remote layer
-is downloaded block by block: a sequential sparse-file scan collects the pending
-blocks, then at most `concurrency` block tasks fetch non-overlapping ranges in
-parallel on a dedicated multi-thread runtime. Layer files are still processed
-one at a time. Downloads of a sandbox-bound device start only after envd is
-ready (plus `delay`), with a 20s fallback if the ready signal is lost; while
-foreground remote reads are in flight, background block reads yield to a small
-guaranteed floor instead of competing at full speed. The generated memory
+is filled block by block into the node-local remote file cache: the cache-owned
+background-download scheduler registers one task per remote layer (deduplicated
+by blob, shared across sandboxes) and downloads only chunks still missing
+from the entry bitmap — each source request fetches `block_size` bytes
+(aligned to whole cache blocks) and publishes the chunk's cache blocks as
+soon as they land. Submission is never rejected under load — tasks run as
+scheduler capacity allows, with at most `maxConcurrentFiles` layer tasks
+concurrently per file-cache backend (from the generated overlaybd download
+config, default 8)
+and at most `concurrency` chunk reads in parallel per layer, subject to the
+scheduler's `max_inflight_blocks` cap. Downloads of a
+sandbox-bound device start only after envd is ready (plus `delay`), with a 20s
+fallback if the ready signal is lost; while foreground remote reads are in
+flight, background block reads yield to a small guaranteed floor instead of
+competing at full speed. The generated memory
 config leaves throttling off (`maxMBps = 0`); image configs that carry a positive
 `maxMBps` keep their historical shared rate limit across the block tasks.
-Completed layers are switched to the local file only after a full-file digest
-check; a failed or canceled block never switches.
+A completed cache block becomes visible to foreground reads as soon as it is
+committed to the cache bitmap; there is no staging file, no full-file digest
+check, and no switch-to-local, so a failed or canceled block simply stays
+uncached and is fetched on demand by foreground reads or a later retry. The
+cache is a bounded working set: blocks may be evicted under capacity pressure
+and are then re-fetched on demand.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -515,6 +527,6 @@ check; a failed or canceled block never switches.
 | `delay` | integer | `0` | Delay in seconds after envd is ready before background download begins (downloads never start before envd readiness; a 20s fallback applies if the ready signal is lost). |
 | `delay_extra` | integer | `1` | Exclusive upper bound for random extra delay. The default `1` ensures `delay = 0` adds no jitter. |
 | `try_cnt` | integer | `5` | Retry count, with the same semantics as OverlayBD `DownloadConfig.tryCnt`. |
-| `block_size` | integer | `16777216` | Download block size in bytes (16 MiB). Peak scratch memory per active layer download is `block_size * concurrency`. |
+| `block_size` | integer | `16777216` | Background download chunk size in bytes (16 MiB): one source request fetches a chunk of this size, aligned down to whole cache blocks. The cache keeps its own smaller block size for foreground reads, so background downloads keep large-request throughput while foreground keeps fine-grained on-demand reads. Peak scratch per active layer download is `block_size × concurrency`. |
 | `concurrency` | integer | `4` | Maximum number of in-flight block remote reads within a single remote layer. `1` keeps the historical serial behavior. Must be greater than zero. |
-| `max_inflight_blocks` | integer | `16` | Process-wide cap on in-flight download blocks shared by every concurrent layer download; bounds total scratch memory to `max_inflight_blocks * block_size`. Must be greater than zero. |
+| `max_inflight_blocks` | integer | `16` | Cap on concurrently downloading chunks enforced by each file-cache backend's download scheduler, shared by every concurrent layer download on that backend; bounds total scratch memory to `max_inflight_blocks` × the download chunk size (`block_size`). The value is fixed when the backend is created from the global config; a per-image `download` override never resizes the scheduler-owned cap (the first mismatch per scheduler is logged as `max_inflight_blocks_override_ignored`). Must be greater than zero. |

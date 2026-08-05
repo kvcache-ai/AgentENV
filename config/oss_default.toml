@@ -159,9 +159,9 @@ enable = true
 delay = 0 # delay after envd is ready (downloads never start before envd readiness; a 20s fallback applies if the ready signal is lost)
 delay_extra = 1 # random extra delay is [0, delay_extra), so 1 adds no jitter
 try_cnt = 5
-block_size = 16777216 # 16 MiB per block; peak scratch memory is block_size * concurrency per layer download
-concurrency = 4 # max in-flight block remote reads per remote layer; layers download sequentially
-max_inflight_blocks = 16 # process-wide cap on in-flight download blocks shared by every layer download
+block_size = 16777216 # background download chunk size: one source request fetches a chunk (aligned down to whole cache blocks); the cache keeps its own smaller block size for foreground reads; peak scratch per active layer download is block_size * concurrency
+concurrency = 4 # max in-flight chunk source reads per remote layer; concurrent layer tasks are bounded by the scheduler's maxConcurrentFiles (default 8), and in-flight chunks globally by maxInflightBlocks
+max_inflight_blocks = 16 # cap on in-flight download blocks enforced by the cache backend's download scheduler; fixed at backend creation, per-image overrides never resize it
 
 [observability]
 enabled = true

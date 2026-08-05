@@ -982,6 +982,11 @@ mod tests {
         assert_eq!(download["tryCnt"], expected.try_cnt);
         assert_eq!(download["blockSize"], expected.block_size);
         assert_eq!(download["concurrency"], expected.concurrency);
+        assert_eq!(download["maxInflightBlocks"], expected.max_inflight_blocks);
+        assert_eq!(
+            download["maxConcurrentFiles"],
+            expected.max_concurrent_files
+        );
     }
 
     #[test]

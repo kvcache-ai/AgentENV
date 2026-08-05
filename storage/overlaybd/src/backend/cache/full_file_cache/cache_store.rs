@@ -100,14 +100,7 @@ impl FileCacheBackend {
         // directly from the mmap region, avoiding the Vec<u8> allocation.
         if start_block == end_block {
             let block = self
-                .try_preadv2_generic(
-                    reader,
-                    cache_id,
-                    source,
-                    ctx,
-                    allow_refill && !did_prefill,
-                    start_block,
-                )
+                .try_preadv2_generic(reader, cache_id, source, ctx, !did_prefill, start_block)
                 .await?;
             let block_base = start_block * block_size;
             let from = usize::try_from(offset.saturating_sub(block_base)).unwrap_or(0);
@@ -125,14 +118,7 @@ impl FileCacheBackend {
         let mut written = 0usize;
         for block_id in start_block..=end_block {
             let block = self
-                .try_preadv2_generic(
-                    reader,
-                    cache_id,
-                    source,
-                    ctx,
-                    allow_refill && !did_prefill,
-                    block_id,
-                )
+                .try_preadv2_generic(reader, cache_id, source, ctx, !did_prefill, block_id)
                 .await?;
             let block_base = block_id * block_size;
             let from = if block_id == start_block {
@@ -245,14 +231,7 @@ impl FileCacheBackend {
         let mut written = 0usize;
         for block_id in start_block..=end_block {
             let block = self
-                .try_preadv2_generic(
-                    reader,
-                    cache_id,
-                    source,
-                    ctx,
-                    allow_refill && !did_prefill,
-                    block_id,
-                )
+                .try_preadv2_generic(reader, cache_id, source, ctx, !did_prefill, block_id)
                 .await?;
             let block_base = block_id * block_size;
             let from = if block_id == start_block {
@@ -529,17 +508,19 @@ impl FileCacheBackend {
             return Ok(());
         }
 
-        let entry = match self.get_cache_entry(cache_id) {
-            Some(e) => e,
-            None => return Ok(()),
-        };
+        let entry = self
+            .get_cache_entry(cache_id)
+            .ok_or_else(|| anyhow!("cache entry evicted: cache_id={cache_id}"))?;
 
         let block_size = self.options.block_size;
         let group_start = refill_off / block_size;
         let group_end = div_round_up(refill_off.saturating_add(refill_size), block_size);
 
-        // Use the waker-based acquire pattern per block.
+        // Use the waker-based acquire pattern per block. The entry-owned read
+        // permit spans source I/O, mmap write, bitmap publication, and refill
+        // guard cleanup, so logical eviction cannot interleave with a refill.
         for block_id in group_start..group_end {
+            let _barrier = entry.refill_eviction_barrier.read().await;
             let result = entry.acquire_refill(block_id).await;
             match result {
                 AcquireRefillResult::InCache => continue,
@@ -550,10 +531,17 @@ impl FileCacheBackend {
                         block_id,
                         active_refills: &self.active_refills,
                     };
-                    self.do_refill_block_generic(reader, cache_id, source, source_size, block_id)
-                        .await?;
-                    // NOTE: _guard will drop automatically here, which will
-                    // decrement active_refills and call finish_refill
+                    self.do_refill_block_generic(
+                        reader,
+                        entry.as_ref(),
+                        cache_id,
+                        source,
+                        source_size,
+                        block_id,
+                    )
+                    .await?;
+                    // NOTE: _guard will drop before _barrier, decrementing
+                    // active_refills and calling finish_refill while protected.
                 }
             }
         }
@@ -572,6 +560,7 @@ impl FileCacheBackend {
     async fn do_refill_block_generic<R: FileReader>(
         &self,
         reader: &R,
+        entry: &CacheEntry,
         cache_id: &str,
         source: &Arc<dyn VirtualFile>,
         source_size: u64,
@@ -595,11 +584,9 @@ impl FileCacheBackend {
             return Err(Errno::ENOSPC.into());
         }
 
-        let entry = match self.get_cache_entry(cache_id) {
-            Some(e) => e,
-            None => return Ok(()),
-        };
-
+        // The caller holds the entry's refill barrier and passes the stable
+        // entry reference. Never look up by cache_id here: that would allow a
+        // stale task to populate a replacement entry after an ABA recycle.
         // Get a mutable slice into the mmap region for this block.
         // Safety: the acquire_refill protocol guarantees we are the sole
         // loader for this block_id.
@@ -622,16 +609,8 @@ impl FileCacheBackend {
         entry.mark_block_cached(block_id);
         entry.record_refill();
 
-        // Update global capacity counter (use actual bytes written).
-        self.state
-            .current_bytes
-            .fetch_add(want as u64, Ordering::Relaxed);
-
-        // Check if over risk mark.
-        let current = self.state.current_bytes.load(Ordering::Relaxed);
-        if current >= self.risk_mark() {
-            self.state.is_full.store(true, Ordering::Relaxed);
-        }
+        // Update global capacity and pressure state atomically as a pair.
+        self.add_current_bytes(want as u64);
 
         Ok(())
     }
@@ -716,10 +695,10 @@ impl FileCacheBackend {
         let end_block = (write_end - 1) / block_size;
         let new_size = source_size.max(write_end);
 
-        let entry = match self.get_cache_entry(cache_id) {
-            Some(e) => e,
-            None => return Ok(0),
-        };
+        let entry = self
+            .get_cache_entry(cache_id)
+            .ok_or_else(|| anyhow!("cache entry evicted: cache_id={cache_id}"))?;
+        let _barrier = entry.refill_eviction_barrier.read().await;
 
         // Ensure data file is large enough.
         if new_size > entry.source_size.load(Ordering::Relaxed) {
@@ -790,15 +769,9 @@ impl FileCacheBackend {
 
         entry.record_refill();
 
-        // Update global capacity.
+        // Update global capacity and pressure state atomically as a pair.
         if bytes_added > 0 {
-            self.state
-                .current_bytes
-                .fetch_add(bytes_added, Ordering::Relaxed);
-            let current = self.state.current_bytes.load(Ordering::Relaxed);
-            if current >= self.risk_mark() {
-                self.state.is_full.store(true, Ordering::Relaxed);
-            }
+            self.add_current_bytes(bytes_added);
         }
 
         // Trigger eviction check asynchronously.
@@ -822,13 +795,9 @@ impl FileCacheBackend {
 
         if old_bytes != new_bytes {
             if new_bytes < old_bytes {
-                self.state
-                    .current_bytes
-                    .fetch_sub(old_bytes - new_bytes, Ordering::Relaxed);
+                self.subtract_current_bytes(old_bytes - new_bytes);
             } else {
-                self.state
-                    .current_bytes
-                    .fetch_add(new_bytes - old_bytes, Ordering::Relaxed);
+                self.add_current_bytes(new_bytes - old_bytes);
             }
         }
         Ok(())
@@ -840,10 +809,9 @@ impl FileCacheBackend {
 
     async fn evict_all_blocks(&self, cache_id: &str) -> Result<()> {
         if let Some(entry) = self.get_cache_entry(cache_id) {
-            let bytes = entry.total_cached_bytes();
-            entry.evict_all_blocks()?;
-            if bytes > 0 {
-                self.state.current_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            let released = entry.evict_all_blocks().await?;
+            if released > 0 {
+                self.subtract_current_bytes(released);
             }
         }
         Ok(())
@@ -994,6 +962,222 @@ impl CachedFile {
 
     pub fn set_source(&self, source: Option<Arc<dyn VirtualFile>>) {
         *self.source.write() = source;
+    }
+
+    pub(crate) fn cache_id(&self) -> &str {
+        &self.cache_id
+    }
+
+    pub(crate) fn background_source_snapshot(&self) -> Result<(Arc<dyn VirtualFile>, u64)> {
+        let source = self
+            .current_source()
+            .ok_or_else(|| anyhow!("background cache download requires source file"))?;
+        Ok((source, self.source_size.load(Ordering::Acquire)))
+    }
+
+    pub(crate) fn background_block_size(&self) -> u64 {
+        self.backend.options.block_size
+    }
+
+    fn background_block_count(&self, source_size: u64) -> Result<u64> {
+        let block_count = div_round_up(source_size, self.background_block_size());
+        ensure!(
+            block_count <= u64::from(u32::MAX) + 1,
+            "background cache block count {block_count} exceeds bitmap range"
+        );
+        Ok(block_count)
+    }
+
+    pub(crate) fn missing_background_blocks(&self, source_size: u64) -> Result<Vec<u64>> {
+        let block_count = self.background_block_count(source_size)?;
+        let index = self
+            .backend
+            .get_cache_entry(&self.cache_id)
+            .ok_or_else(|| anyhow!("cache entry evicted: cache_id={}", self.cache_id))?
+            .index
+            .read()
+            .clone();
+        (0..block_count)
+            .filter_map(|block_id| {
+                let bitmap_id = match u32::try_from(block_id) {
+                    Ok(bitmap_id) => bitmap_id,
+                    Err(error) => return Some(Err(error.into())),
+                };
+                if !index.contains(bitmap_id) {
+                    Some(Ok(block_id))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn background_is_complete(&self, source_size: u64) -> Result<bool> {
+        Ok(self.missing_background_blocks(source_size)?.is_empty())
+    }
+
+    /// Enumerate download chunks (`blocks_per_chunk` cache blocks each) that
+    /// still have at least one missing block, as `(start_block, len_blocks)`
+    /// pairs; the final chunk may be shorter. The download chunk is the
+    /// background fetch granularity (`download.blockSize`) expressed in cache
+    /// blocks — the cache itself keeps storing and exposing blocks in its own
+    /// smaller block size.
+    pub(crate) fn missing_background_chunks(
+        &self,
+        source_size: u64,
+        blocks_per_chunk: u32,
+    ) -> Result<Vec<(u64, u32)>> {
+        let blocks_per_chunk = u64::from(blocks_per_chunk.max(1));
+        let block_count = self.background_block_count(source_size)?;
+        let entry = self
+            .backend
+            .get_cache_entry(&self.cache_id)
+            .ok_or_else(|| anyhow!("cache entry evicted: cache_id={}", self.cache_id))?;
+        let index = entry.index.read();
+        let mut chunks = Vec::new();
+        let mut start = 0u64;
+        while start < block_count {
+            let len = (block_count - start).min(blocks_per_chunk);
+            let has_missing = (start..start + len).any(|block_id| !index.contains(block_id as u32));
+            if has_missing {
+                chunks.push((start, u32::try_from(len)?));
+            }
+            start += len;
+        }
+        Ok(chunks)
+    }
+
+    /// Refill a range of cache blocks from the source with as few requests as
+    /// possible: missing blocks are acquired through the shared loader
+    /// election, then each contiguous run of acquired blocks is fetched with
+    /// one source read and published per block. Blocks already cached (or
+    /// completed by a concurrent loader while we waited) are never rewritten.
+    /// Returns the number of bytes read from the source.
+    ///
+    /// The caller owns pacing (gate, block slots, timeouts); this function
+    /// owns loader election, the eviction barrier, and bitmap publication.
+    pub(crate) async fn background_refill_range(
+        &self,
+        source: &Arc<dyn VirtualFile>,
+        source_size: u64,
+        start_block: u64,
+        len_blocks: u32,
+    ) -> Result<u64> {
+        let end_block = start_block
+            .checked_add(u64::from(len_blocks))
+            .ok_or_else(|| anyhow!("background cache block range overflow"))?;
+        ensure!(
+            end_block <= self.background_block_count(source_size)?,
+            "background cache block range out of bounds"
+        );
+
+        // Back off while the cache is full: the task-level retry loop turns
+        // this into a bounded ENOSPC wait instead of churning eviction.
+        if self.backend.options.capacity_bytes == 0
+            || self.backend.state.is_full.load(Ordering::Relaxed)
+        {
+            return Err(Errno::ENOSPC.into());
+        }
+
+        // Loader election for the whole range before any source I/O. The
+        // barrier blocks logical eviction until every acquired block is
+        // published or released.
+        let entry = self
+            .backend
+            .get_cache_entry(&self.cache_id)
+            .ok_or_else(|| anyhow!("cache entry evicted: cache_id={}", self.cache_id))?;
+        let _barrier = entry.refill_eviction_barrier.read().await;
+        let mut runs: Vec<Vec<(u64, RefillGuard<'_>)>> = Vec::new();
+        for block_id in start_block..end_block {
+            match entry.acquire_refill(block_id).await {
+                AcquireRefillResult::InCache => {}
+                AcquireRefillResult::ShouldLoad => {
+                    self.backend.active_refills.fetch_add(1, Ordering::Relaxed);
+                    let guard = RefillGuard {
+                        entry: entry.as_ref(),
+                        block_id,
+                        active_refills: &self.backend.active_refills,
+                    };
+                    match runs.last_mut() {
+                        Some(last) if last.last().expect("non-empty run").0 + 1 == block_id => {
+                            last.push((block_id, guard))
+                        }
+                        _ => runs.push(vec![(block_id, guard)]),
+                    }
+                }
+            }
+        }
+
+        // Fetch each contiguous run with a single source read. A failed run
+        // releases its blocks for a later retry (guards drop) while runs
+        // already written stay published.
+        let mut read_bytes = 0u64;
+        for run in runs {
+            read_bytes += self
+                .refill_block_run(&entry, source, source_size, run)
+                .await?;
+        }
+        Ok(read_bytes)
+    }
+
+    /// Read one contiguous run of loader-owned blocks in a single source
+    /// request into task scratch, then copy per block into the mmap and
+    /// publish. Guards are consumed so each block's election is released
+    /// right after publication. A failed or timed-out read never touches the
+    /// mmap, so no unaccounted physical pages remain; capacity accounting is
+    /// batched into one update per run.
+    async fn refill_block_run(
+        &self,
+        entry: &Arc<CacheEntry>,
+        source: &Arc<dyn VirtualFile>,
+        source_size: u64,
+        run: Vec<(u64, RefillGuard<'_>)>,
+    ) -> Result<u64> {
+        let block_size = self.background_block_size();
+        let first = run.first().expect("non-empty run").0;
+        let last = run.last().expect("non-empty run").0;
+        let offset = first
+            .checked_mul(block_size)
+            .ok_or_else(|| anyhow!("background cache block offset overflow"))?;
+        let read_len = source_size
+            .saturating_sub(offset)
+            .min((last - first + 1) * block_size);
+        if read_len == 0 {
+            return Ok(0);
+        }
+        let mut scratch =
+            vec![0u8; usize::try_from(read_len).map_err(|_| anyhow!("chunk too large"))?];
+        let n = source.read_at_into(offset, &mut scratch).await?;
+        ensure!(
+            n as u64 == read_len,
+            "short background chunk read at offset {offset}: got {n}, want {read_len}"
+        );
+        let mut committed = 0u64;
+        for (block_id, guard) in run {
+            let want = source_size
+                .saturating_sub(block_id * block_size)
+                .min(block_size) as usize;
+            if want == 0 {
+                continue;
+            }
+            let block_off = usize::try_from((block_id - first) * block_size)?;
+            // Safety: this task is the elected loader for every block in the
+            // run, so writing the mmap directly is race-free.
+            let dst = unsafe {
+                entry
+                    .mmap_mut_for_block(block_id, source_size)?
+                    .ok_or_else(|| anyhow!("background cache block offset beyond source size"))?
+            };
+            dst[..want].copy_from_slice(&scratch[block_off..block_off + want]);
+            entry.mark_block_cached(block_id);
+            entry.record_refill();
+            committed += want as u64;
+            drop(guard);
+        }
+        if committed > 0 {
+            self.backend.add_current_bytes(committed);
+        }
+        Ok(read_len)
     }
 
     pub async fn query(&self, offset: u64, count: usize) -> Result<u64> {

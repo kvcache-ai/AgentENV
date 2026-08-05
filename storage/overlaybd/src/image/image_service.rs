@@ -5,13 +5,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::backend::cache::{CacheFnTransFunc, FileCacheBackend, FileCacheBackendOptions};
+use crate::backend::cache::{
+    BkDownloadSubmitError, CacheFnTransFunc, CachedFile, FileCacheBackend, FileCacheBackendOptions,
+};
 use crate::backend::local::LocalFile;
 use crate::backend::oss::OssBackend;
 use crate::backend::registryfs_v2::RegistryFsV2;
 use crate::config::{
-    load_global_config, resolve_image_config_local_paths, validate_image_config, GlobalConfig,
-    ImageConfig,
+    load_global_config, resolve_image_config_local_paths, validate_image_config, DownloadConfig,
+    GlobalConfig, ImageConfig,
 };
 use crate::image::image_file::ImageFile;
 use crate::io::virtual_file::VirtualFile;
@@ -42,6 +44,11 @@ struct RemoteRuntime {
     underlay_registryfs: RegistryFsV2,
     oss_backend: Option<OssBackend>,
     file_cache: Option<FileCacheBackend>,
+}
+
+pub(crate) struct CacheDownloadRequest {
+    file: Arc<CachedFile>,
+    config: DownloadConfig,
 }
 
 impl fmt::Debug for ImageServiceInner {
@@ -146,7 +153,13 @@ impl ImageService {
         match cfg.cache_config.cache_type.as_str() {
             "" | "file" => {
                 std::fs::create_dir_all(&cfg.cache_config.cache_dir)?;
-                let options = FileCacheBackendOptions::from_cache_config(&cfg.cache_config)?;
+                let mut options = FileCacheBackendOptions::from_cache_config(&cfg.cache_config)?;
+                // The cache-owned background download scheduler takes its
+                // node-level caps from the global download config; per-image
+                // overrides never resize them.
+                options.bk_download_max_inflight_blocks = cfg.download.max_inflight_blocks;
+                options.bk_download_max_concurrent_files = cfg.download.max_concurrent_files;
+                options.bk_download_block_size = cfg.download.block_size;
                 let basename_transform: CacheFnTransFunc = Arc::new(|origin| {
                     let basename = Path::new(origin)
                         .file_name()
@@ -211,8 +224,27 @@ impl ImageService {
         self.inner.global_config.io_engine
     }
 
-    pub(crate) fn p2p_publish_url(&self) -> Option<&str> {
-        self.inner.p2p_publish_url.as_deref()
+    #[cfg(test)]
+    pub(crate) async fn cached_file_stats(
+        &self,
+        source: &str,
+    ) -> Result<Option<crate::backend::cache::CachedFileStats>> {
+        Ok(self
+            .remote_runtime()
+            .await?
+            .file_cache
+            .as_ref()
+            .and_then(|cache| cache.file_stats(source)))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn file_cache_for_test(&self) -> Result<Option<FileCacheBackend>> {
+        Ok(self.remote_runtime().await?.file_cache.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_remote_mode_direct_for_test(&self) {
+        *self.inner.remote_mode.write() = RemoteOpenMode::Direct;
     }
 
     pub(crate) fn p2p_uuid_address(&self) -> Option<String> {
@@ -281,20 +313,14 @@ impl ImageService {
         source_size: Option<u64>,
     ) -> Result<Arc<dyn VirtualFile>> {
         let remote_runtime = self.remote_runtime().await?;
-        let source = self.open_remote_source_with_size(url, source_size).await?;
+        let source = self.open_backend_source_with_size(url, source_size).await?;
         // OSS blobs always go through the file cache (when available) regardless
         // of RemoteOpenMode. RemoteOpenMode::Direct is only meaningful for the
         // P2P accelerator path, which acts as its own cache; OSS has no P2P
         // channel, so we always want the local file cache as a read-ahead layer.
         if Self::is_oss_url(url) {
             if let Some(cache) = remote_runtime.file_cache.as_ref() {
-                let source_size = match source_size {
-                    Some(size) => size,
-                    None => source.size().await?,
-                };
-                let cache_file: Arc<dyn VirtualFile> = cache
-                    .open_file_with_source_size(url.to_string(), source, source_size)
-                    .await?;
+                let cache_file = Self::open_cached_blob(cache, url, source, source_size).await?;
                 return Ok(cache_file);
             }
             return Ok(source);
@@ -304,19 +330,102 @@ impl ImageService {
             RemoteOpenMode::Direct => Ok(source),
             RemoteOpenMode::Cached => {
                 if let Some(cache) = remote_runtime.file_cache.as_ref() {
-                    let source_size = match source_size {
-                        Some(size) => size,
-                        None => source.size().await?,
-                    };
-                    let cache_file: Arc<dyn VirtualFile> = cache
-                        .open_file_with_source_size(url.to_string(), source, source_size)
-                        .await?;
+                    let cache_file =
+                        Self::open_cached_blob(cache, url, source, source_size).await?;
                     Ok(cache_file)
                 } else {
                     Ok(source)
                 }
             }
         }
+    }
+
+    pub(crate) async fn open_remote_blob_for_bk_download_with_size(
+        &self,
+        url: &str,
+        source_size: Option<u64>,
+        config: DownloadConfig,
+    ) -> Result<(Arc<dyn VirtualFile>, CacheDownloadRequest)> {
+        let remote_runtime = self.remote_runtime().await?;
+        let cache = remote_runtime
+            .file_cache
+            .as_ref()
+            .context("background download requires a file cache backend")?;
+        let source = self.open_backend_source_with_size(url, source_size).await?;
+        let cache_file = Self::open_cached_blob(cache, url, source, source_size).await?;
+        Ok((
+            cache_file.clone(),
+            CacheDownloadRequest {
+                file: cache_file,
+                config,
+            },
+        ))
+    }
+
+    /// Submit background downloads for freshly opened layers.
+    ///
+    /// Background download is a best-effort accelerator: submission is
+    /// registered with the cache scheduler and never fails due to execution
+    /// pressure, so a busy scheduler cannot make an image open skip
+    /// background download — tasks simply run later. A shut-down scheduler is
+    /// skipped with a warning (foreground `CachedFile` reads refill missing
+    /// blocks from the origin on demand); a missing file-cache backend is a
+    /// configuration error and still fails.
+    pub(crate) async fn submit_bk_downloads(
+        &self,
+        requests: Vec<CacheDownloadRequest>,
+        device_key: Option<PathBuf>,
+    ) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
+        let remote_runtime = self.remote_runtime().await?;
+        let cache = remote_runtime
+            .file_cache
+            .as_ref()
+            .context("background download requires a file cache backend")?;
+        let request_count = requests.len();
+        let result = cache.submit_bk_download_batch(
+            requests
+                .into_iter()
+                .map(|request| (request.file, request.config, device_key.clone()))
+                .collect(),
+        );
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => match error.downcast_ref::<BkDownloadSubmitError>() {
+                Some(submit_error) => {
+                    // Log only the fixed category and the device key basename;
+                    // the full path can expose tenant/host metadata.
+                    let device_name = device_key
+                        .as_ref()
+                        .and_then(|key| key.file_name().map(|name| name.to_string_lossy()));
+                    tracing::warn!(
+                        error_category = submit_error.category(),
+                        request_count,
+                        device_key = device_name.as_deref().unwrap_or(""),
+                        "skipping background download submission; foreground reads refill from origin"
+                    );
+                    Ok(())
+                }
+                None => Err(error).context("submit background downloads"),
+            },
+        }
+    }
+
+    async fn open_cached_blob(
+        cache: &FileCacheBackend,
+        url: &str,
+        source: Arc<dyn VirtualFile>,
+        source_size: Option<u64>,
+    ) -> Result<Arc<CachedFile>> {
+        let source_size = match source_size {
+            Some(size) => size,
+            None => source.size().await?,
+        };
+        cache
+            .open_file_with_source_size(url.to_string(), source, source_size)
+            .await
     }
 
     pub async fn open_remote_blob(&self, url: &str) -> Result<Arc<dyn VirtualFile>> {
@@ -340,14 +449,6 @@ impl ImageService {
             Ok(parsed) => matches!(parsed.scheme(), "s3" | "oss"),
             Err(_) => false,
         }
-    }
-
-    async fn open_remote_source_with_size(
-        &self,
-        url: &str,
-        source_size: Option<u64>,
-    ) -> Result<Arc<dyn VirtualFile>> {
-        self.open_backend_source_with_size(url, source_size).await
     }
 
     async fn open_backend_source_with_size(

@@ -12,12 +12,12 @@ use crate::io::virtual_file::VirtualFile;
 use anyhow::{anyhow, bail, Context, Result};
 use dashmap::DashMap;
 use nix::errno::Errno;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use tokio::sync::Notify;
 
 // ---------------------------------------------------------------------------
@@ -30,20 +30,44 @@ pub struct FileCacheBackendOptions {
     pub capacity_bytes: u64,
     /// The refill unit and management unit of cache
     pub block_size: u64,
+    /// Node-level cap on concurrently downloading chunks enforced by this
+    /// backend's download scheduler, initialized from the global
+    /// `DownloadConfig.max_inflight_blocks` when the backend is created.
+    /// Bounds total scratch memory to `max_inflight_blocks` × each task's
+    /// download chunk size (`download.blockSize`). Per-image overrides never
+    /// resize it (see `BkDownloadScheduler`).
+    pub bk_download_max_inflight_blocks: usize,
+    /// Node-level cap on concurrently running background-download layer
+    /// tasks, from the global `DownloadConfig.max_concurrent_files`.
+    pub bk_download_max_concurrent_files: usize,
+    /// Global `DownloadConfig.block_size` at backend creation: the maximum
+    /// chunk size the scheduler accepts from any task, so the scratch budget
+    /// `max_inflight_blocks × block_size` holds regardless of per-image
+    /// overrides.
+    pub bk_download_block_size: u32,
+    /// Per-block read timeout for background downloads; a slow read is
+    /// dropped and reissued instead of holding a block slot forever.
+    pub bk_download_hedge_timeout: std::time::Duration,
 }
 
 impl Default for FileCacheBackendOptions {
     fn default() -> Self {
+        let download = crate::config::DownloadConfig::default();
         Self {
             cache_dir: PathBuf::from(DEFAULT_CACHE_DIR),
             capacity_bytes: DEFAULT_CAPACITY_BYTES,
             block_size: DEFAULT_BLOCK_SIZE,
+            bk_download_max_inflight_blocks: download.max_inflight_blocks,
+            bk_download_max_concurrent_files: download.max_concurrent_files,
+            bk_download_block_size: download.block_size,
+            bk_download_hedge_timeout: super::super::bk_download::DEFAULT_HEDGE_TIMEOUT,
         }
     }
 }
 
 impl FileCacheBackendOptions {
     pub fn from_cache_config(cfg: &CacheConfig) -> Result<Self> {
+        let download = crate::config::DownloadConfig::default();
         let mut opt = Self {
             cache_dir: PathBuf::from(&cfg.cache_dir),
             capacity_bytes: u64::from(cfg.cache_size_gb).saturating_mul(GIB),
@@ -52,6 +76,13 @@ impl FileCacheBackendOptions {
             } else {
                 DEFAULT_BLOCK_SIZE
             },
+            // `CacheConfig` does not carry the download config; callers with
+            // access to the global config (e.g. image_service) override these
+            // from `DownloadConfig`.
+            bk_download_max_inflight_blocks: download.max_inflight_blocks,
+            bk_download_max_concurrent_files: download.max_concurrent_files,
+            bk_download_block_size: download.block_size,
+            bk_download_hedge_timeout: super::super::bk_download::DEFAULT_HEDGE_TIMEOUT,
         };
         opt.normalize()?;
         Ok(opt)
@@ -135,13 +166,14 @@ impl CacheSlot {
 }
 
 // ---------------------------------------------------------------------------
-// BackendState — DashMap + atomics (no global Mutex)
+// BackendState — DashMap + pressure-state serialization
 // ---------------------------------------------------------------------------
 
 pub(crate) struct BackendState {
     pub(crate) cache_entries: DashMap<String, CacheSlot>,
     pub(crate) current_bytes: AtomicU64,
     pub(crate) is_full: AtomicBool,
+    pub(crate) pressure_lock: Mutex<()>,
     pub(crate) evict_global: AtomicU64,
     pub(crate) evict_user: AtomicU64,
 }
@@ -152,6 +184,7 @@ impl BackendState {
             cache_entries: DashMap::new(),
             current_bytes: AtomicU64::new(0),
             is_full: AtomicBool::new(false),
+            pressure_lock: Mutex::new(()),
             evict_global: AtomicU64::new(0),
             evict_user: AtomicU64::new(0),
         }
@@ -182,6 +215,10 @@ impl BackendState {
                 }
             }
         }
+        let disk = FileCacheBackend::capture_disk_pressure(options);
+        let _pressure_guard = state.pressure_lock.lock();
+        FileCacheBackend::publish_pressure_locked(&state, options, disk);
+        drop(_pressure_guard);
         Ok(state)
     }
 }
@@ -190,12 +227,40 @@ impl BackendState {
 // FileCacheBackend
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
 pub struct FileCacheBackend {
     pub(crate) options: Arc<FileCacheBackendOptions>,
     pub(crate) state: Arc<BackendState>,
     pub(crate) fn_trans_func: Arc<RwLock<Option<CacheFnTransFunc>>>,
     pub(crate) active_refills: Arc<AtomicU32>,
+    pub(crate) bk_scheduler: Weak<super::super::bk_download::BkDownloadScheduler>,
+    _bk_scheduler_owner: Option<Arc<super::super::bk_download::BkDownloadScheduler>>,
+}
+
+impl Clone for FileCacheBackend {
+    /// Backend clones share cache state and the scheduler weak reference, but
+    /// never inherit ownership of scheduler shutdown. Only the primary value
+    /// returned by the constructor carries `_bk_scheduler_owner`.
+    fn clone(&self) -> Self {
+        Self {
+            options: self.options.clone(),
+            state: self.state.clone(),
+            fn_trans_func: self.fn_trans_func.clone(),
+            active_refills: self.active_refills.clone(),
+            bk_scheduler: self.bk_scheduler.clone(),
+            _bk_scheduler_owner: None,
+        }
+    }
+}
+
+impl Drop for FileCacheBackend {
+    /// Only the primary backend owns the scheduler; dropping it signals all
+    /// scheduled download futures to wind down. Lightweight clones produced
+    /// by `cached_file_backend` carry no owner and stop nothing.
+    fn drop(&mut self) {
+        if let Some(scheduler) = self._bk_scheduler_owner.take() {
+            scheduler.stop();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +272,13 @@ enum EvictionCounter {
     Global,
     User,
 }
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DiskPressureSnapshot {
+    evict_bytes: u64,
+    suppress_cache_pressure: bool,
+}
+
 impl FileCacheBackend {
     pub async fn with_options(options: FileCacheBackendOptions) -> Result<Self> {
         Self::with_options_and_trans_func(options, None).await
@@ -219,11 +291,19 @@ impl FileCacheBackend {
         options.normalize()?;
         std::fs::create_dir_all(&options.cache_dir)?;
         let state = BackendState::load_from_disk(&options).await?;
+        let _bk_scheduler_owner = super::super::bk_download::BkDownloadScheduler::new(
+            options.bk_download_max_inflight_blocks,
+            options.bk_download_max_concurrent_files,
+            options.bk_download_block_size,
+            options.bk_download_hedge_timeout,
+        );
         let backend = Self {
             options: Arc::new(options),
             state: Arc::new(state),
             fn_trans_func: Arc::new(RwLock::new(fn_trans_func)),
             active_refills: Arc::new(AtomicU32::new(0)),
+            bk_scheduler: Arc::downgrade(&_bk_scheduler_owner),
+            _bk_scheduler_owner: Some(_bk_scheduler_owner),
         };
         backend.start_periodic_eviction_worker();
         backend.start_checkpoint_worker();
@@ -347,12 +427,17 @@ impl FileCacheBackend {
         ratio_mark.max(free_space_mark)
     }
 
-    pub(crate) fn risk_mark(&self) -> u64 {
-        let capacity = self.options.capacity_bytes;
+    fn risk_mark_for_options(options: &FileCacheBackendOptions) -> u64 {
+        let capacity = options.capacity_bytes;
         let water_mark = Self::calc_water_mark(capacity);
         capacity
             .saturating_sub(EVICTION_MARK_BYTES)
             .max((water_mark.saturating_add(capacity)) / 2)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn risk_mark(&self) -> u64 {
+        Self::risk_mark_for_options(&self.options)
     }
 
     fn statvfs_for_path(path: &Path) -> Result<libc::statvfs> {
@@ -366,33 +451,86 @@ impl FileCacheBackend {
         Ok(unsafe { st.assume_init() })
     }
 
+    fn capture_disk_pressure(options: &FileCacheBackendOptions) -> DiskPressureSnapshot {
+        let water_mark = Self::calc_water_mark(options.capacity_bytes);
+        let Ok(st) = Self::statvfs_for_path(&options.cache_dir) else {
+            return DiskPressureSnapshot::default();
+        };
+        let fs_capacity = st.f_frsize.saturating_mul(st.f_blocks);
+        let disk_avail = st.f_bavail.saturating_mul(st.f_frsize);
+        if disk_avail < DEFAULT_DISK_AVAIL_BYTES {
+            DiskPressureSnapshot {
+                evict_bytes: DEFAULT_DISK_AVAIL_BYTES.saturating_sub(disk_avail),
+                suppress_cache_pressure: false,
+            }
+        } else {
+            DiskPressureSnapshot {
+                evict_bytes: 0,
+                suppress_cache_pressure: fs_capacity <= water_mark,
+            }
+        }
+    }
+
     fn pressure_evict_target_for_options(
         options: &FileCacheBackendOptions,
         current_bytes: u64,
+        disk: DiskPressureSnapshot,
     ) -> u64 {
         let water_mark = Self::calc_water_mark(options.capacity_bytes);
-        let mut evict_by_cache = 0u64;
-        if current_bytes >= water_mark {
-            evict_by_cache = current_bytes.saturating_sub(water_mark);
-        }
+        let evict_by_cache = if disk.suppress_cache_pressure {
+            0
+        } else if current_bytes >= water_mark {
+            current_bytes.saturating_sub(water_mark)
+        } else {
+            0
+        };
+        evict_by_cache.max(disk.evict_bytes)
+    }
 
-        let mut evict_by_disk = 0u64;
-        if let Ok(st) = Self::statvfs_for_path(&options.cache_dir) {
-            let fs_capacity = st.f_frsize.saturating_mul(st.f_blocks);
-            let disk_avail = st.f_bavail.saturating_mul(st.f_frsize);
-            if disk_avail < DEFAULT_DISK_AVAIL_BYTES {
-                evict_by_disk = DEFAULT_DISK_AVAIL_BYTES.saturating_sub(disk_avail);
-            } else if fs_capacity <= water_mark {
-                return 0;
-            }
-        }
+    fn publish_pressure_locked(
+        state: &BackendState,
+        options: &FileCacheBackendOptions,
+        disk: DiskPressureSnapshot,
+    ) {
+        let current_bytes = state.current_bytes.load(Ordering::Relaxed);
+        let pressure = Self::pressure_evict_target_for_options(options, current_bytes, disk) > 0
+            || current_bytes >= Self::risk_mark_for_options(options);
+        state.is_full.store(pressure, Ordering::Relaxed);
+    }
 
-        evict_by_cache.max(evict_by_disk)
+    fn add_current_bytes_for(state: &BackendState, options: &FileCacheBackendOptions, bytes: u64) {
+        let disk = Self::capture_disk_pressure(options);
+        let _pressure_guard = state.pressure_lock.lock();
+        state.current_bytes.fetch_add(bytes, Ordering::Relaxed);
+        Self::publish_pressure_locked(state, options, disk);
+    }
+
+    fn subtract_current_bytes_for(
+        state: &BackendState,
+        options: &FileCacheBackendOptions,
+        bytes: u64,
+    ) {
+        let disk = Self::capture_disk_pressure(options);
+        let _pressure_guard = state.pressure_lock.lock();
+        state.current_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        Self::publish_pressure_locked(state, options, disk);
+    }
+
+    pub(crate) fn add_current_bytes(&self, bytes: u64) {
+        Self::add_current_bytes_for(&self.state, &self.options, bytes);
+    }
+
+    pub(crate) fn subtract_current_bytes(&self, bytes: u64) {
+        Self::subtract_current_bytes_for(&self.state, &self.options, bytes);
     }
 
     // -------------------------------------------------------------------
     // Eviction
     // -------------------------------------------------------------------
+
+    fn entry_is_busy(entry: &CacheEntry) -> bool {
+        entry.open_count.load(Ordering::SeqCst) > 0 || !entry.block_states.lock().is_empty()
+    }
 
     /// Return a list of cache_id, and order by their last access time.
     /// The returned list is from old to fresh.
@@ -403,8 +541,7 @@ impl FileCacheBackend {
                 continue;
             };
             let bytes = entry.total_cached_bytes();
-            let open = entry.open_count.load(Ordering::SeqCst);
-            if bytes > 0 && open == 0 {
+            if bytes > 0 && !Self::entry_is_busy(entry) {
                 candidates.push((entry.last_access(), entry.cache_id.clone()));
             }
         }
@@ -415,18 +552,19 @@ impl FileCacheBackend {
             .collect()
     }
 
-    async fn evict_entry(state: &BackendState, cache_id: &str, counter: EvictionCounter) -> u64 {
+    async fn evict_entry(
+        state: &BackendState,
+        options: &FileCacheBackendOptions,
+        cache_id: &str,
+        counter: EvictionCounter,
+    ) -> u64 {
         let (entry, notify) = {
             let mut slot_ref = match state.cache_entries.get_mut(cache_id) {
                 Some(r) => r,
                 None => return 0,
             };
             let entry = match slot_ref.value().as_active() {
-                Some(e)
-                    if e.open_count.load(Ordering::SeqCst) == 0 && e.total_cached_bytes() > 0 =>
-                {
-                    e.clone()
-                }
+                Some(e) if !Self::entry_is_busy(e) => e.clone(),
                 _ => return 0,
             };
             let notify = Arc::new(Notify::new());
@@ -434,54 +572,63 @@ impl FileCacheBackend {
             (entry, notify)
         };
 
-        let bytes_before = entry.total_cached_bytes();
-        if bytes_before > 0 {
-            let _ = entry.evict_all_blocks();
-        }
-
+        let released = match entry.evict_all_blocks().await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                if let Some(mut slot_ref) = state.cache_entries.get_mut(cache_id) {
+                    *slot_ref.value_mut() = CacheSlot::Active(entry);
+                }
+                notify.notify_waiters();
+                return 0;
+            }
+        };
         let _ = tokio::fs::remove_dir_all(&entry.paths.dir).await;
-
         state.cache_entries.remove(cache_id);
         notify.notify_waiters();
 
-        if bytes_before > 0 {
-            state
-                .current_bytes
-                .fetch_sub(bytes_before, Ordering::Relaxed);
+        if released > 0 {
+            Self::subtract_current_bytes_for(state, options, released);
             match counter {
                 EvictionCounter::Global => {
-                    state
-                        .evict_global
-                        .fetch_add(bytes_before, Ordering::Relaxed);
+                    state.evict_global.fetch_add(released, Ordering::Relaxed);
                 }
                 EvictionCounter::User => {
-                    state.evict_user.fetch_add(bytes_before, Ordering::Relaxed);
+                    state.evict_user.fetch_add(released, Ordering::Relaxed);
                 }
             }
         }
 
-        bytes_before
+        released
     }
 
     async fn eviction_inner_for(state: &BackendState, options: &FileCacheBackendOptions) {
+        let disk = Self::capture_disk_pressure(options);
         let current_bytes = state.current_bytes.load(Ordering::Relaxed);
-        let mut actual_evict = Self::pressure_evict_target_for_options(options, current_bytes);
-        if actual_evict == 0 {
-            state.is_full.store(false, Ordering::Relaxed);
-            return;
-        }
+        let mut actual_evict =
+            Self::pressure_evict_target_for_options(options, current_bytes, disk);
 
-        state.is_full.store(true, Ordering::Relaxed);
+        if actual_evict > 0 {
+            let _pressure_guard = state.pressure_lock.lock();
+            state.is_full.store(true, Ordering::Relaxed);
+            drop(_pressure_guard);
 
-        for cache_id in Self::evictable_cache_ids_by_lru(state) {
-            if actual_evict == 0 {
-                break;
+            for cache_id in Self::evictable_cache_ids_by_lru(state) {
+                if actual_evict == 0 {
+                    break;
+                }
+                let bytes =
+                    Self::evict_entry(state, options, &cache_id, EvictionCounter::Global).await;
+                actual_evict = actual_evict.saturating_sub(bytes);
             }
-            let bytes = Self::evict_entry(state, &cache_id, EvictionCounter::Global).await;
-            actual_evict = actual_evict.saturating_sub(bytes);
         }
 
-        state.is_full.store(false, Ordering::Relaxed);
+        // Refills can be admitted before this eviction publishes is_full and
+        // may update current_bytes while an entry eviction is awaiting I/O.
+        // Recompute from the post-eviction state rather than publishing the
+        // stale initial target (including when the initial target was zero).
+        let final_disk = Self::capture_disk_pressure(options);
+        let _pressure_guard = state.pressure_lock.lock();
+        Self::publish_pressure_locked(state, options, final_disk);
     }
 
     pub(crate) async fn eviction_inner(&self) {
@@ -676,7 +823,9 @@ impl FileCacheBackend {
             if size == 0 {
                 break;
             }
-            let bytes = Self::evict_entry(&self.state, &cache_id, EvictionCounter::User).await;
+            let bytes =
+                Self::evict_entry(&self.state, &self.options, &cache_id, EvictionCounter::User)
+                    .await;
             evicted = evicted.saturating_add(bytes);
             size = size.saturating_sub(bytes);
         }
@@ -697,10 +846,8 @@ impl FileCacheBackend {
         self.evict_store_key(&store_key).await
     }
 
-    /// Evict all cache files
-    // TODO: possiable rename this function, it is not only evict, but remove
+    /// Evict all cache files that are not owned by an open handle or active task.
     pub async fn evict_global(&self) -> Result<()> {
-        let mut total_bytes = 0u64;
         let ids: Vec<String> = self
             .state
             .cache_entries
@@ -710,34 +857,14 @@ impl FileCacheBackend {
                 Some(s.key().clone())
             })
             .collect();
-        for cache_id in &ids {
-            if let Some(slot_ref) = self.state.cache_entries.get(cache_id) {
-                if let Some(entry) = slot_ref.value().as_active() {
-                    total_bytes += entry.total_cached_bytes();
-                }
-            }
-        }
-        self.state
-            .evict_global
-            .fetch_add(total_bytes, Ordering::Relaxed);
-        self.state.current_bytes.store(0, Ordering::Relaxed);
         for cache_id in ids {
-            let notify = Arc::new(Notify::new());
-            let entry = {
-                let mut slot_ref = match self.state.cache_entries.get_mut(&cache_id) {
-                    Some(r) => r,
-                    None => continue,
-                };
-                let entry = match slot_ref.value().as_active() {
-                    Some(e) => e.clone(),
-                    None => continue,
-                };
-                *slot_ref.value_mut() = CacheSlot::Evicting(notify.clone());
-                entry
-            };
-            let _ = tokio::fs::remove_dir_all(&entry.paths.dir).await;
-            self.state.cache_entries.remove(&cache_id);
-            notify.notify_waiters();
+            let _ = Self::evict_entry(
+                &self.state,
+                &self.options,
+                &cache_id,
+                EvictionCounter::Global,
+            )
+            .await;
         }
         Ok(())
     }
@@ -858,6 +985,17 @@ impl FileCacheBackend {
             .await
     }
 
+    pub(crate) fn cached_file_backend(&self) -> Self {
+        Self {
+            options: self.options.clone(),
+            state: self.state.clone(),
+            fn_trans_func: self.fn_trans_func.clone(),
+            active_refills: self.active_refills.clone(),
+            bk_scheduler: self.bk_scheduler.clone(),
+            _bk_scheduler_owner: None,
+        }
+    }
+
     async fn open_file_with_flags_and_size(
         &self,
         cache_key: impl Into<String>,
@@ -890,7 +1028,7 @@ impl FileCacheBackend {
         entry.touch();
 
         Ok(Arc::new(CachedFile {
-            backend: self.clone(),
+            backend: self.cached_file_backend(),
             source: Arc::new(parking_lot::RwLock::new(Some(source))),
             cache_id,
             source_size: AtomicU64::new(initial_size),
@@ -923,7 +1061,7 @@ impl FileCacheBackend {
             .await?;
         entry.touch();
         Ok(Arc::new(CachedFile {
-            backend: self.clone(),
+            backend: self.cached_file_backend(),
             source: Arc::new(parking_lot::RwLock::new(None)),
             cache_id,
             source_size: AtomicU64::new(initial_size),
@@ -1001,8 +1139,11 @@ impl FileCacheBackend {
                     }
                     CacheSlot::Evicting(notify) => {
                         let notify = notify.clone();
+                        let notified = notify.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
                         drop(slot_ref);
-                        notify.notified().await;
+                        notified.await;
                         continue;
                     }
                 }
@@ -1026,7 +1167,13 @@ impl FileCacheBackend {
                     entry.open_count.fetch_add(1, Ordering::SeqCst);
                     return Ok(entry.clone());
                 }
-                CacheSlot::Evicting(_) => {
+                CacheSlot::Evicting(notify) => {
+                    let notify = notify.clone();
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    drop(slot_ref);
+                    notified.await;
                     continue;
                 }
             }
@@ -1053,6 +1200,76 @@ impl FileCacheBackend {
             .and_then(|s| s.value().as_active().cloned())
     }
 
+    pub fn submit_bk_download(
+        &self,
+        file: Arc<CachedFile>,
+        config: crate::config::DownloadConfig,
+        device_key: Option<std::path::PathBuf>,
+    ) -> Result<()> {
+        self.submit_bk_download_batch(vec![(file, config, device_key)])
+    }
+
+    /// Register background downloads with the backend's scheduler. Submission
+    /// never fails due to execution pressure: tasks wait until the scheduler
+    /// has a free file slot. Only a shut-down scheduler or invalid input is
+    /// reported.
+    pub fn submit_bk_download_batch(
+        &self,
+        requests: Vec<(
+            Arc<CachedFile>,
+            crate::config::DownloadConfig,
+            Option<std::path::PathBuf>,
+        )>,
+    ) -> Result<()> {
+        let scheduler = self
+            .bk_scheduler
+            .upgrade()
+            .ok_or(super::super::BkDownloadSubmitError::Closed)?;
+        scheduler.submit(
+            self,
+            requests
+                .into_iter()
+                .map(|(file, config, device_key)| {
+                    (
+                        file,
+                        config,
+                        device_key.map(|key| key.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// Stop cache-owned background downloads and await active I/O drain.
+    #[allow(dead_code)]
+    pub(crate) async fn shutdown_bk_downloads(&self) {
+        if let Some(scheduler) = self.bk_scheduler.upgrade() {
+            scheduler.shutdown().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bk_download_registered(&self, cache_id: &str) -> bool {
+        self.bk_scheduler
+            .upgrade()
+            .is_some_and(|scheduler| scheduler.is_registered(cache_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bk_download_registered_count(&self) -> usize {
+        self.bk_scheduler
+            .upgrade()
+            .map(|scheduler| scheduler.registered_count())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bk_download_closed(&self) -> bool {
+        self.bk_scheduler
+            .upgrade()
+            .is_some_and(|scheduler| scheduler.is_closed())
+    }
+
     async fn force_recycle(&self, cache_id: &str) -> u64 {
         let (entry, notify) = {
             let mut slot_ref = match self.state.cache_entries.get_mut(cache_id) {
@@ -1060,19 +1277,28 @@ impl FileCacheBackend {
                 None => return 0,
             };
             let entry = match slot_ref.value().as_active() {
-                Some(e) => e.clone(),
-                None => return 0,
+                Some(e) if !Self::entry_is_busy(e) => e.clone(),
+                _ => return 0,
             };
             let notify = Arc::new(Notify::new());
             *slot_ref.value_mut() = CacheSlot::Evicting(notify.clone());
             (entry, notify)
         };
-        let bytes = entry.total_cached_bytes();
-        self.state.current_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        let released = match entry.evict_all_blocks().await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                if let Some(mut slot_ref) = self.state.cache_entries.get_mut(cache_id) {
+                    *slot_ref.value_mut() = CacheSlot::Active(entry);
+                }
+                notify.notify_waiters();
+                return 0;
+            }
+        };
         let _ = tokio::fs::remove_dir_all(&entry.paths.dir).await;
         self.state.cache_entries.remove(cache_id);
         notify.notify_waiters();
-        bytes
+        self.subtract_current_bytes(released);
+        released
     }
 }
 

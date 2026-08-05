@@ -51,6 +51,8 @@ pub(crate) struct CacheEntry {
     pub(crate) dirty: AtomicBool,
     // Open-file reference count
     pub(crate) open_count: AtomicUsize,
+    /// Coordinates block refills with logical eviction of this entry.
+    pub(crate) refill_eviction_barrier: tokio::sync::RwLock<()>,
 }
 
 impl std::fmt::Debug for CacheEntry {
@@ -165,6 +167,7 @@ impl CacheEntry {
             refills: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
             open_count: AtomicUsize::new(0),
+            refill_eviction_barrier: tokio::sync::RwLock::new(()),
         }))
     }
 
@@ -244,6 +247,7 @@ impl CacheEntry {
             refills: AtomicU64::new(meta.header.refills.get()),
             dirty: AtomicBool::new(false),
             open_count: AtomicUsize::new(0),
+            refill_eviction_barrier: tokio::sync::RwLock::new(()),
         }))
     }
 
@@ -308,27 +312,39 @@ impl CacheEntry {
     ///
     /// Uses `fallocate(PUNCH_HOLE | KEEP_SIZE)` to release disk blocks and
     /// page cache. This avoids munmap/remap while still freeing resources.
-    pub(crate) fn evict_all_blocks(&self) -> Result<()> {
-        // First, remove the on-disk index file.
-        match std::fs::remove_file(&self.paths.meta_path) {
-            Ok(_) => {}
-            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {}
-            Err(err) => return Err(err.into()),
-        }
+    pub(crate) async fn evict_all_blocks(&self) -> Result<u64> {
+        // Hold the write side across metadata removal, hole punching, and
+        // bitmap clearing so no refill can publish into the entry afterward.
+        let _barrier = self.refill_eviction_barrier.write().await;
+        let bytes_before = self.total_cached_bytes();
 
+        // Filesystem operations can block under disk pressure — exactly when
+        // eviction runs — so keep them off the async executor.
+        let meta_path = self.paths.meta_path.clone();
+        let data_file = self.data_file.try_clone()?;
         let source_size = self.source_size.load(Ordering::Relaxed);
-        if source_size > 0 {
-            nix::fcntl::fallocate(
-                &self.data_file,
-                FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
-                0,
-                source_size as i64,
-            )?;
-        }
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            // First, remove the on-disk index file.
+            match std::fs::remove_file(&meta_path) {
+                Ok(_) => {}
+                Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(err) => return Err(err.into()),
+            }
+            if source_size > 0 {
+                nix::fcntl::fallocate(
+                    &data_file,
+                    FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
+                    0,
+                    source_size as i64,
+                )?;
+            }
+            Ok(())
+        })
+        .await??;
 
         self.index.write().clear();
         self.dirty.store(true, Ordering::Relaxed);
-        Ok(())
+        Ok(bytes_before)
     }
 
     // -----------------------------------------------------------------------
@@ -447,6 +463,10 @@ impl CacheEntry {
     /// are actually on disk. This is safe — the missing blocks will just
     /// be re-fetched from the remote source.
     pub(crate) async fn checkpoint(&self) -> Result<()> {
+        // Keep checkpoint publication ordered with logical eviction. Without
+        // this permit, an older bitmap snapshot could recreate meta.bin after
+        // eviction punched the data file and cleared the in-memory bitmap.
+        let _barrier = self.refill_eviction_barrier.read().await;
         let bitmap_snapshot = self.index.read().clone();
 
         let meta = CacheMetaDisk {

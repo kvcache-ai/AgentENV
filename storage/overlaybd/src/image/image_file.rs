@@ -1,9 +1,9 @@
 use crate::backend::local::LocalFile;
-use crate::backend::switch::{new_switch_file, SwitchFile};
+use crate::backend::switch::new_switch_file;
 use crate::backend::tar::new_tar_file_adaptor;
-use crate::bk_download::{BackgroundDownloadThread, BkDownload, BkDownloadConfig};
 use crate::config::{DownloadConfig, ImageConfig, LayerConfig, UpperConfig, UpperMode};
 use crate::image::helper::prepare_runtime_upper;
+use crate::image::image_service::CacheDownloadRequest;
 use crate::image::image_service::ImageService;
 use crate::io::transient_io_ring::shared_transient_io_ring;
 use crate::io::virtual_file::VirtualFile;
@@ -33,19 +33,18 @@ const IO_ENGINE_LIBAIO: u32 = 2;
 
 struct OpenedLowerLayer {
     file: Arc<dyn VirtualFile>,
-    download: Option<BkDownload>,
+    download: Option<CacheDownloadRequest>,
 }
 
 struct OpenedLowerFiles {
     file: Option<LSMTReadOnlyFile>,
-    downloads: Vec<BkDownload>,
+    downloads: Vec<CacheDownloadRequest>,
 }
 
 struct InitializedImageFile {
     state: LiveImageState,
-    downloads: Vec<BkDownload>,
+    downloads: Vec<CacheDownloadRequest>,
     prefetcher: Option<Prefetcher>,
-    skip_background_download: bool,
     replay_prefetch: bool,
 }
 
@@ -109,7 +108,6 @@ pub struct ImageFile {
     num_lbas: AtomicU64,
     pub block_size: u32,
     prefetcher: Option<Prefetcher>,
-    download_thread: Option<BackgroundDownloadThread>,
 }
 
 impl ImageFile {
@@ -125,11 +123,9 @@ impl ImageFile {
         let size = Self::base_size(&initialized.state.base).await?;
         let block_size = DEFAULT_BLOCK_SIZE;
         let num_lbas = size / u64::from(block_size);
-        let download_thread = if download_cfg.enable && !initialized.skip_background_download {
-            BackgroundDownloadThread::start(initialized.downloads, &download_cfg, device_key)?
-        } else {
-            None
-        };
+        image_service
+            .submit_bk_downloads(initialized.downloads, device_key)
+            .await?;
         if initialized.replay_prefetch {
             if let Some(prefetcher) = initialized.prefetcher.as_mut() {
                 prefetcher.replay()?;
@@ -142,7 +138,6 @@ impl ImageFile {
             num_lbas: AtomicU64::new(num_lbas),
             block_size,
             prefetcher: initialized.prefetcher,
-            download_thread,
         })
     }
 
@@ -348,6 +343,7 @@ impl ImageFile {
             &lowers_config,
             &config.repo_blob_url,
             download_cfg,
+            download_cfg.enable && !skip_background_download,
             image_service,
             prefetcher.as_ref(),
         )
@@ -375,7 +371,6 @@ impl ImageFile {
                 },
                 downloads: lowers.downloads,
                 prefetcher,
-                skip_background_download,
                 replay_prefetch,
             },
             (Some(lower), None) => InitializedImageFile {
@@ -387,7 +382,6 @@ impl ImageFile {
                 },
                 downloads: lowers.downloads,
                 prefetcher,
-                skip_background_download,
                 replay_prefetch,
             },
             (None, Some(upper)) => InitializedImageFile {
@@ -399,7 +393,6 @@ impl ImageFile {
                 },
                 downloads: Vec::new(),
                 prefetcher,
-                skip_background_download,
                 replay_prefetch: false,
             },
             (None, None) => bail!("image config has no lower and no upper layer"),
@@ -412,6 +405,7 @@ impl ImageFile {
         lowers: &[LayerConfig],
         repo_blob_url: &str,
         download_cfg: &DownloadConfig,
+        collect_download_requests: bool,
         image_service: &ImageService,
         prefetcher: Option<&Prefetcher>,
     ) -> Result<OpenedLowerFiles> {
@@ -431,6 +425,7 @@ impl ImageFile {
                         &image_service,
                         &repo_blob_url,
                         download_cfg,
+                        collect_download_requests,
                         prefetcher,
                         layer,
                         index,
@@ -484,6 +479,7 @@ impl ImageFile {
         image_service: &ImageService,
         repo_blob_url: &str,
         download_cfg: &DownloadConfig,
+        collect_download_requests: bool,
         prefetcher: Option<&Prefetcher>,
         layer: LayerConfig,
         index: usize,
@@ -501,7 +497,15 @@ impl ImageFile {
                 Err(err) => return Err(err),
             }
         } else {
-            Self::open_ro_remote(image_service, repo_blob_url, download_cfg, &layer, index).await?
+            Self::open_ro_remote(
+                image_service,
+                repo_blob_url,
+                download_cfg,
+                collect_download_requests,
+                &layer,
+                index,
+            )
+            .await?
         };
 
         if let Some(prefetcher) = prefetcher {
@@ -632,6 +636,7 @@ impl ImageFile {
         image_service: &ImageService,
         repo_blob_url: &str,
         download_cfg: &DownloadConfig,
+        collect_download_requests: bool,
         layer: &LayerConfig,
         index: usize,
     ) -> Result<OpenedLowerLayer> {
@@ -657,74 +662,43 @@ impl ImageFile {
         }
 
         let url = format!("{}/{}", repo_blob_url.trim_end_matches('/'), layer.digest);
-        let remote_file = image_service
-            .open_remote_blob_with_size(&url, (layer.size != 0).then_some(layer.size))
-            .await?;
+        let source_size = (layer.size != 0).then_some(layer.size);
+        let (remote_file, download) = if collect_download_requests {
+            match image_service
+                .open_remote_blob_for_bk_download_with_size(&url, source_size, download_cfg.clone())
+                .await
+            {
+                Ok((remote_file, request)) => (remote_file, Some(request)),
+                // Background request construction is an optimization; a
+                // cache/source hiccup must not abort the image open. Log only
+                // the fixed category (the error chain may embed the URL).
+                Err(_) => {
+                    tracing::warn!(
+                        error_category = "bk_download_request_build_failed",
+                        "falling back to foreground-only open for remote layer"
+                    );
+                    (
+                        image_service
+                            .open_remote_blob_with_size(&url, source_size)
+                            .await?,
+                        None,
+                    )
+                }
+            }
+        } else {
+            (
+                image_service
+                    .open_remote_blob_with_size(&url, source_size)
+                    .await?,
+                None,
+            )
+        };
         let tar_file = new_tar_file_adaptor(remote_file).await?;
         let switch_file = new_switch_file(tar_file, false, Some(&url)).await?;
-        let download = Self::prepare_bk_download(
-            image_service,
-            download_cfg,
-            layer,
-            &url,
-            switch_file.clone(),
-        )
-        .await;
         Ok(OpenedLowerLayer {
             file: switch_file,
             download,
         })
-    }
-
-    async fn prepare_bk_download(
-        image_service: &ImageService,
-        download_cfg: &DownloadConfig,
-        layer: &LayerConfig,
-        url: &str,
-        switch_file: Arc<SwitchFile>,
-    ) -> Option<BkDownload> {
-        if !download_cfg.enable || layer.dir.is_empty() {
-            return None;
-        }
-        let source_file = match image_service
-            .open_source_blob_with_size(url, (layer.size != 0).then_some(layer.size))
-            .await
-        {
-            Ok(source_file) => source_file,
-            Err(error) => {
-                warn!(%error, "background download disabled for layer: open source failed");
-                return None;
-            }
-        };
-        let file_size = if layer.size != 0 {
-            layer.size
-        } else {
-            match source_file.size().await {
-                Ok(file_size) => file_size,
-                Err(error) => {
-                    warn!(%error, "background download disabled for layer: source size failed");
-                    return None;
-                }
-            }
-        };
-
-        Some(BkDownload::new(
-            switch_file,
-            source_file,
-            file_size,
-            BkDownloadConfig {
-                dir: PathBuf::from(&layer.dir),
-                digest: layer.digest.clone(),
-                url: url.to_string(),
-                try_cnt: download_cfg.try_cnt,
-                max_mbps: download_cfg.max_mbps,
-                block_size: download_cfg.block_size,
-                concurrency: download_cfg.concurrency,
-                max_inflight_blocks: download_cfg.max_inflight_blocks,
-                p2p_publish_url: image_service.p2p_publish_url().map(ToString::to_string),
-            },
-            image_service.io_ring(&layer.dir),
-        ))
     }
 }
 
@@ -738,9 +712,6 @@ fn is_not_found(err: &anyhow::Error) -> bool {
 
 impl Drop for ImageFile {
     fn drop(&mut self) {
-        if let Some(thread) = self.download_thread.as_mut() {
-            thread.stop();
-        }
         let _ = self.prefetcher.take();
     }
 }
@@ -788,6 +759,10 @@ impl VirtualFile for ImageFile {
         len: usize,
     ) -> crate::io::virtual_file::LocalBoxFuture<'a, Result<Bytes>> {
         Box::pin(async move {
+            // Same foreground accounting as `read_at`: ublk queue threads
+            // enter through the ctx variants, so the guard must live inside
+            // this async body (created on first poll, dropped on completion).
+            let _fg_guard = crate::download_gate::FgReadGuard::new();
             let state = self.state.read().await;
             match &state.base {
                 ImageFileBase::ReadOnly(file) => file.read_at_with_ctx(ctx, offset, len).await,
@@ -803,6 +778,9 @@ impl VirtualFile for ImageFile {
         dst: &'a mut [u8],
     ) -> crate::io::virtual_file::LocalBoxFuture<'a, Result<usize>> {
         Box::pin(async move {
+            // See `read_at_with_ctx`: one guard per ImageFile read request,
+            // including the ublk `read_at_into_with_ctx` entry.
+            let _fg_guard = crate::download_gate::FgReadGuard::new();
             let state = self.state.read().await;
             match &state.base {
                 ImageFileBase::ReadOnly(file) => file.read_at_into_with_ctx(ctx, offset, dst).await,
@@ -948,7 +926,7 @@ mod tests {
     use tempfile::{NamedTempFile, TempDir};
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
-    use tokio::time::{sleep, Duration, Instant};
+    use tokio::time::{sleep, Duration};
 
     async fn create_sealed_lower(path: &Path, index_path: &Path, payload: &[u8]) -> Result<()> {
         let ring = test_io_ring();
@@ -1001,7 +979,7 @@ mod tests {
     #[derive(Clone, Debug)]
     struct RemoteLayerState {
         blob: Arc<Vec<u8>>,
-        data_hits: Arc<AtomicUsize>,
+        data_bytes: Arc<AtomicUsize>,
         digest: String,
     }
 
@@ -1030,7 +1008,9 @@ mod tests {
         let start = start.min(len.saturating_sub(1));
         let end = end.min(len.saturating_sub(1));
         let body = state.blob[start as usize..=end as usize].to_vec();
-        state.data_hits.fetch_add(1, AtomicOrdering::Relaxed);
+        state
+            .data_bytes
+            .fetch_add(body.len(), AtomicOrdering::Relaxed);
         Response::builder()
             .status(HttpStatusCode::PARTIAL_CONTENT)
             .header(CONTENT_RANGE_RAW, format!("bytes {start}-{end}/{len}"))
@@ -2167,7 +2147,7 @@ mod tests {
 
         let remote_state = RemoteLayerState {
             blob: Arc::new(blob),
-            data_hits: Arc::new(AtomicUsize::new(0)),
+            data_bytes: Arc::new(AtomicUsize::new(0)),
             digest: digest.clone(),
         };
         let remote_app = Router::new()
@@ -2199,7 +2179,7 @@ mod tests {
 
         assert_eq!(got.as_ref(), payload.as_slice());
         assert!(p2p_hits.load(AtomicOrdering::Relaxed) > 0);
-        assert!(remote_state.data_hits.load(AtomicOrdering::Relaxed) > 0);
+        assert!(remote_state.data_bytes.load(AtomicOrdering::Relaxed) > 0);
         p2p_handle.abort();
         remote_handle.abort();
     }
@@ -2218,7 +2198,7 @@ mod tests {
 
         let remote_state = RemoteLayerState {
             blob: Arc::new(blob),
-            data_hits: Arc::new(AtomicUsize::new(0)),
+            data_bytes: Arc::new(AtomicUsize::new(0)),
             digest: digest.clone(),
         };
         let remote_app = Router::new()
@@ -2249,17 +2229,23 @@ mod tests {
         let got = image.read_at(0, payload.len()).await.expect("read layer");
 
         assert_eq!(got.as_ref(), payload.as_slice());
-        assert!(remote_state.data_hits.load(AtomicOrdering::Relaxed) > 0);
+        assert!(remote_state.data_bytes.load(AtomicOrdering::Relaxed) > 0);
         remote_handle.abort();
     }
 
     #[tokio::test]
-    async fn test_image_file_remote_lower_background_download_switches_to_commit() {
+    async fn test_image_file_remote_lowers_batch_background_downloads_into_foreground_cache() {
         let tmp = TempDir::new().expect("tempdir");
         let lower_path = tmp.path().join("remote-lower.data");
         let lower_index = tmp.path().join("remote-lower.index");
+        let mut seed = 0x1234_5678_9abc_def0u64;
         let payload: Vec<u8> = (0..(1024 * 1024))
-            .map(|idx| ((idx * 7) % 251) as u8)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
             .collect();
         create_sealed_lower(&lower_path, &lower_index, &payload)
             .await
@@ -2269,7 +2255,7 @@ mod tests {
 
         let state = RemoteLayerState {
             blob: Arc::new(blob.clone()),
-            data_hits: Arc::new(AtomicUsize::new(0)),
+            data_bytes: Arc::new(AtomicUsize::new(0)),
             digest: digest.clone(),
         };
         let app = Router::new()
@@ -2280,60 +2266,192 @@ mod tests {
 
         let image_cfg = ImageConfig {
             repo_blob_url: format!("{base}/v2/ns/repo/blobs"),
-            lowers: vec![LayerConfig {
-                dir: tmp
-                    .path()
-                    .join("download-layer")
-                    .to_string_lossy()
-                    .into_owned(),
-                digest: digest.clone(),
-                size: blob.len() as u64,
-                ..LayerConfig::default()
-            }],
+            lowers: vec![
+                LayerConfig {
+                    dir: tmp
+                        .path()
+                        .join("download-layer-a")
+                        .to_string_lossy()
+                        .into_owned(),
+                    digest: format!("{digest}-a"),
+                    size: blob.len() as u64,
+                    ..LayerConfig::default()
+                },
+                LayerConfig {
+                    dir: tmp
+                        .path()
+                        .join("download-layer-b")
+                        .to_string_lossy()
+                        .into_owned(),
+                    digest: format!("{digest}-b"),
+                    size: blob.len() as u64,
+                    ..LayerConfig::default()
+                },
+            ],
             upper: UpperConfig::default(),
             result_file: String::new(),
             download_override: Some(DownloadConfig {
                 enable: true,
                 delay: 0,
-                delay_extra: 1,
+                delay_extra: 0,
                 max_mbps: 0,
                 try_cnt: 1,
                 block_size: 4096,
                 concurrency: 1,
                 max_inflight_blocks: 16,
+                max_concurrent_files: 8,
             }),
             acceleration_layer: false,
             record_trace_path: String::new(),
         };
 
         let service = build_service(&tmp).await;
-        let image = ImageFile::open(image_cfg.clone(), service, None)
+        service
+            .cached_file_stats("initialize-runtime")
+            .await
+            .expect("initialize remote runtime");
+        service.set_remote_mode_direct_for_test();
+        let remote_urls: Vec<_> = image_cfg
+            .lowers
+            .iter()
+            .map(|layer| format!("{}/{}", image_cfg.repo_blob_url, layer.digest))
+            .collect();
+        let image = ImageFile::open(image_cfg.clone(), service.clone(), None)
             .await
             .expect("open remote image");
 
-        let first = image.read_at(0, 4096).await.expect("read first block");
-        assert_eq!(first.as_ref(), &payload[..4096]);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let mut complete = true;
+                for remote_url in &remote_urls {
+                    let stats = service
+                        .cached_file_stats(remote_url)
+                        .await
+                        .expect("read cache stats")
+                        .expect("remote layer cache entry");
+                    complete &= stats.bytes_used >= blob.len() as u64;
+                }
+                if complete {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("background download batch did not fill both remote layer caches");
 
-        let commit = Path::new(&image_cfg.lowers[0].dir).join(COMMIT_FILE_NAME);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline && !commit.exists() {
-            sleep(Duration::from_millis(50)).await;
+        for layer in &image_cfg.lowers {
+            let commit = Path::new(&layer.dir).join(COMMIT_FILE_NAME);
+            assert!(
+                !commit.exists(),
+                "cache background download must not create a layer commit file"
+            );
         }
-        assert!(
-            commit.exists(),
-            "background download did not create commit file"
-        );
-
-        sleep(Duration::from_millis(200)).await;
-        handle.abort();
 
         let offset = 512 * 1024;
+        let before_foreground_read = state.data_bytes.load(AtomicOrdering::Relaxed);
         let later = image
             .read_at(offset as u64, 4096)
             .await
-            .expect("read after switching to local commit");
+            .expect("read background-completed block from foreground cache");
         assert_eq!(later.as_ref(), &payload[offset..offset + 4096]);
-        assert!(state.data_hits.load(AtomicOrdering::Relaxed) > 0);
+        assert_eq!(
+            state.data_bytes.load(AtomicOrdering::Relaxed),
+            before_foreground_read,
+            "foreground read should reuse the background-completed cache block"
+        );
+        handle.abort();
+
+        let later = image
+            .read_at(offset as u64, 4096)
+            .await
+            .expect("read cached block after remote source shutdown");
+        assert_eq!(later.as_ref(), &payload[offset..offset + 4096]);
+    }
+
+    #[tokio::test]
+    async fn test_image_file_open_registers_all_layers_under_execution_pressure() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lower_path = tmp.path().join("remote-lower.data");
+        let lower_index = tmp.path().join("remote-lower.index");
+        let payload = vec![7u8; 1024 * 1024];
+        create_sealed_lower(&lower_path, &lower_index, &payload)
+            .await
+            .expect("build remote lower blob");
+        let blob = std::fs::read(&lower_path).expect("read remote lower blob");
+        let digest = digest_of(&blob);
+        let state = RemoteLayerState {
+            blob: Arc::new(blob.clone()),
+            data_bytes: Arc::new(AtomicUsize::new(0)),
+            digest: digest.clone(),
+        };
+        let app = Router::new()
+            .route("/{*path}", any(handle_remote_request))
+            .route("/token", get(handle_token))
+            .with_state(state);
+        let (base, handle) = spawn_server(app).await;
+
+        // More layers than the scheduler's file-slot cap, all held pending by
+        // a long delay: the scheduler must register every layer (the old
+        // bounded queue silently skipped the whole batch when full).
+        let layer_count = 12;
+        let repo_blob_url = format!("{base}/v2/ns/repo/blobs");
+        let lowers: Vec<LayerConfig> = (0..layer_count)
+            .map(|index| LayerConfig {
+                dir: tmp
+                    .path()
+                    .join(format!("saturated-layer-{index}"))
+                    .to_string_lossy()
+                    .into_owned(),
+                digest: format!("{digest}-{index}"),
+                size: blob.len() as u64,
+                ..LayerConfig::default()
+            })
+            .collect();
+        let image_cfg = ImageConfig {
+            repo_blob_url: repo_blob_url.clone(),
+            lowers,
+            upper: UpperConfig::default(),
+            result_file: String::new(),
+            download_override: Some(DownloadConfig {
+                enable: true,
+                delay: 3600,
+                delay_extra: 0,
+                max_mbps: 0,
+                try_cnt: 1,
+                block_size: 4096,
+                concurrency: 1,
+                max_inflight_blocks: 16,
+                max_concurrent_files: 8,
+            }),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+
+        let service = build_service(&tmp).await;
+        let image = ImageFile::open(image_cfg.clone(), service.clone(), None)
+            .await
+            .expect("open remote image must succeed under execution pressure");
+
+        let cache = service
+            .file_cache_for_test()
+            .await
+            .expect("remote runtime")
+            .expect("file cache");
+        for layer in &image_cfg.lowers {
+            let remote_url = format!("{}/{}", repo_blob_url, layer.digest);
+            let cache_id = encode_hex(&Sha256::digest(remote_url.as_bytes()));
+            assert!(
+                cache.bk_download_registered(&cache_id),
+                "every layer must stay registered; submission never skips"
+            );
+        }
+        cache.shutdown_bk_downloads().await;
+
+        // Foreground reads still refill from the origin on demand.
+        let data = image.read_at(0, 4096).await.expect("foreground read");
+        assert_eq!(data.as_ref(), &payload[..4096]);
+        handle.abort();
     }
 
     #[tokio::test]
@@ -2342,8 +2460,14 @@ mod tests {
         let lower_path = tmp.path().join("remote-lower.data");
         let lower_index = tmp.path().join("remote-lower.index");
         let trace_path = tmp.path().join("record.trace");
-        let payload: Vec<u8> = (0..(256 * 1024))
-            .map(|idx| ((idx * 11) % 251) as u8)
+        let mut seed = 0xfedc_ba98_7654_3210u64;
+        let payload: Vec<u8> = (0..(1024 * 1024))
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
             .collect();
         create_sealed_lower(&lower_path, &lower_index, &payload)
             .await
@@ -2354,7 +2478,7 @@ mod tests {
         let digest = digest_of(&blob);
         let state = RemoteLayerState {
             blob: Arc::new(blob),
-            data_hits: Arc::new(AtomicUsize::new(0)),
+            data_bytes: Arc::new(AtomicUsize::new(0)),
             digest: digest.clone(),
         };
         let remote_size = state.blob.len() as u64;
@@ -2372,7 +2496,7 @@ mod tests {
                     .join("record-download-layer")
                     .to_string_lossy()
                     .into_owned(),
-                digest,
+                digest: digest.clone(),
                 size: remote_size,
                 ..LayerConfig::default()
             }],
@@ -2387,20 +2511,36 @@ mod tests {
                 block_size: 4096,
                 concurrency: 1,
                 max_inflight_blocks: 16,
+                max_concurrent_files: 8,
             }),
             acceleration_layer: false,
             record_trace_path: trace_path.to_string_lossy().into_owned(),
         };
 
         let service = build_service(&tmp).await;
-        let image = ImageFile::open(image_cfg.clone(), service, None)
+        let remote_url = format!("{}/{}", image_cfg.repo_blob_url, digest);
+        let image = ImageFile::open(image_cfg.clone(), service.clone(), None)
             .await
             .expect("open image with record trace");
 
         let first = image.read_at(0, 4096).await.expect("read first block");
         assert_eq!(first.as_ref(), &payload[..4096]);
+        let cached_before_wait = service
+            .cached_file_stats(&remote_url)
+            .await
+            .expect("read cache stats")
+            .expect("remote layer cache entry")
+            .bytes_used;
 
         sleep(Duration::from_millis(500)).await;
+        let cached_after_wait = service
+            .cached_file_stats(&remote_url)
+            .await
+            .expect("read cache stats")
+            .expect("remote layer cache entry")
+            .bytes_used;
+        assert_eq!(cached_after_wait, cached_before_wait);
+        assert!(cached_after_wait < remote_size);
         let commit = Path::new(&image_cfg.lowers[0].dir).join(COMMIT_FILE_NAME);
         assert!(
             !commit.exists(),
@@ -2415,7 +2555,7 @@ mod tests {
             .len();
         assert!(trace_size > 0);
         assert!(PathBuf::from(format!("{}.ok", trace_path.display())).exists());
-        assert!(state.data_hits.load(AtomicOrdering::Relaxed) > 0);
+        assert!(state.data_bytes.load(AtomicOrdering::Relaxed) > 0);
     }
 
     #[tokio::test]
@@ -2524,7 +2664,7 @@ mod tests {
         // --- mock registry server ---
         let state = RemoteLayerState {
             blob: Arc::new(blob.clone()),
-            data_hits: Arc::new(AtomicUsize::new(0)),
+            data_bytes: Arc::new(AtomicUsize::new(0)),
             digest: digest.clone(),
         };
         let app = Router::new()
@@ -2579,7 +2719,7 @@ mod tests {
 
         // remote data hits must have occurred (LSMT trailer + index + data reads)
         assert!(
-            state.data_hits.load(AtomicOrdering::Relaxed) > 0,
+            state.data_bytes.load(AtomicOrdering::Relaxed) > 0,
             "no remote data reads occurred"
         );
 

@@ -415,8 +415,10 @@ pub struct MemorySnapshotBackgroundDownloadConfig {
     pub block_size: u32,
     #[config(default = 4usize)]
     pub concurrency: usize,
-    /// Process-wide cap on in-flight download blocks shared by every
-    /// concurrent layer download (bounds total scratch memory).
+    /// Cap on in-flight background download blocks enforced by the cache
+    /// backend's download queue, shared by every layer download on the node
+    /// (bounds total scratch memory). Fixed when the backend is created;
+    /// per-image overrides never resize it.
     #[config(default = 16usize)]
     pub max_inflight_blocks: usize,
 }
@@ -435,6 +437,8 @@ impl MemorySnapshotBackgroundDownloadConfig {
             block_size: self.block_size,
             concurrency: self.concurrency,
             max_inflight_blocks: self.max_inflight_blocks,
+            // Not a memory-snapshot knob: the cache scheduler default applies.
+            max_concurrent_files: overlaybd::config::DownloadConfig::default().max_concurrent_files,
         }
     }
 }
@@ -827,7 +831,9 @@ impl AppConfig {
 
     /// Sanity-bound the memory-snapshot background download knobs so a legal
     /// config cannot allocate unbounded scratch or fan out unbounded requests.
-    /// Peak scratch per active layer download is block_size * concurrency.
+    /// Peak scratch per active layer download is `block_size × concurrency`
+    /// (the download chunk is `block_size` cache blocks fetched per request),
+    /// and `max_inflight_blocks × block_size` node-wide.
     fn validate_memory_snapshot_background_download(&self) -> Result<()> {
         const MAX_BLOCK_SIZE: u64 = 64 * 1024 * 1024;
         const MAX_CONCURRENCY: usize = 16;
@@ -856,6 +862,20 @@ impl AppConfig {
             bail!(
                 "memory_snapshot.background_download.max_inflight_blocks must be <= \
                  {MAX_INFLIGHT_BLOCKS}"
+            );
+        }
+        // Backend-wide scratch budget: every in-flight chunk may allocate one
+        // block_size buffer, so the global product must stay bounded too.
+        const MAX_GLOBAL_SCRATCH_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+        let global_scratch = u64::from(cfg.block_size)
+            .checked_mul(cfg.max_inflight_blocks as u64)
+            .ok_or_else(|| {
+                anyhow::anyhow!("memory_snapshot.background_download scratch overflow")
+            })?;
+        if global_scratch > MAX_GLOBAL_SCRATCH_BYTES {
+            bail!(
+                "memory_snapshot.background_download block_size * max_inflight_blocks must be <= \
+                 {MAX_GLOBAL_SCRATCH_BYTES} bytes"
             );
         }
         if cfg.delay < 0 {

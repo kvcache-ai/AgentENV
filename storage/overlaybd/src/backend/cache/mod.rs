@@ -1,8 +1,11 @@
+mod bk_download;
 mod cached_fs;
 mod full_file_cache;
 mod meta;
 #[cfg(test)]
 mod tests;
+
+pub(crate) use bk_download::BkDownloadSubmitError;
 
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
