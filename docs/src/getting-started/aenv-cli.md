@@ -281,38 +281,54 @@ To delete a snapshot, use `aenv template delete <snapshot-id>` or `aenv template
 
 `aenv completion <shell>` prints a shell-completion script for the `aenv` CLI to stdout.
 
-### Generate a script
+### Generate and install a script
+
+#### Bash
 
 ```bash
-aenv completion bash
-aenv completion zsh
-aenv completion fish
-```
-
-Each command writes the matching script to stdout, so redirect it into the standard per-user completion directory for your shell:
-
-```bash
+mkdir -p ~/.local/share/bash-completion/completions
 aenv completion bash > ~/.local/share/bash-completion/completions/aenv
-aenv completion zsh  > ~/.local/share/zsh/site-functions/_aenv
-aenv completion fish > ~/.config/fish/completions/aenv.fish
 ```
 
-bash and fish auto-load completions from those directories. zsh autoloads `_cmdname` functions from directories on `fpath`; `~/.local/share/zsh/site-functions` is not on `fpath` by default, so if completion does not load, add the directory to `fpath` before `compinit`:
+The Bash completion file is loaded on demand by
+[`bash-completion`](https://github.com/scop/bash-completion).
+This requires `bash-completion` to be installed and initialized in the current
+shell.
 
-```bash
+#### Zsh
+
+```zsh
+mkdir -p ~/.local/share/zsh/site-functions
+aenv completion zsh > ~/.local/share/zsh/site-functions/_aenv
+```
+
+Zsh loads completion functions from directories listed in `fpath`.
+`~/.local/share/zsh/site-functions` is not included in `fpath` by default on
+all systems. Add the following lines to `~/.zshrc` before any existing
+`compinit` invocation:
+
+```zsh
 fpath=(~/.local/share/zsh/site-functions $fpath)
 autoload -Uz compinit
 compinit
 ```
 
-### Activate it
+#### Fish
 
-For a one-session test, evaluate the script in the current shell:
+```shell
+mkdir -p ~/.config/fish/completions
+aenv completion fish > ~/.config/fish/completions/aenv.fish
+```
+
+### Activate without installing
+
+To test completion for the current shell session without saving a generated
+file:
 
 ```bash
-source <(aenv completion bash)        # bash
-eval "$(aenv completion zsh)"         # zsh
-aenv completion fish | source         # fish
+source <(aenv completion bash)         # Bash
+eval "$(aenv completion zsh)"         # Zsh
+aenv completion fish | source          # Fish
 ```
 
 Once loaded, completion covers the CLI surface:
