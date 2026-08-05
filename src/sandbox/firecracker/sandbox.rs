@@ -61,63 +61,94 @@ const USER_ROOTFS_DRIVE_PATH: &str = "user-rootfs";
 /// makes the configured `*_per_sec` values equal the sustained per-second rate.
 const RATE_LIMIT_REFILL_TIME_MS: i64 = 1000;
 
+fn bandwidth_bucket(
+    cfg: &crate::cfg::DiskRateLimitConfig,
+) -> Result<Option<Box<firecracker_client::models::TokenBucket>>> {
+    if cfg.bandwidth_bytes_per_sec == 0 {
+        return Ok(None);
+    }
+    let size = i64::try_from(cfg.bandwidth_bytes_per_sec)
+        .context("disk bandwidth_bytes_per_sec exceeds Firecracker's i64 range")?;
+    let mut bw = firecracker_client::models::TokenBucket::new(RATE_LIMIT_REFILL_TIME_MS, size);
+    if cfg.bandwidth_burst_bytes > 0 {
+        bw.one_time_burst = Some(
+            i64::try_from(cfg.bandwidth_burst_bytes)
+                .context("disk bandwidth_burst_bytes exceeds Firecracker's i64 range")?,
+        );
+    }
+    Ok(Some(Box::new(bw)))
+}
+
+fn ops_bucket(
+    cfg: &crate::cfg::DiskRateLimitConfig,
+) -> Result<Option<Box<firecracker_client::models::TokenBucket>>> {
+    if cfg.iops == 0 {
+        return Ok(None);
+    }
+    let size = i64::try_from(cfg.iops).context("disk iops exceeds Firecracker's i64 range")?;
+    let mut ops = firecracker_client::models::TokenBucket::new(RATE_LIMIT_REFILL_TIME_MS, size);
+    if cfg.iops_burst > 0 {
+        ops.one_time_burst = Some(
+            i64::try_from(cfg.iops_burst)
+                .context("disk iops_burst exceeds Firecracker's i64 range")?,
+        );
+    }
+    Ok(Some(Box::new(ops)))
+}
+
+/// Build the limiter attached to the user rootfs drive at fresh boot (pre-boot
+/// `PUT /drives`). Returns `None` when limiting is disabled or no dimension is
+/// configured, in which case the drive is added with no limiter.
 fn build_disk_rate_limiter(
     cfg: &crate::cfg::DiskRateLimitConfig,
 ) -> Result<Option<Box<firecracker_client::models::RateLimiter>>> {
     if !cfg.enabled {
         return Ok(None);
     }
-    let mut rl = firecracker_client::models::RateLimiter::new();
-    if cfg.bandwidth_bytes_per_sec > 0 {
-        let size = i64::try_from(cfg.bandwidth_bytes_per_sec)
-            .context("disk bandwidth_bytes_per_sec exceeds Firecracker's i64 range")?;
-        let mut bw = firecracker_client::models::TokenBucket::new(RATE_LIMIT_REFILL_TIME_MS, size);
-        if cfg.bandwidth_burst_bytes > 0 {
-            bw.one_time_burst = Some(
-                i64::try_from(cfg.bandwidth_burst_bytes)
-                    .context("disk bandwidth_burst_bytes exceeds Firecracker's i64 range")?,
-            );
-        }
-        rl.bandwidth = Some(Box::new(bw));
-    }
-    if cfg.iops > 0 {
-        let size = i64::try_from(cfg.iops).context("disk iops exceeds Firecracker's i64 range")?;
-        let mut ops = firecracker_client::models::TokenBucket::new(RATE_LIMIT_REFILL_TIME_MS, size);
-        if cfg.iops_burst > 0 {
-            ops.one_time_burst = Some(
-                i64::try_from(cfg.iops_burst)
-                    .context("disk iops_burst exceeds Firecracker's i64 range")?,
-            );
-        }
-        rl.ops = Some(Box::new(ops));
-    }
-    if rl.bandwidth.is_none() && rl.ops.is_none() {
+    let bandwidth = bandwidth_bucket(cfg)?;
+    let ops = ops_bucket(cfg)?;
+    if bandwidth.is_none() && ops.is_none() {
         return Ok(None);
     }
+    let mut rl = firecracker_client::models::RateLimiter::new();
+    rl.bandwidth = bandwidth;
+    rl.ops = ops;
     Ok(Some(Box::new(rl)))
 }
 
-/// Build an effectively-unlimited rate limiter used to strip a limiter that a
-/// resumed snapshot inherited when the current config disables limiting.
+/// A token bucket so large it never throttles: 1 TiB replenished every 1 ms.
 ///
-/// Firecracker's `PATCH /drives` maps an absent token bucket to
-/// `BucketUpdate::None` (leave unchanged), so PATCHing an empty `RateLimiter`
-/// is a silent no-op and cannot remove an inherited limiter. Overwriting both
-/// buckets with a huge size and a 1 ms refill is the only way to undo it: the
-/// resulting rate dwarfs any real disk, so throttling no longer bites.
-fn unlimited_rate_limiter() -> Box<firecracker_client::models::RateLimiter> {
-    const UNLIMITED_BUCKET_SIZE: i64 = 1 << 40; // 1 TiB replenished every 1 ms
+/// Used to overwrite a snapshot-inherited limiter dimension the current config
+/// leaves unset. Firecracker's `PATCH /drives` maps an *absent* token bucket to
+/// `BucketUpdate::None` (leave unchanged), so an inherited limit cannot be
+/// removed by omission — it must be overwritten with an effectively-unlimited
+/// bucket, whose rate dwarfs any real disk so throttling no longer bites.
+fn unlimited_bucket() -> Box<firecracker_client::models::TokenBucket> {
+    const UNLIMITED_BUCKET_SIZE: i64 = 1 << 40; // 1 TiB
     const UNLIMITED_REFILL_TIME_MS: i64 = 1;
+    Box::new(firecracker_client::models::TokenBucket::new(
+        UNLIMITED_REFILL_TIME_MS,
+        UNLIMITED_BUCKET_SIZE,
+    ))
+}
+
+/// Build the limiter to PATCH on resume, reconciling a snapshot-inherited
+/// limiter against the node's current config. BOTH buckets are always present:
+/// a configured dimension uses its own bucket, an unset dimension is overwritten
+/// with an unlimited bucket so any inherited limit on that dimension is cleared
+/// (an omitted bucket would instead be left unchanged; see [`unlimited_bucket`]).
+fn reconcile_disk_rate_limiter(
+    cfg: &crate::cfg::DiskRateLimitConfig,
+) -> Result<Box<firecracker_client::models::RateLimiter>> {
+    let (bandwidth, ops) = if cfg.enabled {
+        (bandwidth_bucket(cfg)?, ops_bucket(cfg)?)
+    } else {
+        (None, None)
+    };
     let mut rl = firecracker_client::models::RateLimiter::new();
-    rl.bandwidth = Some(Box::new(firecracker_client::models::TokenBucket::new(
-        UNLIMITED_REFILL_TIME_MS,
-        UNLIMITED_BUCKET_SIZE,
-    )));
-    rl.ops = Some(Box::new(firecracker_client::models::TokenBucket::new(
-        UNLIMITED_REFILL_TIME_MS,
-        UNLIMITED_BUCKET_SIZE,
-    )));
-    Box::new(rl)
+    rl.bandwidth = Some(bandwidth.unwrap_or_else(unlimited_bucket));
+    rl.ops = Some(ops.unwrap_or_else(unlimited_bucket));
+    Ok(Box::new(rl))
 }
 
 pub(super) fn managed_snapshot_base() -> PathBuf {
@@ -1321,8 +1352,6 @@ impl FirecrackerSandbox {
         self.configure_microvm(&config, boot_args.as_deref(), &extra_drive_attachments)
             .await?;
         self.fc_instance.start().await?;
-        self.apply_disk_rate_limiter(&config.disk_rate_limit, false)
-            .await?;
         debug!("fresh sandbox started");
         Ok(())
     }
@@ -1534,16 +1563,22 @@ impl FirecrackerSandbox {
 
         let mmds_metadata = self.mmds_metadata(&config.common);
         self.fc_instance.set_mmds(&mmds_metadata).await?;
-        self.fc_instance.resume().await?;
 
-        // A restored snapshot may carry a previously configured limiter, so
-        // reconcile against the node's current config, clearing any inherited
-        // limiter when disk rate limiting is now disabled.
-        self.apply_disk_rate_limiter(
+        // A restored snapshot inherits whatever limiter was active when it was
+        // paused, so reconcile against the node's current config while the VM is
+        // still loaded-but-paused — before resume() lets the guest issue I/O.
+        // Both buckets are always overwritten (configured or unlimited) so an
+        // inherited dimension the current config leaves unset is cleared rather
+        // than left unchanged.
+        let reconciled = reconcile_disk_rate_limiter(
             &ConfigManager::global_config().machine.disk_rate_limit,
-            true,
-        )
-        .await?;
+        )?;
+        self.fc_instance
+            .patch_drive_rate_limiter(USER_ROOTFS_DRIVE_ID, reconciled)
+            .await
+            .context("reconcile disk rate limiter on snapshot resume")?;
+
+        self.fc_instance.resume().await?;
 
         debug!("sandbox restored from snapshot config");
         Ok(())
@@ -1647,6 +1682,7 @@ impl FirecrackerSandbox {
                 true,
                 false,
                 IoEngine::Sync,
+                None,
             )
             .await
             .with_context(|| {
@@ -1656,7 +1692,9 @@ impl FirecrackerSandbox {
                 )
             })?;
 
-        // Drive 1 (/dev/vdb): user image, writable.
+        // Drive 1 (/dev/vdb): user image, writable. The disk rate limiter is
+        // applied here as pre-boot drive config (rather than a post-start PATCH)
+        // so throttling is in force the instant the guest starts issuing I/O.
         self.fc_instance
             .add_drive(
                 USER_ROOTFS_DRIVE_ID,
@@ -1665,6 +1703,7 @@ impl FirecrackerSandbox {
                 false,
                 true,
                 IoEngine::Async,
+                build_disk_rate_limiter(&config.disk_rate_limit)?,
             )
             .await?;
 
@@ -1706,39 +1745,13 @@ impl FirecrackerSandbox {
                     drive.read_only,
                     true,
                     IoEngine::Async,
+                    None,
                 )
                 .await
                 .with_context(|| format!("Failed to add extra drive {}", drive.drive_id))?;
         }
 
         Ok(())
-    }
-
-    /// Applies the given disk rate limiter config to the user rootfs drive via a
-    /// post-boot PATCH, unifying the fresh-boot and resume paths. Fresh boot passes
-    /// the sandbox's own launch config so the configuration used to construct the
-    /// sandbox is the one applied; resume intentionally passes the node's current
-    /// global config to reconcile a restored snapshot against present settings.
-    ///
-    /// When limiting is disabled, `clear_inherited` controls behavior: resume
-    /// passes `true` to overwrite any limiter a restored snapshot inherited with
-    /// an effectively-unlimited one (Firecracker cannot remove a limiter via
-    /// PATCH; see `unlimited_rate_limiter`), while a fresh boot passes `false`
-    /// and skips the PATCH entirely since its device model starts clean.
-    async fn apply_disk_rate_limiter(
-        &self,
-        cfg: &crate::cfg::DiskRateLimitConfig,
-        clear_inherited: bool,
-    ) -> Result<()> {
-        let rl = match build_disk_rate_limiter(cfg)? {
-            Some(rl) => rl,
-            None if clear_inherited => unlimited_rate_limiter(),
-            None => return Ok(()),
-        };
-        self.fc_instance
-            .patch_drive_rate_limiter(USER_ROOTFS_DRIVE_ID, rl)
-            .await
-            .context("apply disk rate limiter to user rootfs drive")
     }
 
     async fn prepare_snapshot_backing_drives(&mut self, extra_drives: &[ExtraDrive]) -> Result<()> {
@@ -1957,17 +1970,65 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_rate_limiter_overwrites_both_buckets() {
-        // Firecracker treats an absent bucket in a PATCH as "leave unchanged",
-        // so clearing an inherited limiter requires overwriting both buckets
-        // with an effectively-unlimited one rather than an empty RateLimiter.
-        let rl = unlimited_rate_limiter();
+    fn reconcile_disabled_makes_both_buckets_unlimited() {
+        // Firecracker treats an absent bucket in a PATCH as "leave unchanged", so
+        // clearing an inherited limiter requires overwriting BOTH buckets with an
+        // effectively-unlimited one rather than sending an empty RateLimiter.
+        let mut cfg = rate_limit_cfg();
+        cfg.enabled = false;
+        cfg.bandwidth_bytes_per_sec = 100 << 20;
+        cfg.iops = 3000;
+        let rl = reconcile_disk_rate_limiter(&cfg).unwrap();
         let bw = rl.bandwidth.expect("bandwidth bucket present");
         let ops = rl.ops.expect("ops bucket present");
-        assert_eq!(bw.refill_time, 1);
-        assert_eq!(ops.refill_time, 1);
-        assert_eq!(bw.size, 1 << 40);
-        assert_eq!(ops.size, 1 << 40);
+        assert_eq!((bw.refill_time, bw.size), (1, 1 << 40));
+        assert_eq!((ops.refill_time, ops.size), (1, 1 << 40));
+    }
+
+    #[test]
+    fn reconcile_bandwidth_only_clears_inherited_iops() {
+        // Enabled with bandwidth but no iops: bandwidth gets its configured
+        // bucket, while the unset iops dimension is overwritten with an unlimited
+        // bucket so a snapshot-inherited IOPS limit does not survive the resume.
+        let mut cfg = rate_limit_cfg();
+        cfg.enabled = true;
+        cfg.bandwidth_bytes_per_sec = 100 << 20;
+        cfg.iops = 0;
+        let rl = reconcile_disk_rate_limiter(&cfg).unwrap();
+        let bw = rl.bandwidth.expect("bandwidth bucket present");
+        let ops = rl.ops.expect("ops bucket present");
+        assert_eq!(bw.refill_time, RATE_LIMIT_REFILL_TIME_MS);
+        assert_eq!(bw.size, 100 << 20);
+        assert_eq!((ops.refill_time, ops.size), (1, 1 << 40));
+    }
+
+    #[test]
+    fn reconcile_iops_only_clears_inherited_bandwidth() {
+        let mut cfg = rate_limit_cfg();
+        cfg.enabled = true;
+        cfg.bandwidth_bytes_per_sec = 0;
+        cfg.iops = 3000;
+        let rl = reconcile_disk_rate_limiter(&cfg).unwrap();
+        let bw = rl.bandwidth.expect("bandwidth bucket present");
+        let ops = rl.ops.expect("ops bucket present");
+        assert_eq!((bw.refill_time, bw.size), (1, 1 << 40));
+        assert_eq!(ops.refill_time, RATE_LIMIT_REFILL_TIME_MS);
+        assert_eq!(ops.size, 3000);
+    }
+
+    #[test]
+    fn reconcile_both_dimensions_use_configured_buckets() {
+        let mut cfg = rate_limit_cfg();
+        cfg.enabled = true;
+        cfg.bandwidth_bytes_per_sec = 100 << 20;
+        cfg.iops = 3000;
+        let rl = reconcile_disk_rate_limiter(&cfg).unwrap();
+        let bw = rl.bandwidth.expect("bandwidth bucket present");
+        let ops = rl.ops.expect("ops bucket present");
+        assert_eq!(bw.refill_time, RATE_LIMIT_REFILL_TIME_MS);
+        assert_eq!(bw.size, 100 << 20);
+        assert_eq!(ops.refill_time, RATE_LIMIT_REFILL_TIME_MS);
+        assert_eq!(ops.size, 3000);
     }
 
     #[test]

@@ -799,6 +799,29 @@ impl AppConfig {
         }
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
+        self.validate_disk_rate_limit()?;
+        Ok(())
+    }
+
+    /// Reject internally inconsistent disk rate limit configs so operator
+    /// mistakes fail at load time. A one-time burst is meaningless without a
+    /// nonzero sustained limit: `build_disk_rate_limiter` only creates a token
+    /// bucket when the sustained value is > 0, so a burst paired with a zero
+    /// sustained limit would be silently ignored.
+    fn validate_disk_rate_limit(&self) -> Result<()> {
+        let cfg = &self.machine.disk_rate_limit;
+        if cfg.bandwidth_burst_bytes > 0 && cfg.bandwidth_bytes_per_sec == 0 {
+            bail!(
+                "machine.disk_rate_limit: bandwidth_burst_bytes is set but \
+                 bandwidth_bytes_per_sec is 0; a burst requires a nonzero sustained limit"
+            );
+        }
+        if cfg.iops_burst > 0 && cfg.iops == 0 {
+            bail!(
+                "machine.disk_rate_limit: iops_burst is set but iops is 0; \
+                 a burst requires a nonzero sustained limit"
+            );
+        }
         Ok(())
     }
 
@@ -1129,6 +1152,40 @@ mod tests {
                 .contains("memory_snapshot.background_download.concurrency must be > 0"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_disk_burst_without_sustained() {
+        let mut config = AppConfig::default();
+        config.machine.disk_rate_limit.bandwidth_bytes_per_sec = 0;
+        config.machine.disk_rate_limit.bandwidth_burst_bytes = 1024;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("bandwidth_burst_bytes is set but"),
+            "unexpected error: {err}"
+        );
+
+        let mut config = AppConfig::default();
+        config.machine.disk_rate_limit.iops = 0;
+        config.machine.disk_rate_limit.iops_burst = 500;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("iops_burst is set but"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_consistent_disk_rate_limit() {
+        let mut config = AppConfig::default();
+        config.machine.disk_rate_limit.enabled = true;
+        config.machine.disk_rate_limit.bandwidth_bytes_per_sec = 104_857_600;
+        config.machine.disk_rate_limit.bandwidth_burst_bytes = 10_485_760;
+        config.machine.disk_rate_limit.iops = 3000;
+        config.machine.disk_rate_limit.iops_burst = 500;
+        config
+            .validate()
+            .expect("consistent disk rate limit config passes");
     }
 
     #[test]

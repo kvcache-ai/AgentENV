@@ -313,7 +313,10 @@ impl FirecrackerInstance {
     ///
     /// `is_root_device` must be `true` for the boot rootfs drive and `false`
     /// for any non-root extra drive. This API is only used during the
-    /// pre-boot configuration phase.
+    /// pre-boot configuration phase. `rate_limiter` attaches a pre-boot limiter
+    /// so throttling is in force from the guest's first I/O (a post-start PATCH
+    /// would leave a brief unthrottled window).
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_drive(
         &self,
         drive_id: &str,
@@ -322,12 +325,14 @@ impl FirecrackerInstance {
         read_only: bool,
         direct: bool,
         io_engine: IoEngine,
+        rate_limiter: Option<Box<RateLimiter>>,
     ) -> Result<()> {
         let mut drive = Drive::new(drive_id.to_string(), is_root_device);
         drive.path_on_host = Some(path_on_host.to_string_lossy().into_owned());
         drive.is_read_only = Some(read_only);
         drive.direct = Some(direct);
         drive.io_engine = Some(io_engine);
+        drive.rate_limiter = rate_limiter;
         let path = format!("/drives/{}", drive_id);
         self.client
             .request_no_content(Method::PUT, &path, Some(&drive))
