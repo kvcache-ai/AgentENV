@@ -258,7 +258,9 @@ fn distro_from_id(id: &str) -> Option<Distro> {
     match id {
         "ubuntu" => Some(Distro::Ubuntu),
         "debian" => Some(Distro::Debian),
-        "centos" | "centos-stream" | "tencentos" | "openeuler" | "openEuler" => Some(Distro::Centos),
+        "centos" | "centos-stream" | "tencentos" | "openeuler" | "openEuler" => {
+            Some(Distro::Centos)
+        }
         "rhel" | "redhat" | "redhatenterpriseserver" => Some(Distro::Rhel),
         "arch" | "manjaro" => Some(Distro::Arch),
         _ => None,

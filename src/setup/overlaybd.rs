@@ -136,8 +136,14 @@ fn configured_overlaybd_release(
         // so it runs fine on other glibc-based distros. Fall back to the
         // oldest published Ubuntu build (lowest glibc requirement) for known
         // RPM-family distros so the CLI tools install without a native asset.
-        "tencentos" | "centos" | "centos-stream" | "rhel" | "redhat"
-        | "redhatenterpriseserver" | "openeuler" | "openEuler" => {
+        "tencentos"
+        | "centos"
+        | "centos-stream"
+        | "rhel"
+        | "redhat"
+        | "redhatenterpriseserver"
+        | "openeuler"
+        | "openEuler" => {
             format!("ubuntu1.{}.{}", FALLBACK_UBUNTU_VERSION, target.arch)
         }
         other => bail!(
@@ -577,7 +583,14 @@ mod tests {
             ),
         };
 
-        for os_id in ["centos", "centos-stream", "tencentos", "rhel", "openeuler", "openEuler"] {
+        for os_id in [
+            "centos",
+            "centos-stream",
+            "tencentos",
+            "rhel",
+            "openeuler",
+            "openEuler",
+        ] {
             let release = configured_overlaybd_release(
                 &config,
                 &OverlaybdReleaseTarget {
