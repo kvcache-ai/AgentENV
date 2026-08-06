@@ -195,7 +195,7 @@ fn load_resize_tool_config(
     );
     Ok(Some(ResizeToolSpec {
         binary: deps_path.join("overlaybd/bin/overlaybd-resize"),
-        lib_dir: Some(deps_path.join("overlaybd/lib")),
+        lib_dir: None,
         timeout_secs: resize_timeout_secs,
     }))
 }

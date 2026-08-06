@@ -1666,7 +1666,10 @@ fn clear_page_cache(device_path: &Path) {
 
     // BLKFLSBUF ioctl number: flush buffer cache
     // Linux asm-generic/ioctl.h encodes _IO(0x12, 97) as (0x12 << 8) | 97.
-    const BLKFLSBUF: libc::c_ulong = 0x1261;
+    // libc models ioctl's request argument differently across Linux libc
+    // implementations (c_ulong on glibc, c_int on musl). Keep the request
+    // value libc-agnostic and infer the ABI-specific type at the call site.
+    const BLKFLSBUF: u32 = 0x1261;
 
     let file = match OpenOptions::new()
         .read(true)
@@ -1681,7 +1684,7 @@ fn clear_page_cache(device_path: &Path) {
     };
 
     let fd = file.as_raw_fd();
-    let ret = unsafe { libc::ioctl(fd, BLKFLSBUF) };
+    let ret = unsafe { libc::ioctl(fd, BLKFLSBUF as _) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
         tracing::warn!(?err, path = %device_path.display(), "failed to clear page cache");

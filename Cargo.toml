@@ -33,6 +33,9 @@ version = "0.1.1"
 [lib]
 path = "src/lib.rs"
 
+[features]
+vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
+
 [dev-dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -109,6 +112,7 @@ iroh-blobs = { version = "=0.101.0" }
 rand = "0.10"
 flate2 = "1"
 tar = "0.4"
+openssl-sys = { version = "0.9", optional = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"

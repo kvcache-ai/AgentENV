@@ -43,25 +43,29 @@ jobs:
                   )
           PY
 
-  build-aenv:
-    name: Build aenv (${{ matrix.asset_name }})
+  build-cli:
+    name: Build CLI (${{ matrix.asset_name }})
     needs: validate-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          - os: ubuntu-22.04
             target: ''
+            features: --features vendored-openssl
             asset_name: aenv-linux-x86_64
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             target: ''
+            features: --features vendored-openssl
             asset_name: aenv-linux-aarch64
           - os: macos-15
             target: x86_64-apple-darwin
+            features: ''
             asset_name: aenv-darwin-x86_64
           - os: macos-15
             target: aarch64-apple-darwin
+            features: ''
             asset_name: aenv-darwin-aarch64
     steps:
       - uses: actions/checkout@v6
@@ -84,7 +88,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build aenv
-        run: cargo build --release -p aenv ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+        env:
+          OPENSSL_STATIC: ${{ runner.os == 'Linux' && '1' || '' }}
+        run: cargo build --release --locked -p aenv ${{ matrix.features }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       - name: Stage artifact
         run: |
@@ -106,10 +112,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          - os: ubuntu-22.04
             arch: x86_64
             modes: kvm pvm
-          - os: ubuntu-24.04-arm
+          - os: ubuntu-22.04-arm
             arch: aarch64
             modes: kvm
     timeout-minutes: 30
@@ -127,9 +133,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build server binaries
+        env:
+          OPENSSL_STATIC: "1"
         run: |
-          cargo build --release -p agentenv --bin server
-          cargo build --release -p uvm-ublk-daemon
+          cargo build --release --locked \
+            -p agentenv --bin server \
+            -p uvm-ublk-daemon --bin uvm-ublk-daemon \
+            --features vendored-openssl
 
       - name: Stage artifacts
         run: |
@@ -188,7 +198,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: [build-aenv, build-server]
+    needs: [build-cli, build-server]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -361,6 +371,7 @@ jobs:
           file: deploy/docker/Dockerfile.agentenv
           platforms: linux/amd64
           push: true
+          cache-from: type=gha,scope=agentenv-runtime
           build-args: |
             AENV_VIRTUALIZATION_MODE=pvm
           tags: |

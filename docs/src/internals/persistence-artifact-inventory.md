@@ -31,11 +31,11 @@ Owned by `src/setup/*` and `src/cfg.rs`.
 | CPU template helper | `<deps_path>/firecracker/{version}/cpu-template-helper` | Optional Firecracker helper executable | Detects host CPU config for cluster-wide CPU intersection | Extracted from Firecracker package when present. |
 | Kernel image | `<deps_path>/kernel/{version}/vmlinux.bin` | Guest kernel | VM boot source | Downloaded during setup. Old versions are retained until manually removed. |
 | Tools drive | `<deps_path>/tools/{version}/tools.ext4` | Read-only ext4 image with envd/tools | Firecracker root drive shared by sandboxes and pinned by snapshots through its immutable release version | Extracted from OCI or imported from `tools.drive_path` during setup. Old versions are retained until manually removed. |
-| Overlaybd tools | `<deps_path>/overlaybd/bin/*`, `<deps_path>/overlaybd/lib/*` | `overlaybd-create`, `overlaybd-apply`, `overlaybd-commit`, `overlaybd-resize`, libraries | OCI-to-overlaybd conversion and packaging | Installed during setup when release metadata does not match. |
+| Overlaybd tools | `<deps_path>/overlaybd/bin/*` | Statically linked `overlaybd-create`, `overlaybd-apply`, `overlaybd-commit`, and `overlaybd-resize` | OCI-to-overlaybd conversion and packaging | Installed during setup when release metadata does not match. |
 | Overlaybd release metadata | `<deps_path>/overlaybd/tools-release.json` | Installed overlaybd release identifier | Detects whether tools need reinstalling | Rewritten on setup when release changes. |
-| Overlaybd package downloads | `<deps_path>/overlaybd/downloads/*` | Downloaded package archives | Setup cache for overlaybd release packages | Kept after install; no automatic GC. |
+| Overlaybd package downloads | `<deps_path>/overlaybd/downloads/*` | Temporary downloaded package archives | Setup staging for overlaybd release packages | Removed after a successful install. |
 | Generated overlaybd config | `$AENV_HOME/overlaybd/overlaybd-global.json`, `$AENV_HOME/overlaybd/mem-overlaybd-global.json`, `$AENV_HOME/overlaybd/convert-overlaybd-global.json`, `$AENV_HOME/overlaybd/resize-overlaybd-global.json` | Runtime global config, cache path, credentials config | Configures overlaybd runtime, memory snapshot overlaybd access, and the offline C++ tools (`overlaybd-apply`, `overlaybd-resize`), which get dedicated configs with isolated cacheDirs (`convert-blocks`, `resize-blocks`) and download disabled | Rewritten during setup/startup. |
-| Overlaybd runtime log | `<deps_path>/overlaybd/overlaybd.log` | Overlaybd runtime logs | Debugging | Appended by overlaybd runtime; no automatic GC. |
+| Overlaybd runtime log | `$AENV_HOME/overlaybd/overlaybd.log` | Overlaybd runtime logs | Debugging | Appended by overlaybd runtime; no automatic GC. |
 
 ## Firecracker Sandbox
 

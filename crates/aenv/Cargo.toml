@@ -7,6 +7,9 @@ edition = "2021"
 name = "aenv"
 path = "src/main.rs"
 
+[features]
+vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
+
 [dependencies]
 anyhow = "1"
 bytes = "1"
@@ -18,6 +21,7 @@ directories = "5"
 envd = { path = "../../thirdparty/envd" }
 futures = "0.3"
 indicatif = "0.17"
+openssl-sys = { version = "0.9", optional = true }
 prost = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["multipart", "rustls", "stream"] }
 rpassword = "7"
