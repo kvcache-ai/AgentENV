@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Linux kernel 6.8+**; the install script additionally requires **Ubuntu 24.04**
+- **Linux kernel 6.8+**; the install script additionally requires **Ubuntu**
 - `/dev/kvm` access for Firecracker microVM execution
 
 > If your server does not support standard KVM, use the dedicated
@@ -20,7 +20,7 @@ uses a dedicated `aenv` system account with `CAP_NET_ADMIN` and
 
 ### 1. Install and start the server
 
-**Option A — Install Script (Ubuntu 24.04)**
+**Option A — Install Script (Ubuntu)**
 
 The script installs both the server and the `aenv` CLI. Set `AENV_HOME_PATH` to
 choose the data directory; if it is not set, AENV stores runtime dependencies

@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -14,7 +13,6 @@ pub struct OverlaybdTools {
     create_bin: PathBuf,
     apply_bin: PathBuf,
     commit_bin: PathBuf,
-    lib_dir: Option<PathBuf>,
 }
 
 pub(crate) struct CreateLayerRequest {
@@ -92,23 +90,12 @@ impl OverlaybdTools {
             create_bin: bin_dir.join("overlaybd-create"),
             apply_bin: bin_dir.join("overlaybd-apply"),
             commit_bin: bin_dir.join("overlaybd-commit"),
-            lib_dir: None,
         }
     }
 
     pub fn from_overlaybd_install_root(root: impl Into<PathBuf>) -> Self {
         let root = root.into();
-        Self {
-            create_bin: root.join("bin/overlaybd-create"),
-            apply_bin: root.join("bin/overlaybd-apply"),
-            commit_bin: root.join("bin/overlaybd-commit"),
-            lib_dir: Some(root.join("lib")),
-        }
-    }
-
-    pub fn with_lib_dir(mut self, lib_dir: impl Into<PathBuf>) -> Self {
-        self.lib_dir = Some(lib_dir.into());
-        self
+        Self::from_bin_dir(root.join("bin"))
     }
 
     pub(crate) async fn create_writable_layer(
@@ -354,16 +341,6 @@ impl OverlaybdTools {
     fn base_command(&self, bin: &Path, work_dir: &Path) -> Command {
         let mut cmd = Command::new(bin);
         cmd.current_dir(work_dir);
-        if let Some(lib_dir) = &self.lib_dir {
-            let mut value = OsString::from(lib_dir);
-            if let Some(existing) = std::env::var_os("LD_LIBRARY_PATH") {
-                if !existing.is_empty() {
-                    value.push(":");
-                    value.push(existing);
-                }
-            }
-            cmd.env("LD_LIBRARY_PATH", value);
-        }
         cmd
     }
 
@@ -618,14 +595,12 @@ mod tests {
     }
 
     #[test]
-    fn convert_runs_fake_tool_chain_in_order_and_sets_ld_library_path() {
+    fn convert_runs_fake_tool_chain_in_order() {
         let tmp = tempdir().unwrap();
         let work_dir = tmp.path().join("work");
         let bin_dir = tmp.path().join("bin");
-        let lib_dir = tmp.path().join("lib");
         let log_path = tmp.path().join("tool.log");
         fs::create_dir_all(&bin_dir).unwrap();
-        fs::create_dir_all(&lib_dir).unwrap();
 
         for tool in ["overlaybd-create", "overlaybd-apply", "overlaybd-commit"] {
             write_script(
@@ -641,7 +616,7 @@ mod tests {
         let input_layer_path = tmp.path().join("layer.tar");
         fs::write(&input_layer_path, b"not-zstd-layer").unwrap();
 
-        let tools = OverlaybdTools::from_bin_dir(&bin_dir).with_lib_dir(&lib_dir);
+        let tools = OverlaybdTools::from_bin_dir(&bin_dir);
         let req = ConvertLayerRequest {
             work_dir: work_dir.clone(),
             input_layer_path,
@@ -690,7 +665,6 @@ mod tests {
         assert!(log.contains("overlaybd-commit"));
         assert!(log.contains("--uuid 11111111-2222-3333-4444-555555555555"));
         assert!(log.contains("--parent-uuid aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
-        assert!(log.contains(&format!("LD_LIBRARY_PATH={}", lib_dir.display())));
         assert!(log.contains(&format!(
             "--service_config_path={}",
             req.global_config_path.display()
@@ -818,7 +792,7 @@ mod tests {
     }
 
     #[test]
-    fn from_overlaybd_install_root_uses_bin_and_lib_subdirs() {
+    fn from_overlaybd_install_root_uses_static_bin_subdir() {
         let tmp = tempdir().unwrap();
         let overlaybd_root = tmp.path().join("overlaybd");
         let tools = OverlaybdTools::from_overlaybd_install_root(&overlaybd_root);
@@ -832,7 +806,6 @@ mod tests {
             tools.commit_bin,
             overlaybd_root.join("bin/overlaybd-commit")
         );
-        assert_eq!(tools.lib_dir, Some(overlaybd_root.join("lib")));
     }
 
     fn write_script(path: &Path, contents: &str) {

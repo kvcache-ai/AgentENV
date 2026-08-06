@@ -50,7 +50,7 @@ If your server does not support standard KVM, see the [PVM deployment guide](htt
 
 **1. Install and start the server**
 
-*Option A — install script (Ubuntu 24.04)*
+*Option A — install script (Ubuntu)*
 
 Install both the server and the `aenv` CLI, then start the server as a systemd service:
 

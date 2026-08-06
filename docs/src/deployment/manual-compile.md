@@ -6,7 +6,7 @@ If you want to skip building from source, see [Quick Start](../getting-started/q
 
 ## Prerequisites
 
-- Ubuntu 24.04 with Linux kernel 6.8+
+- Ubuntu with Linux kernel 6.8+
 - `/dev/kvm` access for Firecracker microVM execution
 - Rust toolchain (stable) — install via [rustup](https://rustup.rs)
 - `sudo` access

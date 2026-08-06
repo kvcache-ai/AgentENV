@@ -1288,7 +1288,7 @@ mod tests {
         let config = AppConfig::default();
         assert_eq!(
             config.resolved_overlaybd_oci_converter_id(),
-            "overlaybd-oci:v1.0.18:agentenv-cache-v1"
+            "overlaybd-oci:v1.0.18-aenv.1:agentenv-cache-v1"
         );
         assert!(!config.ublk.overlaybd.allow_shrink);
         assert_eq!(config.ublk.overlaybd.resize_timeout_secs, 120);

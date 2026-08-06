@@ -43,20 +43,14 @@ jobs:
                   )
           PY
 
-  build-aenv:
-    name: Build aenv (${{ matrix.asset_name }})
+  build-darwin-cli:
+    name: Build Darwin CLI (${{ matrix.asset_name }})
     needs: validate-version
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            target: ''
-            asset_name: aenv-linux-x86_64
-          - os: ubuntu-24.04-arm
-            target: ''
-            asset_name: aenv-linux-aarch64
           - os: macos-15
             target: x86_64-apple-darwin
             asset_name: aenv-darwin-x86_64
@@ -66,15 +60,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install system dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang libclang-dev libprotobuf-dev protobuf-compiler
-
       - name: Install system dependencies (macOS)
-        if: runner.os == 'macOS'
         run: brew install protobuf
 
       - uses: dtolnay/rust-toolchain@stable
@@ -84,12 +70,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build aenv
-        run: cargo build --release -p aenv ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+        run: cargo build --release --locked -p aenv --target ${{ matrix.target }}
 
       - name: Stage artifact
         run: |
           mkdir -p dist
-          BIN=${{ matrix.target && format('target/{0}/release/aenv', matrix.target) || 'target/release/aenv' }}
+          BIN=target/${{ matrix.target }}/release/aenv
           cp "$BIN" dist/${{ matrix.asset_name }}
           strip dist/${{ matrix.asset_name }} || true
 
@@ -98,8 +84,8 @@ jobs:
           name: ${{ matrix.asset_name }}
           path: dist/${{ matrix.asset_name }}
 
-  build-server:
-    name: Build server (linux-${{ matrix.arch }})
+  build-linux:
+    name: Build Linux release (${{ matrix.arch }})
     needs: validate-version
     runs-on: ${{ matrix.os }}
     strategy:
@@ -108,39 +94,191 @@ jobs:
         include:
           - os: ubuntu-24.04
             arch: x86_64
+            rust_target: x86_64-unknown-linux-musl
+            zig_target: x86_64-linux-musl
+            openssl_target: linux-x86_64
             modes: kvm pvm
           - os: ubuntu-24.04-arm
             arch: aarch64
+            rust_target: aarch64-unknown-linux-musl
+            zig_target: aarch64-linux-musl
+            openssl_target: linux-aarch64
             modes: kvm
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install system dependencies
+      - name: Install native build prerequisites
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang libclang-dev libprotobuf-dev protobuf-compiler
+            build-essential \
+            clang \
+            cmake \
+            curl \
+            libclang-dev \
+            libprotobuf-dev \
+            linux-libc-dev \
+            make \
+            ninja-build \
+            perl \
+            pkg-config \
+            protobuf-compiler \
+            xz-utils
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build server binaries
+      - name: Build static Linux binaries
+        env:
+          ZIG_VERSION: 0.15.2
+          OPENSSL_VERSION: 3.5.7
         run: |
-          cargo build --release -p agentenv --bin server
-          cargo build --release -p uvm-ublk-daemon
+          set -euo pipefail
+
+          work_dir="$(mktemp -d "$RUNNER_TEMP/agentenv-static-release.XXXXXXXX")"
+          trap 'rm -rf "$work_dir"' EXIT
+
+          zig_archive="zig-${{ matrix.arch }}-linux-$ZIG_VERSION.tar.xz"
+          zig_dir="$work_dir/zig-$ZIG_VERSION"
+          curl -fsSL --retry 5 \
+            "https://ziglang.org/download/$ZIG_VERSION/$zig_archive" \
+            -o "$work_dir/$zig_archive"
+          mkdir -p "$zig_dir"
+          tar -xJf "$work_dir/$zig_archive" -C "$zig_dir" --strip-components=1
+          zig="$zig_dir/zig"
+
+          toolchain_dir="$work_dir/toolchain"
+          mkdir -p "$toolchain_dir"
+
+          write_compiler_wrapper() {
+            local output=$1
+            local mode=$2
+            local compiler_template
+            compiler_template='#!/usr/bin/env bash
+          set -euo pipefail
+          args=()
+          skip_next=false
+          for arg in "$@"; do
+              if $skip_next; then
+                  skip_next=false
+                  continue
+              fi
+              case "$arg" in
+                  --target=*) continue ;;
+                  --target) skip_next=true; continue ;;
+                  *) args+=("$arg") ;;
+              esac
+          done
+          exec "ZIG_PATH" COMPILER_MODE -target ZIG_TARGET "${args[@]}"
+          '
+            printf '%s' "$compiler_template" > "$output"
+            sed -i \
+              "s|ZIG_PATH|$zig|g; s|COMPILER_MODE|$mode|g; s|ZIG_TARGET|${{ matrix.zig_target }}|g" \
+              "$output"
+            chmod +x "$output"
+          }
+
+          write_compiler_wrapper "$toolchain_dir/musl-cc" cc
+          write_compiler_wrapper "$toolchain_dir/musl-cxx" c++
+
+          for tool_name in ar ranlib; do
+            tool_wrapper="$toolchain_dir/musl-$tool_name"
+            printf '#!/bin/sh\nexec "%s" %s "$@"\n' "$zig" "$tool_name" > "$tool_wrapper"
+            chmod +x "$tool_wrapper"
+          done
+
+          linker_template='#!/usr/bin/env bash
+          set -euo pipefail
+          args=()
+          skip_next=false
+          for arg in "$@"; do
+              if $skip_next; then
+                  skip_next=false
+                  continue
+              fi
+              case "$arg" in
+                  --target=*) continue ;;
+                  --target) skip_next=true; continue ;;
+                  */self-contained/*crt*.o) continue ;;
+                  -lstdc++) args+=("-lc++") ;;
+                  *) args+=("$arg") ;;
+              esac
+          done
+          exec "ZIG_PATH" c++ -target ZIG_TARGET "${args[@]}"
+          '
+          printf '%s' "$linker_template" > "$toolchain_dir/musl-linker"
+          sed -i \
+            "s|ZIG_PATH|$zig|g; s|ZIG_TARGET|${{ matrix.zig_target }}|g" \
+            "$toolchain_dir/musl-linker"
+          chmod +x "$toolchain_dir/musl-linker"
+
+          target_env_key="${{ matrix.rust_target }}"
+          target_env_key="${target_env_key//-/_}"
+          target_key="${{ matrix.rust_target }}"
+          target_key="${target_key^^}"
+          target_key="${target_key//-/_}"
+          export "CC_${target_env_key}=$toolchain_dir/musl-cc"
+          export "CXX_${target_env_key}=$toolchain_dir/musl-cxx"
+          export "AR_${target_env_key}=$toolchain_dir/musl-ar"
+          export "CARGO_TARGET_${target_key}_LINKER=$toolchain_dir/musl-linker"
+
+          openssl_source_dir="$work_dir/openssl-$OPENSSL_VERSION"
+          openssl_install_dir="$work_dir/openssl-musl-${{ matrix.arch }}"
+          openssl_archive="$work_dir/openssl-$OPENSSL_VERSION.tar.gz"
+          curl -fsSL --retry 5 \
+            "https://www.openssl.org/source/openssl-$OPENSSL_VERSION.tar.gz" \
+            -o "$openssl_archive"
+          tar -xzf "$openssl_archive" -C "$work_dir"
+
+          (
+            cd "$openssl_source_dir"
+            CC="$toolchain_dir/musl-cc" \
+              AR="$toolchain_dir/musl-ar" \
+              RANLIB="$toolchain_dir/musl-ranlib" \
+              ./Configure \
+              "${{ matrix.openssl_target }}" \
+              no-shared \
+              no-tests \
+              no-module \
+              --prefix="$openssl_install_dir" \
+              --libdir=lib
+            make -j"$(nproc)" build_libs
+            mkdir -p "$openssl_install_dir/include" "$openssl_install_dir/lib"
+            cp -a include/openssl "$openssl_install_dir/include/"
+            cp -a libcrypto.a libssl.a "$openssl_install_dir/lib/"
+          )
+
+          export OPENSSL_STATIC=1
+          export OPENSSL_DIR="$openssl_install_dir"
+          export OPENSSL_LIB_DIR="$openssl_install_dir/lib"
+          export OPENSSL_INCLUDE_DIR="$openssl_install_dir/include"
+
+          cargo build --release --locked --target "${{ matrix.rust_target }}" -p aenv
+          cargo build --release --locked --target "${{ matrix.rust_target }}" \
+            -p uvm-ublk-daemon --bin uvm-ublk-daemon
+          cargo build --release --locked --target "${{ matrix.rust_target }}" \
+            -p agentenv --bin server
+
+          mkdir -p dist
+          target_dir="target/${{ matrix.rust_target }}/release"
+          cp "$target_dir/aenv" "dist/aenv-linux-${{ matrix.arch }}"
 
       - name: Stage artifacts
         run: |
           set -euo pipefail
+          TARGET_DIR="target/${{ matrix.rust_target }}/release"
 
           for MODE in ${{ matrix.modes }}; do
             BUNDLE="dist/bundle-$MODE"
             mkdir -p "$BUNDLE/ublk"
-            cp target/release/server "$BUNDLE/server"
+            cp "$TARGET_DIR/server" "$BUNDLE/server"
             strip "$BUNDLE/server"
-            cp target/release/uvm-ublk-daemon "$BUNDLE/ublk/uvm-ublk-daemon"
+            cp "$TARGET_DIR/uvm-ublk-daemon" "$BUNDLE/ublk/uvm-ublk-daemon"
             strip "$BUNDLE/ublk/uvm-ublk-daemon"
             cp config/default.toml "$BUNDLE/default.toml"
 
@@ -184,11 +322,14 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: server-bundles-${{ matrix.arch }}
-          path: dist/aenv-server-linux-${{ matrix.arch }}*.tar.gz
+          path: |
+            dist/aenv-linux-${{ matrix.arch }}
+            dist/aenv-server-linux-${{ matrix.arch }}*.tar.gz
+          if-no-files-found: error
 
   release:
     name: Create GitHub Release
-    needs: [build-aenv, build-server]
+    needs: [build-darwin-cli, build-linux]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -361,6 +502,7 @@ jobs:
           file: deploy/docker/Dockerfile.agentenv
           platforms: linux/amd64
           push: true
+          cache-from: type=gha,scope=agentenv-runtime
           build-args: |
             AENV_VIRTUALIZATION_MODE=pvm
           tags: |
