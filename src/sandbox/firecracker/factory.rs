@@ -14,7 +14,9 @@ use super::config::FirecrackerSandboxConfig;
 use super::sandbox::{FirecrackerPausedState, FirecrackerSandbox};
 use crate::cfg::ConfigManager;
 use crate::sandbox::backend::{PausedSandboxState, SandboxBackend, SandboxBackendFactory};
-use crate::sandbox::{FreshSandboxBuildSpec, OverlaybdConfig, SandboxLaunchConfig, UblkConfig};
+use crate::sandbox::{
+    EnvdAccessToken, FreshSandboxBuildSpec, OverlaybdConfig, SandboxLaunchConfig, UblkConfig,
+};
 use crate::snapshot::RunnableSnapshot;
 use crate::types::SandboxId;
 
@@ -165,12 +167,16 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         &self,
         sandbox_id: SandboxId,
         state: &dyn PausedSandboxState,
+        envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>> {
-        let config = state
+        let paused_state = state
             .downcast_ref::<FirecrackerPausedState>()
             .context("The provided PausedSandboxState is not a Firecracker paused state")?;
-        let sandbox =
-            FirecrackerSandbox::from_snapshot_config_with_id(config.snapshot_config(), sandbox_id)?;
+        let sandbox = FirecrackerSandbox::from_snapshot_config_with_override(
+            paused_state.snapshot_config().clone(),
+            sandbox_id,
+            envd_access_token,
+        )?;
         Ok(Box::new(sandbox))
     }
 }
@@ -245,7 +251,7 @@ mod tests {
         let factory = FirecrackerSandboxFactory::new();
         let state: Arc<dyn PausedSandboxState> = Arc::new(WrongPausedState);
 
-        match factory.build_from_paused_state(SandboxId::new(), state.as_ref()) {
+        match factory.build_from_paused_state(SandboxId::new(), state.as_ref(), None) {
             Ok(_) => panic!("wrong snapshot type should fail"),
             Err(err) => assert!(err.to_string().contains("not a Firecracker paused state")),
         }

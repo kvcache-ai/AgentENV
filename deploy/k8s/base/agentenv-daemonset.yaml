@@ -23,6 +23,11 @@ spec:
           env:
             - name: AENV_CONFIG_PATH
               value: /workspace/config/agentenv.toml
+            - name: AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED
+              valueFrom:
+                secretKeyRef:
+                  name: agentenv-runtime-secrets
+                  key: sandbox-access-token-hash-seed
             - name: AENV_VIRTUALIZATION_MODE
               value: "kvm"
             - name: API_ADDR

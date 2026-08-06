@@ -17,8 +17,11 @@ macro_rules! impl_envd_client {
             }
 
             impl $client_struct {
-                pub async fn connect(dst: &str) -> Result<Self, anyhow::Error> {
-                    let chan = crate::transport::new_channel(dst)?;
+                pub async fn connect(
+                    dst: &str,
+                    access_token: Option<&str>,
+                ) -> Result<Self, anyhow::Error> {
+                    let chan = crate::transport::new_channel(dst, access_token)?;
                     Ok(Self {
                         inner: GeneratedClient::new(chan),
                     })

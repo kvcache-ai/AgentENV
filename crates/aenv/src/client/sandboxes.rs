@@ -10,6 +10,8 @@ pub struct NewSandbox<'a> {
     pub template_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secure: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -23,12 +25,16 @@ pub struct NewColdSandbox<'a> {
     pub memory_mb: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "diskSizeMB")]
     pub disk_size_mb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secure: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct Sandbox {
     #[serde(rename = "sandboxID")]
     pub sandbox_id: String,
+    #[serde(default, rename = "envdAccessToken")]
+    pub envd_access_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -37,9 +43,11 @@ pub struct RefreshSandbox {
     pub duration: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct SandboxDetail {
     pub state: String,
+    #[serde(default, rename = "envdAccessToken")]
+    pub envd_access_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -65,14 +73,20 @@ pub struct ListedSandbox {
 }
 
 impl Client {
-    pub fn create_sandbox(&self, template_id: &str, timeout: Option<u32>) -> Result<String> {
+    pub fn create_sandbox(
+        &self,
+        template_id: &str,
+        timeout: Option<u32>,
+        secure: bool,
+    ) -> Result<Sandbox> {
         let body = NewSandbox {
             template_id,
             timeout,
+            secure: secure.then_some(true),
         };
         let resp = handle_status(self.post("/sandboxes").send_json(&body))?;
         let sandbox: Sandbox = resp.into_json()?;
-        Ok(sandbox.sandbox_id)
+        Ok(sandbox)
     }
 
     pub fn create_cold_sandbox(
@@ -82,17 +96,19 @@ impl Client {
         cpu_count: Option<u32>,
         memory_mb: Option<u32>,
         disk_size_mb: Option<u32>,
-    ) -> Result<String> {
+        secure: bool,
+    ) -> Result<Sandbox> {
         let body = NewColdSandbox {
             image,
             timeout,
             cpu_count,
             memory_mb,
             disk_size_mb,
+            secure: secure.then_some(true),
         };
         let resp = handle_status(self.post("/sandboxes-cold").send_json(&body))?;
         let sandbox: Sandbox = resp.into_json()?;
-        Ok(sandbox.sandbox_id)
+        Ok(sandbox)
     }
 
     pub fn list_sandboxes(&self) -> Result<Vec<ListedSandbox>> {
@@ -128,6 +144,11 @@ impl Client {
         Ok(Some(detail.state))
     }
 
+    pub fn get_sandbox(&self, id: &str) -> Result<SandboxDetail> {
+        let resp = handle_status(self.get(&format!("/sandboxes/{id}")).call())?;
+        Ok(resp.into_json()?)
+    }
+
     /// `connect` resumes a paused sandbox or extends the TTL of a running one.
     pub fn connect_sandbox(&self, id: &str, timeout: u32) -> Result<Sandbox> {
         let resp = handle_status(
@@ -153,18 +174,6 @@ impl Client {
         )?;
         Ok(())
     }
-
-    pub async fn envd_ready_with_timeout(
-        &self,
-        sandbox_id: &str,
-        timeout: Duration,
-    ) -> Result<bool> {
-        let transport = self.transport(sandbox_id)?;
-        match tokio::time::timeout(timeout, transport.ready()).await {
-            Ok(Ok(())) => Ok(true),
-            Ok(Err(_)) | Err(_) => Ok(false),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -176,11 +185,13 @@ mod tests {
         let body = NewSandbox {
             template_id: "base-template",
             timeout: Some(300),
+            secure: Some(true),
         };
 
         let value = serde_json::to_value(body).unwrap();
         assert_eq!(value["templateID"], "base-template");
         assert_eq!(value["timeout"], 300);
+        assert_eq!(value["secure"], true);
         assert!(value.get("cpuCount").is_none());
         assert!(value.get("memoryMB").is_none());
     }
@@ -193,6 +204,7 @@ mod tests {
             cpu_count: Some(2),
             memory_mb: Some(1024),
             disk_size_mb: Some(8192),
+            secure: Some(true),
         };
 
         let value = serde_json::to_value(body).unwrap();
@@ -201,6 +213,7 @@ mod tests {
         assert_eq!(value["cpuCount"], 2);
         assert_eq!(value["memoryMB"], 1024);
         assert_eq!(value["diskSizeMB"], 8192);
+        assert_eq!(value["secure"], true);
         assert!(value.get("templateID").is_none());
     }
 

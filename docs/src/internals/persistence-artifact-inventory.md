@@ -9,6 +9,7 @@ This document lists AgentENV artifacts that can remain on disk or in object stor
 | `home_path` | `/var/lib/aenv` | `src/cfg.rs` | Base for paths containing the literal `$AENV_HOME` placeholder. `AENV_HOME_PATH` overrides it before placeholder expansion. |
 | `runtime_path` | `/run/aenv` | `src/cfg.rs`, `src/sandbox/network/*` | Base for transient namespace mount points and daemon sockets. `AENV_RUNTIME_PATH` overrides it. |
 | `deps_path` | `$AENV_HOME/deps` | `src/cfg.rs`, `src/setup/*` | Base for downloaded runtime dependencies. `AENV_DEPS_PATH` can place these rebuildable assets outside `home_path`. |
+| Managed envd access-token seed | `$AENV_HOME/secrets/sandbox-access-token-hash-seed` | `src/sandbox/access.rs` | Node-local secret used when `[sandbox].access_token_hash_seed` is unset. It must be preserved with persisted secure sandboxes. |
 | Firecracker sandbox work dirs | `$AENV_HOME/firecracker-work` with `agentenv-fc-` children | `src/sandbox/firecracker/*` | Per-sandbox runtime directories for sockets, symlinks, ublk runtime dirs, local logs, and writable OverlayBD upper layer data (`overlaybd/upper.data`, `overlaybd/upper.index`). An explicit `[firecracker].work_dir` overrides the root. |
 | `firecracker.serial_dir` | `$AENV_HOME/logs/serial` | `src/sandbox/firecracker/*` | Durable Firecracker stdout/stderr root, grouped by sandbox ID. An explicit `[firecracker].serial_dir` overrides the root. |
 | `managed_snapshot_root` | `<firecracker-work-base>/managed-snapshots` | `src/sandbox/firecracker/*` | In-process live snapshot artifact root used to keep captured snapshots alive until publish or drop. |
@@ -35,6 +36,7 @@ Owned by `src/setup/*` and `src/cfg.rs`.
 | Overlaybd release metadata | `<deps_path>/overlaybd/tools-release.json` | Installed overlaybd release identifier | Detects whether tools need reinstalling | Rewritten on setup when release changes. |
 | Overlaybd package downloads | `<deps_path>/overlaybd/downloads/*` | Downloaded package archives | Setup cache for overlaybd release packages | Kept after install; no automatic GC. |
 | Generated overlaybd config | `$AENV_HOME/overlaybd/overlaybd-global.json`, `$AENV_HOME/overlaybd/mem-overlaybd-global.json` | Runtime global config, cache path, credentials config | Configures overlaybd runtime and memory snapshot overlaybd access | Rewritten during setup/startup. |
+| Managed envd access-token seed | `$AENV_HOME/secrets/sandbox-access-token-hash-seed` | 32 random bytes encoded as lowercase hexadecimal | Derives stable per-sandbox envd access tokens when no explicit seed is configured | Atomically created with mode `0600` during normal startup and reused thereafter. Must not be deleted while secure sandboxes are persisted. |
 | Overlaybd runtime log | `<deps_path>/overlaybd/overlaybd.log` | Overlaybd runtime logs | Debugging | Appended by overlaybd runtime; no automatic GC. |
 
 ## Firecracker Sandbox

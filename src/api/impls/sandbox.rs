@@ -214,7 +214,12 @@ impl From<SandboxMetadata> for models::SandboxDetail {
 
 impl ApiImpl {
     fn sandbox_model(&self, metadata: SandboxMetadata) -> models::Sandbox {
+        let envd_access_token = self
+            .orchestrator
+            .get_envd_access_token(&metadata)
+            .map(|token| token.expose().to_owned());
         let mut sandbox = models::Sandbox::from(metadata);
+        sandbox.envd_access_token = envd_access_token;
         sandbox.domain = self
             .sandbox_proxy_domains()
             .first()
@@ -223,7 +228,12 @@ impl ApiImpl {
     }
 
     fn sandbox_detail_model(&self, metadata: SandboxMetadata) -> models::SandboxDetail {
+        let envd_access_token = self
+            .orchestrator
+            .get_envd_access_token(&metadata)
+            .map(|token| token.expose().to_owned());
         let mut sandbox = models::SandboxDetail::from(metadata);
+        sandbox.envd_access_token = envd_access_token;
         sandbox.domain = self
             .sandbox_proxy_domains()
             .first()
@@ -493,6 +503,7 @@ impl Sandboxes<()> for ApiImpl {
                 .clone()
                 .filter(|env_vars| !env_vars.is_empty()),
             network_policy,
+            secure: body.secure == Some(true),
             custom_extension_params: custom_params,
         };
 
@@ -625,6 +636,7 @@ impl Sandboxes<()> for ApiImpl {
                 .clone()
                 .filter(|env_vars| !env_vars.is_empty()),
             network_policy,
+            secure: body.secure == Some(true),
             custom_extension_params: custom_params,
         };
 

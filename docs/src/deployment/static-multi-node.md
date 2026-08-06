@@ -62,11 +62,13 @@ curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/in
 ```
 
 Edit `/etc/default/aenv` on each machine without removing the paths written by
-the installer. Node A uses:
+the installer. Generate one access-token seed with `openssl rand -hex 32`, store
+it securely, and set the same value on every runtime node. Node A uses:
 
 ```bash
 API_ADDR="0.0.0.0:8000"
 AENV_NODE_ID="node-a"
+AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED="<shared-secret>"
 AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED="true"
 AENV_OBSERVABILITY_SCHEDULER_ENDPOINT="http://10.0.0.10:9090"
 ```
@@ -76,12 +78,14 @@ Node B uses the same values except for its unique node ID:
 ```bash
 API_ADDR="0.0.0.0:8000"
 AENV_NODE_ID="node-b"
+AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED="<same-shared-secret>"
 AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED="true"
 AENV_OBSERVABILITY_SCHEDULER_ENDPOINT="http://10.0.0.10:9090"
 ```
 
 The `AENV_NODE_ID` values must exactly match the corresponding IDs in the
-Scheduler configuration below. Restart and verify each runtime:
+Scheduler configuration below. Changing the shared seed rotates the access
+tokens for existing secure sandboxes. Restart and verify each runtime:
 
 ```bash
 sudo systemctl restart aenv

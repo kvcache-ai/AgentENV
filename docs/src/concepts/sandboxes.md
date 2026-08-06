@@ -51,6 +51,8 @@ aenv start --cold ubuntu:24.04
 
 The cold-start API accepts an optional `diskSizeMB` field to set the root filesystem's virtual size in MiB. Explicit values must be at least 1024 MiB and divisible by 1024 because the current resize tool operates at 1 GiB granularity. Growth is allowed by default; shrinking below the source image size requires `ublk.overlaybd.allow_shrink = true`. If omitted, the image's built-in virtual size is used. Resizing applies only when creating a fresh writable root filesystem, not to read-only images, images with an existing upper, or snapshot resume. Sandbox responses also report disk size as `diskSizeMB`.
 
+Use `aenv start --secure` with either warm or cold starts to require an envd access token for command and file operations. The CLI obtains and sends the token automatically. Secure mode protects the envd control port only; it does not add authentication to application ports. Each fork derives a distinct envd token from the child sandbox ID.
+
 ---
 
 ## Working with Sandboxes

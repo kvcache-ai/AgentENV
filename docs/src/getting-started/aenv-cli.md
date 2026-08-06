@@ -104,12 +104,14 @@ Start a sandbox and attach an interactive shell. `<target>` is a template name o
 
 ```bash
 aenv start my-ubuntu
+aenv start --secure my-ubuntu               # require token-authenticated envd access
 aenv start --cold ubuntu:24.04              # start directly from an OCI image
 ```
 
 | Flag | Description |
 |------|-------------|
 | `--cold` | Start directly from an external OCI image instead of a template |
+| `--secure` | Require token authentication for envd control communication |
 | `--timeout <secs>` | Sandbox TTL in seconds (default: 300) |
 | `--cpu-count <n>` / `--cpu` | CPU cores — only valid with `--cold` |
 | `--memory-mb <n>` / `--mem` | Memory in MiB — only valid with `--cold` |

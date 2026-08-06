@@ -105,6 +105,7 @@ def correctness_tests(
             sandbox_url=sandbox_url,
             api_key=api_key,
             request_timeout=60,
+            secure=True,
         )
         require(correct_sandbox.sandbox_id, "sandbox create returned empty sandbox_id")
         log(f"sandbox created: {correct_sandbox.sandbox_id}")
@@ -254,6 +255,7 @@ def performance_tests(
             sandbox_url=sandbox_url,
             api_key=api_key,
             request_timeout=60,
+            secure=True,
         )
         retry(lambda: perf_sandbox.run_code("1 + 1"), "perf first cmd", attempts=10, delay=2.0)
         cold_to_first_cmd_s = time.perf_counter() - t0
@@ -301,6 +303,7 @@ def performance_tests(
                 sandbox_url=sandbox_url,
                 api_key=api_key,
                 request_timeout=60,
+                secure=True,
             )
             return idx, time.perf_counter() - t0, sb
         except Exception as err:

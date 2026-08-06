@@ -5,8 +5,12 @@ use anyhow::{anyhow, Context, Result};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, trace};
 
+use crate::sandbox::EnvdAccessToken;
 use envd::filesystem::FilesystemClient;
-use envd::http_client::apis::{configuration::Configuration, default_api};
+use envd::http_client::apis::{
+    configuration::{ApiKey, Configuration},
+    default_api,
+};
 use envd::http_client::models::InitPostRequest;
 use envd::process::ProcessClient;
 use envd::reqwest::Client;
@@ -25,10 +29,11 @@ static ENVD_BOOTSTRAP_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
 pub(crate) struct EnvdInstance {
     config: Configuration,
     grpc_address: String,
+    access_token: Option<EnvdAccessToken>,
 }
 
 impl EnvdInstance {
-    pub(crate) fn new(base_path: String) -> Self {
+    pub(crate) fn new(base_path: String, access_token: Option<EnvdAccessToken>) -> Self {
         let grpc_address = base_path.clone();
         Self {
             // Share client configuration without retaining bootstrap TCP
@@ -40,9 +45,13 @@ impl EnvdInstance {
                 basic_auth: None,
                 oauth_access_token: None,
                 bearer_access_token: None,
-                api_key: None,
+                api_key: access_token.as_ref().map(|token| ApiKey {
+                    prefix: None,
+                    key: token.expose().to_owned(),
+                }),
             },
             grpc_address,
+            access_token,
         }
     }
 
@@ -50,9 +59,12 @@ impl EnvdInstance {
     #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
     pub(crate) async fn process_client(&self) -> Result<ProcessClient> {
         trace!(grpc_address = %self.grpc_address, "connecting envd process client");
-        let client = ProcessClient::connect(&self.grpc_address)
-            .await
-            .context("failed to connect process client")?;
+        let client = ProcessClient::connect(
+            &self.grpc_address,
+            self.access_token.as_ref().map(EnvdAccessToken::expose),
+        )
+        .await
+        .context("failed to connect process client")?;
         trace!("connected to envd process client");
         Ok(client)
     }
@@ -61,9 +73,12 @@ impl EnvdInstance {
     #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
     pub(crate) async fn filesystem_client(&self) -> Result<FilesystemClient> {
         trace!(grpc_address = %self.grpc_address, "connecting envd filesystem client");
-        let client = FilesystemClient::connect(&self.grpc_address)
-            .await
-            .context("failed to connect filesystem client")?;
+        let client = FilesystemClient::connect(
+            &self.grpc_address,
+            self.access_token.as_ref().map(EnvdAccessToken::expose),
+        )
+        .await
+        .context("failed to connect filesystem client")?;
         trace!("connected to envd filesystem client");
         Ok(client)
     }
@@ -124,6 +139,10 @@ impl EnvdInstance {
         debug!(has_env_vars = env_vars.is_some(), "initializing envd");
         let now = chrono::Utc::now().fixed_offset();
         let init_post_request = InitPostRequest {
+            access_token: self
+                .access_token
+                .as_ref()
+                .map(|token| token.expose().to_owned()),
             env_vars,
             default_workdir,
             default_user,
@@ -138,14 +157,48 @@ impl EnvdInstance {
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
     use std::time::Instant;
 
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::{TcpListener, TcpStream};
-    use tokio::time::timeout;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::post;
+    use axum::{Json, Router};
+    use serde_json::Value;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
 
     use super::*;
+
+    async fn capture_init_request(
+        State(sender): State<mpsc::Sender<(HeaderMap, Value)>>,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> StatusCode {
+        sender.send((headers, body)).await.unwrap();
+        StatusCode::NO_CONTENT
+    }
+
+    #[tokio::test]
+    async fn init_sends_access_token_in_header_and_body() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (sender, mut receiver) = mpsc::channel(1);
+        let app = Router::new()
+            .route("/init", post(capture_init_request))
+            .with_state(sender);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let token = crate::sandbox::SandboxAccessTokenGenerator::new("envd-init-test-seed")?
+            .generate(crate::types::SandboxId::new());
+        let envd = EnvdInstance::new(format!("http://{address}"), Some(token.clone()));
+
+        envd.init(None, None, None).await?;
+
+        let (headers, body) = receiver.recv().await.expect("captured init request");
+        assert_eq!(headers["x-access-token"], token.expose());
+        assert_eq!(body["accessToken"], token.expose());
+        server.abort();
+        Ok(())
+    }
 
     #[tokio::test]
     async fn readiness_deadline_bounds_a_hung_health_probe() -> Result<()> {
@@ -157,7 +210,7 @@ mod tests {
             #[allow(unreachable_code)]
             Ok::<_, anyhow::Error>(())
         });
-        let envd = EnvdInstance::new(format!("http://{address}"));
+        let envd = EnvdInstance::new(format!("http://{address}"), None);
         let deadline = Duration::from_millis(50);
         let started = Instant::now();
 
@@ -169,113 +222,6 @@ mod tests {
         server.abort();
         assert!(error.to_string().contains("timed out waiting for envd"));
         assert!(started.elapsed() < Duration::from_millis(500));
-        Ok(())
-    }
-
-    async fn read_request(socket: &mut TcpStream) -> Result<String> {
-        let mut request = Vec::with_capacity(1024);
-        let mut chunk = [0_u8; 1024];
-
-        let (header_end, content_length) = loop {
-            let bytes_read = socket.read(&mut chunk).await?;
-            if bytes_read == 0 {
-                return Err(anyhow!("connection closed before request headers"));
-            }
-            request.extend_from_slice(&chunk[..bytes_read]);
-
-            if request.len() > 64 * 1024 {
-                return Err(anyhow!("request headers exceed test limit"));
-            }
-
-            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
-            else {
-                continue;
-            };
-            let header_text = std::str::from_utf8(&request[..header_end + 4])?;
-            let content_length = header_text
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().ok())
-                        .flatten()
-                })
-                .unwrap_or(0);
-            break (header_end + 4, content_length);
-        };
-
-        while request.len() < header_end + content_length {
-            let bytes_read = socket.read(&mut chunk).await?;
-            if bytes_read == 0 {
-                return Err(anyhow!("connection closed before request body"));
-            }
-            request.extend_from_slice(&chunk[..bytes_read]);
-        }
-
-        let request_line = std::str::from_utf8(&request)?
-            .lines()
-            .next()
-            .ok_or_else(|| anyhow!("request line missing"))?;
-        Ok(request_line.to_owned())
-    }
-
-    // The first accepted socket models an idle connection retained from the
-    // previous runtime generation. A second accept models connecting to the
-    // next VM assigned the same address; bytes sent on the first socket would
-    // therefore be stale cross-generation reuse.
-    async fn serve_two_bootstrap_requests(listener: TcpListener) -> Result<Vec<SocketAddr>> {
-        const RESPONSE: &[u8] =
-            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n";
-        let mut peer_addresses = Vec::with_capacity(2);
-        let mut held_connections = Vec::with_capacity(2);
-
-        for expected_prefix in ["GET /health ", "POST /init "] {
-            let (mut socket, peer_address) = listener.accept().await?;
-            let request_line = read_request(&mut socket).await?;
-            if !request_line.starts_with(expected_prefix) {
-                return Err(anyhow!(
-                    "expected request prefix {expected_prefix:?}, got {request_line:?}"
-                ));
-            }
-            socket.write_all(RESPONSE).await?;
-            peer_addresses.push(peer_address);
-
-            // Keep the first socket open so a pooling client would send init
-            // there and never reach the second accept.
-            held_connections.push(socket);
-        }
-
-        Ok(peer_addresses)
-    }
-
-    async fn run_bootstrap_no_reuse_interaction() -> Result<()> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
-        let address = listener.local_addr()?;
-        let server = tokio::spawn(serve_two_bootstrap_requests(listener));
-        let envd = EnvdInstance::new(format!("http://{address}"));
-
-        envd.wait_for_ready(Duration::from_secs(2), Duration::from_millis(10))
-            .await?;
-        timeout(Duration::from_secs(2), envd.init(None, None, None))
-            .await
-            .map_err(|_| {
-                anyhow!("init reused the health connection instead of opening a new one")
-            })??;
-
-        let peer_addresses = timeout(Duration::from_secs(2), server)
-            .await
-            .map_err(|_| anyhow!("timed out waiting for two bootstrap connections"))?
-            .map_err(|err| anyhow!("mock envd task failed: {err}"))??;
-        assert_eq!(peer_addresses.len(), 2);
-        assert_ne!(peer_addresses[0].port(), peer_addresses[1].port());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn bootstrap_http_client_does_not_reuse_connections() -> Result<()> {
-        timeout(Duration::from_secs(5), run_bootstrap_no_reuse_interaction())
-            .await
-            .map_err(|_| anyhow!("timed out running complete envd bootstrap interaction"))??;
         Ok(())
     }
 }

@@ -1,8 +1,18 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
+namespace: agentenv-system
+
 resources:
   - ../../base
+
+secretGenerator:
+  - name: agentenv-runtime-secrets
+    literals:
+      - sandbox-access-token-hash-seed=agentenv-local-dev-access-token-hash-seed
+
+generatorOptions:
+  disableNameSuffixHash: true
 
 patches:
   - target:

@@ -33,6 +33,7 @@ pub struct CreateSandboxRequest {
     pub user_metadata: Option<HashMap<String, String>>,
     pub env_vars: Option<HashMap<String, String>>,
     pub network_policy: crate::sandbox::SandboxNetworkPolicy,
+    pub secure: bool,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     pub custom_extension_params: Option<CustomExtensionParams>,
 }

@@ -32,11 +32,38 @@ git clone https://github.com/kvcache-ai/AgentENV.git
 cd AgentENV
 ```
 
+## Configure the Shared Access-Token Seed
+
+Multi-node deployments should explicitly configure one envd access-token seed
+and use the same value on every **runtime node**. Do not rely on the node-local
+auto-generated seed in a scheduler-managed deployment.
+
+Generate the value once and store it in your secret manager:
+
+```bash
+openssl rand -hex 32
+```
+
+For the checked-in Compose stack, create a private configuration copy outside
+the repository and set the generated value in it:
+
+```bash
+install -d -m 0700 "$HOME/.config/agentenv"
+install -m 0600 config/default.toml "$HOME/.config/agentenv/cluster.toml"
+```
+
+```toml
+[sandbox]
+access_token_hash_seed = "<shared-secret>"
+```
+
+Changing this value rotates the access tokens for existing secure sandboxes.
+
 ## Start the Cluster
 
 ```bash
 sudo bash scripts/docker-setup.sh
-make deploy-up
+CONFIG_PATH="$HOME/.config/agentenv/cluster.toml" make deploy-up
 ```
 
 To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
@@ -44,7 +71,7 @@ domain variable when starting the stack:
 
 ```bash
 SANDBOX_PROXY_DOMAINS=sandbox.example.com \
-make deploy-up
+CONFIG_PATH="$HOME/.config/agentenv/cluster.toml" make deploy-up
 ```
 
 Compose passes this value to both the gateway routing allowlist and runtime

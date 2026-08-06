@@ -1,0 +1,424 @@
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use hmac::{Hmac, Mac};
+use rand::{rngs::SysRng, TryRng};
+use sha2::Sha256;
+use tracing::{info, warn};
+
+use crate::cfg::AppConfig;
+use crate::types::SandboxId;
+
+type HmacSha256 = Hmac<Sha256>;
+
+const MANAGED_SEED_RELATIVE_PATH: &str = "secrets/sandbox-access-token-hash-seed";
+const MANAGED_SEED_BYTES: usize = 32;
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct EnvdAccessToken(String);
+
+impl EnvdAccessToken {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for EnvdAccessToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EnvdAccessToken(<redacted>)")
+    }
+}
+
+#[derive(Clone)]
+pub struct SandboxAccessTokenGenerator {
+    seed: Vec<u8>,
+}
+
+impl SandboxAccessTokenGenerator {
+    pub fn new(seed: &str) -> Result<Self> {
+        let seed = validate_explicit_seed(seed)?;
+        Ok(Self {
+            seed: seed.as_bytes().to_vec(),
+        })
+    }
+
+    pub(crate) fn load_or_create(
+        config: &AppConfig,
+        managed_seed_must_exist: bool,
+    ) -> Result<Self> {
+        if let Some(seed) = config.sandbox.access_token_hash_seed.as_deref() {
+            return Self::new(seed);
+        }
+
+        let managed_seed_path = config.home_path.join(MANAGED_SEED_RELATIVE_PATH);
+        let seed = resolve_seed(&managed_seed_path, managed_seed_must_exist)?;
+
+        if config.sandbox.access_token_hash_seed.is_none()
+            && config.cluster.scheduler_endpoint.is_some()
+        {
+            warn!(
+                path = %managed_seed_path.display(),
+                "using a node-local managed envd access-token seed; configure AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED with the same value on every node before enabling cross-node sandbox recovery"
+            );
+        }
+
+        Self::new(&seed)
+    }
+
+    pub fn generate(&self, subject: SandboxId) -> EnvdAccessToken {
+        let mut mac =
+            HmacSha256::new_from_slice(&self.seed).expect("HMAC accepts keys of any length");
+        mac.update(subject.to_string().as_bytes());
+        EnvdAccessToken(hex::encode(mac.finalize().into_bytes()))
+    }
+
+    pub fn matches(&self, subject: SandboxId, candidate: &str) -> bool {
+        let mut candidate_bytes = [0_u8; 32];
+        let decoded = hex::decode_to_slice(candidate, &mut candidate_bytes).is_ok();
+        let mut mac =
+            HmacSha256::new_from_slice(&self.seed).expect("HMAC accepts keys of any length");
+        mac.update(subject.to_string().as_bytes());
+        mac.verify_slice(&candidate_bytes).is_ok() & decoded
+    }
+}
+
+fn validate_explicit_seed(seed: &str) -> Result<&str> {
+    let seed = seed.trim();
+    if seed.is_empty() {
+        bail!("[sandbox].access_token_hash_seed must be non-empty when configured");
+    }
+    Ok(seed)
+}
+
+fn resolve_seed(managed_path: &Path, managed_seed_must_exist: bool) -> Result<String> {
+    match open_managed_seed(managed_path) {
+        Ok(file) => return read_managed_seed(managed_path, file),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "open managed envd access-token seed {}",
+                    managed_path.display()
+                )
+            });
+        }
+    }
+
+    if managed_seed_must_exist {
+        bail!(
+            "managed envd access-token seed {} is missing while persisted secure sandboxes exist; restore the file or configure AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED",
+            managed_path.display()
+        );
+    }
+
+    create_managed_seed(managed_path)
+}
+
+fn open_managed_seed(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+
+    options.open(path)
+}
+
+fn read_managed_seed(path: &Path, mut file: File) -> Result<String> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect managed envd access-token seed {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!(
+            "managed envd access-token seed {} must be a regular file",
+            path.display()
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            bail!(
+                "managed envd access-token seed {} must have permissions 0600, found {mode:04o}",
+                path.display()
+            );
+        }
+    }
+
+    let mut seed = String::new();
+    file.read_to_string(&mut seed)
+        .with_context(|| format!("read managed envd access-token seed {}", path.display()))?;
+    let seed = seed.trim();
+    if seed.len() != MANAGED_SEED_BYTES * 2
+        || !seed
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!(
+            "managed envd access-token seed {} must contain exactly 64 lowercase hexadecimal characters",
+            path.display()
+        );
+    }
+
+    Ok(seed.to_owned())
+}
+
+fn create_managed_seed(path: &Path) -> Result<String> {
+    let parent = path
+        .parent()
+        .context("managed envd access-token seed path has no parent")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create managed secret directory {}", parent.display()))?;
+    set_permissions(parent, 0o700)?;
+
+    let mut random = [0_u8; MANAGED_SEED_BYTES];
+    SysRng
+        .try_fill_bytes(&mut random)
+        .context("generate managed envd access-token seed")?;
+    let seed = hex::encode(random);
+
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary seed file in {}", parent.display()))?;
+    set_permissions(temporary.path(), 0o600)?;
+    writeln!(temporary, "{seed}")
+        .with_context(|| format!("write temporary seed file in {}", parent.display()))?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("sync temporary seed file in {}", parent.display()))?;
+
+    match temporary.persist_noclobber(path) {
+        Ok(_) => {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .with_context(|| format!("sync managed secret directory {}", parent.display()))?;
+            info!(path = %path.display(), "generated managed envd access-token seed");
+            Ok(seed)
+        }
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
+            let file = open_managed_seed(path).with_context(|| {
+                format!("open managed envd access-token seed {}", path.display())
+            })?;
+            read_managed_seed(path, file)
+        }
+        Err(error) => Err(error.error)
+            .with_context(|| format!("persist managed envd access-token seed {}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn set_permissions(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("set permissions on {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn set_permissions(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+impl fmt::Debug for SandboxAccessTokenGenerator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SandboxAccessTokenGenerator(<redacted>)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+
+    use tempfile::TempDir;
+
+    #[test]
+    fn generates_lowercase_hex_hmac_sha256() {
+        let generator = SandboxAccessTokenGenerator::new("test-seed").unwrap();
+        let subject = SandboxId::try_from("01936f8e-72f5-7000-8000-000000000001").unwrap();
+
+        let token = generator.generate(subject);
+
+        assert_eq!(token.expose().len(), 64);
+        assert_eq!(
+            token.expose(),
+            "4f00f2a93a87c37161ae01c59b6d4f84506668113441277e9f6272dd4bfae1a7"
+        );
+        assert!(token.expose().bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(token.expose(), token.expose().to_ascii_lowercase());
+        assert!(generator.matches(subject, token.expose()));
+        assert!(!generator.matches(subject, "not-a-token"));
+        assert!(!generator.matches(subject, &"0".repeat(64)));
+    }
+
+    #[test]
+    fn rejects_empty_seed_and_redacts_secrets() {
+        assert!(SandboxAccessTokenGenerator::new("  ").is_err());
+        let generator = SandboxAccessTokenGenerator::new("super-secret").unwrap();
+        let subject = SandboxId::default();
+        let token = generator.generate(subject);
+
+        assert!(!format!("{generator:?}").contains("super-secret"));
+        assert!(!format!("{token:?}").contains(token.expose()));
+    }
+
+    #[test]
+    fn explicit_seed_takes_precedence_without_creating_managed_state() -> Result<()> {
+        let temp = TempDir::new()?;
+        let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
+        let config = AppConfig {
+            home_path: temp.path().to_owned(),
+            sandbox: crate::cfg::SandboxConfig {
+                access_token_hash_seed: Some("configured-seed".to_owned()),
+            },
+            ..Default::default()
+        };
+
+        let generator = SandboxAccessTokenGenerator::load_or_create(&config, false)?;
+
+        assert_eq!(generator.seed, "configured-seed".as_bytes());
+        assert!(!managed_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn managed_seed_is_private_and_stable() -> Result<()> {
+        let temp = TempDir::new()?;
+        let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
+
+        let first = resolve_seed(&managed_path, false)?;
+        let second = resolve_seed(&managed_path, false)?;
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let directory_mode = fs::metadata(managed_path.parent().unwrap())?
+                .permissions()
+                .mode()
+                & 0o777;
+            let file_mode = fs::metadata(&managed_path)?.permissions().mode() & 0o777;
+            assert_eq!(directory_mode, 0o700);
+            assert_eq!(file_mode, 0o600);
+        }
+
+        let subject = SandboxId::new();
+        let first_generator = SandboxAccessTokenGenerator::new(&first)?;
+        let second_generator = SandboxAccessTokenGenerator::new(&second)?;
+        assert_eq!(
+            first_generator.generate(subject),
+            second_generator.generate(subject)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_managed_seed_creation_converges() -> Result<()> {
+        const THREADS: usize = 8;
+
+        let temp = TempDir::new()?;
+        let managed_path = Arc::new(temp.path().join(MANAGED_SEED_RELATIVE_PATH));
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let handles = (0..THREADS)
+            .map(|_| {
+                let managed_path = Arc::clone(&managed_path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    resolve_seed(&managed_path, false)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let seeds = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("seed creation thread panicked"))
+            .collect::<Result<Vec<_>>>()?;
+        assert!(seeds.iter().all(|seed| seed == &seeds[0]));
+        Ok(())
+    }
+
+    #[test]
+    fn empty_or_invalid_managed_seed_is_not_replaced() -> Result<()> {
+        let temp = TempDir::new()?;
+        let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
+        fs::create_dir_all(managed_path.parent().unwrap())?;
+
+        for contents in ["", "invalid\n"] {
+            fs::write(&managed_path, contents)?;
+            set_permissions(&managed_path, 0o600)?;
+
+            let error = resolve_seed(&managed_path, false).unwrap_err();
+
+            assert!(error.to_string().contains("64 lowercase hexadecimal"));
+            assert_eq!(fs::read_to_string(&managed_path)?, contents);
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissive_managed_seed_is_rejected() -> Result<()> {
+        let temp = TempDir::new()?;
+        let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
+        fs::create_dir_all(managed_path.parent().unwrap())?;
+        fs::write(&managed_path, format!("{}\n", "a".repeat(64)))?;
+        set_permissions(&managed_path, 0o640)?;
+
+        let error = resolve_seed(&managed_path, false).unwrap_err();
+
+        assert!(error.to_string().contains("permissions 0600"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_seed_symlink_is_rejected() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new()?;
+        let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
+        let target_path = temp.path().join("seed-target");
+        fs::create_dir_all(managed_path.parent().unwrap())?;
+        fs::write(&target_path, format!("{}\n", "a".repeat(64)))?;
+        set_permissions(&target_path, 0o600)?;
+        symlink(&target_path, &managed_path)?;
+
+        let error = resolve_seed(&managed_path, false).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("open managed envd access-token seed"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_managed_seed_is_not_recreated_for_secure_state() -> Result<()> {
+        let temp = TempDir::new()?;
+        let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
+
+        let error = resolve_seed(&managed_path, true).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("persisted secure sandboxes exist"));
+        assert!(!managed_path.exists());
+        Ok(())
+    }
+}

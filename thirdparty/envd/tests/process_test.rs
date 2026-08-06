@@ -14,7 +14,7 @@ const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Verifies that the process list is initially empty.
 #[tokio::test]
 async fn test_list_process() -> Result<()> {
-    let mut client = ProcessClient::connect(TEST_ENVD_ADDR).await?;
+    let mut client = ProcessClient::connect(TEST_ENVD_ADDR, None).await?;
     let request = Request::new(ListRequest {});
 
     let response = client.list(request).await?;
@@ -32,7 +32,7 @@ async fn test_list_process() -> Result<()> {
 async fn test_start_process() -> Result<()> {
     tokio::time::timeout(TEST_TIMEOUT, async {
         // Connect to the server
-        let mut client = ProcessClient::connect(TEST_ENVD_ADDR).await?;
+        let mut client = ProcessClient::connect(TEST_ENVD_ADDR, None).await?;
 
         // Configure the process request: run /bin/bash validation script
         let request = Request::new(StartRequest {
@@ -110,7 +110,7 @@ async fn test_start_process() -> Result<()> {
 #[tokio::test]
 async fn test_process_interactive() -> Result<()> {
     tokio::time::timeout(TEST_TIMEOUT, async {
-        let mut client = ProcessClient::connect(TEST_ENVD_ADDR).await?;
+        let mut client = ProcessClient::connect(TEST_ENVD_ADDR, None).await?;
 
         // Start `cat`
         let request = Request::new(StartRequest {

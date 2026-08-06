@@ -20,6 +20,7 @@ use crate::progress::TransferProgress;
 const API_KEY_HEADER: &str = "X-API-Key";
 const SANDBOX_ID_HEADER: &str = "x-agentenv-sandbox-id";
 const TARGET_PORT_HEADER: &str = "x-agentenv-target-port";
+const ACCESS_TOKEN_HEADER: &str = "X-Access-Token";
 const FILESYSTEM_SERVICE: &str = "filesystem.Filesystem";
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 pub(crate) const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -31,7 +32,12 @@ pub struct EnvdFilesClient {
 }
 
 impl EnvdFilesClient {
-    fn new(base_url: &str, api_key: &str, sandbox_id: &str) -> Result<Self> {
+    fn new(
+        base_url: &str,
+        api_key: &str,
+        sandbox_id: &str,
+        envd_access_token: Option<&str>,
+    ) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(
             API_KEY_HEADER,
@@ -42,6 +48,12 @@ impl EnvdFilesClient {
             HeaderValue::from_str(sandbox_id).context("invalid sandbox ID header value")?,
         );
         headers.insert(TARGET_PORT_HEADER, HeaderValue::from_static(ENVD_PORT_STR));
+        if let Some(token) = envd_access_token {
+            headers.insert(
+                ACCESS_TOKEN_HEADER,
+                HeaderValue::from_str(token).context("invalid envd access token header value")?,
+            );
+        }
         headers.insert(
             USER_AGENT,
             HeaderValue::from_str(&format!("aenv/{}", env!("CARGO_PKG_VERSION")))
@@ -60,7 +72,7 @@ impl EnvdFilesClient {
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             http: client,
-            transport: Transport::new(base_url, api_key, sandbox_id)?,
+            transport: Transport::new(base_url, api_key, sandbox_id, envd_access_token)?,
         })
     }
 
@@ -298,7 +310,13 @@ fn format_envd_response_error(status: reqwest::StatusCode, content: &str) -> any
 
 impl Client {
     pub fn files(&self, sandbox_id: &str) -> Result<EnvdFilesClient> {
-        EnvdFilesClient::new(&self.base, &self.api_key, sandbox_id)
+        let sandbox = self.get_sandbox(sandbox_id)?;
+        EnvdFilesClient::new(
+            &self.base,
+            &self.api_key,
+            sandbox_id,
+            sandbox.envd_access_token.as_deref(),
+        )
     }
 }
 

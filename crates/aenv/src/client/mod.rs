@@ -35,8 +35,12 @@ impl Client {
         })
     }
 
-    pub fn transport(&self, sandbox_id: &str) -> Result<Transport> {
-        Transport::new(&self.base, &self.api_key, sandbox_id)
+    pub fn transport(
+        &self,
+        sandbox_id: &str,
+        envd_access_token: Option<&str>,
+    ) -> Result<Transport> {
+        Transport::new(&self.base, &self.api_key, sandbox_id, envd_access_token)
     }
 
     fn url(&self, path: &str) -> String {

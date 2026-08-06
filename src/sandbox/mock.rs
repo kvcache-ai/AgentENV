@@ -16,15 +16,14 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use tokio::time::sleep;
 
-use crate::snapshot::RunnableSnapshot;
-use crate::types::SandboxId;
-
 use super::backend::{
     CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
-    SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult, SandboxRuntimeInfo,
+    SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult, SandboxForkSpec,
+    SandboxRuntimeInfo,
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
+use crate::snapshot::RunnableSnapshot;
 
 #[derive(Debug)]
 pub struct MockSnapshot;
@@ -309,12 +308,12 @@ impl SandboxBackend for MockSandboxBackend {
 
     async fn fork(
         &mut self,
-        child_ids: &[SandboxId],
+        spec: &[SandboxForkSpec],
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>> {
         self.behavior
             .apply_capture_result(MockOperation::Fork)
             .await?;
-        Ok(child_ids
+        Ok(spec
             .iter()
             .map(|_| {
                 self.behavior
@@ -420,6 +419,7 @@ impl SandboxBackendFactory for MockBackendFactory {
         &self,
         _sandbox_id: crate::types::SandboxId,
         _state: &dyn PausedSandboxState,
+        _envd_access_token: Option<super::EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>> {
         self.behavior.apply_sync(MockOperation::BuildFromSnapshot)?;
         Ok(Box::new(MockSandboxBackend::new_with_host_ip(

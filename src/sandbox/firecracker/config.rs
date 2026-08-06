@@ -14,7 +14,9 @@ use crate::cfg::{AppConfig, ConfigManager, EnvdConfig, ToolsConfig};
 use crate::sandbox::ublk::UblkConfig;
 use crate::sandbox::SandboxNetworkPolicy;
 use crate::sandbox::UblkBackend;
-use crate::sandbox::{validate_drive_id, ExtraDrive, OverlaybdConfig, SandboxLaunchConfig};
+use crate::sandbox::{
+    validate_drive_id, EnvdAccessToken, ExtraDrive, OverlaybdConfig, SandboxLaunchConfig,
+};
 use crate::snapshot::RunnableSnapshot;
 use anyhow::{bail, Context, Result};
 use overlaybd::config::UpperMode;
@@ -150,6 +152,10 @@ pub struct FirecrackerCommonConfig {
     /// start-fresh / start-resume hooks. Persisted with snapshot configs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<crate::sandbox::CustomExtensionParams>,
+    /// Runtime-only envd credential. It is re-derived from sandbox metadata on
+    /// resume and is intentionally excluded from persisted snapshot configs.
+    #[serde(skip)]
+    pub envd_access_token: Option<EnvdAccessToken>,
 }
 
 impl FirecrackerCommonConfig {
@@ -181,6 +187,7 @@ impl FirecrackerCommonConfig {
             cpu_config_json: None,
             network_policy: None,
             custom_extension_params: None,
+            envd_access_token: None,
         }
     }
 
@@ -403,10 +410,12 @@ impl FirecrackerSandboxConfig {
         }
         self.common.mmds_metadata = Some(
             MmdsMetadata::new(launch_config.sandbox_id, launch_config.snapshot_id.clone())
+                .with_access_token(launch_config.envd_access_token.as_ref())
                 .with_extra(launch_config.extra_mmds.clone()),
         );
         self.common.network_policy = launch_config.network.clone();
         self.common.custom_extension_params = launch_config.custom_extension_params.clone();
+        self.common.envd_access_token = launch_config.envd_access_token.clone();
         self
     }
 
