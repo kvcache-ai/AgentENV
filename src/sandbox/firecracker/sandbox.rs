@@ -120,13 +120,12 @@ fn build_disk_rate_limiter(
 ///
 /// Firecracker's `PATCH /drives` maps an *absent* token bucket to
 /// `BucketUpdate::None` (leave unchanged), so a snapshot-inherited limit cannot
-/// be removed by omission. A bucket with `size == 0` is instead treated as an
-/// explicit disable, giving exact remove semantics without depending on the
-/// runtime accepting an unusually large limiter.
+/// be removed by omission. The explicit disable sentinel is a bucket with both
+/// `size == 0` and `refill_time == 0`; a mixed bucket (e.g. `size == 0`,
+/// `refill_time == 1`) is not the sentinel and can be rejected as an invalid
+/// token bucket, failing the resume PATCH. Send both fields as zero.
 fn disabled_bucket() -> Box<firecracker_client::models::TokenBucket> {
-    // size = 0 is the disable signal; refill_time is irrelevant then but kept
-    // nonzero so the bucket is still structurally valid.
-    Box::new(firecracker_client::models::TokenBucket::new(1, 0))
+    Box::new(firecracker_client::models::TokenBucket::new(0, 0))
 }
 
 /// Build the limiter to PATCH on resume, reconciling a snapshot-inherited
