@@ -27,6 +27,12 @@ Recoverable failures leave the sandbox running and surface the error to the
 caller. Terminal failures — where the runtime was mutated past safe resume —
 tear down the sandbox.
 
+After a successful non-terminal capture, the running Firecracker process uses
+the locally captured memory image as the parent of its next capture. Repeated
+captures therefore form an ordered incremental memory chain. Advancing the
+local parent does not wait for repository publication, so a publication
+failure does not make later local captures fall back to the launch-time parent.
+
 ## OverlayBD Image Publication
 
 When the snapshot repository backend is `oss` and `[snapshot.image_publish]` is
