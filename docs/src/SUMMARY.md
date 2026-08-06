@@ -3,7 +3,8 @@
 # Getting Started
 
 - [Overview](./getting-started/overview.md)
-- [Quick Start](./getting-started/quickstart.md)
+- [Quick Start (x86_64)](./getting-started/quickstart.md)
+- [Quick Start (ARM)](./getting-started/quickstart-arm.md)
 - [On-Demand Loading](./getting-started/on-demand-loading.md)
 - [aenv CLI Reference](./getting-started/aenv-cli.md)
 

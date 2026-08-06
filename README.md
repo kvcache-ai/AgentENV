@@ -34,7 +34,8 @@ AgentENV (AENV) is a platform for running agent environments at scale, powering 
 
 ## 📋 Prerequisites
 
-- **Linux kernel 6.8+**; the install script additionally requires **Ubuntu 24.04** (see *Quick Start* below for installation options)
+- **Linux kernel 6.8+** on x86_64 or aarch64; the install script requires **Ubuntu 24.04 (x86_64)**
+- ARM (aarch64) servers are supported via source build — see [ARM Quick Start](docs/src/getting-started/quickstart-arm.md)
 - `/dev/kvm` access for Firecracker microVM execution
 
 If your server does not support standard KVM, see the [PVM deployment guide](https://kvcache-ai.github.io/AgentENV/dev/deployment/pvm.html) before installing.
@@ -73,6 +74,11 @@ docker run -d --privileged -v /dev:/dev -p 8000:8000 ghcr.io/kvcache-ai/aenv-ser
 
 The server is accessible at `http://127.0.0.1:8000` by default.
 
+*Option C — ARM (aarch64) source build*
+
+ARM servers (AWS Graviton, Ampere Altra, Kunpeng) require building from source.
+See the [ARM Quick Start](docs/src/getting-started/quickstart-arm.md) for full instructions.
+
 **2. Install the aenv CLI** *(skip if you used Option A in step 1)*
 
 Install separately if you used the Docker method above, or if you are running
@@ -104,6 +110,7 @@ aenv start ubuntu            # starts a sandbox and attaches an interactive shel
 
 For Docker Compose / Kubernetes cluster deployment and build-from-source instructions,
 see 📖 [Deployment](https://kvcache-ai.github.io/AgentENV/latest/deployment/manual-compile.html).
+For ARM (aarch64) source-build installation, see 📖 [ARM Quick Start](docs/src/getting-started/quickstart-arm.md).
 
 ---
 

@@ -44,7 +44,9 @@ ARG ENVD_REF=2026.17
 ARG ENVD_UPSTREAM_REPO=https://github.com/e2b-dev/infra.git
 ARG TARGETARCH
 
-RUN apt-get update \
+RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list; \
+    apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
@@ -68,6 +70,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     esac; \
     commit_sha="$(git -C /src/infra rev-parse --short HEAD)"; \
     CGO_ENABLED=0 GOOS=linux GOARCH="$TARGETARCH" \
+      GOPROXY=https://goproxy.cn,direct \
       go build \
         -ldflags "-X=main.commitSHA=${commit_sha} -s -w" \
         -o /out/envd \
@@ -82,6 +85,14 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     fi
 
 # ---------------------------------------------------------------------------
+# Stage 2a: pull the full busybox binary (with runsv + svlogd) for the target
+# architecture. We cannot RUN inside this image on hosts without binfmt
+# emulation for the target arch, but COPY --from works because it only reads
+# image layers.
+# ---------------------------------------------------------------------------
+FROM --platform=${TARGETPLATFORM} ${BUSYBOX_IMAGE} AS busybox-bin
+
+# ---------------------------------------------------------------------------
 # Stage 2: assemble the guest-visible tools rootfs.
 #
 # This is not a normal Linux distribution rootfs. It only contains the minimal
@@ -90,10 +101,15 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 #   /agentenv/pivot-init          post-pivot bootstrap
 #   /agentenv/envd                compiled control-plane daemon
 #   /agentenv/bin/busybox         stable helper binary for init scripts
+#
+# debian (instead of busybox/alpine) is used as the rootfs base so this stage
+# can RUN on ARM hosts that cannot exec the busybox image's /bin/sh.
 # ---------------------------------------------------------------------------
-FROM --platform=${TARGETPLATFORM} ${BUSYBOX_IMAGE} AS rootfs
+FROM --platform=$BUILDPLATFORM debian:${DEBIAN_VERSION}-slim AS rootfs
 
 ARG TOOLS_VERSION
+
+COPY --chmod=0755 --from=busybox-bin /bin/busybox /usr/local/bin/busybox-full
 
 COPY --chmod=0755 init /tools-rootfs/init
 COPY --chmod=0755 pivot-init /tools-rootfs/agentenv/pivot-init
@@ -107,7 +123,7 @@ RUN set -eux; \
       /tools-rootfs/proc \
       /tools-rootfs/sys/fs/cgroup \
       /tools-rootfs/agentenv/bin; \
-    cp /bin/busybox /tools-rootfs/agentenv/bin/busybox; \
+    cp /usr/local/bin/busybox-full /tools-rootfs/agentenv/bin/busybox; \
     printf '%s\n' "$TOOLS_VERSION" > /tools-rootfs/agentenv/tools-drive-version; \
     ln -sf /proc/self/mounts /tools-rootfs/etc/mtab; \
     chmod 0755 /tools-rootfs/agentenv/bin/busybox; \
@@ -125,7 +141,9 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 FROM --platform=$BUILDPLATFORM debian:${DEBIAN_VERSION}-slim AS ext4-builder
 
-RUN apt-get update \
+RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || \
+    sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list; \
+    apt-get update \
     && apt-get install -y --no-install-recommends e2fsprogs findutils \
     && rm -rf /var/lib/apt/lists/*
 

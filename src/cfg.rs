@@ -30,6 +30,28 @@ struct SetupDependencyManifest {
 #[derive(Debug, Deserialize)]
 struct ManifestDownload {
     version: String,
+    /// Per-architecture overrides (see `config/deps_manifest.toml`).
+    /// When resolving a path for the current host architecture, the
+    /// override's `version` replaces the top-level default.
+    #[serde(default)]
+    arch: std::collections::HashMap<String, ArchManifestDownload>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ArchManifestDownload {
+    version: String,
+}
+
+impl ManifestDownload {
+    /// Return the effective version for the current host architecture.
+    /// Checks for an arch-specific override in the manifest first; falls
+    /// back to the top-level `version`.
+    fn version_for_host_arch(&self) -> &str {
+        self.arch
+            .get(std::env::consts::ARCH)
+            .map(|a| a.version.as_str())
+            .unwrap_or(&self.version)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -594,7 +616,7 @@ impl AppConfig {
                 .firecracker
                 .version
                 .as_deref()
-                .unwrap_or(&self.manifest_firecracker().version);
+                .unwrap_or_else(|| self.manifest_firecracker().version_for_host_arch());
             self.deps_path
                 .join("firecracker")
                 .join(version)
@@ -608,10 +630,12 @@ impl AppConfig {
                 .kernel
                 .version
                 .as_deref()
-                .unwrap_or(&self.manifest_kernel().version);
+                .unwrap_or_else(|| self.manifest_kernel().version_for_host_arch());
+            let arch = std::env::consts::ARCH;
             self.deps_path
                 .join("kernel")
                 .join(version)
+                .join(arch)
                 .join("vmlinux.bin")
         })
     }
@@ -659,7 +683,7 @@ impl AppConfig {
             .firecracker
             .version
             .as_deref()
-            .unwrap_or(&self.manifest_firecracker().version);
+            .unwrap_or_else(|| self.manifest_firecracker().version_for_host_arch());
         let path = self
             .deps_path
             .join("firecracker")

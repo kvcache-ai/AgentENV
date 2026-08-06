@@ -30,6 +30,17 @@ struct SetupDependencyManifest {
 struct ManifestDownload {
     version: String,
     url: String,
+    /// Per-architecture overrides. When the host architecture matches a key,
+    /// the override's `version` and `url` replace the top-level defaults
+    /// (unless the user has set explicit config values).
+    #[serde(default)]
+    arch: std::collections::HashMap<String, ArchManifestDownload>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ArchManifestDownload {
+    version: String,
+    url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,7 +101,7 @@ pub async fn ensure(config: &AppConfig, deps_path: &Path) -> Result<()> {
     std::fs::create_dir_all(deps_path)?;
 
     ensure_firecracker(config, manifest, &arch).await?;
-    ensure_kernel(config, manifest).await?;
+    ensure_kernel(config, manifest, &arch).await?;
 
     // regctl is a runtime dependency for all registry access, not just tools
     // drive extraction, so it remains provisioned for explicit tools drives.
@@ -125,16 +136,17 @@ async fn ensure_firecracker(
     }
 
     let mode_manifest = manifest.firecracker.for_mode(config.virtualization_mode);
-    let fc_version = config
-        .firecracker
-        .version
-        .as_deref()
-        .unwrap_or(&mode_manifest.version);
-    let fc_url_template = config
-        .firecracker
-        .url
-        .as_deref()
-        .unwrap_or(&mode_manifest.url);
+    let arch_override = mode_manifest.arch.get(arch);
+    let fc_version = config.firecracker.version.as_deref().unwrap_or(
+        arch_override
+            .map(|a| a.version.as_str())
+            .unwrap_or(&mode_manifest.version),
+    );
+    let fc_url_template = config.firecracker.url.as_deref().unwrap_or(
+        arch_override
+            .map(|a| a.url.as_str())
+            .unwrap_or(&mode_manifest.url),
+    );
     let fc_dir = fc_path
         .parent()
         .context("resolved firecracker binary path has no parent")?;
@@ -149,7 +161,11 @@ async fn ensure_firecracker(
     Ok(())
 }
 
-async fn ensure_kernel(config: &AppConfig, manifest: &SetupDependencyManifest) -> Result<()> {
+async fn ensure_kernel(
+    config: &AppConfig,
+    manifest: &SetupDependencyManifest,
+    arch: &str,
+) -> Result<()> {
     if let Some(kernel_path) = config.kernel.image_path.as_deref() {
         return validate_explicit_file("kernel.image_path", kernel_path, false);
     }
@@ -161,13 +177,21 @@ async fn ensure_kernel(config: &AppConfig, manifest: &SetupDependencyManifest) -
     }
 
     let mode_manifest = manifest.kernel.for_mode(config.virtualization_mode);
-    let kernel_version = config
-        .kernel
-        .version
-        .as_deref()
-        .unwrap_or(&mode_manifest.version);
-    let kernel_url_template = config.kernel.url.as_deref().unwrap_or(&mode_manifest.url);
-    let kernel_url = resolve_url(kernel_url_template, &[("version", kernel_version)]);
+    let arch_override = mode_manifest.arch.get(arch);
+    let kernel_version = config.kernel.version.as_deref().unwrap_or(
+        arch_override
+            .map(|a| a.version.as_str())
+            .unwrap_or(&mode_manifest.version),
+    );
+    let kernel_url_template = config.kernel.url.as_deref().unwrap_or(
+        arch_override
+            .map(|a| a.url.as_str())
+            .unwrap_or(&mode_manifest.url),
+    );
+    let kernel_url = resolve_url(
+        kernel_url_template,
+        &[("version", kernel_version), ("arch", arch)],
+    );
     download_file(&kernel_url, &kernel_path).await
 }
 
@@ -865,7 +889,7 @@ mod tests {
         ensure_firecracker(&config, bundled_manifest(), "x86_64")
             .await
             .expect("accept explicit firecracker");
-        ensure_kernel(&config, bundled_manifest())
+        ensure_kernel(&config, bundled_manifest(), "x86_64")
             .await
             .expect("accept explicit kernel");
         ensure_tools(&config, &deps_path, bundled_manifest()).expect("import explicit tools");

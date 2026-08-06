@@ -2,6 +2,12 @@
 version = "1.15.1-patch-v1"
 url = "https://pub-4ee15c400f554ab7a9eac3f5bc8f53de.r2.dev/firecracker-{version}-{arch}.tgz"
 
+# ARM (aarch64) uses the kvcache-ai/firecracker release because the patched
+# R2 build is only published for x86_64.
+[firecracker.kvm.arch.aarch64]
+version = "1.15.1-patch-v1"
+url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/firecracker-{version}-{arch}.tgz"
+
 [firecracker.pvm]
 version = "v1.17.0-next.1"
 url = "https://github.com/kvcache-ai/firecracker-next/releases/download/{version}/firecracker-next-{version}-{arch}.tgz"
@@ -9,6 +15,11 @@ url = "https://github.com/kvcache-ai/firecracker-next/releases/download/{version
 [kernel.kvm]
 version = "vmlinux-6.1.175"
 url = "https://pub-4ee15c400f554ab7a9eac3f5bc8f53de.r2.dev/{version}"
+
+# ARM kernel is published in the same kvcache-ai/firecracker release.
+[kernel.kvm.arch.aarch64]
+version = "vmlinux-6.1.175"
+url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/{version}-{arch}"
 
 [kernel.pvm]
 version = "6.12.33-pvm"
