@@ -150,6 +150,12 @@ pub struct FirecrackerCommonConfig {
     /// start-fresh / start-resume hooks. Persisted with snapshot configs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<crate::sandbox::CustomExtensionParams>,
+    /// Effective disk I/O rate limit for the user rootfs drive. Carried in the
+    /// common config so fresh boot and snapshot resume apply the same config
+    /// and it persists across pause/resume, instead of each path reaching for
+    /// the process-global config.
+    #[serde(default)]
+    pub disk_rate_limit: crate::cfg::DiskRateLimitConfig,
 }
 
 impl FirecrackerCommonConfig {
@@ -181,6 +187,7 @@ impl FirecrackerCommonConfig {
             cpu_config_json: None,
             network_policy: None,
             custom_extension_params: None,
+            disk_rate_limit: crate::cfg::DiskRateLimitConfig::default(),
         }
     }
 
@@ -191,6 +198,7 @@ impl FirecrackerCommonConfig {
 
         let mut common = Self::new(firecracker_binary, tools_drive_version, runtime_policy);
         common.envd_version = config.envd.version.clone();
+        common.disk_rate_limit = config.machine.disk_rate_limit.clone();
         common.rootfs_allow_shrink = config.ublk.overlaybd.allow_shrink;
         common.control_plane_port = config.tools.control_plane_port;
         common.firecracker_work_base_dir = config.firecracker.work_dir.clone();
@@ -326,7 +334,6 @@ pub struct FirecrackerSandboxConfig {
     pub boot_args: Option<String>,
     pub vcpu_count: u32,
     pub mem_size_mib: u32,
-    pub disk_rate_limit: crate::cfg::DiskRateLimitConfig,
 }
 
 impl FirecrackerSandboxConfig {
@@ -347,13 +354,13 @@ impl FirecrackerSandboxConfig {
             read_only: false,
             runtime_upper_mode: UpperMode::LogStructured,
         });
+        common.disk_rate_limit = app_config.machine.disk_rate_limit;
         Self {
             common,
             kernel_image,
             boot_args: None,
             vcpu_count: app_config.machine.vcpu_count,
             mem_size_mib: app_config.machine.mem_size_mib,
-            disk_rate_limit: app_config.machine.disk_rate_limit,
         }
     }
 
@@ -387,7 +394,6 @@ impl FirecrackerSandboxConfig {
                 .or_else(|| Some(DEFAULT_BOOT_ARGS.to_string())),
             vcpu_count: config.machine.vcpu_count,
             mem_size_mib: config.machine.mem_size_mib,
-            disk_rate_limit: config.machine.disk_rate_limit.clone(),
         })
     }
 

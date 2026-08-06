@@ -116,27 +116,25 @@ fn build_disk_rate_limiter(
     Ok(Some(Box::new(rl)))
 }
 
-/// A token bucket so large it never throttles: 1 TiB replenished every 1 ms.
+/// A token bucket Firecracker interprets as "disable this dimension".
 ///
-/// Used to overwrite a snapshot-inherited limiter dimension the current config
-/// leaves unset. Firecracker's `PATCH /drives` maps an *absent* token bucket to
-/// `BucketUpdate::None` (leave unchanged), so an inherited limit cannot be
-/// removed by omission — it must be overwritten with an effectively-unlimited
-/// bucket, whose rate dwarfs any real disk so throttling no longer bites.
-fn unlimited_bucket() -> Box<firecracker_client::models::TokenBucket> {
-    const UNLIMITED_BUCKET_SIZE: i64 = 1 << 40; // 1 TiB
-    const UNLIMITED_REFILL_TIME_MS: i64 = 1;
-    Box::new(firecracker_client::models::TokenBucket::new(
-        UNLIMITED_REFILL_TIME_MS,
-        UNLIMITED_BUCKET_SIZE,
-    ))
+/// Firecracker's `PATCH /drives` maps an *absent* token bucket to
+/// `BucketUpdate::None` (leave unchanged), so a snapshot-inherited limit cannot
+/// be removed by omission. A bucket with `size == 0` is instead treated as an
+/// explicit disable, giving exact remove semantics without depending on the
+/// runtime accepting an unusually large limiter.
+fn disabled_bucket() -> Box<firecracker_client::models::TokenBucket> {
+    // size = 0 is the disable signal; refill_time is irrelevant then but kept
+    // nonzero so the bucket is still structurally valid.
+    Box::new(firecracker_client::models::TokenBucket::new(1, 0))
 }
 
 /// Build the limiter to PATCH on resume, reconciling a snapshot-inherited
 /// limiter against the node's current config. BOTH buckets are always present:
 /// a configured dimension uses its own bucket, an unset dimension is overwritten
-/// with an unlimited bucket so any inherited limit on that dimension is cleared
-/// (an omitted bucket would instead be left unchanged; see [`unlimited_bucket`]).
+/// with a disabled (`size == 0`) bucket so any inherited limit on that dimension
+/// is cleared (an omitted bucket would instead be left unchanged; see
+/// [`disabled_bucket`]).
 fn reconcile_disk_rate_limiter(
     cfg: &crate::cfg::DiskRateLimitConfig,
 ) -> Result<Box<firecracker_client::models::RateLimiter>> {
@@ -146,8 +144,8 @@ fn reconcile_disk_rate_limiter(
         (None, None)
     };
     let mut rl = firecracker_client::models::RateLimiter::new();
-    rl.bandwidth = Some(bandwidth.unwrap_or_else(unlimited_bucket));
-    rl.ops = Some(ops.unwrap_or_else(unlimited_bucket));
+    rl.bandwidth = Some(bandwidth.unwrap_or_else(disabled_bucket));
+    rl.ops = Some(ops.unwrap_or_else(disabled_bucket));
     Ok(Box::new(rl))
 }
 
@@ -1570,9 +1568,7 @@ impl FirecrackerSandbox {
         // Both buckets are always overwritten (configured or unlimited) so an
         // inherited dimension the current config leaves unset is cleared rather
         // than left unchanged.
-        let reconciled = reconcile_disk_rate_limiter(
-            &ConfigManager::global_config().machine.disk_rate_limit,
-        )?;
+        let reconciled = reconcile_disk_rate_limiter(&config.common.disk_rate_limit)?;
         self.fc_instance
             .patch_drive_rate_limiter(USER_ROOTFS_DRIVE_ID, reconciled)
             .await
@@ -1703,7 +1699,7 @@ impl FirecrackerSandbox {
                 false,
                 true,
                 IoEngine::Async,
-                build_disk_rate_limiter(&config.disk_rate_limit)?,
+                build_disk_rate_limiter(&config.common.disk_rate_limit)?,
             )
             .await?;
 
@@ -1970,10 +1966,10 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_disabled_makes_both_buckets_unlimited() {
+    fn reconcile_disabled_makes_both_buckets_disabled() {
         // Firecracker treats an absent bucket in a PATCH as "leave unchanged", so
-        // clearing an inherited limiter requires overwriting BOTH buckets with an
-        // effectively-unlimited one rather than sending an empty RateLimiter.
+        // clearing an inherited limiter requires overwriting BOTH buckets with a
+        // disabled (size == 0) bucket rather than sending an empty RateLimiter.
         let mut cfg = rate_limit_cfg();
         cfg.enabled = false;
         cfg.bandwidth_bytes_per_sec = 100 << 20;
@@ -1981,14 +1977,14 @@ mod tests {
         let rl = reconcile_disk_rate_limiter(&cfg).unwrap();
         let bw = rl.bandwidth.expect("bandwidth bucket present");
         let ops = rl.ops.expect("ops bucket present");
-        assert_eq!((bw.refill_time, bw.size), (1, 1 << 40));
-        assert_eq!((ops.refill_time, ops.size), (1, 1 << 40));
+        assert_eq!(bw.size, 0);
+        assert_eq!(ops.size, 0);
     }
 
     #[test]
     fn reconcile_bandwidth_only_clears_inherited_iops() {
         // Enabled with bandwidth but no iops: bandwidth gets its configured
-        // bucket, while the unset iops dimension is overwritten with an unlimited
+        // bucket, while the unset iops dimension is overwritten with a disabled
         // bucket so a snapshot-inherited IOPS limit does not survive the resume.
         let mut cfg = rate_limit_cfg();
         cfg.enabled = true;
@@ -1999,7 +1995,7 @@ mod tests {
         let ops = rl.ops.expect("ops bucket present");
         assert_eq!(bw.refill_time, RATE_LIMIT_REFILL_TIME_MS);
         assert_eq!(bw.size, 100 << 20);
-        assert_eq!((ops.refill_time, ops.size), (1, 1 << 40));
+        assert_eq!(ops.size, 0);
     }
 
     #[test]
@@ -2011,7 +2007,7 @@ mod tests {
         let rl = reconcile_disk_rate_limiter(&cfg).unwrap();
         let bw = rl.bandwidth.expect("bandwidth bucket present");
         let ops = rl.ops.expect("ops bucket present");
-        assert_eq!((bw.refill_time, bw.size), (1, 1 << 40));
+        assert_eq!(bw.size, 0);
         assert_eq!(ops.refill_time, RATE_LIMIT_REFILL_TIME_MS);
         assert_eq!(ops.size, 3000);
     }

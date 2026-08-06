@@ -256,7 +256,7 @@ pub struct MachineConfig {
     pub disk_rate_limit: DiskRateLimitConfig,
 }
 
-#[derive(Debug, Config, Clone)]
+#[derive(Debug, Config, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DiskRateLimitConfig {
     /// Enable per-sandbox disk I/O rate limiting via Firecracker's virtio-blk rate limiter.
     #[config(default = false)]
@@ -803,13 +803,22 @@ impl AppConfig {
         Ok(())
     }
 
-    /// Reject internally inconsistent disk rate limit configs so operator
-    /// mistakes fail at load time. A one-time burst is meaningless without a
-    /// nonzero sustained limit: `build_disk_rate_limiter` only creates a token
-    /// bucket when the sustained value is > 0, so a burst paired with a zero
-    /// sustained limit would be silently ignored.
+    /// Reject internally inconsistent or out-of-range disk rate limit configs so
+    /// operator mistakes fail at load time. Disabled sections are skipped: both
+    /// the fresh-boot and snapshot-resume paths ignore all configured values when
+    /// disabled, so dormant/pre-staged values must not block startup.
+    ///
+    /// When enabled: a one-time burst is meaningless without a nonzero sustained
+    /// limit (`build_disk_rate_limiter` only creates a bucket when the sustained
+    /// value is > 0, so a burst paired with a zero sustained limit is silently
+    /// ignored), and every value must fit Firecracker's signed `i64` token-bucket
+    /// fields (the consumer converts with `i64::try_from`, so an out-of-range
+    /// value would otherwise only fail later at sandbox start).
     fn validate_disk_rate_limit(&self) -> Result<()> {
         let cfg = &self.machine.disk_rate_limit;
+        if !cfg.enabled {
+            return Ok(());
+        }
         if cfg.bandwidth_burst_bytes > 0 && cfg.bandwidth_bytes_per_sec == 0 {
             bail!(
                 "machine.disk_rate_limit: bandwidth_burst_bytes is set but \
@@ -821,6 +830,20 @@ impl AppConfig {
                 "machine.disk_rate_limit: iops_burst is set but iops is 0; \
                  a burst requires a nonzero sustained limit"
             );
+        }
+        for (name, value) in [
+            ("bandwidth_bytes_per_sec", cfg.bandwidth_bytes_per_sec),
+            ("bandwidth_burst_bytes", cfg.bandwidth_burst_bytes),
+            ("iops", cfg.iops),
+            ("iops_burst", cfg.iops_burst),
+        ] {
+            if value > i64::MAX as u64 {
+                bail!(
+                    "machine.disk_rate_limit.{name} ({value}) exceeds the maximum \
+                     supported value {}",
+                    i64::MAX
+                );
+            }
         }
         Ok(())
     }
@@ -1157,6 +1180,7 @@ mod tests {
     #[test]
     fn validate_rejects_disk_burst_without_sustained() {
         let mut config = AppConfig::default();
+        config.machine.disk_rate_limit.enabled = true;
         config.machine.disk_rate_limit.bandwidth_bytes_per_sec = 0;
         config.machine.disk_rate_limit.bandwidth_burst_bytes = 1024;
         let err = config.validate().unwrap_err();
@@ -1166,11 +1190,39 @@ mod tests {
         );
 
         let mut config = AppConfig::default();
+        config.machine.disk_rate_limit.enabled = true;
         config.machine.disk_rate_limit.iops = 0;
         config.machine.disk_rate_limit.iops_burst = 500;
         let err = config.validate().unwrap_err();
         assert!(
             err.to_string().contains("iops_burst is set but"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_skips_disabled_disk_rate_limit() {
+        // A disabled section is ignored at runtime, so even internally
+        // inconsistent or out-of-range values must not block startup.
+        let mut config = AppConfig::default();
+        config.machine.disk_rate_limit.enabled = false;
+        config.machine.disk_rate_limit.bandwidth_bytes_per_sec = 0;
+        config.machine.disk_rate_limit.bandwidth_burst_bytes = 1024;
+        config.machine.disk_rate_limit.iops = u64::MAX;
+        config
+            .validate()
+            .expect("disabled disk rate limit config is not validated");
+    }
+
+    #[test]
+    fn validate_rejects_disk_rate_limit_above_i64_max() {
+        let mut config = AppConfig::default();
+        config.machine.disk_rate_limit.enabled = true;
+        config.machine.disk_rate_limit.bandwidth_bytes_per_sec = i64::MAX as u64 + 1;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("machine.disk_rate_limit.bandwidth_bytes_per_sec"),
             "unexpected error: {err}"
         );
     }
