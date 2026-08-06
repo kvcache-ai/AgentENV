@@ -5,6 +5,12 @@
 - **Linux kernel 6.8+**; the install script additionally requires **Ubuntu 24.04**
 - `/dev/kvm` access for Firecracker microVM execution
 
+Verify that the current user has read and write access to KVM:
+
+```bash
+test -r /dev/kvm && test -w /dev/kvm && echo "KVM is accessible"
+```
+
 > If your server does not support standard KVM, use the dedicated
 > [PVM Deployment](../deployment/pvm.md) guide instead.
 

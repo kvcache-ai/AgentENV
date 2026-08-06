@@ -28,6 +28,12 @@ AgentENV (AENV) is a platform for running agent environments at scale, powering 
 - **Linux kernel 6.8+**; the install script additionally requires **Ubuntu 24.04** (see *Quick Start* below for installation options)
 - `/dev/kvm` access for Firecracker microVM execution
 
+Verify that the current user can access KVM before installation:
+
+```bash
+test -r /dev/kvm && test -w /dev/kvm && echo "KVM is accessible"
+```
+
 If your server does not support standard KVM, see the [PVM deployment guide](https://kvcache-ai.github.io/AgentENV/deployment/pvm.html) before installing.
 
 ---
