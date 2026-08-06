@@ -263,6 +263,11 @@ pub struct UblkDaemonServer {
     devices: Arc<DashMap<u32, ManagedDevice>>,
     pool_state: Option<Arc<PoolState>>,
     resize_tool: Option<ResizeToolSpec>,
+    resize_global_config: PathBuf,
+    /// Daemon-wide permit serializing overlaybd-resize child processes: they
+    /// all share the single isolated resize cacheDir, so only one may run at
+    /// a time.
+    resize_permit: Arc<Mutex<()>>,
     shutdown: Arc<Notify>,
 }
 
@@ -271,14 +276,22 @@ impl UblkDaemonServer {
         socket_path: PathBuf,
         ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
         default_image_service: ImageService,
+        resize_global_config: PathBuf,
     ) -> Self {
-        Self::new_with_p2p_publish_url(socket_path, ctrl_ring, default_image_service, None)
+        Self::new_with_p2p_publish_url(
+            socket_path,
+            ctrl_ring,
+            default_image_service,
+            resize_global_config,
+            None,
+        )
     }
 
     pub fn new_with_p2p_publish_url(
         socket_path: PathBuf,
         ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
         default_image_service: ImageService,
+        resize_global_config: PathBuf,
         p2p_publish_url: Option<String>,
     ) -> Self {
         let mut cache = ImageServiceCache::new(p2p_publish_url);
@@ -301,6 +314,8 @@ impl UblkDaemonServer {
             devices: Arc::new(DashMap::new()),
             pool_state: None,
             resize_tool: None,
+            resize_global_config,
+            resize_permit: Arc::new(Mutex::new(())),
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -367,7 +382,11 @@ impl UblkDaemonServer {
 
         let listener = UnixListener::bind(&self.socket_path)
             .with_context(|| format!("bind daemon socket: {}", self.socket_path.display()))?;
-        tracing::info!(path = %self.socket_path.display(), "ublk daemon listening");
+        tracing::info!(
+            path = %self.socket_path.display(),
+            resize_global_config = %self.resize_global_config.display(),
+            "ublk daemon listening"
+        );
         signal_ready()?;
 
         // Note: spawned connection handlers may outlive the accept loop when
@@ -384,6 +403,8 @@ impl UblkDaemonServer {
                     let image_service_cache = Arc::clone(&self.image_service_cache);
                     let pool_state = self.pool_state.as_ref().map(Arc::clone);
                     let resize_tool = self.resize_tool.clone();
+                    let resize_global_config = self.resize_global_config.clone();
+                    let resize_permit = Arc::clone(&self.resize_permit);
                     let shutdown = Arc::clone(&self.shutdown);
                     tokio::spawn(async move {
                         if let Err(err) = handle_connection(
@@ -393,6 +414,8 @@ impl UblkDaemonServer {
                             image_service_cache,
                             pool_state,
                             resize_tool,
+                            resize_global_config,
+                            resize_permit,
                             shutdown,
                         ).await {
                             tracing::error!(?err, "daemon connection handler failed");
@@ -469,6 +492,7 @@ impl UblkDaemonServer {
 
 // ── Per-connection handler ──────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: tokio::net::UnixStream,
     devices: Arc<DashMap<u32, ManagedDevice>>,
@@ -476,6 +500,8 @@ async fn handle_connection(
     image_service_cache: Arc<ImageServiceCache>,
     pool_state: Option<Arc<PoolState>>,
     resize_tool: Option<ResizeToolSpec>,
+    resize_global_config: PathBuf,
+    resize_permit: Arc<Mutex<()>>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
     let Some(request) = recv_message::<DaemonRequest>(&mut stream).await? else {
@@ -515,6 +541,8 @@ async fn handle_connection(
                 requested_virtual_size,
                 known_source_virtual_size,
                 resize_tool: resize_tool.as_ref(),
+                resize_global_config: &resize_global_config,
+                resize_permit: Arc::clone(&resize_permit),
                 allow_shrink,
             };
             handle_create_overlaybd_runtime_device(
@@ -610,6 +638,8 @@ struct OverlaybdRuntimeDeviceRequest<'a> {
     requested_virtual_size: Option<u64>,
     known_source_virtual_size: Option<u64>,
     resize_tool: Option<&'a crate::protocol::ResizeToolSpec>,
+    resize_global_config: &'a Path,
+    resize_permit: Arc<Mutex<()>>,
     allow_shrink: bool,
 }
 
@@ -631,6 +661,8 @@ async fn handle_create_overlaybd_runtime_device(
             requested_virtual_size: request.requested_virtual_size,
             known_source_virtual_size: request.known_source_virtual_size,
             resize_tool: request.resize_tool,
+            resize_global_config: request.resize_global_config,
+            resize_permit: request.resize_permit,
             allow_shrink: request.allow_shrink,
         })
         .await

@@ -29,6 +29,10 @@ struct Cli {
     #[arg(long)]
     global_config: PathBuf,
 
+    /// Path to the OverlayBD global config used only by overlaybd-resize.
+    #[arg(long)]
+    resize_global_config: PathBuf,
+
     /// Path to AgentENV TOML config. Pool settings are read from [pool.block].
     #[arg(long)]
     config: Option<PathBuf>,
@@ -294,6 +298,7 @@ fn main() -> Result<()> {
             cli.socket_path.clone(),
             ctrl_ring,
             image_service,
+            cli.resize_global_config.clone(),
             cli.p2p_publish_url.clone(),
         );
         let daemon_config =

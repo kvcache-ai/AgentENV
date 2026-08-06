@@ -15,7 +15,7 @@ This document lists AgentENV artifacts that can remain on disk or in object stor
 | `persisted_sandbox_store_path` | `$AENV_HOME/persisted-sandboxes` | `src/orchestrator/persistence/*` | Durable paused sandbox records and artifacts. |
 | `snapshot_store` | `$AENV_HOME/snapshot-store` | `src/snapshot/repository/*` | Durable committed snapshot repository root. The configured backend uses `<snapshot_store>/repository`. Relative explicit paths are resolved against the config file directory. |
 | `snapshot.local_cache_path` | `$AENV_HOME/snapshot-local-cache` | `src/snapshot/artifact_cache.rs`, runtime resolvers | Node-local cache for materialized runtime artifacts. Relative explicit paths are resolved against the config file directory. |
-| `image.cache.root_dir` | `$AENV_HOME/image-cache` | `src/image/*`, overlaybd runtime | Node-local image cache root. Contains `configs/`, `indexes/`, `commits/`, and `remote-blocks/`. |
+| `image.cache.root_dir` | `$AENV_HOME/image-cache` | `src/image/*`, overlaybd runtime | Node-local image cache root. Contains `configs/`, `indexes/`, `commits/`, and `remote-blocks/`. The offline C++ tools own isolated sibling cache roots: `convert-blocks/` (`overlaybd-apply`) and `resize-blocks/` (`overlaybd-resize`). |
 | `p2p.store_dir` | `$AENV_HOME/p2p/store` | `src/p2p/*`, `src/cfg.rs` | Local store for P2P artifact transport backends. Relative explicit paths are resolved against the config file directory. |
 | `image.cache.remote_blocks` | `<image.cache.root_dir>/remote-blocks` | overlaybd runtime config | Remote block cache root. Overlaybd also stores `premerged-index/` under this cache dir. Its size limit comes from `image.cache.remote_blocks.max_size_gb`. |
 | `ublk.daemon_socket_path` | `$AENV_RUNTIME/ublk-daemon.sock` | `src/sandbox/ublk/*`, `storage/ublk-daemon/*` | Unix socket used for server-to-daemon IPC. |
@@ -34,7 +34,7 @@ Owned by `src/setup/*` and `src/cfg.rs`.
 | Overlaybd tools | `<deps_path>/overlaybd/bin/*`, `<deps_path>/overlaybd/lib/*` | `overlaybd-create`, `overlaybd-apply`, `overlaybd-commit`, `overlaybd-resize`, libraries | OCI-to-overlaybd conversion and packaging | Installed during setup when release metadata does not match. |
 | Overlaybd release metadata | `<deps_path>/overlaybd/tools-release.json` | Installed overlaybd release identifier | Detects whether tools need reinstalling | Rewritten on setup when release changes. |
 | Overlaybd package downloads | `<deps_path>/overlaybd/downloads/*` | Downloaded package archives | Setup cache for overlaybd release packages | Kept after install; no automatic GC. |
-| Generated overlaybd config | `$AENV_HOME/overlaybd/overlaybd-global.json`, `$AENV_HOME/overlaybd/mem-overlaybd-global.json` | Runtime global config, cache path, credentials config | Configures overlaybd runtime and memory snapshot overlaybd access | Rewritten during setup/startup. |
+| Generated overlaybd config | `$AENV_HOME/overlaybd/overlaybd-global.json`, `$AENV_HOME/overlaybd/mem-overlaybd-global.json`, `$AENV_HOME/overlaybd/convert-overlaybd-global.json`, `$AENV_HOME/overlaybd/resize-overlaybd-global.json` | Runtime global config, cache path, credentials config | Configures overlaybd runtime, memory snapshot overlaybd access, and the offline C++ tools (`overlaybd-apply`, `overlaybd-resize`), which get dedicated configs with isolated cacheDirs (`convert-blocks`, `resize-blocks`) and download disabled | Rewritten during setup/startup. |
 | Overlaybd runtime log | `<deps_path>/overlaybd/overlaybd.log` | Overlaybd runtime logs | Debugging | Appended by overlaybd runtime; no automatic GC. |
 
 ## Firecracker Sandbox
@@ -166,6 +166,7 @@ Owned by `storage/overlaybd/*`.
 | Artifact | Location | Contents | Purpose | Lifecycle | Rebuildable |
 | --- | --- | --- | --- | --- | --- |
 | Remote block cache | configured `cacheConfig.cacheDir`, derived from `<image.cache.root_dir>/remote-blocks` | Cached registryfs_v2 block ranges | Speeds remote overlaybd-native layer reads | Managed by overlaybd cache settings. | Yes. |
+| Offline C++ tool block caches | `<image.cache.root_dir>/convert-blocks` (`overlaybd-apply`), `<image.cache.root_dir>/resize-blocks` (`overlaybd-resize`) | C++ file-cache entries for the offline tools | Keeps C++ cache eviction (truncate+unlink of flat cacheDir files) away from the Rust runtime cache's per-entry directories | Owned and evicted by the C++ tools via their dedicated generated global configs; download is disabled in those configs. Never shared with the Rust runtime `remote-blocks` cache. | Yes. |
 | Premerged index cache | `cacheConfig.cacheDir/premerged-index/*.pmidx` | Serialized merged read-only lower index | Speeds opening repeated lower stacks | Written asynchronously on read-only open. Pruned by size limit derived from cache size. | Yes. |
 | Sealed overlaybd commit files | Various owner paths: image cache, snapshot dirs, repository managed layers | Overlaybd layer data and index trailer | Immutable lower layers for block devices and memory images | Lifecycle is owned by the module that stores the file. Overlaybd only defines the format and open/merge behavior. | Depends on owner. |
 

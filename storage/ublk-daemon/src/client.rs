@@ -115,6 +115,7 @@ pub struct UblkDaemonSpawnConfig<'a> {
     pub binary_path: &'a Path,
     pub socket_path: PathBuf,
     pub global_config: &'a Path,
+    pub resize_global_config: &'a Path,
     pub app_config: Option<&'a Path>,
     pub log_file: Option<&'a Path>,
     pub metrics_listen_addr: &'a str,
@@ -150,6 +151,7 @@ impl UblkDaemonClient {
             binary = %config.binary_path.display(),
             socket = %config.socket_path.display(),
             global_config = %config.global_config.display(),
+            resize_global_config = %config.resize_global_config.display(),
             app_config = ?config.app_config,
             log_file = ?config.log_file,
             metrics_listen_addr = config.metrics_listen_addr,
@@ -166,6 +168,8 @@ impl UblkDaemonClient {
             .arg(&config.socket_path)
             .arg("--global-config")
             .arg(config.global_config)
+            .arg("--resize-global-config")
+            .arg(config.resize_global_config)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
 

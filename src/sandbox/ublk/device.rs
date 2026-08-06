@@ -83,6 +83,8 @@ pub struct UblkDaemonConfig {
     pub daemon_binary: PathBuf,
     pub socket_path: PathBuf,
     pub global_config: PathBuf,
+    /// OverlayBD global config used by the daemon only for overlaybd-resize.
+    pub resize_global_config: PathBuf,
     pub app_config: Option<PathBuf>,
     /// Log file path for the daemon. If `None`, the daemon logs to stderr.
     pub log_file: Option<PathBuf>,
@@ -125,6 +127,7 @@ impl UblkDaemonConfig {
             daemon_binary,
             socket_path: ublk.daemon_socket_path.clone(),
             global_config: ublk.overlaybd.global_config_path.clone(),
+            resize_global_config: config.resolved_overlaybd_resize_global_config_path(),
             app_config: crate::cfg::ConfigManager::global()
                 .config_path()
                 .map(PathBuf::from),
@@ -197,6 +200,7 @@ impl UblkDeviceManager {
                             binary_path: &cfg.daemon_binary,
                             socket_path: cfg.socket_path,
                             global_config: &cfg.global_config,
+                            resize_global_config: &cfg.resize_global_config,
                             app_config: cfg.app_config.as_deref(),
                             log_file: cfg.log_file.as_deref(),
                             metrics_listen_addr: &cfg.metrics_listen_addr,

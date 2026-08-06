@@ -652,6 +652,36 @@ impl AppConfig {
         format!("overlaybd-oci:{version}:agentenv-cache-v1")
     }
 
+    /// Path of the generated overlaybd global config dedicated to the offline
+    /// C++ conversion tools (`overlaybd-apply`). It mirrors the runtime global
+    /// config but points at an isolated cacheDir: the C++ file cache manages
+    /// cacheDir as flat files and evicts (truncate+unlink) whatever it finds,
+    /// which would destroy the Rust runtime cache's per-entry directories if
+    /// both shared `remote-blocks`.
+    pub(crate) fn resolved_overlaybd_convert_global_config_path(&self) -> PathBuf {
+        self.ublk
+            .overlaybd
+            .global_config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("convert-overlaybd-global.json")
+    }
+
+    /// Path of the generated overlaybd global config dedicated to the offline
+    /// C++ resize tool (`overlaybd-resize`). It mirrors the runtime global
+    /// config but points at an isolated cacheDir: the C++ file cache manages
+    /// cacheDir as flat files and evicts (truncate+unlink) whatever it finds,
+    /// which would destroy the Rust runtime cache's per-entry directories if
+    /// both shared `remote-blocks`.
+    pub(crate) fn resolved_overlaybd_resize_global_config_path(&self) -> PathBuf {
+        self.ublk
+            .overlaybd
+            .global_config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("resize-overlaybd-global.json")
+    }
+
     /// Resolve the cpu-template-helper binary path derived from deps_path + version.
     /// Returns `None` if the binary does not exist on disk.
     pub fn resolved_cpu_template_helper(&self) -> Option<PathBuf> {
@@ -888,28 +918,45 @@ impl AppConfig {
     }
 
     pub(crate) fn validate_overlaybd_global_config_paths(&self) -> Result<()> {
-        // Shared lexical normalization (no filesystem access) so aliased
-        // spellings of the same file cannot skip validation.
-        let rootfs =
-            overlaybd::config::lexically_normalize_path(&self.ublk.overlaybd.global_config_path);
-        let memory = overlaybd::config::lexically_normalize_path(
-            &self.memory_snapshot.overlaybd_global_config_path,
-        );
-        // Lexical equality catches spelling aliases; canonicalize covers
-        // symlink aliases for paths that already exist.
-        let same = rootfs == memory
-            || match (
-                std::fs::canonicalize(&rootfs),
-                std::fs::canonicalize(&memory),
-            ) {
-                (Ok(rootfs), Ok(memory)) => rootfs == memory,
-                _ => false,
-            };
-        if same {
-            bail!(
-                "ublk.overlaybd.global_config_path and \
-                 memory_snapshot.overlaybd_global_config_path must be different"
-            );
+        let paths = [
+            (
+                "ublk.overlaybd.global_config_path",
+                &self.ublk.overlaybd.global_config_path,
+            ),
+            (
+                "memory_snapshot.overlaybd_global_config_path",
+                &self.memory_snapshot.overlaybd_global_config_path,
+            ),
+            (
+                "derived convert overlaybd global config path",
+                &self.resolved_overlaybd_convert_global_config_path(),
+            ),
+            (
+                "derived resize overlaybd global config path",
+                &self.resolved_overlaybd_resize_global_config_path(),
+            ),
+        ];
+        let normalized =
+            paths.map(|(name, path)| (name, overlaybd::config::lexically_normalize_path(path)));
+        let canonical = normalized
+            .clone()
+            .map(|(name, path)| (name, std::fs::canonicalize(&path).ok()));
+
+        for left in 0..normalized.len() {
+            for right in (left + 1)..normalized.len() {
+                let lexical_alias = normalized[left].1 == normalized[right].1;
+                let canonical_alias =
+                    canonical[left].1.is_some() && canonical[left].1 == canonical[right].1;
+                if lexical_alias || canonical_alias {
+                    bail!(
+                        "{} ({:?}) and {} ({:?}) must be different",
+                        normalized[left].0,
+                        normalized[left].1,
+                        normalized[right].0,
+                        normalized[right].1,
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -1251,6 +1298,34 @@ mod tests {
         config.memory_snapshot.overlaybd_global_config_path =
             PathBuf::from("/tmp/benv/global.json");
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_rootfs_path_equal_to_derived_resize_path() {
+        let mut config = AppConfig::default();
+        config.ublk.overlaybd.global_config_path =
+            PathBuf::from("/tmp/overlaybd/resize-overlaybd-global.json");
+
+        let err = config.validate().unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("ublk.overlaybd.global_config_path"));
+        assert!(message.contains("derived resize"));
+        assert!(message.contains("must be different"));
+    }
+
+    #[test]
+    fn validate_rejects_memory_path_equal_to_derived_convert_path() {
+        let mut config = AppConfig::default();
+        config.ublk.overlaybd.global_config_path =
+            PathBuf::from("/tmp/overlaybd/overlaybd-global.json");
+        config.memory_snapshot.overlaybd_global_config_path =
+            PathBuf::from("/tmp/overlaybd/convert-overlaybd-global.json");
+
+        let err = config.validate().unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("memory_snapshot.overlaybd_global_config_path"));
+        assert!(message.contains("derived convert"));
+        assert!(message.contains("must be different"));
     }
 
     #[test]

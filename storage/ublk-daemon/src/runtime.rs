@@ -2,6 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -82,7 +83,7 @@ impl MaterializedOverlaybdRuntime {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct MaterializeOverlaybdRuntimeRequest<'a> {
     pub(crate) image_service_cache: &'a ImageServiceCache,
     pub(crate) source_image_config: &'a Path,
@@ -93,6 +94,14 @@ pub(crate) struct MaterializeOverlaybdRuntimeRequest<'a> {
     pub(crate) requested_virtual_size: Option<u64>,
     pub(crate) known_source_virtual_size: Option<u64>,
     pub(crate) resize_tool: Option<&'a ResizeToolSpec>,
+    /// Dedicated OverlayBD global config used only by the overlaybd-resize
+    /// child process (isolated cacheDir, download disabled). The normal
+    /// `global_config` above still drives size resolution and the Rust-side
+    /// reopen/verification.
+    pub(crate) resize_global_config: &'a Path,
+    /// Daemon-wide permit serializing overlaybd-resize child processes, which
+    /// all share the single isolated resize cacheDir.
+    pub(crate) resize_permit: Arc<tokio::sync::Mutex<()>>,
     pub(crate) allow_shrink: bool,
 }
 
@@ -142,6 +151,8 @@ async fn materialize_runtime_contents(
         requested_virtual_size,
         known_source_virtual_size,
         resize_tool,
+        resize_global_config,
+        resize_permit,
         allow_shrink,
     } = request;
 
@@ -214,13 +225,21 @@ async fn materialize_runtime_contents(
                 "overlaybd resize tool is required when virtual size changes".to_string(),
             )
         })?;
+        // Serialize overlaybd-resize children daemon-wide: they all share the
+        // single isolated resize cacheDir. The guard is held only around the
+        // child process and is released on every exit path (normal, non-zero
+        // exit, timeout, spawn/read errors) when it drops below or during
+        // error propagation; verification reopens through the Rust
+        // ImageService with the request's normal global config.
+        let resize_guard = resize_permit.lock().await;
         run_resize_tool(
             tool,
             &runtime_image_config_path,
-            global_config,
+            resize_global_config,
             actual_virtual_size,
         )
         .await?;
+        drop(resize_guard);
         verify_resized_runtime(
             image_service_cache,
             &runtime_image_config_path,
@@ -308,7 +327,7 @@ fn validate_requested_virtual_size(
 async fn run_resize_tool(
     tool: &ResizeToolSpec,
     image_config: &Path,
-    global_config: &Path,
+    resize_global_config: &Path,
     target_size: u64,
 ) -> Result<()> {
     let runtime_dir = image_config
@@ -322,7 +341,7 @@ async fn run_resize_tool(
         .arg("--size")
         .arg((target_size / GIB).to_string())
         .arg("--service_config_path")
-        .arg(global_config)
+        .arg(resize_global_config)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -654,6 +673,8 @@ mod tests {
             requested_virtual_size: None,
             known_source_virtual_size: None,
             resize_tool: None,
+            resize_global_config: global_config,
+            resize_permit: Arc::new(tokio::sync::Mutex::new(())),
             allow_shrink: false,
         }
     }
@@ -786,6 +807,12 @@ mod tests {
         let runtime = temp.path().join("runtime");
         let observed = temp.path().join("observed");
         let tool_lib = temp.path().join("tool-lib");
+        let resize_global_config = temp.path().join("resize-overlaybd-global.json");
+        fs::write(
+            &resize_global_config,
+            serde_json::to_vec_pretty(&GlobalConfig::default()).unwrap(),
+        )
+        .unwrap();
         let script = fake_resize_tool(
             temp.path(),
             &format!(
@@ -798,12 +825,15 @@ mod tests {
         let resize_tool = ResizeToolSpec {
             binary: script,
             lib_dir: Some(tool_lib.clone()),
-            timeout_secs: 2,
+            timeout_secs: 60,
         };
+        let resize_permit = Arc::new(tokio::sync::Mutex::new(()));
         let mut request = materialize_test_request(&cache, &source, &global_config, &runtime);
         request.requested_virtual_size = Some(2 * GIB);
-        request.known_source_virtual_size = Some(GIB);
+        request.known_source_virtual_size = None;
         request.resize_tool = Some(&resize_tool);
+        request.resize_global_config = &resize_global_config;
+        request.resize_permit = Arc::clone(&resize_permit);
         let materialized = materialize_overlaybd_runtime(request).await.unwrap();
 
         assert_eq!(materialized.actual_virtual_size, 2 * GIB);
@@ -829,13 +859,50 @@ mod tests {
             "{}\n--config\n{}\n--size\n2\n--service_config_path\n{}\n",
             runtime.display(),
             materialized.runtime_image_config_path.display(),
-            global_config.display(),
+            resize_global_config.display(),
         );
         let library_path = observed.strip_prefix(&expected_prefix).unwrap().trim_end();
         assert_eq!(
             std::env::split_paths(OsStr::new(library_path)).next(),
             Some(tool_lib)
         );
+
+        let timeout_tool = ResizeToolSpec {
+            binary: fake_resize_tool(temp.path(), "sleep 30"),
+            lib_dir: None,
+            timeout_secs: 1,
+        };
+        let timed_out_runtime = temp.path().join("runtime-timed-out");
+        let mut timed_out_request =
+            materialize_test_request(&cache, &source, &global_config, &timed_out_runtime);
+        timed_out_request.requested_virtual_size = Some(2 * GIB);
+        timed_out_request.resize_tool = Some(&timeout_tool);
+        timed_out_request.resize_global_config = &resize_global_config;
+        timed_out_request.resize_permit = Arc::clone(&resize_permit);
+        let err = materialize_overlaybd_runtime(timed_out_request)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out after 1 seconds"));
+
+        let second_tool = fake_resize_tool(temp.path(), "exit 0");
+        let second_tool = ResizeToolSpec {
+            binary: second_tool,
+            lib_dir: None,
+            timeout_secs: 2,
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let _guard = resize_permit.lock().await;
+            run_resize_tool(
+                &second_tool,
+                &materialized.runtime_image_config_path,
+                &resize_global_config,
+                2 * GIB,
+            )
+            .await
+        })
+        .await
+        .expect("resize permit must be released after timeout")
+        .unwrap();
     }
 
     #[tokio::test]

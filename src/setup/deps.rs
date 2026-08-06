@@ -11,7 +11,8 @@ use serde::Deserialize;
 use tracing::{debug, info};
 
 use crate::cfg::{
-    AppConfig, OssBackendConfig, OverlaybdDependencyConfig, SnapshotRepositoryBackendKind,
+    AppConfig, OssBackendConfig, OverlaybdDependencyConfig, ResolvedImageCacheConfig,
+    SnapshotRepositoryBackendKind,
 };
 use crate::digest::FileDigest;
 use crate::virtualization::VirtualizationMode;
@@ -312,16 +313,73 @@ pub(crate) fn write_generated_overlaybd_global_configs(
         .background_download
         .to_overlaybd_download_config();
 
-    for (path, download) in [
-        (&config.ublk.overlaybd.global_config_path, &rootfs_download),
-        (
-            &config.memory_snapshot.overlaybd_global_config_path,
-            &memory_download,
-        ),
-    ] {
-        write_generated_overlaybd_global_config(path, config, p2p_facade_address, download)
-            .with_context(|| format!("write overlaybd global config {}", path.display()))?;
-    }
+    let image_cache = config.image_cache_layout();
+    write_generated_overlaybd_global_config(
+        &config.ublk.overlaybd.global_config_path,
+        config,
+        &image_cache,
+        p2p_facade_address,
+        &rootfs_download,
+    )
+    .with_context(|| {
+        format!(
+            "write overlaybd global config {}",
+            config.ublk.overlaybd.global_config_path.display()
+        )
+    })?;
+
+    let mut memory_cache = image_cache.clone();
+    memory_cache.remote_blocks_dir = image_cache.root_dir.join("memory-blocks");
+    write_generated_overlaybd_global_config(
+        &config.memory_snapshot.overlaybd_global_config_path,
+        config,
+        &memory_cache,
+        p2p_facade_address,
+        &memory_download,
+    )
+    .with_context(|| {
+        format!(
+            "write overlaybd global config {}",
+            config
+                .memory_snapshot
+                .overlaybd_global_config_path
+                .display()
+        )
+    })?;
+
+    // The offline C++ conversion tools (`overlaybd-apply`) get a dedicated
+    // global config with an isolated cacheDir: the C++ file cache treats every
+    // file under cacheDir as a flat cache entry and evicts (truncate+unlink)
+    // them, which destroys the Rust runtime cache's per-entry directories when
+    // both share `remote-blocks`. Background download stays disabled because
+    // conversion only ever opens local layers.
+    let mut convert_cache = image_cache.clone();
+    convert_cache.remote_blocks_dir = image_cache.root_dir.join("convert-blocks");
+    let convert_path = config.resolved_overlaybd_convert_global_config_path();
+    write_generated_overlaybd_global_config(
+        &convert_path,
+        config,
+        &convert_cache,
+        p2p_facade_address,
+        &DownloadConfig::default(),
+    )
+    .with_context(|| format!("write overlaybd global config {}", convert_path.display()))?;
+
+    // The offline C++ resize tool (`overlaybd-resize`) gets a dedicated global
+    // config with an isolated cacheDir for the same reason as the conversion
+    // tools above: the C++ file cache would otherwise evict live entries from
+    // the shared Rust runtime cache. Background download stays disabled.
+    let mut resize_cache = image_cache.clone();
+    resize_cache.remote_blocks_dir = image_cache.root_dir.join("resize-blocks");
+    let resize_path = config.resolved_overlaybd_resize_global_config_path();
+    write_generated_overlaybd_global_config(
+        &resize_path,
+        config,
+        &resize_cache,
+        p2p_facade_address,
+        &DownloadConfig::default(),
+    )
+    .with_context(|| format!("write overlaybd global config {}", resize_path.display()))?;
     Ok(())
 }
 
@@ -588,11 +646,11 @@ fn extract_ext4_from_ghcr(
 fn write_generated_overlaybd_global_config(
     path: &Path,
     app_config: &AppConfig,
+    image_cache: &ResolvedImageCacheConfig,
     p2p_facade_address: Option<&str>,
     download: &DownloadConfig,
 ) -> Result<()> {
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let image_cache = app_config.image_cache_layout();
     let log_path = config_dir.join("overlaybd.log");
     let credential_config = match detect_docker_credential_config() {
         Some(credential_path) => {
@@ -1010,6 +1068,100 @@ mod tests {
     }
 
     #[test]
+    fn generated_convert_overlaybd_global_config_uses_isolated_cache_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp.path().join("overlaybd-global.json");
+        let mem = temp.path().join("mem-overlaybd-global.json");
+        let mut config =
+            app_config_with_overlaybd_global_configs(temp.path(), rootfs.clone(), mem.clone());
+        config.image.cache.root_dir = temp.path().join("image-cache");
+
+        write_generated_overlaybd_global_configs(&config, None).expect("write global configs");
+
+        let convert = temp.path().join("convert-overlaybd-global.json");
+        let convert_value = read_global_config_value(&convert);
+        let rootfs_value = read_global_config_value(&rootfs);
+        let expected_cache_dir = temp.path().join("image-cache").join("convert-blocks");
+        assert_eq!(
+            convert_value["cacheConfig"]["cacheDir"].as_str(),
+            expected_cache_dir.to_str(),
+            "convert tools must use an isolated cacheDir"
+        );
+        assert_ne!(
+            convert_value["cacheConfig"]["cacheDir"], rootfs_value["cacheConfig"]["cacheDir"],
+            "convert tools must not share the runtime remote-blocks cacheDir"
+        );
+        assert_eq!(convert_value["download"]["enable"], false);
+    }
+
+    #[test]
+    fn resolved_overlaybd_resize_global_config_path_is_sibling_of_runtime_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp.path().join("overlaybd-global.json");
+        let mem = temp.path().join("mem-overlaybd-global.json");
+        let config = app_config_with_overlaybd_global_configs(temp.path(), rootfs, mem);
+
+        assert_eq!(
+            config.resolved_overlaybd_resize_global_config_path(),
+            temp.path().join("resize-overlaybd-global.json")
+        );
+    }
+
+    #[test]
+    fn generated_resize_overlaybd_global_config_uses_isolated_cache_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp.path().join("overlaybd-global.json");
+        let mem = temp.path().join("mem-overlaybd-global.json");
+        let mut config =
+            app_config_with_overlaybd_global_configs(temp.path(), rootfs.clone(), mem.clone());
+        config.image.cache.root_dir = temp.path().join("image-cache");
+
+        write_generated_overlaybd_global_configs(&config, None).expect("write global configs");
+
+        let resize = temp.path().join("resize-overlaybd-global.json");
+        let resize_value = read_global_config_value(&resize);
+        let rootfs_value = read_global_config_value(&rootfs);
+        let convert_value =
+            read_global_config_value(&temp.path().join("convert-overlaybd-global.json"));
+        let expected_resize_cache_dir = temp.path().join("image-cache").join("resize-blocks");
+        assert_eq!(
+            resize_value["cacheConfig"]["cacheDir"].as_str(),
+            expected_resize_cache_dir.to_str(),
+            "resize tool must use an isolated cacheDir"
+        );
+        assert_ne!(
+            resize_value["cacheConfig"]["cacheDir"], rootfs_value["cacheConfig"]["cacheDir"],
+            "resize tool must not share the runtime remote-blocks cacheDir"
+        );
+        assert_ne!(
+            resize_value["cacheConfig"]["cacheDir"], convert_value["cacheConfig"]["cacheDir"],
+            "resize tool must not share the conversion convert-blocks cacheDir"
+        );
+        assert_eq!(resize_value["download"]["enable"], false);
+
+        // Isolation only changes cache/download ownership: registry, credential
+        // and P2P fields stay identical to the runtime rootfs config.
+        assert_eq!(
+            resize_value["registryFsVersion"],
+            rootfs_value["registryFsVersion"]
+        );
+        assert_eq!(
+            resize_value["credentialConfig"],
+            rootfs_value["credentialConfig"]
+        );
+        assert_eq!(resize_value["p2pConfig"], rootfs_value["p2pConfig"]);
+        assert_eq!(resize_value["ioEngine"], rootfs_value["ioEngine"]);
+        assert_eq!(
+            resize_value["cacheConfig"]["cacheType"],
+            rootfs_value["cacheConfig"]["cacheType"]
+        );
+        assert_eq!(
+            resize_value["cacheConfig"]["cacheSizeGB"],
+            rootfs_value["cacheConfig"]["cacheSizeGB"]
+        );
+    }
+
+    #[test]
     fn generated_memory_overlaybd_global_config_uses_explicit_download_overrides() {
         let temp = tempfile::tempdir().expect("tempdir");
         let rootfs = temp.path().join("overlaybd-global.json");
@@ -1031,6 +1183,49 @@ mod tests {
                 .to_overlaybd_download_config()
         };
         assert_download_json(&read_global_config_value(&mem), &expected_memory);
+    }
+
+    #[test]
+    fn generated_memory_overlaybd_global_config_uses_independent_cache_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp.path().join("overlaybd-global.json");
+        let mem = temp.path().join("mem-overlaybd-global.json");
+        let mut config =
+            app_config_with_overlaybd_global_configs(temp.path(), rootfs.clone(), mem.clone());
+        config.image.cache.root_dir = temp.path().join("image-cache");
+        config.memory_snapshot.background_download.enable = false;
+        config.memory_snapshot.background_download.block_size = 2 * 1024 * 1024;
+        config.memory_snapshot.background_download.concurrency = 7;
+
+        write_generated_overlaybd_global_configs(&config, None).expect("write global configs");
+
+        let rootfs_value = read_global_config_value(&rootfs);
+        let memory_value = read_global_config_value(&mem);
+        let convert_value =
+            read_global_config_value(&temp.path().join("convert-overlaybd-global.json"));
+        let resize_value =
+            read_global_config_value(&temp.path().join("resize-overlaybd-global.json"));
+        let expected_memory_cache_dir = config.image.cache.root_dir.join("memory-blocks");
+        assert_eq!(
+            memory_value["cacheConfig"]["cacheDir"].as_str(),
+            expected_memory_cache_dir.to_str(),
+            "memory snapshots must use an independent Rust cacheDir"
+        );
+        for other in [&rootfs_value, &convert_value, &resize_value] {
+            assert_ne!(
+                memory_value["cacheConfig"]["cacheDir"], other["cacheConfig"]["cacheDir"],
+                "memory cacheDir must be distinct from every other cacheDir"
+            );
+        }
+        let expected_memory = DownloadConfig {
+            enable: false,
+            block_size: 2 * 1024 * 1024,
+            concurrency: 7,
+            ..MemorySnapshotConfig::default()
+                .background_download
+                .to_overlaybd_download_config()
+        };
+        assert_download_json(&memory_value, &expected_memory);
     }
 
     #[test]

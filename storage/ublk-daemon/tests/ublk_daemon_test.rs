@@ -872,7 +872,12 @@ mod server_tests {
 
         let image_service = test_image_service(dir.path()).await;
         let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
-        let server = UblkDaemonServer::new(sock_path.clone(), ctrl_ring, image_service);
+        let server = UblkDaemonServer::new(
+            sock_path.clone(),
+            ctrl_ring,
+            image_service,
+            dir.path().join("resize-overlaybd-global.json"),
+        );
 
         // Run server in background.
         let server_task = tokio::spawn(async move { server.run().await });
@@ -911,6 +916,7 @@ mod server_tests {
             sock_path.clone(),
             ctrl_ring,
             image_service,
+            dir.path().join("resize-overlaybd-global.json"),
         ));
 
         let server_clone = Arc::clone(&server);
@@ -946,6 +952,7 @@ mod server_tests {
             sock_path.clone(),
             ctrl_ring,
             image_service,
+            dir.path().join("resize-overlaybd-global.json"),
         ));
 
         let server_clone = Arc::clone(&server);
@@ -977,7 +984,12 @@ mod server_tests {
 
         let image_service = test_image_service(dir.path()).await;
         let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
-        let server = UblkDaemonServer::new(sock_path.clone(), ctrl_ring, image_service);
+        let server = UblkDaemonServer::new(
+            sock_path.clone(),
+            ctrl_ring,
+            image_service,
+            dir.path().join("resize-overlaybd-global.json"),
+        );
 
         // Server should fail because the socket is in use.
         let result = server.run().await;
@@ -997,6 +1009,7 @@ mod server_tests {
             sock_path.clone(),
             ctrl_ring,
             image_service,
+            dir.path().join("resize-overlaybd-global.json"),
         ));
 
         let server_clone = Arc::clone(&server);
@@ -1041,6 +1054,7 @@ mod server_tests {
             sock_path.clone(),
             ctrl_ring,
             image_service,
+            dir.path().join("resize-overlaybd-global.json"),
         ));
 
         let server_clone = Arc::clone(&server);
@@ -1085,6 +1099,7 @@ mod server_tests {
             sock_path.clone(),
             ctrl_ring,
             image_service,
+            dir.path().join("resize-overlaybd-global.json"),
         ));
 
         let server_clone = Arc::clone(&server);
@@ -1125,6 +1140,7 @@ mod server_tests {
             sock_path.clone(),
             ctrl_ring,
             image_service,
+            dir.path().join("resize-overlaybd-global.json"),
         ));
 
         let server_clone = Arc::clone(&server);

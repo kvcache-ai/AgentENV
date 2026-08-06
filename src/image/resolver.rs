@@ -55,7 +55,7 @@ pub struct ResolvedBlockImage {
 pub struct ImageResolver {
     store: Arc<dyn SourceImageStore>,
     overlaybd_install_root: PathBuf,
-    overlaybd_global_config: PathBuf,
+    overlaybd_convert_global_config: PathBuf,
     overlaybd_oci_converter_id: String,
     regctl_binary: PathBuf,
     default_image: String,
@@ -71,7 +71,7 @@ impl ImageResolver {
         Self {
             store,
             overlaybd_install_root: config.deps_path.join("overlaybd"),
-            overlaybd_global_config: config.ublk.overlaybd.global_config_path.clone(),
+            overlaybd_convert_global_config: config.resolved_overlaybd_convert_global_config_path(),
             overlaybd_oci_converter_id: config.resolved_overlaybd_oci_converter_id(),
             regctl_binary: config.resolved_regctl_binary(),
             default_image: config.image.resolver.default_image.clone(),
@@ -296,7 +296,7 @@ impl ImageResolver {
             fetched,
             oci_image::OverlaybdConversionEnv {
                 install_root: &self.overlaybd_install_root,
-                global_config: &self.overlaybd_global_config,
+                global_config: &self.overlaybd_convert_global_config,
                 converter_id: &self.overlaybd_oci_converter_id,
                 regctl_binary: &self.regctl_binary,
             },
