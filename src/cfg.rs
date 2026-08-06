@@ -264,13 +264,18 @@ pub struct DiskRateLimitConfig {
     /// Sustained disk bandwidth limit in bytes per second (0 = unlimited).
     #[config(default = 0u64)]
     pub bandwidth_bytes_per_sec: u64,
-    /// One-time burst allowance in bytes above the sustained bandwidth.
+    /// One-time bandwidth burst in bytes, granted once when the VM starts (maps
+    /// to Firecracker's `one_time_burst`). It is a separate allowance consumed
+    /// before the sustained bucket and is not replenished after use, so it only
+    /// absorbs the initial I/O spike; it does not raise the steady-state rate.
     #[config(default = 0u64)]
     pub bandwidth_burst_bytes: u64,
     /// Sustained IOPS limit (0 = unlimited).
     #[config(default = 0u64)]
     pub iops: u64,
-    /// One-time burst allowance in operations above the sustained IOPS.
+    /// One-time IOPS burst, granted once when the VM starts (maps to
+    /// Firecracker's `one_time_burst`). Consumed before the sustained bucket and
+    /// not replenished, so it only absorbs the initial spike, not steady state.
     #[config(default = 0u64)]
     pub iops_burst: u64,
 }

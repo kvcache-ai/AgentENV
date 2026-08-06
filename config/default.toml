@@ -112,10 +112,10 @@ vcpu_count = 2
 
 [machine.disk_rate_limit]
 # enabled = true
-# bandwidth_bytes_per_sec = 104857600   # 100 MB/s
-# bandwidth_burst_bytes = 10485760      # 10 MB burst
+# bandwidth_bytes_per_sec = 104857600   # 100 MB/s sustained
+# bandwidth_burst_bytes = 10485760      # 10 MB one-time burst at VM start (not replenished)
 # iops = 3000
-# iops_burst = 500
+# iops_burst = 500                       # one-time IOPS burst at VM start (not replenished)
 
 [envd]
 version = "0.5.15"
