@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d35defb3.js";
+            window.path_to_searchindex_js = "searchindex-63f65001.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-795efd7f.js"></script>
@@ -596,6 +596,47 @@ aenv snapshot list --sandbox-id &lt;sandbox-id&gt;
 </div>
 <p>The table output includes an <code>IMAGE REF</code> column (<code>-</code> when no image was published); JSON output includes the optional <code>imageRef</code> field.</p>
 <p>To delete a snapshot, use <code>aenv template delete &lt;snapshot-id&gt;</code> or <code>aenv template delete &lt;name&gt;</code> — snapshots share the same underlying store as templates and are deleted through the same command.</p>
+<hr>
+<h2 id="shell-completion"><a class="header" href="#shell-completion">Shell completion</a></h2>
+<p><code>aenv completion &lt;shell&gt;</code> prints a shell-completion script for the <code>aenv</code> CLI to stdout.</p>
+<h3 id="generate-and-install-a-script"><a class="header" href="#generate-and-install-a-script">Generate and install a script</a></h3>
+<h4 id="bash"><a class="header" href="#bash">Bash</a></h4>
+<pre><code class="language-bash">mkdir -p ~/.local/share/bash-completion/completions
+aenv completion bash &gt; ~/.local/share/bash-completion/completions/aenv
+</code></pre>
+<p>The Bash completion file is loaded on demand by
+<a href="https://github.com/scop/bash-completion"><code>bash-completion</code></a>.
+This requires <code>bash-completion</code> to be installed and initialized in the current
+shell.</p>
+<h4 id="zsh"><a class="header" href="#zsh">Zsh</a></h4>
+<pre><code class="language-zsh">mkdir -p ~/.local/share/zsh/site-functions
+aenv completion zsh &gt; ~/.local/share/zsh/site-functions/_aenv
+</code></pre>
+<p>Zsh loads completion functions from directories listed in <code>fpath</code>.
+<code>~/.local/share/zsh/site-functions</code> is not included in <code>fpath</code> by default on
+all systems. Add the following lines to <code>~/.zshrc</code> before any existing
+<code>compinit</code> invocation:</p>
+<pre><code class="language-zsh">fpath=(~/.local/share/zsh/site-functions $fpath)
+autoload -Uz compinit
+compinit
+</code></pre>
+<h4 id="fish"><a class="header" href="#fish">Fish</a></h4>
+<pre><code class="language-shell">mkdir -p ~/.config/fish/completions
+aenv completion fish &gt; ~/.config/fish/completions/aenv.fish
+</code></pre>
+<h3 id="activate-without-installing"><a class="header" href="#activate-without-installing">Activate without installing</a></h3>
+<p>To test completion for the current shell session without saving a generated
+file:</p>
+<pre><code class="language-bash">source &lt;(aenv completion bash)         # Bash
+eval "$(aenv completion zsh)"         # Zsh
+aenv completion fish | source          # Fish
+</code></pre>
+<p>Once loaded, completion covers the CLI surface:</p>
+<pre><code class="language-bash">aenv &lt;TAB&gt;                       # top-level commands
+aenv snapshot &lt;TAB&gt;              # nested subcommands (create, list, ...)
+aenv list --output &lt;TAB&gt;         # enum values: table, json
+aenv build ./&lt;TAB&gt;               # local path arguments
+</code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="docker-single-node"><a class="header" href="#docker-single-node">Docker (Single Node)</a></h1>
 <p>Run a single AgentENV node in a Docker container. This avoids installing the Rust toolchain on the host but still requires <code>/dev/kvm</code>.</p>
