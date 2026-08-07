@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use super::build_files::TemplateBuildFileStore;
 use super::errors::RepositoryResult;
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::types::{
@@ -173,6 +174,15 @@ pub trait SnapshotRepository: Send + Sync {
         id: &SnapshotId,
         reason: TemplateBuildErrorReason,
     ) -> RepositoryResult<()>;
+
+    /// Returns the shared store for template build-context archives.
+    ///
+    /// Returns `None` when this backend does not support build-context
+    /// uploads; the template files API then reports the capability as
+    /// unavailable instead of failing at build time.
+    fn template_build_files(&self) -> Option<Arc<dyn TemplateBuildFileStore>> {
+        None
+    }
 }
 
 #[async_trait]

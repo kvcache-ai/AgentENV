@@ -67,6 +67,22 @@ pub enum TemplatesTemplateIdDeleteResponse {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+pub enum TemplatesTemplateIdFilesHashGetResponse {
+    /// Successfully returned the upload link
+    Status201_SuccessfullyReturnedTheUploadLink(models::TemplateBuildFileUpload),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum TemplatesTemplateIdGetResponse {
     /// Successfully returned the template with its builds
     Status200_SuccessfullyReturnedTheTemplateWithItsBuilds(models::TemplateWithBuilds),
@@ -186,6 +202,19 @@ pub trait Templates<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         claims: &Self::Claims,
         path_params: &models::TemplatesTemplateIdDeletePathParams,
     ) -> Result<TemplatesTemplateIdDeleteResponse, E>;
+
+    /// Template build file upload link.
+    ///
+    /// TemplatesTemplateIdFilesHashGet - GET /templates/{templateID}/files/{hash}
+    async fn templates_template_id_files_hash_get(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::TemplatesTemplateIdFilesHashGetPathParams,
+    ) -> Result<TemplatesTemplateIdFilesHashGetResponse, E>;
 
     /// List template builds.
     ///

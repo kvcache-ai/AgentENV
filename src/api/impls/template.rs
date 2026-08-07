@@ -17,6 +17,7 @@ use super::template_helpers::{
 };
 use super::ApiImpl;
 use crate::image::ResolvedBlockImage;
+use crate::snapshot::repository::build_files::is_valid_build_files_hash;
 use crate::snapshot::{
     CommandContext, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
     TemplateBuildErrorReason, TemplateBuildStatus,
@@ -317,6 +318,100 @@ impl Templates<()> for ApiImpl {
                 Self::snapshot_manager_error(&err),
             )),
         }
+    }
+
+    async fn templates_template_id_files_hash_get(
+        &self,
+        _method: &Method,
+        host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::TemplatesTemplateIdFilesHashGetPathParams,
+    ) -> Result<TemplatesTemplateIdFilesHashGetResponse, ()> {
+        let template_id = &path_params.template_id;
+        let hash = &path_params.hash;
+
+        if !is_valid_build_files_hash(hash) {
+            return Ok(
+                TemplatesTemplateIdFilesHashGetResponse::Status400_BadRequest(Self::error(
+                    400,
+                    format!("invalid build files hash '{hash}'"),
+                )),
+            );
+        }
+        let Some(store) = self.snapshot_manager.template_build_files() else {
+            return Ok(
+                TemplatesTemplateIdFilesHashGetResponse::Status400_BadRequest(Self::error(
+                    400,
+                    "the configured snapshot backend does not support build-context uploads",
+                )),
+            );
+        };
+
+        match self.snapshot_manager.get(template_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok(TemplatesTemplateIdFilesHashGetResponse::Status404_NotFound(
+                    Self::error(404, format!("template {template_id} not found")),
+                ));
+            }
+            Err(err) => {
+                return Ok(
+                    TemplatesTemplateIdFilesHashGetResponse::Status500_ServerError(
+                        Self::snapshot_manager_error(&err),
+                    ),
+                );
+            }
+        }
+
+        let present = match store.exists(hash).await {
+            Ok(present) => present,
+            Err(err) => {
+                return Ok(
+                    TemplatesTemplateIdFilesHashGetResponse::Status500_ServerError(Self::error(
+                        500,
+                        format!("failed to check build archive: {err}"),
+                    )),
+                );
+            }
+        };
+        let config = &crate::cfg::ConfigManager::global_config().template_build;
+        let expires = chrono::Utc::now()
+            .timestamp()
+            .saturating_add(i64::try_from(config.files_url_ttl_secs).unwrap_or(i64::MAX));
+        let token = match store.create_upload_grant(template_id, hash, expires).await {
+            Ok(token) => token,
+            Err(err) => {
+                return Ok(
+                    TemplatesTemplateIdFilesHashGetResponse::Status500_ServerError(Self::error(
+                        500,
+                        format!("failed to prepare upload link: {err}"),
+                    )),
+                );
+            }
+        };
+
+        // The SDK PUTs to this URL with a bare HTTP client (no auth headers),
+        // so the durable bearer token in the query string is the credential.
+        // Reusing the Host header keeps the URL valid across gateway and
+        // direct-node access.
+        let base = config
+            .public_base_url
+            .clone()
+            .unwrap_or_else(|| format!("http://{host}"));
+        let url = format!(
+            "{}/templates/{template_id}/files/{hash}/content?expires={expires}&token={token}",
+            base.trim_end_matches('/'),
+        );
+
+        Ok(
+            TemplatesTemplateIdFilesHashGetResponse::Status201_SuccessfullyReturnedTheUploadLink(
+                models::TemplateBuildFileUpload {
+                    present,
+                    url: Some(url),
+                },
+            ),
+        )
     }
 
     async fn templates_get(
