@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e7e0841d.js";
+            window.path_to_searchindex_js = "searchindex-0a99b7fd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-795efd7f.js"></script>
@@ -4272,7 +4272,7 @@ network namespaces are missing</li>
 <tr><td><code>persisted_sandbox_store_path</code></td><td><code>$AENV_HOME/persisted-sandboxes</code></td><td><code>src/orchestrator/persistence/*</code></td><td>Durable paused sandbox records and artifacts.</td></tr>
 <tr><td><code>snapshot_store</code></td><td><code>$AENV_HOME/snapshot-store</code></td><td><code>src/snapshot/repository/*</code></td><td>Durable committed snapshot repository root. The configured backend uses <code>&lt;snapshot_store&gt;/repository</code>. Relative explicit paths are resolved against the config file directory.</td></tr>
 <tr><td><code>snapshot.local_cache_path</code></td><td><code>$AENV_HOME/snapshot-local-cache</code></td><td><code>src/snapshot/artifact_cache.rs</code>, runtime resolvers</td><td>Node-local cache for materialized runtime artifacts. Relative explicit paths are resolved against the config file directory.</td></tr>
-<tr><td><code>image.cache.root_dir</code></td><td><code>$AENV_HOME/image-cache</code></td><td><code>src/image/*</code>, overlaybd runtime</td><td>Node-local image cache root. Contains <code>configs/</code>, <code>indexes/</code>, <code>commits/</code>, and <code>remote-blocks/</code>.</td></tr>
+<tr><td><code>image.cache.root_dir</code></td><td><code>$AENV_HOME/image-cache</code></td><td><code>src/image/*</code>, overlaybd runtime</td><td>Node-local image cache root. Contains <code>configs/</code>, <code>indexes/</code>, <code>commits/</code>, and <code>remote-blocks/</code>. The offline C++ tools own isolated sibling cache roots: <code>convert-blocks/</code> (<code>overlaybd-apply</code>) and <code>resize-blocks/</code> (<code>overlaybd-resize</code>).</td></tr>
 <tr><td><code>p2p.store_dir</code></td><td><code>$AENV_HOME/p2p/store</code></td><td><code>src/p2p/*</code>, <code>src/cfg.rs</code></td><td>Local store for P2P artifact transport backends. Relative explicit paths are resolved against the config file directory.</td></tr>
 <tr><td><code>image.cache.remote_blocks</code></td><td><code>&lt;image.cache.root_dir&gt;/remote-blocks</code></td><td>overlaybd runtime config</td><td>Remote block cache root. Overlaybd also stores <code>premerged-index/</code> under this cache dir. Its size limit comes from <code>image.cache.remote_blocks.max_size_gb</code>.</td></tr>
 <tr><td><code>ublk.daemon_socket_path</code></td><td><code>$AENV_RUNTIME/ublk-daemon.sock</code></td><td><code>src/sandbox/ublk/*</code>, <code>storage/ublk-daemon/*</code></td><td>Unix socket used for server-to-daemon IPC.</td></tr>
@@ -4295,7 +4295,7 @@ network namespaces are missing</li>
 <tr><td>Overlaybd tools</td><td><code>&lt;deps_path&gt;/overlaybd/bin/*</code>, <code>&lt;deps_path&gt;/overlaybd/lib/*</code></td><td><code>overlaybd-create</code>, <code>overlaybd-apply</code>, <code>overlaybd-commit</code>, <code>overlaybd-resize</code>, libraries</td><td>OCI-to-overlaybd conversion and packaging</td><td>Installed during setup when release metadata does not match.</td></tr>
 <tr><td>Overlaybd release metadata</td><td><code>&lt;deps_path&gt;/overlaybd/tools-release.json</code></td><td>Installed overlaybd release identifier</td><td>Detects whether tools need reinstalling</td><td>Rewritten on setup when release changes.</td></tr>
 <tr><td>Overlaybd package downloads</td><td><code>&lt;deps_path&gt;/overlaybd/downloads/*</code></td><td>Downloaded package archives</td><td>Setup cache for overlaybd release packages</td><td>Kept after install; no automatic GC.</td></tr>
-<tr><td>Generated overlaybd config</td><td><code>$AENV_HOME/overlaybd/overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/mem-overlaybd-global.json</code></td><td>Runtime global config, cache path, credentials config</td><td>Configures overlaybd runtime and memory snapshot overlaybd access</td><td>Rewritten during setup/startup.</td></tr>
+<tr><td>Generated overlaybd config</td><td><code>$AENV_HOME/overlaybd/overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/mem-overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/convert-overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/resize-overlaybd-global.json</code></td><td>Runtime global config, cache path, credentials config</td><td>Configures overlaybd runtime, memory snapshot overlaybd access, and the offline C++ tools (<code>overlaybd-apply</code>, <code>overlaybd-resize</code>), which get dedicated configs with isolated cacheDirs (<code>convert-blocks</code>, <code>resize-blocks</code>) and download disabled</td><td>Rewritten during setup/startup.</td></tr>
 <tr><td>Overlaybd runtime log</td><td><code>&lt;deps_path&gt;/overlaybd/overlaybd.log</code></td><td>Overlaybd runtime logs</td><td>Debugging</td><td>Appended by overlaybd runtime; no automatic GC.</td></tr>
 </tbody>
 </table>
@@ -4462,6 +4462,7 @@ network namespaces are missing</li>
 </thead>
 <tbody>
 <tr><td>Remote block cache</td><td>configured <code>cacheConfig.cacheDir</code>, derived from <code>&lt;image.cache.root_dir&gt;/remote-blocks</code></td><td>Cached registryfs_v2 block ranges</td><td>Speeds remote overlaybd-native layer reads</td><td>Managed by overlaybd cache settings.</td><td>Yes.</td></tr>
+<tr><td>Offline C++ tool block caches</td><td><code>&lt;image.cache.root_dir&gt;/convert-blocks</code> (<code>overlaybd-apply</code>), <code>&lt;image.cache.root_dir&gt;/resize-blocks</code> (<code>overlaybd-resize</code>)</td><td>C++ file-cache entries for the offline tools</td><td>Keeps C++ cache eviction (truncate+unlink of flat cacheDir files) away from the Rust runtime cache’s per-entry directories</td><td>Owned and evicted by the C++ tools via their dedicated generated global configs; download is disabled in those configs. Never shared with the Rust runtime <code>remote-blocks</code> cache.</td><td>Yes.</td></tr>
 <tr><td>Premerged index cache</td><td><code>cacheConfig.cacheDir/premerged-index/*.pmidx</code></td><td>Serialized merged read-only lower index</td><td>Speeds opening repeated lower stacks</td><td>Written asynchronously on read-only open. Pruned by size limit derived from cache size.</td><td>Yes.</td></tr>
 <tr><td>Sealed overlaybd commit files</td><td>Various owner paths: image cache, snapshot dirs, repository managed layers</td><td>Overlaybd layer data and index trailer</td><td>Immutable lower layers for block devices and memory images</td><td>Lifecycle is owned by the module that stores the file. Overlaybd only defines the format and open/merge behavior.</td><td>Depends on owner.</td></tr>
 </tbody>
