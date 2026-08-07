@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e721dda3.js";
+            window.path_to_searchindex_js = "searchindex-f7fc3e87.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-795efd7f.js"></script>
@@ -225,7 +225,7 @@ The repository is available at <a href="https://github.com/kvcache-ai/AgentENV">
 <h1 id="quick-start"><a class="header" href="#quick-start">Quick Start</a></h1>
 <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
 <ul>
-<li><strong>Linux kernel 6.8+</strong>; the install script additionally requires <strong>Ubuntu 24.04</strong></li>
+<li><strong>Linux kernel 6.8+</strong></li>
 <li><code>/dev/kvm</code> access for Firecracker microVM execution</li>
 </ul>
 <blockquote>
@@ -240,7 +240,7 @@ uses a dedicated <code>aenv</code> system account with <code>CAP_NET_ADMIN</code
 <code>CAP_SYS_ADMIN</code>, plus group access to <code>/dev/kvm</code> and the ublk devices.</p>
 <h2 id="setup"><a class="header" href="#setup">Setup</a></h2>
 <h3 id="1-install-and-start-the-server"><a class="header" href="#1-install-and-start-the-server">1. Install and start the server</a></h3>
-<p><strong>Option A — Install Script (Ubuntu 24.04)</strong></p>
+<p><strong>Option A — Install Script</strong></p>
 <p>The script installs both the server and the <code>aenv</code> CLI. Set <code>AENV_HOME_PATH</code> to
 choose the data directory; if it is not set, AENV stores runtime dependencies
 and data in <code>/var/lib/aenv</code>. After installation, start the server as a systemd
@@ -4294,11 +4294,11 @@ network namespaces are missing</li>
 <tr><td>CPU template helper</td><td><code>&lt;deps_path&gt;/firecracker/{version}/cpu-template-helper</code></td><td>Optional Firecracker helper executable</td><td>Detects host CPU config for cluster-wide CPU intersection</td><td>Extracted from Firecracker package when present.</td></tr>
 <tr><td>Kernel image</td><td><code>&lt;deps_path&gt;/kernel/{version}/vmlinux.bin</code></td><td>Guest kernel</td><td>VM boot source</td><td>Downloaded during setup. Old versions are retained until manually removed.</td></tr>
 <tr><td>Tools drive</td><td><code>&lt;deps_path&gt;/tools/{version}/tools.ext4</code></td><td>Read-only ext4 image with envd/tools</td><td>Firecracker root drive shared by sandboxes and pinned by snapshots through its immutable release version</td><td>Extracted from OCI or imported from <code>tools.drive_path</code> during setup. Old versions are retained until manually removed.</td></tr>
-<tr><td>Overlaybd tools</td><td><code>&lt;deps_path&gt;/overlaybd/bin/*</code>, <code>&lt;deps_path&gt;/overlaybd/lib/*</code></td><td><code>overlaybd-create</code>, <code>overlaybd-apply</code>, <code>overlaybd-commit</code>, <code>overlaybd-resize</code>, libraries</td><td>OCI-to-overlaybd conversion and packaging</td><td>Installed during setup when release metadata does not match.</td></tr>
+<tr><td>Overlaybd tools</td><td><code>&lt;deps_path&gt;/overlaybd/bin/*</code></td><td>Statically linked <code>overlaybd-create</code>, <code>overlaybd-apply</code>, <code>overlaybd-commit</code>, and <code>overlaybd-resize</code></td><td>OCI-to-overlaybd conversion and packaging</td><td>Installed during setup when release metadata does not match.</td></tr>
 <tr><td>Overlaybd release metadata</td><td><code>&lt;deps_path&gt;/overlaybd/tools-release.json</code></td><td>Installed overlaybd release identifier</td><td>Detects whether tools need reinstalling</td><td>Rewritten on setup when release changes.</td></tr>
-<tr><td>Overlaybd package downloads</td><td><code>&lt;deps_path&gt;/overlaybd/downloads/*</code></td><td>Downloaded package archives</td><td>Setup cache for overlaybd release packages</td><td>Kept after install; no automatic GC.</td></tr>
+<tr><td>Overlaybd package downloads</td><td><code>&lt;deps_path&gt;/overlaybd/downloads/*</code></td><td>Temporary downloaded package archives</td><td>Setup staging for overlaybd release packages</td><td>Removed after a successful install.</td></tr>
 <tr><td>Generated overlaybd config</td><td><code>$AENV_HOME/overlaybd/overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/mem-overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/convert-overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/resize-overlaybd-global.json</code></td><td>Runtime global config, cache path, credentials config</td><td>Configures overlaybd runtime, memory snapshot overlaybd access, and the offline C++ tools (<code>overlaybd-apply</code>, <code>overlaybd-resize</code>), which get dedicated configs with isolated cacheDirs (<code>convert-blocks</code>, <code>resize-blocks</code>) and download disabled</td><td>Rewritten during setup/startup.</td></tr>
-<tr><td>Overlaybd runtime log</td><td><code>&lt;deps_path&gt;/overlaybd/overlaybd.log</code></td><td>Overlaybd runtime logs</td><td>Debugging</td><td>Appended by overlaybd runtime; no automatic GC.</td></tr>
+<tr><td>Overlaybd runtime log</td><td><code>$AENV_HOME/overlaybd/overlaybd.log</code></td><td>Overlaybd runtime logs</td><td>Debugging</td><td>Appended by overlaybd runtime; no automatic GC.</td></tr>
 </tbody>
 </table>
 </div>

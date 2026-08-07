@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e721dda3.js";
+            window.path_to_searchindex_js = "../searchindex-f7fc3e87.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-795efd7f.js"></script>
@@ -184,7 +184,7 @@
                         <h1 id="quick-start"><a class="header" href="#quick-start">Quick Start</a></h1>
 <h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
 <ul>
-<li><strong>Linux kernel 6.8+</strong>; the install script additionally requires <strong>Ubuntu 24.04</strong></li>
+<li><strong>Linux kernel 6.8+</strong></li>
 <li><code>/dev/kvm</code> access for Firecracker microVM execution</li>
 </ul>
 <blockquote>
@@ -199,7 +199,7 @@ uses a dedicated <code>aenv</code> system account with <code>CAP_NET_ADMIN</code
 <code>CAP_SYS_ADMIN</code>, plus group access to <code>/dev/kvm</code> and the ublk devices.</p>
 <h2 id="setup"><a class="header" href="#setup">Setup</a></h2>
 <h3 id="1-install-and-start-the-server"><a class="header" href="#1-install-and-start-the-server">1. Install and start the server</a></h3>
-<p><strong>Option A — Install Script (Ubuntu 24.04)</strong></p>
+<p><strong>Option A — Install Script</strong></p>
 <p>The script installs both the server and the <code>aenv</code> CLI. Set <code>AENV_HOME_PATH</code> to
 choose the data directory; if it is not set, AENV stores runtime dependencies
 and data in <code>/var/lib/aenv</code>. After installation, start the server as a systemd
