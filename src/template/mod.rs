@@ -1,5 +1,6 @@
 mod build_spec;
 mod builder;
+mod copy_plan;
 mod errors;
 mod runner;
 mod step_executor;

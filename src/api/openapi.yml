@@ -904,6 +904,18 @@ components:
           type: boolean
           description: Whether the step should be forced to run regardless of the cache
 
+    TemplateBuildFileUpload:
+      description: Upload link for one build context archive, addressed by its files hash
+      required:
+        - present
+      properties:
+        present:
+          type: boolean
+          description: Whether the archive for this hash is already stored
+        url:
+          type: string
+          description: URL the client should PUT the tar archive to
+
     TemplateBuildRequestV3:
       properties:
         name:
@@ -2138,6 +2150,42 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TemplateBuildInfo"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /templates/{templateID}/files/{hash}:
+    get:
+      summary: Template build file upload link
+      description: Get an upload link for a tar archive containing build context files for one COPY step
+      tags: [templates]
+      security:
+        - AccessTokenAuth: []
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/templateID"
+        - in: path
+          name: hash
+          required: true
+          schema:
+            type: string
+            description: Hash of the build context files
+      responses:
+        "201":
+          description: Successfully returned the upload link
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuildFileUpload"
         "400":
           $ref: "#/components/responses/400"
         "401":
