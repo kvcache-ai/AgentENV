@@ -450,21 +450,6 @@ impl FirecrackerInstance {
             .context("Failed to resume microVM")
     }
 
-    /// Creates a snapshot of the microVM.
-    #[tracing::instrument(skip(self), fields(snapshot_path = %snapshot_path.display(), mem_file_path = %mem_file_path.display()))]
-    pub async fn create_snapshot(&self, snapshot_path: &Path, mem_file_path: &Path) -> Result<()> {
-        let mut params = SnapshotCreateParams::new(snapshot_path.to_string_lossy().into_owned());
-        params.mem_file_path = Some(mem_file_path.to_string_lossy().into_owned());
-        // create diff snapshot, when not enable kvm dirty tracking, it will use mincore
-        // internally, to get the present pages and dump as a sparse file.
-        params.snapshot_type =
-            Some(firecracker_client::models::snapshot_create_params::SnapshotType::Diff);
-        self.client
-            .request_no_content(Method::PUT, "/snapshot/create", Some(&params))
-            .await
-            .context("Failed to create snapshot")
-    }
-
     /// Creates a diff snapshot containing VM state only.
     ///
     /// The memory data path is handled by AgentENV through dirty memory ranges.
@@ -758,16 +743,17 @@ mod tests {
         let instance = FirecrackerInstance::new(temp.path().to_path_buf());
 
         assert_eq!(
-            instance.resolve_host_path(Path::new("mem.bin")),
-            temp.path().join("mem.bin")
+            instance.resolve_host_path(Path::new("vm_state.bin")),
+            temp.path().join("vm_state.bin")
         );
         assert_eq!(
-            instance.resolve_host_path(Path::new("/tmp/mem.bin")),
-            PathBuf::from("/tmp/mem.bin")
+            instance.resolve_host_path(Path::new("/tmp/vm_state.bin")),
+            PathBuf::from("/tmp/vm_state.bin")
         );
 
         Ok(())
     }
+
     #[tokio::test]
     async fn fresh_and_restore_requests_include_track_dirty_pages() -> Result<()> {
         let temp = tempdir()?;

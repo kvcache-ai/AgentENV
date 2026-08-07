@@ -199,13 +199,10 @@ startup_prewarm = true
 fill_concurrency = 4
 
 [memory_snapshot]
-# Experimental: create memory overlaybd layers directly from Firecracker dirty
-# ranges via process_vm_readv, skipping the intermediate mem.bin file.
-direct_overlaybd = true
 # Experimental: enable Firecracker KVM dirty-page tracking for memory snapshots.
-# Requires direct_overlaybd = true. PVM is temporarily disabled because this
-# combination has not been tested.
-# Default false uses the mincore-based memory selection path.
+# Defaults to false and uses the mincore-based memory selection path. PVM is
+# temporarily disabled because this combination has not been tested.
+# Memory snapshot packaging always uses the direct OverlayBD path.
 # Can also be set with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES.
 track_dirty_pages = false
 compression_enabled = false

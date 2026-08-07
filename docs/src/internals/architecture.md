@@ -129,7 +129,7 @@ Memory snapshot restore uses ublk-backed overlaybd devices rather than userfault
 
 **Sharing**: Multiple sandboxes booting from the same snapshot template share a single memory ublk device via reference counting. This allows the Linux page cache to be reused across all sandboxes using the same memory image, significantly reducing I/O for concurrent launches from the same template.
 
-**Memory snapshot creation**: On pause, Firecracker's native diff snapshot (`SnapshotType::Diff`) produces a sparse `mem.bin` (using mincore internally to find present pages). This sparse file is then packaged into an overlaybd layer via `convert_sparse_mem_to_overlaybd`. Parent layers from previous snapshots are stacked, forming the full layered memory image.
+**Memory snapshot creation**: On pause, Firecracker creates a state-only diff snapshot. AgentENV queries Firecracker's dirty/present memory ranges, reads the selected memory with `process_vm_readv`, and directly creates the OverlayBD memory layer. Parent layers from previous snapshots are stacked, forming the full layered memory image.
 
 > **Note**: `storage/uffd-core/` contains an alternative userfaultfd-based memory restore implementation that is retained for reference but excluded from the workspace build.
 

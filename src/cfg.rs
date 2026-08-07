@@ -413,8 +413,6 @@ pub enum MemorySnapshotCompressionAlgorithm {
 pub struct MemorySnapshotConfig {
     #[config(default = "$AENV_HOME/overlaybd/mem-overlaybd-global.json")]
     pub overlaybd_global_config_path: PathBuf,
-    #[config(env = "AGENTENV_MEMORY_SNAPSHOT_DIRECT_OVERLAYBD", default = true)]
-    pub direct_overlaybd: bool,
     /// Enable Firecracker KVM dirty-page tracking for memory snapshots.
     /// Default: false, preserving the mincore-based path.
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = false)]
@@ -946,12 +944,6 @@ impl AppConfig {
                 "memory_snapshot.track_dirty_pages=true is disabled in PVM mode because this combination has not been tested"
             );
         }
-        if !memory.direct_overlaybd {
-            bail!(concat!(
-                "memory_snapshot.track_dirty_pages=true requires ",
-                "memory_snapshot.direct_overlaybd=true for cumulative dirty snapshots"
-            ));
-        }
         Ok(())
     }
 
@@ -1328,26 +1320,14 @@ mod tests {
         let path = temp.path().join("config.toml");
         std::fs::write(
             &path,
-            "virtualization_mode = \"kvm\"\n[memory_snapshot]\ntrack_dirty_pages = true\ndirect_overlaybd = true\n",
+            "virtualization_mode = \"kvm\"\n[memory_snapshot]\ntrack_dirty_pages = true\n",
         )?;
         let config = ConfigManager::new_from_path(&path)?;
         assert!(config.config().memory_snapshot.track_dirty_pages);
-        assert!(config.config().memory_snapshot.direct_overlaybd);
         assert_eq!(config.config().virtualization_mode, VirtualizationMode::Kvm);
         std::fs::write(
             &path,
-            "virtualization_mode = \"kvm\"\n[memory_snapshot]\ntrack_dirty_pages = true\ndirect_overlaybd = false\n",
-        )?;
-        let error = ConfigManager::new_from_path(&path).unwrap_err();
-        assert!(
-            error.to_string().contains(
-                "memory_snapshot.track_dirty_pages=true requires memory_snapshot.direct_overlaybd=true"
-            ),
-            "unexpected error: {error}"
-        );
-        std::fs::write(
-            &path,
-            "virtualization_mode = \"pvm\"\n[memory_snapshot]\ntrack_dirty_pages = true\ndirect_overlaybd = true\n",
+            "virtualization_mode = \"pvm\"\n[memory_snapshot]\ntrack_dirty_pages = true\n",
         )?;
         let error = ConfigManager::new_from_path(&path).unwrap_err();
         assert!(
@@ -1356,13 +1336,9 @@ mod tests {
             ),
             "unexpected error: {error}"
         );
-        std::fs::write(
-            &path,
-            "[memory_snapshot]\ntrack_dirty_pages = false\ndirect_overlaybd = false\n",
-        )?;
+        std::fs::write(&path, "[memory_snapshot]\ntrack_dirty_pages = false\n")?;
         let config = ConfigManager::new_from_path(&path)?;
         assert!(!config.config().memory_snapshot.track_dirty_pages);
-        assert!(!config.config().memory_snapshot.direct_overlaybd);
         Ok(())
     }
 
