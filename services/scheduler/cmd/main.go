@@ -69,7 +69,14 @@ func main() {
 		svc := scheduler.NewService(
 			logger,
 			registry,
-			scheduler.NewStrategy(cfg.Scheduler.Strategy),
+			scheduler.NewStrategy(
+				cfg.Scheduler.Strategy,
+				scheduler.WithGroupedRoundRobinLimits(scheduler.GroupedRoundRobinLimits{
+					MaxSandboxCount: cfg.Scheduler.GroupedRoundRobin.MaxSandboxCount,
+					MaxCPUCount:     cfg.Scheduler.GroupedRoundRobin.MaxCPUCount,
+					MaxMemoryMB:     cfg.Scheduler.GroupedRoundRobin.MaxMemoryMB,
+				}),
+			),
 			store,
 			scheduler.WithArtifactStore(scheduler.NewInMemoryArtifactStore(
 				cfg.Scheduler.ArtifactStoreCapacity,
