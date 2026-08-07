@@ -13,6 +13,7 @@ K8S_NAMESPACE ?= agentenv-system
 K8S_RUNTIME_IMAGE ?= agentenv-runtime:latest
 K8S_GATEWAY_IMAGE ?= agentenv-gateway:latest
 K8S_SCHEDULER_IMAGE ?= agentenv-scheduler:latest
+K8S_WEB_IMAGE ?= agentenv-web:latest
 K3S_CTR ?= sudo k3s ctr
 
 # aenv home path.
@@ -238,19 +239,23 @@ k8s-build:
 	$(DOCKER) build $(if $(APT_MIRROR_BASE),--build-arg APT_MIRROR_BASE="$(APT_MIRROR_BASE)",) -f deploy/docker/Dockerfile.agentenv -t $(K8S_RUNTIME_IMAGE) .
 	$(DOCKER) build -f deploy/docker/Dockerfile.gateway -t $(K8S_GATEWAY_IMAGE) .
 	$(DOCKER) build -f deploy/docker/Dockerfile.scheduler -t $(K8S_SCHEDULER_IMAGE) .
+	$(DOCKER) build -f deploy/docker/Dockerfile.web -t $(K8S_WEB_IMAGE) web
 
 k8s-redeploy:
 	$(KUBECTL) rollout restart deploy/agentenv-gateway -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout restart deploy/agentenv-scheduler -n $(K8S_NAMESPACE)
+	$(KUBECTL) rollout restart deploy/agentenv-web -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout restart ds/agentenv-node -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout status deploy/agentenv-gateway -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout status deploy/agentenv-scheduler -n $(K8S_NAMESPACE)
+	$(KUBECTL) rollout status deploy/agentenv-web -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout status ds/agentenv-node -n $(K8S_NAMESPACE)
 
 k8s-load-dev:
 	$(DOCKER) save $(K8S_RUNTIME_IMAGE) | $(K3S_CTR) images import -
 	$(DOCKER) save $(K8S_GATEWAY_IMAGE) | $(K3S_CTR) images import -
 	$(DOCKER) save $(K8S_SCHEDULER_IMAGE) | $(K3S_CTR) images import -
+	$(DOCKER) save $(K8S_WEB_IMAGE) | $(K3S_CTR) images import -
 
 k8s-refresh-dev: k8s-build k8s-load-dev k8s-redeploy
 

@@ -6,6 +6,7 @@
 - [Quick Start](./getting-started/quickstart.md)
 - [On-Demand Loading](./getting-started/on-demand-loading.md)
 - [aenv CLI Reference](./getting-started/aenv-cli.md)
+- [Web UI](./getting-started/web-ui.md)
 
 # Deployment
 

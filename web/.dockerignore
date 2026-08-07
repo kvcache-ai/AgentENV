@@ -1,0 +1,13 @@
+node_modules
+.next
+.git
+.gitignore
+*.md
+.env*
+.env*.local
+eslint.config.*
+.next/
+out/
+coverage/
+.turbo
+.DS_Store

@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentenv-web
+  labels:
+    app.kubernetes.io/name: agentenv-web
+spec:
+  selector:
+    app.kubernetes.io/name: agentenv-web
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http

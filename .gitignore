@@ -68,3 +68,8 @@ env/
 
 ### Node.js
 node_modules/
+web/.next/
+web/out/
+web/.turbo/
+*.tsbuildinfo
+.pnpm-store/

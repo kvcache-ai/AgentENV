@@ -12,6 +12,8 @@ resources:
   - scheduler-deployment.yaml
   - gateway-service.yaml
   - gateway-deployment.yaml
+  - web-service.yaml
+  - web-deployment.yaml
   - agentenv-headless-service.yaml
   - agentenv-ublk-daemon-metrics-service.yaml
   - agentenv-daemonset.yaml
@@ -39,6 +41,9 @@ images:
     newTag: latest
   - name: agentenv-runtime
     newName: agentenv-runtime
+    newTag: latest
+  - name: agentenv-web
+    newName: agentenv-web
     newTag: latest
 
 generatorOptions:
