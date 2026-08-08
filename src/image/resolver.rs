@@ -677,7 +677,7 @@ mod tests {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
                     "digest": "sha256:overlaybd",
                     "size": 20,
-                    "artifactType": OVERLAYBD_NATIVE_ARTIFACT_TYPE
+                    "artifactType": "application/vnd.containerd.overlaybd.native.v1+json"
                 }
             ]
         });
@@ -700,13 +700,13 @@ mod tests {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
                     "digest": "sha256:first",
                     "size": 10,
-                    "artifactType": OVERLAYBD_NATIVE_ARTIFACT_TYPE
+                    "artifactType": "application/vnd.containerd.overlaybd.native.v1+json"
                 },
                 {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
                     "digest": "sha256:second",
                     "size": 20,
-                    "artifactType": OVERLAYBD_NATIVE_ARTIFACT_TYPE
+                    "artifactType": "application/vnd.containerd.overlaybd.native.v1+json"
                 }
             ]
         });
@@ -748,7 +748,7 @@ mod tests {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
                     "digest": "sha256:0a21030948e9223e054ab830dd82b0ad85f921df34f11c5bf769bb0ed636d72a",
                     "size": 1234,
-                    "artifactType": ACR_ARTIFACT_STREAMING_ARTIFACT_TYPE,
+                    "artifactType": "application/vnd.azure.artifact.streaming.v1",
                     "annotations": {
                         "streaming.format": "overlaybd",
                         "streaming.version": "v1",
@@ -764,7 +764,61 @@ mod tests {
             Some((
                 "sha256:0a21030948e9223e054ab830dd82b0ad85f921df34f11c5bf769bb0ed636d72a"
                     .to_string(),
-                ACR_ARTIFACT_STREAMING_ARTIFACT_TYPE
+                "application/vnd.azure.artifact.streaming.v1"
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_overlaybd_referrer_selects_first_of_acr_per_platform_referrers() {
+        // Captured from `regctl artifact list --format body` against a real ACR
+        // registry, using a multi-arch *tag* as the subject, with the generic
+        // `org.opencontainers.image.*` annotations elided for readability.
+        //
+        // ACR attaches one streaming referrer per platform, all sharing the same
+        // artifactType, so an index subject yields several matches. The resolver
+        // never passes an index: `resolve_fetched_manifest` hands
+        // `FetchedManifest::selected_image_ref` to discovery, which is already
+        // pinned to the platform-resolved manifest digest, and such a subject
+        // carries exactly one referrer. This multi-match shape is therefore a
+        // defensive lock on first-match selection rather than the common path.
+        let body = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:1bdbcce5b02202d0c4c204da05e6ffbb8605bb178f441ff2990b9924c046a69f",
+                    "size": 2817,
+                    "artifactType": "application/vnd.azure.artifact.streaming.v1",
+                    "annotations": {
+                        "streaming.format": "overlaybd",
+                        "streaming.version": "v1",
+                        "streaming.platform.os": "linux",
+                        "streaming.platform.arch": "amd64"
+                    }
+                },
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:3a5ae9547e3ed4d44f435db3ca286f9655e9fcb43ba36b0f5a6cf7da409ce0b8",
+                    "size": 2819,
+                    "artifactType": "application/vnd.azure.artifact.streaming.v1",
+                    "annotations": {
+                        "streaming.format": "overlaybd",
+                        "streaming.version": "v1",
+                        "streaming.platform.os": "linux",
+                        "streaming.platform.arch": "arm64"
+                    }
+                }
+            ]
+        });
+
+        assert_eq!(
+            parse_overlaybd_referrer(&body.to_string()).expect("parse"),
+            Some((
+                "sha256:1bdbcce5b02202d0c4c204da05e6ffbb8605bb178f441ff2990b9924c046a69f"
+                    .to_string(),
+                "application/vnd.azure.artifact.streaming.v1"
             ))
         );
     }
@@ -779,20 +833,23 @@ mod tests {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
                     "digest": "sha256:acr",
                     "size": 10,
-                    "artifactType": ACR_ARTIFACT_STREAMING_ARTIFACT_TYPE
+                    "artifactType": "application/vnd.azure.artifact.streaming.v1"
                 },
                 {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
                     "digest": "sha256:native",
                     "size": 20,
-                    "artifactType": OVERLAYBD_NATIVE_ARTIFACT_TYPE
+                    "artifactType": "application/vnd.containerd.overlaybd.native.v1+json"
                 }
             ]
         });
 
         assert_eq!(
             parse_overlaybd_referrer(&body.to_string()).expect("parse"),
-            Some(("sha256:native".to_string(), OVERLAYBD_NATIVE_ARTIFACT_TYPE))
+            Some((
+                "sha256:native".to_string(),
+                "application/vnd.containerd.overlaybd.native.v1+json"
+            ))
         );
     }
 
@@ -822,6 +879,169 @@ mod tests {
         assert_eq!(
             parse_overlaybd_referrer(&body.to_string()).expect("parse"),
             None
+        );
+    }
+
+    #[test]
+    fn overlaybd_referrer_artifact_types_match_published_wire_values() {
+        // These are registry wire values, not internal identifiers: they must
+        // match byte-for-byte what accelerated-container-image and ACR publish.
+        // Asserting the literals here means a typo in the constants fails with
+        // a readable diff instead of only surfacing as a missed referrer.
+        assert_eq!(
+            OVERLAYBD_NATIVE_ARTIFACT_TYPE,
+            "application/vnd.containerd.overlaybd.native.v1+json"
+        );
+        assert_eq!(
+            ACR_ARTIFACT_STREAMING_ARTIFACT_TYPE,
+            "application/vnd.azure.artifact.streaming.v1"
+        );
+        // Preference order is part of the contract: an image carrying both
+        // referrers must resolve to the accelerated-container-image one.
+        assert_eq!(
+            OVERLAYBD_REFERRER_ARTIFACT_TYPES.to_vec(),
+            vec![
+                "application/vnd.containerd.overlaybd.native.v1+json",
+                "application/vnd.azure.artifact.streaming.v1",
+            ]
+        );
+    }
+
+    /// Install a fake `regctl` that records its argv (one entry per line) into
+    /// `<dir>/argv`, replays `stdout`/`stderr`, and exits with `exit_code`.
+    ///
+    /// This covers the half of discovery that fixture-only tests cannot: the
+    /// argv actually handed to `regctl`.
+    #[cfg(unix)]
+    fn fake_regctl(
+        dir: &std::path::Path,
+        stdout: &str,
+        stderr: &str,
+        exit_code: i32,
+    ) -> std::path::PathBuf {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let stdout_path = dir.join("stdout");
+        let stderr_path = dir.join("stderr");
+        std::fs::write(&stdout_path, stdout).expect("write stdout fixture");
+        std::fs::write(&stderr_path, stderr).expect("write stderr fixture");
+
+        // The script locates its fixtures relative to `$0` rather than
+        // embedding absolute paths, so a TMPDIR containing shell
+        // metacharacters cannot break or inject into the generated script.
+        //
+        // Staged write + rename so the binary is never observed half-written or
+        // non-executable, matching how the real dependency installer stages
+        // downloads.
+        let binary = dir.join("regctl");
+        let staged = dir.join("regctl.staged");
+        {
+            let mut file = std::fs::File::create(&staged).expect("create fake regctl");
+            write!(
+                file,
+                "#!/bin/sh\ndir=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nprintf '%s\\n' \"$@\" > \"$dir/argv\"\ncat \"$dir/stdout\"\ncat \"$dir/stderr\" >&2\nexit {exit_code}\n",
+            )
+            .expect("write fake regctl");
+            file.sync_all().expect("sync fake regctl");
+        }
+        let mut permissions = std::fs::metadata(&staged).expect("stat").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&staged, permissions).expect("chmod fake regctl");
+        std::fs::rename(&staged, &binary).expect("publish fake regctl");
+        binary
+    }
+
+    #[cfg(unix)]
+    fn recorded_argv(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(dir.join("argv"))
+            .expect("fake regctl did not run")
+            .lines()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn discover_overlaybd_referrer_lists_referrers_unfiltered_and_finds_acr_streaming() {
+        let temp = TempDir::new().expect("tempdir");
+        let subject = "demo.azurecr.io/python:3.11-slim";
+        // Literal referrers index as returned by ACR for an image processed by
+        // `az acr artifact-streaming create`.
+        let body = json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [
+                {
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "digest": "sha256:0a21030948e9223e054ab830dd82b0ad85f921df34f11c5bf769bb0ed636d72a",
+                    "size": 1234,
+                    "artifactType": "application/vnd.azure.artifact.streaming.v1",
+                    "annotations": {
+                        "streaming.format": "overlaybd",
+                        "streaming.version": "v1",
+                        "streaming.platform.os": "linux",
+                        "streaming.platform.arch": "amd64"
+                    }
+                }
+            ]
+        });
+        let regctl = fake_regctl(temp.path(), &body.to_string(), "", 0);
+
+        let discovered = discover_overlaybd_referrer(&regctl, subject)
+            .await
+            .expect("discover referrer");
+
+        assert_eq!(
+            discovered,
+            Some((
+                "sha256:0a21030948e9223e054ab830dd82b0ad85f921df34f11c5bf769bb0ed636d72a"
+                    .to_string(),
+                "application/vnd.azure.artifact.streaming.v1"
+            ))
+        );
+
+        let argv = recorded_argv(temp.path());
+        // The listing must stay unfiltered. `regctl artifact list` accepts only
+        // one `--filter-artifact-type`, so reintroducing it would pin discovery
+        // to a single artifactType and silently drop ACR referrers while every
+        // parse-level test stayed green.
+        assert!(
+            !argv.iter().any(|arg| arg == "--filter-artifact-type"),
+            "referrers must be listed unfiltered and matched locally, got argv: {argv:?}"
+        );
+        assert_eq!(
+            argv,
+            vec!["artifact", "list", "--format", "body", subject],
+            "unexpected regctl invocation"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn discover_overlaybd_referrer_surfaces_regctl_failure() {
+        let temp = TempDir::new().expect("tempdir");
+        let regctl = fake_regctl(
+            temp.path(),
+            "",
+            "unauthorized: authentication required\n",
+            1,
+        );
+
+        let error = discover_overlaybd_referrer(&regctl, "demo.azurecr.io/python:3.11-slim")
+            .await
+            .expect_err("regctl failure must not be reported as 'no referrer'");
+
+        // A registry error has to fail loudly: swallowing it into `Ok(None)`
+        // would silently downgrade to a local pull-and-convert.
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("regctl artifact list failed"),
+            "unexpected error: {rendered}"
+        );
+        assert!(
+            rendered.contains("unauthorized: authentication required"),
+            "regctl stderr must be preserved: {rendered}"
         );
     }
 
