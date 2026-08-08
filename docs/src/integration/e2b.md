@@ -101,3 +101,22 @@ sandbox.kill()
 
 AgentENV is compatible with the E2B CLI, but we recommend using the
 [aenv CLI](../getting-started/aenv-cli.md) for AgentENV workflows.
+
+## Crabbox
+
+[Crabbox](https://crabbox.sh/providers/e2b.html) is a third-party client that
+uses AgentENV through its E2B-compatible API. Configure its `e2b` provider with:
+
+```bash
+export CRABBOX_E2B_API_URL=https://agentenv.example.com
+export CRABBOX_E2B_API_KEY=e2b_000000
+export CRABBOX_E2B_TEMPLATE=ubuntu
+
+crabbox doctor --provider e2b
+crabbox run --provider e2b -- make test-unit
+```
+
+`run` also requires host-based sandbox routing through a domain in
+`[sandbox_proxy].domains`; wildcard DNS and TLS must cover URLs shaped like
+`https://{port}-{sandboxID}.{domain}`. If an intermediary removes the `domain`
+field from AgentENV's response, set `CRABBOX_E2B_DOMAIN` to the same domain.
