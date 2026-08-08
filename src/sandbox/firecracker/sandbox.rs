@@ -20,8 +20,7 @@ use super::manifest::FirecrackerSnapshotManifest;
 use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
-    convert_sparse_mem_to_overlaybd, restack_snapshot_overlaybd_device,
-    restack_snapshot_overlaybd_rootfs,
+    restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
 };
 use super::pool::{warm_stderr_path, warm_stdout_path, FirecrackerPool};
 use super::FirecrackerInstance;
@@ -809,44 +808,22 @@ impl FirecrackerSandbox {
         memory_output: OverlaybdCompactOutput,
     ) -> Result<(PathBuf, u64)> {
         let mem_overlaybd_dir = snapshot_dir.join("mem_overlaybd");
-        let config = ConfigManager::global_config();
-        let use_direct_overlaybd =
-            config.memory_snapshot.direct_overlaybd || self.launch.common().track_dirty_pages;
-        // Persisted dirty sandboxes must keep cumulative direct capture after restart.
-        if use_direct_overlaybd {
-            let firecracker_pid = self.fc_instance.pid()?;
-            self.fc_instance
-                .create_state_only_snapshot(vm_state_path)
-                .await?;
-            // `vm_state.bin` now represents this paused VM state. Any later
-            // error aborts this direct snapshot attempt and is propagated to
-            // the lifecycle caller for recovery.
-            let dirty_ranges = self.fc_instance.get_dirty_memory_ranges().await?;
-            convert_dirty_memory_to_overlaybd(
-                firecracker_pid,
-                &dirty_ranges,
-                &mem_overlaybd_dir,
-                memory_output,
-            )
-            .await
-            .context("convert dirty memory ranges to overlaybd layer")
-        } else {
-            let mem_path = snapshot_dir.join("mem.bin");
-            self.fc_instance
-                .create_snapshot(vm_state_path, &mem_path)
-                .await?;
-
-            // Convert the sparse diff mem snapshot to an overlaybd layer.
-            let mem_virtual_size = tokio::fs::metadata(&mem_path)
-                .await
-                .with_context(|| format!("stat mem snapshot: {}", mem_path.display()))?
-                .len();
-            let mem_layer_path =
-                convert_sparse_mem_to_overlaybd(&mem_path, &mem_overlaybd_dir, memory_output)
-                    .await
-                    .context("convert mem snapshot to overlaybd layer")?;
-            Ok((mem_layer_path, mem_virtual_size))
-        }
+        let firecracker_pid = self.fc_instance.pid()?;
+        self.fc_instance
+            .create_state_only_snapshot(vm_state_path)
+            .await?;
+        // `vm_state.bin` now represents this paused VM state. Any later
+        // error aborts this direct snapshot attempt and is propagated to
+        // the lifecycle caller for recovery.
+        let dirty_ranges = self.fc_instance.get_dirty_memory_ranges().await?;
+        convert_dirty_memory_to_overlaybd(
+            firecracker_pid,
+            &dirty_ranges,
+            &mem_overlaybd_dir,
+            memory_output,
+        )
+        .await
+        .context("convert dirty memory ranges to overlaybd layer")
     }
 
     /// Resume a paused sandbox in-place.

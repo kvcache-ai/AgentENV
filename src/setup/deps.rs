@@ -832,7 +832,6 @@ mod tests {
             },
             memory_snapshot: MemorySnapshotConfig {
                 overlaybd_global_config_path: mem_global,
-                direct_overlaybd: false,
                 ..Default::default()
             },
             ..AppConfig::default()

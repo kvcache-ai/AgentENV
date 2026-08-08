@@ -199,12 +199,11 @@ async fn microvm_lifecycle_and_snapshot_preserve_disk_state() -> Result<()> {
     Ok(())
 }
 
-/// Shared body of the direct/legacy memory snapshot format tests: pause a
-/// marked sandbox into a temp dir, assert the snapshot artifact layout for the
-/// selected memory snapshot path (`direct` = direct overlaybd), validate the
-/// newest memory lower against the configured compression policy, and verify
-/// that a resume round-trip preserves guest disk state.
-async fn run_memory_snapshot_format_and_resume_case(direct: bool) -> Result<()> {
+/// Shared body of the memory snapshot format test: pause a marked sandbox into
+/// a temp dir, assert the direct OverlayBD snapshot artifact layout, validate
+/// the newest memory lower against the configured compression policy, and
+/// verify that a resume round-trip preserves guest disk state.
+async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
     let sandbox_config = common::default_sandbox_config()?;
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
@@ -220,17 +219,10 @@ async fn run_memory_snapshot_format_and_resume_case(direct: bool) -> Result<()> 
         .path()
         .join("mem_overlaybd/overlaybd.commit")
         .exists());
-    if direct {
-        assert!(snapshot_dir.path().join("mem_image.json").exists());
-    }
+    assert!(snapshot_dir.path().join("mem_image.json").exists());
     assert!(
         !snapshot_dir.path().join("mem.bin").exists(),
-        "{}",
-        if direct {
-            "direct overlaybd snapshot should not create mem.bin"
-        } else {
-            "legacy snapshot should remove mem.bin after overlaybd conversion"
-        }
+        "direct OverlayBD snapshot should not create mem.bin"
     );
     assert_memory_layer_matches_config(&snapshot).await?;
 
@@ -240,38 +232,13 @@ async fn run_memory_snapshot_format_and_resume_case(direct: bool) -> Result<()> 
     Ok(())
 }
 
-/// Direct path (`direct_overlaybd = true`): memory overlaybd layers are built
-/// straight from Firecracker dirty ranges without an intermediate `mem.bin`.
-/// The newest memory lower must match the configured compression policy and
-/// the snapshot must resume with guest state intact. This single test is run
-/// by three independent processes (raw/lz4/zstd temp configs) to cover all
-/// three modes.
+/// Direct OverlayBD memory layers are built from Firecracker memory ranges
+/// without an intermediate raw memory file. This test is run by three
+/// independent processes (raw/lz4/zstd temp configs) to cover all modes.
 #[tokio::test]
 async fn memory_snapshot_format_matches_config_and_resumes() -> Result<()> {
     common::setup().await;
-    let config = agentenv::cfg::ConfigManager::global().config();
-    if !config.memory_snapshot.direct_overlaybd {
-        eprintln!("skipping direct overlaybd integration test; direct_overlaybd is disabled");
-        return Ok(());
-    }
-
-    run_memory_snapshot_format_and_resume_case(true).await
-}
-
-/// Legacy path (`direct_overlaybd = false`): Firecracker first writes a sparse
-/// `mem.bin` diff snapshot, which is converted into a sealed overlaybd layer
-/// and removed after the conversion. Same format/resume assertions as the
-/// direct path; run by the legacy temp-config processes.
-#[tokio::test]
-async fn legacy_memory_snapshot_format_matches_config_and_resumes() -> Result<()> {
-    common::setup().await;
-    let config = agentenv::cfg::ConfigManager::global().config();
-    if config.memory_snapshot.direct_overlaybd {
-        eprintln!("skipping legacy memory snapshot test; direct_overlaybd is enabled");
-        return Ok(());
-    }
-
-    run_memory_snapshot_format_and_resume_case(false).await
+    run_memory_snapshot_format_and_resume_case().await
 }
 
 #[tokio::test]
