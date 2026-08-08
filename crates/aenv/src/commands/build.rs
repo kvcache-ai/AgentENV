@@ -4,6 +4,7 @@ use crate::client::{
 };
 use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
+use parse_dockerfile::{Command, HereDoc, Instruction, RunInstruction};
 use shell_util::shell_quote;
 use std::path::{Path, PathBuf};
 
@@ -67,21 +68,14 @@ pub(crate) fn parse_alias(flag: Option<&str>, dockerfile: &Path) -> String {
 }
 
 pub(crate) fn first_from_image(dockerfile: &str) -> Option<String> {
-    dockerfile.lines().find_map(|raw| {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+    let parsed = parse_dockerfile::parse(dockerfile).ok()?;
+    parsed.instructions.iter().find_map(|instruction| {
+        let Instruction::From(from) = instruction else {
             return None;
-        }
-        let mut parts = line.split_whitespace();
-        let instruction = parts.next()?;
-        if !instruction.eq_ignore_ascii_case("FROM") {
-            return None;
-        }
-        parts
-            .find(|part| !part.starts_with("--"))
-            .filter(|image| !image.is_empty())
-            .filter(|image| *image != "scratch" && !image.starts_with('$'))
-            .map(str::to_string)
+        };
+        let image = from.image.value.as_ref();
+        (!image.is_empty() && image != "scratch" && !image.starts_with('$'))
+            .then(|| image.to_string())
     })
 }
 
@@ -92,40 +86,77 @@ struct DockerfileBuildPlan {
 }
 
 fn dockerfile_build_plan(dockerfile: &str) -> Result<DockerfileBuildPlan> {
+    let parsed = parse_dockerfile::parse(dockerfile).context("parsing Dockerfile")?;
+    let escape = parsed
+        .parser_directives
+        .escape
+        .as_ref()
+        .map_or('\\', |directive| directive.value.value);
     let mut steps = Vec::new();
     let mut entrypoint = None;
     let mut cmd = None;
 
-    for (instruction, args) in dockerfile.lines().filter_map(dockerfile_instruction) {
-        let step = match instruction.to_ascii_uppercase().as_str() {
-            "FROM" => None,
-            "RUN" | "WORKDIR" | "USER" => Some(TemplateStep {
-                r#type: instruction.to_ascii_uppercase(),
-                args: vec![args.to_string()],
+    for instruction in &parsed.instructions {
+        let step = match instruction {
+            Instruction::From(_) => None,
+            Instruction::Run(run) => Some(TemplateStep {
+                r#type: "RUN".to_string(),
+                args: vec![dockerfile_run_command(run, escape)?],
             }),
-            "ENV" | "ARG" => Some(TemplateStep {
-                r#type: instruction.to_ascii_uppercase(),
-                args: key_value_args(instruction, args)?,
+            Instruction::Workdir(workdir) => Some(TemplateStep {
+                r#type: "WORKDIR".to_string(),
+                args: vec![workdir.arguments.value.to_string()],
             }),
-            "ENTRYPOINT" => {
-                entrypoint = dockerfile_command(args);
+            Instruction::User(user) => Some(TemplateStep {
+                r#type: "USER".to_string(),
+                args: vec![user.arguments.value.to_string()],
+            }),
+            Instruction::Env(env) => Some(TemplateStep {
+                r#type: "ENV".to_string(),
+                args: key_value_args("ENV", &env.arguments.value)?,
+            }),
+            Instruction::Arg(arg) => Some(TemplateStep {
+                r#type: "ARG".to_string(),
+                args: key_value_args("ARG", &arg.arguments.value)?,
+            }),
+            Instruction::Entrypoint(instruction) => {
+                entrypoint = dockerfile_command(&instruction.arguments);
                 None
             }
-            "CMD" => {
-                cmd = dockerfile_command(args);
+            Instruction::Cmd(instruction) => {
+                cmd = dockerfile_command(&instruction.arguments);
                 None
             }
-            "SHELL" | "STOPSIGNAL" => None,
-            "EXPOSE" | "VOLUME" | "LABEL" => {
-                eprintln!(
-                    "warning: {instruction} instruction is not supported and will be ignored"
-                );
+            Instruction::Shell(_) | Instruction::Stopsignal(_) => None,
+            Instruction::Expose(_) => {
+                warn_ignored_instruction("EXPOSE");
                 None
             }
-            "COPY" | "ADD" => {
-                bail!("{instruction} instructions are not supported by AENV template builds yet")
+            Instruction::Volume(_) => {
+                warn_ignored_instruction("VOLUME");
+                None
             }
-            _ => bail!("Dockerfile instruction {instruction} is not supported"),
+            Instruction::Label(_) => {
+                warn_ignored_instruction("LABEL");
+                None
+            }
+            Instruction::Maintainer(_) => {
+                warn_ignored_instruction("MAINTAINER");
+                None
+            }
+            Instruction::Copy(_) => {
+                bail!("COPY instructions are not supported by AENV template builds yet")
+            }
+            Instruction::Add(_) => {
+                bail!("ADD instructions are not supported by AENV template builds yet")
+            }
+            Instruction::Healthcheck(_) => {
+                bail!("Dockerfile instruction HEALTHCHECK is not supported")
+            }
+            Instruction::Onbuild(_) => {
+                bail!("Dockerfile instruction ONBUILD is not supported")
+            }
+            _ => bail!("Dockerfile instruction is not supported"),
         };
         if let Some(step) = step {
             steps.push(step);
@@ -138,38 +169,88 @@ fn dockerfile_build_plan(dockerfile: &str) -> Result<DockerfileBuildPlan> {
     })
 }
 
-fn dockerfile_command(args: &str) -> Option<String> {
-    let args = args.trim();
-    if args.is_empty() {
-        return None;
-    }
-    if args.starts_with('[') {
-        if let Ok(parts) = serde_json::from_str::<Vec<String>>(args) {
-            if parts.is_empty() {
-                return None;
-            }
-            return Some(
-                parts
-                    .iter()
-                    .map(|s| shell_quote(s))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
+fn dockerfile_run_command(run: &RunInstruction<'_>, escape: char) -> Result<String> {
+    match (&run.arguments, run.here_docs.as_slice()) {
+        (Command::Exec(_), []) => dockerfile_command(&run.arguments)
+            .context("RUN instruction requires a non-empty command"),
+        (Command::Shell(command), []) => Ok(normalize_run_continuations(command.value, escape)),
+        (Command::Shell(command), [here_doc]) if command.value.trim().is_empty() => {
+            Ok(here_doc.value.to_string())
         }
+        (Command::Shell(command), [here_doc]) => {
+            Ok(render_run_heredoc(command.value.trim(), here_doc))
+        }
+        (_, here_docs) if here_docs.len() > 1 => {
+            bail!("multiple RUN heredocs are not supported")
+        }
+        _ => bail!("RUN heredocs are only supported for shell-form commands"),
     }
-    Some(args.to_string())
 }
 
-fn dockerfile_instruction(line: &str) -> Option<(&str, &str)> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
-        return None;
+fn render_run_heredoc(command: &str, here_doc: &HereDoc<'_>) -> String {
+    let delimiter = unique_heredoc_delimiter(&here_doc.value);
+    let opening_delimiter = if here_doc.expand {
+        delimiter.clone()
+    } else {
+        format!("'{delimiter}'")
+    };
+    let body_newline = if here_doc.value.is_empty() || here_doc.value.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+
+    format!(
+        "<<{opening_delimiter} {command}\n{}{body_newline}{delimiter}",
+        here_doc.value
+    )
+}
+
+fn unique_heredoc_delimiter(body: &str) -> String {
+    const BASE: &str = "AENV_HEREDOC";
+
+    (0..)
+        .map(|suffix| {
+            if suffix == 0 {
+                BASE.to_string()
+            } else {
+                format!("{BASE}_{suffix}")
+            }
+        })
+        .find(|delimiter| body.lines().all(|line| line != delimiter))
+        .expect("the unbounded delimiter sequence must contain an unused value")
+}
+
+fn normalize_run_continuations(command: &str, escape: char) -> String {
+    if escape == '\\' {
+        return command.to_string();
     }
-    let (instruction, args) = line
-        .split_once(char::is_whitespace)
-        .map(|(instruction, args)| (instruction, args.trim()))
-        .unwrap_or((line, ""));
-    Some((instruction, args))
+
+    command
+        .replace(&format!("{escape}\r\n"), "\\\r\n")
+        .replace(&format!("{escape}\n"), "\\\n")
+}
+
+fn dockerfile_command(command: &Command<'_>) -> Option<String> {
+    match command {
+        Command::Exec(parts) => (!parts.value.is_empty()).then(|| {
+            parts
+                .value
+                .iter()
+                .map(|part| shell_quote(&part.value))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }),
+        Command::Shell(command) => {
+            let command = command.value.trim();
+            (!command.is_empty()).then(|| command.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn warn_ignored_instruction(instruction: &str) {
+    eprintln!("warning: {instruction} instruction is not supported and will be ignored");
 }
 
 fn key_value_args(instruction: &str, args: &str) -> Result<Vec<String>> {
@@ -259,6 +340,101 @@ ARG NODE_ENV=production
     }
 
     #[test]
+    fn dockerfile_build_plan_parses_multiline_run() {
+        let plan = dockerfile_build_plan(
+            r#"FROM ubuntu:24.04
+RUN apt-get update && \
+    apt-get install -y curl
+WORKDIR /app
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].r#type, "RUN");
+        assert_eq!(
+            plan.steps[0].args,
+            ["apt-get update && \\\n    apt-get install -y curl"]
+        );
+        assert_eq!(plan.steps[1].r#type, "WORKDIR");
+    }
+
+    #[test]
+    fn dockerfile_build_plan_honors_escape_directive_for_multiline_run() {
+        let plan = dockerfile_build_plan(
+            r#"# escape=`
+FROM ubuntu:24.04
+RUN echo first && `
+    echo second
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].r#type, "RUN");
+        assert_eq!(
+            plan.steps[0].args[0],
+            r#"echo first && \
+    echo second"#
+        );
+    }
+
+    #[test]
+    fn dockerfile_build_plan_parses_bare_run_heredoc_as_script() {
+        let plan = dockerfile_build_plan(
+            r#"FROM ubuntu:24.04
+RUN <<EOF
+set -eu
+echo hello
+EOF
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].r#type, "RUN");
+        assert_eq!(plan.steps[0].args, ["set -eu\necho hello\n"]);
+    }
+
+    #[test]
+    fn dockerfile_build_plan_preserves_run_heredoc_command() {
+        let plan = dockerfile_build_plan(
+            r#"FROM ubuntu:24.04
+RUN <<EOF bash
+set -eu
+echo hello
+EOF
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].r#type, "RUN");
+        assert_eq!(
+            plan.steps[0].args,
+            ["<<AENV_HEREDOC bash\nset -eu\necho hello\nAENV_HEREDOC"]
+        );
+    }
+
+    #[test]
+    fn dockerfile_build_plan_renders_safe_quoted_heredoc_delimiter() {
+        let plan = dockerfile_build_plan(
+            r#"FROM ubuntu:24.04
+RUN <<'EOF' cat
+AENV_HEREDOC
+EOF
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(
+            plan.steps[0].args,
+            ["<<'AENV_HEREDOC_1' cat\nAENV_HEREDOC\nAENV_HEREDOC_1"]
+        );
+    }
+
+    #[test]
     fn dockerfile_build_plan_uses_entrypoint_as_start_cmd() {
         let plan = dockerfile_build_plan(
             r#"
@@ -341,6 +517,21 @@ RUN echo hi
 "#,
         )
         .unwrap();
+        assert_eq!(plan.steps.len(), 1);
+        assert_eq!(plan.steps[0].r#type, "RUN");
+    }
+
+    #[test]
+    fn dockerfile_build_plan_skips_maintainer() {
+        let plan = dockerfile_build_plan(
+            r#"
+FROM ubuntu:24.04
+MAINTAINER AgentENV
+RUN echo hi
+"#,
+        )
+        .unwrap();
+
         assert_eq!(plan.steps.len(), 1);
         assert_eq!(plan.steps[0].r#type, "RUN");
     }
