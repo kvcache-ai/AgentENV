@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-f7fc3e87.js";
+            window.path_to_searchindex_js = "../searchindex-57a597c0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-795efd7f.js"></script>
@@ -717,19 +717,17 @@ host sysctls; otherwise configure these kernel parameters on the host.</p>
 </table>
 </div>
 <h2 id="ublk"><a class="header" href="#ublk"><code>[ublk]</code></a></h2>
-<p>Optional userspace block device configuration. When enabled, rootfs is served through a ublk device instead of a plain file, managed by <code>uvm-ublk-daemon</code>.</p>
+<p>Userspace block device configuration. Rootfs is served through an OverlayBD-backed ublk device managed by <code>uvm-ublk-daemon</code>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable ublk-backed rootfs</td></tr>
 <tr><td><code>daemon_binary_path</code></td><td>string</td><td><code>"$AENV_HOME/ublk/uvm-ublk-daemon"</code></td><td>Path to the <code>uvm-ublk-daemon</code> binary</td></tr>
 <tr><td><code>daemon_socket_path</code></td><td>string</td><td><code>"$AENV_RUNTIME/ublk-daemon.sock"</code></td><td>Unix socket path used by the daemon</td></tr>
 <tr><td><code>daemon_log_path</code></td><td>string</td><td><code>"$AENV_HOME/logs/ublk-daemon.log"</code></td><td>File path for daemon logs; deployments are responsible for rotation and retention</td></tr>
 <tr><td><code>daemon_metrics_listen_addr</code></td><td>string</td><td><code>"0.0.0.0:9103"</code></td><td>HTTP listen address for daemon Prometheus metrics; empty string disables it</td></tr>
-<tr><td><code>device_type</code></td><td>string</td><td><code>"overlaybd"</code></td><td><code>"cow"</code> (copy-on-write) or <code>"overlaybd"</code> (layered image)</td></tr>
 </tbody>
 </table>
 </div>
@@ -739,7 +737,7 @@ host sysctls; otherwise configure these kernel parameters on the host.</p>
 <li><code>AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR</code></li>
 </ul>
 <h2 id="ublkoverlaybd"><a class="header" href="#ublkoverlaybd"><code>[ublk.overlaybd]</code></a></h2>
-<p>Overlaybd-specific configuration used when <code>ublk.device_type = "overlaybd"</code>.</p>
+<p>OverlayBD configuration for ublk. Legacy <code>enabled</code> and <code>device_type</code> keys are ignored.</p>
 <div class="table-wrapper">
 <table>
 <thead>

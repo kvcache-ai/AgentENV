@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-f7fc3e87.js";
+            window.path_to_searchindex_js = "../searchindex-57a597c0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-795efd7f.js"></script>
@@ -581,18 +581,16 @@ ready after VM start (default: 30).</li>
 <li>
 <p><code>[ublk]</code></p>
 <ul>
-<li><code>enabled</code>: Enables ublk-backed rootfs handling.</li>
 <li><code>daemon_binary_path</code>: Optional path to <code>uvm-ublk-daemon</code>.</li>
 <li><code>daemon_socket_path</code>: Optional unix socket path for daemon RPCs.</li>
 <li><code>daemon_log_path</code>: Optional log file path for the daemon process.</li>
-<li><code>device_type</code>: <code>cow</code> or <code>overlaybd</code>.</li>
 </ul>
 </li>
 <li>
 <p><code>[ublk.overlaybd]</code></p>
 <ul>
 <li><code>global_config_path</code>: path to the generated overlaybd runtime config.
-Required for <code>overlaybd</code> device_type. Per-image configs are derived from
+Required for ublk. Per-image configs are derived from
 template build <code>fromImage</code> values and live under
 <code>&lt;image.cache.root_dir&gt;/configs</code>.</li>
 </ul>

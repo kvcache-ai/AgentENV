@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-f7fc3e87.js";
+            window.path_to_searchindex_js = "../searchindex-57a597c0.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-795efd7f.js"></script>
@@ -250,7 +250,7 @@
 <p><strong>Snapshot</strong>: <code>ImageFile::create_snapshot_and_restack()</code> is the primary pause path. It seals the live upper layer via <code>LSMTFile::close_seal_and_reopen()</code> so the upper becomes the newest lower layer, then reopens a fresh writable upper in place. <code>image/snapshot.rs::export_upper_as_snapshot_layer()</code> retains the explicit upper-export path used by packaging and export flows.</p>
 <p><strong>Key files</strong>: <code>image/image_file.rs</code> (high-level image), <code>lsmt/file/</code> (LSMT stacking: <code>readonly.rs</code> for <code>LSMTReadOnlyFile</code>, <code>readwrite.rs</code> for <code>LSMTFile</code>, <code>stack.rs</code> for open/merge/stack helpers), <code>lsmt/format.rs</code> (binary format), <code>lsmt/index.rs</code> (segment mapping), <code>compression/zfile.rs</code> (compression), <code>image/snapshot.rs</code>.</p>
 <h3 id="ublk-storageublk"><a class="header" href="#ublk-storageublk">ublk (<code>storage/ublk/</code>)</a></h3>
-<p>Async userspace block device server using Linux’s ublk kernel driver. Exposes overlaybd images (or raw CoW files) as <code>/dev/ublkbN</code> block devices.</p>
+<p>Async userspace block device server using Linux’s ublk kernel driver. Exposes OverlayBD images as <code>/dev/ublkbN</code> block devices.</p>
 <p><strong>Device lifecycle</strong>:</p>
 <ol>
 <li><code>UVMUblkCtrlBuilder</code> sends <code>ADD</code> to <code>/dev/ublk-control</code> via io_uring <code>UringCmd</code></li>
@@ -259,17 +259,16 @@
 <li>Kernel dispatches block I/O to mmap’d <code>ublksrv_io_desc</code> arrays; userspace processes them asynchronously</li>
 <li><code>delete_dev()</code> tears down the device</li>
 </ol>
-<p><strong>Target implementations</strong> (<code>UVMUblkTarget</code> trait):</p>
+<p><strong>Target implementation</strong> (<code>UVMUblkTarget</code> trait):</p>
 <ul>
 <li><code>OverlaybdTarget</code>: wraps <code>ImageFile</code> for full layered image I/O</li>
-<li><code>BasicCowTarget</code>: chunk-based copy-on-write over a read-only origin file. Per-chunk <code>AtomicU8</code> state tracking (Origin -&gt; Copying -&gt; Cow) prevents duplicate copies. Coalesces adjacent reads.</li>
 </ul>
 <p><strong>I/O buffers</strong>: <code>AutoRegBuffer</code> (zero-copy via sparse buffer table, kernel 6.8+) or <code>UserBuffer</code> (traditional allocation).</p>
-<p><strong>Key files</strong>: <code>lib.rs</code> (public API), <code>ctrl.rs</code> (device controller), <code>dev.rs</code> (device + queue management), <code>queue.rs</code> (I/O descriptor handling), <code>io_buffer.rs</code>, <code>impls/cow.rs</code>, <code>impls/overlaybd_target.rs</code>.</p>
+<p><strong>Key files</strong>: <code>lib.rs</code> (public API), <code>ctrl.rs</code> (device controller), <code>dev.rs</code> (device + queue management), <code>queue.rs</code> (I/O descriptor handling), <code>io_buffer.rs</code>, <code>impls/overlaybd_target.rs</code>.</p>
 <h3 id="ublk-daemon-storageublk-daemon"><a class="header" href="#ublk-daemon-storageublk-daemon">ublk-daemon (<code>storage/ublk-daemon/</code>)</a></h3>
 <p>Long-running daemon process (<code>uvm-ublk-daemon</code>) that manages all ublk devices in one process and communicates with the AgentENV node over a Unix domain socket.</p>
 <ul>
-<li>Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD/COW device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.</li>
+<li>Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.</li>
 <li><code>UblkDaemonClient</code> spawns and monitors the daemon process from the node runtime.</li>
 <li><code>UblkDeviceManager</code> (<code>src/sandbox/ublk/device.rs</code>) is the node-facing singleton that delegates lifecycle operations to the daemon client; device IDs are allocated in the daemon.</li>
 </ul>
@@ -433,7 +432,6 @@ at render/apply time so AgentENV runtime config remains single-sourced.</p>
 │   ├── queue.rs                # I/O descriptor handling
 │   ├── io_buffer.rs            # zero-copy + traditional buffers
 │   └── impls/                  # target implementations
-│       ├── cow.rs              # BasicCowTarget
 │       └── overlaybd_target.rs # OverlaybdTarget
 ├── ublk-daemon/src/            # ublk daemon (unix socket RPC)
 │   ├── client.rs               # daemon client used by node runtime
