@@ -115,9 +115,7 @@ access_key_secret = "minioadmin"
 cache_max_size_gb = 10
 
 [ublk]
-enabled = true
 daemon_metrics_listen_addr = "0.0.0.0:9103"
-device_type = "overlaybd"
 
 [ublk.overlaybd]
 read_only = false

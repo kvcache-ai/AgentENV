@@ -293,15 +293,12 @@ enabled = false
   - `snapshot_store`: Committed snapshot store root. Defaults to `$AENV_HOME/snapshot-store`.
 
 - `[ublk]`
-  - `enabled`: Enables ublk-backed rootfs handling.
   - `daemon_binary_path`: Optional path to `uvm-ublk-daemon`.
   - `daemon_socket_path`: Optional unix socket path for daemon RPCs.
   - `daemon_log_path`: Optional log file path for the daemon process.
-  - `device_type`: `cow` or `overlaybd`.
-
 - `[ublk.overlaybd]`
   - `global_config_path`: path to the generated overlaybd runtime config.
-    Required for `overlaybd` device_type. Per-image configs are derived from
+    Required for ublk. Per-image configs are derived from
     template build `fromImage` values and live under
     `<image.cache.root_dir>/configs`.
 

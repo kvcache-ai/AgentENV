@@ -434,16 +434,14 @@ Protobuf compiler metadata for code generation lives in
 
 ## `[ublk]`
 
-Optional userspace block device configuration. When enabled, rootfs is served through a ublk device instead of a plain file, managed by `uvm-ublk-daemon`.
+Userspace block device configuration. Rootfs is served through an OverlayBD-backed ublk device managed by `uvm-ublk-daemon`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | boolean | `true` | Enable ublk-backed rootfs |
 | `daemon_binary_path` | string | `"$AENV_HOME/ublk/uvm-ublk-daemon"` | Path to the `uvm-ublk-daemon` binary |
 | `daemon_socket_path` | string | `"$AENV_RUNTIME/ublk-daemon.sock"` | Unix socket path used by the daemon |
 | `daemon_log_path` | string | `"$AENV_HOME/logs/ublk-daemon.log"` | File path for daemon logs; deployments are responsible for rotation and retention |
 | `daemon_metrics_listen_addr` | string | `"0.0.0.0:9103"` | HTTP listen address for daemon Prometheus metrics; empty string disables it |
-| `device_type` | string | `"overlaybd"` | `"cow"` (copy-on-write) or `"overlaybd"` (layered image) |
 
 Environment variable override:
 
@@ -452,7 +450,7 @@ Environment variable override:
 
 ## `[ublk.overlaybd]`
 
-Overlaybd-specific configuration used when `ublk.device_type = "overlaybd"`.
+OverlayBD configuration for ublk. Legacy `enabled` and `device_type` keys are ignored.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

@@ -300,7 +300,7 @@ impl TemplateBuilder {
                 image_configs,
             } => {
                 Self::ensure_path_exists(image_config_path, "overlaybd image config")?;
-                let ublk_config = Self::load_overlaybd_build_ublk_config(image_config_path)?;
+                let ublk_config = Self::load_overlaybd_build_ublk_config(image_config_path);
                 Ok(TemplateBuildBase::Rootfs {
                     launch_rootfs_path: image_config_path.clone(),
                     ublk_config: Some(ublk_config),
@@ -310,21 +310,13 @@ impl TemplateBuilder {
         }
     }
 
-    fn load_overlaybd_build_ublk_config(
-        image_config_path: &Path,
-    ) -> TemplateBuildResult<UblkConfig> {
+    fn load_overlaybd_build_ublk_config(image_config_path: &Path) -> UblkConfig {
         let ublk = &ConfigManager::global_config().ublk;
-        if !ublk.enabled {
-            return Err(TemplateBuildError::invalid_input(
-                "overlaybd build base requires ublk to be enabled",
-            ));
-        }
-
-        Ok(UblkConfig::overlaybd_with_runtime_upper_mode(
+        UblkConfig::overlaybd_with_runtime_upper_mode(
             image_config_path.to_path_buf(),
             ublk.overlaybd.read_only,
             ublk.overlaybd.runtime_upper_mode,
-        ))
+        )
     }
 
     fn ensure_path_exists(path: &Path, kind: &str) -> TemplateBuildResult<()> {

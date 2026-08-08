@@ -354,8 +354,6 @@ pub enum SnapshotRepositoryBackendKind {
 
 #[derive(Debug, Config, Clone)]
 pub struct UblkTomlConfig {
-    #[config(default = true)]
-    pub enabled: bool,
     /// Path to the `uvm-ublk-daemon` binary.
     #[config(env = "AENV_UBLK_DAEMON_BINARY_PATH", parse_env = parse_required_path)]
     pub daemon_binary_path: Option<PathBuf>,
@@ -368,8 +366,6 @@ pub struct UblkTomlConfig {
     /// HTTP listen address for ublk daemon metrics. Empty string disables it.
     #[config(env = "AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR", parse_env = parse_trimmed_string, default = "0.0.0.0:9103")]
     pub daemon_metrics_listen_addr: String,
-    #[config(default = "overlaybd")]
-    pub device_type: String,
     #[config(nested)]
     pub overlaybd: UblkOverlaybdTomlConfig,
 }

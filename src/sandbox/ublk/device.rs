@@ -27,10 +27,30 @@ pub struct UblkConfig {
     pub backend: UblkBackend,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub enum UblkBackend {
-    Cow,
     Overlaybd(OverlaybdConfig),
+}
+
+impl<'de> Deserialize<'de> for UblkBackend {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum PersistedUblkBackend {
+            #[serde(rename = "Cow")]
+            LegacyCow,
+            Overlaybd(OverlaybdConfig),
+        }
+
+        match PersistedUblkBackend::deserialize(deserializer)? {
+            PersistedUblkBackend::Overlaybd(config) => Ok(Self::Overlaybd(config)),
+            PersistedUblkBackend::LegacyCow => Err(serde::de::Error::custom(
+                "the legacy CoW ublk backend is no longer supported; this persisted sandbox cannot be resumed and must be rebuilt with OverlayBD",
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -49,12 +69,6 @@ pub(crate) struct OverlaybdRuntimeDevice {
 }
 
 impl UblkConfig {
-    pub fn cow() -> Self {
-        Self {
-            backend: UblkBackend::Cow,
-        }
-    }
-
     pub fn overlaybd(image_config_path: PathBuf, read_only: bool) -> Self {
         Self::overlaybd_with_runtime_upper_mode(
             image_config_path,
@@ -101,20 +115,16 @@ pub struct UblkDaemonConfig {
 impl UblkDaemonConfig {
     /// Resolve daemon configuration from the application config.
     ///
-    /// Returns `Ok(None)` if ublk is not enabled. Returns `Err` if ublk is
-    /// enabled but the daemon binary cannot be found (fail-fast).
-    pub fn from_app_config(config: &crate::cfg::AppConfig) -> Result<Option<Self>> {
+    /// Returns `Err` if the daemon binary cannot be found (fail-fast).
+    pub fn from_app_config(config: &crate::cfg::AppConfig) -> Result<Self> {
         let ublk = &config.ublk;
-        if !ublk.enabled {
-            return Ok(None);
-        }
         let daemon_binary = ublk
             .daemon_binary_path
             .clone()
             .or_else(|| which::which("uvm-ublk-daemon").ok())
             .ok_or_else(|| {
                 anyhow!(
-                    "ublk is enabled but daemon binary not found; \
+                    "ublk daemon binary not found; \
                      set ublk.daemon_binary_path in config or ensure uvm-ublk-daemon is in PATH"
                 )
             })?;
@@ -123,7 +133,7 @@ impl UblkDaemonConfig {
         let runtime_device_timeout =
             runtime_device_timeout(config.ublk.overlaybd.resize_timeout_secs);
 
-        Ok(Some(Self {
+        Ok(Self {
             daemon_binary,
             socket_path: ublk.daemon_socket_path.clone(),
             global_config: ublk.overlaybd.global_config_path.clone(),
@@ -136,7 +146,7 @@ impl UblkDaemonConfig {
             pool_config,
             p2p_publish_url: None,
             runtime_device_timeout,
-        }))
+        })
     }
 }
 
@@ -227,10 +237,9 @@ impl UblkDeviceManager {
 
     /// Convenience: resolve daemon config from [`AppConfig`] and initialize.
     ///
-    /// Returns an error if ublk is enabled but the daemon binary cannot be
-    /// found. Returns `Ok(())` if ublk is disabled or initialization succeeds.
+    /// Returns an error if the daemon binary cannot be found.
     pub async fn init_global_from_config(config: &crate::cfg::AppConfig) -> Result<()> {
-        Self::init_global(UblkDaemonConfig::from_app_config(config)?).await;
+        Self::init_global(Some(UblkDaemonConfig::from_app_config(config)?)).await;
         Ok(())
     }
 
@@ -240,10 +249,8 @@ impl UblkDeviceManager {
         p2p_publish_url: Option<&str>,
     ) -> Result<()> {
         let mut daemon_config = UblkDaemonConfig::from_app_config(config)?;
-        if let Some(cfg) = daemon_config.as_mut() {
-            cfg.p2p_publish_url = p2p_publish_url.map(|s| s.to_string());
-        }
-        Self::init_global(daemon_config).await;
+        daemon_config.p2p_publish_url = p2p_publish_url.map(|s| s.to_string());
+        Self::init_global(Some(daemon_config)).await;
         Ok(())
     }
 
@@ -256,16 +263,15 @@ impl UblkDeviceManager {
             .expect("UblkDeviceManager::init_global() must be called before global()")
     }
 
-    /// Returns `true` if the ublk daemon client is available (i.e. ublk is
-    /// enabled in the config and the daemon was successfully spawned).
-    pub fn is_enabled(&self) -> bool {
+    /// Returns `true` if the ublk daemon client was successfully spawned.
+    pub fn is_available(&self) -> bool {
         self.client.is_some()
     }
 
     fn require_client(&self) -> Result<&Arc<UblkDaemonClient>> {
         self.client
             .as_ref()
-            .context("ublk daemon client not initialized; is ublk enabled in config?")
+            .context("ublk daemon client is unavailable")
     }
 
     /// Tell the daemon the sandbox owning `device_key` finished booting,
@@ -695,5 +701,20 @@ pub(crate) struct UblkDevice {
 impl UblkDevice {
     pub fn device_path(&self) -> &Path {
         &self.device_path
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_persisted_cow_backend_with_migration_guidance() {
+        let error = serde_json::from_str::<UblkBackend>(r#""Cow""#)
+            .expect_err("persisted CoW backend must be rejected");
+        let message = error.to_string();
+
+        assert!(message.contains("cannot be resumed"), "error: {message}");
+        assert!(message.contains("OverlayBD"), "error: {message}");
     }
 }

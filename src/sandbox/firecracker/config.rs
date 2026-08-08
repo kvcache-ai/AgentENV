@@ -217,14 +217,6 @@ impl FirecrackerCommonConfig {
             .map(|level| level.trim().to_string())
             .filter(|level| !level.is_empty());
 
-        if config.ublk.enabled {
-            match config.ublk.device_type.trim().to_ascii_lowercase().as_str() {
-                "" | "cow" => common.ublk_config = Some(UblkConfig::cow()),
-                "overlaybd" => {}
-                other => bail!("unsupported ublk.device_type: {}", other),
-            };
-        }
-
         Ok(common)
     }
 
@@ -285,13 +277,12 @@ impl FirecrackerCommonConfig {
             anyhow::bail!("rootfs virtual size must be non-zero");
         }
         if let Some(ublk_config) = &self.ublk_config {
-            if let UblkBackend::Overlaybd(overlaybd_cfg) = &ublk_config.backend {
-                if !overlaybd_cfg.image_config_path.exists() {
-                    anyhow::bail!(
-                        "overlaybd image config not found at {}",
-                        overlaybd_cfg.image_config_path.display()
-                    );
-                }
+            let UblkBackend::Overlaybd(overlaybd_cfg) = &ublk_config.backend;
+            if !overlaybd_cfg.image_config_path.exists() {
+                anyhow::bail!(
+                    "overlaybd image config not found at {}",
+                    overlaybd_cfg.image_config_path.display()
+                );
             }
         }
         Ok(())
@@ -382,13 +373,11 @@ impl FirecrackerSandboxConfig {
 
         let mut common = FirecrackerCommonConfig::from_app_config(config)?;
         common.rootfs_image_config = Some(user_image_config.clone());
-        if ublk.enabled && ublk.device_type.trim().eq_ignore_ascii_case("overlaybd") {
-            common.ublk_config = Some(UblkConfig::overlaybd_with_runtime_upper_mode(
-                user_image_config.image_config_path.clone(),
-                user_image_config.read_only,
-                runtime_upper_mode,
-            ));
-        }
+        common.ublk_config = Some(UblkConfig::overlaybd_with_runtime_upper_mode(
+            user_image_config.image_config_path.clone(),
+            user_image_config.read_only,
+            runtime_upper_mode,
+        ));
 
         Ok(Self {
             common,
@@ -483,9 +472,6 @@ impl FirecrackerSnapshotConfig {
                 snapshot_mode,
                 app_config.virtualization_mode
             );
-        }
-        if !app_config.ublk.enabled {
-            bail!("repository-backed snapshot launch requires ublk to be enabled");
         }
         let tools_drive_version = &snapshot.committed().runtime_versions.tools_drive_version;
         if tools_drive_version.trim().is_empty() {
@@ -699,27 +685,10 @@ mod tests {
     }
 
     #[test]
-    fn common_config_rejects_unsupported_ublk_device_type() {
+    fn from_app_config_does_not_bind_ublk_without_user_image() -> Result<()> {
         let mut config = base_app_config();
         config.ublk = UblkTomlConfig {
-            enabled: true,
             daemon_binary_path: None,
-            device_type: "mystery".to_string(),
-            daemon_log_path: None,
-            ..UblkTomlConfig::default()
-        };
-
-        let err = FirecrackerCommonConfig::from_app_config(&config).expect_err("unsupported ublk");
-        assert!(err.to_string().contains("unsupported ublk.device_type"));
-    }
-
-    #[test]
-    fn from_app_config_accepts_overlaybd_device_type_without_global_image() -> Result<()> {
-        let mut config = base_app_config();
-        config.ublk = UblkTomlConfig {
-            enabled: true,
-            daemon_binary_path: None,
-            device_type: "overlaybd".to_string(),
             daemon_log_path: None,
             overlaybd: UblkOverlaybdTomlConfig {
                 global_config_path: "overlaybd_global.json".into(),
@@ -745,12 +714,10 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_config_binds_overlaybd_device_type_to_user_image() -> Result<()> {
+    fn sandbox_config_binds_overlaybd_to_user_image() -> Result<()> {
         let mut config = base_app_config();
         config.ublk = UblkTomlConfig {
-            enabled: true,
             daemon_binary_path: None,
-            device_type: "overlaybd".to_string(),
             daemon_log_path: None,
             overlaybd: UblkOverlaybdTomlConfig {
                 global_config_path: "overlaybd_global.json".into(),

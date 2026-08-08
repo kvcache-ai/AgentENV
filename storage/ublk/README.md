@@ -28,20 +28,15 @@ cargo build
 # First insert kernel module
 modprobe ublk_drv ublks_max=65536
 
-# Then prepare your own base image
-BASE_IMG=/path/to/your/base
-COW_IMG=/path/to/store/the/local/write
+# Then prepare OverlayBD global and image configs
+GLOBAL_CONFIG=/path/to/overlaybd-global.json
+IMAGE_CONFIG=/path/to/image.json
 UBLK_ID=1
-size=$(stat -c %s $BASE_IMG)
-truncate -s ${size} $COW_IMG
-args=(--nr-queues 1 --depth 16 $UBLK_ID cow\
-    --chunksize-kb 64 \
-    --origin $BASE_IMG --cow $COW_IMG \
-    --origin-dio
-)
 
 # This will start a command in current shell
-./target/debug/uvm-ublk create "${args[@]}"
+./target/debug/uvm-ublk create --nr-queues 1 --depth 16 "$UBLK_ID" overlaybd \
+    --global-config "$GLOBAL_CONFIG" \
+    --image-config "$IMAGE_CONFIG"
 
 # Then you can access /dev/ublkb1 in another shell
 
@@ -50,5 +45,3 @@ args=(--nr-queues 1 --depth 16 $UBLK_ID cow\
 ```
 
 Note that the `ublks_max=65536` module parameter is mainly used for lower-version kernels (e.g., 6.8.0). If your kernel version is higher (e.g., 6.17), you do not need this.
-
-Do not use the zero-copy feature of uvm-ublk (e.g., --zero-copy) for a fuse-based filesystem if your kernel version is < 6.18. It has a bug in the kernel, which will be fixed in kernel 6.18.

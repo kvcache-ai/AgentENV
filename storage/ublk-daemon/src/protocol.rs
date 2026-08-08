@@ -39,12 +39,6 @@ pub enum DaemonRequest {
         #[serde(default)]
         allow_shrink: bool,
     },
-    /// Create a raw COW ublk device. This is separate from OverlayBD runtime
-    /// materialization and does not support restack snapshot.
-    CreateCow {
-        origin: PathBuf,
-        cow: PathBuf,
-    },
     Delete {
         dev_id: u32,
     },
@@ -500,23 +494,6 @@ mod tests {
     }
 
     // ── New serde round-trip tests for remaining variants ───────────────
-
-    #[test]
-    fn request_create_cow_round_trip() {
-        let req = DaemonRequest::CreateCow {
-            origin: PathBuf::from("/data/origin.img"),
-            cow: PathBuf::from("/data/cow.img"),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
-        match decoded {
-            DaemonRequest::CreateCow { origin, cow } => {
-                assert_eq!(origin, PathBuf::from("/data/origin.img"));
-                assert_eq!(cow, PathBuf::from("/data/cow.img"));
-            }
-            _ => panic!("unexpected variant"),
-        }
-    }
 
     #[test]
     fn request_restack_snapshot_round_trip() {

@@ -822,10 +822,8 @@ mod tests {
         AppConfig {
             deps_path: root.to_path_buf(),
             ublk: UblkTomlConfig {
-                enabled: true,
                 daemon_binary_path: None,
                 daemon_log_path: None,
-                device_type: "overlaybd".to_string(),
                 overlaybd: UblkOverlaybdTomlConfig {
                     global_config_path: rootfs_global,
                     ..Default::default()

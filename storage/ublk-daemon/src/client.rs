@@ -433,29 +433,6 @@ impl UblkDaemonClient {
         }
     }
 
-    /// Create a new COW-backed ublk device.
-    ///
-    /// Returns the kernel-assigned device ID and path (e.g. `/dev/ublkb0`).
-    pub async fn create_cow(&self, origin: &Path, cow: &Path) -> Result<(u32, PathBuf)> {
-        let request = DaemonRequest::CreateCow {
-            origin: origin.to_path_buf(),
-            cow: cow.to_path_buf(),
-        };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
-            DaemonResponse::DeviceCreated {
-                dev_id,
-                device_path,
-            } => Ok((dev_id, device_path)),
-            DaemonResponse::TerminalError { message } => {
-                bail!("daemon: create cow failed terminally: {message}")
-            }
-            DaemonResponse::Error { message } => {
-                bail!("daemon: create cow failed: {message}")
-            }
-            other => bail!("daemon: unexpected response for create cow: {other:?}"),
-        }
-    }
-
     /// Delete a ublk device.
     pub async fn delete(&self, dev_id: u32) -> Result<()> {
         let request = DaemonRequest::Delete { dev_id };
@@ -686,11 +663,6 @@ mod tests {
         );
 
         let err = client.delete(0).await;
-        assert!(err.is_err());
-
-        let err = client
-            .create_cow(Path::new("/origin"), Path::new("/cow"))
-            .await;
         assert!(err.is_err());
 
         let err = client.restack_snapshot(0, Path::new("/out")).await;

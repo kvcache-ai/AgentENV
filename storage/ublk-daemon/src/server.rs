@@ -19,8 +19,8 @@ use warm_pool::{PoolConfig, PoolMaintenanceAction, WarmPool};
 
 use storage_util::io_ring::IoRingHandle;
 use uvm_ublk::{
-    delete_dev, ublk_caps, wait_for_ublk_dev, BasicCowConfig, BasicCowTarget, OverlaybdTarget,
-    UVMUblkCtrlBuilder, UVMUblkDev, UVMUblkDevBuilder, UVMUblkTarget,
+    delete_dev, ublk_caps, wait_for_ublk_dev, OverlaybdTarget, UVMUblkCtrlBuilder, UVMUblkDev,
+    UVMUblkDevBuilder, UVMUblkTarget,
 };
 
 use crate::protocol::{
@@ -30,14 +30,9 @@ use crate::runtime;
 
 // ── Managed device wrapper ──────────────────────────────────────────────────
 
-enum ManagedDevice {
-    Overlaybd {
-        _dev: UVMUblkDev<OverlaybdTarget>,
-        image: Arc<ImageFile>,
-    },
-    Cow {
-        _dev: UVMUblkDev<BasicCowTarget>,
-    },
+struct ManagedDevice {
+    dev: UVMUblkDev<OverlaybdTarget>,
+    image: Arc<ImageFile>,
 }
 
 // ── Pooled device wrapper ───────────────────────────────────────────────────
@@ -554,9 +549,6 @@ async fn handle_connection(
             )
             .await
         }
-        DaemonRequest::CreateCow { origin, cow } => {
-            handle_create_cow(&devices, ctrl_ring, &origin, &cow).await
-        }
         DaemonRequest::Delete { dev_id } => handle_delete(&devices, ctrl_ring, dev_id).await,
         DaemonRequest::RestackSnapshot {
             dev_id,
@@ -813,8 +805,8 @@ async fn create_overlaybd_device(
     let device_path = dev.device_path().to_path_buf();
     devices.insert(
         dev_id,
-        ManagedDevice::Overlaybd {
-            _dev: dev,
+        ManagedDevice {
+            dev,
             image: Arc::clone(&image),
         },
     );
@@ -824,55 +816,6 @@ async fn create_overlaybd_device(
         "overlaybd device created"
     );
     Ok((dev_id, device_path))
-}
-
-async fn handle_create_cow(
-    devices: &DashMap<u32, ManagedDevice>,
-    ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
-    origin: &Path,
-    cow: &Path,
-) -> Result<DaemonResponse> {
-    tracing::info!(origin = %origin.display(), cow = %cow.display(), "creating cow device");
-
-    let cow_config = BasicCowConfig {
-        origin: origin.to_path_buf(),
-        cow: cow.to_path_buf(),
-        origin_dio: false,
-        cow_dio: false,
-        chunksize_kb: 32,
-    };
-
-    let target = BasicCowTarget::new(&cow_config).context("create cow target")?;
-
-    let ctrl = UVMUblkCtrlBuilder::new()
-        .name("cow-blk")
-        .build(ctrl_ring.clone())
-        .context("build ublk ctrl")?;
-
-    let mut dev = UVMUblkDevBuilder::new(ctrl)
-        .set_target(target)
-        .build()
-        .await
-        .context("build ublk dev")?;
-
-    let dev_id = dev.dev_id();
-    if let Err(err) = dev.start().await.context("start ublk dev") {
-        cleanup_failed_ublk_start(ctrl_ring.clone(), dev).await;
-        return Err(err);
-    }
-    if let Err(err) = wait_for_ublk_dev(dev_id).context("wait for ublk device") {
-        cleanup_failed_ublk_start(ctrl_ring.clone(), dev).await;
-        return Err(err);
-    }
-
-    let device_path = dev.device_path().to_path_buf();
-    devices.insert(dev_id, ManagedDevice::Cow { _dev: dev });
-    tracing::info!(dev_id, path = %device_path.display(), "cow device created");
-
-    Ok(DaemonResponse::DeviceCreated {
-        dev_id,
-        device_path,
-    })
 }
 
 async fn handle_delete(
@@ -899,10 +842,7 @@ async fn handle_delete(
 }
 
 async fn quiesce_managed_device(device: &mut ManagedDevice) {
-    match device {
-        ManagedDevice::Overlaybd { _dev, .. } => quiesce_ublk_device(_dev).await,
-        ManagedDevice::Cow { _dev } => quiesce_ublk_device(_dev).await,
-    }
+    quiesce_ublk_device(&mut device.dev).await;
 }
 
 async fn quiesce_ublk_device<T: UVMUblkTarget>(dev: &mut UVMUblkDev<T>) {
@@ -1021,14 +961,7 @@ async fn handle_restack_snapshot(
     output_layer_path: &Path,
 ) -> Result<DaemonResponse> {
     let (image, image_config) = if let Some(device_ref) = devices.get(&dev_id) {
-        let image = match device_ref.value() {
-            ManagedDevice::Overlaybd { image, .. } => Arc::clone(image),
-            ManagedDevice::Cow { .. } => {
-                bail!(
-                    "snapshot is only supported for overlaybd devices, not cow (dev_id={dev_id})"
-                );
-            }
-        };
+        let image = Arc::clone(&device_ref.image);
         drop(device_ref);
         (image, None)
     } else if let Some(pool) = pool_state {

@@ -50,9 +50,7 @@ pub fn ensure_host(config: &AppConfig, runtime_user: &str, runtime_group: &str) 
             "runtime user added to the kvm group; restart its session before starting AENV manually"
         );
     }
-    if config.ublk.enabled {
-        ublk::provision(runtime_group)?;
-    }
+    ublk::provision(runtime_group)?;
     overlaybd::install_system_default_config(&config.deps_path, runtime_gid)?;
     network_capacity::install_persistent_config().context("install /etc/sysctl.d/99-aenv.conf")?;
     fs::write("/proc/sys/net/ipv4/ip_forward", "1\n").context("enable host IPv4 forwarding")?;
@@ -122,13 +120,9 @@ pub async fn ensure_environment(
     info!(virtualization_mode = %config.virtualization_mode, "checking virtualization availability");
     kvm::check(config.virtualization_mode)?;
 
-    // 3. ublk setup (only if ublk is enabled in config)
-    if config.ublk.enabled {
-        info!("checking ublk module and permissions");
-        ublk::check()?;
-    } else {
-        info!("ublk not enabled in config, skipping ublk setup");
-    }
+    // 3. ublk setup
+    info!("checking ublk module and permissions");
+    ublk::check()?;
 
     // 4. Download dependencies and generate overlaybd runtime configs.
     ensure_dependencies(config).await?;

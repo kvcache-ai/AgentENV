@@ -82,7 +82,7 @@ LSMT (Log Structured Merge Tree) based layered image format.
 
 ### ublk (`storage/ublk/`)
 
-Async userspace block device server using Linux's ublk kernel driver. Exposes overlaybd images (or raw CoW files) as `/dev/ublkbN` block devices.
+Async userspace block device server using Linux's ublk kernel driver. Exposes OverlayBD images as `/dev/ublkbN` block devices.
 
 **Device lifecycle**:
 1. `UVMUblkCtrlBuilder` sends `ADD` to `/dev/ublk-control` via io_uring `UringCmd`
@@ -91,19 +91,18 @@ Async userspace block device server using Linux's ublk kernel driver. Exposes ov
 4. Kernel dispatches block I/O to mmap'd `ublksrv_io_desc` arrays; userspace processes them asynchronously
 5. `delete_dev()` tears down the device
 
-**Target implementations** (`UVMUblkTarget` trait):
+**Target implementation** (`UVMUblkTarget` trait):
 - `OverlaybdTarget`: wraps `ImageFile` for full layered image I/O
-- `BasicCowTarget`: chunk-based copy-on-write over a read-only origin file. Per-chunk `AtomicU8` state tracking (Origin -> Copying -> Cow) prevents duplicate copies. Coalesces adjacent reads.
 
 **I/O buffers**: `AutoRegBuffer` (zero-copy via sparse buffer table, kernel 6.8+) or `UserBuffer` (traditional allocation).
 
-**Key files**: `lib.rs` (public API), `ctrl.rs` (device controller), `dev.rs` (device + queue management), `queue.rs` (I/O descriptor handling), `io_buffer.rs`, `impls/cow.rs`, `impls/overlaybd_target.rs`.
+**Key files**: `lib.rs` (public API), `ctrl.rs` (device controller), `dev.rs` (device + queue management), `queue.rs` (I/O descriptor handling), `io_buffer.rs`, `impls/overlaybd_target.rs`.
 
 ### ublk-daemon (`storage/ublk-daemon/`)
 
 Long-running daemon process (`uvm-ublk-daemon`) that manages all ublk devices in one process and communicates with the AgentENV node over a Unix domain socket.
 
-- Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD/COW device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.
+- Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.
 - `UblkDaemonClient` spawns and monitors the daemon process from the node runtime.
 - `UblkDeviceManager` (`src/sandbox/ublk/device.rs`) is the node-facing singleton that delegates lifecycle operations to the daemon client; device IDs are allocated in the daemon.
 
@@ -293,7 +292,6 @@ storage/
 │   ├── queue.rs                # I/O descriptor handling
 │   ├── io_buffer.rs            # zero-copy + traditional buffers
 │   └── impls/                  # target implementations
-│       ├── cow.rs              # BasicCowTarget
 │       └── overlaybd_target.rs # OverlaybdTarget
 ├── ublk-daemon/src/            # ublk daemon (unix socket RPC)
 │   ├── client.rs               # daemon client used by node runtime
