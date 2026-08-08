@@ -165,6 +165,8 @@ p2p_enabled = true
 # bucket = "agentenv-oss-validation"
 # region = "cn-beijing"
 # prefix = "validation/"
+# Configure a seven-day bucket lifecycle expiration rule for
+# "<prefix>/template-build-files/"; AgentENV does not provision this rule.
 # credential_process = ""
 # cache_max_size_gb = 10
 

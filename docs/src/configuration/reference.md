@@ -412,6 +412,7 @@ Notes:
 - `credential_process` and static access key settings are mutually exclusive in practice; when `credential_process` is set, the backend ignores static credential fields.
 - `credential_process` should be written as a portable argv-style command line. Avoid `$VAR`, backticks, `$(...)`, pipes, and shell builtins.
 - Although the config section is still named `oss`, the runtime path is implemented via a shared S3-compatible client, so `region` must be configured.
+- Configure a bucket lifecycle expiration rule for `<prefix>/template-build-files/`. AgentENV does not provision or validate this rule. Seven days matches the POSIX cache retention and covers the maximum upload-link TTL; without the rule, abandoned upload grants and cached build archives remain until removed manually.
 
 Other path override:
 

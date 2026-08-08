@@ -42,6 +42,7 @@ pub(crate) struct OssSnapshotRepository {
     client: Arc<OssClient>,
     snapshot_image_storage: SnapshotImageStoragePolicy,
     acr_exporter: AcrDiskImageExporter,
+    build_files: Arc<super::build_files::OssTemplateBuildFileStore>,
 }
 
 const MAX_ALIAS_BIND_ATTEMPTS: usize = 5;
@@ -51,10 +52,12 @@ impl OssSnapshotRepository {
         client: Arc<OssClient>,
         snapshot_image_storage: SnapshotImageStoragePolicy,
     ) -> Self {
+        let build_files = super::build_files::OssTemplateBuildFileStore::new(Arc::clone(&client));
         Self {
             client,
             snapshot_image_storage,
             acr_exporter: AcrDiskImageExporter::new(),
+            build_files,
         }
     }
 
@@ -148,6 +151,15 @@ fn fallback_to_object_storage_would_mix_sources(
 
 #[async_trait]
 impl SnapshotRepository for OssSnapshotRepository {
+    fn template_build_files(
+        &self,
+    ) -> Option<Arc<dyn crate::snapshot::repository::TemplateBuildFileStore>> {
+        Some(Arc::clone(&self.build_files)
+            as Arc<
+                dyn crate::snapshot::repository::TemplateBuildFileStore,
+            >)
+    }
+
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         if !matches!(record.source, SnapshotSource::Template { .. }) {
             return Err(RepositoryError::InvalidRequest {
