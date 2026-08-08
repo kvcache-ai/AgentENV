@@ -114,6 +114,41 @@ impl EnvdInstance {
         }
     }
 
+    /// Uploads a local file into the guest at `guest_path` via envd's files
+    /// API. `username` selects the guest account envd writes as; template
+    /// builds pass "root" because plain OCI images have no other account.
+    #[tracing::instrument(skip(self, local_path))]
+    pub(crate) async fn upload_file(
+        &self,
+        local_path: &std::path::Path,
+        guest_path: &str,
+        username: &str,
+    ) -> Result<()> {
+        use envd::http_client::apis::files_api;
+
+        match files_api::files_post(
+            &self.config,
+            Some(guest_path),
+            Some(username),
+            None,
+            None,
+            Some(local_path.to_path_buf()),
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            // envd currently returns a successful text/plain response for
+            // this endpoint, while the generated client attempts to decode
+            // every 2xx response as JSON. The upload has completed by the
+            // time this response-body error is produced.
+            Err(envd::http_client::apis::Error::Serde(error)) => {
+                debug!(%error, "ignoring envd upload response-body decoding error");
+                Ok(())
+            }
+            Err(error) => Err(anyhow::Error::new(error).context("upload file to sandbox via envd")),
+        }
+    }
+
     #[tracing::instrument(skip(self, env_vars))]
     pub(crate) async fn init(
         &self,

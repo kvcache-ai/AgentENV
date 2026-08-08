@@ -84,6 +84,14 @@ impl SnapshotManager {
         self.repository.create(record).await
     }
 
+    /// Returns the shared build-context archive store, when the configured
+    /// repository backend provides one.
+    pub fn template_build_files(
+        &self,
+    ) -> Option<Arc<dyn crate::snapshot::repository::TemplateBuildFileStore>> {
+        self.repository.template_build_files()
+    }
+
     #[tracing::instrument(skip(self, metadata, manifest), fields(snapshot_id = %metadata.id))]
     pub async fn publish(
         &self,

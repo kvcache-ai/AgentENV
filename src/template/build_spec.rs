@@ -25,13 +25,41 @@ pub(crate) struct TemplateBuildStep {
 
 #[derive(Clone, Debug)]
 pub(crate) enum TemplateBuildStepKind {
-    Run { cmd: String },
-    Env { key: String, value: String },
-    Workdir { path: PathBuf },
-    User { value: String },
-    ExposedPort { port: String },
-    Volume { path: String },
-    Label { key: String, value: String },
+    Run {
+        cmd: String,
+    },
+    Env {
+        key: String,
+        value: String,
+    },
+    Workdir {
+        path: PathBuf,
+    },
+    User {
+        value: String,
+    },
+    ExposedPort {
+        port: String,
+    },
+    Volume {
+        path: String,
+    },
+    Label {
+        key: String,
+        value: String,
+    },
+    /// Copies files from an uploaded build-context archive into the rootfs.
+    ///
+    /// `files_hash` addresses the archive in the repository's template
+    /// build-file store; `user` and `mode` mirror Docker's `--chown` /
+    /// `--chmod` flags.
+    Copy {
+        src: String,
+        dest: String,
+        files_hash: String,
+        user: Option<String>,
+        mode: Option<u32>,
+    },
 }
 
 impl TemplateBuildStep {
@@ -81,6 +109,24 @@ impl TemplateBuildStep {
             kind: TemplateBuildStepKind::Label {
                 key: key.into(),
                 value: value.into(),
+            },
+        }
+    }
+
+    pub(crate) fn copy(
+        src: impl Into<String>,
+        dest: impl Into<String>,
+        files_hash: impl Into<String>,
+        user: Option<String>,
+        mode: Option<u32>,
+    ) -> Self {
+        Self {
+            kind: TemplateBuildStepKind::Copy {
+                src: src.into(),
+                dest: dest.into(),
+                files_hash: files_hash.into(),
+                user,
+                mode,
             },
         }
     }
@@ -165,6 +211,35 @@ impl TemplateBuildSpec {
     pub fn label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.steps.push(TemplateBuildStep::label(key, value));
         self
+    }
+
+    /// Appends a build step copying files from an uploaded build-context
+    /// archive (addressed by `files_hash`) into the rootfs.
+    pub fn copy(
+        mut self,
+        src: impl Into<String>,
+        dest: impl Into<String>,
+        files_hash: impl Into<String>,
+        user: Option<String>,
+        mode: Option<u32>,
+    ) -> Self {
+        self.steps
+            .push(TemplateBuildStep::copy(src, dest, files_hash, user, mode));
+        self
+    }
+
+    /// Returns the distinct build-context archive hashes referenced by COPY steps.
+    pub(crate) fn referenced_build_file_hashes(steps: &[TemplateBuildStep]) -> Vec<String> {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut hashes: Vec<String> = Vec::new();
+        for step in steps {
+            if let TemplateBuildStepKind::Copy { files_hash, .. } = &step.kind {
+                if seen.insert(files_hash.as_str()) {
+                    hashes.push(files_hash.clone());
+                }
+            }
+        }
+        hashes
     }
 
     /// Appends an `apt-get install` build step for the provided packages.

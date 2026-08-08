@@ -1,3 +1,4 @@
+mod build_files;
 mod client;
 mod config;
 mod layout;

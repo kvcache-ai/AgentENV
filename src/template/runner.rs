@@ -66,6 +66,9 @@ pub(crate) struct TemplateBuildContext {
     // Keep the tempdir owner alive for the duration of build + publish.
     pub workspace: TempDir,
     pub steps: Vec<TemplateBuildStep>,
+    /// Node-local archives for COPY steps, keyed by files hash. Populated by
+    /// the builder before execution.
+    pub build_archives: std::collections::HashMap<String, PathBuf>,
     pub base: TemplateBuildBase,
     pub cpu_config_json: Option<String>,
     pub virtualization_mode: VirtualizationMode,
@@ -200,6 +203,7 @@ impl TemplateBuildRunner {
         let worker_span = tracing::debug_span!("template_build_sandbox", sandbox_id = %sandbox_id);
         let step_executor = self.step_executor.clone();
         let steps = context.steps.clone();
+        let build_archives = context.build_archives.clone();
         let output_dir = context.local_dir().to_path_buf();
         let initial_context = context.initial_context.clone();
         let startup = context.startup.clone();
@@ -223,7 +227,7 @@ impl TemplateBuildRunner {
                         debug!("template build sandbox started");
 
                         let build_context = step_executor
-                            .execute(&sandbox, &steps, initial_context)
+                            .execute(&sandbox, &steps, initial_context, &build_archives)
                             .await?;
                         ensure_default_user(&sandbox, &build_context).await?;
                         let startup = prepare_startup(startup, override_startup, &build_context);

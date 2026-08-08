@@ -59,6 +59,10 @@ impl ApiImpl {
         Arc::clone(&self.orchestrator)
     }
 
+    pub(crate) fn snapshot_manager(&self) -> &SnapshotManager {
+        &self.snapshot_manager
+    }
+
     pub(crate) fn proxy_client(&self) -> &ProxyClient {
         &self.proxy_client
     }

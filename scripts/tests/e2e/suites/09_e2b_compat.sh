@@ -130,13 +130,13 @@ if python3 -c 'import e2b' >/dev/null 2>&1; then
   log "Running: e2b Python SDK compatibility (${sdk_script})"
   if command -v timeout >/dev/null 2>&1; then
     if sdk_output=$(timeout "${sdk_timeout}" python3 "$sdk_script" 2>&1); then
-      _pass "e2b Python SDK template build, startCmd/readyCmd, sandbox lifecycle, and commands"
+      _pass "e2b Python SDK fresh COPY/ADD template build and sandbox lifecycle"
     else
       log "e2b Python SDK output: ${sdk_output:0:1200}"
       _fail "e2b Python SDK compatibility" "exit 0" "non-zero"
     fi
   elif sdk_output=$(python3 "$sdk_script" 2>&1); then
-    _pass "e2b Python SDK template build, startCmd/readyCmd, sandbox lifecycle, and commands"
+    _pass "e2b Python SDK fresh COPY/ADD template build and sandbox lifecycle"
   else
     log "e2b Python SDK output: ${sdk_output:0:1200}"
     _fail "e2b Python SDK compatibility" "exit 0" "non-zero"

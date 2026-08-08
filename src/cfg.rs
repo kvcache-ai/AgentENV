@@ -132,6 +132,8 @@ pub struct AppConfig {
     pub network: NetworkConfig,
     #[config(nested)]
     pub custom_extension: CustomExtensionConfig,
+    #[config(nested)]
+    pub template_build: TemplateBuildConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Config)]
@@ -540,6 +542,43 @@ pub struct CustomExtensionConfig {
     pub timeout_ms: u64,
 }
 
+/// Settings for the template build-context upload path used by the E2B SDK's
+/// `COPY` support (`GET /templates/{templateID}/files/{hash}` plus the upload
+/// URL it returns).
+#[derive(Debug, Config, Clone)]
+pub struct TemplateBuildConfig {
+    /// Maximum accepted size for one uploaded build-context archive, in MiB.
+    #[config(default = 1024u64)]
+    pub files_max_upload_mib: u64,
+    /// Maximum size one build-context archive may expand to once
+    /// decompressed, in MiB. This bounds what a compressed upload can cost
+    /// the node that runs the build.
+    #[config(default = 4096u64)]
+    pub files_max_context_mib: u64,
+    /// Cap on the combined on-disk size of all build-context archives one
+    /// build spec may reference, in MiB.
+    #[config(default = 4096u64)]
+    pub files_max_build_context_mib: u64,
+    /// How long an issued upload URL stays valid, in seconds.
+    #[config(default = 3600u64)]
+    pub files_url_ttl_secs: u64,
+    /// How long one build-context upload request may run before the server
+    /// gives up and responds 408, in seconds.
+    #[config(default = 300u64)]
+    pub files_upload_timeout_secs: u64,
+    /// Optional external base URL (e.g. "https://agentenv.example.com") used
+    /// when building upload URLs. When unset, upload URLs reuse the Host
+    /// header of the upload-link request with plain http, which matches
+    /// direct-node and bundled-gateway deployments.
+    ///
+    /// Any TLS-terminated, gateway-fronted, or multi-hop deployment MUST set
+    /// this to the external origin clients reach: the fallback derives the URL
+    /// from the request Host header with plain http, and that upload URL
+    /// carries a bearer token in its query string.
+    #[config(env = "AENV_TEMPLATE_BUILD_PUBLIC_BASE_URL", parse_env = parse_trimmed_string)]
+    pub public_base_url: Option<String>,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct P2pConfig {
     #[config(default = false)]
@@ -854,6 +893,17 @@ impl AppConfig {
         self.cluster.normalize();
         self.sandbox_proxy.normalize()?;
 
+        // An env var exported empty means unset, matching the custom-extension
+        // URL handling; validation and the upload-URL builder then agree on
+        // the exact value in use.
+        self.template_build.public_base_url = self
+            .template_build
+            .public_base_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+
         Ok(())
     }
 
@@ -884,6 +934,7 @@ impl AppConfig {
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
+        self.validate_template_build()?;
         Ok(())
     }
 
@@ -947,6 +998,69 @@ impl AppConfig {
                 "memory_snapshot.track_dirty_pages=true requires ",
                 "memory_snapshot.direct_overlaybd=true for cumulative dirty snapshots"
             ));
+        }
+        Ok(())
+    }
+
+    /// Reject template build-context settings that would only fail later, at
+    /// upload-link time: a base URL that cannot produce a usable upload URL,
+    /// or a TTL that makes the `now + ttl` expiry arithmetic overflow or the
+    /// grant effectively unexpirable.
+    fn validate_template_build(&self) -> Result<()> {
+        // 7 days. Upload grants are single-use credentials in a query string,
+        // so a longer window is always a misconfiguration.
+        const MAX_URL_TTL_SECS: u64 = 604_800;
+        let cfg = &self.template_build;
+        if cfg.files_url_ttl_secs == 0 {
+            bail!("template_build.files_url_ttl_secs must be > 0");
+        }
+        if cfg.files_url_ttl_secs > MAX_URL_TTL_SECS {
+            bail!(
+                "template_build.files_url_ttl_secs must be <= {MAX_URL_TTL_SECS} (got {})",
+                cfg.files_url_ttl_secs
+            );
+        }
+        if cfg.files_upload_timeout_secs == 0 {
+            bail!("template_build.files_upload_timeout_secs must be > 0");
+        }
+        // An upload slower than the grant TTL would stage the whole body and
+        // then lose the grant to expiry-based pruning at claim time.
+        if cfg.files_upload_timeout_secs > cfg.files_url_ttl_secs {
+            bail!(
+                "template_build.files_upload_timeout_secs ({}) must be <= \
+                 files_url_ttl_secs ({})",
+                cfg.files_upload_timeout_secs,
+                cfg.files_url_ttl_secs
+            );
+        }
+        if cfg.files_max_upload_mib == 0 {
+            bail!("template_build.files_max_upload_mib must be > 0");
+        }
+        if cfg.files_max_context_mib == 0 {
+            bail!("template_build.files_max_context_mib must be > 0");
+        }
+        if cfg.files_max_build_context_mib == 0 {
+            bail!("template_build.files_max_build_context_mib must be > 0");
+        }
+        if let Some(base_url) = cfg.public_base_url.as_deref() {
+            let parsed = url::Url::parse(base_url).with_context(|| {
+                format!(
+                    "invalid template_build.public_base_url {base_url:?}: must be an absolute \
+                     http/https URL"
+                )
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                bail!(
+                    "invalid template_build.public_base_url {base_url:?}: scheme must be http or \
+                     https"
+                );
+            }
+            if parsed.query().is_some() {
+                bail!("invalid template_build.public_base_url {base_url:?}: must have no query");
+            }
+            if parsed.fragment().is_some() {
+                bail!("invalid template_build.public_base_url {base_url:?}: must have no fragment");
+            }
         }
         Ok(())
     }
@@ -1562,6 +1676,115 @@ mod tests {
         let mut config = AppConfig::default();
         config.memory_snapshot.background_download.try_cnt = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn template_build_defaults_pass_validation() {
+        let config = AppConfig::default();
+        assert_eq!(config.template_build.files_url_ttl_secs, 3600);
+        assert_eq!(config.template_build.files_upload_timeout_secs, 300);
+        assert_eq!(config.template_build.files_max_build_context_mib, 4096);
+        assert!(config.template_build.public_base_url.is_none());
+        config.validate().expect("default config passes");
+    }
+
+    #[test]
+    fn validate_accepts_absolute_template_build_public_base_url() {
+        let mut config = AppConfig::default();
+        config.template_build.public_base_url = Some("https://agentenv.example.com".to_string());
+
+        config.validate().expect("https base url passes");
+    }
+
+    #[test]
+    fn validate_rejects_template_build_public_base_url_with_query() {
+        let mut config = AppConfig::default();
+        config.template_build.public_base_url =
+            Some("https://agentenv.example.com/?token=abc".to_string());
+
+        let err = config.validate().unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("public_base_url"), "{message}");
+        assert!(message.contains("must have no query"), "{message}");
+    }
+
+    #[test]
+    fn validate_rejects_template_build_public_base_url_without_scheme() {
+        let mut config = AppConfig::default();
+        config.template_build.public_base_url = Some("agentenv.example.com".to_string());
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("public_base_url"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_bounds_template_build_files_url_ttl() {
+        let mut config = AppConfig::default();
+        config.template_build.files_url_ttl_secs = 0;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("template_build.files_url_ttl_secs must be > 0"),
+            "unexpected error: {err}"
+        );
+
+        let mut config = AppConfig::default();
+        config.template_build.files_url_ttl_secs = 604_801;
+        assert!(config.validate().is_err());
+
+        let mut config = AppConfig::default();
+        config.template_build.files_url_ttl_secs = 604_800;
+        config.validate().expect("max ttl passes");
+    }
+
+    #[test]
+    fn validate_bounds_template_build_upload_timeout() {
+        let mut config = AppConfig::default();
+        config.template_build.files_upload_timeout_secs = 0;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("template_build.files_upload_timeout_secs must be > 0"),
+            "unexpected error: {err}"
+        );
+
+        let mut config = AppConfig::default();
+        config.template_build.files_upload_timeout_secs = 3601;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("must be <= files_url_ttl_secs"),
+            "unexpected error: {err}"
+        );
+
+        let mut config = AppConfig::default();
+        config.template_build.files_max_upload_mib = 0;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("template_build.files_max_upload_mib must be > 0"),
+            "unexpected error: {err}"
+        );
+
+        let mut config = AppConfig::default();
+        config.template_build.files_max_context_mib = 0;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("template_build.files_max_context_mib must be > 0"),
+            "unexpected error: {err}"
+        );
+
+        let mut config = AppConfig::default();
+        config.template_build.files_max_build_context_mib = 0;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("template_build.files_max_build_context_mib must be > 0"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

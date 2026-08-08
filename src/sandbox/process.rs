@@ -239,6 +239,18 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// Upload a local file into the sandbox at `guest_path` as `username`.
+    pub async fn upload_file(
+        &self,
+        local_path: &std::path::Path,
+        guest_path: &str,
+        username: &str,
+    ) -> Result<()> {
+        self.envd_instance
+            .upload_file(local_path, guest_path, username)
+            .await
+    }
+
     /// Start a process via the envd gRPC client and return a [`ProcessHandle`].
     async fn start_process_inner(
         &self,

@@ -7,11 +7,13 @@ use tokio::task;
 
 use super::super::shared_runtime_cache_root;
 use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
+use super::build_files::PosixFsTemplateBuildFileStore;
 use super::catalog::PosixFsCatalogStore;
 use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
+use crate::snapshot::repository::build_files::TemplateBuildFileStore;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 use crate::snapshot::repository::{RepositoryError, RepositoryResult, SnapshotListFilter};
 use crate::snapshot::types::{
@@ -72,9 +74,11 @@ impl PosixFsBackend {
         let runtime_cache_root = runtime_cache_root.unwrap_or_else(|| cache_root.join("runtime"));
         let catalog_store = Arc::new(PosixFsCatalogStore::new(root.clone()));
         let artifact_store = Arc::new(PosixFsArtifactStore::new(root.clone()));
+        let build_files = PosixFsTemplateBuildFileStore::new(&root);
         let repository: Arc<dyn SnapshotRepository> = Arc::new(PosixFsSnapshotRepository::new(
             catalog_store,
             artifact_store,
+            build_files,
         ));
         let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> = Arc::new(
             PosixFsRuntimeResolver::new(root, runtime_cache_root, store, cache),
@@ -111,16 +115,19 @@ impl PosixFsBackend {
 pub(crate) struct PosixFsSnapshotRepository {
     catalog_store: Arc<PosixFsCatalogStore>,
     artifact_store: Arc<PosixFsArtifactStore>,
+    build_files: Arc<PosixFsTemplateBuildFileStore>,
 }
 
 impl PosixFsSnapshotRepository {
     pub(crate) fn new(
         catalog_store: Arc<PosixFsCatalogStore>,
         artifact_store: Arc<PosixFsArtifactStore>,
+        build_files: Arc<PosixFsTemplateBuildFileStore>,
     ) -> Self {
         Self {
             catalog_store,
             artifact_store,
+            build_files,
         }
     }
 
@@ -236,6 +243,10 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
             repository.create_sync(record)
         })
         .await
+    }
+
+    fn template_build_files(&self) -> Option<Arc<dyn TemplateBuildFileStore>> {
+        Some(Arc::clone(&self.build_files) as Arc<dyn TemplateBuildFileStore>)
     }
 
     async fn publish(
@@ -400,6 +411,7 @@ mod tests {
         PosixFsSnapshotRepository::new(
             Arc::new(PosixFsCatalogStore::new(root.to_path_buf())),
             Arc::new(PosixFsArtifactStore::new(root.to_path_buf())),
+            super::super::build_files::PosixFsTemplateBuildFileStore::new(root),
         )
     }
 

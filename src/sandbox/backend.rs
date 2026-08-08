@@ -387,4 +387,18 @@ pub trait SandboxExecutor: Send {
     ) -> Result<ProcessHandle> {
         self.executor()?.start_process(cmd, args, opts).await
     }
+
+    /// Upload a local file into the sandbox at `guest_path` as `username`.
+    ///
+    /// Streams through envd's files API, so the sandbox must be running.
+    async fn upload_file(
+        &self,
+        local_path: &std::path::Path,
+        guest_path: &str,
+        username: &str,
+    ) -> Result<()> {
+        self.executor()?
+            .upload_file(local_path, guest_path, username)
+            .await
+    }
 }

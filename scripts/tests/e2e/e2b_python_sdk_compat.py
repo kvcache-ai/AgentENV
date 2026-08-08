@@ -6,6 +6,8 @@ from __future__ import annotations
 import importlib.metadata
 import os
 import time
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Callable, TypeVar
 
 from e2b import Sandbox, Template
@@ -56,21 +58,32 @@ def main() -> int:
     workdir = f"/tmp/{template_name}"
     derived_workdir = f"/tmp/{derived_template_name}"
     build_marker = f"sdk-build-marker-{time.time_ns()}"
+    copy_marker = f"sdk-copy-marker-{time.time_ns()}"
+    add_marker = f"sdk-add-marker-{time.time_ns()}"
     derived_marker = f"sdk-from-template-marker-{time.time_ns()}"
     startup_marker = f"sdk-startup-marker-{time.time_ns()}"
 
+    build_context = TemporaryDirectory(prefix="agentenv-e2b-build-context-")
     build_info = None
     derived_build_info = None
     sandbox = None
     derived_sandbox = None
 
     try:
+        context_path = Path(build_context.name)
+        (context_path / "copy-source.txt").write_text(copy_marker, encoding="utf-8")
+        (context_path / "add-source.txt").write_text(add_marker, encoding="utf-8")
+
         log(f"building template {template_name} from {base_image}")
         template = (
-            Template()
-            .from_image(base_image)
-            .run_cmd(f"mkdir -p {workdir}")
-            .set_workdir(workdir)
+            Template(file_context_path=context_path)
+            .from_dockerfile(
+                f"""FROM {base_image}
+WORKDIR {workdir}
+COPY copy-source.txt copied.txt
+ADD add-source.txt added.txt
+"""
+            )
             .set_envs({"AENV_E2B_SDK_MARKER": build_marker})
             .run_cmd("printf '%s' \"$AENV_E2B_SDK_MARKER\" > marker.txt")
             .run_cmd("pwd > workdir.txt")
@@ -130,6 +143,8 @@ def main() -> int:
                 "test -n \"$pid_line\"; "
                 "printf 'marker=' && cat marker.txt && "
                 "printf '\\nworkdir=' && cat workdir.txt && "
+                "printf '\\ncopy=' && cat copied.txt && "
+                "printf '\\nadd=' && cat added.txt && "
                 "printf '\\nstartup=' && cat startup-ready.txt && "
                 "printf '\\nprocess=%s' \"$pid_line\"",
                 cwd=workdir,
@@ -141,6 +156,8 @@ def main() -> int:
         require(result.exit_code == 0, f"command exited with {result.exit_code}")
         require(f"marker={build_marker}" in result.stdout, "build marker file did not match")
         require(f"workdir={workdir}" in result.stdout, "WORKDIR build step was not preserved")
+        require(f"copy={copy_marker}" in result.stdout, "COPY artifact did not match")
+        require(f"add={add_marker}" in result.stdout, "ADD artifact did not match")
         require(
             f"startup={startup_marker}" in result.stdout,
             "startup ready marker file did not match",
@@ -303,6 +320,8 @@ def main() -> int:
                 )
             except Exception as error:  # noqa: BLE001 - best-effort cleanup.
                 log(f"cleanup template delete failed: {error}")
+
+        build_context.cleanup()
 
 
 if __name__ == "__main__":

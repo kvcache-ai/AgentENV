@@ -18,6 +18,9 @@ use crate::snapshot::{
 };
 use crate::types::SandboxResources;
 
+/// Bounds the node disk cost of one build spec.
+const MAX_BUILD_ARCHIVES: usize = 32;
+
 #[derive(Clone)]
 /// Coordinates template-builder flows over committed snapshots.
 pub struct TemplateBuilder {
@@ -100,9 +103,12 @@ impl TemplateBuilder {
     async fn execute_and_publish(
         &self,
         snapshot_manager: &SnapshotManager,
-        context: TemplateBuildContext,
+        mut context: TemplateBuildContext,
         operation: &'static str,
     ) -> TemplatePipelineResult<SnapshotRecord> {
+        context.build_archives =
+            Self::materialize_build_archives(snapshot_manager, &context).await?;
+
         info!("executing template build");
         let build_execution = match TemplateBuildRunner::new().execute(&context) {
             Ok(execution) => execution,
@@ -152,6 +158,87 @@ impl TemplateBuilder {
 }
 
 impl TemplateBuilder {
+    /// Fetches every build-context archive referenced by COPY steps into
+    /// node-local files before the build sandbox starts.
+    async fn materialize_build_archives(
+        snapshot_manager: &SnapshotManager,
+        context: &TemplateBuildContext,
+    ) -> TemplatePipelineResult<std::collections::HashMap<String, std::path::PathBuf>> {
+        let hashes = TemplateBuildSpec::referenced_build_file_hashes(&context.steps);
+        if hashes.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        if hashes.len() > MAX_BUILD_ARCHIVES {
+            return Err(TemplateBuildError::invalid_input(format!(
+                "template build references {} distinct build context archives, which exceeds the \
+                 limit of {MAX_BUILD_ARCHIVES}",
+                hashes.len()
+            ))
+            .into());
+        }
+
+        let Some(store) = snapshot_manager.template_build_files() else {
+            return Err(TemplateBuildError::invalid_input(
+                "the configured snapshot backend does not support the build-context uploads required by COPY steps",
+            )
+            .into());
+        };
+
+        let scratch = context.local_dir().join("build-archives");
+        tokio::fs::create_dir_all(&scratch).await.map_err(|error| {
+            TemplateBuildError::with_source("create build archive scratch dir", error)
+        })?;
+
+        let max_context_mib = ConfigManager::global_config()
+            .template_build
+            .files_max_build_context_mib;
+        let max_total_bytes = max_context_mib.saturating_mul(1024 * 1024);
+
+        let mut archives = std::collections::HashMap::new();
+        let mut total_bytes: u64 = 0;
+        for hash in hashes {
+            match store.materialize(&hash, &scratch).await {
+                Ok(Some(path)) => {
+                    let size = tokio::fs::metadata(&path)
+                        .await
+                        .map_err(|error| {
+                            TemplateBuildError::with_source(
+                                format!("read build context archive '{hash}' metadata"),
+                                error,
+                            )
+                        })?
+                        .len();
+                    total_bytes = total_bytes.saturating_add(size);
+                    if total_bytes > max_total_bytes {
+                        return Err(TemplateBuildError::invalid_input(format!(
+                            "template build context archives total at least {total_bytes} bytes, \
+                             which exceeds the template_build.files_max_build_context_mib limit of \
+                             {max_context_mib} MiB"
+                        ))
+                        .into());
+                    }
+                    archives.insert(hash, path);
+                }
+                Ok(None) => {
+                    return Err(TemplateBuildError::invalid_input(format!(
+                        "build context archive '{hash}' has not been uploaded; request an upload \
+                         link via GET /templates/{{templateID}}/files/{hash} and upload the \
+                         archive before starting the build"
+                    ))
+                    .into());
+                }
+                Err(error) => {
+                    return Err(TemplateBuildError::with_source(
+                        format!("fetch build context archive '{hash}'"),
+                        error,
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(archives)
+    }
+
     fn build_failure_reason(error: &AnyhowError) -> TemplateBuildErrorReason {
         error
             .chain()
@@ -210,6 +297,7 @@ impl TemplateBuilder {
             resources,
             workspace,
             steps: spec.steps().to_vec(),
+            build_archives: std::collections::HashMap::new(),
             base,
             cpu_config_json: self.current_cpu_config(),
             virtualization_mode: ConfigManager::global_config().virtualization_mode,
@@ -272,6 +360,7 @@ impl TemplateBuilder {
             resources,
             workspace,
             steps: spec.steps().to_vec(),
+            build_archives: std::collections::HashMap::new(),
             base: TemplateBuildBase::Snapshot {
                 base_snapshot: Box::new(base_snapshot.clone()),
             },
@@ -374,6 +463,33 @@ mod tests {
             .build_and_publish(&snapshot_manager, TemplateBuildSpec::new())
             .await
             .expect_err("missing rootfs base should fail");
+
+        assert!(matches!(
+            err,
+            crate::template::TemplatePipelineError::Build(TemplateBuildError::InvalidInput { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn materialize_build_archives_rejects_too_many_archives() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let (manager, snapshot_manager) = test_parts(tempdir.path());
+        let runnable = RunnableSnapshot::mock();
+        let mut spec = TemplateBuildSpec::new();
+        for index in 0..=MAX_BUILD_ARCHIVES {
+            spec = spec.copy("./src", "/app", format!("hash-{index}"), None, None);
+        }
+        let context = manager
+            .prepare_snapshot_base_context(
+                &spec,
+                crate::snapshot::SnapshotId::generate(),
+                &runnable,
+            )
+            .expect("snapshot-base preparation should succeed");
+
+        let err = TemplateBuilder::materialize_build_archives(&snapshot_manager, &context)
+            .await
+            .expect_err("too many referenced archives should be rejected");
 
         assert!(matches!(
             err,

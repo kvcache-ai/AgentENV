@@ -83,6 +83,30 @@ peer_discovery_refresh_interval_secs = 5
 # Timeout for custom extension HTTP calls, in milliseconds.
 # timeout_ms = 5000
 
+[template_build]
+# Build-context upload settings backing the E2B SDK's COPY support
+# (GET /templates/{templateID}/files/{hash} plus the returned upload URL).
+# Maximum accepted size for one uploaded build-context archive, in MiB.
+# files_max_upload_mib = 1024
+# Maximum size one build-context archive may expand to once decompressed, in MiB.
+# files_max_context_mib = 4096
+# Cap on the combined on-disk size of all build-context archives one build spec
+# may reference, in MiB.
+# files_max_build_context_mib = 4096
+# How long an issued upload URL stays valid, in seconds.
+# files_url_ttl_secs = 3600
+# How long one build-context upload request may run before the server gives up
+# and responds 408, in seconds.
+# files_upload_timeout_secs = 300
+# Optional external base URL used when building upload URLs. Defaults to
+# "http://{Host header}" of the upload-link request, which matches
+# direct-node and bundled-gateway deployments.
+# Any TLS-terminated, gateway-fronted, or multi-hop deployment MUST set this to
+# the external origin clients reach: the fallback derives the URL from the
+# request Host header with plain http, and that upload URL carries a bearer
+# token in its query string.
+# public_base_url = "https://agentenv.example.com"
+
 [cluster]
 # Shared gRPC endpoint for cluster-level services such as scheduler heartbeat
 # reporting and P2P peer discovery (e.g. "http://127.0.0.1:9090").
