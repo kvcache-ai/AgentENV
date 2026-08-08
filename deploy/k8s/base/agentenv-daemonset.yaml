@@ -16,6 +16,41 @@ spec:
       terminationGracePeriodSeconds: 3600
       nodeSelector:
         kubernetes.io/os: linux
+      initContainers:
+        # ublk_drv must be loaded in the host kernel before the server's startup
+        # check runs. chroot into the host root so modprobe resolves modules for
+        # the node's running kernel instead of the container image.
+        - name: load-ublk
+          image: agentenv-runtime:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - "-c"
+            - |
+              chroot /host modprobe ublk_drv
+              chroot /host ls -l /dev/ublk-control
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: host-root
+              mountPath: /host
+              readOnly: true
+        # The workspace hostPath is mounted over /workspace and shadows the
+        # runtime assets baked into the image at /workspace/env. Seed them into
+        # the host directory so the server does not re-download them at startup.
+        # --update=none keeps existing host state untouched.
+        - name: seed-deps
+          image: agentenv-runtime:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - "-c"
+            - |
+              mkdir -p /host-workspace/env
+              cp -a --update=none /workspace/env/. /host-workspace/env/
+          volumeMounts:
+            - name: workspace
+              mountPath: /host-workspace
       containers:
         - name: agentenv
           image: agentenv-runtime:latest
@@ -45,6 +80,19 @@ spec:
                   name: sandbox-proxy-config
                   key: SANDBOX_PROXY_DOMAINS
                   optional: true
+            # Both the main runtime and the firecracker pool runtime size
+            # themselves from the host's core count, which on a large node means
+            # hundreds of worker threads. Every one of them takes a jemalloc
+            # arena and inflates the address space, and the sandbox start path
+            # spawns helper processes (iptables, ip) whose cost scales with it.
+            - name: TOKIO_WORKER_THREADS
+              value: "32"
+            # jemalloc defaults to 4x the core count in arenas and holds dirty
+            # pages for 10s, which lets RSS stay high long after one-off work
+            # such as image conversion. Capping arenas and shortening decay
+            # keeps the resident set an order of magnitude smaller.
+            - name: _RJEM_MALLOC_CONF
+              value: narenas:8,dirty_decay_ms:1000,muzzy_decay_ms:0,background_thread:true
           ports:
             - name: http
               containerPort: 8000
@@ -138,4 +186,8 @@ spec:
         - name: host-dev
           hostPath:
             path: /dev
+            type: Directory
+        - name: host-root
+          hostPath:
+            path: /
             type: Directory
