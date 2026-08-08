@@ -42,12 +42,12 @@ aenv pull ubuntu:24.04
 Build a template by running Dockerfile instructions inside a temporary sandbox:
 
 ```bash
-aenv build ./Dockerfile
+aenv build ./Dockerfile --name my-template
 ```
 
 | Flag | Description |
 |------|-------------|
-| `-t`, `--tag <name>` | Template name. Defaults to the parent directory name of the Dockerfile |
+| `--name <name>` | Required template name |
 | `--image <ref>` | Override the `FROM` image |
 
 Supported Dockerfile instructions:
@@ -81,12 +81,12 @@ corresponding Dockerfile instructions executed during the build. The following f
 
 ### Aliases
 
-Each template is identified by a UUID. Pass `--name` or `-t` at creation time
-to assign a human-readable alias:
+Each template is identified by a UUID. Pass `--name` at creation time to assign
+a human-readable alias:
 
 ```bash
 aenv pull ubuntu:24.04 --name my-base
-aenv build ./Dockerfile -t my-service
+aenv build ./Dockerfile --name my-service
 ```
 
 The alias can be used wherever a template ID is accepted:

@@ -22,6 +22,7 @@ envd = { path = "../../thirdparty/envd" }
 futures = "0.3"
 indicatif = "0.17"
 openssl-sys = { version = "0.9", optional = true }
+parse-dockerfile = { version = "0.1.8", default-features = false }
 prost = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["multipart", "rustls", "stream"] }
 rpassword = "7"

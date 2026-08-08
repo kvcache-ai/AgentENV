@@ -52,19 +52,18 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 | `-d, --detach` | Submit the build and return immediately without waiting |
 | `--timeout <SECS>` | Maximum seconds to wait for the build to complete |
 
-### `aenv build <dockerfile>`
+### `aenv build <dockerfile> --name <name>`
 
 Create a template from a local Dockerfile.
 
 ```bash
-aenv build ./Dockerfile
-aenv build ./Dockerfile -t my-app
-aenv build ./Dockerfile --image ghcr.io/myorg/base:latest
+aenv build ./Dockerfile --name my-app
+aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
 ```
 
 | Flag | Description |
 |------|-------------|
-| `-t, --tag <name>` | Template name. Defaults to the parent directory name |
+| `--name <name>` | Required template name |
 | `--image <image>` | Override the `FROM` image used as the rootfs base |
 
 ### `aenv template list`
