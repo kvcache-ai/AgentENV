@@ -6,15 +6,15 @@ use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
 use parse_dockerfile::{Command, HereDoc, Instruction, RunInstruction};
 use shell_util::shell_quote;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(ClapArgs)]
 pub struct Args {
     /// Path to the Dockerfile used to build the template
     dockerfile: PathBuf,
-    /// Template name, optionally with `:tag`
-    #[arg(short = 't', long = "tag")]
-    name: Option<String>,
+    /// Template name
+    #[arg(long)]
+    name: String,
     #[command(flatten)]
     resources: super::CpuMemoryArgs,
     /// Override the Dockerfile FROM image used as the template rootfs base. Shortnames like `ubuntu:22.04` are supported.
@@ -26,12 +26,11 @@ pub fn run(args: Args) -> Result<()> {
     let client = Client::from_env()?;
     let dockerfile = std::fs::read_to_string(&args.dockerfile)
         .with_context(|| format!("reading {}", args.dockerfile.display()))?;
-    let alias = parse_alias(args.name.as_deref(), &args.dockerfile);
     let user_image = args.user_image.or_else(|| first_from_image(&dockerfile));
     let build_plan = dockerfile_build_plan(&dockerfile)?;
 
     let req = CreateTemplateV3 {
-        name: alias.to_string(),
+        name: args.name,
         tags: Vec::new(),
         cpu_count: args.resources.cpu_count,
         memory_mb: args.resources.memory_mb,
@@ -54,17 +53,6 @@ pub fn run(args: Args) -> Result<()> {
     println!("Build started.");
     println!("Watch with: aenv template watch {}", resp.template_id);
     Ok(())
-}
-
-pub(crate) fn parse_alias(flag: Option<&str>, dockerfile: &Path) -> String {
-    flag.map(|s| s.to_string()).unwrap_or_else(|| {
-        dockerfile
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            .unwrap_or("template")
-            .to_string()
-    })
 }
 
 pub(crate) fn first_from_image(dockerfile: &str) -> Option<String> {
@@ -285,6 +273,23 @@ fn key_value_args(instruction: &str, args: &str) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::{dockerfile_build_plan, first_from_image};
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: super::Args,
+    }
+
+    #[test]
+    fn build_requires_name_flag() {
+        let cli = TestCli::try_parse_from(["test", "Dockerfile", "--name", "my-template"])
+            .expect("--name should be accepted");
+        assert_eq!(cli.args.name, "my-template");
+
+        assert!(TestCli::try_parse_from(["test", "Dockerfile"]).is_err());
+        assert!(TestCli::try_parse_from(["test", "Dockerfile", "--tag", "old"]).is_err());
+    }
 
     #[test]
     fn first_from_image_reads_basic_from() {
