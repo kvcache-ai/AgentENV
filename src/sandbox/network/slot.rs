@@ -1061,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CAP_NET_ADMIN/CAP_SYS_ADMIN and affects system configuration"]
+    #[ignore = "requires CAP_NET_ADMIN/CAP_NET_RAW/CAP_SYS_ADMIN and affects system configuration"]
     fn test_network_lifecycle() {
         crate::logging::init_for_tests();
 
@@ -1070,7 +1070,7 @@ mod tests {
         let slot = unused_test_slot();
 
         // 1. Create Network
-        // This requires CAP_NET_ADMIN and CAP_SYS_ADMIN.
+        // This requires CAP_NET_ADMIN, CAP_NET_RAW, and CAP_SYS_ADMIN.
         match slot.create_network() {
             Ok(_) => {}
             Err(e) => {

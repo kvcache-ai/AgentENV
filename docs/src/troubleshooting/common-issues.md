@@ -39,7 +39,7 @@ AENV_VIRTUALIZATION_MODE=pvm
 
 **Symptom**: Sandbox creation fails with network namespace or iptables errors.
 
-**Solution**: The server requires both `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` in
+**Solution**: The server requires `CAP_NET_ADMIN`, `CAP_NET_RAW`, and `CAP_SYS_ADMIN` in
 its effective, permitted, and inheritable sets. The installed systemd unit
 configures these automatically. For a source checkout, use `make start-server`
 or `scripts/run-with-capabilities.sh <server-binary>`; do not run the whole

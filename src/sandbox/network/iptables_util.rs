@@ -105,7 +105,11 @@ fn build_restore_script(commands: &[IptablesRestoreCommand]) -> String {
 }
 
 fn apply_restore_script(script: &str) -> Result<()> {
-    crate::privileges::run_with_scoped_capabilities(&[crate::privileges::CAP_NET_ADMIN], || {
+    let capabilities = [
+        crate::privileges::CAP_NET_ADMIN,
+        crate::privileges::CAP_NET_RAW,
+    ];
+    crate::privileges::run_with_scoped_capabilities(&capabilities, || {
         let mut child = Command::new("iptables-restore")
             .arg("--noflush")
             .stdin(Stdio::piped())

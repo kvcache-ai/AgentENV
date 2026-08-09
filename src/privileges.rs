@@ -5,11 +5,12 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use tracing::warn;
 
-pub use linux_cap::{CAP_NET_ADMIN, CAP_SYS_ADMIN};
+pub use linux_cap::{CAP_NET_ADMIN, CAP_NET_RAW, CAP_SYS_ADMIN};
 
 fn capability_name(capability: i32) -> &'static str {
     match capability {
         CAP_NET_ADMIN => "CAP_NET_ADMIN",
+        CAP_NET_RAW => "CAP_NET_RAW",
         CAP_SYS_ADMIN => "CAP_SYS_ADMIN",
         _ => "unknown capability",
     }
@@ -23,7 +24,7 @@ fn capability_name(capability: i32) -> &'static str {
 pub fn require_runtime_capabilities() -> Result<()> {
     let sets = linux_cap::CapabilitySets::current().context("read process capability sets")?;
     let is_root = nix::unistd::Uid::effective().is_root();
-    let missing = [CAP_NET_ADMIN, CAP_SYS_ADMIN]
+    let missing = [CAP_NET_ADMIN, CAP_NET_RAW, CAP_SYS_ADMIN]
         .into_iter()
         .filter(|capability| {
             if is_root {
@@ -37,7 +38,7 @@ pub fn require_runtime_capabilities() -> Result<()> {
 
     if !missing.is_empty() {
         bail!(
-            "AENV runtime is missing required Linux capabilities: {}. Start it with CAP_NET_ADMIN and CAP_SYS_ADMIN in the inheritable, permitted, and effective sets (the installed systemd unit configures this automatically)",
+            "AENV runtime is missing required Linux capabilities: {}. Start it with CAP_NET_ADMIN, CAP_NET_RAW, and CAP_SYS_ADMIN in the inheritable, permitted, and effective sets (the installed systemd unit configures this automatically)",
             missing.join(", ")
         );
     }
@@ -183,18 +184,20 @@ mod tests {
     #[test]
     fn parses_capability_sets() {
         let status =
-            "CapInh:\t0000000000201000\nCapPrm:\t0000000000201000\nCapEff:\t0000000000201000\n";
+            "CapInh:\t0000000000203000\nCapPrm:\t0000000000203000\nCapEff:\t0000000000203000\n";
         let sets = linux_cap::CapabilitySets::from_proc_status(status).unwrap();
         assert!(sets.is_delegable(CAP_NET_ADMIN).unwrap());
+        assert!(sets.is_delegable(CAP_NET_RAW).unwrap());
         assert!(sets.is_delegable(CAP_SYS_ADMIN).unwrap());
     }
 
     #[test]
     fn capability_must_be_present_in_all_required_sets() {
         let status =
-            "CapInh:\t0000000000201000\nCapPrm:\t0000000000201000\nCapEff:\t0000000000001000\n";
+            "CapInh:\t0000000000203000\nCapPrm:\t0000000000203000\nCapEff:\t0000000000001000\n";
         let sets = linux_cap::CapabilitySets::from_proc_status(status).unwrap();
         assert!(sets.is_delegable(CAP_NET_ADMIN).unwrap());
+        assert!(!sets.is_delegable(CAP_NET_RAW).unwrap());
         assert!(!sets.is_delegable(CAP_SYS_ADMIN).unwrap());
     }
 

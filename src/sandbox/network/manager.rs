@@ -486,7 +486,10 @@ impl NetworkManager {
             "iptables-save",
             "iptables-save",
             &[],
-            &[crate::privileges::CAP_NET_ADMIN],
+            &[
+                crate::privileges::CAP_NET_ADMIN,
+                crate::privileges::CAP_NET_RAW,
+            ],
             &firewall_conflict_patterns,
             "detected iptables rules referencing AgentENV interfaces or network ranges; sandbox traffic may be redirected, filtered, or rewritten by another program",
         );
@@ -719,8 +722,9 @@ mod tests {
     }
 
     fn has_network_runtime_capabilities() -> bool {
-        let required =
-            (1u64 << crate::privileges::CAP_NET_ADMIN) | (1u64 << crate::privileges::CAP_SYS_ADMIN);
+        let required = (1u64 << crate::privileges::CAP_NET_ADMIN)
+            | (1u64 << crate::privileges::CAP_NET_RAW)
+            | (1u64 << crate::privileges::CAP_SYS_ADMIN);
         std::fs::read_to_string("/proc/self/status")
             .ok()
             .and_then(|status| {
@@ -1237,7 +1241,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires CAP_NET_ADMIN/CAP_SYS_ADMIN and intentionally crashes a child process"]
+    #[ignore = "requires CAP_NET_ADMIN/CAP_NET_RAW/CAP_SYS_ADMIN and intentionally crashes a child process"]
     fn panic_exit_with_pooled_slot_is_cleaned_by_exit_hook() {
         const CHILD_ENV: &str = "AENV_NETWORK_PANIC_CHILD";
         const TEST_NAME: &str =

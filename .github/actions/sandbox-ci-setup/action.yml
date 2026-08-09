@@ -141,8 +141,8 @@ runs:
         [[ -d /sys/module/ublk_drv ]]
         output="$(scripts/run-with-capabilities.sh sh -c 'id -u; sed -n "s/^CapEff:[[:space:]]*//p" /proc/self/status')"
         [[ "$(sed -n '1p' <<< "$output")" != "0" ]]
-        # CAP_NET_ADMIN (bit 12) | CAP_SYS_ADMIN (bit 21) = 0x201000.
-        [[ "$(sed -n '2p' <<< "$output")" == "0000000000201000" ]]
+        # CAP_NET_ADMIN (bit 12) | CAP_NET_RAW (bit 13) | CAP_SYS_ADMIN (bit 21) = 0x203000.
+        [[ "$(sed -n '2p' <<< "$output")" == "0000000000203000" ]]
         scripts/run-with-capabilities.sh sh -c '
           test -s /etc/overlaybd/overlaybd.json
           test -r /etc/overlaybd/overlaybd.json

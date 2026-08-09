@@ -338,8 +338,8 @@ EnvironmentFile=${ENV_FILE}
 ExecStart=${INSTALL_DIR}/server
 RuntimeDirectory=aenv
 RuntimeDirectoryMode=0750
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_SYS_ADMIN
 NoNewPrivileges=true
 UMask=0027
 LimitNOFILE=1048576
@@ -393,8 +393,8 @@ if [[ -d /run/systemd/system ]]; then
 else
     echo "systemd not detected. Start the server manually:"
     echo "  sudo setpriv --reuid=${SERVICE_USER} --regid=${SERVICE_GROUP} --init-groups \\"
-    echo "    --inh-caps=+net_admin,+sys_admin --ambient-caps=+net_admin,+sys_admin \\"
-    echo "    --bounding-set=-all,+net_admin,+sys_admin --nnp \\"
+    echo "    --inh-caps=+net_admin,+net_raw,+sys_admin --ambient-caps=+net_admin,+net_raw,+sys_admin \\"
+    echo "    --bounding-set=-all,+net_admin,+net_raw,+sys_admin --nnp \\"
     echo "    env AENV_CONFIG_PATH=${CONFIG_PATH} AENV_HOME_PATH=${DATA_DIR} AENV_RUNTIME_PATH=${RUNTIME_DIR} \\"
     echo "    AENV_VIRTUALIZATION_MODE=${VIRTUALIZATION_MODE} \\"
     echo "    API_ADDR=127.0.0.1:8000 ${INSTALL_DIR}/server"
