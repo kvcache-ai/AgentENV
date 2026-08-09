@@ -175,7 +175,7 @@ Overlaybd registryfs_v2 remote block cache settings. The directory is always
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `max_size_gb` | integer | `10` | Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd `cacheConfig.cacheSizeGB` |
+| `max_size_gb` | integer | `100` | Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd `cacheConfig.cacheSizeGB` |
 
 Resolved image data is cached under:
 
@@ -336,7 +336,12 @@ Shared cluster-level service endpoints.
 
 ## `[p2p]`
 
-Project-wide artifact transport configuration. The transport is disabled by default. When enabled, it is used by the overlaybd P2P HTTP facade and by snapshot publication/runtime resolution as an optional artifact visibility and acceleration path.
+> **Experimental:** P2P has not been tested in production. Keep it disabled in
+> production unless the deployment accepts that operational risk.
+
+Project-wide artifact transport configuration. The transport is disabled by
+default. When enabled, it is used by the overlaybd P2P HTTP facade and by
+snapshot publication/runtime resolution as an optional acceleration path.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

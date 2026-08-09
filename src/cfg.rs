@@ -1297,24 +1297,14 @@ mod tests {
         );
         assert_eq!(default.compression_workers, 1);
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
-        for relative in ["config/default.toml", "config/oss_default.toml"] {
-            let config = ConfigManager::new_from_path(&workspace.join(relative))?;
-            assert!(!config.config().memory_snapshot.compression_enabled);
-            assert!(
-                !config.config().memory_snapshot.track_dirty_pages,
-                "unexpected track_dirty_pages default in {relative}"
-            );
-            assert_eq!(
-                config.config().memory_snapshot.compression_algorithm,
-                MemorySnapshotCompressionAlgorithm::Lz4,
-                "unexpected compression default in {relative}"
-            );
-            assert_eq!(
-                config.config().memory_snapshot.compression_workers,
-                1,
-                "unexpected compression_workers default in {relative}"
-            );
-        }
+        let config = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        assert!(!config.config().memory_snapshot.compression_enabled);
+        assert!(!config.config().memory_snapshot.track_dirty_pages);
+        assert_eq!(
+            config.config().memory_snapshot.compression_algorithm,
+            MemorySnapshotCompressionAlgorithm::Lz4,
+        );
+        assert_eq!(config.config().memory_snapshot.compression_workers, 1);
         Ok(())
     }
 

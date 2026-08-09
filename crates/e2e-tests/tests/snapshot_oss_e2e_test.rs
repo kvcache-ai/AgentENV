@@ -95,8 +95,9 @@ fn ensure_test_config() -> Result<()> {
     let deps_path = config_root.join("env");
     let local_cache = config_root.join("snapshot-local-cache");
     std::fs::create_dir_all(&config_root)?;
-    let config_path = workspace_root.join("config").join("oss_default.toml");
+    let config_path = workspace_root.join("config").join("default.toml");
     std::env::set_var("AENV_CONFIG_PATH", &config_path);
+    std::env::set_var("AENV_HOME_PATH", &config_root);
     std::env::set_var("AENV_DEPS_PATH", &deps_path);
     std::env::set_var("AENV_SNAPSHOT_LOCAL_CACHE_PATH", &local_cache);
 
