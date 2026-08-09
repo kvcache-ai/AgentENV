@@ -34,6 +34,7 @@ enum Cmd {
     /// Download a file from a sandbox
     Download(commands::download::Args),
     /// Generate shell completion scripts
+    #[command(hide = true)]
     Completion(commands::completion::Args),
     /// Attach an interactive shell to a running sandbox
     #[command(visible_alias = "cn")]
