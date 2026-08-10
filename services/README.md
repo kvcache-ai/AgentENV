@@ -129,6 +129,8 @@ Group accounting occurs atomically during scheduling, before the runtime finishe
 }
 ```
 
+When a cold-start request omits `cpuCount` or `memoryMB` while the corresponding group limit is enabled, the scheduler charges that dimension at the full configured group limit. Runtime defaults are node-local and are not available in the gateway hint, so this conservative behavior closes that request's group instead of allowing an unknown default to exceed the budget.
+
 Template-based create requests do not carry CPU or memory values, so their groups are bounded by `max_sandbox_count` only. Image tags and template aliases are used exactly as supplied and may be mutable; a stale grouping hint can reduce cache affinity, but cannot bypass group or node resource limits.
 
 ### Node resource limit

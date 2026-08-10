@@ -63,6 +63,24 @@ func TestGroupedRoundRobinClosesGroupAtMemoryLimit(t *testing.T) {
 	}
 }
 
+func TestGroupedRoundRobinTreatsOmittedColdResourcesConservatively(t *testing.T) {
+	strategy := NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{
+		MaxSandboxCount: 10,
+		MaxCPUCount:     4,
+		MaxMemoryMB:     1024,
+	})
+	nodes := readyNodes("a", "b")
+
+	got := []string{
+		selectNodeID(t, strategy, nodes, coldHint("ubuntu", 0, 0)),
+		selectNodeID(t, strategy, nodes, coldHint("ubuntu", 0, 0)),
+	}
+	want := []string{"a", "b"}
+	if !equalNodeIDs(got, want) {
+		t.Fatalf("placements for omitted resources = %v, want %v", got, want)
+	}
+}
+
 func TestGroupedRoundRobinOversizedRequestDoesNotLeaveOpenGroup(t *testing.T) {
 	strategy := NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{
 		MaxSandboxCount: 10,

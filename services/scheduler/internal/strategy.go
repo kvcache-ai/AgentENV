@@ -112,7 +112,7 @@ func (s *GroupedRoundRobinStrategy) Select(nodes []RichNode, hint *schedulerv1.S
 		return RichNode{}, ErrNoNodes
 	}
 
-	request, grouped := groupedRoundRobinRequestFromHint(hint)
+	request, grouped := groupedRoundRobinRequestFromHint(hint, s.limits)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -197,7 +197,10 @@ func readyGroupedRoundRobinNodes(nodes []RichNode) []RichNode {
 	return ready
 }
 
-func groupedRoundRobinRequestFromHint(hint *schedulerv1.ScheduleRequestHint) (groupedRoundRobinRequest, bool) {
+func groupedRoundRobinRequestFromHint(
+	hint *schedulerv1.ScheduleRequestHint,
+	limits GroupedRoundRobinLimits,
+) (groupedRoundRobinRequest, bool) {
 	var request groupedRoundRobinRequest
 	switch kind := hint.GetKind().(type) {
 	case *schedulerv1.ScheduleRequestHint_NewColdSandbox:
@@ -209,6 +212,17 @@ func groupedRoundRobinRequestFromHint(hint *schedulerv1.ScheduleRequestHint) (gr
 			key:      "image:" + strings.TrimSpace(images[0]),
 			cpuCount: kind.NewColdSandbox.GetCpuCount(),
 			memoryMB: kind.NewColdSandbox.GetMemoryMb(),
+		}
+		// The runtime fills omitted cold-start resources from node-local
+		// machine defaults. The scheduler cannot know those defaults for every
+		// candidate, so charge an unknown dimension at the full configured
+		// group limit. This conservatively prevents an omitted value from
+		// allowing a group to exceed its resource budget.
+		if request.cpuCount == 0 && limits.MaxCPUCount > 0 {
+			request.cpuCount = limits.MaxCPUCount
+		}
+		if request.memoryMB == 0 && limits.MaxMemoryMB > 0 {
+			request.memoryMB = limits.MaxMemoryMB
 		}
 	case *schedulerv1.ScheduleRequestHint_NewSandbox:
 		request.key = "template:" + strings.TrimSpace(kind.NewSandbox.GetTemplateId())
