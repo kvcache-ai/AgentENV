@@ -25,10 +25,10 @@ AgentENV (AENV) is a platform for running agent environments at scale, powering 
 
 ## 🚀 Why AgentENV
 
-- **Scale across diverse environments**: AENV runs massive numbers of Firecracker environments across machines and diverse OCI-compatible images, loaded on demand via [overlaybd](https://containerd.github.io/overlaybd/#/). Local disk acts as a bounded cache, retaining hot data and evicting cold, so images can exceed disk capacity while startup stays fast cluster-wide, without pre-warming every host.
+- **Scale across diverse environments**: AENV runs massive numbers of Firecracker environments across machines, loading diverse OCI-compatible images on demand via [overlaybd](https://containerd.github.io/overlaybd/#/) and scaling to [1.5 million images in production](https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf). Local disk acts as a bounded cache, retaining hot data and evicting cold, so the aggregate image and snapshot footprint can exceed local disk capacity by several orders of magnitude while startup stays fast cluster-wide, without pre-warming every host.
 - **Make idle environments inexpensive**: Snapshot-backed environments boot or resume in under 50 ms and pause in under 100 ms. Idle environments can quickly release CPU and memory, then return when new work arrives.
 - **Native snapshot and fork support**: AENV snapshots memory and filesystem changes incrementally, completing in under 100 ms even under heavy disk modification. A running environment can fork into multiple independent sandboxes for parallel agent workflows. Snapshots persist to S3-compatible object storage or a shared distributed filesystem to prevent data loss.
-- **Preserve performance and density over time**: AENV delivers high-performance I/O via ublk while sharing the host page cache across storage and memory-snapshot data. Memory ballooning returns reclaimable guest memory to the host, sustaining high overcommit as environments run longer and diverge.
+- **Preserve performance and density over time**: AENV delivers high-performance I/O via ublk while sharing the host page cache across storage and memory-snapshot data. Memory ballooning returns reclaimable guest memory to the host, achieving a 9.6x memory overcommit ratio in production as environments run longer and diverge.
 
 ---
 
@@ -58,8 +58,6 @@ Install both the server and the `aenv` CLI, then start the server as a systemd s
 curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install.sh | sudo bash
 sudo systemctl start aenv
 ```
-
-If this installation fails because standard KVM is unavailable, follow the [PVM deployment guide](https://kvcache-ai.github.io/AgentENV/dev/deployment/pvm.html) instead.
 
 *Option B — Docker*
 
