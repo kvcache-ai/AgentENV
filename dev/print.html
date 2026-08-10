@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-a6e2536f.js";
+            window.path_to_searchindex_js = "searchindex-706eb9d3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-795efd7f.js"></script>
@@ -408,11 +408,10 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 </tbody>
 </table>
 </div>
-<h3 id="aenv-build-dockerfile"><a class="header" href="#aenv-build-dockerfile"><code>aenv build &lt;dockerfile&gt;</code></a></h3>
+<h3 id="aenv-build-dockerfile---name-name"><a class="header" href="#aenv-build-dockerfile---name-name"><code>aenv build &lt;dockerfile&gt; --name &lt;name&gt;</code></a></h3>
 <p>Create a template from a local Dockerfile.</p>
-<pre><code class="language-bash">aenv build ./Dockerfile
-aenv build ./Dockerfile -t my-app
-aenv build ./Dockerfile --image ghcr.io/myorg/base:latest
+<pre><code class="language-bash">aenv build ./Dockerfile --name my-app
+aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
 </code></pre>
 <div class="table-wrapper">
 <table>
@@ -420,7 +419,7 @@ aenv build ./Dockerfile --image ghcr.io/myorg/base:latest
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>-t, --tag &lt;name&gt;</code></td><td>Template name. Defaults to the parent directory name</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Required template name</td></tr>
 <tr><td><code>--image &lt;image&gt;</code></td><td>Override the <code>FROM</code> image used as the rootfs base</td></tr>
 </tbody>
 </table>
@@ -1518,7 +1517,7 @@ eviction.</p>
 <tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>max_size_gb</code></td><td>integer</td><td><code>10</code></td><td>Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd <code>cacheConfig.cacheSizeGB</code></td></tr>
+<tr><td><code>max_size_gb</code></td><td>integer</td><td><code>100</code></td><td>Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd <code>cacheConfig.cacheSizeGB</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -1722,7 +1721,13 @@ and scheduler heartbeats.</p>
 </table>
 </div>
 <h2 id="p2p"><a class="header" href="#p2p"><code>[p2p]</code></a></h2>
-<p>Project-wide artifact transport configuration. The transport is disabled by default. When enabled, it is used by the overlaybd P2P HTTP facade and by snapshot publication/runtime resolution as an optional artifact visibility and acceleration path.</p>
+<blockquote>
+<p><strong>Experimental:</strong> P2P has not been tested in production. Keep it disabled in
+production unless the deployment accepts that operational risk.</p>
+</blockquote>
+<p>Project-wide artifact transport configuration. The transport is disabled by
+default. When enabled, it is used by the overlaybd P2P HTTP facade and by
+snapshot publication/runtime resolution as an optional acceleration path.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -2191,7 +2196,7 @@ once and later create sandboxes from it in milliseconds.</p>
 <p>⚠️ <strong>Experimental</strong> — Not recommended for production use.</p>
 </blockquote>
 <p>Build a template by running Dockerfile instructions inside a temporary sandbox:</p>
-<pre><code class="language-bash">aenv build ./Dockerfile
+<pre><code class="language-bash">aenv build ./Dockerfile --name my-template
 </code></pre>
 <div class="table-wrapper">
 <table>
@@ -2199,7 +2204,7 @@ once and later create sandboxes from it in milliseconds.</p>
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>-t</code>, <code>--tag &lt;name&gt;</code></td><td>Template name. Defaults to the parent directory name of the Dockerfile</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Required template name</td></tr>
 <tr><td><code>--image &lt;ref&gt;</code></td><td>Override the <code>FROM</code> image</td></tr>
 </tbody>
 </table>
@@ -2243,10 +2248,10 @@ corresponding Dockerfile instructions executed during the build. The following f
 </table>
 </div>
 <h3 id="aliases"><a class="header" href="#aliases">Aliases</a></h3>
-<p>Each template is identified by a UUID. Pass <code>--name</code> or <code>-t</code> at creation time
-to assign a human-readable alias:</p>
+<p>Each template is identified by a UUID. Pass <code>--name</code> at creation time to assign
+a human-readable alias:</p>
 <pre><code class="language-bash">aenv pull ubuntu:24.04 --name my-base
-aenv build ./Dockerfile -t my-service
+aenv build ./Dockerfile --name my-service
 </code></pre>
 <p>The alias can be used wherever a template ID is accepted:</p>
 <pre><code class="language-bash">aenv start my-base

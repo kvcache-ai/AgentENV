@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-a6e2536f.js";
+            window.path_to_searchindex_js = "../searchindex-706eb9d3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-795efd7f.js"></script>
@@ -220,7 +220,7 @@ once and later create sandboxes from it in milliseconds.</p>
 <p>⚠️ <strong>Experimental</strong> — Not recommended for production use.</p>
 </blockquote>
 <p>Build a template by running Dockerfile instructions inside a temporary sandbox:</p>
-<pre><code class="language-bash">aenv build ./Dockerfile
+<pre><code class="language-bash">aenv build ./Dockerfile --name my-template
 </code></pre>
 <div class="table-wrapper">
 <table>
@@ -228,7 +228,7 @@ once and later create sandboxes from it in milliseconds.</p>
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>-t</code>, <code>--tag &lt;name&gt;</code></td><td>Template name. Defaults to the parent directory name of the Dockerfile</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Required template name</td></tr>
 <tr><td><code>--image &lt;ref&gt;</code></td><td>Override the <code>FROM</code> image</td></tr>
 </tbody>
 </table>
@@ -272,10 +272,10 @@ corresponding Dockerfile instructions executed during the build. The following f
 </table>
 </div>
 <h3 id="aliases"><a class="header" href="#aliases">Aliases</a></h3>
-<p>Each template is identified by a UUID. Pass <code>--name</code> or <code>-t</code> at creation time
-to assign a human-readable alias:</p>
+<p>Each template is identified by a UUID. Pass <code>--name</code> at creation time to assign
+a human-readable alias:</p>
 <pre><code class="language-bash">aenv pull ubuntu:24.04 --name my-base
-aenv build ./Dockerfile -t my-service
+aenv build ./Dockerfile --name my-service
 </code></pre>
 <p>The alias can be used wherever a template ID is accepted:</p>
 <pre><code class="language-bash">aenv start my-base

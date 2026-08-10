@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-a6e2536f.js";
+            window.path_to_searchindex_js = "../searchindex-706eb9d3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-795efd7f.js"></script>
@@ -388,7 +388,7 @@ eviction.</p>
 <tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>max_size_gb</code></td><td>integer</td><td><code>10</code></td><td>Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd <code>cacheConfig.cacheSizeGB</code></td></tr>
+<tr><td><code>max_size_gb</code></td><td>integer</td><td><code>100</code></td><td>Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd <code>cacheConfig.cacheSizeGB</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -592,7 +592,13 @@ and scheduler heartbeats.</p>
 </table>
 </div>
 <h2 id="p2p"><a class="header" href="#p2p"><code>[p2p]</code></a></h2>
-<p>Project-wide artifact transport configuration. The transport is disabled by default. When enabled, it is used by the overlaybd P2P HTTP facade and by snapshot publication/runtime resolution as an optional artifact visibility and acceleration path.</p>
+<blockquote>
+<p><strong>Experimental:</strong> P2P has not been tested in production. Keep it disabled in
+production unless the deployment accepts that operational risk.</p>
+</blockquote>
+<p>Project-wide artifact transport configuration. The transport is disabled by
+default. When enabled, it is used by the overlaybd P2P HTTP facade and by
+snapshot publication/runtime resolution as an optional acceleration path.</p>
 <div class="table-wrapper">
 <table>
 <thead>

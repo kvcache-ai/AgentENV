@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-a6e2536f.js";
+            window.path_to_searchindex_js = "../searchindex-706eb9d3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-795efd7f.js"></script>
@@ -221,11 +221,10 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 </tbody>
 </table>
 </div>
-<h3 id="aenv-build-dockerfile"><a class="header" href="#aenv-build-dockerfile"><code>aenv build &lt;dockerfile&gt;</code></a></h3>
+<h3 id="aenv-build-dockerfile---name-name"><a class="header" href="#aenv-build-dockerfile---name-name"><code>aenv build &lt;dockerfile&gt; --name &lt;name&gt;</code></a></h3>
 <p>Create a template from a local Dockerfile.</p>
-<pre><code class="language-bash">aenv build ./Dockerfile
-aenv build ./Dockerfile -t my-app
-aenv build ./Dockerfile --image ghcr.io/myorg/base:latest
+<pre><code class="language-bash">aenv build ./Dockerfile --name my-app
+aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
 </code></pre>
 <div class="table-wrapper">
 <table>
@@ -233,7 +232,7 @@ aenv build ./Dockerfile --image ghcr.io/myorg/base:latest
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>-t, --tag &lt;name&gt;</code></td><td>Template name. Defaults to the parent directory name</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Required template name</td></tr>
 <tr><td><code>--image &lt;image&gt;</code></td><td>Override the <code>FROM</code> image used as the rootfs base</td></tr>
 </tbody>
 </table>
