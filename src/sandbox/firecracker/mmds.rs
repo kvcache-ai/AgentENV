@@ -5,6 +5,7 @@ use crate::sandbox::EnvdAccessToken;
 use crate::types::SandboxId;
 
 const EMPTY_ACCESS_TOKEN: &str = "";
+const RESERVED_FIELDS: [&str; 4] = ["instanceID", "envID", "address", "accessTokenHash"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MmdsMetadata {
@@ -18,9 +19,10 @@ pub struct MmdsMetadata {
     pub access_token_hash: String,
     /// Extra key-value pairs merged into the top-level MMDS JSON object.
     /// API layers use this to pass opaque data (e.g. image configs)
-    /// through to the VM without the sandbox layer interpreting it.
+    /// through to the VM without the sandbox layer interpreting it. Reserved
+    /// MMDS fields are ignored so extras cannot override runtime identity or auth.
     #[serde(flatten)]
-    pub extra: serde_json::Map<String, serde_json::Value>,
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl MmdsMetadata {
@@ -35,7 +37,8 @@ impl MmdsMetadata {
     }
 
     /// Merge additional key-value pairs into the extra MMDS metadata.
-    pub fn with_extra(mut self, extra: serde_json::Map<String, serde_json::Value>) -> Self {
+    pub fn with_extra(mut self, mut extra: serde_json::Map<String, serde_json::Value>) -> Self {
+        extra.retain(|key, _| !RESERVED_FIELDS.contains(&key.as_str()));
         self.extra.extend(extra);
         self
     }
@@ -116,6 +119,29 @@ mod tests {
             value["instanceID"],
             json!("00000000-0000-0000-0000-000000000000")
         );
+    }
+
+    #[test]
+    fn extra_fields_cannot_override_reserved_fields() {
+        let sandbox_id = SandboxId::from_uuid(Uuid::nil());
+        let token = crate::sandbox::SandboxAccessTokenGenerator::new("mmds-test-seed")
+            .unwrap()
+            .generate(sandbox_id);
+        let expected =
+            MmdsMetadata::new(sandbox_id, "snapshot-123").with_access_token(Some(&token));
+        let mut extra = serde_json::Map::new();
+        for field in RESERVED_FIELDS {
+            extra.insert(field.to_string(), json!("attacker-controlled"));
+        }
+
+        let metadata = expected.clone().with_extra(extra);
+        let value = serde_json::to_value(&metadata).expect("serialize");
+
+        assert_eq!(metadata, expected);
+        assert_eq!(value["instanceID"], json!(sandbox_id.to_string()));
+        assert_eq!(value["envID"], json!("snapshot-123"));
+        assert_eq!(value["address"], json!(""));
+        assert_eq!(value["accessTokenHash"], json!(expected.access_token_hash));
     }
 
     #[test]
