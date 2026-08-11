@@ -15,7 +15,7 @@ use super::layout::OssSnapshotArtifactLayout;
 use crate::cfg::SnapshotImageStoragePolicy;
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::repository::backends::common::acr::{
-    AcrDiskImageExporter, DiskImageExportOutcome, DiskImageSubject,
+    AcrDiskImageExporter, DiskImageExportOutcome, DiskImageSubject, SnapshotOciConfigInput,
 };
 use crate::snapshot::repository::backends::common::write_dense_overlaybd_layer_to_file;
 use crate::snapshot::repository::interfaces::SnapshotRepository;
@@ -222,12 +222,17 @@ impl SnapshotRepository for OssSnapshotRepository {
         let publish_result = async {
             validate_publish_manifest_image_configs(&manifest)?;
 
-            // 1. Export rootfs disk image.
+            // 1. Export rootfs disk image with the effective runtime config.
+            let rootfs_config = SnapshotOciConfigInput::new(
+                &metadata.context,
+                metadata.image_configs.rootfs_config(),
+            );
             let rootfs_outcome = self
                 .export_disk_image(
                     id,
                     DiskImageSubject::Rootfs,
                     &manifest.rootfs.image_config_path,
+                    Some(rootfs_config),
                 )
                 .await?;
             if let Some(publication) = rootfs_outcome.publication.clone() {
@@ -802,6 +807,7 @@ impl OssSnapshotRepository {
         snapshot_id: &SnapshotId,
         subject: DiskImageSubject,
         image_config_path: &Path,
+        config: Option<SnapshotOciConfigInput<'_>>,
     ) -> RepositoryResult<DiskImageExportOutcome> {
         if !matches!(
             self.snapshot_image_storage,
@@ -811,7 +817,7 @@ impl OssSnapshotRepository {
         }
         match self
             .acr_exporter
-            .export(snapshot_id, subject.clone(), image_config_path)
+            .export(snapshot_id, subject.clone(), image_config_path, config)
             .await
         {
             Err(RepositoryError::Unsupported { feature }) => {
@@ -872,6 +878,7 @@ impl OssSnapshotRepository {
                         drive_id: drive.drive_id.clone(),
                     },
                     &drive.image_config_path,
+                    None,
                 )
                 .await?;
             if let Some(publication) = outcome.publication.clone() {

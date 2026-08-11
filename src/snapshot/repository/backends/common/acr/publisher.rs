@@ -16,7 +16,8 @@ use crate::snapshot::{
 
 use super::client::{AcrClient, AcrClientError};
 use super::manifest::{
-    build_oci_image_manifest, host_architecture_for_oci, minimal_oci_config_blob, OciDescriptor,
+    build_oci_image_manifest, host_architecture_for_oci, minimal_oci_config_blob,
+    snapshot_oci_config_blob, OciDescriptor, SnapshotOciConfigInput,
 };
 use super::source_image::{
     load_source_registry_image, LocalSnapshotDelta, LocalSnapshotDeltaDescriptor,
@@ -74,6 +75,7 @@ impl AcrDiskImageExporter {
         snapshot_id: &SnapshotId,
         subject: DiskImageSubject,
         image_config_path: &Path,
+        config: Option<SnapshotOciConfigInput<'_>>,
     ) -> RepositoryResult<DiskImageExportOutcome> {
         let image = load_source_registry_image(image_config_path)?;
         let target = &image.target;
@@ -117,8 +119,10 @@ impl AcrDiskImageExporter {
             }));
         }
 
-        let (config_bytes, config_digest, config_size) =
-            minimal_oci_config_blob(host_architecture_for_oci())?;
+        let (config_bytes, config_digest, config_size) = match config {
+            Some(config) => snapshot_oci_config_blob(host_architecture_for_oci(), config)?,
+            None => minimal_oci_config_blob(host_architecture_for_oci())?,
+        };
         if !client
             .blob_exists(&target.repo_blob_url, &target.repository, &config_digest)
             .await?
@@ -318,6 +322,7 @@ fn is_tag_char(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
 
     use serde_json::json;
@@ -325,6 +330,7 @@ mod tests {
 
     use super::super::client::tests::{client as test_client, fake_server, FakeState};
     use super::*;
+    use crate::snapshot::CommandContext;
 
     #[test]
     fn validates_oci_snapshot_tags() {
@@ -381,6 +387,7 @@ mod tests {
                 &crate::snapshot::SnapshotId::generate(),
                 DiskImageSubject::Rootfs,
                 &image,
+                None,
             )
             .await
             .expect_err("planned ACR source must not fall back on missing credentials");
@@ -421,9 +428,19 @@ mod tests {
         let publisher =
             AcrDiskImageExporter::new_with_client_builder(Arc::new(move |_| Ok(client.clone())));
         let snapshot_id = crate::snapshot::SnapshotId::generate();
+        let context = CommandContext::new(
+            HashMap::from([("APP_ENV".to_string(), "snapshot".to_string())]),
+            "/workspace",
+        );
+        let raw = json!({"StopSignal": "SIGTERM"});
 
         let outcome = publisher
-            .export(&snapshot_id, DiskImageSubject::Rootfs, &image)
+            .export(
+                &snapshot_id,
+                DiskImageSubject::Rootfs,
+                &image,
+                Some(SnapshotOciConfigInput::new(&context, Some(&raw))),
+            )
             .await
             .unwrap();
 
@@ -453,9 +470,15 @@ mod tests {
                 }),
             ]
         );
+        let (_, expected_config_digest, _) = snapshot_oci_config_blob(
+            host_architecture_for_oci(),
+            SnapshotOciConfigInput::new(&context, Some(&raw)),
+        )
+        .unwrap();
         let state = state.lock().unwrap();
         assert_eq!(state.manifest_puts.len(), 1);
         let manifest: serde_json::Value = serde_json::from_slice(&state.manifest_puts[0]).unwrap();
+        assert_eq!(manifest["config"]["digest"], expected_config_digest);
         assert_eq!(manifest["layers"][0]["digest"], "sha256:base");
         assert_eq!(manifest["layers"][1]["digest"], "sha256:delta");
         assert_eq!(

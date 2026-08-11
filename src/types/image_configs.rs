@@ -56,6 +56,14 @@ impl ImageConfigs {
         &self.0
     }
 
+    /// Return the raw config associated with the rootfs image, if present.
+    pub fn rootfs_config(&self) -> Option<&serde_json::Value> {
+        self.0
+            .iter()
+            .find(|entry| entry.drive_id.is_none() && entry.mount_path == "/")
+            .map(|entry| &entry.config)
+    }
+
     /// Serialize into a `serde_json::Value` (JSON array) suitable for
     /// embedding into the MMDS extra metadata map.
     pub fn to_value(&self) -> serde_json::Value {
@@ -71,17 +79,18 @@ mod tests {
     #[test]
     fn serializes_as_flat_array() {
         let mut configs = ImageConfigs::new();
-        configs.add(None::<String>, "/", json!({"Cmd": ["/bin/sh"]}));
         configs.add(Some("data"), "/mnt/data", json!({"Env": ["DATA=1"]}));
+        configs.add(None::<String>, "/", json!({"Cmd": ["/bin/sh"]}));
 
         let value = serde_json::to_value(&configs).expect("serialize");
         assert_eq!(
             value,
             json!([
-                { "mountPath": "/", "config": {"Cmd": ["/bin/sh"]} },
                 { "driveId": "data", "mountPath": "/mnt/data", "config": {"Env": ["DATA=1"]} },
+                { "mountPath": "/", "config": {"Cmd": ["/bin/sh"]} },
             ])
         );
+        assert_eq!(configs.rootfs_config(), Some(&json!({"Cmd": ["/bin/sh"]})));
     }
 
     #[test]

@@ -1,9 +1,11 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::digest;
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
+use crate::snapshot::CommandContext;
 
 pub(crate) const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 pub(crate) const OCI_IMAGE_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
@@ -55,54 +57,169 @@ struct OciManifest {
     annotations: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Serialize)]
-struct MinimalOciConfig<'a> {
-    created: &'a str,
-    architecture: &'a str,
-    os: &'a str,
-    config: MinimalRuntimeConfig,
-    rootfs: MinimalRootfs,
-    history: Vec<serde_json::Value>,
+/// Effective runtime metadata plus the optional source rootfs OCI config.
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotOciConfigInput<'a> {
+    context: &'a CommandContext,
+    raw_config: Option<&'a Value>,
+}
+
+impl<'a> SnapshotOciConfigInput<'a> {
+    pub(crate) fn new(context: &'a CommandContext, raw_config: Option<&'a Value>) -> Self {
+        Self {
+            context,
+            raw_config,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-struct MinimalRuntimeConfig {
-    env: Vec<String>,
-    working_dir: String,
+struct OciConfig<'a> {
+    created: &'a str,
+    architecture: &'a str,
+    os: &'a str,
+    config: Value,
+    rootfs: MinimalRootfs,
+    history: Vec<Value>,
 }
 
 #[derive(Debug, Serialize)]
 struct MinimalRootfs {
     #[serde(rename = "type")]
     rootfs_type: &'static str,
+    // OverlayBD snapshot layers are not ordinary uncompressed OCI tar diffs,
+    // so this intentionally stays empty for AgentENV-only use.
     diff_ids: Vec<String>,
+}
+
+fn oci_config_blob(
+    architecture: &str,
+    config: Value,
+    operation: &'static str,
+) -> RepositoryResult<(Vec<u8>, String, u64)> {
+    let config = OciConfig {
+        created: "1970-01-01T00:00:00Z",
+        architecture,
+        os: "linux",
+        config,
+        rootfs: MinimalRootfs {
+            rootfs_type: "layers",
+            diff_ids: Vec::new(),
+        },
+        history: Vec::new(),
+    };
+    let bytes =
+        serde_json::to_vec(&config).map_err(|error| RepositoryError::backend(operation, error))?;
+    let digest = digest::sha256_digest(&bytes);
+    let size = bytes.len() as u64;
+    Ok((bytes, digest, size))
+}
+
+fn set_optional(config: &mut Map<String, Value>, key: &str, value: Option<Value>) {
+    if let Some(value) = value {
+        config.insert(key.to_string(), value);
+    } else {
+        config.remove(key);
+    }
+}
+
+fn empty_object_map(values: &[String]) -> Value {
+    Value::Object(
+        values
+            .iter()
+            .map(|value| (value.clone(), Value::Object(Map::new())))
+            .collect(),
+    )
+}
+
+fn canonicalize_json(value: Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.into_iter().map(canonicalize_json).collect()),
+        Value::Object(values) => {
+            let mut entries: Vec<_> = values.into_iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, canonicalize_json(value)))
+                    .collect(),
+            )
+        }
+        value => value,
+    }
+}
+
+fn merged_runtime_config(input: SnapshotOciConfigInput<'_>) -> Value {
+    let mut config = input
+        .raw_config
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let context = input.context;
+
+    let mut env: Vec<_> = context
+        .env_vars
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect();
+    env.sort();
+    config.insert("Env".to_string(), serde_json::json!(env));
+    config.insert(
+        "WorkingDir".to_string(),
+        Value::String(context.workdir.clone()),
+    );
+    set_optional(&mut config, "User", context.user.clone().map(Value::String));
+    set_optional(
+        &mut config,
+        "Entrypoint",
+        context
+            .entrypoint
+            .clone()
+            .map(|value| serde_json::json!(value)),
+    );
+    set_optional(
+        &mut config,
+        "Cmd",
+        context.cmd.clone().map(|value| serde_json::json!(value)),
+    );
+    set_optional(
+        &mut config,
+        "ExposedPorts",
+        (!context.exposed_ports.is_empty()).then(|| empty_object_map(&context.exposed_ports)),
+    );
+    set_optional(
+        &mut config,
+        "Volumes",
+        (!context.volumes.is_empty()).then(|| empty_object_map(&context.volumes)),
+    );
+    set_optional(
+        &mut config,
+        "Labels",
+        (!context.labels.is_empty()).then(|| serde_json::json!(context.labels)),
+    );
+
+    canonicalize_json(Value::Object(config))
+}
+
+pub(crate) fn snapshot_oci_config_blob(
+    architecture: &str,
+    input: SnapshotOciConfigInput<'_>,
+) -> RepositoryResult<(Vec<u8>, String, u64)> {
+    oci_config_blob(
+        architecture,
+        merged_runtime_config(input),
+        "serialize snapshot OCI config",
+    )
 }
 
 pub(crate) fn minimal_oci_config_blob(
     architecture: &str,
 ) -> RepositoryResult<(Vec<u8>, String, u64)> {
-    let config = MinimalOciConfig {
-        created: "1970-01-01T00:00:00Z",
+    oci_config_blob(
         architecture,
-        os: "linux",
-        config: MinimalRuntimeConfig {
-            env: Vec::new(),
-            working_dir: String::new(),
-        },
-        rootfs: MinimalRootfs {
-            rootfs_type: "layers",
-            // OverlayBD snapshot layers are not ordinary uncompressed OCI tar
-            // diffs, so this intentionally stays empty for AgentENV-only use.
-            diff_ids: Vec::new(),
-        },
-        history: Vec::new(),
-    };
-    let bytes = serde_json::to_vec(&config)
-        .map_err(|e| RepositoryError::backend("serialize minimal OCI config", e))?;
-    let digest = digest::sha256_digest(&bytes);
-    let size = bytes.len() as u64;
-    Ok((bytes, digest, size))
+        serde_json::json!({"Env": [], "WorkingDir": ""}),
+        "serialize minimal OCI config",
+    )
 }
 
 /// OCI architecture string of the host running this binary.
@@ -138,7 +255,12 @@ pub(crate) fn build_oci_image_manifest(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
+    use serde_json::json;
+
     use super::*;
+    use crate::snapshot::CommandContext;
 
     #[test]
     fn minimal_config_has_documented_empty_diff_ids() {
@@ -151,6 +273,74 @@ mod tests {
         assert_eq!(value["rootfs"]["diff_ids"].as_array().unwrap().len(), 0);
         assert_eq!(size, bytes.len() as u64);
         assert_eq!(digest, crate::digest::sha256_digest(&bytes));
+    }
+
+    #[test]
+    fn snapshot_config_merges_context_and_raw_config_deterministically() {
+        let raw = json!({
+            "Env": ["STALE=1"],
+            "WorkingDir": "/old",
+            "User": "root",
+            "Entrypoint": ["/old-entrypoint"],
+            "Cmd": ["old"],
+            "ExposedPorts": {"80/tcp": {}},
+            "Volumes": {"/old-data": {}},
+            "Labels": {"old": "label"},
+            "StopSignal": "SIGTERM",
+            "Healthcheck": {"Test": ["CMD", "true"]}
+        });
+        let cases = [
+            (
+                CommandContext::new(
+                    HashMap::from([
+                        ("B".to_string(), "two".to_string()),
+                        ("A".to_string(), "one".to_string()),
+                    ]),
+                    "/workspace",
+                )
+                .with_user(Some("1000:1000".to_string()))
+                .with_exposed_ports(vec!["8080/tcp".to_string()])
+                .with_entrypoint(Some(vec!["/app".to_string()]))
+                .with_cmd(Some(vec!["serve".to_string()]))
+                .with_volumes(vec!["/data".to_string()])
+                .with_labels(HashMap::from([(
+                    "org.example.name".to_string(),
+                    "snapshot".to_string(),
+                )])),
+                json!({
+                    "Env": ["A=one", "B=two"],
+                    "WorkingDir": "/workspace",
+                    "User": "1000:1000",
+                    "Entrypoint": ["/app"],
+                    "Cmd": ["serve"],
+                    "ExposedPorts": {"8080/tcp": {}},
+                    "Volumes": {"/data": {}},
+                    "Labels": {"org.example.name": "snapshot"},
+                    "StopSignal": "SIGTERM",
+                    "Healthcheck": {"Test": ["CMD", "true"]}
+                }),
+            ),
+            (
+                CommandContext::default(),
+                json!({
+                    "Env": [],
+                    "WorkingDir": "/",
+                    "StopSignal": "SIGTERM",
+                    "Healthcheck": {"Test": ["CMD", "true"]}
+                }),
+            ),
+        ];
+
+        for (context, expected_config) in cases {
+            let (bytes, _, _) = snapshot_oci_config_blob(
+                "amd64",
+                SnapshotOciConfigInput::new(&context, Some(&raw)),
+            )
+            .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["config"], expected_config);
+            assert_eq!(value["rootfs"]["diff_ids"], json!([]));
+        }
     }
 
     #[test]

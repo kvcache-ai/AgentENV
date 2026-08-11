@@ -59,6 +59,15 @@ Notes:
 - Deleting a snapshot also attempts to delete its published manifest from the
   registry.
 
+Published rootfs images preserve the snapshot's effective OCI runtime fields
+(`Env`, `WorkingDir`, `User`, `Entrypoint`, `Cmd`, `ExposedPorts`, `Volumes`,
+and `Labels`) and retain unmodeled fields from the source rootfs config when
+available. AgentENV-specific startup commands remain snapshot metadata and are
+not converted into OCI `Entrypoint` or `Cmd`; use explicit OCI command metadata
+when that behavior must survive image export. Republishing a snapshot with this
+metadata changes its manifest digest, so an existing published tag still
+requires a new tag or deletion.
+
 ## Export a Snapshot Rootfs as a Standalone OCI Image
 
 `aenv-snapshot-image` (build with `make build-snapshot-image`; not part of the
@@ -85,6 +94,8 @@ check is not atomic against concurrent tag writers. The tool records no new
 publication state. If the selected reference is already recorded as a
 snapshot-managed publication, the tool warns that it may be deleted with the
 snapshot; other exported references live independently of snapshot deletion.
+The standalone export preserves the same effective OCI runtime fields described
+under [OverlayBD Image Publication](#overlaybd-image-publication).
 
 ## Manage Snapshots
 
