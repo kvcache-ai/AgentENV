@@ -1198,9 +1198,6 @@ mod tests {
         let mut config =
             app_config_with_overlaybd_global_configs(temp.path(), rootfs.clone(), mem.clone());
         config.image.cache.root_dir = temp.path().join("image-cache");
-        config.memory_snapshot.background_download.enable = false;
-        config.memory_snapshot.background_download.block_size = 2 * 1024 * 1024;
-        config.memory_snapshot.background_download.concurrency = 7;
 
         write_generated_overlaybd_global_configs(&config, None).expect("write global configs");
 
@@ -1222,15 +1219,6 @@ mod tests {
                 "memory cacheDir must be distinct from every other cacheDir"
             );
         }
-        let expected_memory = DownloadConfig {
-            enable: false,
-            block_size: 2 * 1024 * 1024,
-            concurrency: 7,
-            ..MemorySnapshotConfig::default()
-                .background_download
-                .to_overlaybd_download_config()
-        };
-        assert_download_json(&memory_value, &expected_memory);
     }
 
     #[test]

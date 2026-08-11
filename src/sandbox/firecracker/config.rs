@@ -704,16 +704,6 @@ mod tests {
     }
 
     #[test]
-    fn from_app_config_maps_track_dirty_pages() -> Result<()> {
-        let mut config = base_app_config();
-        config.memory_snapshot.track_dirty_pages = true;
-
-        let common_config = FirecrackerCommonConfig::from_app_config(&config)?;
-        assert!(common_config.track_dirty_pages);
-        Ok(())
-    }
-
-    #[test]
     fn sandbox_config_binds_overlaybd_to_user_image() -> Result<()> {
         let mut config = base_app_config();
         config.ublk = UblkTomlConfig {

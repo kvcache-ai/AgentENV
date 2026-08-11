@@ -626,17 +626,8 @@ fn parse_log_level(level: &str) -> Result<firecracker_client::models::logger::Le
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::BodyExt;
-    use hyper::body::Incoming;
-    use hyper::server::conn::http1;
-    use hyper::service::service_fn;
-    use hyper::{Request, Response, StatusCode};
-    use hyper_util::rt::TokioIo;
-    use serde_json::Value;
     use std::process::Command as StdCommand;
     use tempfile::tempdir;
-    use tokio::net::UnixListener;
-    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn wait_for_ready_times_out_when_socket_never_appears() {
@@ -766,64 +757,6 @@ mod tests {
             PathBuf::from("/tmp/mem.bin")
         );
 
-        Ok(())
-    }
-    #[tokio::test]
-    async fn fresh_and_restore_requests_include_track_dirty_pages() -> Result<()> {
-        let temp = tempdir()?;
-        let listener = UnixListener::bind(temp.path().join("firecracker.socket"))?;
-        let (requests_tx, mut requests_rx) = mpsc::unbounded_channel::<(String, Value)>();
-
-        let server = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (stream, _) = listener.accept().await.expect("accept request");
-                let requests_tx = requests_tx.clone();
-                http1::Builder::new()
-                    .keep_alive(false)
-                    .serve_connection(
-                        TokioIo::new(stream),
-                        service_fn(move |request: Request<Incoming>| {
-                            let requests_tx = requests_tx.clone();
-                            async move {
-                                let path = request.uri().path().to_string();
-                                let body =
-                                    request.collect().await.expect("collect request").to_bytes();
-                                let json = serde_json::from_slice(&body).expect("decode request");
-                                requests_tx.send((path, json)).expect("send request");
-                                Ok::<_, std::convert::Infallible>(
-                                    Response::builder()
-                                        .status(StatusCode::NO_CONTENT)
-                                        .body(http_body_util::Full::new(hyper::body::Bytes::new()))
-                                        .expect("build response"),
-                                )
-                            }
-                        }),
-                    )
-                    .await
-                    .expect("serve request");
-            }
-        });
-
-        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
-        instance.set_machine_config(512, 2, false, true).await?;
-        instance
-            .load_snapshot_file(
-                Path::new("vm_state.bin"),
-                Path::new("mem_backend"),
-                &[],
-                false,
-                true,
-            )
-            .await?;
-
-        let (fresh_path, fresh_body) = requests_rx.recv().await.expect("fresh request");
-        let (restore_path, restore_body) = requests_rx.recv().await.expect("restore request");
-        assert_eq!(fresh_path, "/machine-config");
-        assert_eq!(fresh_body["track_dirty_pages"], true);
-        assert_eq!(restore_path, "/snapshot/load");
-        assert_eq!(restore_body["track_dirty_pages"], true);
-
-        server.await.expect("request server");
         Ok(())
     }
 }

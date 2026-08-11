@@ -226,3 +226,37 @@ impl ImageResolverConfig {
             .collect();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_rejects_invalid_gc_watermarks() {
+        let cases = [
+            (
+                ImageCacheGcConfig {
+                    high_watermark_ratio: 1.2,
+                    ..Default::default()
+                },
+                "high_watermark_ratio",
+            ),
+            (
+                ImageCacheGcConfig {
+                    high_watermark_ratio: 0.5,
+                    low_watermark_ratio: 0.7,
+                    ..Default::default()
+                },
+                "low_watermark_ratio",
+            ),
+        ];
+
+        for (config, expected_error) in cases {
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string().contains(expected_error),
+                "expected error containing {expected_error:?}, got: {err}"
+            );
+        }
+    }
+}

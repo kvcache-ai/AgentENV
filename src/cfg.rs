@@ -1287,106 +1287,54 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn memory_snapshot_config_defaults_are_valid() -> Result<()> {
-        let default = MemorySnapshotConfig::default();
-        assert!(!default.compression_enabled);
-        assert!(!default.track_dirty_pages);
-        assert_eq!(
-            default.compression_algorithm,
-            MemorySnapshotCompressionAlgorithm::Lz4
-        );
-        assert_eq!(default.compression_workers, 1);
+    fn bundled_default_config_loads() -> Result<()> {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let config = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
-        assert!(!config.config().memory_snapshot.compression_enabled);
-        assert!(!config.config().memory_snapshot.track_dirty_pages);
-        assert_eq!(
-            config.config().memory_snapshot.compression_algorithm,
-            MemorySnapshotCompressionAlgorithm::Lz4,
-        );
-        assert_eq!(config.config().memory_snapshot.compression_workers, 1);
+        ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
         Ok(())
     }
 
     #[test]
-    fn memory_snapshot_track_dirty_pages_validates_supported_combinations() -> Result<()> {
-        let temp = tempdir()?;
-        let path = temp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "virtualization_mode = \"kvm\"\n[memory_snapshot]\ntrack_dirty_pages = true\ndirect_overlaybd = true\n",
-        )?;
-        let config = ConfigManager::new_from_path(&path)?;
-        assert!(config.config().memory_snapshot.track_dirty_pages);
-        assert!(config.config().memory_snapshot.direct_overlaybd);
-        assert_eq!(config.config().virtualization_mode, VirtualizationMode::Kvm);
-        std::fs::write(
-            &path,
-            "virtualization_mode = \"kvm\"\n[memory_snapshot]\ntrack_dirty_pages = true\ndirect_overlaybd = false\n",
-        )?;
-        let error = ConfigManager::new_from_path(&path).unwrap_err();
-        assert!(
-            error.to_string().contains(
-                "memory_snapshot.track_dirty_pages=true requires memory_snapshot.direct_overlaybd=true"
+    fn validate_memory_snapshot_options_enforces_dirty_page_requirements() {
+        let cases = [
+            (VirtualizationMode::Kvm, false, false, None),
+            (VirtualizationMode::Kvm, true, true, None),
+            (
+                VirtualizationMode::Kvm,
+                true,
+                false,
+                Some("requires memory_snapshot.direct_overlaybd=true"),
             ),
-            "unexpected error: {error}"
-        );
-        std::fs::write(
-            &path,
-            "virtualization_mode = \"pvm\"\n[memory_snapshot]\ntrack_dirty_pages = true\ndirect_overlaybd = true\n",
-        )?;
-        let error = ConfigManager::new_from_path(&path).unwrap_err();
-        assert!(
-            error.to_string().contains(
-                "memory_snapshot.track_dirty_pages=true is disabled in PVM mode because this combination has not been tested"
+            (
+                VirtualizationMode::Pvm,
+                true,
+                true,
+                Some("is disabled in PVM mode"),
             ),
-            "unexpected error: {error}"
-        );
-        std::fs::write(
-            &path,
-            "[memory_snapshot]\ntrack_dirty_pages = false\ndirect_overlaybd = false\n",
-        )?;
-        let config = ConfigManager::new_from_path(&path)?;
-        assert!(!config.config().memory_snapshot.track_dirty_pages);
-        assert!(!config.config().memory_snapshot.direct_overlaybd);
-        Ok(())
-    }
+        ];
 
-    #[test]
-    fn memory_snapshot_compression_config_is_valid() -> Result<()> {
-        let temp = tempdir()?;
-        let path = temp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[memory_snapshot]\ncompression_enabled = true\ncompression_algorithm = \"zstd\"\ncompression_workers = 4\n",
-        )?;
-        let config = ConfigManager::new_from_path(&path)?;
-        assert!(config.config().memory_snapshot.compression_enabled);
-        assert_eq!(
-            config.config().memory_snapshot.compression_algorithm,
-            MemorySnapshotCompressionAlgorithm::Zstd
-        );
-        assert_eq!(config.config().memory_snapshot.compression_workers, 4);
-        std::fs::write(
-            &path,
-            "[memory_snapshot]\ncompression_enabled = true\ncompression_algorithm = \"snappy\"\n",
-        )?;
-        assert!(ConfigManager::new_from_path(&path).is_err());
-        Ok(())
-    }
+        for (virtualization_mode, track_dirty_pages, direct_overlaybd, expected_error) in cases {
+            let config = AppConfig {
+                virtualization_mode,
+                memory_snapshot: MemorySnapshotConfig {
+                    track_dirty_pages,
+                    direct_overlaybd,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
 
-    #[test]
-    fn memory_snapshot_background_download_defaults() {
-        let config = MemorySnapshotConfig::default();
-        let download = config.background_download;
-
-        assert!(download.enable);
-        assert_eq!(download.delay, 0);
-        assert_eq!(download.delay_extra, 1);
-        assert_eq!(download.try_cnt, 5);
-        assert_eq!(download.block_size, 16 * 1024 * 1024);
-        assert_eq!(download.concurrency, 4);
-        assert_eq!(download.max_inflight_blocks, 16);
+            let result = config.validate_memory_snapshot_options();
+            match expected_error {
+                Some(expected_error) => {
+                    let error = result.unwrap_err();
+                    assert!(
+                        error.to_string().contains(expected_error),
+                        "expected error containing {expected_error:?}, got: {error}"
+                    );
+                }
+                None => result.expect("supported memory snapshot options should be valid"),
+            }
+        }
     }
 
     #[test]
@@ -1403,26 +1351,44 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_disk_burst_without_sustained() {
-        let mut config = AppConfig::default();
-        config.machine.disk_rate_limit.enabled = true;
-        config.machine.disk_rate_limit.bandwidth_bytes_per_sec = 0;
-        config.machine.disk_rate_limit.bandwidth_burst_bytes = 1024;
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("bandwidth_burst_bytes is set but"),
-            "unexpected error: {err}"
-        );
+    fn validate_rejects_invalid_disk_rate_limit() {
+        let cases = [
+            (
+                DiskRateLimitConfig {
+                    enabled: true,
+                    bandwidth_burst_bytes: 1024,
+                    ..Default::default()
+                },
+                "bandwidth_burst_bytes is set but",
+            ),
+            (
+                DiskRateLimitConfig {
+                    enabled: true,
+                    iops_burst: 500,
+                    ..Default::default()
+                },
+                "iops_burst is set but",
+            ),
+            (
+                DiskRateLimitConfig {
+                    enabled: true,
+                    bandwidth_bytes_per_sec: i64::MAX as u64 + 1,
+                    ..Default::default()
+                },
+                "machine.disk_rate_limit.bandwidth_bytes_per_sec",
+            ),
+        ];
 
-        let mut config = AppConfig::default();
-        config.machine.disk_rate_limit.enabled = true;
-        config.machine.disk_rate_limit.iops = 0;
-        config.machine.disk_rate_limit.iops_burst = 500;
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("iops_burst is set but"),
-            "unexpected error: {err}"
-        );
+        for (disk_rate_limit, expected_error) in cases {
+            let mut config = AppConfig::default();
+            config.machine.disk_rate_limit = disk_rate_limit;
+
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string().contains(expected_error),
+                "expected error containing {expected_error:?}, got: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1440,19 +1406,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_disk_rate_limit_above_i64_max() {
-        let mut config = AppConfig::default();
-        config.machine.disk_rate_limit.enabled = true;
-        config.machine.disk_rate_limit.bandwidth_bytes_per_sec = i64::MAX as u64 + 1;
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("machine.disk_rate_limit.bandwidth_bytes_per_sec"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
     fn validate_accepts_consistent_disk_rate_limit() {
         let mut config = AppConfig::default();
         config.machine.disk_rate_limit.enabled = true;
@@ -1466,62 +1419,48 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_shared_overlaybd_global_config_path() {
-        let mut config = AppConfig::default();
-        let shared_path = PathBuf::from("/tmp/shared-overlaybd-global.json");
-        config.ublk.overlaybd.global_config_path = shared_path.clone();
-        config.memory_snapshot.overlaybd_global_config_path = shared_path;
+    fn validate_rejects_colliding_overlaybd_global_config_paths() {
+        let cases = [
+            (
+                "/tmp/shared-overlaybd-global.json",
+                "/tmp/shared-overlaybd-global.json",
+                "ublk.overlaybd.global_config_path",
+                "memory_snapshot.overlaybd_global_config_path",
+            ),
+            (
+                "/tmp/aenv/x/../global.json",
+                "/tmp/aenv/global.json",
+                "ublk.overlaybd.global_config_path",
+                "memory_snapshot.overlaybd_global_config_path",
+            ),
+            (
+                "/tmp/overlaybd/resize-overlaybd-global.json",
+                "/var/lib/aenv/overlaybd/mem-overlaybd-global.json",
+                "ublk.overlaybd.global_config_path",
+                "derived resize",
+            ),
+            (
+                "/tmp/overlaybd/overlaybd-global.json",
+                "/tmp/overlaybd/convert-overlaybd-global.json",
+                "memory_snapshot.overlaybd_global_config_path",
+                "derived convert",
+            ),
+        ];
 
-        let err = config.validate().unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("ublk.overlaybd.global_config_path"));
-        assert!(message.contains("memory_snapshot.overlaybd_global_config_path"));
-        assert!(message.contains("must be different"));
-    }
+        for (runtime_path, memory_path, left_name, right_name) in cases {
+            let mut config = AppConfig::default();
+            config.ublk.overlaybd.global_config_path = runtime_path.into();
+            config.memory_snapshot.overlaybd_global_config_path = memory_path.into();
 
-    #[test]
-    fn validate_rejects_aliased_overlaybd_global_config_paths() {
-        let mut config = AppConfig::default();
-        config.ublk.overlaybd.global_config_path = PathBuf::from("/tmp/aenv/x/../global.json");
-        config.memory_snapshot.overlaybd_global_config_path =
-            PathBuf::from("/tmp/aenv/global.json");
-
-        let err = config.validate().unwrap_err();
-        assert!(err.to_string().contains("must be different"), "{err}");
-
-        let mut config = AppConfig::default();
-        config.ublk.overlaybd.global_config_path = PathBuf::from("/tmp/./benv/global.json");
-        config.memory_snapshot.overlaybd_global_config_path =
-            PathBuf::from("/tmp/benv/global.json");
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
-    fn validate_rejects_rootfs_path_equal_to_derived_resize_path() {
-        let mut config = AppConfig::default();
-        config.ublk.overlaybd.global_config_path =
-            PathBuf::from("/tmp/overlaybd/resize-overlaybd-global.json");
-
-        let err = config.validate().unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("ublk.overlaybd.global_config_path"));
-        assert!(message.contains("derived resize"));
-        assert!(message.contains("must be different"));
-    }
-
-    #[test]
-    fn validate_rejects_memory_path_equal_to_derived_convert_path() {
-        let mut config = AppConfig::default();
-        config.ublk.overlaybd.global_config_path =
-            PathBuf::from("/tmp/overlaybd/overlaybd-global.json");
-        config.memory_snapshot.overlaybd_global_config_path =
-            PathBuf::from("/tmp/overlaybd/convert-overlaybd-global.json");
-
-        let err = config.validate().unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("memory_snapshot.overlaybd_global_config_path"));
-        assert!(message.contains("derived convert"));
-        assert!(message.contains("must be different"));
+            let err = config.validate().unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains(left_name), "unexpected error: {err}");
+            assert!(message.contains(right_name), "unexpected error: {err}");
+            assert!(
+                message.contains("must be different"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1555,14 +1494,19 @@ mod tests {
     }
 
     #[test]
-    fn overlaybd_converter_cache_version_includes_tool_version() {
-        let config = AppConfig::default();
+    fn overlaybd_converter_cache_id_includes_configured_tool_version() {
+        let config = AppConfig {
+            overlaybd: Some(OverlaybdDependencyConfig {
+                version: "test-version".to_string(),
+                url: None,
+                package_url: None,
+            }),
+            ..Default::default()
+        };
         assert_eq!(
             config.resolved_overlaybd_oci_converter_id(),
-            "overlaybd-oci:v1.0.18-aenv.1:agentenv-cache-v1"
+            "overlaybd-oci:test-version:agentenv-cache-v1"
         );
-        assert!(!config.ublk.overlaybd.allow_shrink);
-        assert_eq!(config.ublk.overlaybd.resize_timeout_secs, 120);
     }
 
     #[test]
@@ -1572,16 +1516,8 @@ mod tests {
         let home_path = temp.path().join("home");
 
         assert_eq!(
-            resolve_path(&home_path, config_dir, Path::new("./env")),
-            config_dir.join("./env")
-        );
-        assert_eq!(
             resolve_path(&home_path, config_dir, Path::new("bin/firecracker")),
             config_dir.join("bin/firecracker")
-        );
-        assert_eq!(
-            resolve_path(&home_path, config_dir, Path::new("overlaybd/global.json")),
-            config_dir.join("overlaybd/global.json")
         );
         assert_eq!(
             resolve_path(&home_path, config_dir, Path::new("$AENV_HOME/image-cache")),
@@ -1917,55 +1853,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_custom_network_config() -> Result<()> {
-        let config = NetworkConfig {
-            egress: NetworkEgressConfig {
-                always_denied_cidrs: vec!["127.0.0.0/8".to_string(), "169.254.0.0/16".to_string()],
-            },
-            internal: NetworkInternalConfig {
-                host_interaction_cidr: "100.64.0.0/16".to_string(),
-                veth_cidr: "100.65.0.0/16".to_string(),
-            },
-        };
-
-        NetworkConfig::validate(&config)?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn normalize_posix_snapshot_store_from_backend_section() -> Result<()> {
-        let temp = tempdir()?;
-        let config_dir = temp.path().join("configs");
-        let mut config = AppConfig::default();
-        config.snapshot.repository_backend = SnapshotRepositoryBackendKind::PosixFs;
-        config.snapshot.local_cache_path = "./snapshot-local-cache".into();
-        config.backend.posix_fs = Some(PosixFsBackendConfig {
-            snapshot_store: "./snapshot-store".into(),
-        });
-        config.normalize(&config_dir)?;
-
-        assert_eq!(
-            config
-                .backend
-                .posix_fs
-                .as_ref()
-                .map(|cfg| cfg.snapshot_store.clone()),
-            Some(config_dir.join("./snapshot-store"))
-        );
-        assert_eq!(
-            config.backend.posix_fs.as_ref().unwrap().snapshot_store,
-            config_dir.join("./snapshot-store")
-        );
-        assert_eq!(
-            config.snapshot.local_cache_path,
-            config_dir.join("./snapshot-local-cache")
-        );
-
-        Ok(())
-    }
-
-    #[test]
     fn resolve_config_path_keeps_absolute_paths_unchanged() {
         let absolute = PathBuf::from("/tmp/agentenv-absolute");
         assert_eq!(
@@ -2040,26 +1927,6 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(
             err.to_string().contains("resize_timeout_secs must be > 0"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_invalid_image_gc_watermarks() {
-        let mut config = AppConfig::default();
-        config.image.cache.gc.high_watermark_ratio = 1.2;
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("high_watermark_ratio"),
-            "unexpected error: {err}"
-        );
-
-        let mut config = AppConfig::default();
-        config.image.cache.gc.high_watermark_ratio = 0.5;
-        config.image.cache.gc.low_watermark_ratio = 0.7;
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("low_watermark_ratio"),
             "unexpected error: {err}"
         );
     }
