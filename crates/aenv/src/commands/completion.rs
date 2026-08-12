@@ -5,6 +5,10 @@ use clap::CommandFactory;
 use clap::ValueEnum;
 use clap_complete::Shell as ClapShell;
 use std::io::Write;
+use std::time::Duration;
+
+const DYNAMIC_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+const DYNAMIC_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Shell to generate completion for.
 ///
@@ -32,6 +36,88 @@ pub struct Args {
     pub shell: Shell,
 }
 
+#[derive(ClapArgs)]
+pub struct CompleteArgs {
+    /// Zero-based cursor position in the shell word list.
+    #[arg(long)]
+    pub index: usize,
+    /// The command line words, including `aenv` as the first word.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+    pub words: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SandboxStateFilter {
+    Running,
+    Paused,
+    Active,
+}
+
+pub fn run_dynamic(args: CompleteArgs) -> Result<()> {
+    let Some((filter, prefix)) = dynamic_request(&args.words, args.index) else {
+        return Ok(());
+    };
+
+    let Ok(credentials) = crate::auth::load() else {
+        return Ok(());
+    };
+    let Ok(client) = crate::client::Client::new_with_timeouts(
+        &credentials.url,
+        &credentials.api_key,
+        DYNAMIC_CONNECT_TIMEOUT,
+        DYNAMIC_REQUEST_TIMEOUT,
+    ) else {
+        return Ok(());
+    };
+    let Ok(mut sandboxes) = client.list_sandboxes() else {
+        return Ok(());
+    };
+
+    sandboxes.sort_by(|left, right| left.sandbox_id.cmp(&right.sandbox_id));
+    for sandbox in sandboxes {
+        if state_matches(filter, sandbox.state.as_deref()) && sandbox.sandbox_id.starts_with(prefix)
+        {
+            println!("{}", sandbox.sandbox_id);
+        }
+    }
+    Ok(())
+}
+
+fn state_matches(filter: SandboxStateFilter, state: Option<&str>) -> bool {
+    match filter {
+        SandboxStateFilter::Running => state == Some("running"),
+        SandboxStateFilter::Paused => state == Some("paused"),
+        SandboxStateFilter::Active => matches!(state, Some("running" | "paused")),
+    }
+}
+
+fn dynamic_request(words: &[String], index: usize) -> Option<(SandboxStateFilter, &str)> {
+    if words.first().map(String::as_str) != Some("aenv") || index >= words.len() {
+        return None;
+    }
+    let current = words[index].as_str();
+    let command = words.get(1).map(String::as_str)?;
+    let filter = match command {
+        "pause" | "exec" | "upload" | "download" | "timeout" if index == 2 => {
+            SandboxStateFilter::Running
+        }
+        "resume" if index == 2 => SandboxStateFilter::Paused,
+        "connect" | "cn" | "delete" | "rm" if index == 2 => SandboxStateFilter::Active,
+        "snapshot" if words.get(2).map(String::as_str) == Some("create") && index == 3 => {
+            SandboxStateFilter::Running
+        }
+        "snapshot"
+            if words.get(2).map(String::as_str) == Some("list")
+                && index > 3
+                && words[..index].last().map(String::as_str) == Some("--sandbox-id") =>
+        {
+            SandboxStateFilter::Active
+        }
+        _ => return None,
+    };
+    Some((filter, current))
+}
+
 /// Generate a completion script for the requested shell and write it to stdout.
 pub fn run(args: Args) -> Result<()> {
     write_completion(args.shell, &mut std::io::stdout().lock())
@@ -50,10 +136,57 @@ fn write_completion<W: Write>(shell: Shell, out: &mut W) -> Result<()> {
     let mut cmd = crate::Cli::command();
     let mut script = Vec::new();
     clap_complete::generate(ClapShell::from(shell), &mut cmd, "aenv", &mut script);
+    script.extend_from_slice(dynamic_wrapper(shell).as_bytes());
     match out.write_all(&script).and_then(|_| out.flush()) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         Err(err) => Err(err).context("writing completion script to stdout"),
+    }
+}
+
+fn dynamic_wrapper(shell: Shell) -> &'static str {
+    match shell {
+        Shell::Bash => {
+            r#"
+
+_aenv_dynamic() {
+    local dynamic
+    dynamic=$(command aenv __complete --index "$COMP_CWORD" -- "${COMP_WORDS[@]}" 2>/dev/null)
+    if [[ -n "$dynamic" ]]; then
+        COMPREPLY=( $(compgen -W "$dynamic" -- "${COMP_WORDS[COMP_CWORD]}") )
+        return
+    fi
+    _aenv "$@"
+}
+complete -o nospace -o bashdefault -o nosort -F _aenv_dynamic aenv
+"#
+        }
+        Shell::Zsh => {
+            r#"
+
+_aenv_dynamic() {
+    local -a dynamic
+    dynamic=("${(@f)$(command aenv __complete --index $((CURRENT - 1)) -- "${words[@]}" 2>/dev/null)}")
+    if (( ${#dynamic} )); then
+        _describe 'sandbox' dynamic
+        return
+    fi
+    _aenv "$@"
+}
+compdef _aenv_dynamic aenv
+"#
+        }
+        Shell::Fish => {
+            r#"
+
+function __aenv_dynamic
+    set -l words (commandline -opc)
+    set -a words (commandline -ct)
+    command aenv __complete --index (math (count $words) - 1) -- $words 2>/dev/null
+end
+complete -c aenv -a '(__aenv_dynamic)'
+"#
+        }
     }
 }
 
@@ -225,5 +358,37 @@ mod tests {
                 .contains("writing completion script to stdout"),
             "error should carry completion context; got: {err}"
         );
+    }
+
+    #[test]
+    fn dynamic_request_recognizes_sandbox_positions() {
+        let words = vec!["aenv".into(), "pause".into(), "sb".into()];
+        assert_eq!(
+            dynamic_request(&words, 2),
+            Some((SandboxStateFilter::Running, "sb"))
+        );
+    }
+
+    #[test]
+    fn dynamic_request_supports_active_sandbox_commands() {
+        let words = vec!["aenv".into(), "cn".into(), "sb".into()];
+        assert_eq!(
+            dynamic_request(&words, 2),
+            Some((SandboxStateFilter::Active, "sb"))
+        );
+    }
+
+    #[test]
+    fn dynamic_request_ignores_remote_exec_arguments() {
+        let words = vec!["aenv".into(), "exec".into(), "sb".into(), "echo".into()];
+        assert_eq!(dynamic_request(&words, 3), None);
+    }
+
+    #[test]
+    fn generated_scripts_install_dynamic_adapters() {
+        let bash = generate_for(Shell::Bash);
+        assert!(bash.contains("_aenv_dynamic"));
+        assert!(generate_for(Shell::Zsh).contains("compdef _aenv_dynamic aenv"));
+        assert!(generate_for(Shell::Fish).contains("__aenv_dynamic"));
     }
 }

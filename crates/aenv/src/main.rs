@@ -35,6 +35,9 @@ enum Cmd {
     Download(commands::download::Args),
     /// Generate shell completion scripts
     Completion(commands::completion::Args),
+    /// Internal dynamic completion protocol
+    #[command(name = "__complete", hide = true)]
+    Complete(commands::completion::CompleteArgs),
     /// Attach an interactive shell to a running sandbox
     #[command(visible_alias = "cn")]
     Connect(commands::connect::Args),
@@ -69,6 +72,7 @@ fn main() -> Result<()> {
         Cmd::Upload(a) => commands::upload::run(a),
         Cmd::Download(a) => commands::download::run(a),
         Cmd::Completion(a) => commands::completion::run(a),
+        Cmd::Complete(a) => commands::completion::run_dynamic(a),
         Cmd::Connect(a) => commands::connect::run(a),
         Cmd::Pause(a) => commands::pause::run(a),
         Cmd::Resume(a) => commands::resume::run(a),

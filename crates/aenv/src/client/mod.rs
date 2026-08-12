@@ -23,10 +23,24 @@ impl Client {
     }
 
     pub fn new(url: &str, api_key: &str) -> Result<Self> {
+        Self::new_with_timeouts(
+            url,
+            api_key,
+            Duration::from_secs(5),
+            Duration::from_secs(120),
+        )
+    }
+
+    pub fn new_with_timeouts(
+        url: &str,
+        api_key: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self> {
         let base = url.trim_end_matches('/').to_string();
         let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout(Duration::from_secs(120))
+            .timeout_connect(connect_timeout)
+            .timeout(request_timeout)
             .build();
         Ok(Self {
             agent,
