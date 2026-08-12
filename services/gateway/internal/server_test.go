@@ -1361,6 +1361,22 @@ func TestFlushInterval(t *testing.T) {
 	}
 }
 
+func TestMetricsEndpointReturnsNotFoundWithoutProxyRouting(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
+	gatewayServer := httptest.NewServer(server.Handler())
+	defer gatewayServer.Close()
+
+	resp, err := http.Get(gatewayServer.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("gateway metrics request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("gateway metrics status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
 func TestHealthEndpointReturnsGatewayHealthWithoutProxyHeaders(t *testing.T) {
 	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
 	gatewayServer := httptest.NewServer(server.Handler())
@@ -1382,14 +1398,14 @@ func TestHealthEndpointReturnsGatewayHealthWithoutProxyHeaders(t *testing.T) {
 	}
 }
 
-func TestHealthEndpointWithSandboxHeadersProxiesToSandbox(t *testing.T) {
+func TestHealthAndMetricsEndpointsWithSandboxHeadersProxyToSandbox(t *testing.T) {
 	type upstreamRequestSnapshot struct {
 		path         string
 		targetPort   string
 		forwardedURI string
 	}
 
-	requests := make(chan upstreamRequestSnapshot, 1)
+	requests := make(chan upstreamRequestSnapshot, 2)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests <- upstreamRequestSnapshot{
 			path:         r.URL.Path,
@@ -1402,7 +1418,7 @@ func TestHealthEndpointWithSandboxHeadersProxiesToSandbox(t *testing.T) {
 
 	server := newTestServer(t, stubSchedulerClient{
 		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			if req.GetSandboxId() != "sbx-health" {
+			if req.GetSandboxId() != "sbx-service" {
 				return nil, fmt.Errorf("unexpected sandbox id lookup: %q", req.GetSandboxId())
 			}
 			return &schedulerv1.LookupNodeResponse{
@@ -1417,65 +1433,73 @@ func TestHealthEndpointWithSandboxHeadersProxiesToSandbox(t *testing.T) {
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
 
-	req, err := http.NewRequest(http.MethodGet, gatewayServer.URL+"/health", nil)
-	if err != nil {
-		t.Fatalf("build health proxy request failed: %v", err)
-	}
-	req.Header.Set(headerSandboxID, "sbx-health")
-	req.Header.Set(headerTargetPort, "49983")
+	for _, path := range []string{"/health", "/metrics"} {
+		t.Run(path, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, gatewayServer.URL+path, nil)
+			if err != nil {
+				t.Fatalf("build proxy request failed: %v", err)
+			}
+			req.Header.Set(headerSandboxID, "sbx-service")
+			req.Header.Set(headerTargetPort, "49983")
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("health proxy request failed: %v", err)
-	}
-	defer resp.Body.Close()
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("proxy request failed: %v", err)
+			}
+			defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusNoContent {
-		t.Fatalf("health proxy status = %d, want %d", resp.StatusCode, http.StatusNoContent)
-	}
+			if resp.StatusCode != http.StatusNoContent {
+				t.Fatalf("proxy status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+			}
 
-	upstreamReq := <-requests
-	if upstreamReq.path != "/proxy/health" {
-		t.Fatalf("upstream path = %q, want %q", upstreamReq.path, "/proxy/health")
-	}
-	if upstreamReq.targetPort != "49983" {
-		t.Fatalf("target port header = %q, want %q", upstreamReq.targetPort, "49983")
-	}
-	if upstreamReq.forwardedURI != "/health" {
-		t.Fatalf("X-Forwarded-URI = %q, want %q", upstreamReq.forwardedURI, "/health")
+			upstreamReq := <-requests
+			if upstreamReq.path != "/proxy"+path {
+				t.Fatalf("upstream path = %q, want %q", upstreamReq.path, "/proxy"+path)
+			}
+			if upstreamReq.targetPort != "49983" {
+				t.Fatalf("target port header = %q, want %q", upstreamReq.targetPort, "49983")
+			}
+			if upstreamReq.forwardedURI != path {
+				t.Fatalf("X-Forwarded-URI = %q, want %q", upstreamReq.forwardedURI, path)
+			}
+		})
 	}
 }
 
-func TestHealthEndpointWithProxyHeadersMissingSandboxIDReturnsBadRequest(t *testing.T) {
+func TestHealthAndMetricsEndpointsWithProxyHeadersMissingSandboxIDReturnBadRequest(t *testing.T) {
 	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
 
-	req, err := http.NewRequest(http.MethodGet, gatewayServer.URL+"/health", nil)
-	if err != nil {
-		t.Fatalf("build malformed health proxy request failed: %v", err)
-	}
-	req.Header.Set(headerTargetPort, "49983")
+	for _, path := range []string{"/health", "/metrics"} {
+		t.Run(path, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, gatewayServer.URL+path, nil)
+			if err != nil {
+				t.Fatalf("build malformed proxy request failed: %v", err)
+			}
+			req.Header.Set(headerTargetPort, "49983")
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("malformed health proxy request failed: %v", err)
-	}
-	defer resp.Body.Close()
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("malformed proxy request failed: %v", err)
+			}
+			defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("malformed health proxy status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("malformed proxy status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+			}
+		})
 	}
 }
 
-func TestHealthEndpointWithHostRoutingProxiesToSandbox(t *testing.T) {
+func TestHealthAndMetricsEndpointsWithHostRoutingProxyToSandbox(t *testing.T) {
 	type upstreamRequestSnapshot struct {
 		path       string
 		sandboxID  string
 		targetPort string
 	}
 
-	requests := make(chan upstreamRequestSnapshot, 1)
+	requests := make(chan upstreamRequestSnapshot, 2)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests <- upstreamRequestSnapshot{
 			path:       r.URL.Path,
@@ -1488,7 +1512,7 @@ func TestHealthEndpointWithHostRoutingProxiesToSandbox(t *testing.T) {
 
 	server := newTestServer(t, stubSchedulerClient{
 		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			if req.GetSandboxId() != "sbx-health" {
+			if req.GetSandboxId() != "sbx-service" {
 				return nil, fmt.Errorf("unexpected sandbox id lookup: %q", req.GetSandboxId())
 			}
 			return &schedulerv1.LookupNodeResponse{
@@ -1502,31 +1526,35 @@ func TestHealthEndpointWithHostRoutingProxiesToSandbox(t *testing.T) {
 	gatewayServer := httptest.NewServer(server.Handler())
 	defer gatewayServer.Close()
 
-	req, err := http.NewRequest(http.MethodGet, gatewayServer.URL+"/health", nil)
-	if err != nil {
-		t.Fatalf("build health request failed: %v", err)
-	}
-	req.Host = "40988-sbx-health.sandbox-proxy.example.invalid"
+	for _, path := range []string{"/health", "/metrics"} {
+		t.Run(path, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, gatewayServer.URL+path, nil)
+			if err != nil {
+				t.Fatalf("build host-routed request failed: %v", err)
+			}
+			req.Host = "40988-sbx-service.sandbox-proxy.example.invalid"
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("host-routed health request failed: %v", err)
-	}
-	defer resp.Body.Close()
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("host-routed request failed: %v", err)
+			}
+			defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("health status = %d, want %d", resp.StatusCode, http.StatusAccepted)
-	}
+			if resp.StatusCode != http.StatusAccepted {
+				t.Fatalf("proxy status = %d, want %d", resp.StatusCode, http.StatusAccepted)
+			}
 
-	upstreamReq := <-requests
-	if upstreamReq.path != "/proxy/health" {
-		t.Fatalf("upstream path = %q, want %q", upstreamReq.path, "/proxy/health")
-	}
-	if upstreamReq.sandboxID != "sbx-health" {
-		t.Fatalf("sandbox routing header = %q, want %q", upstreamReq.sandboxID, "sbx-health")
-	}
-	if upstreamReq.targetPort != "40988" {
-		t.Fatalf("target port header = %q, want 40988", upstreamReq.targetPort)
+			upstreamReq := <-requests
+			if upstreamReq.path != "/proxy"+path {
+				t.Fatalf("upstream path = %q, want %q", upstreamReq.path, "/proxy"+path)
+			}
+			if upstreamReq.sandboxID != "sbx-service" {
+				t.Fatalf("sandbox routing header = %q, want %q", upstreamReq.sandboxID, "sbx-service")
+			}
+			if upstreamReq.targetPort != "40988" {
+				t.Fatalf("target port header = %q, want 40988", upstreamReq.targetPort)
+			}
+		})
 	}
 }
 

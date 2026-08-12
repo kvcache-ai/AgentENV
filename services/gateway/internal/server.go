@@ -94,11 +94,7 @@ func (s *Server) Handler() http.Handler {
 	// decoding %2F → / and issuing 301 redirects), which breaks proxy
 	// forwarding of percent-encoded path segments such as /files/%2F.
 	core := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/metrics" {
-			http.NotFound(w, r)
-			return
-		}
-		if r.URL.Path == "/health" {
+		if r.URL.Path == "/health" || r.URL.Path == "/metrics" {
 			hostRoute, hostRouteErr := parseHostRoute(r.Host, s.sandboxProxyDomains)
 			if hostRoute != nil || hostRouteErr != nil {
 				s.handleProxy(w, r)
@@ -113,8 +109,15 @@ func (s *Server) Handler() http.Handler {
 				s.handleProxy(w, r)
 				return
 			}
-			// Keep load balancer health checks local when they are not sandbox-routed.
-			w.WriteHeader(http.StatusNoContent)
+			if r.URL.Path == "/health" {
+				// Keep load balancer health checks local when they are not sandbox-routed.
+				w.WriteHeader(http.StatusNoContent)
+			} else {
+				// Gateway Prometheus metrics use the separate metrics listener. Keep
+				// this path unavailable on the public HTTP listener unless it is
+				// explicitly routed to a sandbox.
+				http.NotFound(w, r)
+			}
 			return
 		}
 		s.handleProxy(w, r)
