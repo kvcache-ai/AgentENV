@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-706eb9d3.js";
+            window.path_to_searchindex_js = "../searchindex-1a1f1562.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-795efd7f.js"></script>
@@ -289,7 +289,7 @@
 <h3 id="memory-snapshot-restore"><a class="header" href="#memory-snapshot-restore">Memory Snapshot Restore</a></h3>
 <p>Memory snapshot restore uses ublk-backed overlaybd devices rather than userfaultfd. On resume, a read-only ublk device is created from the stacked memory overlaybd layers and passed to Firecracker as a <code>BackendType::File</code> memory backend. Firecracker mmaps the block device and COWs pages into anonymous memory on first write, so the underlying device is never modified.</p>
 <p><strong>Sharing</strong>: Multiple sandboxes booting from the same snapshot template share a single memory ublk device via reference counting. This allows the Linux page cache to be reused across all sandboxes using the same memory image, significantly reducing I/O for concurrent launches from the same template.</p>
-<p><strong>Memory snapshot creation</strong>: On pause, Firecracker’s native diff snapshot (<code>SnapshotType::Diff</code>) produces a sparse <code>mem.bin</code> (using mincore internally to find present pages). This sparse file is then packaged into an overlaybd layer via <code>convert_sparse_mem_to_overlaybd</code>. Parent layers from previous snapshots are stacked, forming the full layered memory image.</p>
+<p><strong>Memory snapshot creation</strong>: On pause, Firecracker creates a state-only diff snapshot. AgentENV queries Firecracker’s dirty/present memory ranges, reads the selected memory with <code>process_vm_readv</code>, and directly creates the OverlayBD memory layer. Parent layers from previous snapshots are stacked, forming the full layered memory image.</p>
 <blockquote>
 <p><strong>Note</strong>: <code>storage/uffd-core/</code> contains an alternative userfaultfd-based memory restore implementation that is retained for reference but excluded from the workspace build.</p>
 </blockquote>

@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-706eb9d3.js";
+            window.path_to_searchindex_js = "searchindex-1a1f1562.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-795efd7f.js"></script>
@@ -1912,8 +1912,7 @@ the default path on every startup.</p>
 </thead>
 <tbody>
 <tr><td><code>overlaybd_global_config_path</code></td><td>string</td><td><code>"$AENV_HOME/overlaybd/mem-overlaybd-global.json"</code></td><td>Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file.</td></tr>
-<tr><td><code>direct_overlaybd</code></td><td>bool</td><td><code>true</code></td><td>Create memory overlaybd layers directly from Firecracker dirty memory ranges via <code>process_vm_readv</code>, skipping the intermediate <code>mem.bin</code> file. Set <code>AGENTENV_MEMORY_SNAPSHOT_DIRECT_OVERLAYBD=false</code> to force the legacy <code>mem.bin</code> conversion path.</td></tr>
-<tr><td><code>track_dirty_pages</code></td><td>bool</td><td><code>false</code></td><td>Enable Firecracker KVM dirty-page tracking for memory snapshots. When true, <code>direct_overlaybd</code> must also be <code>true</code>; PVM is temporarily disabled because this combination has not been tested. Set <code>AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=true</code> to enable it.</td></tr>
+<tr><td><code>track_dirty_pages</code></td><td>bool</td><td><code>false</code></td><td>Enable Firecracker KVM dirty-page tracking for memory snapshots. It defaults to false. The option is temporarily disabled in PVM mode because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set <code>AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=true</code> to enable it.</td></tr>
 <tr><td><code>compression_enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable compression for memory snapshot layers. When disabled, <code>compression_algorithm</code> is still parsed but has no effect. This setting affects only memory layers; the physical file name remains <code>overlaybd.commit</code>.</td></tr>
 <tr><td><code>compression_algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm for memory snapshot layers. Valid values are only <code>lz4</code> and <code>zstd</code>.</td></tr>
 </tbody>
@@ -3015,7 +3014,7 @@ by path when needed:</p>
 <h3 id="memory-snapshot-restore"><a class="header" href="#memory-snapshot-restore">Memory Snapshot Restore</a></h3>
 <p>Memory snapshot restore uses ublk-backed overlaybd devices rather than userfaultfd. On resume, a read-only ublk device is created from the stacked memory overlaybd layers and passed to Firecracker as a <code>BackendType::File</code> memory backend. Firecracker mmaps the block device and COWs pages into anonymous memory on first write, so the underlying device is never modified.</p>
 <p><strong>Sharing</strong>: Multiple sandboxes booting from the same snapshot template share a single memory ublk device via reference counting. This allows the Linux page cache to be reused across all sandboxes using the same memory image, significantly reducing I/O for concurrent launches from the same template.</p>
-<p><strong>Memory snapshot creation</strong>: On pause, Firecracker’s native diff snapshot (<code>SnapshotType::Diff</code>) produces a sparse <code>mem.bin</code> (using mincore internally to find present pages). This sparse file is then packaged into an overlaybd layer via <code>convert_sparse_mem_to_overlaybd</code>. Parent layers from previous snapshots are stacked, forming the full layered memory image.</p>
+<p><strong>Memory snapshot creation</strong>: On pause, Firecracker creates a state-only diff snapshot. AgentENV queries Firecracker’s dirty/present memory ranges, reads the selected memory with <code>process_vm_readv</code>, and directly creates the OverlayBD memory layer. Parent layers from previous snapshots are stacked, forming the full layered memory image.</p>
 <blockquote>
 <p><strong>Note</strong>: <code>storage/uffd-core/</code> contains an alternative userfaultfd-based memory restore implementation that is retained for reference but excluded from the workspace build.</p>
 </blockquote>
@@ -3348,8 +3347,8 @@ then waits for guest-level envd readiness.</li>
 <li><code>pause().await</code>
 <ul>
 <li>Sends <code>PATCH /vm</code> to pause the VM.</li>
-<li>Creates snapshot artifacts including <code>vm_state.bin</code>, <code>mem.bin</code>, the
-packaged memory image config, and rootfs snapshot state.</li>
+<li>Creates snapshot artifacts including <code>vm_state.bin</code>, <code>mem_image.json</code>,
+<code>mem_overlaybd/overlaybd.commit</code>, and rootfs snapshot state.</li>
 <li>Returns a <code>FirecrackerSnapshotConfig</code> that owns the tempdir holding these files.</li>
 </ul>
 </li>
@@ -3735,7 +3734,8 @@ Boots a fresh VM and verifies that:</p>
 Validates pause + snapshot creation by:</p>
 <ul>
 <li>Pausing a running VM via FC API.</li>
-<li>Creating <code>vm_state.bin</code> and <code>mem.bin</code>.</li>
+<li>Creating <code>vm_state.bin</code>, <code>mem_image.json</code>, and
+<code>mem_overlaybd/overlaybd.commit</code>.</li>
 <li>Ensuring those files exist on disk.</li>
 </ul>
 </li>
@@ -4270,9 +4270,8 @@ network namespaces are missing</li>
 </thead>
 <tbody>
 <tr><td>Managed live snapshot root</td><td><code>&lt;firecracker-work-base&gt;/managed-snapshots/{sandbox_id}/{uuid}/...</code></td><td>Firecracker snapshot artifacts kept alive in-process</td><td>Holds captured running-sandbox snapshots until publish, and supports in-process pause state</td><td>Created by <code>FirecrackerSandbox::pause()</code> or <code>snapshot()</code>. Removed when <code>PersistentSnapshotRootGuard</code> drops.</td><td>No.</td></tr>
-<tr><td>Snapshot VM state</td><td>snapshot artifact dir <code>vm_state.bin</code></td><td>Firecracker VM state</td><td>Pause/resume and snapshot publish input</td><td>Created by Firecracker <code>create_snapshot</code>. Owner depends on caller: persister, managed root, or repository publish input.</td><td>No.</td></tr>
-<tr><td>Raw memory diff</td><td>snapshot artifact dir <code>mem.bin</code></td><td>Sparse Firecracker diff memory dump</td><td>Input to memory overlaybd conversion and source for virtual memory size</td><td>Created by Firecracker <code>create_snapshot</code>. Removed best-effort after the memory overlaybd layer is committed.</td><td>Temporary input only; not reconstructed after cleanup.</td></tr>
-<tr><td>Memory overlaybd layer</td><td>snapshot artifact dir <code>mem_overlaybd/overlaybd.commit</code></td><td>Sealed overlaybd layer for memory pages</td><td>Runtime memory restore and publish input</td><td>Created by packaging <code>mem.bin</code>. Imported into repository managed layers during publish.</td><td>No, unless raw <code>mem.bin</code> is still present.</td></tr>
+<tr><td>Snapshot VM state</td><td>snapshot artifact dir <code>vm_state.bin</code></td><td>Firecracker VM state</td><td>Pause/resume and snapshot publish input</td><td>Created by Firecracker’s state-only diff snapshot. Owner depends on caller: persister, managed root, or repository publish input.</td><td>No.</td></tr>
+<tr><td>Memory overlaybd layer</td><td>snapshot artifact dir <code>mem_overlaybd/overlaybd.commit</code></td><td>Sealed OverlayBD layer for memory pages</td><td>Runtime memory restore and publish input</td><td>Created directly from Firecracker dirty/present memory ranges read with <code>process_vm_readv</code>. Imported into repository managed layers during publish.</td><td>No.</td></tr>
 <tr><td>Memory image config</td><td>snapshot artifact dir <code>mem_image.json</code></td><td>Overlaybd image config stacking memory layers</td><td>Resume paused sandbox and publish memory layers</td><td>Written after memory conversion. Later repository resolvers regenerate runtime memory configs from committed layers.</td><td>Yes after publish; no for paused sandbox unless layers are known.</td></tr>
 <tr><td>Rootfs snapshot config</td><td>snapshot artifact dir <code>rootfs/image.json</code></td><td>Overlaybd image config for captured rootfs state</td><td>Resume paused sandbox and publish rootfs layers</td><td>Staged from live runtime config after restack/seal.</td><td>Yes only from associated layers and metadata.</td></tr>
 <tr><td>Rootfs snapshot layer</td><td>snapshot artifact dir <code>rootfs/snapshot.commit</code></td><td>Sealed writable upper from live rootfs</td><td>Captures disk writes since previous lower stack</td><td>Created by ublk daemon restack for writable overlaybd rootfs.</td><td>No.</td></tr>

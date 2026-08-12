@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-706eb9d3.js";
+            window.path_to_searchindex_js = "../searchindex-1a1f1562.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-795efd7f.js"></script>
@@ -335,8 +335,8 @@ then waits for guest-level envd readiness.</li>
 <li><code>pause().await</code>
 <ul>
 <li>Sends <code>PATCH /vm</code> to pause the VM.</li>
-<li>Creates snapshot artifacts including <code>vm_state.bin</code>, <code>mem.bin</code>, the
-packaged memory image config, and rootfs snapshot state.</li>
+<li>Creates snapshot artifacts including <code>vm_state.bin</code>, <code>mem_image.json</code>,
+<code>mem_overlaybd/overlaybd.commit</code>, and rootfs snapshot state.</li>
 <li>Returns a <code>FirecrackerSnapshotConfig</code> that owns the tempdir holding these files.</li>
 </ul>
 </li>
@@ -722,7 +722,8 @@ Boots a fresh VM and verifies that:</p>
 Validates pause + snapshot creation by:</p>
 <ul>
 <li>Pausing a running VM via FC API.</li>
-<li>Creating <code>vm_state.bin</code> and <code>mem.bin</code>.</li>
+<li>Creating <code>vm_state.bin</code>, <code>mem_image.json</code>, and
+<code>mem_overlaybd/overlaybd.commit</code>.</li>
 <li>Ensuring those files exist on disk.</li>
 </ul>
 </li>
