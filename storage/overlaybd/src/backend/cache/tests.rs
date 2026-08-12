@@ -2620,3 +2620,54 @@ async fn test_concurrent_read_during_capacity_eviction() {
         }
     }
 }
+
+/// Regression for the 2026-08-11 cache-poison incident: eviction must clear
+/// the in-memory bitmap before any destructive filesystem operation, so a
+/// failed eviction can never leave a bitmap claiming blocks whose data is
+/// already gone (which would serve zeroed bytes to every later read).
+#[tokio::test]
+async fn test_eviction_clears_bitmap_before_destroying_data() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let payload = uniform_char_random_data(4096, 31);
+    let source = Arc::new(MockSource::new(payload.clone(), Duration::ZERO));
+    let file = backend
+        .open_file_with_source_size("evict-order", source, payload.len() as u64)
+        .await
+        .expect("open cached file");
+    assert_eq!(
+        file.read_at(0, 4096).await.expect("warm read").as_ref(),
+        payload.as_slice()
+    );
+
+    // Force eviction to fail at metadata removal: meta.bin is replaced by a
+    // directory (fresh entries have no meta.bin until the first checkpoint).
+    let entry = backend
+        .get_cache_entry(&super::cache_key_digest("evict-order"))
+        .expect("entry");
+    let meta_path = entry.paths.meta_path.clone();
+    let _ = std::fs::remove_file(&meta_path);
+    std::fs::create_dir(&meta_path).expect("replace meta.bin with a directory");
+    entry
+        .evict_all_blocks()
+        .await
+        .expect_err("eviction must fail when meta removal fails");
+
+    assert!(
+        entry.index.read().is_empty(),
+        "a failed eviction must leave the in-memory bitmap cleared"
+    );
+    std::fs::remove_dir(&meta_path).expect("cleanup meta directory");
+    assert_eq!(
+        file.read_at(0, 4096)
+            .await
+            .expect("read after failed eviction")
+            .as_ref(),
+        payload.as_slice(),
+        "reads after a failed eviction must fall back to the source"
+    );
+}

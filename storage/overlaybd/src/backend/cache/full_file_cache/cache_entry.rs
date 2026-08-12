@@ -313,10 +313,17 @@ impl CacheEntry {
     /// Uses `fallocate(PUNCH_HOLE | KEEP_SIZE)` to release disk blocks and
     /// page cache. This avoids munmap/remap while still freeing resources.
     pub(crate) async fn evict_all_blocks(&self) -> Result<u64> {
-        // Hold the write side across metadata removal, hole punching, and
-        // bitmap clearing so no refill can publish into the entry afterward.
+        // Hold the write side across bitmap clearing, metadata removal, and
+        // hole punching so no refill can publish into the entry afterward.
         let _barrier = self.refill_eviction_barrier.write().await;
         let bytes_before = self.total_cached_bytes();
+
+        // Clear the in-memory bitmap before any destructive filesystem
+        // operation: from here on every read misses and falls back to the
+        // source, so a failure partway can never leave a bitmap that claims
+        // cached data whose blocks are already gone.
+        self.index.write().clear();
+        self.dirty.store(true, Ordering::Relaxed);
 
         // Filesystem operations can block under disk pressure — exactly when
         // eviction runs — so keep them off the async executor.
@@ -324,7 +331,9 @@ impl CacheEntry {
         let data_file = self.data_file.try_clone()?;
         let source_size = self.source_size.load(Ordering::Relaxed);
         tokio::task::spawn_blocking(move || -> Result<()> {
-            // First, remove the on-disk index file.
+            // Remove the on-disk index before punching: a crash after the
+            // punch with meta.bin still present would otherwise reload a
+            // bitmap claiming blocks the punch already released.
             match std::fs::remove_file(&meta_path) {
                 Ok(_) => {}
                 Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {}
@@ -342,8 +351,6 @@ impl CacheEntry {
         })
         .await??;
 
-        self.index.write().clear();
-        self.dirty.store(true, Ordering::Relaxed);
         Ok(bytes_before)
     }
 
