@@ -1498,4 +1498,42 @@ mod tests {
 
         assert_eq!(policy, SandboxNetworkPolicy::default());
     }
+
+    // Regression: the generated NewSandbox model renamed this field to
+    // "allow_internet_access" while the spec (and the aenv CLI) send
+    // "allowInternetAccess", so POST /sandboxes silently dropped it and
+    // sandboxes created with --no-internet came up with an open base policy.
+    #[test]
+    fn new_sandbox_accepts_camel_case_allow_internet_access() {
+        let body: models::NewSandbox = serde_json::from_str(
+            r#"{"templateID": "tpl", "allowInternetAccess": false,
+                "network": {"allowOut": ["198.51.100.7"]}}"#,
+        )
+        .expect("camelCase allowInternetAccess must deserialize");
+        assert_eq!(body.allow_internet_access, Some(false));
+
+        let policy = network_policy_from_create(body.allow_internet_access, body.network.as_ref())
+            .expect("policy from create");
+        assert_eq!(policy.base_policy, BaseSandboxNetworkPolicy::Deny);
+        assert_eq!(policy.egress.allowed_cidrs, ["198.51.100.7/32"]);
+    }
+
+    #[test]
+    fn new_sandbox_still_accepts_snake_case_allow_internet_access() {
+        let body: models::NewSandbox =
+            serde_json::from_str(r#"{"templateID": "tpl", "allow_internet_access": true}"#)
+                .expect("legacy snake_case spelling must keep deserializing");
+        assert_eq!(body.allow_internet_access, Some(true));
+    }
+
+    #[test]
+    fn network_update_accepts_both_allow_internet_access_spellings() {
+        let snake: models::SandboxNetworkUpdateConfig =
+            serde_json::from_str(r#"{"allow_internet_access": false}"#).unwrap();
+        assert_eq!(snake.allow_internet_access, Some(false));
+
+        let camel: models::SandboxNetworkUpdateConfig =
+            serde_json::from_str(r#"{"allowInternetAccess": false}"#).unwrap();
+        assert_eq!(camel.allow_internet_access, Some(false));
+    }
 }

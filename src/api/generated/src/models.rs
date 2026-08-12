@@ -2874,7 +2874,13 @@ pub struct NewSandbox {
     pub secure: Option<bool>,
 
     /// Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut to 0.0.0.0/0 in the network config.
-    #[serde(rename = "allow_internet_access")]
+    // `allow_internet_access` stays canonical, matching the E2B NewSandbox
+    // contract. The alias additionally accepts `allowInternetAccess` — the
+    // spelling SandboxDetail returns and NewColdSandbox takes — because an
+    // unrecognised key here is silently dropped, yielding
+    // BaseSandboxNetworkPolicy::Default (open) when the caller asked for Deny.
+    // Manual patch: preserve on regeneration.
+    #[serde(rename = "allow_internet_access", alias = "allowInternetAccess")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_internet_access: Option<bool>,
 
@@ -5912,7 +5918,9 @@ pub struct SandboxNetworkUpdateConfig {
     pub deny_out: Option<Vec<String>>,
 
     /// Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut to 0.0.0.0/0 in the network config.
-    #[serde(rename = "allow_internet_access")]
+    // Same alias as NewSandbox so both endpoints accept both spellings.
+    // Manual patch: preserve on regeneration.
+    #[serde(rename = "allow_internet_access", alias = "allowInternetAccess")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_internet_access: Option<bool>,
 }
