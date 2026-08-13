@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-1a1f1562.js";
+            window.path_to_searchindex_js = "../searchindex-3d5d857f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-795efd7f.js"></script>
@@ -289,21 +289,22 @@ aenv timeout &lt;sandbox-id&gt; 600
 <pre><code class="language-bash">curl -X POST \
   -H 'X-API-Key: test-key' \
   -H 'Content-Type: application/json' \
-  -d '{"templateID": "my-ubuntu", "allowInternetAccess": false}' \
+  -d '{"templateID": "my-ubuntu", "allow_internet_access": false}' \
   http://127.0.0.1:8000/sandboxes
 </code></pre>
-<p>For fine-grained egress control, pass a <code>network</code> object when creating the sandbox. Allowed entries take precedence over denied entries:</p>
+<p>For fine-grained egress control, pass a <code>network</code> object when creating the sandbox. Egress is allow-by-default, and <code>allowOut</code> entries take precedence over matching <code>denyOut</code> entries. <code>allowOut</code> by itself does not create an allowlist: destinations that do not match a deny rule remain reachable.</p>
 <ul>
-<li><code>allowOut</code> — CIDR, IP, or domain patterns</li>
+<li><code>allowOut</code> — CIDR or IP. Domain patterns are currently not supported.</li>
 <li><code>denyOut</code> — CIDR or IP</li>
 </ul>
+<p>To create an allowlist, deny all traffic and then add the allowed exceptions with <code>allowOut</code>. You can deny all traffic explicitly with <code>denyOut: ["0.0.0.0/0"]</code>, or use <code>allow_internet_access: false</code> together with <code>allowOut</code>.</p>
 <pre><code class="language-bash">curl -X POST \
   -H 'X-API-Key: test-key' \
   -H 'Content-Type: application/json' \
   -d '{
     "templateID": "my-ubuntu",
     "network": {
-      "allowOut": ["8.8.8.8/32", "example.com", "*.example.com"],
+      "allowOut": ["8.8.8.8/32", "1.1.1.1/32"],
       "denyOut": ["0.0.0.0/0"]
     }
   }' \
@@ -316,7 +317,7 @@ aenv timeout &lt;sandbox-id&gt; 600
   -d '{"allowOut": ["8.8.8.8/32"], "denyOut": ["0.0.0.0/0"]}' \
   http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/network
 </code></pre>
-<p>Omitting both fields clears all egress rules.</p>
+<p>Omitting both fields clears all per-sandbox egress rules and restores the default allow behavior.</p>
 <hr>
 <h2 id="data-storage"><a class="header" href="#data-storage">Data Storage</a></h2>
 <div class="table-wrapper">
