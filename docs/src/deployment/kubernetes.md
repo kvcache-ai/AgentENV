@@ -43,40 +43,9 @@ make k8s-build
 
 This builds three images: `agentenv-runtime:latest`, `agentenv-gateway:latest`, and `agentenv-scheduler:latest`.
 
-## Configure the Shared Access-Token Seed
+## Configure the Access-Token Seed (Optional)
 
-Before starting runtime Pods, create the namespace and generate one envd
-access-token seed. Store it in the Secret required by the checked-in DaemonSet:
-
-```bash
-kubectl apply -f deploy/k8s/base/namespace.yaml
-
-AENV_ACCESS_TOKEN_HASH_SEED="$(openssl rand -hex 32)"
-kubectl -n agentenv-system create secret generic agentenv-runtime-secrets \
-  --from-literal="sandbox-access-token-hash-seed=${AENV_ACCESS_TOKEN_HASH_SEED}" \
-  --dry-run=client -o yaml | kubectl apply -f -
-unset AENV_ACCESS_TOKEN_HASH_SEED
-```
-
-Run this once for a new cluster. During upgrades, preserve the existing Secret
-instead of generating another value. Production deployments may replace this
-command with an external secret manager, but must provide the same Secret name
-and key:
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: agentenv-runtime-secrets
-  namespace: agentenv-system
-stringData:
-  sandbox-access-token-hash-seed: <shared-secret>
-```
-
-The DaemonSet injects this value into every runtime Pod. The Gateway and
-Scheduler do not consume it. Changing the Secret rotates the access tokens for
-existing secure sandboxes, so update it only as a coordinated credential
-rotation.
+See [Secure Sandboxes](../security/secure-sandboxes.md) for the optional shared seed configuration and Kubernetes Secret example.
 
 ## Deploy
 

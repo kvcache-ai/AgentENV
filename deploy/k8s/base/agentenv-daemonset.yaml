@@ -28,6 +28,7 @@ spec:
                 secretKeyRef:
                   name: agentenv-runtime-secrets
                   key: sandbox-access-token-hash-seed
+                  optional: true
             - name: AENV_VIRTUALIZATION_MODE
               value: "kvm"
             - name: API_ADDR

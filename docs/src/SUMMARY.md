@@ -21,6 +21,10 @@
 - [Configuration Reference](./configuration/reference.md)
 - [Environment Variables](./configuration/env-vars.md)
 
+# Security
+
+- [Secure Sandboxes](./security/secure-sandboxes.md)
+
 # Core Concepts
 
 - [How AgentENV Works](./concepts/overview.md)
