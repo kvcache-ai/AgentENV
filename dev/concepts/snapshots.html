@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3d5d857f.js";
+            window.path_to_searchindex_js = "../searchindex-21b7a8e2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-795efd7f.js"></script>
@@ -230,6 +230,14 @@ administrators can still move or replace tags through external tooling.</li>
 <li>Deleting a snapshot also attempts to delete its published manifest from the
 registry.</li>
 </ul>
+<p>Published rootfs images preserve the snapshot’s effective OCI runtime fields
+(<code>Env</code>, <code>WorkingDir</code>, <code>User</code>, <code>Entrypoint</code>, <code>Cmd</code>, <code>ExposedPorts</code>, <code>Volumes</code>,
+and <code>Labels</code>) and retain unmodeled fields from the source rootfs config when
+available. AgentENV-specific startup commands remain snapshot metadata and are
+not converted into OCI <code>Entrypoint</code> or <code>Cmd</code>; use explicit OCI command metadata
+when that behavior must survive image export. Republishing a snapshot with this
+metadata changes its manifest digest, so an existing published tag still
+requires a new tag or deletion.</p>
 <h2 id="export-a-snapshot-rootfs-as-a-standalone-oci-image"><a class="header" href="#export-a-snapshot-rootfs-as-a-standalone-oci-image">Export a Snapshot Rootfs as a Standalone OCI Image</a></h2>
 <p><code>aenv-snapshot-image</code> (build with <code>make build-snapshot-image</code>; not part of the
 server binary, Docker image, or install packages) publishes a committed
@@ -251,7 +259,9 @@ are refused, and blobs already present at the target are skipped. The conflict
 check is not atomic against concurrent tag writers. The tool records no new
 publication state. If the selected reference is already recorded as a
 snapshot-managed publication, the tool warns that it may be deleted with the
-snapshot; other exported references live independently of snapshot deletion.</p>
+snapshot; other exported references live independently of snapshot deletion.
+The standalone export preserves the same effective OCI runtime fields described
+under <a href="#overlaybd-image-publication">OverlayBD Image Publication</a>.</p>
 <h2 id="manage-snapshots"><a class="header" href="#manage-snapshots">Manage Snapshots</a></h2>
 <h3 id="list-snapshots"><a class="header" href="#list-snapshots">List Snapshots</a></h3>
 <p>List all snapshots, optionally filtered by source sandbox:</p>
