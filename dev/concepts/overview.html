@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-21b7a8e2.js";
+            window.path_to_searchindex_js = "../searchindex-53ff16dd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-795efd7f.js"></script>
@@ -184,28 +184,15 @@
                         <h1 id="how-agentenv-works"><a class="header" href="#how-agentenv-works">How AgentENV Works</a></h1>
 <p>AgentENV runs AI agents inside isolated Firecracker microVMs. Each sandbox is a lightweight Linux VM with its own kernel, filesystem, and network namespace.</p>
 <h2 id="system-overview"><a class="header" href="#system-overview">System Overview</a></h2>
-<pre><code>                    ┌──────────────────────────────────────────────────┐
-                    │                  AgentENV Node                   │
-                    │                                                  │
-                    │  ┌──────────┐   ┌──────────────┐                 │
-                    │  │ API      │──&gt;│ Orchestrator │                 │
-                    │  │ (Axum)   │   │ (lifecycle)  │                 │
-                    │  └──────────┘   └──────┬───────┘                 │
-                    │                        │                         │
-                    │              ┌─────────▼───────────┐             │
-                    │              │  Firecracker VM     │             │
-                    │              │                     │             │
-                    │              │  /dev/vda (rootfs)  │             │
-                    │              │  /dev/vdb (extra)   │             │
-                    │              │                     │             │
-                    │              └─────────────────────┘             │
-                    │                        │                         │
-                    │              ┌─────────▼────────────┐            │
-                    │              │  Block Device Layer  │            │
-                    │              │  (overlaybd + ublk)  │            │
-                    │              └──────────────────────┘            │
-                    └──────────────────────────────────────────────────┘
-</code></pre>
+<pre class="mermaid">flowchart TD
+    subgraph node[AgentENV Node]
+        api["API&lt;br/&gt;(Axum)"] --&gt; orchestrator["Orchestrator&lt;br/&gt;(lifecycle)"]
+        orchestrator --&gt; vm["Firecracker VM&lt;br/&gt;/dev/vda (rootfs)&lt;br/&gt;/dev/vdb (extra)"]
+        vm --&gt; block["Block Device Layer&lt;br/&gt;(overlaybd + ublk)"]
+    end
+    style node fill:transparent,stroke:gray
+</pre>
+
 <h2 id="request-flow"><a class="header" href="#request-flow">Request Flow</a></h2>
 <ol>
 <li>A client sends an HTTP request to the AgentENV API (for example, <code>POST /sandboxes</code>).</li>
@@ -235,13 +222,14 @@
 </div>
 <h2 id="multi-node-architecture"><a class="header" href="#multi-node-architecture">Multi-Node Architecture</a></h2>
 <p>For multi-node deployments, a <strong>gateway</strong> and <strong>scheduler</strong> sit in front of multiple AgentENV nodes:</p>
-<pre><code>    Client ──HTTP──&gt; Gateway (:8080) ──gRPC──&gt; Scheduler (:9090)
-                        │                          │
-                        │    ┌─────────────────────┘
-                        │    │ node selection / lookup
-                        ▼    ▼
-                   Node A (:8000)    Node B (:8000)
-</code></pre>
+<pre class="mermaid">flowchart LR
+    client["Client"] --&gt;|HTTP| gateway["Gateway&lt;br/&gt;(:8080)"]
+    gateway --&gt;|gRPC| scheduler["Scheduler&lt;br/&gt;(:9090)"]
+    gateway --&gt;|proxy HTTP| nodeA["Node A&lt;br/&gt;(:8000)"]
+    gateway --&gt;|proxy HTTP| nodeB["Node B&lt;br/&gt;(:8000)"]
+    scheduler -.-&gt;|node selection /&lt;br/&gt; lookup result| gateway
+</pre>
+
 <p>The gateway routes requests by sandbox ID. For new sandboxes, the scheduler picks a node. For existing sandboxes, the scheduler looks up the node that owns it. See <a href="../deployment/docker-compose.html">Deployment</a> for setup instructions.</p>
 
                     </main>
@@ -296,6 +284,7 @@
 
         <!-- Custom JS scripts -->
         <script src="../theme/version-selector-067fd7db.js"></script>
+        <script src="../mermaid-init-3bdacd7b.js"></script>
 
 
 
