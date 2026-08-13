@@ -153,14 +153,16 @@ Each sandbox runs in its own network namespace. By default, outbound internet ac
 curl -X POST \
   -H 'X-API-Key: test-key' \
   -H 'Content-Type: application/json' \
-  -d '{"templateID": "my-ubuntu", "allowInternetAccess": false}' \
+  -d '{"templateID": "my-ubuntu", "allow_internet_access": false}' \
   http://127.0.0.1:8000/sandboxes
 ```
 
-For fine-grained egress control, pass a `network` object when creating the sandbox. Allowed entries take precedence over denied entries:
+For fine-grained egress control, pass a `network` object when creating the sandbox. Egress is allow-by-default, and `allowOut` entries take precedence over matching `denyOut` entries. `allowOut` by itself does not create an allowlist: destinations that do not match a deny rule remain reachable.
 
-- `allowOut` — CIDR, IP, or domain patterns
+- `allowOut` — CIDR or IP. Domain patterns are currently not supported.
 - `denyOut` — CIDR or IP
+
+To create an allowlist, deny all traffic and then add the allowed exceptions with `allowOut`. You can deny all traffic explicitly with `denyOut: ["0.0.0.0/0"]`, or use `allow_internet_access: false` together with `allowOut`.
 
 ```bash
 curl -X POST \
@@ -169,7 +171,7 @@ curl -X POST \
   -d '{
     "templateID": "my-ubuntu",
     "network": {
-      "allowOut": ["8.8.8.8/32", "example.com", "*.example.com"],
+      "allowOut": ["8.8.8.8/32", "1.1.1.1/32"],
       "denyOut": ["0.0.0.0/0"]
     }
   }' \
@@ -186,7 +188,7 @@ curl -X PUT \
   http://127.0.0.1:8000/sandboxes/<sandbox-id>/network
 ```
 
-Omitting both fields clears all egress rules.
+Omitting both fields clears all per-sandbox egress rules and restores the default allow behavior.
 
 ---
 
