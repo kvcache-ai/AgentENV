@@ -4,28 +4,14 @@ AgentENV runs AI agents inside isolated Firecracker microVMs. Each sandbox is a 
 
 ## System Overview
 
-```
-                    ┌──────────────────────────────────────────────────┐
-                    │                  AgentENV Node                   │
-                    │                                                  │
-                    │  ┌──────────┐   ┌──────────────┐                 │
-                    │  │ API      │──>│ Orchestrator │                 │
-                    │  │ (Axum)   │   │ (lifecycle)  │                 │
-                    │  └──────────┘   └──────┬───────┘                 │
-                    │                        │                         │
-                    │              ┌─────────▼───────────┐             │
-                    │              │  Firecracker VM     │             │
-                    │              │                     │             │
-                    │              │  /dev/vda (rootfs)  │             │
-                    │              │  /dev/vdb (extra)   │             │
-                    │              │                     │             │
-                    │              └─────────────────────┘             │
-                    │                        │                         │
-                    │              ┌─────────▼────────────┐            │
-                    │              │  Block Device Layer  │            │
-                    │              │  (overlaybd + ublk)  │            │
-                    │              └──────────────────────┘            │
-                    └──────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph node[AgentENV Node]
+        api["API<br/>(Axum)"] --> orchestrator["Orchestrator<br/>(lifecycle)"]
+        orchestrator --> vm["Firecracker VM<br/>/dev/vda (rootfs)<br/>/dev/vdb (extra)"]
+        vm --> block["Block Device Layer<br/>(overlaybd + ublk)"]
+    end
+    style node fill:transparent,stroke:gray
 ```
 
 ## Request Flow
@@ -54,13 +40,13 @@ AgentENV runs AI agents inside isolated Firecracker microVMs. Each sandbox is a 
 
 For multi-node deployments, a **gateway** and **scheduler** sit in front of multiple AgentENV nodes:
 
-```
-    Client ──HTTP──> Gateway (:8080) ──gRPC──> Scheduler (:9090)
-                        │                          │
-                        │    ┌─────────────────────┘
-                        │    │ node selection / lookup
-                        ▼    ▼
-                   Node A (:8000)    Node B (:8000)
+```mermaid
+flowchart LR
+    client["Client"] -->|HTTP| gateway["Gateway<br/>(:8080)"]
+    gateway -->|gRPC| scheduler["Scheduler<br/>(:9090)"]
+    gateway -->|proxy HTTP| nodeA["Node A<br/>(:8000)"]
+    gateway -->|proxy HTTP| nodeB["Node B<br/>(:8000)"]
+    scheduler -.->|node selection /<br/> lookup result| gateway
 ```
 
 The gateway routes requests by sandbox ID. For new sandboxes, the scheduler picks a node. For existing sandboxes, the scheduler looks up the node that owns it. See [Deployment](../deployment/docker-compose.md) for setup instructions.

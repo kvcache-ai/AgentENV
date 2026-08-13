@@ -11,4 +11,7 @@ build-dir = "book"
 git-repository-url = "https://github.com/kvcache-ai/AgentENV"
 edit-url-template = "https://github.com/kvcache-ai/AgentENV/edit/main/docs/{path}"
 additional-css = ["theme/version-selector.css"]
-additional-js = ["theme/version-selector.js"]
+additional-js = ["theme/version-selector.js", "mermaid-init.js"]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"

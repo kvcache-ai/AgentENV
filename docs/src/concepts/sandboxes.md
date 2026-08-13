@@ -6,12 +6,20 @@ A sandbox is an isolated Firecracker microVM with its own Linux kernel, filesyst
 
 ## Lifecycle
 
-```
-Creating ──> Running ──> Pausing ──> Paused
-                │                      │
-                ├──> Snapshotting      └──> Resuming ──> Running
-                ├──> Forking
-                └──> Killing
+```mermaid
+stateDiagram-v2
+    [*] --> Creating
+    Creating --> Running
+    Running --> Pausing
+    Pausing --> Paused
+    Paused --> Resuming
+    Resuming --> Running
+    Running --> Snapshotting
+    Snapshotting --> Running
+    Running --> Forking
+    Forking --> Running
+    Running --> Killing
+    Killing --> [*]
 ```
 
 | State | Description |
@@ -157,10 +165,25 @@ curl -X POST \
   http://127.0.0.1:8000/sandboxes
 ```
 
-For fine-grained egress control, pass a `network` object when creating the sandbox. Egress is allow-by-default, and `allowOut` entries take precedence over matching `denyOut` entries. `allowOut` by itself does not create an allowlist: destinations that do not match a deny rule remain reachable.
+For fine-grained egress control, pass a `network` object when creating the sandbox. Within user-configured egress rules, traffic is allow-by-default, and `allowOut` entries take precedence over matching `denyOut` entries. `allowOut` by itself does not create an allowlist: destinations that do not match a deny rule remain reachable.
 
 - `allowOut` — CIDR or IP. Domain patterns are currently not supported.
 - `denyOut` — CIDR or IP
+
+The following diagram illustrates how the rules are evaluated:
+
+```mermaid
+flowchart TD
+    A[Destination packet] --> B{Matches allowOut?}
+    B -->|Yes| C[Allow traffic]
+    B -->|No| D{Matches denyOut?}
+    D -->|Yes| E[Reject traffic]
+    D -->|No| F{"allow_internet_access?"}
+    F -->|Yes| C
+    F -->|No| E
+```
+
+`allowOut` is evaluated before `denyOut` in the user egress chain, so an allowed destination can override an overlapping user-configured deny rule. `allow_internet_access: false` sets the base policy to `Deny`, which appends a catch-all reject after those rules and makes the remaining destinations fail closed. Static internal-network deny rules are evaluated before the user egress chain and cannot be overridden by `allowOut`.
 
 To create an allowlist, deny all traffic and then add the allowed exceptions with `allowOut`. You can deny all traffic explicitly with `denyOut: ["0.0.0.0/0"]`, or use `allow_internet_access: false` together with `allowOut`.
 

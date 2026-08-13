@@ -4,54 +4,27 @@ AgentENV runs AI agents inside isolated, snapshot-capable Firecracker microVMs. 
 
 ## System Overview
 
-```
-                    ┌───────────────────────────────────────────────────────────┐
-                    │                       AgentENV Node                       │
-                    │                                                           │
-                    │  ┌──────────┐   ┌──────────────┐                          │
-                    │  │ API      │──>│ Orchestrator │                          │
-                    │  │ (Axum)   │   │ (lifecycle)  │                          │
-                    │  └──────────┘   └──────┬───────┘                          │
-                    │                        │                                  │
-                    │              ┌─────────▼───────────┐                      │
-                    │              │  Firecracker VM     │                      │
-                    │              │                     │                      │
-                    │              │  /dev/vda (rootfs)  │                      │
-                    │              │  /dev/vdb (extra)───┼───┐                  │
-                    │              │  VM memory ─────────┼───┼──┐               │
-                    │              │                     │   │  │               │
-                    │              └─────────────────────┘   │  │               │
-                    │                                        │  │               │
-                    │    Block device path:                  │  │               │
-                    │              ┌────────────────────────▼──┐│               │
-                    │              │  ublk (/dev/ublkbN)       ││               │
-                    │              │  userspace block device   ││               │
-                    │              └────────────┬──────────────┘│               │
-                    │                           │               │               │
-                    │              ┌─────────────▼─────────────┐│               │
-                    │              │  overlaybd                ││               │
-                    │              │  ┌───────┐ ┌───────┐      ││               │
-                    │              │  │ upper │ │layer 0│ ...  ││               │
-                    │              │  │ (r/w) │ │(r/o)  │      ││               │
-                    │              │  └───────┘ └───────┘      ││               │
-                    │              └───────────────────────────┘│               │
-                    │                                           │               │
-                    │    Memory restore path:                   │               │
-                    │              ┌────────────────────────────▼───┐           │
-                    │              │  ublk (/dev/ublkbM)            │           │
-                    │              │  read-only memory block device │           │
-                    │              │  (shared across same-snapshot  │           │
-                    │              │   sandboxes via refcounting)   │           │
-                    │              └────────────┬───────────────────┘           │
-                    │                           │                               │
-                    │              ┌─────────────▼──────────────┐               │
-                    │              │  overlaybd (mem layers)    │               │
-                    │              │  ┌───────┐ ┌───────┐       │               │
-                    │              │  │snap N │ │snap 0 │ ...   │               │
-                    │              │  │(r/o)  │ │(r/o)  │       │               │
-                    │              │  └───────┘ └───────┘       │               │
-                    │              └────────────────────────────┘               │
-                    └───────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph node[AgentENV Node]
+        direction TB
+        api["API<br/>(Axum)"] --> orchestrator["Orchestrator<br/>(lifecycle)"]
+        orchestrator --> vm["Firecracker VM"]
+        vm --> rootfs["/dev/vda (rootfs)"]
+        rootfs --> ublkN["ublk (/dev/ublkbN)<br/>userspace block device"]
+        ublkN --> overlay["overlaybd"]
+        overlay --> upper["upper<br/>(r/w)"]
+        overlay --> layer0["layer 0, 1, 2, ...<br/>(r/o)"]
+        vm --> extra["/dev/vdb (extra)"]
+        extra --> ublkExtra["ublk device"]
+        ublkExtra --> overlayExtra["overlaybd<br/>(extra drive)"]
+        vm --> memory["VM memory"]
+        memory --> ublkM["ublk (/dev/ublkbM)<br/>read-only memory block device (shared across same-snapshot sandboxes via refcounting)"]
+        ublkM --> memLayers["overlaybd<br/>(mem layers)"]
+        memLayers --> snapN["snap N<br/>(r/o)"]
+        memLayers --> snap0["snap 0, 1, 2, ...<br/>(r/o)"]
+    end
+    style node fill:transparent,stroke:gray
 ```
 
 ## Storage 
@@ -217,13 +190,13 @@ See [P2P Artifact Transport](./p2p-design.md) for the detailed design.
 
 The multi-node control plane in `services/` routes client traffic across multiple AgentENV backend nodes.
 
-```
-    Client ──HTTP──> Gateway (:8080) ──gRPC──> Scheduler (:9090)
-                        │                          │
-                        │    ┌─────────────────────┘
-                        │    │ node selection / lookup
-                        ▼    ▼
-                   Node A (:8000)    Node B (:8000)
+```mermaid
+flowchart LR
+    client["Client"] -->|HTTP| gateway["Gateway<br/>(:8080)"]
+    gateway -->|gRPC| scheduler["Scheduler<br/>(:9090)"]
+    gateway -->|proxy HTTP| nodeA["Node A<br/>(:8000)"]
+    gateway -->|proxy HTTP| nodeB["Node B<br/>(:8000)"]
+    scheduler -.->|node selection /<br/> lookup result| gateway
 ```
 
 **Gateway** (`services/gateway/`): HTTP reverse proxy. Extracts sandbox data-plane routes from headers (`x-agentenv-sandbox-id` / `e2b-sandbox-id`) or configured host-based proxy domains (`{port}-{sandboxID}.{domain}`). Host-based routes are only enabled for explicit `gateway.sandbox_proxy_domains` entries, require RFC 952/1123 DNS-label-compatible sandbox IDs, and require the full `{port}-{sandboxID}` label to fit the 63-character DNS label limit. Runtime nodes have their own `[sandbox_proxy].domains` setting for the same host-based URL shape and return the first configured domain in sandbox metadata. In multi-node deployments, repository helpers can apply one `SANDBOX_PROXY_DOMAINS` value to both gateway and runtime node configuration. Sandbox control-plane routes such as `/sandboxes/{id}/pause` are routed by sandbox ID from the URL path; sandbox data-plane traffic is not inferred from URL path alone. For new sandboxes, calls `Schedule()` to pick a node. For existing sandboxes, calls `LookupNode()`. After sandbox creation, calls `RecordAssignment()` to seed a sandbox-to-node binding. Without explicit routing headers, it also handles cluster aggregation of `GET /sandboxes`, `GET /v2/sandboxes`, `GET /nodes`, and resolves `GET /nodes/{id}` via scheduler before proxying to the resolved node.
