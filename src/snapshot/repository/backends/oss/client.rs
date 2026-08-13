@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -11,12 +12,41 @@ use object_store_operator::{
 use opendal::{Error as OpenDalError, ErrorKind as OpenDalErrorKind, Operator};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
+use tracing::info;
 use url::Url;
 
 use crate::observability::prometheus::MetricGuard;
 
 const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 const OSS_OPERATION_DURATION: &str = "agentenv_snapshot_oss_operation_duration_seconds";
+
+/// Snapshot artifacts uploaded to OSS. Used as the `artifact` label on upload
+/// metrics and in upload completion logs so memory layers can be told apart
+/// from rootfs/attached-drive layers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OssUploadArtifact {
+    RootfsLayer,
+    AttachedDriveLayer,
+    MemoryLayer,
+    VmState,
+    FirecrackerManifest,
+    CatalogRecord,
+    Alias,
+}
+
+impl OssUploadArtifact {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::RootfsLayer => "rootfs_layer",
+            Self::AttachedDriveLayer => "attached_drive_layer",
+            Self::MemoryLayer => "memory_layer",
+            Self::VmState => "vm_state",
+            Self::FirecrackerManifest => "manifest",
+            Self::CatalogRecord => "record",
+            Self::Alias => "alias",
+        }
+    }
+}
 
 /// Thin wrapper around the OSS client used by the repository and resolver.
 #[derive(Clone, Debug)]
@@ -147,11 +177,17 @@ impl OssClient {
     }
 
     /// Write small data (catalog JSON, alias JSON, etc.).
-    pub(crate) async fn put_bytes(&self, key: &str, data: impl Into<Bytes>) -> Result<()> {
+    pub(crate) async fn put_bytes(
+        &self,
+        key: &str,
+        data: impl Into<Bytes>,
+        artifact: OssUploadArtifact,
+    ) -> Result<()> {
         let data = data.into();
         let size = data.len() as u64;
         let oss_key = self.full_key(key);
-        let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "put_bytes");
+        let mut metric =
+            MetricGuard::operation_artifact(OSS_OPERATION_DURATION, "put_bytes", artifact.as_str());
         let result = self
             .run_with_operator(|operator| {
                 let data = data.clone();
@@ -165,6 +201,7 @@ impl OssClient {
             metrics::counter!(
                 "agentenv_snapshot_oss_upload_bytes_total",
                 "operation" => "put_bytes",
+                "artifact" => artifact.as_str(),
             )
             .increment(size);
         }
@@ -173,10 +210,17 @@ impl OssClient {
     }
 
     /// Upload a local file to OSS.
-    pub(crate) async fn put_file(&self, key: &str, path: &Path) -> Result<()> {
+    pub(crate) async fn put_file(
+        &self,
+        key: &str,
+        path: &Path,
+        artifact: OssUploadArtifact,
+    ) -> Result<()> {
         let oss_key = self.full_key(key);
         let path = path.to_path_buf();
-        let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "put_file");
+        let mut metric =
+            MetricGuard::operation_artifact(OSS_OPERATION_DURATION, "put_file", artifact.as_str());
+        let start = Instant::now();
         let result: Result<u64> = async {
             let size = tokio::fs::metadata(&path)
                 .await
@@ -198,8 +242,16 @@ impl OssClient {
                 metrics::counter!(
                     "agentenv_snapshot_oss_upload_bytes_total",
                     "operation" => "put_file",
+                    "artifact" => artifact.as_str(),
                 )
                 .increment(size);
+                info!(
+                    key = %oss_key,
+                    artifact = artifact.as_str(),
+                    size_bytes = size,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "oss file uploaded"
+                );
                 Ok(())
             }
             Err(err) => Err(err),

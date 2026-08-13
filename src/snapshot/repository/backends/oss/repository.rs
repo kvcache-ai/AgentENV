@@ -10,7 +10,7 @@ use overlaybd::dense_export;
 use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
 use tracing::{debug, info, warn};
 
-use super::client::OssClient;
+use super::client::{OssClient, OssUploadArtifact};
 use super::layout::OssSnapshotArtifactLayout;
 use crate::cfg::SnapshotImageStoragePolicy;
 use crate::sandbox::FirecrackerSnapshotManifest;
@@ -245,6 +245,7 @@ impl SnapshotRepository for OssSnapshotRepository {
                 .put_file(
                     &layout.artifact_key(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
                     vm_state_local_path,
+                    OssUploadArtifact::VmState,
                 )
                 .await
                 .map_err(|e| {
@@ -265,6 +266,7 @@ impl SnapshotRepository for OssSnapshotRepository {
                 .put_bytes(
                     &layout.artifact_key(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest),
                     persisted_manifest_bytes,
+                    OssUploadArtifact::FirecrackerManifest,
                 )
                 .await
                 .map_err(|e| RepositoryError::backend("write firecracker manifest to oss", e))?;
@@ -531,7 +533,11 @@ impl OssSnapshotRepository {
         let bytes = serde_json::to_vec_pretty(record)
             .map_err(|e| RepositoryError::backend("serialize snapshot record", e))?;
         self.client
-            .put_bytes(&OssSnapshotArtifactLayout::record_key(&record.id), bytes)
+            .put_bytes(
+                &OssSnapshotArtifactLayout::record_key(&record.id),
+                bytes,
+                OssUploadArtifact::CatalogRecord,
+            )
             .await
             .map_err(|e| RepositoryError::backend("write snapshot record", e))
     }
@@ -626,7 +632,7 @@ impl OssSnapshotRepository {
             // Step 5: write our binding (unconditional — OSS does not
             // support conditional headers on S3-compatible writes).
             self.client
-                .put_bytes(&key, payload.clone())
+                .put_bytes(&key, payload.clone(), OssUploadArtifact::Alias)
                 .await
                 .map_err(|e| RepositoryError::backend("write alias binding", e))?;
 
@@ -673,10 +679,11 @@ impl OssSnapshotRepository {
     async fn export_managed_disk_image(
         &self,
         image_config_path: &Path,
+        artifact: OssUploadArtifact,
     ) -> RepositoryResult<DiskImageExportOutcome> {
         Ok(DiskImageExportOutcome {
             layers: self
-                .derive_and_upload_disk_image_layers(image_config_path)
+                .derive_and_upload_disk_image_layers(image_config_path, artifact)
                 .await?,
             publication: None,
         })
@@ -685,6 +692,7 @@ impl OssSnapshotRepository {
     async fn derive_and_upload_disk_image_layers(
         &self,
         image_config_path: &Path,
+        artifact: OssUploadArtifact,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
         let image_config = load_overlaybd_image_config(image_config_path).map_err(|e| {
             RepositoryError::backend(
@@ -703,13 +711,20 @@ impl OssSnapshotRepository {
                 let layer_path = Path::new(&layer.file);
                 if !layer.digest.is_empty() && layer.size > 0 {
                     let managed = self
-                        .import_managed_layer_with_descriptor(layer_path, &layer.digest, layer.size)
+                        .import_managed_layer_with_descriptor(
+                            layer_path,
+                            &layer.digest,
+                            layer.size,
+                            artifact,
+                        )
                         .await?;
                     layers.push(OverlaybdLayerRef::Managed(managed));
                     continue;
                 }
                 if crate::image::local_layer::rootfs_layer_is_runtime_generated_delta(layer_path) {
-                    let managed = self.import_descriptorless_rootfs_layer(layer_path).await?;
+                    let managed = self
+                        .import_descriptorless_rootfs_layer(layer_path, artifact)
+                        .await?;
                     layers.push(OverlaybdLayerRef::Managed(managed));
                     continue;
                 }
@@ -786,12 +801,16 @@ impl OssSnapshotRepository {
                         layer_path,
                         &layer.digest,
                         layer.size,
+                        OssUploadArtifact::MemoryLayer,
                     )
                     .await?,
                 );
                 continue;
             }
-            layers.push(self.import_managed_layer_by_hash(layer_path).await?);
+            layers.push(
+                self.import_managed_layer_by_hash(layer_path, OssUploadArtifact::MemoryLayer)
+                    .await?,
+            );
         }
 
         Ok(layers)
@@ -803,11 +822,17 @@ impl OssSnapshotRepository {
         subject: DiskImageSubject,
         image_config_path: &Path,
     ) -> RepositoryResult<DiskImageExportOutcome> {
+        let artifact = match &subject {
+            DiskImageSubject::Rootfs => OssUploadArtifact::RootfsLayer,
+            DiskImageSubject::AttachedDrive { .. } => OssUploadArtifact::AttachedDriveLayer,
+        };
         if !matches!(
             self.snapshot_image_storage,
             SnapshotImageStoragePolicy::SourceRegistry
         ) {
-            return self.export_managed_disk_image(image_config_path).await;
+            return self
+                .export_managed_disk_image(image_config_path, artifact)
+                .await;
         }
         match self
             .acr_exporter
@@ -831,7 +856,8 @@ impl OssSnapshotRepository {
                     reason = %feature,
                     "falling back to managed disk image layers"
                 );
-                self.export_managed_disk_image(image_config_path).await
+                self.export_managed_disk_image(image_config_path, artifact)
+                    .await
             }
             result => result,
         }
@@ -975,6 +1001,7 @@ impl OssSnapshotRepository {
     async fn import_descriptorless_rootfs_layer(
         &self,
         source: &Path,
+        artifact: OssUploadArtifact,
     ) -> RepositoryResult<ManagedLayer> {
         let canonical = std::fs::canonicalize(source).map_err(|e| {
             RepositoryError::backend(
@@ -983,14 +1010,18 @@ impl OssSnapshotRepository {
             )
         })?;
         if dense_export::should_dense_export_layer(&canonical) {
-            return self.import_sparse_overlaybd_layer_dense(&canonical).await;
+            return self
+                .import_sparse_overlaybd_layer_dense(&canonical, artifact)
+                .await;
         }
-        self.import_managed_layer_by_hash(&canonical).await
+        self.import_managed_layer_by_hash(&canonical, artifact)
+            .await
     }
 
     async fn import_sparse_overlaybd_layer_dense(
         &self,
         canonical: &Path,
+        artifact: OssUploadArtifact,
     ) -> RepositoryResult<ManagedLayer> {
         let dense_temp = tempfile::NamedTempFile::new().map_err(|e| {
             RepositoryError::backend(
@@ -1014,8 +1045,7 @@ impl OssSnapshotRepository {
                 )
             })?;
         let oss_key = OssSnapshotArtifactLayout::managed_layer_key(&descriptor.digest);
-        upload_managed_layer_if_missing(&self.client, &oss_key, &dense_path, &descriptor.digest)
-            .await?;
+        upload_managed_layer_if_missing(&self.client, &oss_key, &dense_path, artifact).await?;
 
         Ok(ManagedLayer {
             digest: descriptor.digest,
@@ -1024,7 +1054,11 @@ impl OssSnapshotRepository {
         })
     }
 
-    async fn import_managed_layer_by_hash(&self, source: &Path) -> RepositoryResult<ManagedLayer> {
+    async fn import_managed_layer_by_hash(
+        &self,
+        source: &Path,
+        artifact: OssUploadArtifact,
+    ) -> RepositoryResult<ManagedLayer> {
         let canonical = std::fs::canonicalize(source).map_err(|e| {
             RepositoryError::backend(
                 format!("canonicalize managed layer '{}'", source.display()),
@@ -1040,8 +1074,7 @@ impl OssSnapshotRepository {
                 )
             })?;
         let oss_key = OssSnapshotArtifactLayout::managed_layer_key(&descriptor.sha256);
-        upload_managed_layer_if_missing(&self.client, &oss_key, &canonical, &descriptor.sha256)
-            .await?;
+        upload_managed_layer_if_missing(&self.client, &oss_key, &canonical, artifact).await?;
 
         Ok(ManagedLayer {
             digest: descriptor.sha256,
@@ -1055,6 +1088,7 @@ impl OssSnapshotRepository {
         source: &Path,
         digest: &str,
         size: u64,
+        artifact: OssUploadArtifact,
     ) -> RepositoryResult<ManagedLayer> {
         let canonical = std::fs::canonicalize(source).map_err(|e| {
             RepositoryError::backend(
@@ -1085,7 +1119,7 @@ impl OssSnapshotRepository {
         // Descriptor-backed imports intentionally trust internally generated
         // content digests and only validate the cheap size invariant here.
         let oss_key = OssSnapshotArtifactLayout::managed_layer_key(digest);
-        upload_managed_layer_if_missing(&self.client, &oss_key, &canonical, digest).await?;
+        upload_managed_layer_if_missing(&self.client, &oss_key, &canonical, artifact).await?;
 
         Ok(ManagedLayer {
             digest: digest.to_string(),
@@ -1112,7 +1146,7 @@ async fn upload_managed_layer_if_missing(
     client: &OssClient,
     key: &str,
     canonical: &Path,
-    digest: &str,
+    artifact: OssUploadArtifact,
 ) -> RepositoryResult<()> {
     let already_exists = client
         .exists(key)
@@ -1120,10 +1154,15 @@ async fn upload_managed_layer_if_missing(
         .map_err(|e| RepositoryError::backend("check managed layer existence", e))?;
 
     if !already_exists {
-        client.put_file(key, canonical).await.map_err(|e| {
-            RepositoryError::backend(format!("upload managed layer '{}'", canonical.display()), e)
-        })?;
-        debug!(digest = %digest, key, "uploaded managed layer to oss");
+        client
+            .put_file(key, canonical, artifact)
+            .await
+            .map_err(|e| {
+                RepositoryError::backend(
+                    format!("upload managed layer '{}'", canonical.display()),
+                    e,
+                )
+            })?;
     }
 
     Ok(())
@@ -1325,7 +1364,7 @@ mod tests {
         );
 
         let layers = test_repository()
-            .derive_and_upload_disk_image_layers(&image)
+            .derive_and_upload_disk_image_layers(&image, OssUploadArtifact::RootfsLayer)
             .await
             .expect("derive layers");
 
