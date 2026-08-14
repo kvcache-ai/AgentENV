@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-53ff16dd.js";
+            window.path_to_searchindex_js = "../searchindex-289f5a05.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-795efd7f.js"></script>
+        <script src="../toc-c346f288.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -230,6 +230,7 @@
 <pre><code class="language-bash">aenv start --cold ubuntu:24.04
 </code></pre>
 <p>The cold-start API accepts an optional <code>diskSizeMB</code> field to set the root filesystem’s virtual size in MiB. Explicit values must be at least 1024 MiB and divisible by 1024 because the current resize tool operates at 1 GiB granularity. Growth is allowed by default; shrinking below the source image size requires <code>ublk.overlaybd.allow_shrink = true</code>. If omitted, the image’s built-in virtual size is used. Resizing applies only when creating a fresh writable root filesystem, not to read-only images, images with an existing upper, or snapshot resume. Sandbox responses also report disk size as <code>diskSizeMB</code>.</p>
+<p>Use <code>aenv start --secure</code> with either warm or cold starts to require an envd access token for command and file operations. The CLI obtains and sends the token automatically. Secure mode protects the envd control port only; it does not add authentication to application ports. Each fork derives a distinct envd token from the child sandbox ID.</p>
 <hr>
 <h2 id="working-with-sandboxes"><a class="header" href="#working-with-sandboxes">Working with Sandboxes</a></h2>
 <h3 id="shell-and-command-execution"><a class="header" href="#shell-and-command-execution">Shell and command execution</a></h3>

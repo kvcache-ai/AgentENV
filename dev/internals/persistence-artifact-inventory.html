@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-53ff16dd.js";
+            window.path_to_searchindex_js = "../searchindex-289f5a05.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-795efd7f.js"></script>
+        <script src="../toc-c346f288.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -193,6 +193,7 @@
 <tr><td><code>home_path</code></td><td><code>/var/lib/aenv</code></td><td><code>src/cfg.rs</code></td><td>Base for paths containing the literal <code>$AENV_HOME</code> placeholder. <code>AENV_HOME_PATH</code> overrides it before placeholder expansion.</td></tr>
 <tr><td><code>runtime_path</code></td><td><code>/run/aenv</code></td><td><code>src/cfg.rs</code>, <code>src/sandbox/network/*</code></td><td>Base for transient namespace mount points and daemon sockets. <code>AENV_RUNTIME_PATH</code> overrides it.</td></tr>
 <tr><td><code>deps_path</code></td><td><code>$AENV_HOME/deps</code></td><td><code>src/cfg.rs</code>, <code>src/setup/*</code></td><td>Base for downloaded runtime dependencies. <code>AENV_DEPS_PATH</code> can place these rebuildable assets outside <code>home_path</code>.</td></tr>
+<tr><td>Managed envd access-token seed</td><td><code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code></td><td><code>src/sandbox/access.rs</code></td><td>Node-local secret used when <code>[sandbox].access_token_hash_seed</code> is unset. It must be preserved with persisted secure sandboxes.</td></tr>
 <tr><td>Firecracker sandbox work dirs</td><td><code>$AENV_HOME/firecracker-work</code> with <code>agentenv-fc-</code> children</td><td><code>src/sandbox/firecracker/*</code></td><td>Per-sandbox runtime directories for sockets, symlinks, ublk runtime dirs, local logs, and writable OverlayBD upper layer data (<code>overlaybd/upper.data</code>, <code>overlaybd/upper.index</code>). An explicit <code>[firecracker].work_dir</code> overrides the root.</td></tr>
 <tr><td><code>firecracker.serial_dir</code></td><td><code>$AENV_HOME/logs/serial</code></td><td><code>src/sandbox/firecracker/*</code></td><td>Durable Firecracker stdout/stderr root, grouped by sandbox ID. An explicit <code>[firecracker].serial_dir</code> overrides the root.</td></tr>
 <tr><td><code>managed_snapshot_root</code></td><td><code>&lt;firecracker-work-base&gt;/managed-snapshots</code></td><td><code>src/sandbox/firecracker/*</code></td><td>In-process live snapshot artifact root used to keep captured snapshots alive until publish or drop.</td></tr>
@@ -224,6 +225,7 @@
 <tr><td>Overlaybd package downloads</td><td><code>&lt;deps_path&gt;/overlaybd/downloads/*</code></td><td>Temporary downloaded package archives</td><td>Setup staging for overlaybd release packages</td><td>Removed after a successful install.</td></tr>
 <tr><td>Generated overlaybd config</td><td><code>$AENV_HOME/overlaybd/overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/mem-overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/convert-overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/resize-overlaybd-global.json</code></td><td>Runtime global config, cache path, credentials config</td><td>Configures overlaybd runtime, memory snapshot overlaybd access, and the offline C++ tools (<code>overlaybd-apply</code>, <code>overlaybd-resize</code>), which get dedicated configs with isolated cacheDirs (<code>convert-blocks</code>, <code>resize-blocks</code>) and download disabled</td><td>Rewritten during setup/startup.</td></tr>
 <tr><td>Overlaybd runtime log</td><td><code>$AENV_HOME/overlaybd/overlaybd.log</code></td><td>Overlaybd runtime logs</td><td>Debugging</td><td>Appended by overlaybd runtime; no automatic GC.</td></tr>
+<tr><td>Managed envd access-token seed</td><td><code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code></td><td>32 random bytes encoded as lowercase hexadecimal</td><td>Derives stable per-sandbox envd access tokens when no explicit seed is configured</td><td>Atomically created with mode <code>0600</code> during normal startup and reused thereafter. Must not be deleted while secure sandboxes are persisted.</td></tr>
 </tbody>
 </table>
 </div>

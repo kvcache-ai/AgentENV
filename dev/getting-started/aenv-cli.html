@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-53ff16dd.js";
+            window.path_to_searchindex_js = "../searchindex-289f5a05.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-795efd7f.js"></script>
+        <script src="../toc-c346f288.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -257,6 +257,7 @@ aenv template delete &lt;template-id&gt;
 <h3 id="aenv-start-target"><a class="header" href="#aenv-start-target"><code>aenv start &lt;target&gt;</code></a></h3>
 <p>Start a sandbox and attach an interactive shell. <code>&lt;target&gt;</code> is a template name or template UUID.</p>
 <pre><code class="language-bash">aenv start my-ubuntu
+aenv start --secure my-ubuntu               # require token-authenticated envd access
 aenv start --cold ubuntu:24.04              # start directly from an OCI image
 </code></pre>
 <div class="table-wrapper">
@@ -266,6 +267,7 @@ aenv start --cold ubuntu:24.04              # start directly from an OCI image
 </thead>
 <tbody>
 <tr><td><code>--cold</code></td><td>Start directly from an external OCI image instead of a template</td></tr>
+<tr><td><code>--secure</code></td><td>Require token authentication for envd control communication</td></tr>
 <tr><td><code>--timeout &lt;secs&gt;</code></td><td>Sandbox TTL in seconds (default: 300)</td></tr>
 <tr><td><code>--cpu-count &lt;n&gt;</code> / <code>--cpu</code></td><td>CPU cores — only valid with <code>--cold</code></td></tr>
 <tr><td><code>--memory-mb &lt;n&gt;</code> / <code>--mem</code></td><td>Memory in MiB — only valid with <code>--cold</code></td></tr>

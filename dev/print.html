@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-53ff16dd.js";
+            window.path_to_searchindex_js = "searchindex-289f5a05.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-795efd7f.js"></script>
+        <script src="toc-c346f288.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -444,6 +444,7 @@ aenv template delete &lt;template-id&gt;
 <h3 id="aenv-start-target"><a class="header" href="#aenv-start-target"><code>aenv start &lt;target&gt;</code></a></h3>
 <p>Start a sandbox and attach an interactive shell. <code>&lt;target&gt;</code> is a template name or template UUID.</p>
 <pre><code class="language-bash">aenv start my-ubuntu
+aenv start --secure my-ubuntu               # require token-authenticated envd access
 aenv start --cold ubuntu:24.04              # start directly from an OCI image
 </code></pre>
 <div class="table-wrapper">
@@ -453,6 +454,7 @@ aenv start --cold ubuntu:24.04              # start directly from an OCI image
 </thead>
 <tbody>
 <tr><td><code>--cold</code></td><td>Start directly from an external OCI image instead of a template</td></tr>
+<tr><td><code>--secure</code></td><td>Require token authentication for envd control communication</td></tr>
 <tr><td><code>--timeout &lt;secs&gt;</code></td><td>Sandbox TTL in seconds (default: 300)</td></tr>
 <tr><td><code>--cpu-count &lt;n&gt;</code> / <code>--cpu</code></td><td>CPU cores — only valid with <code>--cold</code></td></tr>
 <tr><td><code>--memory-mb &lt;n&gt;</code> / <code>--mem</code></td><td>Memory in MiB — only valid with <code>--cold</code></td></tr>
@@ -668,6 +670,9 @@ configuration.</p>
 <pre><code class="language-bash">git clone https://github.com/kvcache-ai/AgentENV.git
 cd AgentENV
 </code></pre>
+<h2 id="configure-the-access-token-seed-optional"><a class="header" href="#configure-the-access-token-seed-optional">Configure the Access-Token Seed (Optional)</a></h2>
+<p>See <a href="#secure-sandboxes">Secure Sandboxes</a>
+if the deployment needs future cross-node sandbox recovery.</p>
 <h2 id="start-the-cluster"><a class="header" href="#start-the-cluster">Start the Cluster</a></h2>
 <pre><code class="language-bash">sudo bash scripts/docker-setup.sh
 make deploy-up
@@ -769,8 +774,9 @@ an external metrics collector needs them.</p>
 <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install.sh \
   | sudo bash
 </code></pre>
-<p>Edit <code>/etc/default/aenv</code> on each machine without removing the paths written by
-the installer. Node A uses:</p>
+<p>Edit <code>/etc/default/aenv</code> on each machine without removing the paths written by the installer.
+See <a href="#secure-sandboxes">Secure Sandboxes</a> if the deployment needs future cross-node sandbox recovery.</p>
+<p>Node A uses:</p>
 <pre><code class="language-bash">API_ADDR="0.0.0.0:8000"
 AENV_NODE_ID="node-a"
 AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED="true"
@@ -988,6 +994,8 @@ cd AgentENV
 <pre><code class="language-bash">make k8s-build
 </code></pre>
 <p>This builds three images: <code>agentenv-runtime:latest</code>, <code>agentenv-gateway:latest</code>, and <code>agentenv-scheduler:latest</code>.</p>
+<h2 id="configure-the-access-token-seed-optional-1"><a class="header" href="#configure-the-access-token-seed-optional-1">Configure the Access-Token Seed (Optional)</a></h2>
+<p>See <a href="#secure-sandboxes">Secure Sandboxes</a> for the optional shared seed configuration and Kubernetes Secret example.</p>
 <h2 id="deploy"><a class="header" href="#deploy">Deploy</a></h2>
 <pre><code class="language-bash"># Run on each worker node before deploying
 sudo bash scripts/docker-setup.sh
@@ -1026,6 +1034,9 @@ make k8s-delete
 </code></pre>
 <h2 id="local-development-k3s"><a class="header" href="#local-development-k3s">Local Development (k3s)</a></h2>
 <p>A dedicated <code>local-dev</code> overlay mounts the repository’s <code>env/</code> directory directly into the DaemonSet at <code>/workspace/env</code>, avoiding runtime asset copies:</p>
+<p>This overlay also generates <code>agentenv-runtime-secrets</code> with a fixed test-only
+seed so local and E2E deployments do not require production secret management.
+Do not reuse that value outside local development.</p>
 <pre><code class="language-bash">make k8s-build
 make k8s-load-dev       # Import images into k3s/containerd
 make k8s-render-dev     # Preview manifests
@@ -1079,10 +1090,12 @@ API_ADDR=0.0.0.0:8000 make start-server-release
 <p>See <a href="#configuration-reference">Configuration Reference</a> for all settings.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="pvm-deployment"><a class="header" href="#pvm-deployment">PVM Deployment</a></h1>
-<blockquote>
+<blockquote class="blockquote-tag blockquote-tag-note">
+<p class="blockquote-tag-title"><svg viewbox="0 0 16 16" width="18" height="18"><path d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"></path></svg>Note</p>
 <p><strong>Use this guide when standard KVM is unavailable</strong>, which commonly happens on cloud VMs where nested virtualization is not exposed. If standard KVM already works, use the <a href="#quick-start">Quick Start</a> instead.</p>
 </blockquote>
-<blockquote>
+<blockquote class="blockquote-tag blockquote-tag-warning">
+<p class="blockquote-tag-title"><svg viewbox="0 0 16 16" width="18" height="18"><path d="M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"></path></svg>Warning</p>
 <p>This feature is <strong>EXPERIMENTAL</strong>. The PVM feature has not yet been merged into the mainline Linux kernel, and the forked kernel may not receive the same level of testing and security updates as the mainline kernel.</p>
 </blockquote>
 <p>PVM, originally proposed in the paper <a href="https://dl.acm.org/doi/10.1145/3600006.3613158"><em>PVM: Efficient Shadow Paging for Deploying Secure Containers in Cloud-native Environment</em></a>, is an alternative virtualization mode that can provide the KVM-compatible interface required by AgentENV without relying on conventional nested virtualization. After the PVM host environment is installed, AgentENV still uses <code>/dev/kvm</code> to create Firecracker microVMs.</p>
@@ -1103,7 +1116,8 @@ API_ADDR=0.0.0.0:8000 make start-server-release
 <li>Linux kernel 6.8 or newer for the remaining AgentENV requirements.</li>
 </ul>
 <p>AgentENV does <strong>not</strong> replace the running host kernel automatically. Prebuilt PVM host-kernel packages are published separately in the <a href="https://github.com/kvcache-ai/linux/releases"><code>kvcache-ai/linux</code> releases</a>. You must install the appropriate package, reboot into that kernel, and verify the PVM module before installing AgentENV.</p>
-<blockquote>
+<blockquote class="blockquote-tag blockquote-tag-warning">
+<p class="blockquote-tag-title"><svg viewbox="0 0 16 16" width="18" height="18"><path d="M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"></path></svg>Warning</p>
 <p>Before changing kernels on a production server, confirm that you have console access or another recovery path in case the new kernel does not boot.</p>
 </blockquote>
 <h2 id="host-and-guest-kernel-compatibility"><a class="header" href="#host-and-guest-kernel-compatibility">Host and Guest Kernel Compatibility</a></h2>
@@ -1610,6 +1624,20 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 </tbody>
 </table>
 </div>
+<h2 id="sandbox"><a class="header" href="#sandbox"><code>[sandbox]</code></a></h2>
+<p>Sandbox control communication settings.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>access_token_hash_seed</code></td><td>string</td><td>auto-generated</td><td>Optional override for the secret used to derive secure sandbox envd access tokens. When unset, normal server startup creates and reuses <code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code>. Configure an explicit shared value when the deployment needs to recover the same sandbox ID on another node.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The managed seed is node-local persistent state and must be included in backups of <code>$AENV_HOME</code>. AgentENV refuses to generate a replacement when persisted secure sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates access tokens for existing secure sandboxes.</p>
+<p>Configure <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> with the same value on every node when cross-node recovery of the same sandbox is required. Nodes use their own managed seed when it is unset.</p>
 <h2 id="orchestrator"><a class="header" href="#orchestrator"><code>[orchestrator]</code></a></h2>
 <p>Sandbox lifecycle management.</p>
 <div class="table-wrapper">
@@ -1993,6 +2021,7 @@ and are then re-fetched on demand.</p>
 <tr><td><code>AENV_OBSERVABILITY_SCHEDULER_ENDPOINT</code></td><td>unset</td><td>Override scheduler heartbeat reporting endpoint</td></tr>
 <tr><td><code>AENV_OBSERVABILITY_REPORT_INTERVAL_SECS</code></td><td><code>5</code></td><td>Override heartbeat reporting interval in seconds</td></tr>
 <tr><td><code>AENV_CUSTOM_EXTENSION_URL</code></td><td>unset</td><td>Override <code>[custom_extension].url</code>, the HTTP base URL of the custom extension service</td></tr>
+<tr><td><code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code></td><td>auto-generated under <code>$AENV_HOME/secrets</code></td><td>Optional override for the secret used to derive secure sandbox envd access tokens. Configure the same value on every node when cross-node recovery of the same sandbox ID is required; otherwise each node uses its own managed seed.</td></tr>
 <tr><td><code>AENV_SANDBOX_PROXY_DOMAINS</code></td><td>from config</td><td>Comma-separated DNS domains that enable server-side host-based sandbox proxy URLs like <code>{port}-{sandboxID}.{domain}</code> and populate the sandbox response <code>domain</code> field. Empty or unset keeps <code>[sandbox_proxy].domains</code>.</td></tr>
 <tr><td><code>AENV_HOME_PATH</code></td><td><code>/var/lib/aenv</code></td><td>Override the base directory from which AgentENV derives local state, caches, logs, generated configs, and downloaded dependencies. Component-specific path settings remain available as advanced overrides.</td></tr>
 <tr><td><code>AENV_RUNTIME_PATH</code></td><td><code>/run/aenv</code></td><td>Override the transient runtime directory used for network namespace mount points and the default ublk daemon socket.</td></tr>
@@ -2092,6 +2121,46 @@ export E2B_ACCESS_TOKEN=dummy
 </tbody>
 </table>
 </div>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="secure-sandboxes"><a class="header" href="#secure-sandboxes">Secure Sandboxes</a></h1>
+<p>Secure sandboxes use an envd access token for control-plane communication. This protects envd operations such as command execution and file access.</p>
+<blockquote class="blockquote-tag blockquote-tag-warning">
+<p class="blockquote-tag-title"><svg viewbox="0 0 16 16" width="18" height="18"><path d="M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"></path></svg>Warning</p>
+<p>This feature does not add authentication to application ports exposed by the sandbox.</p>
+</blockquote>
+<p>Set <code>secure: true</code> when creating a sandbox through API or E2B-compatible SDKs to enable secure mode. Or use the CLI:</p>
+<pre><code class="language-bash">aenv start --secure &lt;template-id&gt;
+</code></pre>
+<p>The API and SDKs return the sandbox’s <code>envdAccessToken</code> where appropriate and attach it to envd requests automatically. Forked sandboxes get independent tokens. Secure mode is preserved across pause, restart, and resume; legacy sandboxes remain non-secure unless created with <code>secure: true</code>.</p>
+<h2 id="access-token-seed"><a class="header" href="#access-token-seed">Access-Token Seed</a></h2>
+<p>A seed is a random value used to derive the access token for each sandbox. This seed is optional. When it is unset, each runtime node automatically creates and persists a node-local seed under <code>$AENV_HOME/secrets</code>.
+This is sufficient for normal single-node operation and does not require additional setup.</p>
+<p>Configure the same explicit seed on every runtime node when the deployment needs to recover the same sandbox ID on another node in the future. Generate it once and store it in the deployment’s secret manager:</p>
+<pre><code class="language-bash">openssl rand -hex 32
+</code></pre>
+<p>Set the value as <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> on every runtime node.
+For TOML configuration, use <code>[sandbox].access_token_hash_seed</code> instead.</p>
+<p>Preserve the seed across upgrades; changing it rotates access tokens for existing secure sandboxes.</p>
+<h3 id="kubernetes"><a class="header" href="#kubernetes">Kubernetes</a></h3>
+<p>The runtime DaemonSet reads the optional <code>agentenv-runtime-secrets</code> Secret. To configure a shared seed for all runtime Pods, create it before applying the runtime manifests:</p>
+<pre><code class="language-bash">kubectl apply -f deploy/k8s/base/namespace.yaml
+
+AENV_ACCESS_TOKEN_HASH_SEED="$(openssl rand -hex 32)"
+kubectl -n agentenv-system create secret generic agentenv-runtime-secrets \
+  --from-literal="sandbox-access-token-hash-seed=${AENV_ACCESS_TOKEN_HASH_SEED}" \
+  --dry-run=client -o yaml | kubectl apply -f -
+unset AENV_ACCESS_TOKEN_HASH_SEED
+</code></pre>
+<p>Run this once for a new cluster and preserve the existing Secret during upgrades. An external secret manager may be used instead, provided it creates the same Secret name and key:</p>
+<pre><code class="language-yaml">apiVersion: v1
+kind: Secret
+metadata:
+  name: agentenv-runtime-secrets
+  namespace: agentenv-system
+stringData:
+  sandbox-access-token-hash-seed: &lt;shared-secret&gt;
+</code></pre>
+<p>If the Secret is not created, the DaemonSet still starts and each runtime Pod uses its automatically managed node-local seed.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="how-agentenv-works"><a class="header" href="#how-agentenv-works">How AgentENV Works</a></h1>
 <p>AgentENV runs AI agents inside isolated Firecracker microVMs. Each sandbox is a lightweight Linux VM with its own kernel, filesystem, and network namespace.</p>
@@ -2319,6 +2388,7 @@ aenv start -d &lt;template-id-or-name&gt;   # detach: print sandbox ID and exit
 <pre><code class="language-bash">aenv start --cold ubuntu:24.04
 </code></pre>
 <p>The cold-start API accepts an optional <code>diskSizeMB</code> field to set the root filesystem’s virtual size in MiB. Explicit values must be at least 1024 MiB and divisible by 1024 because the current resize tool operates at 1 GiB granularity. Growth is allowed by default; shrinking below the source image size requires <code>ublk.overlaybd.allow_shrink = true</code>. If omitted, the image’s built-in virtual size is used. Resizing applies only when creating a fresh writable root filesystem, not to read-only images, images with an existing upper, or snapshot resume. Sandbox responses also report disk size as <code>diskSizeMB</code>.</p>
+<p>Use <code>aenv start --secure</code> with either warm or cold starts to require an envd access token for command and file operations. The CLI obtains and sends the token automatically. Secure mode protects the envd control port only; it does not add authentication to application ports. Each fork derives a distinct envd token from the child sandbox ID.</p>
 <hr>
 <h2 id="working-with-sandboxes"><a class="header" href="#working-with-sandboxes">Working with Sandboxes</a></h2>
 <h3 id="shell-and-command-execution"><a class="header" href="#shell-and-command-execution">Shell and command execution</a></h3>
@@ -4221,6 +4291,7 @@ network namespaces are missing</li>
 <tr><td><code>home_path</code></td><td><code>/var/lib/aenv</code></td><td><code>src/cfg.rs</code></td><td>Base for paths containing the literal <code>$AENV_HOME</code> placeholder. <code>AENV_HOME_PATH</code> overrides it before placeholder expansion.</td></tr>
 <tr><td><code>runtime_path</code></td><td><code>/run/aenv</code></td><td><code>src/cfg.rs</code>, <code>src/sandbox/network/*</code></td><td>Base for transient namespace mount points and daemon sockets. <code>AENV_RUNTIME_PATH</code> overrides it.</td></tr>
 <tr><td><code>deps_path</code></td><td><code>$AENV_HOME/deps</code></td><td><code>src/cfg.rs</code>, <code>src/setup/*</code></td><td>Base for downloaded runtime dependencies. <code>AENV_DEPS_PATH</code> can place these rebuildable assets outside <code>home_path</code>.</td></tr>
+<tr><td>Managed envd access-token seed</td><td><code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code></td><td><code>src/sandbox/access.rs</code></td><td>Node-local secret used when <code>[sandbox].access_token_hash_seed</code> is unset. It must be preserved with persisted secure sandboxes.</td></tr>
 <tr><td>Firecracker sandbox work dirs</td><td><code>$AENV_HOME/firecracker-work</code> with <code>agentenv-fc-</code> children</td><td><code>src/sandbox/firecracker/*</code></td><td>Per-sandbox runtime directories for sockets, symlinks, ublk runtime dirs, local logs, and writable OverlayBD upper layer data (<code>overlaybd/upper.data</code>, <code>overlaybd/upper.index</code>). An explicit <code>[firecracker].work_dir</code> overrides the root.</td></tr>
 <tr><td><code>firecracker.serial_dir</code></td><td><code>$AENV_HOME/logs/serial</code></td><td><code>src/sandbox/firecracker/*</code></td><td>Durable Firecracker stdout/stderr root, grouped by sandbox ID. An explicit <code>[firecracker].serial_dir</code> overrides the root.</td></tr>
 <tr><td><code>managed_snapshot_root</code></td><td><code>&lt;firecracker-work-base&gt;/managed-snapshots</code></td><td><code>src/sandbox/firecracker/*</code></td><td>In-process live snapshot artifact root used to keep captured snapshots alive until publish or drop.</td></tr>
@@ -4252,6 +4323,7 @@ network namespaces are missing</li>
 <tr><td>Overlaybd package downloads</td><td><code>&lt;deps_path&gt;/overlaybd/downloads/*</code></td><td>Temporary downloaded package archives</td><td>Setup staging for overlaybd release packages</td><td>Removed after a successful install.</td></tr>
 <tr><td>Generated overlaybd config</td><td><code>$AENV_HOME/overlaybd/overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/mem-overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/convert-overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/resize-overlaybd-global.json</code></td><td>Runtime global config, cache path, credentials config</td><td>Configures overlaybd runtime, memory snapshot overlaybd access, and the offline C++ tools (<code>overlaybd-apply</code>, <code>overlaybd-resize</code>), which get dedicated configs with isolated cacheDirs (<code>convert-blocks</code>, <code>resize-blocks</code>) and download disabled</td><td>Rewritten during setup/startup.</td></tr>
 <tr><td>Overlaybd runtime log</td><td><code>$AENV_HOME/overlaybd/overlaybd.log</code></td><td>Overlaybd runtime logs</td><td>Debugging</td><td>Appended by overlaybd runtime; no automatic GC.</td></tr>
+<tr><td>Managed envd access-token seed</td><td><code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code></td><td>32 random bytes encoded as lowercase hexadecimal</td><td>Derives stable per-sandbox envd access tokens when no explicit seed is configured</td><td>Atomically created with mode <code>0600</code> during normal startup and reused thereafter. Must not be deleted while secure sandboxes are persisted.</td></tr>
 </tbody>
 </table>
 </div>
@@ -4717,7 +4789,7 @@ make deploy-ps      # status
 make deploy-logs    # logs
 make deploy-down    # teardown
 </code></pre>
-<h3 id="kubernetes"><a class="header" href="#kubernetes">Kubernetes</a></h3>
+<h3 id="kubernetes-1"><a class="header" href="#kubernetes-1">Kubernetes</a></h3>
 <pre><code class="language-bash">make k8s-render     # render manifests
 make k8s-apply      # apply to cluster
 </code></pre>

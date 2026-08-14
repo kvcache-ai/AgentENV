@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-53ff16dd.js";
+            window.path_to_searchindex_js = "../searchindex-289f5a05.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-795efd7f.js"></script>
+        <script src="../toc-c346f288.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -222,6 +222,8 @@ cd AgentENV
 <pre><code class="language-bash">make k8s-build
 </code></pre>
 <p>This builds three images: <code>agentenv-runtime:latest</code>, <code>agentenv-gateway:latest</code>, and <code>agentenv-scheduler:latest</code>.</p>
+<h2 id="configure-the-access-token-seed-optional"><a class="header" href="#configure-the-access-token-seed-optional">Configure the Access-Token Seed (Optional)</a></h2>
+<p>See <a href="../security/secure-sandboxes.html">Secure Sandboxes</a> for the optional shared seed configuration and Kubernetes Secret example.</p>
 <h2 id="deploy"><a class="header" href="#deploy">Deploy</a></h2>
 <pre><code class="language-bash"># Run on each worker node before deploying
 sudo bash scripts/docker-setup.sh
@@ -260,6 +262,9 @@ make k8s-delete
 </code></pre>
 <h2 id="local-development-k3s"><a class="header" href="#local-development-k3s">Local Development (k3s)</a></h2>
 <p>A dedicated <code>local-dev</code> overlay mounts the repository’s <code>env/</code> directory directly into the DaemonSet at <code>/workspace/env</code>, avoiding runtime asset copies:</p>
+<p>This overlay also generates <code>agentenv-runtime-secrets</code> with a fixed test-only
+seed so local and E2E deployments do not require production secret management.
+Do not reuse that value outside local development.</p>
 <pre><code class="language-bash">make k8s-build
 make k8s-load-dev       # Import images into k3s/containerd
 make k8s-render-dev     # Preview manifests

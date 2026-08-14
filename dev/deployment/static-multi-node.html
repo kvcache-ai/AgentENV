@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-53ff16dd.js";
+            window.path_to_searchindex_js = "../searchindex-289f5a05.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-795efd7f.js"></script>
+        <script src="../toc-c346f288.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -243,8 +243,9 @@ an external metrics collector needs them.</p>
 <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install.sh \
   | sudo bash
 </code></pre>
-<p>Edit <code>/etc/default/aenv</code> on each machine without removing the paths written by
-the installer. Node A uses:</p>
+<p>Edit <code>/etc/default/aenv</code> on each machine without removing the paths written by the installer.
+See <a href="../security/secure-sandboxes.html">Secure Sandboxes</a> if the deployment needs future cross-node sandbox recovery.</p>
+<p>Node A uses:</p>
 <pre><code class="language-bash">API_ADDR="0.0.0.0:8000"
 AENV_NODE_ID="node-a"
 AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED="true"
