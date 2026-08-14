@@ -42,6 +42,7 @@ struct ImageServiceInner {
 
 struct RemoteRuntime {
     underlay_registryfs: RegistryFsV2,
+    direct_registryfs: RegistryFsV2,
     oss_backend: Option<OssBackend>,
     file_cache: Option<FileCacheBackend>,
 }
@@ -193,6 +194,12 @@ impl ImageService {
 
     async fn build_remote_runtime(&self) -> Result<RemoteRuntime> {
         let underlay_registryfs = RegistryFsV2::from_global_config(&self.inner.global_config)?;
+        let direct_registryfs = RegistryFsV2::from_global_config(&self.inner.global_config)?;
+        direct_registryfs.set_accelerate_address("");
+        // Probe before the OnceCell captures this runtime. Otherwise a caller
+        // that reaches `remote_runtime` before `create_image_file` freezes an
+        // empty acceleration address into the first burst of remote reads.
+        self.enable_acceleration();
         underlay_registryfs.set_accelerate_address(self.current_accelerate_address());
         let oss_backend = if self.inner.global_config.oss_config.enable {
             Some(OssBackend::new(&self.inner.global_config.oss_config)?)
@@ -203,6 +210,7 @@ impl ImageService {
 
         Ok(RemoteRuntime {
             underlay_registryfs,
+            direct_registryfs,
             oss_backend,
             file_cache,
         })
@@ -444,10 +452,39 @@ impl ImageService {
         self.open_backend_source_with_size(url, source_size).await
     }
 
+    pub(crate) async fn open_unaccelerated_source_blob_with_size(
+        &self,
+        url: &str,
+        source_size: Option<u64>,
+    ) -> Result<Arc<dyn VirtualFile>> {
+        let remote_runtime = self.remote_runtime().await?;
+        if Self::is_oss_url(url) {
+            let oss = remote_runtime
+                .oss_backend
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("OSS backend not enabled in config"))?;
+            return oss.open_with_size_hint(url, source_size);
+        }
+
+        Self::open_registry_source_with_size(&remote_runtime.direct_registryfs, url, source_size)
+            .await
+    }
+
     fn is_oss_url(url: &str) -> bool {
         match reqwest::Url::parse(url) {
             Ok(parsed) => matches!(parsed.scheme(), "s3" | "oss"),
             Err(_) => false,
+        }
+    }
+
+    async fn open_registry_source_with_size(
+        registryfs: &RegistryFsV2,
+        url: &str,
+        source_size: Option<u64>,
+    ) -> Result<Arc<dyn VirtualFile>> {
+        match source_size {
+            Some(size) => Ok(registryfs.open_with_size_hint(url.to_string(), Some(size))),
+            None => registryfs.open(url.to_string()).await,
         }
     }
 
@@ -465,17 +502,8 @@ impl ImageService {
             return oss.open_with_size_hint(url, source_size);
         }
 
-        match source_size {
-            Some(size) => Ok(remote_runtime
-                .underlay_registryfs
-                .open_with_size_hint(url.to_string(), Some(size))),
-            None => {
-                remote_runtime
-                    .underlay_registryfs
-                    .open(url.to_string())
-                    .await
-            }
-        }
+        Self::open_registry_source_with_size(&remote_runtime.underlay_registryfs, url, source_size)
+            .await
     }
 
     pub async fn export_upper_as_oss_sealed(
@@ -956,6 +984,54 @@ mod tests {
             service.p2p_uuid_address().as_deref(),
             Some("http://127.0.0.1:9731/p2p-uuid")
         );
+    }
+
+    #[tokio::test]
+    async fn test_remote_runtime_initialization_probes_p2p_first() {
+        let tmp = TempDir::new().expect("tempdir");
+        let global_path = tmp.path().join("overlaybd.json");
+        let (facade_base, server_handle) = spawn_server(Router::new()).await;
+        let p2p_address = format!("{facade_base}/p2p-http");
+
+        write_json(
+            &global_path,
+            &serde_json::json!({
+                "registryFsVersion": "v2",
+                "ioEngine": 0,
+                "cacheConfig": {
+                    "cacheType": "file",
+                    "cacheDir": tmp.path().join("cache"),
+                    "cacheSizeGB": 1,
+                    "refillSize": 262144,
+                    "blockSize": 65536
+                },
+                "p2pConfig": {
+                    "enable": true,
+                    "address": p2p_address
+                }
+            }),
+        );
+
+        let service = ImageService::from_config_path(&global_path)
+            .await
+            .expect("service");
+        assert!(service.inner.remote_runtime.get().is_none());
+        assert_eq!(
+            *service.inner.remote_mode.read(),
+            RemoteOpenMode::Cached,
+            "P2P must not be marked reachable before the first probe"
+        );
+
+        service
+            .remote_runtime()
+            .await
+            .expect("initialize remote runtime before create_image_file");
+
+        assert!(service.inner.remote_runtime.get().is_some());
+        assert_eq!(*service.inner.remote_mode.read(), RemoteOpenMode::Direct);
+        assert_eq!(service.current_accelerate_address(), p2p_address);
+
+        server_handle.abort();
     }
 
     #[tokio::test]

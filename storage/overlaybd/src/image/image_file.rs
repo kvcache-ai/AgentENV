@@ -602,7 +602,7 @@ impl ImageFile {
             .context("lower layer local file is missing and p2p uuid facade is not configured")?;
         let url = format!("{}/{}", p2p_uuid_address.trim_end_matches('/'), uuid);
         let remote_file = image_service
-            .open_source_blob_with_size(&url, (layer.size != 0).then_some(layer.size))
+            .open_unaccelerated_source_blob_with_size(&url, (layer.size != 0).then_some(layer.size))
             .await?;
         let tar_file = new_tar_file_adaptor(remote_file).await?;
         let switch_file = new_switch_file(tar_file, false, Some(&url)).await?;
@@ -1168,10 +1168,54 @@ mod tests {
         miss: bool,
     }
 
+    async fn proxy_p2p_origin_request(
+        headers: HttpHeaderMap,
+        origin_url: String,
+    ) -> Response<Body> {
+        let mut origin_request = reqwest::Client::new().get(origin_url);
+        if let Some(range) = headers.get(reqwest::header::RANGE) {
+            origin_request = origin_request.header(reqwest::header::RANGE, range.clone());
+        }
+        let origin_response = match origin_request.send().await {
+            Ok(response) => response,
+            Err(_) => {
+                return Response::builder()
+                    .status(HttpStatusCode::BAD_GATEWAY)
+                    .body(Body::empty())
+                    .expect("502 response");
+            }
+        };
+        let status = origin_response.status();
+        let headers = origin_response.headers().clone();
+        let body = match origin_response.bytes().await {
+            Ok(body) => body,
+            Err(_) => {
+                return Response::builder()
+                    .status(HttpStatusCode::BAD_GATEWAY)
+                    .body(Body::empty())
+                    .expect("502 response");
+            }
+        };
+        let mut response = Response::builder()
+            .status(status)
+            .body(Body::from(body))
+            .expect("origin proxy response");
+        *response.headers_mut() = headers;
+        response
+    }
+
     async fn handle_p2p_uuid_request(
         State(state): State<P2pUuidLayerState>,
         request: Request,
     ) -> Response<Body> {
+        let origin_url = request
+            .uri()
+            .path()
+            .strip_prefix("/p2p-http/")
+            .map(str::to_owned);
+        if let Some(origin_url) = origin_url {
+            return proxy_p2p_origin_request(request.headers().clone(), origin_url).await;
+        }
         let path = request.uri().path();
         if !path.starts_with("/p2p-uuid/") {
             return Response::builder()
