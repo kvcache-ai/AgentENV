@@ -19,7 +19,7 @@ pub(crate) const PARALLEL_LOAD_INDEX: usize = 32;
 
 pub const MAX_STACK_LAYERS: usize = 255;
 
-pub(super) const PREMERGED_INDEX_DIR: &str = "premerged-index";
+pub(crate) const PREMERGED_INDEX_DIR: &str = "premerged-index";
 pub(super) const PREMERGED_INDEX_EXT: &str = "pmidx";
 pub(super) const PREMERGED_INDEX_MAGIC: [u8; 8] = *b"PMIDX001";
 pub(super) const PREMERGED_INDEX_FORMAT_VERSION: u32 = 1;

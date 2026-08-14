@@ -9,6 +9,7 @@ use super::cache_entry::CacheEntry;
 use super::cache_store::CachedFile;
 use crate::config::CacheConfig;
 use crate::io::virtual_file::VirtualFile;
+use crate::lsmt::file::PREMERGED_INDEX_DIR;
 use anyhow::{anyhow, bail, Context, Result};
 use dashmap::DashMap;
 use nix::errno::Errno;
@@ -199,6 +200,11 @@ impl BackendState {
                 continue;
             }
             let cache_id = item.file_name().to_string_lossy().to_string();
+            // The LSMT premerged-index artifact cache shares this cache root
+            // but is not a full-file cache entry; leave it untouched.
+            if cache_id == PREMERGED_INDEX_DIR {
+                continue;
+            }
             let paths = EntryPaths::new(&options.cache_dir, &cache_id);
             match CacheEntry::load_from_disk(cache_id.clone(), paths, options).await {
                 Ok(entry) => {

@@ -1052,6 +1052,25 @@ async fn test_cache_persistence_reload() {
 }
 
 #[tokio::test]
+async fn test_load_from_disk_preserves_premerged_index_dir() {
+    let tmp = tempdir().expect("create tempdir");
+    let reserved = tmp.path().join(crate::lsmt::file::PREMERGED_INDEX_DIR);
+    std::fs::create_dir_all(&reserved).expect("create premerged-index dir");
+    let artifact = reserved.join("deadbeef.pmidx");
+    std::fs::write(&artifact, b"pmidx-bytes").expect("write artifact");
+
+    let backend = FileCacheBackend::with_options(test_options(tmp.path()))
+        .await
+        .expect("backend init");
+    drop(backend);
+
+    assert!(
+        artifact.try_exists().expect("stat artifact"),
+        "recovery must not remove the premerged-index artifact cache"
+    );
+}
+
+#[tokio::test]
 async fn test_inflight_refill_dedup() {
     let tmp = tempdir().expect("create tempdir");
     let backend = FileCacheBackend::with_options(test_options(tmp.path()))
