@@ -147,6 +147,7 @@ dependencies = [
  "sha2 0.10.9",
  "shell-util",
  "storage-util",
+ "subtle",
  "tar",
  "tempfile",
  "thiserror 2.0.18",

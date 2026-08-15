@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -8,10 +8,13 @@ use rand::{rngs::SysRng, TryRng};
 use tracing::info;
 
 use crate::cfg::AppConfig;
+use crate::managed_secret::{self, CreateOutcome};
 
 const API_KEY_ENV: &str = "AENV_API_KEY";
 const EXTERNAL_API_KEY_PATH: &str = "/run/secrets/api-key";
 const MANAGED_API_KEY_RELATIVE_PATH: &str = "secrets/api-key";
+const API_KEY_MAX_LEN: usize = 4096;
+const API_KEY_FILE_MAX_LEN: usize = API_KEY_MAX_LEN + 2;
 const GENERATED_API_KEY_PREFIX: &str = "e2b_";
 
 pub fn resolve(config: &AppConfig) -> Result<String> {
@@ -36,7 +39,7 @@ fn resolve_from(
         .context("invalid AENV_API_KEY");
     }
 
-    match read(external_path) {
+    match read_external(external_path) {
         Ok(key) => {
             info!(path = %external_path.display(), "loaded API key from external secret");
             return Ok(key);
@@ -46,78 +49,75 @@ fn resolve_from(
     }
 
     let managed_path = home_path.join(MANAGED_API_KEY_RELATIVE_PATH);
-    match read(&managed_path) {
-        Ok(key) => return Ok(key),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("load managed API key"),
+    match fs::symlink_metadata(&managed_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return create(&managed_path),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect managed API key {}", managed_path.display()));
+        }
+        Ok(_) => {}
+    }
+    if let Some(value) =
+        managed_secret::read(&managed_path, API_KEY_FILE_MAX_LEN).context("load managed API key")?
+    {
+        return validate_file_contents(&value).context("invalid managed API key");
     }
 
     create(&managed_path)
 }
 
-fn read(path: &Path) -> Result<String, io::Error> {
-    let value = fs::read_to_string(path)?;
-    validate(&value).map_err(io::Error::other)
+fn read_external(path: &Path) -> Result<String, io::Error> {
+    let value = read_bounded(File::open(path)?)?;
+    validate_file_contents(&value).map_err(io::Error::other)
+}
+
+fn read_bounded(file: File) -> Result<String, io::Error> {
+    let mut value = String::with_capacity(API_KEY_FILE_MAX_LEN);
+    file.take((API_KEY_FILE_MAX_LEN + 1) as u64)
+        .read_to_string(&mut value)?;
+    if value.len() > API_KEY_FILE_MAX_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("API key file must be at most {API_KEY_FILE_MAX_LEN} bytes"),
+        ));
+    }
+    Ok(value)
 }
 
 fn validate(value: &str) -> Result<String> {
-    let value = value.trim();
-    if value.len() < 32
+    if !(32..=API_KEY_MAX_LEN).contains(&value.len())
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'~' | b'-'))
     {
-        bail!("API key must contain at least 32 URL-safe characters");
+        bail!("API key must contain between 32 and {API_KEY_MAX_LEN} URL-safe characters");
     }
     Ok(value.to_owned())
 }
 
-fn create(path: &Path) -> Result<String> {
-    let parent = path
-        .parent()
-        .context("managed API key path has no parent")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create managed secret directory {}", parent.display()))?;
-    set_permissions(parent, 0o700)?;
+fn validate_file_contents(value: &str) -> Result<String> {
+    let value = value.strip_suffix('\n').unwrap_or(value);
+    validate(value.strip_suffix('\r').unwrap_or(value))
+}
 
+fn create(path: &Path) -> Result<String> {
     let mut random = [0_u8; 32];
     SysRng
         .try_fill_bytes(&mut random)
         .context("generate managed API key")?;
     let key = format!("{GENERATED_API_KEY_PREFIX}{}", hex::encode(random));
 
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("create temporary API key in {}", parent.display()))?;
-    set_permissions(temporary.path(), 0o600)?;
-    writeln!(temporary, "{key}")?;
-    temporary.as_file().sync_all()?;
-
-    match temporary.persist_noclobber(path) {
-        Ok(_) => {
-            File::open(parent)?.sync_all()?;
+    match managed_secret::create(path, format!("{key}\n").as_bytes())? {
+        CreateOutcome::Created => {
             info!(path = %path.display(), "generated managed API key");
             Ok(key)
         }
-        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-            read(path).context("load concurrently generated API key")
-        }
-        Err(error) => {
-            Err(error.error).with_context(|| format!("persist managed API key {}", path.display()))
+        CreateOutcome::Existing(file) => {
+            let value = managed_secret::read_file(path, file, API_KEY_FILE_MAX_LEN)
+                .context("load concurrently generated API key")?;
+            validate_file_contents(&value).context("invalid concurrently generated API key")
         }
     }
-}
-
-#[cfg(unix)]
-fn set_permissions(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .with_context(|| format!("set permissions on {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_permissions(_path: &Path, _mode: u32) -> Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

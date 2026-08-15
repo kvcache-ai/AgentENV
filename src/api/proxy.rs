@@ -56,8 +56,6 @@ struct ResolvedProxyRequest {
     sandbox_id: SandboxId,
     upstream_uri: Uri,
     original_host: Option<HeaderValue>,
-    target_port: u16,
-    envd_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,10 +147,10 @@ where
 }
 
 pub(crate) fn route_for_auth(request: &Request, domains: &[String]) -> Option<(SandboxId, u16)> {
-    match parse_host_proxy_route(request_host(request), domains) {
-        Ok(Some(route)) => return Some((route.sandbox_id, route.target_port)),
-        Err(_) => return None,
-        Ok(None) => {}
+    if !has_proxy_prefix(request.uri().path()) {
+        if let Ok(Some(route)) = parse_host_proxy_route(request_host(request), domains) {
+            return Some((route.sandbox_id, route.target_port));
+        }
     }
 
     Some((
@@ -181,7 +179,7 @@ pub(crate) async fn has_valid_envd_access_token(
 
 pub(crate) fn is_sandbox_proxy_request(request: &Request, domains: &[String]) -> bool {
     let path = request.uri().path();
-    if path == PROXY_ROUTE || path.starts_with("/proxy/") {
+    if has_proxy_prefix(path) {
         return true;
     }
 
@@ -216,7 +214,7 @@ where
     I: AsRef<ApiImpl> + Clone + Send + Sync + 'static,
 {
     let path = request.uri().path();
-    if path == PROXY_ROUTE || path.starts_with("/proxy/") {
+    if has_proxy_prefix(path) {
         return next.run(request).await;
     }
 
@@ -338,6 +336,10 @@ fn strip_proxy_prefix(path: &str) -> &str {
     path.strip_prefix(PROXY_ROUTE).unwrap_or("")
 }
 
+fn has_proxy_prefix(path: &str) -> bool {
+    path == PROXY_ROUTE || path.starts_with("/proxy/")
+}
+
 fn parse_host_proxy_route(
     raw_host: Option<&str>,
     domains: &[String],
@@ -437,11 +439,9 @@ async fn proxy_http_request(
         sandbox_id,
         upstream_uri,
         original_host,
-        target_port,
-        envd_port,
     } = resolved;
 
-    sanitize_request_headers(&mut parts.headers, target_port, envd_port);
+    sanitize_request_headers(&mut parts.headers);
     inject_forwarded_headers(
         &mut parts.headers,
         original_host.as_ref(),
@@ -622,11 +622,9 @@ async fn proxy_websocket_request(
         sandbox_id,
         upstream_uri,
         original_host,
-        target_port,
-        envd_port,
     } = resolved;
 
-    sanitize_websocket_request_headers(&mut parts.headers, target_port, envd_port);
+    sanitize_websocket_request_headers(&mut parts.headers);
     inject_forwarded_headers(
         &mut parts.headers,
         original_host.as_ref(),
@@ -807,14 +805,6 @@ async fn resolve_proxy_request(
         }
     };
 
-    let metadata = api_impl
-        .orchestrator()
-        .get_sandbox(&sandbox_id)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
-        .ok_or_else(|| proxy_error_response(&ProxyRequestError::SandboxNotFound(sandbox_id)))?;
-    let envd_port = effective_envd_port(&metadata);
-
     let upstream_uri = if is_websocket_request {
         build_upstream_uri_with_scheme("ws", &target, target_port, proxy_path, parts.uri.query())
     } else {
@@ -826,8 +816,6 @@ async fn resolve_proxy_request(
         sandbox_id,
         upstream_uri,
         original_host: parts.headers.get(header::HOST).cloned(),
-        target_port,
-        envd_port,
     })
 }
 
@@ -1045,7 +1033,7 @@ fn build_upstream_uri_with_scheme(
         .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
-fn sanitize_request_headers(headers: &mut HeaderMap, target_port: u16, envd_port: u16) {
+fn sanitize_request_headers(headers: &mut HeaderMap) {
     // These headers are only for the control-plane hop between the client and
     // AgentENV. Upstream sandbox services should not see them.
     headers.remove(SANDBOX_ID_HEADER);
@@ -1055,14 +1043,11 @@ fn sanitize_request_headers(headers: &mut HeaderMap, target_port: u16, envd_port
     headers.remove(API_KEY_HEADER);
     headers.remove(TRAFFIC_ACCESS_TOKEN_HEADER);
     headers.remove(header::HOST);
-    if target_port != envd_port {
-        headers.remove(ENVD_ACCESS_TOKEN_HEADER);
-    }
     remove_hop_by_hop_headers(headers);
 }
 
-fn sanitize_websocket_request_headers(headers: &mut HeaderMap, target_port: u16, envd_port: u16) {
-    sanitize_request_headers(headers, target_port, envd_port);
+fn sanitize_websocket_request_headers(headers: &mut HeaderMap) {
+    sanitize_request_headers(headers);
     headers.remove(header::SEC_WEBSOCKET_ACCEPT);
     headers.remove(header::SEC_WEBSOCKET_EXTENSIONS);
     headers.remove(header::SEC_WEBSOCKET_KEY);
@@ -1841,11 +1826,7 @@ mod tests {
             HeaderValue::from_static("keep"),
         );
 
-        sanitize_request_headers(
-            &mut headers,
-            8080,
-            ConfigManager::global_config().tools.control_plane_port,
-        );
+        sanitize_request_headers(&mut headers);
 
         assert!(headers.get(SANDBOX_ID_HEADER).is_none());
         assert!(headers.get(E2B_SANDBOX_ID_HEADER).is_none());

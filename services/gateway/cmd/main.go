@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -27,6 +28,8 @@ import (
 const (
 	apiKeyEnv         = "AENV_API_KEY"
 	defaultAPIKeyPath = "/run/secrets/api-key"
+	maxAPIKeyLen      = 4096
+	maxAPIKeyFileLen  = maxAPIKeyLen + 2
 )
 
 func newSchedulerConn(addr string) (*grpc.ClientConn, error) {
@@ -45,22 +48,27 @@ func loadAPIKeyFrom(lookupEnv func(string) (string, bool), secretPath string) (s
 	if explicit, present := lookupEnv(apiKeyEnv); present {
 		value = explicit
 	} else {
-		contents, err := os.ReadFile(secretPath)
+		file, err := os.Open(secretPath)
 		if err != nil {
 			if os.IsNotExist(err) {
 				return "", fmt.Errorf("%s must be set or %s must exist", apiKeyEnv, secretPath)
 			}
 			return "", fmt.Errorf("read secret %s: %w", secretPath, err)
 		}
-		value, source = string(contents), secretPath
+		defer file.Close()
+		contents, err := io.ReadAll(io.LimitReader(file, maxAPIKeyFileLen+1))
+		if err != nil {
+			return "", fmt.Errorf("read secret %s: %w", secretPath, err)
+		}
+		value = strings.TrimSuffix(strings.TrimSuffix(string(contents), "\n"), "\r")
+		source = secretPath
 	}
 	return validateAPIKey(value, source)
 }
 
 func validateAPIKey(value, source string) (string, error) {
-	value = strings.TrimSpace(value)
-	if len(value) < 32 {
-		return "", fmt.Errorf("API key from %s must contain at least 32 URL-safe characters", source)
+	if len(value) < 32 || len(value) > maxAPIKeyLen {
+		return "", fmt.Errorf("API key from %s must contain between 32 and %d URL-safe characters", source, maxAPIKeyLen)
 	}
 	for _, char := range []byte(value) {
 		if (char >= 'a' && char <= 'z') ||
@@ -69,7 +77,7 @@ func validateAPIKey(value, source string) (string, error) {
 			char == '.' || char == '_' || char == '~' || char == '-' {
 			continue
 		}
-		return "", fmt.Errorf("API key from %s must contain at least 32 URL-safe characters", source)
+		return "", fmt.Errorf("API key from %s must contain between 32 and %d URL-safe characters", source, maxAPIKeyLen)
 	}
 	return value, nil
 }

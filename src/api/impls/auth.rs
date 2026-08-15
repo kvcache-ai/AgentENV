@@ -7,6 +7,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use subtle::ConstantTimeEq;
 
 use super::{ApiImpl, Claims};
 use crate::{api::proxy, types::SandboxId};
@@ -23,8 +24,11 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a HeaderVal
 
 impl ApiImpl {
     pub(crate) fn has_valid_api_key(&self, headers: &HeaderMap) -> bool {
-        single_header(headers, API_KEY_HEADER)
-            .is_some_and(|value| value.as_bytes() == self.api_key.as_bytes())
+        single_header(headers, API_KEY_HEADER).is_some_and(|value| {
+            let candidate = value.as_bytes();
+            let expected = self.api_key.as_bytes();
+            candidate.len() == expected.len() && bool::from(candidate.ct_eq(expected))
+        })
     }
 
     pub(crate) fn traffic_access_token(&self, sandbox_id: SandboxId) -> String {
@@ -43,7 +47,7 @@ impl ApiImpl {
 
 pub(crate) async fn require_auth<I>(
     State(api_impl): State<I>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response<Body>
 where
@@ -57,29 +61,32 @@ where
 
     let api_impl = api_impl.as_ref();
     let mut authorized = api_impl.has_valid_api_key(request.headers());
-    if !authorized && proxy_request {
+    let mut envd_authorized = false;
+    if proxy_request {
         if let Some((sandbox_id, target_port)) =
             proxy::route_for_auth(&request, api_impl.sandbox_proxy_domains())
         {
-            authorized = api_impl.has_valid_traffic_access_token(request.headers(), sandbox_id);
+            authorized |= api_impl.has_valid_traffic_access_token(request.headers(), sandbox_id);
             let envd_candidate = single_header(request.headers(), ENVD_ACCESS_TOKEN_HEADER)
                 .and_then(|value| value.to_str().ok());
-            if !authorized {
-                if let Some(candidate) = envd_candidate {
-                    authorized = proxy::has_valid_envd_access_token(
-                        api_impl,
-                        sandbox_id,
-                        target_port,
-                        candidate,
-                    )
-                    .await;
-                }
+            if let Some(candidate) = envd_candidate {
+                envd_authorized = proxy::has_valid_envd_access_token(
+                    api_impl,
+                    sandbox_id,
+                    target_port,
+                    candidate,
+                )
+                .await;
+                authorized |= envd_authorized;
             }
         }
     }
 
     if !authorized {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !envd_authorized {
+        request.headers_mut().remove(ENVD_ACCESS_TOKEN_HEADER);
     }
 
     next.run(request).await

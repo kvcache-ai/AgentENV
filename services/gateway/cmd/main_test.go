@@ -12,7 +12,7 @@ const testAPIKey = "e2b_0123456789abcdef0123456789abcdef0123456789abcdef01234567
 func TestValidateAPIKey(t *testing.T) {
 	t.Parallel()
 
-	got, err := validateAPIKey("  "+testAPIKey+"\n", "test")
+	got, err := validateAPIKey(testAPIKey, "test")
 	if err != nil {
 		t.Fatalf("validateAPIKey() error = %v", err)
 	}
@@ -20,7 +20,7 @@ func TestValidateAPIKey(t *testing.T) {
 		t.Fatalf("validateAPIKey() = %q, want %q", got, testAPIKey)
 	}
 
-	for _, invalid := range []string{"", "too-short", strings.Repeat("a", 31), strings.Repeat("a", 31) + "!"} {
+	for _, invalid := range []string{"", "too-short", " " + testAPIKey, testAPIKey + "\n", strings.Repeat("a", 31), strings.Repeat("a", maxAPIKeyLen+1), strings.Repeat("a", 31) + "!"} {
 		if _, err := validateAPIKey(invalid, "test"); err == nil {
 			t.Errorf("validateAPIKey(%q) unexpectedly succeeded", invalid)
 		}

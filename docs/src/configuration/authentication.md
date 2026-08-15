@@ -96,7 +96,7 @@ export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
 make start-server
 ```
 
-Custom keys must contain at least 32 URL-safe characters. In a multi-node
+Custom keys must contain between 32 and 4096 URL-safe characters. In a multi-node
 deployment, use exactly the same value for the gateway and every runtime node.
 The generated keys use `e2b_` followed by hexadecimal characters so they pass
 the E2B SDK default API-key validation. Use that format for custom keys when

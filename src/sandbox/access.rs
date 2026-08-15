@@ -1,6 +1,4 @@
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -10,6 +8,7 @@ use sha2::Sha256;
 use tracing::{info, warn};
 
 use crate::cfg::AppConfig;
+use crate::managed_secret::{self, CreateOutcome};
 use crate::types::SandboxId;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -116,30 +115,8 @@ fn validate_explicit_seed(seed: &str) -> Result<&str> {
 }
 
 fn resolve_seed(managed_path: &Path, managed_seed_must_exist: bool) -> Result<String> {
-    let parent = managed_path
-        .parent()
-        .context("managed sandbox access-token seed path has no parent")?;
-    match validate_managed_seed_directory(parent) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!("validate managed secret directory {}", parent.display())
-            });
-        }
-    }
-
-    match open_managed_seed(managed_path) {
-        Ok(file) => return read_managed_seed(managed_path, file),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "open managed sandbox access-token seed {}",
-                    managed_path.display()
-                )
-            });
-        }
+    if let Some(contents) = managed_secret::read(managed_path, MANAGED_SEED_FILE_MAX_LEN)? {
+        return validate_managed_seed(managed_path, &contents);
     }
 
     if managed_seed_must_exist {
@@ -152,80 +129,8 @@ fn resolve_seed(managed_path: &Path, managed_seed_must_exist: bool) -> Result<St
     create_managed_seed(managed_path)
 }
 
-fn open_managed_seed(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-
-    options.open(path)
-}
-
-fn validate_managed_seed_file(path: &Path, file: &File) -> Result<fs::Metadata> {
-    let metadata = file.metadata().with_context(|| {
-        format!(
-            "inspect managed sandbox access-token seed {}",
-            path.display()
-        )
-    })?;
-    if !metadata.is_file() {
-        bail!(
-            "managed sandbox access-token seed {} must be a regular file",
-            path.display()
-        );
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode != 0o600 {
-            bail!(
-                "managed sandbox access-token seed {} must have permissions 0600, found {mode:04o}",
-                path.display()
-            );
-        }
-        let expected_uid = nix::unistd::Uid::effective().as_raw();
-        if metadata.uid() != expected_uid {
-            bail!(
-                "managed sandbox access-token seed {} must be owned by uid {expected_uid}, found uid {}",
-                path.display(),
-                metadata.uid()
-            );
-        }
-    }
-
-    Ok(metadata)
-}
-
-fn read_managed_seed(path: &Path, mut file: File) -> Result<String> {
-    let metadata = validate_managed_seed_file(path, &file)?;
-
-    if metadata.len() > MANAGED_SEED_FILE_MAX_LEN as u64 {
-        bail!(
-            "managed sandbox access-token seed {} must be at most {MANAGED_SEED_FILE_MAX_LEN} bytes",
-            path.display()
-        );
-    }
-
-    let mut contents = String::with_capacity(MANAGED_SEED_FILE_MAX_LEN);
-    Read::by_ref(&mut file)
-        .take((MANAGED_SEED_FILE_MAX_LEN + 1) as u64)
-        .read_to_string(&mut contents)
-        .with_context(|| format!("read managed sandbox access-token seed {}", path.display()))?;
-    if contents.len() > MANAGED_SEED_FILE_MAX_LEN {
-        bail!(
-            "managed sandbox access-token seed {} must be at most {MANAGED_SEED_FILE_MAX_LEN} bytes",
-            path.display()
-        );
-    }
-    let seed = contents.strip_suffix('\n').unwrap_or(&contents);
+fn validate_managed_seed(path: &Path, contents: &str) -> Result<String> {
+    let seed = contents.strip_suffix('\n').unwrap_or(contents);
     if !is_valid_managed_seed(seed) {
         bail!(
             "managed sandbox access-token seed {} must contain exactly {SEED_HEX_LEN} lowercase hexadecimal characters, optionally followed by a newline",
@@ -237,57 +142,21 @@ fn read_managed_seed(path: &Path, mut file: File) -> Result<String> {
 }
 
 fn create_managed_seed(path: &Path) -> Result<String> {
-    let parent = path
-        .parent()
-        .context("managed sandbox access-token seed path has no parent")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create managed secret directory {}", parent.display()))?;
-    validate_managed_seed_directory_identity(parent).with_context(|| {
-        format!(
-            "validate managed secret directory ownership {}",
-            parent.display()
-        )
-    })?;
-    set_permissions(parent, 0o700)?;
-    validate_managed_seed_directory(parent)
-        .with_context(|| format!("validate managed secret directory {}", parent.display()))?;
-
     let mut random = [0_u8; MANAGED_SEED_BYTES];
     SysRng
         .try_fill_bytes(&mut random)
         .context("generate managed sandbox access-token seed")?;
     let seed = hex::encode(random);
 
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("create temporary seed file in {}", parent.display()))?;
-    set_permissions(temporary.path(), 0o600)?;
-    writeln!(temporary, "{seed}")
-        .with_context(|| format!("write temporary seed file in {}", parent.display()))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .with_context(|| format!("sync temporary seed file in {}", parent.display()))?;
-
-    match temporary.persist_noclobber(path) {
-        Ok(_) => {
-            fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
-                .with_context(|| format!("sync managed secret directory {}", parent.display()))?;
+    match managed_secret::create(path, format!("{seed}\n").as_bytes())? {
+        CreateOutcome::Created => {
             info!(path = %path.display(), "generated managed sandbox access-token seed");
             Ok(seed)
         }
-        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
-            let file = open_managed_seed(path).with_context(|| {
-                format!("open managed sandbox access-token seed {}", path.display())
-            })?;
-            read_managed_seed(path, file)
-        }
-        Err(error) => Err(error.error).with_context(|| {
-            format!(
-                "persist managed sandbox access-token seed {}",
-                path.display()
-            )
-        }),
+        CreateOutcome::Existing(file) => validate_managed_seed(
+            path,
+            &managed_secret::read_file(path, file, MANAGED_SEED_FILE_MAX_LEN)?,
+        ),
     }
 }
 
@@ -296,66 +165,6 @@ fn is_valid_managed_seed(seed: &str) -> bool {
         && seed
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn validate_managed_seed_directory(path: &Path) -> io::Result<()> {
-    let metadata = validate_managed_seed_directory_identity(path)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mode = metadata.permissions().mode() & 0o777;
-        if mode != 0o700 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("must have permissions 0700, found {mode:04o}"),
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_managed_seed_directory_identity(path: &Path) -> io::Result<fs::Metadata> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "must be a directory and not a symbolic link",
-        ));
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-
-        let expected_uid = nix::unistd::Uid::effective().as_raw();
-        if metadata.uid() != expected_uid {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "must be owned by uid {expected_uid}, found uid {}",
-                    metadata.uid()
-                ),
-            ));
-        }
-    }
-
-    Ok(metadata)
-}
-
-#[cfg(unix)]
-fn set_permissions(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .with_context(|| format!("set permissions on {}", path.display()))
-}
-
-#[cfg(not(unix))]
-fn set_permissions(_path: &Path, _mode: u32) -> Result<()> {
-    Ok(())
 }
 
 impl fmt::Debug for SandboxAccessTokenGenerator {
@@ -367,13 +176,20 @@ impl fmt::Debug for SandboxAccessTokenGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::sync::{Arc, Barrier};
 
     use tempfile::TempDir;
 
     fn create_private_managed_seed_directory(path: &Path) -> Result<()> {
         fs::create_dir_all(path)?;
-        set_permissions(path, 0o700)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
     }
 
     #[test]
@@ -505,7 +321,7 @@ mod tests {
 
         for contents in ["", "invalid\n"] {
             fs::write(&managed_path, contents)?;
-            set_permissions(&managed_path, 0o600)?;
+            set_test_permissions(&managed_path, 0o600)?;
 
             let error = resolve_seed(&managed_path, false).unwrap_err();
 
@@ -522,7 +338,7 @@ mod tests {
         let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
         create_private_managed_seed_directory(managed_path.parent().unwrap())?;
         fs::write(&managed_path, format!("{}\n", "a".repeat(64)))?;
-        set_permissions(&managed_path, 0o640)?;
+        set_test_permissions(&managed_path, 0o640)?;
 
         let error = resolve_seed(&managed_path, false).unwrap_err();
 
@@ -540,14 +356,12 @@ mod tests {
         let target_path = temp.path().join("seed-target");
         create_private_managed_seed_directory(managed_path.parent().unwrap())?;
         fs::write(&target_path, format!("{}\n", "a".repeat(64)))?;
-        set_permissions(&target_path, 0o600)?;
+        set_test_permissions(&target_path, 0o600)?;
         symlink(&target_path, &managed_path)?;
 
         let error = resolve_seed(&managed_path, false).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("open managed sandbox access-token seed"));
+        assert!(error.to_string().contains("open managed secret"));
         Ok(())
     }
 
@@ -556,9 +370,9 @@ mod tests {
         let temp = TempDir::new()?;
         let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
         create_private_managed_seed_directory(managed_path.parent().unwrap())?;
-        let file = File::create(&managed_path)?;
+        let file = fs::File::create(&managed_path)?;
         file.set_len(1024 * 1024)?;
-        set_permissions(&managed_path, 0o600)?;
+        set_test_permissions(&managed_path, 0o600)?;
 
         let error = resolve_seed(&managed_path, false).unwrap_err();
 
@@ -572,7 +386,7 @@ mod tests {
         let temp = TempDir::new()?;
         let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
         fs::create_dir_all(managed_path.parent().unwrap())?;
-        set_permissions(managed_path.parent().unwrap(), 0o770)?;
+        set_test_permissions(managed_path.parent().unwrap(), 0o770)?;
 
         let error = resolve_seed(&managed_path, false).unwrap_err();
 
@@ -606,6 +420,19 @@ mod tests {
 
         assert!(error.to_string().contains("persisted sandboxes exist"));
         assert!(!managed_path.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn set_test_permissions(path: &Path, mode: u32) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn set_test_permissions(_path: &Path, _mode: u32) -> Result<()> {
         Ok(())
     }
 }

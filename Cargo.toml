@@ -107,6 +107,7 @@ io-uring = "0.7.9"
 tokio-tungstenite = "0.28"
 sha2 = "0.10"
 hmac = "0.12"
+subtle = "2.6"
 hex = "0.4"
 semver = "1"
 iroh = { version = "=1.0.0-rc.0" }
