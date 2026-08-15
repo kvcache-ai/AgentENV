@@ -61,18 +61,20 @@ make k8s-render
 make k8s-apply
 ```
 
-`make k8s-apply` generates a 256-bit API key and sandbox access-token seed on
-the first deployment and stores both in `Secret/agentenv-auth`. Later applies
-reuse both values. Read the API key locally when configuring clients:
+`make k8s-apply` generates a 256-bit API key on the first deployment and stores
+it in `Secret/agentenv-auth`. Later applies reuse it. Read the key locally when
+configuring clients:
 
 ```bash
 kubectl -n agentenv-system get secret agentenv-auth \
   -o go-template='{{index .data "AENV_API_KEY" | base64decode}}{{"\n"}}'
 ```
 
-Set `AENV_API_KEY` and `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` when applying to
-supply your own values. A standalone `make k8s-render` uses temporary generated
-values because it does not modify or read cluster state.
+Set `AENV_API_KEY` when applying to supply your own value. A standalone
+`make k8s-render` uses a temporary generated value because it does not modify or
+read cluster state. The optional runtime seed keeps its existing
+`agentenv-runtime-secrets` contract described in
+[Secure Sandboxes](../security/secure-sandboxes.md).
 
 To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when rendering or applying manifests:
@@ -114,8 +116,9 @@ make k8s-delete
 
 A dedicated `local-dev` overlay mounts the repository's `env/` directory directly into the DaemonSet at `/workspace/env`, avoiding runtime asset copies:
 
-The apply helper provisions the same generated `agentenv-auth` secrets used by
-the default overlay.
+The apply helper provisions the same generated API key used by the default
+overlay. The local development overlay retains its fixed test-only runtime seed;
+do not reuse that seed outside local development.
 
 ```bash
 make k8s-build

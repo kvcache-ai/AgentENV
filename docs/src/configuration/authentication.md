@@ -39,10 +39,9 @@ generates a 256-bit key and atomically stores it in the managed path with
 `0600` permissions. It reuses that key on later starts. Dependency and host
 setup modes do not create a key.
 
-The gateway uses `AENV_API_KEY` or `/run/secrets/api-key`. It also reads the
-sandbox seed from `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` or
-`/run/secrets/sandbox-access-token-hash-seed`. The gateway never generates
-either value because it must share them with every runtime node.
+The gateway uses `AENV_API_KEY` or `/run/secrets/api-key`; it never generates a
+key. Runtime nodes validate sandbox-scoped tokens, so the gateway does not need
+the sandbox seed.
 
 ## Installation Methods
 
@@ -70,8 +69,7 @@ container replacements.
 The checked-in Compose deployment mounts one named volume read-write on both
 runtime nodes and read-only at `/run/secrets` on the gateway. Concurrent node
 startup is safe: atomic creation makes both nodes converge on the same key and
-sandbox seed.
-Read it with:
+sandbox seed. The gateway reads only the API key from that volume. Read it with:
 
 ```bash
 docker compose -f deploy/docker-compose.yml exec -T agentenv-a \
@@ -81,8 +79,8 @@ docker compose -f deploy/docker-compose.yml exec -T agentenv-a \
 `docker compose down` preserves the key. `docker compose down -v` removes the
 auth volume, so the next startup generates a new key.
 
-`make k8s-apply` creates `Secret/agentenv-auth` with an API key and sandbox
-seed on the first apply, then reuses both values. Read the API key with:
+`make k8s-apply` creates `Secret/agentenv-auth` with an API key on the first
+apply, then reuses it. Read the key with:
 
 ```bash
 kubectl -n agentenv-system get secret agentenv-auth \
@@ -120,7 +118,7 @@ network, use a VPN, or terminate HTTPS at a reverse proxy or load balancer.
 ## Rotation
 
 Changing `AENV_API_KEY` invalidates existing client API credentials without
-changing sandbox credentials. Changing
+changing sandbox credentials; apply it to the gateway and every runtime node
+together. Changing
 `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` rotates both `trafficAccessToken` and
-`envdAccessToken` values. Apply either change to the gateway and every runtime
-node together, then restart them.
+`envdAccessToken` values and must be changed on every runtime node together.

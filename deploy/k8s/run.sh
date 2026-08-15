@@ -38,17 +38,15 @@ if [[ "${MODE}" == "apply" ]]; then
   fi
 fi
 
-read_existing_secret() {
-  local secret="$1"
-  local key="$2"
+read_existing_api_key() {
   local encoded_value=""
 
   if [[ -z "${namespace_name}" ]]; then
     return 0
   fi
-  if ! encoded_value="$("${KUBECTL_BIN}" -n "${NAMESPACE}" get secret "${secret}" \
-    --ignore-not-found -o "go-template={{index .data \"${key}\"}}")"; then
-    echo "failed to read ${key} from Secret ${NAMESPACE}/${secret}" >&2
+  if ! encoded_value="$("${KUBECTL_BIN}" -n "${NAMESPACE}" get secret agentenv-auth \
+    --ignore-not-found -o 'go-template={{index .data "AENV_API_KEY"}}')"; then
+    echo "failed to read AENV_API_KEY from Secret ${NAMESPACE}/agentenv-auth" >&2
     return 1
   fi
   if [[ -n "${encoded_value}" ]]; then
@@ -60,27 +58,7 @@ if [[ "${MODE}" != "delete" ]]; then
   API_KEY_VALUE=""
   if [[ "${AENV_API_KEY+x}" == "x" ]]; then
     API_KEY_VALUE="${AENV_API_KEY}"
-  elif ! API_KEY_VALUE="$(read_existing_secret agentenv-auth AENV_API_KEY)"; then
-    exit 1
-  fi
-
-  ACCESS_TOKEN_SEED_VALUE=""
-  if [[ "${AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED+x}" == "x" ]]; then
-    ACCESS_TOKEN_SEED_VALUE="${AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED}"
-  elif ! ACCESS_TOKEN_SEED_VALUE="$(read_existing_secret agentenv-auth AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED)"; then
-    exit 1
-  fi
-  if [[ -z "${ACCESS_TOKEN_SEED_VALUE}" ]]; then
-    if ! ACCESS_TOKEN_SEED_VALUE="$(read_existing_secret agentenv-runtime-secrets sandbox-access-token-hash-seed)"; then
-      exit 1
-    fi
-  fi
-
-  if [[ -z "${ACCESS_TOKEN_SEED_VALUE}" ]]; then
-    ACCESS_TOKEN_SEED_VALUE="$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')"
-  fi
-  if [[ ! "${ACCESS_TOKEN_SEED_VALUE}" =~ ^[A-Za-z0-9._~-]{32,}$ ]]; then
-    echo "AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED must contain at least 32 URL-safe characters" >&2
+  elif ! API_KEY_VALUE="$(read_existing_api_key)"; then
     exit 1
   fi
 
@@ -94,9 +72,6 @@ if [[ "${MODE}" != "delete" ]]; then
 
   sed_in_place \
     "s#- AENV_API_KEY=.*#- AENV_API_KEY=${API_KEY_VALUE}#" \
-    "${TEMP_DIR}/k8s/base/kustomization.yaml"
-  sed_in_place \
-    "s#- AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED=.*#- AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED=${ACCESS_TOKEN_SEED_VALUE}#" \
     "${TEMP_DIR}/k8s/base/kustomization.yaml"
 fi
 

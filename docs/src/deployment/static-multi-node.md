@@ -55,9 +55,9 @@ an external metrics collector needs them.
 
 ## 1. Install the runtime nodes
 
-Generate one API key and one sandbox access-token seed, deliver them through
-your normal secret-management channel, and use the same values on every runtime
-node and the Gateway:
+Generate one API key and one sandbox access-token seed through your normal
+secret-management channel. Use the API key on the gateway and every runtime
+node; use the seed only on runtime nodes:
 
 ```bash
 export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
@@ -117,7 +117,7 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin agentenv-contro
 sudo install -d -o root -g agentenv-control -m 0750 /etc/agentenv
 ```
 
-Create `/etc/agentenv/auth.env` with the same values used on the runtime nodes:
+Create `/etc/agentenv/auth.env` with the API key used on the runtime nodes:
 
 ```bash
 sudo install -o root -g agentenv-control -m 0640 /dev/null /etc/agentenv/auth.env
@@ -126,7 +126,6 @@ sudoedit /etc/agentenv/auth.env
 
 ```text
 AENV_API_KEY=<same shared key>
-AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED=<same shared seed>
 ```
 
 If the `agentenv-control` account already exists, the `useradd` command reports

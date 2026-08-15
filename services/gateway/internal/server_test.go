@@ -148,10 +148,7 @@ func (s stubSchedulerClient) UnregisterNode(ctx context.Context, req *schedulerv
 	return s.unregisterNodeFunc(ctx, req, opts...)
 }
 
-const (
-	testAPIKey          = "test-api-key"
-	testAccessTokenSeed = "test-access-token-seed"
-)
+const testAPIKey = "test-api-key"
 
 type testServerOption func(*ServerOptions)
 
@@ -159,10 +156,9 @@ func newTestServer(t *testing.T, schedulerClient schedulerv1.SchedulerClient, ti
 	t.Helper()
 
 	options := ServerOptions{
-		RequestTimeout:         timeout,
-		MaxResponseSize:        maxRespSize,
-		APIKey:                 testAPIKey,
-		SandboxAccessTokenSeed: testAccessTokenSeed,
+		RequestTimeout:  timeout,
+		MaxResponseSize: maxRespSize,
+		APIKey:          testAPIKey,
 	}
 	for _, opt := range opts {
 		opt(&options)
@@ -190,17 +186,6 @@ func TestNewServerRejectsEmptyAPIKey(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("NewServer accepted an empty API key")
-	}
-}
-
-func TestNewServerRejectsEmptySandboxAccessTokenSeed(t *testing.T) {
-	_, err := NewServer(zap.NewNop(), stubSchedulerClient{}, ServerOptions{
-		APIKey:          testAPIKey,
-		RequestTimeout:  time.Second,
-		MaxResponseSize: 1024,
-	})
-	if err == nil {
-		t.Fatal("NewServer accepted an empty sandbox access-token seed")
 	}
 }
 
@@ -263,7 +248,7 @@ func TestGatewayRequiresExactAPIKey(t *testing.T) {
 	}
 }
 
-func TestGatewayAcceptsSandboxScopedTrafficToken(t *testing.T) {
+func TestGatewayForwardsSandboxTokensOnlyOnDataPlane(t *testing.T) {
 	const sandboxID = "0191f4d0-7b2a-7c11-9c2d-0123456789ab"
 	lookupCalls := 0
 	server := newTestServer(t, stubSchedulerClient{
@@ -277,7 +262,7 @@ func TestGatewayAcceptsSandboxScopedTrafficToken(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/proxy", nil)
 	req.Header.Set(headerE2BSandboxID, sandboxID)
 	req.Header.Set(headerE2BTargetPort, "49983")
-	req.Header.Set(headerTrafficToken, trafficAccessToken([]byte(testAccessTokenSeed), sandboxID))
+	req.Header.Set(headerTrafficToken, "runtime-validates-this-token")
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 	if recorder.Code == http.StatusUnauthorized || lookupCalls != 1 {
@@ -287,39 +272,31 @@ func TestGatewayAcceptsSandboxScopedTrafficToken(t *testing.T) {
 	req = httptest.NewRequest(http.MethodGet, "/proxy", nil)
 	req.Header.Set(headerE2BSandboxID, sandboxID)
 	req.Header.Set(headerE2BTargetPort, "49983")
-	req.Header.Set(headerTrafficToken, trafficAccessToken([]byte(testAccessTokenSeed), "another-sandbox"))
+	req.Header.Set(headerTrafficToken, "wrong-token")
 	recorder = httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusUnauthorized || lookupCalls != 1 {
-		t.Fatalf("wrong scoped token: status=%d lookup calls=%d", recorder.Code, lookupCalls)
+	if recorder.Code == http.StatusUnauthorized || lookupCalls != 2 {
+		t.Fatalf("runtime-scoped token: status=%d lookup calls=%d", recorder.Code, lookupCalls)
 	}
 
 	req = httptest.NewRequest(http.MethodGet, "/proxy", nil)
 	req.Header.Set(headerE2BSandboxID, sandboxID)
 	req.Header.Set(headerE2BTargetPort, "8080")
-	req.Header.Set("X-Access-Token", trafficAccessToken([]byte(testAccessTokenSeed), sandboxID))
+	req.Header.Set("X-Access-Token", "runtime-validates-this-token")
 	recorder = httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
-	if recorder.Code != http.StatusUnauthorized || lookupCalls != 1 {
-		t.Fatalf("envd token authorized application proxy: status=%d lookup calls=%d", recorder.Code, lookupCalls)
+	if recorder.Code == http.StatusUnauthorized || lookupCalls != 3 {
+		t.Fatalf("runtime-scoped envd token: status=%d lookup calls=%d", recorder.Code, lookupCalls)
 	}
 
 	req = httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/pause", nil)
 	req.Header.Set(headerE2BSandboxID, sandboxID)
-	req.Header.Set(headerTrafficToken, trafficAccessToken([]byte(testAccessTokenSeed), sandboxID))
+	req.Header.Set(headerTrafficToken, "runtime-validates-this-token")
 	recorder = httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 
-	if recorder.Code != http.StatusUnauthorized || lookupCalls != 1 {
+	if recorder.Code != http.StatusUnauthorized || lookupCalls != 3 {
 		t.Fatalf("scoped token reached control plane: status=%d lookup calls=%d", recorder.Code, lookupCalls)
-	}
-}
-
-func TestTrafficAccessTokenVector(t *testing.T) {
-	const sandboxID = "0191f4d0-7b2a-7c11-9c2d-0123456789ab"
-	const want = "f5457a589b09265b169392dd49506ec70458f685cf2ba7fc2c5b4763c42a5b17"
-	if got := trafficAccessToken([]byte("test-seed"), sandboxID); got != want {
-		t.Fatalf("trafficAccessToken() = %q, want %q", got, want)
 	}
 }
 

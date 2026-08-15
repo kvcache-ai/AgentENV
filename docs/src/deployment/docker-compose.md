@@ -34,10 +34,9 @@ The Gateway is available at `http://127.0.0.1:8000` and forwards requests to
 the backend nodes.
 
 On first startup, the runtime nodes atomically generate one API key and sandbox
-access-token seed in the
-shared `agentenv-auth` volume. The gateway mounts that volume read-only at
-`/run/secrets`, so all three services use the same secrets. Normal
-`make deploy-down` calls preserve the volume and both values.
+access-token seed in the shared `agentenv-auth` volume. The gateway mounts that
+volume read-only and reads the API key; sandbox tokens are validated by the
+runtime nodes. Normal `make deploy-down` calls preserve both values.
 
 To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when starting the stack:

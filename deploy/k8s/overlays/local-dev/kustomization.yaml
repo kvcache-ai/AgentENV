@@ -6,6 +6,14 @@ namespace: agentenv-system
 resources:
   - ../../base
 
+secretGenerator:
+  - name: agentenv-runtime-secrets
+    literals:
+      - sandbox-access-token-hash-seed=agentenv-local-dev-access-token-hash-seed
+
+generatorOptions:
+  disableNameSuffixHash: true
+
 patches:
   - target:
       kind: DaemonSet

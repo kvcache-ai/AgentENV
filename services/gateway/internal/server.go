@@ -3,9 +3,6 @@ package gateway
 import (
 	"bytes"
 	"context"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -28,8 +25,6 @@ const (
 	headerAPIKey               = "X-API-Key"
 	headerTrafficToken         = "e2b-traffic-access-token"
 	headerEnvdAccessToken      = "X-Access-Token"
-	trafficTokenPrefix         = "sandbox-traffic"
-	envdControlPlanePort       = 49983
 	headerSandboxID            = "x-agentenv-sandbox-id"
 	headerE2BSandboxID         = "e2b-sandbox-id"
 	headerTargetPort           = "x-agentenv-target-port"
@@ -50,7 +45,6 @@ const (
 
 type ServerOptions struct {
 	APIKey                   string
-	SandboxAccessTokenSeed   string
 	RequestTimeout           time.Duration
 	MaxResponseSize          int64
 	DebugMode                bool
@@ -64,7 +58,6 @@ type Server struct {
 	queryOnlyScheduler schedulerv1.SchedulerClient
 	httpClient         *http.Client
 	apiKey             []byte
-	accessTokenSeed    []byte
 	requestTimeout     time.Duration
 	maxRespSize        int64
 	// debugMode, when true, enables debug-only behaviors such as exposing
@@ -79,11 +72,6 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 	if apiKey == "" {
 		return nil, errors.New("API key is required")
 	}
-	accessTokenSeed := strings.TrimSpace(options.SandboxAccessTokenSeed)
-	if accessTokenSeed == "" {
-		return nil, errors.New("sandbox access-token seed is required")
-	}
-
 	sandboxProxyDomains, err := normalizeProxyDomains(options.SandboxProxyDomains)
 	if err != nil {
 		return nil, err
@@ -102,7 +90,6 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		requestTimeout:      options.RequestTimeout,
 		maxRespSize:         options.MaxResponseSize,
 		apiKey:              []byte(apiKey),
-		accessTokenSeed:     []byte(accessTokenSeed),
 		debugMode:           options.DebugMode,
 		sandboxProxyDomains: sandboxProxyDomains,
 	}, nil
@@ -841,12 +828,6 @@ func singleHeaderMatches(headers http.Header, name string, expected []byte) bool
 	return len(values) == 1 && bytes.Equal([]byte(values[0]), expected)
 }
 
-func trafficAccessToken(seed []byte, sandboxID string) string {
-	mac := hmac.New(sha256.New, seed)
-	_, _ = mac.Write([]byte(trafficTokenPrefix + "-" + sandboxID))
-	return hex.EncodeToString(mac.Sum(nil))
-}
-
 func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
 	if strings.TrimRight(r.URL.Path, "/") == "/proxy" || strings.HasPrefix(r.URL.Path, "/proxy/") {
 		return true
@@ -858,33 +839,6 @@ func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
 	}
 
 	return !isSandboxControlPlaneRequest(r) && hasProxyRoutingHeaders(r.Header)
-}
-
-func (s *Server) sandboxIDForDataPlaneAuth(r *http.Request) (string, bool) {
-	hostRoute, err := parseHostRoute(r.Host, s.sandboxProxyDomains)
-	if err != nil {
-		return "", false
-	}
-	if hostRoute != nil {
-		return hostRoute.sandboxID, true
-	}
-	return sandboxIDFromHeaders(r.Header)
-}
-
-func (s *Server) isEnvdDataPlaneRequest(r *http.Request) bool {
-	hostRoute, err := parseHostRoute(r.Host, s.sandboxProxyDomains)
-	if err != nil {
-		return false
-	}
-	if hostRoute != nil {
-		return hostRoute.targetPort == envdControlPlanePort
-	}
-	targetPort, ok := targetPortFromHeaders(r.Header)
-	if !ok {
-		return false
-	}
-	port, err := strconv.Atoi(targetPort)
-	return err == nil && port == envdControlPlanePort
 }
 
 func hasSingleNonEmptyHeader(headers http.Header, name string) bool {
@@ -902,15 +856,9 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 
 		authorized := singleHeaderMatches(r.Header, headerAPIKey, s.apiKey)
 		if !authorized && dataPlane {
-			if sandboxID, ok := s.sandboxIDForDataPlaneAuth(r); ok {
-				expected := trafficAccessToken(s.accessTokenSeed, sandboxID)
-				authorized = singleHeaderMatches(r.Header, headerTrafficToken, []byte(expected))
-			}
-		}
-		if !authorized && dataPlane && s.isEnvdDataPlaneRequest(r) {
-			// The runtime node owns the envd token seed and performs the definitive
-			// sandbox-scoped validation before forwarding the request to envd.
-			authorized = hasSingleNonEmptyHeader(r.Header, headerEnvdAccessToken)
+			// Runtime nodes perform the definitive sandbox-scoped token validation.
+			authorized = hasSingleNonEmptyHeader(r.Header, headerTrafficToken) ||
+				hasSingleNonEmptyHeader(r.Header, headerEnvdAccessToken)
 		}
 		if !authorized {
 			w.WriteHeader(http.StatusUnauthorized)

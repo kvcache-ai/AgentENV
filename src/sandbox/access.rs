@@ -15,7 +15,6 @@ use crate::types::SandboxId;
 type HmacSha256 = Hmac<Sha256>;
 
 const MANAGED_SEED_RELATIVE_PATH: &str = "secrets/sandbox-access-token-hash-seed";
-const EXTERNAL_SEED_PATH: &str = "/run/secrets/sandbox-access-token-hash-seed";
 const MANAGED_SEED_BYTES: usize = 32;
 const SEED_HEX_LEN: usize = MANAGED_SEED_BYTES * 2;
 const MANAGED_SEED_FILE_MAX_LEN: usize = SEED_HEX_LEN + 1;
@@ -55,24 +54,6 @@ impl SandboxAccessTokenGenerator {
     ) -> Result<Self> {
         if let Some(seed) = config.sandbox.access_token_hash_seed.as_deref() {
             return Self::new(seed);
-        }
-
-        match fs::read_to_string(EXTERNAL_SEED_PATH) {
-            Ok(seed) => {
-                let generator =
-                    Self::new(&seed).context("invalid external sandbox access-token seed")?;
-                info!(
-                    path = EXTERNAL_SEED_PATH,
-                    "loaded sandbox access-token seed from external secret"
-                );
-                return Ok(generator);
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("read external sandbox access-token seed {EXTERNAL_SEED_PATH}")
-                });
-            }
         }
 
         let managed_seed_path = config.home_path.join(MANAGED_SEED_RELATIVE_PATH);

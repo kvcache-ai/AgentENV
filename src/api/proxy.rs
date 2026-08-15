@@ -148,49 +148,24 @@ where
         .with_state(api_impl)
 }
 
-fn proxy_route_for_auth(request: &Request, domains: &[String]) -> Option<HostProxyRoute> {
+pub(crate) fn route_for_auth(request: &Request, domains: &[String]) -> Option<(SandboxId, u16)> {
     match parse_host_proxy_route(request_host(request), domains) {
-        Ok(Some(route)) => return Some(route),
+        Ok(Some(route)) => return Some((route.sandbox_id, route.target_port)),
         Err(_) => return None,
         Ok(None) => {}
     }
 
-    Some(HostProxyRoute {
-        sandbox_id: parse_sandbox_id_header(request.headers()).ok()?,
-        target_port: parse_target_port_header(request.headers()).ok()?,
-    })
-}
-
-pub(crate) fn sandbox_id_for_proxy_auth(
-    request: &Request,
-    domains: &[String],
-) -> Option<SandboxId> {
-    Some(proxy_route_for_auth(request, domains)?.sandbox_id)
-}
-
-pub(crate) fn envd_access_token_for_proxy_auth(
-    request: &Request,
-    domains: &[String],
-) -> Option<(SandboxId, u16, String)> {
-    let route = proxy_route_for_auth(request, domains)?;
-    let candidate = {
-        let mut candidates = request.headers().get_all(ENVD_ACCESS_TOKEN_HEADER).iter();
-        let candidate = candidates.next()?;
-        if candidates.next().is_some() {
-            return None;
-        }
-        let candidate = candidate.to_str().ok()?;
-        candidate.to_owned()
-    };
-
-    Some((route.sandbox_id, route.target_port, candidate))
+    Some((
+        parse_sandbox_id_header(request.headers()).ok()?,
+        parse_target_port_header(request.headers()).ok()?,
+    ))
 }
 
 pub(crate) async fn has_valid_envd_access_token(
     api_impl: &ApiImpl,
     sandbox_id: SandboxId,
     target_port: u16,
-    candidate: String,
+    candidate: &str,
 ) -> bool {
     let Ok(Some(metadata)) = api_impl.orchestrator().get_sandbox(&sandbox_id).await else {
         return false;
@@ -201,7 +176,7 @@ pub(crate) async fn has_valid_envd_access_token(
 
     api_impl
         .orchestrator()
-        .validate_envd_access_token(sandbox_id, &candidate)
+        .validate_envd_access_token(sandbox_id, candidate)
 }
 
 pub(crate) fn is_sandbox_proxy_request(request: &Request, domains: &[String]) -> bool {
@@ -245,17 +220,10 @@ where
         return next.run(request).await;
     }
 
-    let host = request
-        .headers()
-        .get(header::HOST)
-        .and_then(|host| host.to_str().ok())
-        .or_else(|| {
-            request
-                .uri()
-                .authority()
-                .map(|authority| authority.as_str())
-        });
-    let host_route = match parse_host_proxy_route(host, api_impl.as_ref().sandbox_proxy_domains()) {
+    let host_route = match parse_host_proxy_route(
+        request_host(&request),
+        api_impl.as_ref().sandbox_proxy_domains(),
+    ) {
         Ok(Some(route)) => route,
         Ok(None) => {
             return next.run(request).await;
