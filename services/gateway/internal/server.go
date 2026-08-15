@@ -3,6 +3,9 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
@@ -22,6 +25,12 @@ import (
 )
 
 const (
+	headerAPIKey               = "X-API-Key"
+	headerTrafficToken         = "e2b-traffic-access-token"
+	headerEnvdAccessToken      = "X-Access-Token"
+	trafficTokenPrefix         = "aenv_trf_"
+	trafficTokenContext        = "agentenv-sandbox-traffic-v1\x00"
+	envdControlPlanePort       = 49983
 	headerSandboxID            = "x-agentenv-sandbox-id"
 	headerE2BSandboxID         = "e2b-sandbox-id"
 	headerTargetPort           = "x-agentenv-target-port"
@@ -41,6 +50,7 @@ const (
 )
 
 type ServerOptions struct {
+	APIKey                   string
 	RequestTimeout           time.Duration
 	MaxResponseSize          int64
 	DebugMode                bool
@@ -53,6 +63,7 @@ type Server struct {
 	scheduler          schedulerv1.SchedulerClient
 	queryOnlyScheduler schedulerv1.SchedulerClient
 	httpClient         *http.Client
+	apiKey             []byte
 	requestTimeout     time.Duration
 	maxRespSize        int64
 	// debugMode, when true, enables debug-only behaviors such as exposing
@@ -63,6 +74,11 @@ type Server struct {
 }
 
 func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, options ServerOptions) (*Server, error) {
+	apiKey := strings.TrimSpace(options.APIKey)
+	if apiKey == "" {
+		return nil, errors.New("API key is required")
+	}
+
 	sandboxProxyDomains, err := normalizeProxyDomains(options.SandboxProxyDomains)
 	if err != nil {
 		return nil, err
@@ -80,6 +96,7 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		httpClient:          &http.Client{},
 		requestTimeout:      options.RequestTimeout,
 		maxRespSize:         options.MaxResponseSize,
+		apiKey:              []byte(apiKey),
 		debugMode:           options.DebugMode,
 		sandboxProxyDomains: sandboxProxyDomains,
 	}, nil
@@ -122,7 +139,7 @@ func (s *Server) Handler() http.Handler {
 		}
 		s.handleProxy(w, r)
 	})
-	return s.instrumentGatewayHTTP(core)
+	return s.instrumentGatewayHTTP(s.authenticate(core))
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {
@@ -811,4 +828,90 @@ func extractSandboxIDsFromResponse(body []byte) []string {
 		unique = append(unique, id)
 	}
 	return unique
+}
+
+func singleHeaderMatches(headers http.Header, name string, expected []byte) bool {
+	values := headers.Values(name)
+	return len(values) == 1 && bytes.Equal([]byte(values[0]), expected)
+}
+
+func trafficAccessToken(apiKey []byte, sandboxID string) string {
+	mac := hmac.New(sha256.New, apiKey)
+	_, _ = mac.Write([]byte(trafficTokenContext))
+	_, _ = mac.Write([]byte(sandboxID))
+	return trafficTokenPrefix + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
+	if strings.TrimRight(r.URL.Path, "/") == "/proxy" || strings.HasPrefix(r.URL.Path, "/proxy/") {
+		return true
+	}
+
+	hostRoute, err := parseHostRoute(r.Host, s.sandboxProxyDomains)
+	if hostRoute != nil || err != nil {
+		return true
+	}
+
+	return !isSandboxControlPlaneRequest(r) && hasProxyRoutingHeaders(r.Header)
+}
+
+func (s *Server) sandboxIDForDataPlaneAuth(r *http.Request) (string, bool) {
+	hostRoute, err := parseHostRoute(r.Host, s.sandboxProxyDomains)
+	if err != nil {
+		return "", false
+	}
+	if hostRoute != nil {
+		return hostRoute.sandboxID, true
+	}
+	return sandboxIDFromHeaders(r.Header)
+}
+
+func (s *Server) isEnvdDataPlaneRequest(r *http.Request) bool {
+	hostRoute, err := parseHostRoute(r.Host, s.sandboxProxyDomains)
+	if err != nil {
+		return false
+	}
+	if hostRoute != nil {
+		return hostRoute.targetPort == envdControlPlanePort
+	}
+	targetPort, ok := targetPortFromHeaders(r.Header)
+	if !ok {
+		return false
+	}
+	port, err := strconv.Atoi(targetPort)
+	return err == nil && port == envdControlPlanePort
+}
+
+func hasSingleNonEmptyHeader(headers http.Header, name string) bool {
+	values := headers.Values(name)
+	return len(values) == 1 && strings.TrimSpace(values[0]) != ""
+}
+
+func (s *Server) authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dataPlane := s.isSandboxDataPlaneRequest(r)
+		if r.URL.Path == "/health" && !dataPlane {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		authorized := singleHeaderMatches(r.Header, headerAPIKey, s.apiKey)
+		if !authorized && dataPlane {
+			if sandboxID, ok := s.sandboxIDForDataPlaneAuth(r); ok {
+				expected := trafficAccessToken(s.apiKey, sandboxID)
+				authorized = singleHeaderMatches(r.Header, headerTrafficToken, []byte(expected))
+			}
+		}
+		if !authorized && dataPlane && s.isEnvdDataPlaneRequest(r) {
+			// The runtime node owns the envd token seed and performs the definitive
+			// sandbox-scoped validation before forwarding the request to envd.
+			authorized = hasSingleNonEmptyHeader(r.Header, headerEnvdAccessToken)
+		}
+		if !authorized {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }

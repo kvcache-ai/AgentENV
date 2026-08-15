@@ -220,6 +220,9 @@ impl ApiImpl {
             .map(|token| token.expose().to_owned());
         let mut sandbox = models::Sandbox::from(metadata);
         sandbox.envd_access_token = envd_access_token;
+        sandbox.traffic_access_token = Some(Nullable::Present(
+            self.traffic_access_token(&sandbox.sandbox_id),
+        ));
         sandbox.domain = self
             .sandbox_proxy_domains()
             .first()

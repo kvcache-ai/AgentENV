@@ -50,6 +50,7 @@ default. Transient namespace and daemon-socket state lives under `/run/aenv`.
 curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/docker-setup.sh | sudo bash
 docker pull ghcr.io/kvcache-ai/aenv-server:latest
 docker run --rm -it \
+  --name aenv-server \
   --device /dev/kvm --privileged -v /dev:/dev \
   -p 8000:8000 \
   ghcr.io/kvcache-ai/aenv-server:latest
@@ -61,6 +62,7 @@ To customize the server configuration, download and edit the configuration file,
 curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/config/default.toml -o config.toml
 vim config.toml
 docker run --rm -it \
+  --name aenv-server \
   --device /dev/kvm --privileged -v /dev:/dev \
   -v "$PWD/config.toml:/workspace/config/default.toml:ro" \
   -p 8000:8000 \
@@ -87,13 +89,22 @@ curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/in
 
 ### 3. Authenticate
 
+The server generates the key on its first normal startup. Native installations
+reuse the managed key; a normal Docker container keeps it in its writable
+container layer:
+
+```bash
+# Native
+sudo cat /var/lib/aenv/secrets/api-key
+# Docker
+docker exec aenv-server cat /workspace/env/secrets/api-key
+```
+
 ```bash
 aenv auth
 # AENV server URL [http://localhost:8000]: http://127.0.0.1:8000
-# API key: dummy
+# API key: <paste the generated key>
 ```
-
-For local development, any non-empty string works as the API key.
 
 ### 4. Pull a template and run a sandbox
 

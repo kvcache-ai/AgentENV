@@ -11,8 +11,8 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
   source "${E2E_RUNTIME_DIR}/server.sh"
 
   : "${E2E_MODE:=single-node}"
-  : "${AENV_API_KEY:=e2e-test-key}"
-  : "${AENV_ADMIN_TOKEN:=e2e-admin-token}"
+  : "${AENV_API_KEY:=e2b_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
+  export AENV_API_KEY
   : "${E2E_COMPOSE_FILE:=deploy/docker-compose.yml}"
   : "${E2E_COMPOSE_OVERRIDE_FILE:=scripts/tests/e2e/docker-compose.e2e.yml}"
   : "${E2E_COMPOSE_START_TIMEOUT:=120}"
@@ -237,7 +237,7 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
     log "Waiting for scheduler to observe ${expected_count} ready node(s) via ${AENV_URL}/nodes (timeout ${timeout}s) ..."
     for ((i = 1; i <= timeout; i++)); do
       response=$(curl -s \
-        -H "X-Admin-Token: ${AENV_ADMIN_TOKEN}" \
+        -H "X-API-Key: ${AENV_API_KEY}" \
         -w $'\n%{http_code}' \
         "${AENV_URL}/nodes" 2>/dev/null || true)
       status="${response##*$'\n'}"
@@ -397,6 +397,12 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
       die "agentenv-a failed to become ready within ${timeout}s"
     _wait_for_health_url "agentenv-b" "${AENV_NODE_B_URL}" "${timeout}" ||
       die "agentenv-b failed to become ready within ${timeout}s"
+
+    AENV_API_KEY="$(_compose_cmd exec -T agentenv-a cat /workspace/env/secrets/api-key)" ||
+      die "Failed to read the Compose deployment API key"
+    [[ "${AENV_API_KEY}" =~ ^[A-Za-z0-9._~-]{32,}$ ]] ||
+      die "Compose deployment returned an invalid API key"
+    export AENV_API_KEY
 
     expected_nodes="$(_runtime_node_count)"
     [[ "${expected_nodes}" -gt 0 ]] || expected_nodes=1

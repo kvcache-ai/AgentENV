@@ -220,10 +220,11 @@ Discovery modes:
 **Deployment**:
 
 ```bash
+export AENV_API_KEY="e2b_$(openssl rand -hex 32)" # shared by local runtime and gateway processes
 # local dev (single node)
 make start-server && make -C services run-scheduler && make -C services run-gateway
 
-# docker compose (multi-node)
+# docker compose (multi-node; shared auth volume is provisioned automatically)
 make deploy-up     # gateway + scheduler + 2 backend nodes
 make deploy-down   # teardown
 

@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,11 +24,52 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+const (
+	apiKeyEnv         = "AENV_API_KEY"
+	defaultAPIKeyPath = "/run/secrets/api-key"
+)
+
 func newSchedulerConn(addr string) (*grpc.ClientConn, error) {
 	return grpc.NewClient(
 		addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
+}
+
+func loadAPIKey() (string, error) {
+	return loadAPIKeyFrom(os.LookupEnv, defaultAPIKeyPath)
+}
+
+func loadAPIKeyFrom(lookupEnv func(string) (string, bool), secretPath string) (string, error) {
+	if value, present := lookupEnv(apiKeyEnv); present {
+		return validateAPIKey(value, apiKeyEnv)
+	}
+
+	contents, err := os.ReadFile(secretPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", fmt.Errorf("%s must be set or %s must exist", apiKeyEnv, secretPath)
+		}
+		return "", fmt.Errorf("read API key secret %s: %w", secretPath, err)
+	}
+	return validateAPIKey(string(contents), secretPath)
+}
+
+func validateAPIKey(value, source string) (string, error) {
+	value = strings.TrimSpace(value)
+	if len(value) < 32 {
+		return "", fmt.Errorf("API key from %s must contain at least 32 URL-safe characters", source)
+	}
+	for _, char := range []byte(value) {
+		if (char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '.' || char == '_' || char == '~' || char == '-' {
+			continue
+		}
+		return "", fmt.Errorf("API key from %s must contain at least 32 URL-safe characters", source)
+	}
+	return value, nil
 }
 
 func main() {
@@ -36,6 +79,10 @@ func main() {
 	cfg, err := config.Load(*configPath, "gateway")
 	if err != nil {
 		log.Fatalf("load config failed: %v", err)
+	}
+	apiKey, err := loadAPIKey()
+	if err != nil {
+		log.Fatalf("load API key failed: %v", err)
 	}
 
 	logger, err := logging.New(cfg.LogLevel, cfg.LogFormat)
@@ -65,6 +112,7 @@ func main() {
 	s, err := gateway.NewServer(logger, schedulerClient, gateway.ServerOptions{
 		RequestTimeout:           cfg.Gateway.RequestTimeout,
 		MaxResponseSize:          cfg.Gateway.ForwardResponseSize,
+		APIKey:                   apiKey,
 		DebugMode:                cfg.Gateway.DebugMode,
 		SandboxProxyDomains:      cfg.Gateway.SandboxProxyDomains,
 		QueryOnlySchedulerClient: queryOnlySchedulerClient,

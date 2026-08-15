@@ -256,6 +256,7 @@ sudo chmod 0640 "$CONFIG_PATH"
 if [[ -d /run/systemd/system ]]; then
     ENV_FILE_STATUS="exists"
     if [[ ! -f "$ENV_FILE" ]]; then
+        sudo install -o root -g "$SERVICE_GROUP" -m 0640 /dev/null "$ENV_FILE"
         sudo tee "$ENV_FILE" > /dev/null <<EOF
 API_ADDR="127.0.0.1:8000"
 AENV_CONFIG_PATH="${CONFIG_PATH}"
@@ -320,7 +321,7 @@ EOF
         if [[ "$found_virtualization" == "0" ]]; then
             printf 'AENV_VIRTUALIZATION_MODE="%s"\n' "$VIRTUALIZATION_MODE" >> "$tmp_env"
         fi
-        sudo install -m 0644 "$tmp_env" "$ENV_FILE"
+        sudo install -o root -g "$SERVICE_GROUP" -m 0640 "$tmp_env" "$ENV_FILE"
         rm -f "$current_env" "$tmp_env"
         ENV_FILE_STATUS="updated"
     fi
@@ -370,6 +371,7 @@ echo "  CLI    : ${INSTALL_DIR}/aenv"
 echo "  Server : ${INSTALL_DIR}/server"
 echo "  Data   : ${DATA_DIR}"
 echo "  Config : ${CONFIG_PATH}"
+echo "  API key: generated on first server start in ${DATA_DIR}/secrets/api-key"
 echo "  Mode   : ${VIRTUALIZATION_MODE}"
 if [[ -d /run/systemd/system ]]; then
     if [[ "$ENV_FILE_STATUS" == "written" ]]; then

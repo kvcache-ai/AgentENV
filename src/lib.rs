@@ -1,4 +1,5 @@
 pub mod api;
+pub mod api_key;
 pub mod cfg;
 mod digest;
 pub mod identity;

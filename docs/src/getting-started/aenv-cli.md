@@ -27,7 +27,7 @@ Save the server URL and API key. Credentials are stored at `~/.config/aenv/crede
 ```bash
 aenv auth
 # AENV server URL [http://localhost:8000]: The address of the AgentENV server
-# API key: dummy (Any non-empty string works for local development.)
+# API key: <the server's configured or generated API key>
 ```
 
 ---

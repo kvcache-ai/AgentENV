@@ -10,6 +10,7 @@ MODE="$1"
 shift
 KUBECTL_BIN="${KUBECTL:-kubectl}"
 OVERLAY_NAME="${K8S_OVERLAY:-default}"
+NAMESPACE="${K8S_NAMESPACE:-agentenv-system}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -28,6 +29,43 @@ sed_in_place() {
 
 cp -R "${SCRIPT_DIR}" "${TEMP_DIR}/k8s"
 cp "${REPO_ROOT}/config/default.toml" "${TEMP_DIR}/k8s/base/config/agentenv.toml"
+if [[ "${MODE}" != "delete" ]]; then
+  API_KEY_VALUE=""
+  if [[ "${AENV_API_KEY+x}" == "x" ]]; then
+    API_KEY_VALUE="${AENV_API_KEY}"
+  elif [[ "${MODE}" == "apply" ]]; then
+    encoded_key=""
+    if ! namespace_name="$("${KUBECTL_BIN}" get namespace "${NAMESPACE}" --ignore-not-found -o name)"; then
+      echo "failed to check namespace ${NAMESPACE}" >&2
+      exit 1
+    fi
+    if [[ -n "${namespace_name}" ]]; then
+      if ! encoded_key="$("${KUBECTL_BIN}" -n "${NAMESPACE}" get secret agentenv-auth \
+        --ignore-not-found -o jsonpath='{.data.AENV_API_KEY}')"; then
+        echo "failed to read existing Secret ${NAMESPACE}/agentenv-auth" >&2
+        exit 1
+      fi
+    fi
+    if [[ -n "${encoded_key}" ]]; then
+      if ! API_KEY_VALUE="$(printf '%s' "${encoded_key}" | base64 -d)"; then
+        echo "failed to decode the existing agentenv-auth Secret" >&2
+        exit 1
+      fi
+    fi
+  fi
+
+  if [[ -z "${API_KEY_VALUE}" ]]; then
+    API_KEY_VALUE="e2b_$(od -An -N32 -tx1 /dev/urandom | tr -d '[:space:]')"
+  fi
+  if [[ ! "${API_KEY_VALUE}" =~ ^[A-Za-z0-9._~-]{32,}$ ]]; then
+    echo "AENV_API_KEY must contain at least 32 URL-safe characters" >&2
+    exit 1
+  fi
+
+  sed_in_place \
+    "s#- AENV_API_KEY=.*#- AENV_API_KEY=${API_KEY_VALUE}#" \
+    "${TEMP_DIR}/k8s/base/kustomization.yaml"
+fi
 
 if [[ "${SANDBOX_PROXY_DOMAINS+x}" == "x" ]]; then
   ESCAPED_SANDBOX_PROXY_DOMAINS="${SANDBOX_PROXY_DOMAINS//\\/\\\\}"
@@ -65,6 +103,9 @@ case "${MODE}" in
     ;;
   apply)
     "${KUBECTL_BIN}" apply -k "${OVERLAY_PATH}" "$@"
+    echo "AgentENV API key stored in Secret ${NAMESPACE}/agentenv-auth." >&2
+    echo "Read it with:" >&2
+    echo "  ${KUBECTL_BIN} -n ${NAMESPACE} get secret agentenv-auth -o go-template='{{index .data \"AENV_API_KEY\" | base64decode}}{{\"\\n\"}}'" >&2
     ;;
   delete)
     "${KUBECTL_BIN}" delete --ignore-not-found -k "${OVERLAY_PATH}" "$@"

@@ -197,7 +197,7 @@ Use the dedicated PVM image:
 ```bash
 docker pull ghcr.io/kvcache-ai/aenv-server:latest-pvm
 
-docker run --rm -it \
+docker run --rm -it --name aenv-server \
   --device /dev/kvm \
   --privileged \
   -v /dev:/dev \
@@ -217,6 +217,9 @@ export AENV_VIRTUALIZATION_MODE=pvm
 cargo run --bin server -- --setup-only
 make start-server
 ```
+
+The server generates and persists the API key under
+`$AENV_HOME/secrets/api-key` on its first normal startup.
 
 You can also set the mode in the TOML configuration:
 

@@ -38,6 +38,11 @@ make deploy-up
 The Gateway is available at `http://127.0.0.1:8000` and forwards requests to
 the backend nodes.
 
+On first startup, the runtime nodes atomically generate one API key in the
+shared `agentenv-auth` volume. The gateway mounts that volume read-only at
+`/run/secrets`, so all three services use the same key. Normal
+`make deploy-down` calls preserve the volume and key.
+
 To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when starting the stack:
 
@@ -58,6 +63,14 @@ curl http://127.0.0.1:8000/health
 
 # Cluster node snapshots via gateway
 curl http://127.0.0.1:8000/nodes
+
+# Authenticated cluster node snapshots via gateway
+export AENV_API_KEY="$(docker compose -f deploy/docker-compose.yml exec -T agentenv-a \
+  cat /workspace/env/secrets/api-key)"
+curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8080/nodes
+
+# Direct health check on a backend node
+curl http://127.0.0.1:8001/health
 ```
 
 ## Management Commands
@@ -67,6 +80,31 @@ make deploy-ps      # Show container status
 make deploy-logs    # Stream logs from all services
 make deploy-down    # Tear down the cluster
 ```
+
+Removing Compose volumes with `docker compose down -v` also removes the API
+key. The next startup generates a new key and existing clients must be updated.
+
+To provide an existing key through Docker Compose secrets, add a file-backed
+secret in an override file and mount it with `target: api-key` on the gateway
+and both runtime nodes. AgentENV automatically reads `/run/secrets/api-key`;
+no file-path environment variable is needed.
+
+```yaml
+services:
+  gateway:
+    secrets: [api-key]
+  agentenv-a:
+    secrets: [api-key]
+  agentenv-b:
+    secrets: [api-key]
+
+secrets:
+  api-key:
+    file: ./api-key
+```
+
+The secret name is also its default target filename, so this mounts the key at
+`/run/secrets/api-key` in each service.
 
 ## Configuration
 

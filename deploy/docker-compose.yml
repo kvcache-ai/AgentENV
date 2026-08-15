@@ -16,8 +16,9 @@ x-agentenv-base: &agentenv-base
     - /dev:/dev
     - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
     # Runtime assets are baked into the image by `server --setup-only`; compose
-    # persists only committed snapshots across container restarts.
+    # persists committed snapshots and the deployment API key across restarts.
     - agentenv-snapshot-store:/workspace/env/snapshot-store
+    - agentenv-auth:/workspace/env/secrets
   devices:
     - /dev/kvm:/dev/kvm
   privileged: true
@@ -67,7 +68,9 @@ services:
     depends_on:
       scheduler:
         condition: service_healthy
-    volumes: *control-plane-config-volume
+    volumes:
+      - ./docker/config/default.json:/config/default.json:ro
+      - agentenv-auth:/run/secrets:ro
     environment:
       GATEWAY_HTTP_LISTEN_ADDR: :8080
       GATEWAY_SCHEDULER_ADDR: scheduler:9090
@@ -96,4 +99,5 @@ services:
       AENV_NODE_ID: node-b
 
 volumes:
+  agentenv-auth:
   agentenv-snapshot-store:

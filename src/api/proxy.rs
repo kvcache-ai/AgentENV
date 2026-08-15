@@ -7,7 +7,7 @@ use axum::{
             rejection::WebSocketUpgradeRejection, CloseFrame, Message as WebSocketMessage,
             WebSocket, WebSocketUpgrade,
         },
-        FromRequestParts, Request, State,
+        FromRequestParts, MatchedPath, Request, State,
     },
     http::{header, HeaderMap, HeaderName, HeaderValue, Method, Response, StatusCode, Uri},
     middleware::Next,
@@ -35,10 +35,16 @@ use tokio_tungstenite::{
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    api::ApiImpl,
+    api::{
+        impls::auth::{API_KEY_HEADER, ENVD_ACCESS_TOKEN_HEADER, TRAFFIC_ACCESS_TOKEN_HEADER},
+        ApiImpl,
+    },
     cfg::ConfigManager,
     observability::prometheus::HttpRouteSource,
-    orchestrator::{NewTimeout, OrchestratorError, ProxyLookupResult, ProxyTarget, SandboxState},
+    orchestrator::{
+        NewTimeout, OrchestratorError, ProxyLookupResult, ProxyTarget, SandboxMetadata,
+        SandboxState,
+    },
     types::SandboxId,
 };
 
@@ -50,6 +56,8 @@ struct ResolvedProxyRequest {
     sandbox_id: SandboxId,
     upstream_uri: Uri,
     original_host: Option<HeaderValue>,
+    target_port: u16,
+    envd_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,8 +91,6 @@ const E2B_SANDBOX_ID_HEADER: &str = "e2b-sandbox-id";
 const TARGET_PORT_HEADER: &str = "x-agentenv-target-port";
 /// E2B-compatible alias for the target port header.
 const E2B_TARGET_PORT_HEADER: &str = "e2b-sandbox-port";
-const ENVD_ACCESS_TOKEN_HEADER: &str = "x-access-token";
-
 #[cfg(test)]
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
@@ -142,6 +148,91 @@ where
         .with_state(api_impl)
 }
 
+fn proxy_route_for_auth(request: &Request, domains: &[String]) -> Option<HostProxyRoute> {
+    match parse_host_proxy_route(request_host(request), domains) {
+        Ok(Some(route)) => return Some(route),
+        Err(_) => return None,
+        Ok(None) => {}
+    }
+
+    Some(HostProxyRoute {
+        sandbox_id: parse_sandbox_id_header(request.headers()).ok()?,
+        target_port: parse_target_port_header(request.headers()).ok()?,
+    })
+}
+
+pub(crate) fn sandbox_id_for_proxy_auth(request: &Request, domains: &[String]) -> Option<String> {
+    Some(
+        proxy_route_for_auth(request, domains)?
+            .sandbox_id
+            .to_string(),
+    )
+}
+
+pub(crate) fn envd_access_token_for_proxy_auth(
+    request: &Request,
+    domains: &[String],
+) -> Option<(SandboxId, u16, String)> {
+    let route = proxy_route_for_auth(request, domains)?;
+    let candidate = {
+        let mut candidates = request.headers().get_all(ENVD_ACCESS_TOKEN_HEADER).iter();
+        let candidate = candidates.next()?;
+        if candidates.next().is_some() {
+            return None;
+        }
+        let candidate = candidate.to_str().ok()?;
+        candidate.to_owned()
+    };
+
+    Some((route.sandbox_id, route.target_port, candidate))
+}
+
+pub(crate) async fn has_valid_envd_access_token(
+    api_impl: &ApiImpl,
+    sandbox_id: SandboxId,
+    target_port: u16,
+    candidate: String,
+) -> bool {
+    let Ok(Some(metadata)) = api_impl.orchestrator().get_sandbox(&sandbox_id).await else {
+        return false;
+    };
+    if !metadata.secure || target_port != effective_envd_port(&metadata) {
+        return false;
+    }
+
+    api_impl
+        .orchestrator()
+        .validate_envd_access_token(sandbox_id, &candidate)
+}
+
+pub(crate) fn is_sandbox_proxy_request(request: &Request, domains: &[String]) -> bool {
+    let path = request.uri().path();
+    if path == PROXY_ROUTE || path.starts_with("/proxy/") {
+        return true;
+    }
+
+    match parse_host_proxy_route(request_host(request), domains) {
+        Ok(Some(_)) | Err(_) => true,
+        Ok(None) => {
+            request.extensions().get::<MatchedPath>().is_none()
+                && has_routing_header(request.headers())
+        }
+    }
+}
+
+fn request_host(request: &Request) -> Option<&str> {
+    request
+        .headers()
+        .get(header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+        })
+}
+
 pub(crate) async fn sandbox_proxy_classifier<I>(
     State(api_impl): State<I>,
     request: Request,
@@ -167,7 +258,9 @@ where
         });
     let host_route = match parse_host_proxy_route(host, api_impl.as_ref().sandbox_proxy_domains()) {
         Ok(Some(route)) => route,
-        Ok(None) => return next.run(request).await,
+        Ok(None) => {
+            return next.run(request).await;
+        }
         Err(err) => {
             return with_route_source(proxy_error_response(&err), HttpRouteSource::ProxyHost);
         }
@@ -358,6 +451,14 @@ fn has_routing_header(headers: &HeaderMap) -> bool {
     headers.get(SANDBOX_ID_HEADER).is_some() || headers.get(E2B_SANDBOX_ID_HEADER).is_some()
 }
 
+fn effective_envd_port(metadata: &SandboxMetadata) -> u16 {
+    metadata
+        .paused_state
+        .as_ref()
+        .and_then(|state| state.control_plane_port())
+        .unwrap_or_else(|| ConfigManager::global_config().tools.control_plane_port)
+}
+
 /// Proxies a standard HTTP request to the resolved upstream URI and returns the response.
 async fn proxy_http_request(
     api_impl: &ApiImpl,
@@ -369,9 +470,11 @@ async fn proxy_http_request(
         sandbox_id,
         upstream_uri,
         original_host,
+        target_port,
+        envd_port,
     } = resolved;
 
-    sanitize_request_headers(&mut parts.headers);
+    sanitize_request_headers(&mut parts.headers, target_port, envd_port);
     inject_forwarded_headers(
         &mut parts.headers,
         original_host.as_ref(),
@@ -552,9 +655,11 @@ async fn proxy_websocket_request(
         sandbox_id,
         upstream_uri,
         original_host,
+        target_port,
+        envd_port,
     } = resolved;
 
-    sanitize_websocket_request_headers(&mut parts.headers);
+    sanitize_websocket_request_headers(&mut parts.headers, target_port, envd_port);
     inject_forwarded_headers(
         &mut parts.headers,
         original_host.as_ref(),
@@ -735,6 +840,14 @@ async fn resolve_proxy_request(
         }
     };
 
+    let metadata = api_impl
+        .orchestrator()
+        .get_sandbox(&sandbox_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
+        .ok_or_else(|| proxy_error_response(&ProxyRequestError::SandboxNotFound(sandbox_id)))?;
+    let envd_port = effective_envd_port(&metadata);
+
     let upstream_uri = if is_websocket_request {
         build_upstream_uri_with_scheme("ws", &target, target_port, proxy_path, parts.uri.query())
     } else {
@@ -746,6 +859,8 @@ async fn resolve_proxy_request(
         sandbox_id,
         upstream_uri,
         original_host: parts.headers.get(header::HOST).cloned(),
+        target_port,
+        envd_port,
     })
 }
 
@@ -755,15 +870,15 @@ async fn authorize_secure_envd_auto_resume(
     target_port: u16,
     headers: &HeaderMap,
 ) -> Result<(), Response<Body>> {
-    if target_port != ConfigManager::global_config().tools.control_plane_port {
-        return Ok(());
-    }
     let metadata = api_impl
         .orchestrator()
         .get_sandbox(&sandbox_id)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?
         .ok_or_else(|| proxy_error_response(&ProxyRequestError::SandboxNotFound(sandbox_id)))?;
+    if target_port != effective_envd_port(&metadata) {
+        return Ok(());
+    }
     if !metadata.secure {
         return Ok(());
     }
@@ -963,19 +1078,24 @@ fn build_upstream_uri_with_scheme(
         .map_err(|_| StatusCode::BAD_REQUEST)
 }
 
-fn sanitize_request_headers(headers: &mut HeaderMap) {
+fn sanitize_request_headers(headers: &mut HeaderMap, target_port: u16, envd_port: u16) {
     // These headers are only for the control-plane hop between the client and
     // AgentENV. Upstream sandbox services should not see them.
     headers.remove(SANDBOX_ID_HEADER);
     headers.remove(E2B_SANDBOX_ID_HEADER);
     headers.remove(TARGET_PORT_HEADER);
     headers.remove(E2B_TARGET_PORT_HEADER);
+    headers.remove(API_KEY_HEADER);
+    headers.remove(TRAFFIC_ACCESS_TOKEN_HEADER);
     headers.remove(header::HOST);
+    if target_port != envd_port {
+        headers.remove(ENVD_ACCESS_TOKEN_HEADER);
+    }
     remove_hop_by_hop_headers(headers);
 }
 
-fn sanitize_websocket_request_headers(headers: &mut HeaderMap) {
-    sanitize_request_headers(headers);
+fn sanitize_websocket_request_headers(headers: &mut HeaderMap, target_port: u16, envd_port: u16) {
+    sanitize_request_headers(headers, target_port, envd_port);
     headers.remove(header::SEC_WEBSOCKET_ACCEPT);
     headers.remove(header::SEC_WEBSOCKET_EXTENSIONS);
     headers.remove(header::SEC_WEBSOCKET_KEY);
@@ -1389,8 +1509,13 @@ mod tests {
                 "e2b_sandbox_header_seen": headers.get(E2B_SANDBOX_ID_HEADER).is_some(),
                 "target_port_header_seen": headers.get(TARGET_PORT_HEADER).is_some(),
                 "e2b_target_port_header_seen": headers.get(E2B_TARGET_PORT_HEADER).is_some(),
-                "envd_access_token": headers
+                "api_key_header_seen": headers.get(API_KEY_HEADER).is_some(),
+                "traffic_token_header_seen": headers.get(TRAFFIC_ACCESS_TOKEN_HEADER).is_some(),
+                "access_token": headers
                     .get(ENVD_ACCESS_TOKEN_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                "authorization": headers
+                    .get(header::AUTHORIZATION)
                     .and_then(|value| value.to_str().ok()),
                 "forwarded_host": headers
                     .get("x-forwarded-host")
@@ -1622,6 +1747,7 @@ mod tests {
             image_resolver,
             None,
             domains,
+            "test-key".to_string(),
         ))
     }
 
@@ -1650,11 +1776,11 @@ mod tests {
         .await
     }
 
-    async fn proxy_app_for_sandbox_with_domains(
+    async fn proxy_app_with_access_token_for_sandbox(
         sandbox_id: &SandboxId,
-        domains: Vec<String>,
-    ) -> axum::Router {
-        let api = build_api_with_sandbox_proxy_domains(domains).await;
+    ) -> (axum::Router, String) {
+        let api = build_api().await;
+        let access_token = api.traffic_access_token(&sandbox_id.to_string());
         api.orchestrator()
             .set_proxy_target_for_test(
                 *sandbox_id,
@@ -1662,7 +1788,23 @@ mod tests {
                 crate::orchestrator::SandboxState::Running,
             )
             .await;
-        server::new(api)
+        (server::new(api), access_token)
+    }
+
+    async fn proxy_app_for_sandbox_with_domains(
+        sandbox_id: &SandboxId,
+        domains: Vec<String>,
+    ) -> (axum::Router, String) {
+        let api = build_api_with_sandbox_proxy_domains(domains).await;
+        let access_token = api.traffic_access_token(&sandbox_id.to_string());
+        api.orchestrator()
+            .set_proxy_target_for_test(
+                *sandbox_id,
+                ProxyTarget::new(Ipv4Addr::LOCALHOST),
+                crate::orchestrator::SandboxState::Running,
+            )
+            .await;
+        (server::new(api), access_token)
     }
 
     async fn proxy_app_for_running_sandbox_without_route(sandbox_id: &SandboxId) -> axum::Router {
@@ -1732,7 +1874,11 @@ mod tests {
             HeaderValue::from_static("keep"),
         );
 
-        sanitize_request_headers(&mut headers);
+        sanitize_request_headers(
+            &mut headers,
+            8080,
+            ConfigManager::global_config().tools.control_plane_port,
+        );
 
         assert!(headers.get(SANDBOX_ID_HEADER).is_none());
         assert!(headers.get(E2B_SANDBOX_ID_HEADER).is_none());
@@ -1784,6 +1930,120 @@ mod tests {
 
         assert!(is_send_request_failure_text(&SendRequestError));
         assert!(!is_send_request_failure_text(&"client error (Connect)"));
+    }
+
+    #[tokio::test]
+    async fn server_requires_exact_api_key_and_leaves_health_public() {
+        let app = server::new(build_api().await);
+
+        for request in [
+            Request::builder()
+                .uri("/nonexistent/path")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/nonexistent/path")
+                .header(header::AUTHORIZATION, "Bearer test-key")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/nonexistent/path")
+                .header(API_KEY_HEADER, "wrong-key")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .uri("/nonexistent/path")
+                .header(API_KEY_HEADER, "test-key")
+                .header(API_KEY_HEADER, "test-key")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/nonexistent/path")
+                    .header(API_KEY_HEADER, "test-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::HOST, "localhost")
+                    .header(SANDBOX_ID_HEADER, SandboxId::new().to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn traffic_token_cannot_authenticate_control_plane() {
+        let api = build_api().await;
+        let sandbox_id = SandboxId::new();
+        let traffic_token = api.traffic_access_token(&sandbox_id.to_string());
+        let app = server::new(api);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("/sandboxes/{sandbox_id}/pause"))
+                    .header(TRAFFIC_ACCESS_TOKEN_HEADER, traffic_token)
+                    .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
+                    .header(TARGET_PORT_HEADER, "80")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn envd_token_cannot_authenticate_application_proxy() {
+        let api = build_api().await;
+        let sandbox_id = SandboxId::new();
+        let traffic_token = api.traffic_access_token(&sandbox_id.to_string());
+        let response = server::new(api)
+            .oneshot(
+                Request::builder()
+                    .uri("/proxy/hello")
+                    .header(ENVD_ACCESS_TOKEN_HEADER, traffic_token)
+                    .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
+                    .header(TARGET_PORT_HEADER, "80")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -2046,9 +2306,11 @@ mod tests {
                     .uri("/proxy/echo/test?foo=bar".to_string())
                     .header("host", "client.example")
                     .header("x-api-key", "test-key")
+                    .header(header::AUTHORIZATION, "Bearer application-token")
                     .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
                     .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
                     .header(ENVD_ACCESS_TOKEN_HEADER, "envd-token")
+                    .header(TRAFFIC_ACCESS_TOKEN_HEADER, "traffic-token")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2065,8 +2327,11 @@ mod tests {
         assert_eq!(payload["e2b_sandbox_header_seen"], false);
         assert_eq!(payload["target_port_header_seen"], false);
         assert_eq!(payload["e2b_target_port_header_seen"], false);
-        assert_eq!(payload["envd_access_token"], "envd-token");
+        assert!(payload["access_token"].is_null());
+        assert_eq!(payload["traffic_token_header_seen"], false);
         assert_eq!(payload["forwarded_host"], "client.example");
+        assert_eq!(payload["api_key_header_seen"], false);
+        assert_eq!(payload["authorization"], "Bearer application-token");
     }
 
     #[tokio::test]
@@ -2288,7 +2553,7 @@ mod tests {
     async fn sandbox_proxy_host_routes_control_paths_and_skips_explicit_proxy() {
         let upstream_addr = start_upstream_server().await;
         let sandbox_id = SandboxId::new();
-        let app = proxy_app_for_sandbox_with_domains(
+        let (app, access_token) = proxy_app_for_sandbox_with_domains(
             &sandbox_id,
             vec!["sandbox.example.invalid".to_string()],
         )
@@ -2299,7 +2564,29 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
+                    .uri("/health")
+                    .header(
+                        "host",
+                        format!(
+                            "{}-{}.sandbox.example.invalid",
+                            upstream_addr.port(),
+                            sandbox_id
+                        ),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
                     .uri("/health?foo=bar")
+                    .header(TRAFFIC_ACCESS_TOKEN_HEADER, access_token)
                     .header(
                         "host",
                         format!(
@@ -2332,6 +2619,7 @@ mod tests {
                         upstream_addr.port(),
                         sandbox_id
                     ))
+                    .header("x-api-key", "test-key")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2343,7 +2631,7 @@ mod tests {
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["path"], "/authority");
 
-        let app = proxy_app_for_sandbox_with_domains(
+        let (app, _) = proxy_app_for_sandbox_with_domains(
             &sandbox_id,
             vec!["sandbox.example.invalid".to_string()],
         )
@@ -2354,6 +2642,7 @@ mod tests {
                 Request::builder()
                     .method(Method::GET)
                     .uri("/proxy/health")
+                    .header("x-api-key", "test-key")
                     .header(
                         "host",
                         format!(
@@ -2375,6 +2664,7 @@ mod tests {
                 Request::builder()
                     .method(Method::GET)
                     .uri("/proxy/health")
+                    .header("x-api-key", "test-key")
                     .header(
                         "host",
                         format!(
@@ -2401,14 +2691,14 @@ mod tests {
     async fn proxy_accepts_e2b_compatible_headers() {
         let upstream_addr = start_upstream_server().await;
         let sandbox_id = SandboxId::new();
-        let app = proxy_app_for_sandbox(&sandbox_id).await;
+        let (app, access_token) = proxy_app_with_access_token_for_sandbox(&sandbox_id).await;
 
         let response = app
             .oneshot(
                 Request::builder()
                     .method(Method::GET)
                     .uri("/proxy/e2b/health")
-                    .header("x-api-key", "test-key")
+                    .header(TRAFFIC_ACCESS_TOKEN_HEADER, access_token)
                     .header(E2B_SANDBOX_ID_HEADER, sandbox_id.to_string())
                     .header(E2B_TARGET_PORT_HEADER, upstream_addr.port().to_string())
                     .body(Body::empty())
@@ -2426,6 +2716,10 @@ mod tests {
         assert_eq!(payload["e2b_sandbox_header_seen"], false);
         assert_eq!(payload["target_port_header_seen"], false);
         assert_eq!(payload["e2b_target_port_header_seen"], false);
+        assert!(
+            payload["access_token"].is_null(),
+            "envd credential leaked to application port"
+        );
     }
 
     #[tokio::test]

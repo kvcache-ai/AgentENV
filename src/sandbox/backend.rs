@@ -35,6 +35,10 @@ pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
     /// The orchestrator only carries this value to the image-liveness layer; it
     /// does not interpret the backend-specific artifact identities inside it.
     fn runtime_artifacts(&self) -> RuntimeArtifactSet;
+    /// Effective envd control-plane port persisted with the paused runtime, when available.
+    fn control_plane_port(&self) -> Option<u16> {
+        None
+    }
 }
 
 impl dyn PausedSandboxState {

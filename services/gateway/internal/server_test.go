@@ -148,6 +148,8 @@ func (s stubSchedulerClient) UnregisterNode(ctx context.Context, req *schedulerv
 	return s.unregisterNodeFunc(ctx, req, opts...)
 }
 
+const testAPIKey = "test-api-key"
+
 type testServerOption func(*ServerOptions)
 
 func newTestServer(t *testing.T, schedulerClient schedulerv1.SchedulerClient, timeout time.Duration, maxRespSize int64, opts ...testServerOption) *Server {
@@ -156,6 +158,7 @@ func newTestServer(t *testing.T, schedulerClient schedulerv1.SchedulerClient, ti
 	options := ServerOptions{
 		RequestTimeout:  timeout,
 		MaxResponseSize: maxRespSize,
+		APIKey:          testAPIKey,
 	}
 	for _, opt := range opts {
 		opt(&options)
@@ -166,6 +169,143 @@ func newTestServer(t *testing.T, schedulerClient schedulerv1.SchedulerClient, ti
 		t.Fatalf("new gateway server failed: %v", err)
 	}
 	return server
+}
+
+func authenticatedTestHandler(server *Server) http.Handler {
+	handler := server.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Set(headerAPIKey, testAPIKey)
+		handler.ServeHTTP(w, r)
+	})
+}
+
+func TestNewServerRejectsEmptyAPIKey(t *testing.T) {
+	_, err := NewServer(zap.NewNop(), stubSchedulerClient{}, ServerOptions{
+		RequestTimeout:  time.Second,
+		MaxResponseSize: 1024,
+	})
+	if err == nil {
+		t.Fatal("NewServer accepted an empty API key")
+	}
+}
+
+func TestGatewayRequiresExactAPIKey(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
+	handler := server.Handler()
+	tests := []struct {
+		name       string
+		addHeaders func(http.Header)
+		wantStatus int
+	}{
+		{
+			name:       "missing",
+			addHeaders: func(http.Header) {},
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "wrong",
+			addHeaders: func(headers http.Header) {
+				headers.Set(headerAPIKey, "wrong-key")
+			},
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "authorization is application data",
+			addHeaders: func(headers http.Header) {
+				headers.Set("Authorization", "Bearer "+testAPIKey)
+			},
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "valid",
+			addHeaders: func(headers http.Header) {
+				headers.Set(headerAPIKey, testAPIKey)
+			},
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name: "duplicate",
+			addHeaders: func(headers http.Header) {
+				headers.Add(headerAPIKey, testAPIKey)
+				headers.Add(headerAPIKey, testAPIKey)
+			},
+			wantStatus: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			tt.addHeaders(req.Header)
+			recorder := httptest.NewRecorder()
+
+			handler.ServeHTTP(recorder, req)
+
+			if recorder.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", recorder.Code, tt.wantStatus)
+			}
+		})
+	}
+}
+
+func TestGatewayAcceptsSandboxScopedTrafficToken(t *testing.T) {
+	const sandboxID = "0191f4d0-7b2a-7c11-9c2d-0123456789ab"
+	lookupCalls := 0
+	server := newTestServer(t, stubSchedulerClient{
+		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			lookupCalls++
+			return nil, fmt.Errorf("lookup reached")
+		},
+	}, time.Second, 1024)
+	handler := server.Handler()
+
+	req := httptest.NewRequest(http.MethodGet, "/proxy", nil)
+	req.Header.Set(headerE2BSandboxID, sandboxID)
+	req.Header.Set(headerE2BTargetPort, "49983")
+	req.Header.Set(headerTrafficToken, trafficAccessToken([]byte(testAPIKey), sandboxID))
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code == http.StatusUnauthorized || lookupCalls != 1 {
+		t.Fatalf("valid scoped token: status=%d lookup calls=%d", recorder.Code, lookupCalls)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/proxy", nil)
+	req.Header.Set(headerE2BSandboxID, sandboxID)
+	req.Header.Set(headerE2BTargetPort, "49983")
+	req.Header.Set(headerTrafficToken, trafficAccessToken([]byte(testAPIKey), "another-sandbox"))
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusUnauthorized || lookupCalls != 1 {
+		t.Fatalf("wrong scoped token: status=%d lookup calls=%d", recorder.Code, lookupCalls)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/proxy", nil)
+	req.Header.Set(headerE2BSandboxID, sandboxID)
+	req.Header.Set(headerE2BTargetPort, "8080")
+	req.Header.Set("X-Access-Token", trafficAccessToken([]byte(testAPIKey), sandboxID))
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	if recorder.Code != http.StatusUnauthorized || lookupCalls != 1 {
+		t.Fatalf("envd token authorized application proxy: status=%d lookup calls=%d", recorder.Code, lookupCalls)
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/pause", nil)
+	req.Header.Set(headerE2BSandboxID, sandboxID)
+	req.Header.Set(headerTrafficToken, trafficAccessToken([]byte(testAPIKey), sandboxID))
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized || lookupCalls != 1 {
+		t.Fatalf("scoped token reached control plane: status=%d lookup calls=%d", recorder.Code, lookupCalls)
+	}
+}
+
+func TestTrafficAccessTokenVector(t *testing.T) {
+	const sandboxID = "0191f4d0-7b2a-7c11-9c2d-0123456789ab"
+	const want = "aenv_trf_PwHqhTxLa_mzUCNIGx03uiTHxZ3k995pKDOS50PaGWo"
+	if got := trafficAccessToken([]byte("test-key"), sandboxID); got != want {
+		t.Fatalf("trafficAccessToken() = %q, want %q", got, want)
+	}
 }
 
 func withSandboxProxyDomains(domains ...string) testServerOption {
@@ -398,7 +538,7 @@ func TestHandleProxyReturnsAggregatedNodesFromScheduler(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "http://gateway.test/nodes?clusterID=cluster-1", nil)
 	response := httptest.NewRecorder()
 
-	server.Handler().ServeHTTP(response, request)
+	authenticatedTestHandler(server).ServeHTTP(response, request)
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", response.Code)
@@ -453,7 +593,7 @@ func TestHandleProxyDirectForwardsNodeDetail(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "http://gateway.test/nodes/node-a?clusterID=cluster-1", nil)
 	response := httptest.NewRecorder()
 
-	server.Handler().ServeHTTP(response, request)
+	authenticatedTestHandler(server).ServeHTTP(response, request)
 
 	if response.Code != http.StatusOK {
 		t.Fatalf("expected status 200, got %d", response.Code)
@@ -486,7 +626,7 @@ func TestLookupNodeUsesQueryOnlySchedulerClient(t *testing.T) {
 	}
 	server := newTestServer(t, mainScheduler, time.Second, 1024, withQueryOnlyScheduler(queryScheduler))
 
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	req, err := http.NewRequest(http.MethodGet, gatewayServer.URL+"/health", nil)
@@ -555,7 +695,7 @@ func TestSandboxControlPlaneRequestWithE2BHeadersUsesPathRoute(t *testing.T) {
 		},
 	}, time.Second, 1024)
 
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+"/sandboxes/sbx-path/connect", strings.NewReader(`{"timeout":60}`))
@@ -833,7 +973,7 @@ func TestHandleProxyAggregatesSandboxListAcrossNodes(t *testing.T) {
 		},
 	}, time.Second, 1024)
 
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	req, err := http.NewRequest(http.MethodGet, gatewayServer.URL+"/sandboxes?metadata=team%3Dalpha", nil)
@@ -909,7 +1049,7 @@ func TestHandleProxyAggregatesV2SandboxesWithGlobalPagination(t *testing.T) {
 		},
 	}, time.Second, 1024)
 
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	req, err := http.NewRequest(http.MethodGet, gatewayServer.URL+"/v2/sandboxes?metadata=team%3Dalpha&state=running%2Cpaused&limit=2", nil)
@@ -1012,7 +1152,7 @@ func TestHandleProxyAggregatesSandboxListDedupsDuplicateSandboxIDs(t *testing.T)
 		},
 	}, time.Second, 1024)
 
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	resp, err := http.Get(gatewayServer.URL + "/v2/sandboxes?limit=10")
@@ -1055,7 +1195,7 @@ func TestHandleProxyClusterListFailsWhenNodeFails(t *testing.T) {
 		},
 	}, time.Second, 1024)
 
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	resp, err := http.Get(gatewayServer.URL + "/sandboxes")
@@ -1085,7 +1225,7 @@ func TestHandleProxyClusterListPropagatesUnauthorized(t *testing.T) {
 		},
 	}, time.Second, 1024)
 
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	resp, err := http.Get(gatewayServer.URL + "/sandboxes")
@@ -1379,7 +1519,7 @@ func TestMetricsEndpointReturnsNotFoundWithoutProxyRouting(t *testing.T) {
 
 func TestHealthEndpointReturnsGatewayHealthWithoutProxyHeaders(t *testing.T) {
 	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	resp, err := http.Get(gatewayServer.URL + "/health")
@@ -1430,7 +1570,7 @@ func TestHealthAndMetricsEndpointsWithSandboxHeadersProxyToSandbox(t *testing.T)
 		},
 	}, time.Second, 1024)
 
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	for _, path := range []string{"/health", "/metrics"} {
@@ -1468,7 +1608,7 @@ func TestHealthAndMetricsEndpointsWithSandboxHeadersProxyToSandbox(t *testing.T)
 
 func TestHealthAndMetricsEndpointsWithProxyHeadersMissingSandboxIDReturnBadRequest(t *testing.T) {
 	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	for _, path := range []string{"/health", "/metrics"} {
@@ -1523,7 +1663,7 @@ func TestHealthAndMetricsEndpointsWithHostRoutingProxyToSandbox(t *testing.T) {
 			}, nil
 		},
 	}, time.Second, 1024, withSandboxProxyDomains("sandbox-proxy.example.invalid"))
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	for _, path := range []string{"/health", "/metrics"} {
@@ -1602,7 +1742,7 @@ func TestHandleProxyHostBasedRoutingForwardsToSandboxProxy(t *testing.T) {
 		},
 	}, time.Second, 1024, withSandboxProxyDomains("sandbox-proxy.example.invalid"))
 
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	req, err := http.NewRequest(http.MethodGet, gatewayServer.URL+"/readyz?x=1", nil)
@@ -1650,7 +1790,7 @@ func TestHandleProxyHostBasedRoutingForwardsToSandboxProxy(t *testing.T) {
 
 func TestHandleProxyHostBasedRoutingRejectsInvalidHost(t *testing.T) {
 	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024, withSandboxProxyDomains("sandbox-proxy.example.invalid"))
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	req, err := http.NewRequest(http.MethodGet, gatewayServer.URL+"/readyz", nil)
@@ -1736,7 +1876,7 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 		},
 	}, time.Second, 1024, withDebugMode(true))
 
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+"/sandboxes", strings.NewReader(`{"template":"base"}`))
@@ -1860,7 +2000,7 @@ func TestHandleProxyColdSandboxCreateRecordsAssignment(t *testing.T) {
 		},
 	}, time.Second, 1024, withDebugMode(true))
 
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+"/sandboxes-cold", strings.NewReader(`{"image":"ubuntu:24.04"}`))
@@ -1992,7 +2132,7 @@ func TestHandleProxyWebSocketForwarding(t *testing.T) {
 		},
 	}, time.Second, 1024)
 
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	gatewayURL, err := url.Parse(gatewayServer.URL)
@@ -2108,7 +2248,7 @@ func TestHandleProxyPreservesEncodedPathSegments(t *testing.T) {
 		},
 	}, time.Second, 1024)
 
-	gatewayServer := httptest.NewServer(server.Handler())
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
 	tests := []struct {

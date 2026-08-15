@@ -76,6 +76,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let api_key = agentenv::api_key::resolve(config)?;
+
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
@@ -147,6 +149,7 @@ async fn main() -> anyhow::Result<()> {
         image_resolver,
         observability,
         config.sandbox_proxy.domains.clone(),
+        api_key,
     ));
     let app = server::new(api_impl);
     let shutdown_orchestrator = Arc::clone(&orchestrator);

@@ -25,7 +25,8 @@ make proto      # regenerate protobuf
 # Start scheduler (default: 127.0.0.1:9090)
 make -C services run-scheduler
 
-# Start gateway
+# Start gateway (use the same key on runtime nodes)
+export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
 make -C services run-gateway
 ```
 
@@ -41,6 +42,7 @@ The scheduler supports two node discovery modes:
 ### Docker Compose
 
 ```bash
+# Run scripts/docker-setup.sh first for host prerequisites.
 make deploy-up      # gateway + scheduler + 2 backend nodes
 make deploy-ps      # status
 make deploy-logs    # logs
