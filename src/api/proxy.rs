@@ -137,6 +137,13 @@ where
 {
     Router::new()
         .route(PROXY_ROUTE, any(proxy_via_prefix::<I>))
+        // `/proxy/` has nothing left after the prefix, so the wildcard route
+        // below cannot match it (catch-all params must be non-empty) and the
+        // exact route above does not either. Without this route it reaches
+        // `proxy_via_fallback`, which forwards the path unmodified and leaks
+        // the `/proxy` prefix into the sandbox. The distributed gateway builds
+        // exactly this shape whenever a client requests `/`.
+        .route("/proxy/", any(proxy_via_prefix::<I>))
         .route("/proxy/{*proxy_path}", any(proxy_via_prefix::<I>))
         .fallback(proxy_via_fallback::<I>)
         .with_state(api_impl)
@@ -2031,6 +2038,61 @@ mod tests {
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["path"], "/");
         assert_eq!(payload["query"], "foo=bar");
+    }
+
+    #[tokio::test]
+    async fn proxy_root_with_trailing_slash_forwards_to_upstream_root_path() {
+        let upstream_addr = start_upstream_server().await;
+        let sandbox_id = SandboxId::new();
+        let app = proxy_app_for_sandbox(&sandbox_id).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/proxy/?foo=bar")
+                    .header("x-api-key", "test-key")
+                    .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
+                    .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["path"], "/");
+        assert_eq!(payload["query"], "foo=bar");
+    }
+
+    #[tokio::test]
+    async fn proxy_preserves_trailing_slash_in_wildcard_path() {
+        let upstream_addr = start_upstream_server().await;
+        let sandbox_id = SandboxId::new();
+        let app = proxy_app_for_sandbox(&sandbox_id).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/proxy/api/")
+                    .header("x-api-key", "test-key")
+                    .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
+                    .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["path"], "/api/");
     }
 
     #[tokio::test]
