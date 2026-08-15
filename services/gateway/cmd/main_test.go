@@ -8,6 +8,7 @@ import (
 )
 
 const testAPIKey = "e2b_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+const testAccessTokenSeed = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 func TestValidateAPIKey(t *testing.T) {
 	t.Parallel()
@@ -73,5 +74,31 @@ func TestLoadAPIKeyRejectsMissingFile(t *testing.T) {
 	missing := filepath.Join(dir, "missing")
 	if _, err := loadAPIKeyFrom(func(string) (string, bool) { return "", false }, missing); err == nil {
 		t.Fatal("loadAPIKeyFrom() unexpectedly accepted a missing secret")
+	}
+}
+
+func TestLoadAccessTokenSeed(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sandbox-access-token-hash-seed")
+	if err := os.WriteFile(path, []byte(testAccessTokenSeed+"\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadAccessTokenSeedFrom(func(string) (string, bool) { return "", false }, path)
+	if err != nil {
+		t.Fatalf("loadAccessTokenSeedFrom() error = %v", err)
+	}
+	if got != testAccessTokenSeed {
+		t.Fatalf("loadAccessTokenSeedFrom() = %q, want %q", got, testAccessTokenSeed)
+	}
+}
+
+func TestLoadAccessTokenSeedRejectsExplicitEmptyEnvironment(t *testing.T) {
+	if _, err := loadAccessTokenSeedFrom(
+		func(name string) (string, bool) { return "", name == accessTokenSeedEnv },
+		filepath.Join(t.TempDir(), "missing"),
+	); err == nil {
+		t.Fatal("loadAccessTokenSeedFrom() unexpectedly accepted an empty environment value")
 	}
 }

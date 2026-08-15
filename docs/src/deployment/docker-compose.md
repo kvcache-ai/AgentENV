@@ -23,11 +23,6 @@ git clone https://github.com/kvcache-ai/AgentENV.git
 cd AgentENV
 ```
 
-## Configure the Access-Token Seed (Optional)
-
-See [Secure Sandboxes](../security/secure-sandboxes.md)
-if the deployment needs future cross-node sandbox recovery.
-
 ## Start the Cluster
 
 ```bash
@@ -38,10 +33,11 @@ make deploy-up
 The Gateway is available at `http://127.0.0.1:8000` and forwards requests to
 the backend nodes.
 
-On first startup, the runtime nodes atomically generate one API key in the
+On first startup, the runtime nodes atomically generate one API key and sandbox
+access-token seed in the
 shared `agentenv-auth` volume. The gateway mounts that volume read-only at
-`/run/secrets`, so all three services use the same key. Normal
-`make deploy-down` calls preserve the volume and key.
+`/run/secrets`, so all three services use the same secrets. Normal
+`make deploy-down` calls preserve the volume and both values.
 
 To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when starting the stack:
@@ -81,8 +77,9 @@ make deploy-logs    # Stream logs from all services
 make deploy-down    # Tear down the cluster
 ```
 
-Removing Compose volumes with `docker compose down -v` also removes the API
-key. The next startup generates a new key and existing clients must be updated.
+Removing Compose volumes with `docker compose down -v` also removes both
+secrets. The next startup generates new values, so existing clients and sandbox
+access tokens are invalidated.
 
 To provide an existing key through Docker Compose secrets, add a file-backed
 secret in an override file and mount it with `target: api-key` on the gateway

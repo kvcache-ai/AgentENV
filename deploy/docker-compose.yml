@@ -16,7 +16,7 @@ x-agentenv-base: &agentenv-base
     - /dev:/dev
     - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
     # Runtime assets are baked into the image by `server --setup-only`; compose
-    # persists committed snapshots and the deployment API key across restarts.
+    # persists committed snapshots and deployment secrets across restarts.
     - agentenv-snapshot-store:/workspace/env/snapshot-store
     - agentenv-auth:/workspace/env/secrets
   devices:

@@ -55,11 +55,13 @@ an external metrics collector needs them.
 
 ## 1. Install the runtime nodes
 
-Generate one API key, deliver it through your normal secret-management channel,
-and use the same value on every runtime node and the Gateway:
+Generate one API key and one sandbox access-token seed, deliver them through
+your normal secret-management channel, and use the same values on every runtime
+node and the Gateway:
 
 ```bash
 export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
+export AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED="$(openssl rand -hex 32)"
 ```
 
 Run the installation on each runtime node:
@@ -69,11 +71,9 @@ curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/in
 ```
 
 Edit `/etc/default/aenv` on each machine without removing the paths written by
-the installer, and add `AENV_API_KEY=<the shared key>` before starting the
-services. A multi-node deployment must not let each node generate an
-independent managed key.
-
-See [Secure Sandboxes](../security/secure-sandboxes.md) if the deployment needs future cross-node sandbox recovery.
+the installer, and add both shared values before starting the services. A
+multi-node deployment must not let each node generate independent managed
+secrets.
 
 Node A uses:
 
@@ -117,7 +117,7 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin agentenv-contro
 sudo install -d -o root -g agentenv-control -m 0750 /etc/agentenv
 ```
 
-Create `/etc/agentenv/auth.env` with the same key used on the runtime nodes:
+Create `/etc/agentenv/auth.env` with the same values used on the runtime nodes:
 
 ```bash
 sudo install -o root -g agentenv-control -m 0640 /dev/null /etc/agentenv/auth.env
@@ -126,6 +126,7 @@ sudoedit /etc/agentenv/auth.env
 
 ```text
 AENV_API_KEY=<same shared key>
+AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED=<same shared seed>
 ```
 
 If the `agentenv-control` account already exists, the `useradd` command reports

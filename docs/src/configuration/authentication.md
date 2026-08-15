@@ -23,6 +23,9 @@ For secure sandboxes, `envdAccessToken` is a separate credential for envd
 control traffic and must be sent as `X-Access-Token` only when targeting the
 envd control-plane port. It is absent for insecure sandboxes.
 
+Both sandbox credentials are derived from the sandbox ID and one independent
+`AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED`. They are not derived from the API key.
+
 ## Key Resolution
 
 On normal startup, a runtime node uses the first available source:
@@ -36,8 +39,10 @@ generates a 256-bit key and atomically stores it in the managed path with
 `0600` permissions. It reuses that key on later starts. Dependency and host
 setup modes do not create a key.
 
-The gateway uses `AENV_API_KEY` or `/run/secrets/api-key`; it never generates a
-key because every gateway and runtime node in a cluster must share one.
+The gateway uses `AENV_API_KEY` or `/run/secrets/api-key`. It also reads the
+sandbox seed from `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` or
+`/run/secrets/sandbox-access-token-hash-seed`. The gateway never generates
+either value because it must share them with every runtime node.
 
 ## Installation Methods
 
@@ -64,7 +69,8 @@ container replacements.
 
 The checked-in Compose deployment mounts one named volume read-write on both
 runtime nodes and read-only at `/run/secrets` on the gateway. Concurrent node
-startup is safe: atomic creation makes both nodes converge on the same key.
+startup is safe: atomic creation makes both nodes converge on the same key and
+sandbox seed.
 Read it with:
 
 ```bash
@@ -75,8 +81,8 @@ docker compose -f deploy/docker-compose.yml exec -T agentenv-a \
 `docker compose down` preserves the key. `docker compose down -v` removes the
 auth volume, so the next startup generates a new key.
 
-`make k8s-apply` creates `Secret/agentenv-auth` on the first apply and reuses
-the existing key on later applies. Read it with:
+`make k8s-apply` creates `Secret/agentenv-auth` with an API key and sandbox
+seed on the first apply, then reuses both values. Read the API key with:
 
 ```bash
 kubectl -n agentenv-system get secret agentenv-auth \
@@ -113,9 +119,8 @@ network, use a VPN, or terminate HTTPS at a reverse proxy or load balancer.
 
 ## Rotation
 
-Set a new `AENV_API_KEY` on the gateway and every runtime node, or replace the
-shared secret file, then restart them. Existing clients must switch to the new
-value. Previously issued
-`trafficAccessToken` values stop working when the key changes.
-`envdAccessToken` values are unaffected and rotate only when the optional envd
-seed changes.
+Changing `AENV_API_KEY` invalidates existing client API credentials without
+changing sandbox credentials. Changing
+`AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` rotates both `trafficAccessToken` and
+`envdAccessToken` values. Apply either change to the gateway and every runtime
+node together, then restart them.

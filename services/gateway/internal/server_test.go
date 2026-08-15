@@ -148,7 +148,10 @@ func (s stubSchedulerClient) UnregisterNode(ctx context.Context, req *schedulerv
 	return s.unregisterNodeFunc(ctx, req, opts...)
 }
 
-const testAPIKey = "test-api-key"
+const (
+	testAPIKey          = "test-api-key"
+	testAccessTokenSeed = "test-access-token-seed"
+)
 
 type testServerOption func(*ServerOptions)
 
@@ -156,9 +159,10 @@ func newTestServer(t *testing.T, schedulerClient schedulerv1.SchedulerClient, ti
 	t.Helper()
 
 	options := ServerOptions{
-		RequestTimeout:  timeout,
-		MaxResponseSize: maxRespSize,
-		APIKey:          testAPIKey,
+		RequestTimeout:         timeout,
+		MaxResponseSize:        maxRespSize,
+		APIKey:                 testAPIKey,
+		SandboxAccessTokenSeed: testAccessTokenSeed,
 	}
 	for _, opt := range opts {
 		opt(&options)
@@ -186,6 +190,17 @@ func TestNewServerRejectsEmptyAPIKey(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("NewServer accepted an empty API key")
+	}
+}
+
+func TestNewServerRejectsEmptySandboxAccessTokenSeed(t *testing.T) {
+	_, err := NewServer(zap.NewNop(), stubSchedulerClient{}, ServerOptions{
+		APIKey:          testAPIKey,
+		RequestTimeout:  time.Second,
+		MaxResponseSize: 1024,
+	})
+	if err == nil {
+		t.Fatal("NewServer accepted an empty sandbox access-token seed")
 	}
 }
 
@@ -262,7 +277,7 @@ func TestGatewayAcceptsSandboxScopedTrafficToken(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/proxy", nil)
 	req.Header.Set(headerE2BSandboxID, sandboxID)
 	req.Header.Set(headerE2BTargetPort, "49983")
-	req.Header.Set(headerTrafficToken, trafficAccessToken([]byte(testAPIKey), sandboxID))
+	req.Header.Set(headerTrafficToken, trafficAccessToken([]byte(testAccessTokenSeed), sandboxID))
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 	if recorder.Code == http.StatusUnauthorized || lookupCalls != 1 {
@@ -272,7 +287,7 @@ func TestGatewayAcceptsSandboxScopedTrafficToken(t *testing.T) {
 	req = httptest.NewRequest(http.MethodGet, "/proxy", nil)
 	req.Header.Set(headerE2BSandboxID, sandboxID)
 	req.Header.Set(headerE2BTargetPort, "49983")
-	req.Header.Set(headerTrafficToken, trafficAccessToken([]byte(testAPIKey), "another-sandbox"))
+	req.Header.Set(headerTrafficToken, trafficAccessToken([]byte(testAccessTokenSeed), "another-sandbox"))
 	recorder = httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusUnauthorized || lookupCalls != 1 {
@@ -282,7 +297,7 @@ func TestGatewayAcceptsSandboxScopedTrafficToken(t *testing.T) {
 	req = httptest.NewRequest(http.MethodGet, "/proxy", nil)
 	req.Header.Set(headerE2BSandboxID, sandboxID)
 	req.Header.Set(headerE2BTargetPort, "8080")
-	req.Header.Set("X-Access-Token", trafficAccessToken([]byte(testAPIKey), sandboxID))
+	req.Header.Set("X-Access-Token", trafficAccessToken([]byte(testAccessTokenSeed), sandboxID))
 	recorder = httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 	if recorder.Code != http.StatusUnauthorized || lookupCalls != 1 {
@@ -291,7 +306,7 @@ func TestGatewayAcceptsSandboxScopedTrafficToken(t *testing.T) {
 
 	req = httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/pause", nil)
 	req.Header.Set(headerE2BSandboxID, sandboxID)
-	req.Header.Set(headerTrafficToken, trafficAccessToken([]byte(testAPIKey), sandboxID))
+	req.Header.Set(headerTrafficToken, trafficAccessToken([]byte(testAccessTokenSeed), sandboxID))
 	recorder = httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
 
@@ -302,8 +317,8 @@ func TestGatewayAcceptsSandboxScopedTrafficToken(t *testing.T) {
 
 func TestTrafficAccessTokenVector(t *testing.T) {
 	const sandboxID = "0191f4d0-7b2a-7c11-9c2d-0123456789ab"
-	const want = "aenv_trf_PwHqhTxLa_mzUCNIGx03uiTHxZ3k995pKDOS50PaGWo"
-	if got := trafficAccessToken([]byte("test-key"), sandboxID); got != want {
+	const want = "f5457a589b09265b169392dd49506ec70458f685cf2ba7fc2c5b4763c42a5b17"
+	if got := trafficAccessToken([]byte("test-seed"), sandboxID); got != want {
 		t.Fatalf("trafficAccessToken() = %q, want %q", got, want)
 	}
 }

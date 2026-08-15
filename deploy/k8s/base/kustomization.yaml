@@ -34,6 +34,7 @@ secretGenerator:
   - name: agentenv-auth
     literals:
       - AENV_API_KEY=
+      - AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED=
 
 images:
   - name: agentenv-gateway

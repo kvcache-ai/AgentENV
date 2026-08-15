@@ -162,12 +162,12 @@ where
         // Restore persisted sandboxes from the previous run, keeping the paused
         // ones (with their state) for the paused-protection reconcile below.
         let persisted = persister.load_all(&factory).await?;
-        let managed_seed_must_exist = persisted.iter().any(|metadata| metadata.secure);
+        let managed_seed_must_exist = !persisted.is_empty();
         let access_tokens = tokio::task::spawn_blocking(move || {
             SandboxAccessTokenGenerator::load_or_create(app_config, managed_seed_must_exist)
         })
         .await
-        .context("join envd access-token seed loader")??;
+        .context("join sandbox access-token seed loader")??;
         let restored_paused: Vec<(SandboxId, Arc<dyn PausedSandboxState>)> = persisted
             .iter()
             .filter(|metadata| metadata.state == SandboxState::Paused)
@@ -739,6 +739,14 @@ where
 
     pub fn validate_envd_access_token(&self, sandbox_id: SandboxId, candidate: &str) -> bool {
         self.access_tokens.matches(sandbox_id, candidate)
+    }
+
+    pub fn traffic_access_token(&self, sandbox_id: SandboxId) -> String {
+        self.access_tokens.generate_traffic(sandbox_id)
+    }
+
+    pub fn validate_traffic_access_token(&self, sandbox_id: SandboxId, candidate: &str) -> bool {
+        self.access_tokens.matches_traffic(sandbox_id, candidate)
     }
 
     /// Resolves the current proxyability of a sandbox without touching the sandbox mutex.

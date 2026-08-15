@@ -73,13 +73,15 @@ Start gateway with the same API key configured on every AgentENV runtime node:
 
 ```bash
 export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
+export AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED="$(openssl rand -hex 32)"
 make run-gateway
 ```
 
 The default local config uses `127.0.0.1:9090` for the scheduler.
 
-The gateway and runtime nodes require the same API key. The gateway reads an
-explicit `AENV_API_KEY` or `/run/secrets/api-key`; it does not generate one.
+The gateway and runtime nodes require the same API key and sandbox access-token
+seed. The gateway reads explicit environment values or the corresponding files
+under `/run/secrets`; it does not generate either secret.
 Application proxy requests may additionally use the sandbox response's
 `trafficAccessToken` in the `e2b-traffic-access-token` header.
 

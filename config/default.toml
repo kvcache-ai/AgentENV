@@ -188,7 +188,7 @@ init_timeout_secs = 60
 poll_ms = 3
 
 [sandbox]
-# Optional secret used to derive per-sandbox envd access tokens. When unset,
+# Optional secret used to derive per-sandbox envd and traffic access tokens. When unset,
 # AgentENV creates a node-local seed under $AENV_HOME/secrets. Configure the
 # same explicit value on every node when cross-node sandbox recovery is required.
 # access_token_hash_seed = "replace-with-a-secret"

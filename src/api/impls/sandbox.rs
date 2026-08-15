@@ -214,15 +214,14 @@ impl From<SandboxMetadata> for models::SandboxDetail {
 
 impl ApiImpl {
     fn sandbox_model(&self, metadata: SandboxMetadata) -> models::Sandbox {
+        let traffic_access_token = self.traffic_access_token(metadata.id);
         let envd_access_token = self
             .orchestrator
             .get_envd_access_token(&metadata)
             .map(|token| token.expose().to_owned());
         let mut sandbox = models::Sandbox::from(metadata);
         sandbox.envd_access_token = envd_access_token;
-        sandbox.traffic_access_token = Some(Nullable::Present(
-            self.traffic_access_token(&sandbox.sandbox_id),
-        ));
+        sandbox.traffic_access_token = Some(Nullable::Present(traffic_access_token));
         sandbox.domain = self
             .sandbox_proxy_domains()
             .first()

@@ -1,3 +1,4 @@
+use agentenv_http_server::apis;
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -6,20 +7,13 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-
-use agentenv_http_server::apis;
 
 use super::{ApiImpl, Claims};
-use crate::api::proxy;
+use crate::{api::proxy, types::SandboxId};
 
 pub(crate) const API_KEY_HEADER: &str = "x-api-key";
 pub(crate) const TRAFFIC_ACCESS_TOKEN_HEADER: &str = "e2b-traffic-access-token";
 pub(crate) const ENVD_ACCESS_TOKEN_HEADER: &str = "x-access-token";
-const TRAFFIC_TOKEN_PREFIX: &str = "aenv_trf_";
-const TRAFFIC_TOKEN_CONTEXT: &[u8] = b"agentenv-sandbox-traffic-v1\0";
 
 fn single_header_matches(headers: &HeaderMap, name: &str, expected: &str) -> bool {
     let mut values = headers.get_all(name).iter();
@@ -33,29 +27,26 @@ fn single_header_matches(headers: &HeaderMap, name: &str, expected: &str) -> boo
     value.as_bytes() == expected.as_bytes()
 }
 
-fn derive_traffic_access_token(api_key: &[u8], sandbox_id: &str) -> String {
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(api_key).expect("HMAC accepts API keys of any length");
-    mac.update(TRAFFIC_TOKEN_CONTEXT);
-    mac.update(sandbox_id.as_bytes());
-    format!(
-        "{TRAFFIC_TOKEN_PREFIX}{}",
-        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
-    )
-}
-
 impl ApiImpl {
     pub(crate) fn has_valid_api_key(&self, headers: &HeaderMap) -> bool {
         single_header_matches(headers, API_KEY_HEADER, &self.api_key)
     }
 
-    pub(crate) fn traffic_access_token(&self, sandbox_id: &str) -> String {
-        derive_traffic_access_token(self.api_key.as_bytes(), sandbox_id)
+    pub(crate) fn traffic_access_token(&self, sandbox_id: SandboxId) -> String {
+        self.orchestrator.traffic_access_token(sandbox_id)
     }
 
-    fn has_valid_traffic_access_token(&self, headers: &HeaderMap, sandbox_id: &str) -> bool {
-        let expected = self.traffic_access_token(sandbox_id);
-        single_header_matches(headers, TRAFFIC_ACCESS_TOKEN_HEADER, &expected)
+    fn has_valid_traffic_access_token(&self, headers: &HeaderMap, sandbox_id: SandboxId) -> bool {
+        let mut values = headers.get_all(TRAFFIC_ACCESS_TOKEN_HEADER).iter();
+        let Some(candidate) = values.next().and_then(|value| value.to_str().ok()) else {
+            return false;
+        };
+        if values.next().is_some() {
+            return false;
+        }
+
+        self.orchestrator
+            .validate_traffic_access_token(sandbox_id, candidate)
     }
 }
 
@@ -80,7 +71,7 @@ where
                 .is_some_and(|sandbox_id| {
                     api_impl
                         .as_ref()
-                        .has_valid_traffic_access_token(request.headers(), &sandbox_id)
+                        .has_valid_traffic_access_token(request.headers(), sandbox_id)
                 });
     }
     if !authorized && proxy_request {
@@ -164,13 +155,5 @@ mod tests {
             API_KEY_HEADER,
             "correct-key"
         ));
-    }
-
-    #[test]
-    fn traffic_access_token_matches_gateway_contract() {
-        assert_eq!(
-            derive_traffic_access_token(b"test-key", "0191f4d0-7b2a-7c11-9c2d-0123456789ab"),
-            "aenv_trf_PwHqhTxLa_mzUCNIGx03uiTHxZ3k995pKDOS50PaGWo"
-        );
     }
 }

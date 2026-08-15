@@ -17,44 +17,34 @@ The API and SDKs return the sandbox's `envdAccessToken` where appropriate and at
 
 ## Access-Token Seed
 
-A seed is a random value used to derive the access token for each sandbox. This seed is optional. When it is unset, each runtime node automatically creates and persists a node-local seed under `$AENV_HOME/secrets`.
+A seed is a random value used to derive each sandbox's envd and traffic access tokens. This seed is optional for a standalone runtime. When it is unset, the runtime automatically creates and persists a seed under `$AENV_HOME/secrets`.
 This is sufficient for normal single-node operation and does not require additional setup.
 
-Configure the same explicit seed on every runtime node when the deployment needs to recover the same sandbox ID on another node in the future. Generate it once and store it in the deployment's secret manager:
+Configure the same explicit seed on the gateway and every runtime node in a clustered deployment. Generate it once and store it in the deployment's secret manager:
 
 ```bash
 openssl rand -hex 32
 ```
 
-Set the value as `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` on every runtime node.
+Set the value as `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` on the gateway and every runtime node.
 For TOML configuration, use `[sandbox].access_token_hash_seed` instead.
+Container deployments may mount it at
+`/run/secrets/sandbox-access-token-hash-seed`.
 
-Preserve the seed across upgrades; changing it rotates access tokens for existing secure sandboxes.
+Preserve the seed across upgrades; changing it rotates both sandbox access tokens.
 
 ### Kubernetes
 
-The runtime DaemonSet reads the optional `agentenv-runtime-secrets` Secret. To configure a shared seed for all runtime Pods, create it before applying the runtime manifests:
+`make k8s-apply` generates and preserves the seed in `Secret/agentenv-auth`, then injects it into the gateway and runtime Pods. Set `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` before applying to supply your own value.
 
-```bash
-kubectl apply -f deploy/k8s/base/namespace.yaml
-
-AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED="$(openssl rand -hex 32)"
-kubectl -n agentenv-system create secret generic agentenv-runtime-secrets \
-  --from-literal="sandbox-access-token-hash-seed=${AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED}" \
-  --dry-run=client -o yaml | kubectl apply -f -
-unset AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED
-```
-
-Run this once for a new cluster and preserve the existing Secret during upgrades. An external secret manager may be used instead, provided it creates the same Secret name and key:
+An external secret manager may provide the same Secret and key:
 
 ```yaml
 apiVersion: v1
 kind: Secret
 metadata:
-  name: agentenv-runtime-secrets
+  name: agentenv-auth
   namespace: agentenv-system
 stringData:
-  sandbox-access-token-hash-seed: <shared-secret>
+  AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED: <shared-secret>
 ```
-
-If the Secret is not created, the DaemonSet still starts and each runtime Pod uses its automatically managed node-local seed.

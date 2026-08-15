@@ -5,7 +5,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
-	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -28,8 +28,7 @@ const (
 	headerAPIKey               = "X-API-Key"
 	headerTrafficToken         = "e2b-traffic-access-token"
 	headerEnvdAccessToken      = "X-Access-Token"
-	trafficTokenPrefix         = "aenv_trf_"
-	trafficTokenContext        = "agentenv-sandbox-traffic-v1\x00"
+	trafficTokenPrefix         = "sandbox-traffic"
 	envdControlPlanePort       = 49983
 	headerSandboxID            = "x-agentenv-sandbox-id"
 	headerE2BSandboxID         = "e2b-sandbox-id"
@@ -51,6 +50,7 @@ const (
 
 type ServerOptions struct {
 	APIKey                   string
+	SandboxAccessTokenSeed   string
 	RequestTimeout           time.Duration
 	MaxResponseSize          int64
 	DebugMode                bool
@@ -64,6 +64,7 @@ type Server struct {
 	queryOnlyScheduler schedulerv1.SchedulerClient
 	httpClient         *http.Client
 	apiKey             []byte
+	accessTokenSeed    []byte
 	requestTimeout     time.Duration
 	maxRespSize        int64
 	// debugMode, when true, enables debug-only behaviors such as exposing
@@ -77,6 +78,10 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 	apiKey := strings.TrimSpace(options.APIKey)
 	if apiKey == "" {
 		return nil, errors.New("API key is required")
+	}
+	accessTokenSeed := strings.TrimSpace(options.SandboxAccessTokenSeed)
+	if accessTokenSeed == "" {
+		return nil, errors.New("sandbox access-token seed is required")
 	}
 
 	sandboxProxyDomains, err := normalizeProxyDomains(options.SandboxProxyDomains)
@@ -97,6 +102,7 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		requestTimeout:      options.RequestTimeout,
 		maxRespSize:         options.MaxResponseSize,
 		apiKey:              []byte(apiKey),
+		accessTokenSeed:     []byte(accessTokenSeed),
 		debugMode:           options.DebugMode,
 		sandboxProxyDomains: sandboxProxyDomains,
 	}, nil
@@ -835,11 +841,10 @@ func singleHeaderMatches(headers http.Header, name string, expected []byte) bool
 	return len(values) == 1 && bytes.Equal([]byte(values[0]), expected)
 }
 
-func trafficAccessToken(apiKey []byte, sandboxID string) string {
-	mac := hmac.New(sha256.New, apiKey)
-	_, _ = mac.Write([]byte(trafficTokenContext))
-	_, _ = mac.Write([]byte(sandboxID))
-	return trafficTokenPrefix + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+func trafficAccessToken(seed []byte, sandboxID string) string {
+	mac := hmac.New(sha256.New, seed)
+	_, _ = mac.Write([]byte(trafficTokenPrefix + "-" + sandboxID))
+	return hex.EncodeToString(mac.Sum(nil))
 }
 
 func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
@@ -898,7 +903,7 @@ func (s *Server) authenticate(next http.Handler) http.Handler {
 		authorized := singleHeaderMatches(r.Header, headerAPIKey, s.apiKey)
 		if !authorized && dataPlane {
 			if sandboxID, ok := s.sandboxIDForDataPlaneAuth(r); ok {
-				expected := trafficAccessToken(s.apiKey, sandboxID)
+				expected := trafficAccessToken(s.accessTokenSeed, sandboxID)
 				authorized = singleHeaderMatches(r.Header, headerTrafficToken, []byte(expected))
 			}
 		}

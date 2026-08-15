@@ -25,8 +25,10 @@ import (
 )
 
 const (
-	apiKeyEnv         = "AENV_API_KEY"
-	defaultAPIKeyPath = "/run/secrets/api-key"
+	apiKeyEnv                  = "AENV_API_KEY"
+	accessTokenSeedEnv         = "AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED"
+	defaultAPIKeyPath          = "/run/secrets/api-key"
+	defaultAccessTokenSeedPath = "/run/secrets/sandbox-access-token-hash-seed"
 )
 
 func newSchedulerConn(addr string) (*grpc.ClientConn, error) {
@@ -41,18 +43,35 @@ func loadAPIKey() (string, error) {
 }
 
 func loadAPIKeyFrom(lookupEnv func(string) (string, bool), secretPath string) (string, error) {
-	if value, present := lookupEnv(apiKeyEnv); present {
-		return validateAPIKey(value, apiKeyEnv)
+	return loadSecretFrom(lookupEnv, apiKeyEnv, secretPath, validateAPIKey)
+}
+
+func loadAccessTokenSeed() (string, error) {
+	return loadAccessTokenSeedFrom(os.LookupEnv, defaultAccessTokenSeedPath)
+}
+
+func loadAccessTokenSeedFrom(lookupEnv func(string) (string, bool), secretPath string) (string, error) {
+	return loadSecretFrom(lookupEnv, accessTokenSeedEnv, secretPath, validateAccessTokenSeed)
+}
+
+func loadSecretFrom(
+	lookupEnv func(string) (string, bool),
+	envName string,
+	secretPath string,
+	validate func(string, string) (string, error),
+) (string, error) {
+	if value, present := lookupEnv(envName); present {
+		return validate(value, envName)
 	}
 
 	contents, err := os.ReadFile(secretPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return "", fmt.Errorf("%s must be set or %s must exist", apiKeyEnv, secretPath)
+			return "", fmt.Errorf("%s must be set or %s must exist", envName, secretPath)
 		}
-		return "", fmt.Errorf("read API key secret %s: %w", secretPath, err)
+		return "", fmt.Errorf("read secret %s: %w", secretPath, err)
 	}
-	return validateAPIKey(string(contents), secretPath)
+	return validate(string(contents), secretPath)
 }
 
 func validateAPIKey(value, source string) (string, error) {
@@ -72,6 +91,14 @@ func validateAPIKey(value, source string) (string, error) {
 	return value, nil
 }
 
+func validateAccessTokenSeed(value, source string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("sandbox access-token seed from %s must be non-empty", source)
+	}
+	return value, nil
+}
+
 func main() {
 	configPath := flag.String("config", "", "path to JSON config file")
 	flag.Parse()
@@ -83,6 +110,10 @@ func main() {
 	apiKey, err := loadAPIKey()
 	if err != nil {
 		log.Fatalf("load API key failed: %v", err)
+	}
+	accessTokenSeed, err := loadAccessTokenSeed()
+	if err != nil {
+		log.Fatalf("load sandbox access-token seed failed: %v", err)
 	}
 
 	logger, err := logging.New(cfg.LogLevel, cfg.LogFormat)
@@ -113,6 +144,7 @@ func main() {
 		RequestTimeout:           cfg.Gateway.RequestTimeout,
 		MaxResponseSize:          cfg.Gateway.ForwardResponseSize,
 		APIKey:                   apiKey,
+		SandboxAccessTokenSeed:   accessTokenSeed,
 		DebugMode:                cfg.Gateway.DebugMode,
 		SandboxProxyDomains:      cfg.Gateway.SandboxProxyDomains,
 		QueryOnlySchedulerClient: queryOnlySchedulerClient,

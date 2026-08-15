@@ -161,12 +161,11 @@ fn proxy_route_for_auth(request: &Request, domains: &[String]) -> Option<HostPro
     })
 }
 
-pub(crate) fn sandbox_id_for_proxy_auth(request: &Request, domains: &[String]) -> Option<String> {
-    Some(
-        proxy_route_for_auth(request, domains)?
-            .sandbox_id
-            .to_string(),
-    )
+pub(crate) fn sandbox_id_for_proxy_auth(
+    request: &Request,
+    domains: &[String],
+) -> Option<SandboxId> {
+    Some(proxy_route_for_auth(request, domains)?.sandbox_id)
 }
 
 pub(crate) fn envd_access_token_for_proxy_auth(
@@ -1780,7 +1779,7 @@ mod tests {
         sandbox_id: &SandboxId,
     ) -> (axum::Router, String) {
         let api = build_api().await;
-        let access_token = api.traffic_access_token(&sandbox_id.to_string());
+        let access_token = api.traffic_access_token(*sandbox_id);
         api.orchestrator()
             .set_proxy_target_for_test(
                 *sandbox_id,
@@ -1796,7 +1795,7 @@ mod tests {
         domains: Vec<String>,
     ) -> (axum::Router, String) {
         let api = build_api_with_sandbox_proxy_domains(domains).await;
-        let access_token = api.traffic_access_token(&sandbox_id.to_string());
+        let access_token = api.traffic_access_token(*sandbox_id);
         api.orchestrator()
             .set_proxy_target_for_test(
                 *sandbox_id,
@@ -2006,7 +2005,7 @@ mod tests {
     async fn traffic_token_cannot_authenticate_control_plane() {
         let api = build_api().await;
         let sandbox_id = SandboxId::new();
-        let traffic_token = api.traffic_access_token(&sandbox_id.to_string());
+        let traffic_token = api.traffic_access_token(sandbox_id);
         let app = server::new(api);
         let response = app
             .oneshot(
@@ -2029,7 +2028,7 @@ mod tests {
     async fn envd_token_cannot_authenticate_application_proxy() {
         let api = build_api().await;
         let sandbox_id = SandboxId::new();
-        let traffic_token = api.traffic_access_token(&sandbox_id.to_string());
+        let traffic_token = api.traffic_access_token(sandbox_id);
         let response = server::new(api)
             .oneshot(
                 Request::builder()

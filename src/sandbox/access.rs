@@ -15,9 +15,11 @@ use crate::types::SandboxId;
 type HmacSha256 = Hmac<Sha256>;
 
 const MANAGED_SEED_RELATIVE_PATH: &str = "secrets/sandbox-access-token-hash-seed";
+const EXTERNAL_SEED_PATH: &str = "/run/secrets/sandbox-access-token-hash-seed";
 const MANAGED_SEED_BYTES: usize = 32;
 const SEED_HEX_LEN: usize = MANAGED_SEED_BYTES * 2;
 const MANAGED_SEED_FILE_MAX_LEN: usize = SEED_HEX_LEN + 1;
+const TRAFFIC_ACCESS_TOKEN_PREFIX: &str = "sandbox-traffic";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct EnvdAccessToken(String);
@@ -55,6 +57,24 @@ impl SandboxAccessTokenGenerator {
             return Self::new(seed);
         }
 
+        match fs::read_to_string(EXTERNAL_SEED_PATH) {
+            Ok(seed) => {
+                let generator =
+                    Self::new(&seed).context("invalid external sandbox access-token seed")?;
+                info!(
+                    path = EXTERNAL_SEED_PATH,
+                    "loaded sandbox access-token seed from external secret"
+                );
+                return Ok(generator);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("read external sandbox access-token seed {EXTERNAL_SEED_PATH}")
+                });
+            }
+        }
+
         let managed_seed_path = config.home_path.join(MANAGED_SEED_RELATIVE_PATH);
         let seed = resolve_seed(&managed_seed_path, managed_seed_must_exist)?;
 
@@ -63,7 +83,7 @@ impl SandboxAccessTokenGenerator {
         {
             warn!(
                 path = %managed_seed_path.display(),
-                "using a node-local managed envd access-token seed; configure AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED with the same value on every node before enabling cross-node sandbox recovery"
+                "using a node-local managed sandbox access-token seed; configure AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED with the same value on every node in a clustered deployment"
             );
         }
 
@@ -71,18 +91,37 @@ impl SandboxAccessTokenGenerator {
     }
 
     pub fn generate(&self, subject: SandboxId) -> EnvdAccessToken {
+        EnvdAccessToken(self.generate_for(subject.to_string().as_bytes()))
+    }
+
+    pub fn generate_traffic(&self, subject: SandboxId) -> String {
+        self.generate_for(format!("{TRAFFIC_ACCESS_TOKEN_PREFIX}-{subject}").as_bytes())
+    }
+
+    fn generate_for(&self, subject: &[u8]) -> String {
         let mut mac =
             HmacSha256::new_from_slice(&self.seed).expect("HMAC accepts keys of any length");
-        mac.update(subject.to_string().as_bytes());
-        EnvdAccessToken(hex::encode(mac.finalize().into_bytes()))
+        mac.update(subject);
+        hex::encode(mac.finalize().into_bytes())
     }
 
     pub fn matches(&self, subject: SandboxId, candidate: &str) -> bool {
+        self.matches_for(subject.to_string().as_bytes(), candidate)
+    }
+
+    pub fn matches_traffic(&self, subject: SandboxId, candidate: &str) -> bool {
+        self.matches_for(
+            format!("{TRAFFIC_ACCESS_TOKEN_PREFIX}-{subject}").as_bytes(),
+            candidate,
+        )
+    }
+
+    fn matches_for(&self, subject: &[u8], candidate: &str) -> bool {
         let mut candidate_bytes = [0_u8; 32];
         let decoded = hex::decode_to_slice(candidate, &mut candidate_bytes).is_ok();
         let mut mac =
             HmacSha256::new_from_slice(&self.seed).expect("HMAC accepts keys of any length");
-        mac.update(subject.to_string().as_bytes());
+        mac.update(subject);
         mac.verify_slice(&candidate_bytes).is_ok() & decoded
     }
 }
@@ -98,7 +137,7 @@ fn validate_explicit_seed(seed: &str) -> Result<&str> {
 fn resolve_seed(managed_path: &Path, managed_seed_must_exist: bool) -> Result<String> {
     let parent = managed_path
         .parent()
-        .context("managed envd access-token seed path has no parent")?;
+        .context("managed sandbox access-token seed path has no parent")?;
     match validate_managed_seed_directory(parent) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -115,7 +154,7 @@ fn resolve_seed(managed_path: &Path, managed_seed_must_exist: bool) -> Result<St
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
-                    "open managed envd access-token seed {}",
+                    "open managed sandbox access-token seed {}",
                     managed_path.display()
                 )
             });
@@ -124,7 +163,7 @@ fn resolve_seed(managed_path: &Path, managed_seed_must_exist: bool) -> Result<St
 
     if managed_seed_must_exist {
         bail!(
-            "managed envd access-token seed {} is missing while persisted secure sandboxes exist; restore the file or configure AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED",
+            "managed sandbox access-token seed {} is missing while persisted sandboxes exist; restore the file or configure AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED",
             managed_path.display()
         );
     }
@@ -147,12 +186,15 @@ fn open_managed_seed(path: &Path) -> io::Result<File> {
 }
 
 fn validate_managed_seed_file(path: &Path, file: &File) -> Result<fs::Metadata> {
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("inspect managed envd access-token seed {}", path.display()))?;
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "inspect managed sandbox access-token seed {}",
+            path.display()
+        )
+    })?;
     if !metadata.is_file() {
         bail!(
-            "managed envd access-token seed {} must be a regular file",
+            "managed sandbox access-token seed {} must be a regular file",
             path.display()
         );
     }
@@ -164,14 +206,14 @@ fn validate_managed_seed_file(path: &Path, file: &File) -> Result<fs::Metadata> 
         let mode = metadata.permissions().mode() & 0o777;
         if mode != 0o600 {
             bail!(
-                "managed envd access-token seed {} must have permissions 0600, found {mode:04o}",
+                "managed sandbox access-token seed {} must have permissions 0600, found {mode:04o}",
                 path.display()
             );
         }
         let expected_uid = nix::unistd::Uid::effective().as_raw();
         if metadata.uid() != expected_uid {
             bail!(
-                "managed envd access-token seed {} must be owned by uid {expected_uid}, found uid {}",
+                "managed sandbox access-token seed {} must be owned by uid {expected_uid}, found uid {}",
                 path.display(),
                 metadata.uid()
             );
@@ -186,7 +228,7 @@ fn read_managed_seed(path: &Path, mut file: File) -> Result<String> {
 
     if metadata.len() > MANAGED_SEED_FILE_MAX_LEN as u64 {
         bail!(
-            "managed envd access-token seed {} must be at most {MANAGED_SEED_FILE_MAX_LEN} bytes",
+            "managed sandbox access-token seed {} must be at most {MANAGED_SEED_FILE_MAX_LEN} bytes",
             path.display()
         );
     }
@@ -195,17 +237,17 @@ fn read_managed_seed(path: &Path, mut file: File) -> Result<String> {
     Read::by_ref(&mut file)
         .take((MANAGED_SEED_FILE_MAX_LEN + 1) as u64)
         .read_to_string(&mut contents)
-        .with_context(|| format!("read managed envd access-token seed {}", path.display()))?;
+        .with_context(|| format!("read managed sandbox access-token seed {}", path.display()))?;
     if contents.len() > MANAGED_SEED_FILE_MAX_LEN {
         bail!(
-            "managed envd access-token seed {} must be at most {MANAGED_SEED_FILE_MAX_LEN} bytes",
+            "managed sandbox access-token seed {} must be at most {MANAGED_SEED_FILE_MAX_LEN} bytes",
             path.display()
         );
     }
     let seed = contents.strip_suffix('\n').unwrap_or(&contents);
     if !is_valid_managed_seed(seed) {
         bail!(
-            "managed envd access-token seed {} must contain exactly {SEED_HEX_LEN} lowercase hexadecimal characters, optionally followed by a newline",
+            "managed sandbox access-token seed {} must contain exactly {SEED_HEX_LEN} lowercase hexadecimal characters, optionally followed by a newline",
             path.display()
         );
     }
@@ -216,7 +258,7 @@ fn read_managed_seed(path: &Path, mut file: File) -> Result<String> {
 fn create_managed_seed(path: &Path) -> Result<String> {
     let parent = path
         .parent()
-        .context("managed envd access-token seed path has no parent")?;
+        .context("managed sandbox access-token seed path has no parent")?;
     fs::create_dir_all(parent)
         .with_context(|| format!("create managed secret directory {}", parent.display()))?;
     validate_managed_seed_directory_identity(parent).with_context(|| {
@@ -232,7 +274,7 @@ fn create_managed_seed(path: &Path) -> Result<String> {
     let mut random = [0_u8; MANAGED_SEED_BYTES];
     SysRng
         .try_fill_bytes(&mut random)
-        .context("generate managed envd access-token seed")?;
+        .context("generate managed sandbox access-token seed")?;
     let seed = hex::encode(random);
 
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
@@ -250,17 +292,21 @@ fn create_managed_seed(path: &Path) -> Result<String> {
             fs::File::open(parent)
                 .and_then(|directory| directory.sync_all())
                 .with_context(|| format!("sync managed secret directory {}", parent.display()))?;
-            info!(path = %path.display(), "generated managed envd access-token seed");
+            info!(path = %path.display(), "generated managed sandbox access-token seed");
             Ok(seed)
         }
         Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => {
             let file = open_managed_seed(path).with_context(|| {
-                format!("open managed envd access-token seed {}", path.display())
+                format!("open managed sandbox access-token seed {}", path.display())
             })?;
             read_managed_seed(path, file)
         }
-        Err(error) => Err(error.error)
-            .with_context(|| format!("persist managed envd access-token seed {}", path.display())),
+        Err(error) => Err(error.error).with_context(|| {
+            format!(
+                "persist managed sandbox access-token seed {}",
+                path.display()
+            )
+        }),
     }
 }
 
@@ -350,22 +396,31 @@ mod tests {
     }
 
     #[test]
-    fn generates_lowercase_hex_hmac_sha256() {
+    fn generates_e2b_compatible_access_tokens() {
         let generator = SandboxAccessTokenGenerator::new("test-seed").unwrap();
         let subject = SandboxId::try_from("01936f8e-72f5-7000-8000-000000000001").unwrap();
 
-        let token = generator.generate(subject);
+        let envd_token = generator.generate(subject);
+        let traffic_token = generator.generate_traffic(subject);
 
-        assert_eq!(token.expose().len(), 64);
         assert_eq!(
-            token.expose(),
+            envd_token.expose(),
             "4f00f2a93a87c37161ae01c59b6d4f84506668113441277e9f6272dd4bfae1a7"
         );
-        assert!(token.expose().bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_eq!(token.expose(), token.expose().to_ascii_lowercase());
-        assert!(generator.matches(subject, token.expose()));
+        assert_eq!(
+            traffic_token,
+            "586547d7c10facb0f4871297fdbfd9d2b4376f4b02b2e1487646c1c87a293bd8"
+        );
+        assert!(envd_token
+            .expose()
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+        assert!(traffic_token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(generator.matches(subject, envd_token.expose()));
+        assert!(generator.matches_traffic(subject, &traffic_token));
         assert!(!generator.matches(subject, "not-a-token"));
         assert!(!generator.matches(subject, &"0".repeat(64)));
+        assert!(!generator.matches_traffic(subject, envd_token.expose()));
     }
 
     #[test]
@@ -511,7 +566,7 @@ mod tests {
 
         assert!(error
             .to_string()
-            .contains("open managed envd access-token seed"));
+            .contains("open managed sandbox access-token seed"));
         Ok(())
     }
 
@@ -562,15 +617,13 @@ mod tests {
     }
 
     #[test]
-    fn missing_managed_seed_is_not_recreated_for_secure_state() -> Result<()> {
+    fn missing_managed_seed_is_not_recreated_for_persisted_state() -> Result<()> {
         let temp = TempDir::new()?;
         let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
 
         let error = resolve_seed(&managed_path, true).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("persisted secure sandboxes exist"));
+        assert!(error.to_string().contains("persisted sandboxes exist"));
         assert!(!managed_path.exists());
         Ok(())
     }
