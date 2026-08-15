@@ -44,9 +44,9 @@ If your server does not support standard KVM, see the [PVM deployment guide](htt
 ## ⚡ Quick Start (Single Node)
 
 > [!WARNING]
-> **AgentENV currently does not support authorization.** Do not expose the AgentENV
-> API to the public network. Run it only on a trusted network or behind an
-> authorization proxy with appropriate network controls.
+> AgentENV authenticates API requests but does not encrypt traffic. Do not send
+> the API key over an untrusted plaintext network. Run AgentENV on a trusted
+> network or terminate HTTPS at a reverse proxy or load balancer.
 
 **1. Install and start the server**
 
@@ -66,7 +66,7 @@ Set up the server:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/docker-setup.sh | sudo bash
 docker pull ghcr.io/kvcache-ai/aenv-server:latest
-docker run -d --privileged -v /dev:/dev -p 8000:8000 ghcr.io/kvcache-ai/aenv-server:latest
+docker run -d --name aenv-server --privileged -v /dev:/dev -p 8000:8000 ghcr.io/kvcache-ai/aenv-server:latest
 ```
 
 The server is accessible at `http://127.0.0.1:8000` by default.
@@ -83,10 +83,23 @@ curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/in
 
 **3. Authenticate**
 
+The server generates an API key on its first startup. Retrieve it for the
+installation method used in step 1:
+
+```bash
+# Native install
+sudo cat /var/lib/aenv/secrets/api-key
+
+# Docker
+docker exec aenv-server cat /workspace/env/secrets/api-key
+```
+
+Then run `aenv auth` and paste that key:
+
 ```bash
 aenv auth
 # AENV server URL [http://localhost:8000]: http://127.0.0.1:8000
-# API key: dummy
+# API key: <paste the generated key>
 ```
 
 **4. Pull a template and run a sandbox**
