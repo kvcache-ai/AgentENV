@@ -73,18 +73,40 @@ impl SandboxNetworkEgressPolicy {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SandboxNetworkPolicy {
+    #[serde(default = "default_allow_public_traffic")]
+    pub allow_public_traffic: bool,
     pub base_policy: BaseSandboxNetworkPolicy,
     pub egress: SandboxNetworkEgressPolicy,
+}
+
+fn default_allow_public_traffic() -> bool {
+    true
+}
+
+impl Default for SandboxNetworkPolicy {
+    fn default() -> Self {
+        Self {
+            allow_public_traffic: true,
+            base_policy: BaseSandboxNetworkPolicy::default(),
+            egress: SandboxNetworkEgressPolicy::default(),
+        }
+    }
 }
 
 impl SandboxNetworkPolicy {
     pub fn new(base_policy: BaseSandboxNetworkPolicy, egress: SandboxNetworkEgressPolicy) -> Self {
         Self {
+            allow_public_traffic: true,
             base_policy,
             egress,
         }
+    }
+
+    pub fn with_allow_public_traffic(mut self, allow_public_traffic: bool) -> Self {
+        self.allow_public_traffic = allow_public_traffic;
+        self
     }
 
     pub(crate) fn runtime_policy(&self) -> Option<Self> {
@@ -335,14 +357,29 @@ mod tests {
             SandboxNetworkEgressPolicy::new(Some(vec!["8.8.8.8/32".to_string()]), None).unwrap(),
         );
 
+        assert!(policy.allow_public_traffic);
         assert_eq!(policy.base_policy, BaseSandboxNetworkPolicy::Deny);
         assert!(policy.egress.denied_cidrs.is_empty());
         assert!(policy.has_runtime_egress_rules());
     }
 
     #[test]
+    fn missing_ingress_policy_deserializes_as_public() {
+        let mut value = serde_json::to_value(SandboxNetworkPolicy::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("allow_public_traffic");
+
+        let policy: SandboxNetworkPolicy = serde_json::from_value(value).unwrap();
+
+        assert!(policy.allow_public_traffic);
+    }
+
+    #[test]
     fn build_rules_keeps_allow_before_deny() {
         let policy = SandboxNetworkPolicy {
+            allow_public_traffic: true,
             base_policy: BaseSandboxNetworkPolicy::Deny,
             egress: SandboxNetworkEgressPolicy {
                 allowed_cidrs: vec!["8.8.8.8/32".to_string()],
@@ -371,6 +408,7 @@ mod tests {
     #[test]
     fn build_policy_replacement_flushes_before_installing_rules() {
         let policy = SandboxNetworkPolicy {
+            allow_public_traffic: true,
             base_policy: BaseSandboxNetworkPolicy::Deny,
             egress: SandboxNetworkEgressPolicy {
                 allowed_cidrs: vec!["8.8.8.8/32".to_string()],

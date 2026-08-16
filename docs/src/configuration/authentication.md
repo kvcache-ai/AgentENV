@@ -1,124 +1,61 @@
 # Authentication
 
 AgentENV uses one shared API key for a single-tenant deployment. The gateway
-and every runtime node in a cluster must resolve the same key.
+and every runtime node must use the same value.
 
-Clients authenticate API requests with:
+| Credential | Scope | Header |
+|---|---|---|
+| API key | AgentENV lifecycle and management APIs | `X-API-Key` |
+| `trafficAccessToken` | Application ingress when `allowPublicTraffic` is `false` | `e2b-traffic-access-token` |
+| `envdAccessToken` | Direct envd access for secure sandboxes | `X-Access-Token` |
 
-```text
-X-API-Key: <AENV_API_KEY>
-```
+The credentials are not interchangeable. Public application ingress and envd
+in insecure sandboxes need no AgentENV credential. `Authorization` remains an
+application header and does not authenticate AgentENV. On sandbox routes,
+`X-API-Key` is also treated as application data unless it exactly matches the
+AgentENV API key, in which case it is removed to avoid forwarding the platform
+credential.
 
-`Authorization`, `X-Admin-Token`, and `X-Team-ID` do not authenticate
-AgentENV. The `Authorization` header is left unchanged when a request is
-proxied into a sandbox, so applications inside a sandbox can use it normally.
-`GET /health` is public for load balancer and container health checks.
+`GET /health` and node `GET /metrics` are outside API-key authentication. The
+gateway exposes Prometheus metrics on its separate metrics listener. Protect
+these endpoints with the network and authentication controls used by your
+Prometheus deployment. They are distinct from E2B's authenticated sandbox
+metrics API.
 
-E2B SDK users set `E2B_API_KEY` to the same value. Sandbox create responses
-include an independent `trafficAccessToken`; send it as
-`e2b-traffic-access-token` on application proxy requests. The token is scoped to
-the sandbox and is not accepted for control-plane API calls.
-
-For secure sandboxes, `envdAccessToken` is a separate credential for envd
-control traffic and must be sent as `X-Access-Token` only when targeting the
-envd control-plane port. It is absent for insecure sandboxes.
-
-Both sandbox credentials are derived from the sandbox ID and one independent
-`AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED`. They are not derived from the API key.
+E2B SDK users set `E2B_API_KEY` to the AgentENV API key. Sandbox credentials
+are derived from the sandbox ID and
+`AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED`, independently of the API key.
 
 ## Key Resolution
 
-On normal startup, a runtime node uses the first available source:
+A runtime node checks these sources in order:
 
 1. `AENV_API_KEY`
 2. `/run/secrets/api-key`
 3. `$AENV_HOME/secrets/api-key`
 
-If neither an environment value nor an external secret exists, the server
-generates a 256-bit key and atomically stores it in the managed path with
-`0600` permissions. It reuses that key on later starts. Dependency and host
-setup modes do not create a key.
+If none exists, normal server startup generates and atomically stores a key at
+the managed path. The gateway checks only the first two sources and never
+generates a key.
 
-The gateway uses `AENV_API_KEY` or `/run/secrets/api-key`; it never generates a
-key. Runtime nodes validate sandbox-scoped tokens, so the gateway does not need
-the sandbox seed.
-
-## Installation Methods
-
-For a native installation, start the service once and read the managed key:
-
-```bash
-sudo cat /var/lib/aenv/secrets/api-key
-```
-
-When upgrading an installation that already has `AENV_API_KEY` in
-`/etc/default/aenv`, the installer preserves that entry and the server keeps
-using it. Fresh installations leave key creation to the server.
-
-For a single Docker container, no auth volume is required. The server creates
-the key in its writable container layer:
-
-```bash
-docker exec aenv-server cat /workspace/env/secrets/api-key
-```
-
-Removing the container removes this generated key. Supply an explicit key or
-mount a secret at `/run/secrets/api-key` when it must remain stable across
-container replacements.
-
-The checked-in Compose deployment mounts one named volume read-write on both
-runtime nodes and read-only at `/run/secrets` on the gateway. Concurrent node
-startup is safe: atomic creation makes both nodes converge on the same key and
-sandbox seed. The gateway reads only the API key from that volume. Read it with:
-
-```bash
-docker compose -f deploy/docker-compose.yml exec -T agentenv-a \
-  cat /workspace/env/secrets/api-key
-```
-
-`docker compose down` preserves the key. `docker compose down -v` removes the
-auth volume, so the next startup generates a new key.
-
-`make k8s-apply` creates `Secret/agentenv-auth` with an API key on the first
-apply, then reuses it. Read the key with:
-
-```bash
-kubectl -n agentenv-system get secret agentenv-auth \
-  -o go-template='{{index .data "AENV_API_KEY" | base64decode}}{{"\n"}}'
-```
-
-For a single-node manual build, start the server and read
-`$AENV_HOME/secrets/api-key`. To provide your own key instead, export it before
-startup:
+Custom keys must contain 32 to 4096 URL-safe characters. Generated keys use an
+E2B-compatible `e2b_` prefix. For example:
 
 ```bash
 export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
-make start-server
 ```
 
-Custom keys must contain between 32 and 4096 URL-safe characters. In a multi-node
-deployment, use exactly the same value for the gateway and every runtime node.
-The generated keys use `e2b_` followed by hexadecimal characters so they pass
-the E2B SDK default API-key validation. Use that format for custom keys when
-you need E2B SDK compatibility.
+Docker Compose shares one managed-secret volume between runtime nodes and
+mounts it read-only on the gateway. Kubernetes stores the key in
+`Secret/agentenv-auth`. See the corresponding deployment guide for commands to
+read or supply those values. Multi-node deployments must also share one
+`AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` across runtime nodes.
 
-Docker Compose secrets can supply a pre-existing key without another AgentENV
-configuration variable. In an override file, define a file-backed secret and
-mount it with `target: api-key` on the gateway and every runtime node. Compose
-then exposes the standard `/run/secrets/api-key` path. Compose secret sources
-must already exist, so the named-volume setup remains the zero-configuration
-default that allows Rust to generate the key during startup.
+## Security and Rotation
 
-## Transport Security
+API-key authentication does not encrypt traffic. Use HTTPS termination, a VPN,
+loopback, or a trusted private network.
 
-API key authentication does not encrypt HTTP traffic. Do not send the key over
-an untrusted plaintext network. Keep AgentENV on loopback or a trusted private
-network, use a VPN, or terminate HTTPS at a reverse proxy or load balancer.
-
-## Rotation
-
-Changing `AENV_API_KEY` invalidates existing client API credentials without
-changing sandbox credentials; apply it to the gateway and every runtime node
-together. Changing
-`AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` rotates both `trafficAccessToken` and
-`envdAccessToken` values and must be changed on every runtime node together.
+Changing `AENV_API_KEY` invalidates API clients without changing sandbox
+credentials. Changing `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` rotates both
+sandbox token types. Apply either change to all relevant processes together.

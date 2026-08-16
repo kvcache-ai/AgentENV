@@ -58,9 +58,7 @@ impl SandboxAccessTokenGenerator {
         let managed_seed_path = config.home_path.join(MANAGED_SEED_RELATIVE_PATH);
         let seed = resolve_seed(&managed_seed_path, managed_seed_must_exist)?;
 
-        if config.sandbox.access_token_hash_seed.is_none()
-            && config.cluster.scheduler_endpoint.is_some()
-        {
+        if config.cluster.scheduler_endpoint.is_some() {
             warn!(
                 path = %managed_seed_path.display(),
                 "using a node-local managed sandbox access-token seed; configure AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED with the same value on every node in a clustered deployment"
@@ -121,7 +119,7 @@ fn resolve_seed(managed_path: &Path, managed_seed_must_exist: bool) -> Result<St
 
     if managed_seed_must_exist {
         bail!(
-            "managed sandbox access-token seed {} is missing while persisted sandboxes exist; restore the file or configure AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED",
+            "managed sandbox access-token seed {} is missing while token-protected persisted sandboxes exist; restore the file or configure AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED",
             managed_path.display()
         );
     }
@@ -377,20 +375,6 @@ mod tests {
         let error = resolve_seed(&managed_path, false).unwrap_err();
 
         assert!(error.to_string().contains("must be at most 65 bytes"));
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn permissive_managed_seed_directory_is_rejected() -> Result<()> {
-        let temp = TempDir::new()?;
-        let managed_path = temp.path().join(MANAGED_SEED_RELATIVE_PATH);
-        fs::create_dir_all(managed_path.parent().unwrap())?;
-        set_test_permissions(managed_path.parent().unwrap(), 0o770)?;
-
-        let error = resolve_seed(&managed_path, false).unwrap_err();
-
-        assert!(format!("{error:#}").contains("permissions 0700"));
         Ok(())
     }
 

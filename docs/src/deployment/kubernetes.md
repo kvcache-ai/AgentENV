@@ -71,8 +71,8 @@ kubectl -n agentenv-system get secret agentenv-auth \
 ```
 
 Set `AENV_API_KEY` when applying to supply your own value. A standalone
-`make k8s-render` uses a temporary generated value because it does not modify or
-read cluster state. The optional runtime seed keeps its existing
+`make k8s-render` uses an invalid `REDACTED` placeholder so preview output never
+contains a deployable API key. The optional runtime seed keeps its existing
 `agentenv-runtime-secrets` contract described in
 [Secure Sandboxes](../security/secure-sandboxes.md).
 

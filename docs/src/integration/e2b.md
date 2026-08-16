@@ -15,12 +15,13 @@ export E2B_SANDBOX_URL=${E2B_API_URL}
 export E2B_API_KEY=${AENV_API_KEY}
 ```
 
-No `E2B_ACCESS_TOKEN` is needed. AgentENV returns `trafficAccessToken` for
-application proxy traffic and (for secure sandboxes) `envdAccessToken` for envd
-control traffic. These credentials have different headers and trust boundaries:
-use `e2b-traffic-access-token` for application routes and `X-Access-Token` only
-for envd. This is transport data, not the deprecated user-supplied
-`E2B_ACCESS_TOKEN`.
+No `E2B_ACCESS_TOKEN` is needed. AgentENV returns `trafficAccessToken` when
+`network.allowPublicTraffic` is false and (for secure sandboxes)
+`envdAccessToken` for envd control traffic. These credentials have different
+headers and trust boundaries: use `e2b-traffic-access-token` for private
+application routes and `X-Access-Token` only for envd. Public application
+routes require neither token. This is transport data, not the deprecated
+user-supplied `E2B_ACCESS_TOKEN`.
 
 ### TypeScript SDK
 

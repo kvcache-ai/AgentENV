@@ -76,10 +76,10 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let api_key = agentenv::api_key::resolve(config)?;
-
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
+
+    let api_key = agentenv::api_key::resolve(config)?;
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
     let identity = NodeIdentity::from_config(&config.node_identity);

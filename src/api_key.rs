@@ -1,5 +1,5 @@
 use std::ffi::OsStr;
-use std::fs::{self, File};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::Path;
 
@@ -49,14 +49,6 @@ fn resolve_from(
     }
 
     let managed_path = home_path.join(MANAGED_API_KEY_RELATIVE_PATH);
-    match fs::symlink_metadata(&managed_path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return create(&managed_path),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("inspect managed API key {}", managed_path.display()));
-        }
-        Ok(_) => {}
-    }
     if let Some(value) =
         managed_secret::read(&managed_path, API_KEY_FILE_MAX_LEN).context("load managed API key")?
     {
@@ -67,8 +59,29 @@ fn resolve_from(
 }
 
 fn read_external(path: &Path) -> Result<String, io::Error> {
-    let value = read_bounded(File::open(path)?)?;
+    let file = open_external(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "API key secret must be a regular file",
+        ));
+    }
+    let value = read_bounded(file)?;
     validate_file_contents(&value).map_err(io::Error::other)
+}
+
+fn open_external(path: &Path) -> Result<File, io::Error> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+
+    options.open(path)
 }
 
 fn read_bounded(file: File) -> Result<String, io::Error> {
@@ -123,7 +136,7 @@ fn create(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Barrier};
+    use std::fs;
 
     use tempfile::TempDir;
 
@@ -141,6 +154,34 @@ mod tests {
         );
         assert_eq!(resolve_from(None, &external_path, temp.path())?, TEST_KEY);
         assert!(!temp.path().join(MANAGED_API_KEY_RELATIVE_PATH).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn external_secret_must_be_a_regular_file() -> Result<()> {
+        let temp = TempDir::new()?;
+        let external_path = temp.path().join("external");
+        fs::create_dir(&external_path)?;
+
+        let error = resolve_from(None, &external_path, temp.path()).unwrap_err();
+
+        assert!(error.to_string().contains("load external API key"));
+        assert!(format!("{error:#}").contains("must be a regular file"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn external_secret_allows_kubernetes_style_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new()?;
+        let target_path = temp.path().join("target");
+        let external_path = temp.path().join("external");
+        fs::write(&target_path, format!("{TEST_KEY}\n"))?;
+        symlink(&target_path, &external_path)?;
+
+        assert_eq!(resolve_from(None, &external_path, temp.path())?, TEST_KEY);
         Ok(())
     }
 
@@ -163,33 +204,6 @@ mod tests {
             );
             assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
         }
-        Ok(())
-    }
-
-    #[test]
-    fn concurrent_creation_converges() -> Result<()> {
-        const THREADS: usize = 8;
-        let temp = TempDir::new()?;
-        let home_path = Arc::new(temp.path().to_owned());
-        let external_path = Arc::new(temp.path().join("missing"));
-        let barrier = Arc::new(Barrier::new(THREADS));
-        let handles = (0..THREADS)
-            .map(|_| {
-                let home_path = Arc::clone(&home_path);
-                let external_path = Arc::clone(&external_path);
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    resolve_from(None, &external_path, &home_path)
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let keys = handles
-            .into_iter()
-            .map(|handle| handle.join().expect("API key creation thread panicked"))
-            .collect::<Result<Vec<_>>>()?;
-        assert!(keys.iter().all(|key| key == &keys[0]));
         Ok(())
     }
 }

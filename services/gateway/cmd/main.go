@@ -48,7 +48,7 @@ func loadAPIKeyFrom(lookupEnv func(string) (string, bool), secretPath string) (s
 	if explicit, present := lookupEnv(apiKeyEnv); present {
 		value = explicit
 	} else {
-		file, err := os.Open(secretPath)
+		file, err := openSecretFile(secretPath)
 		if err != nil {
 			if os.IsNotExist(err) {
 				return "", fmt.Errorf("%s must be set or %s must exist", apiKeyEnv, secretPath)
@@ -64,6 +64,28 @@ func loadAPIKeyFrom(lookupEnv func(string) (string, bool), secretPath string) (s
 		source = secretPath
 	}
 	return validateAPIKey(value, source)
+}
+
+func openSecretFile(path string) (*os.File, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return nil, fmt.Errorf("open returned an invalid file descriptor")
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, fmt.Errorf("must be a regular file")
+	}
+	return file, nil
 }
 
 func validateAPIKey(value, source string) (string, error) {

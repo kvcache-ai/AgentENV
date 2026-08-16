@@ -162,7 +162,7 @@ where
         // Restore persisted sandboxes from the previous run, keeping the paused
         // ones (with their state) for the paused-protection reconcile below.
         let persisted = persister.load_all(&factory).await?;
-        let managed_seed_must_exist = !persisted.is_empty();
+        let managed_seed_must_exist = persisted_sandboxes_require_managed_seed(&persisted);
         let access_tokens = tokio::task::spawn_blocking(move || {
             SandboxAccessTokenGenerator::load_or_create(app_config, managed_seed_must_exist)
         })
@@ -1548,7 +1548,7 @@ where
     async fn replace_sandbox_network_policy_inner(
         &self,
         sandbox_id: SandboxId,
-        network_policy: SandboxNetworkPolicy,
+        mut network_policy: SandboxNetworkPolicy,
     ) -> Result<()> {
         let metadata = self
             .store
@@ -1561,6 +1561,7 @@ where
                 state: metadata.state,
             });
         }
+        network_policy.allow_public_traffic = metadata.network_policy.allow_public_traffic;
 
         let sandbox = {
             let sandboxes = self.sandboxes.read().await;
@@ -2458,6 +2459,12 @@ where
     }
 }
 
+fn persisted_sandboxes_require_managed_seed(persisted: &[SandboxMetadata]) -> bool {
+    persisted
+        .iter()
+        .any(|metadata| metadata.secure || !metadata.network_policy.allow_public_traffic)
+}
+
 #[cfg(test)]
 impl<S, F, P> Orchestrator<S, F, P>
 where
@@ -2530,6 +2537,19 @@ where
             return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
         };
         metadata.secure = secure;
+        self.store.update(metadata).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn set_allow_public_traffic_for_test(
+        &self,
+        sandbox_id: &SandboxId,
+        allow_public_traffic: bool,
+    ) -> Result<()> {
+        let Some(mut metadata) = self.store.get(sandbox_id).await? else {
+            return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
+        };
+        metadata.network_policy.allow_public_traffic = allow_public_traffic;
         self.store.update(metadata).await?;
         Ok(())
     }

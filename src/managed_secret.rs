@@ -12,22 +12,18 @@ pub(crate) enum CreateOutcome {
 }
 
 pub(crate) fn read(path: &Path, max_len: usize) -> Result<Option<String>> {
-    let parent = path.parent().context("managed secret path has no parent")?;
-    match validate_directory(parent) {
-        Ok(()) => {}
+    ensure_supported()?;
+    let parent = managed_parent(path)?;
+    let file = match open_secret(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(error).with_context(|| {
-                format!("validate managed secret directory {}", parent.display())
-            });
+            return Err(error).with_context(|| format!("open managed secret {}", path.display()));
         }
-    }
-
-    match open(path) {
-        Ok(file) => read_file(path, file, max_len).map(Some),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("open managed secret {}", path.display())),
-    }
+    };
+    validate_directory(parent)
+        .with_context(|| format!("validate managed secret directory {}", parent.display()))?;
+    read_file(path, file, max_len).map(Some)
 }
 
 pub(crate) fn read_file(path: &Path, mut file: File, max_len: usize) -> Result<String> {
@@ -42,7 +38,7 @@ pub(crate) fn read_file(path: &Path, mut file: File, max_len: usize) -> Result<S
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        let mode = metadata.permissions().mode() & 0o777;
+        let mode = metadata.permissions().mode() & 0o7777;
         if mode != 0o600 {
             bail!(
                 "managed secret {} must have permissions 0600, found {mode:04o}",
@@ -65,10 +61,12 @@ pub(crate) fn read_file(path: &Path, mut file: File, max_len: usize) -> Result<S
             path.display()
         );
     }
-
+    let read_limit = max_len
+        .checked_add(1)
+        .context("managed secret size limit is too large")?;
     let mut contents = String::with_capacity(max_len);
     Read::by_ref(&mut file)
-        .take((max_len + 1) as u64)
+        .take(read_limit as u64)
         .read_to_string(&mut contents)
         .with_context(|| format!("read managed secret {}", path.display()))?;
     if contents.len() > max_len {
@@ -82,7 +80,7 @@ pub(crate) fn read_file(path: &Path, mut file: File, max_len: usize) -> Result<S
 
 pub(crate) fn create(path: &Path, contents: &[u8]) -> Result<CreateOutcome> {
     ensure_supported()?;
-    let parent = path.parent().context("managed secret path has no parent")?;
+    let parent = managed_parent(path)?;
     create_directory(parent)?;
     validate_directory_identity(parent).with_context(|| {
         format!(
@@ -116,7 +114,7 @@ pub(crate) fn create(path: &Path, contents: &[u8]) -> Result<CreateOutcome> {
             validate_directory(parent).with_context(|| {
                 format!("validate managed secret directory {}", parent.display())
             })?;
-            open(path)
+            open_secret(path)
                 .map(CreateOutcome::Existing)
                 .with_context(|| format!("open managed secret {}", path.display()))
         }
@@ -126,36 +124,42 @@ pub(crate) fn create(path: &Path, contents: &[u8]) -> Result<CreateOutcome> {
     }
 }
 
+fn managed_parent(path: &Path) -> Result<&Path> {
+    let parent = path.parent().context("managed secret path has no parent")?;
+    if parent.file_name().is_none_or(|name| name != "secrets") {
+        bail!(
+            "managed secret parent {} must be a dedicated directory named secrets",
+            parent.display()
+        );
+    }
+    Ok(parent)
+}
+
 fn create_directory(path: &Path) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-
         builder.mode(0o700);
     }
-
     builder
         .create(path)
         .with_context(|| format!("create managed secret directory {}", path.display()))
 }
 
 #[cfg(unix)]
-fn open(path: &Path) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-
+fn open_secret(path: &Path) -> io::Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-
-    options.open(path)
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
 }
 
 #[cfg(not(unix))]
-fn open(_path: &Path) -> io::Result<File> {
+fn open_secret(_path: &Path) -> io::Result<File> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "managed secrets require Unix no-follow file semantics",
@@ -174,12 +178,11 @@ fn ensure_supported() -> Result<()> {
 
 fn validate_directory(path: &Path) -> io::Result<()> {
     let metadata = validate_directory_identity(path)?;
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
-        let mode = metadata.permissions().mode() & 0o777;
+        let mode = metadata.permissions().mode() & 0o7777;
         if mode != 0o700 {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -187,7 +190,6 @@ fn validate_directory(path: &Path) -> io::Result<()> {
             ));
         }
     }
-
     Ok(())
 }
 
@@ -199,7 +201,6 @@ fn validate_directory_identity(path: &Path) -> io::Result<fs::Metadata> {
             "must be a directory and not a symbolic link",
         ));
     }
-
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -215,7 +216,6 @@ fn validate_directory_identity(path: &Path) -> io::Result<fs::Metadata> {
             ));
         }
     }
-
     Ok(metadata)
 }
 
@@ -230,4 +230,44 @@ fn set_permissions(path: &Path, mode: u32) -> Result<()> {
 #[cfg(not(unix))]
 fn set_permissions(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn creation_tightens_an_empty_volume_directory() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let directory = root.path().join("secrets");
+        let secret = directory.join("api-key");
+        fs::create_dir(&directory)?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))?;
+
+        assert!(read(&secret, 64)?.is_none());
+        assert!(matches!(
+            create(&secret, b"secret"),
+            Ok(CreateOutcome::Created)
+        ));
+        assert_eq!(
+            fs::metadata(directory)?.permissions().mode() & 0o7777,
+            0o700
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn creation_rejects_a_non_dedicated_parent() -> Result<()> {
+        let parent = tempfile::tempdir()?;
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o750))?;
+
+        assert!(create(&parent.path().join("api-key"), b"secret").is_err());
+        assert_eq!(
+            fs::metadata(parent.path())?.permissions().mode() & 0o7777,
+            0o750
+        );
+        Ok(())
+    }
 }

@@ -230,7 +230,8 @@ impl FirecrackerPausedState {
 
 impl PausedSandboxState for FirecrackerPausedState {
     fn control_plane_port(&self) -> Option<u16> {
-        Some(self.snapshot_config.common.control_plane_port)
+        let port = self.snapshot_config.common.control_plane_port;
+        (port != 0).then_some(port)
     }
 
     fn encode(&self) -> Result<serde_json::Value> {

@@ -7,11 +7,19 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
   E2E_RUNTIME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   E2E_REPO_ROOT="$(cd "${E2E_RUNTIME_DIR}/../../../.." && pwd)"
 
+  _E2E_API_KEY_FROM_USER=0
+  if [[ "${AENV_API_KEY+x}" == "x" ]]; then
+    if [[ -z "${AENV_API_KEY}" ]]; then
+      echo "AENV_API_KEY must not be empty" >&2
+      return 1
+    fi
+    _E2E_API_KEY_FROM_USER=1
+  fi
+
   # shellcheck source=/dev/null
   source "${E2E_RUNTIME_DIR}/server.sh"
 
   : "${E2E_MODE:=single-node}"
-  : "${AENV_API_KEY:=e2b_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
   export AENV_API_KEY
   : "${E2E_COMPOSE_FILE:=deploy/docker-compose.yml}"
   : "${E2E_COMPOSE_OVERRIDE_FILE:=scripts/tests/e2e/docker-compose.e2e.yml}"
@@ -61,7 +69,11 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
   }
 
   _deploy_make_cmd() {
-    make --no-print-directory -C "${E2E_REPO_ROOT}" "$@"
+    if [[ "${_E2E_API_KEY_FROM_USER}" == "1" ]]; then
+      make --no-print-directory -C "${E2E_REPO_ROOT}" "$@"
+    else
+      env -u AENV_API_KEY make --no-print-directory -C "${E2E_REPO_ROOT}" "$@"
+    fi
   }
 
   _run_deploy_target() {
@@ -156,7 +168,12 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
   _run_k8s_target() {
     local target="${1:?usage: _run_k8s_target <target>}"
     [[ -n "${target}" && "${target}" != "none" ]] || return 0
-    make --no-print-directory -C "${E2E_REPO_ROOT}" "${target}"
+    _deploy_make_cmd "${target}"
+  }
+
+  _read_k8s_api_key() {
+    kubectl -n "${E2E_K8S_NAMESPACE}" get secret agentenv-auth \
+      -o 'go-template={{index .data "AENV_API_KEY" | base64decode}}'
   }
 
   _resolve_runtime_path() {
@@ -398,8 +415,10 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
     _wait_for_health_url "agentenv-b" "${AENV_NODE_B_URL}" "${timeout}" ||
       die "agentenv-b failed to become ready within ${timeout}s"
 
-    AENV_API_KEY="$(_compose_cmd exec -T agentenv-a cat /workspace/env/secrets/api-key)" ||
-      die "Failed to read the Compose deployment API key"
+    if [[ "${_E2E_API_KEY_FROM_USER}" != "1" ]]; then
+      AENV_API_KEY="$(_compose_cmd exec -T agentenv-a cat /workspace/env/secrets/api-key)" ||
+        die "Failed to read the Compose deployment API key"
+    fi
     [[ "${AENV_API_KEY}" =~ ^[A-Za-z0-9._~-]{32,4096}$ ]] ||
       die "Compose deployment returned an invalid API key"
     export AENV_API_KEY
@@ -439,6 +458,14 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
       _wait_for_health_url "${label}" "${node_url}" "${timeout}" ||
         die "${label} failed to become ready within ${timeout}s"
     done < <(printf '%s\n' "${AENV_NODE_URLS}" | tr ' ' '\n')
+
+    if [[ "${_E2E_API_KEY_FROM_USER}" != "1" ]]; then
+      AENV_API_KEY="$(_read_k8s_api_key)" ||
+        die "Failed to read the Kubernetes deployment API key"
+    fi
+    [[ "${AENV_API_KEY}" =~ ^[A-Za-z0-9._~-]{32,4096}$ ]] ||
+      die "Kubernetes deployment returned an invalid API key"
+    export AENV_API_KEY
 
     expected_nodes="$(_runtime_node_count)"
     [[ "${expected_nodes}" -gt 0 ]] || expected_nodes=1

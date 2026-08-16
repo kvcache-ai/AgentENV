@@ -8,6 +8,7 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
   : "${AENV_API_KEY:=e2b_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
   : "${AENV_TEMPLATE_ID:=ubuntu}"
   : "${AENV_PROXY_URL:=${AENV_URL}/proxy}"
+  : "${AENV_ENVD_PORT:=49983}"
   : "${E2E_MODE:=single-node}"
   : "${E2E_DEFAULT_USER_IMAGE:=ghcr.io/linuxserver/baseimage-ubuntu:noble}"
   : "${E2E_TEMPLATE_USER_IMAGE:=${E2E_DEFAULT_USER_IMAGE}}"
@@ -120,44 +121,6 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
     HTTP_HEADERS=$(<"$_E2E_HEADERS")
   }
 
-  api_admin_get() {
-    local path="$1"
-    _curl_do -s \
-      -H "X-API-Key: ${AENV_API_KEY}" \
-      "${AENV_URL}${path}"
-  }
-
-  api_admin_get_at() {
-    local base_url="$1"
-    local path="$2"
-    _curl_do -s \
-      -H "X-API-Key: ${AENV_API_KEY}" \
-      "${base_url}${path}"
-  }
-
-  api_admin_get_with_headers() {
-    local path="$1"
-    [[ -z "$_E2E_HEADERS" ]] && _E2E_HEADERS=$(mktemp)
-    curl -s -o "$_E2E_BODY" -D "$_E2E_HEADERS" -w '%{http_code}' \
-      -H "X-API-Key: ${AENV_API_KEY}" \
-      "${AENV_URL}${path}" > "$_E2E_STATUS" 2>/dev/null || true
-    HTTP_STATUS=$(<"$_E2E_STATUS")
-    HTTP_BODY=$(<"$_E2E_BODY")
-    HTTP_HEADERS=$(<"$_E2E_HEADERS")
-  }
-
-  api_admin_get_with_headers_at() {
-    local base_url="$1"
-    local path="$2"
-    [[ -z "$_E2E_HEADERS" ]] && _E2E_HEADERS=$(mktemp)
-    curl -s -o "$_E2E_BODY" -D "$_E2E_HEADERS" -w '%{http_code}' \
-      -H "X-API-Key: ${AENV_API_KEY}" \
-      "${base_url}${path}" > "$_E2E_STATUS" 2>/dev/null || true
-    HTTP_STATUS=$(<"$_E2E_STATUS")
-    HTTP_BODY=$(<"$_E2E_BODY")
-    HTTP_HEADERS=$(<"$_E2E_HEADERS")
-  }
-
   api_post() {
     local path="$1"
     local body="${2:-}"
@@ -208,9 +171,8 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
   proxy_get_with_sandbox() {
     local sandbox_id="$1"
     local path="${2:-/health}"
-    local target_port="${3:-49983}"
+    local target_port="${3:-${AENV_ENVD_PORT}}"
     _curl_do -s --max-time 5 \
-      -H "X-API-Key: ${AENV_API_KEY}" \
       -H "x-agentenv-sandbox-id: ${sandbox_id}" \
       -H "x-agentenv-target-port: ${target_port}" \
       "${AENV_PROXY_URL}${path}"

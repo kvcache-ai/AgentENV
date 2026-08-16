@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -68,8 +69,7 @@ type Server struct {
 }
 
 func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, options ServerOptions) (*Server, error) {
-	apiKey := strings.TrimSpace(options.APIKey)
-	if apiKey == "" {
+	if options.APIKey == "" {
 		return nil, errors.New("API key is required")
 	}
 	sandboxProxyDomains, err := normalizeProxyDomains(options.SandboxProxyDomains)
@@ -89,7 +89,7 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		httpClient:          &http.Client{},
 		requestTimeout:      options.RequestTimeout,
 		maxRespSize:         options.MaxResponseSize,
-		apiKey:              []byte(apiKey),
+		apiKey:              []byte(options.APIKey),
 		debugMode:           options.DebugMode,
 		sandboxProxyDomains: sandboxProxyDomains,
 	}, nil
@@ -104,7 +104,20 @@ func (s *Server) Handler() http.Handler {
 	// decoding %2F → / and issuing 301 redirects), which breaks proxy
 	// forwarding of percent-encoded path segments such as /files/%2F.
 	core := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" || r.URL.Path == "/metrics" {
+		if isExplicitProxyPath(r.URL.Path) && !hasCompleteProxyRouteHeaders(r.Header) {
+			setGatewayRouteSource(w, routeSourceHeader)
+			if _, hasSandbox := sandboxIDFromHeaders(r.Header); !hasSandbox {
+				http.Error(w, "sandbox id header required", http.StatusBadRequest)
+				return
+			}
+			http.Error(w, "target port header required", http.StatusBadRequest)
+			return
+		}
+		if r.URL.Path == "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path == "/health" {
 			hostRoute, hostRouteErr := parseHostRoute(r.Host, s.sandboxProxyDomains)
 			if hostRoute != nil || hostRouteErr != nil {
 				s.handleProxy(w, r)
@@ -542,6 +555,12 @@ func hasProxyRoutingHeaders(h http.Header) bool {
 	return false
 }
 
+func hasCompleteProxyRouteHeaders(h http.Header) bool {
+	_, hasSandbox := sandboxIDFromHeaders(h)
+	_, hasTargetPort := targetPortFromHeaders(h)
+	return hasSandbox && hasTargetPort
+}
+
 func targetPortFromHeaders(h http.Header) (string, bool) {
 	for _, name := range []string{headerTargetPort, headerE2BTargetPort} {
 		v := strings.TrimSpace(h.Get(name))
@@ -825,42 +844,45 @@ func extractSandboxIDsFromResponse(body []byte) []string {
 
 func singleHeaderMatches(headers http.Header, name string, expected []byte) bool {
 	values := headers.Values(name)
-	return len(values) == 1 && bytes.Equal([]byte(values[0]), expected)
+	if len(values) != 1 || len(values[0]) != len(expected) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(values[0]), expected) == 1
 }
 
 func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
-	if strings.TrimRight(r.URL.Path, "/") == "/proxy" || strings.HasPrefix(r.URL.Path, "/proxy/") {
+	if isExplicitProxyPath(r.URL.Path) {
+		// The explicit proxy prefix cannot dispatch to a control-plane handler.
+		// Let the core handler return a stable 400 for incomplete routing data.
 		return true
 	}
 
 	hostRoute, err := parseHostRoute(r.Host, s.sandboxProxyDomains)
-	if hostRoute != nil || err != nil {
+	if hostRoute != nil {
 		return true
 	}
+	if err != nil {
+		return false
+	}
 
-	return !isSandboxControlPlaneRequest(r) && hasProxyRoutingHeaders(r.Header)
+	return !isSandboxControlPlaneRequest(r) && hasCompleteProxyRouteHeaders(r.Header)
 }
 
-func hasSingleNonEmptyHeader(headers http.Header, name string) bool {
-	values := headers.Values(name)
-	return len(values) == 1 && strings.TrimSpace(values[0]) != ""
+func isExplicitProxyPath(path string) bool {
+	return path == "/proxy" || strings.HasPrefix(path, "/proxy/")
 }
 
 func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		dataPlane := s.isSandboxDataPlaneRequest(r)
-		if r.URL.Path == "/health" && !dataPlane {
+		if dataPlane || r.URL.Path == "/health" || r.URL.Path == "/metrics" {
+			// Sandbox-scoped ingress and envd authorization depend on runtime
+			// metadata and are enforced by the owning runtime node.
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		authorized := singleHeaderMatches(r.Header, headerAPIKey, s.apiKey)
-		if !authorized && dataPlane {
-			// Runtime nodes perform the definitive sandbox-scoped token validation.
-			authorized = hasSingleNonEmptyHeader(r.Header, headerTrafficToken) ||
-				hasSingleNonEmptyHeader(r.Header, headerEnvdAccessToken)
-		}
-		if !authorized {
+		if !singleHeaderMatches(r.Header, headerAPIKey, s.apiKey) {
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}

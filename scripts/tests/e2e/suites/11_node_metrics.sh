@@ -11,7 +11,7 @@ log "Suite: Node Metrics"
 readonly NODE_METRICS_SANDBOX_TIMEOUT_SECONDS=60
 readonly SCHEDULER_BINDING_CLEANUP_TIMEOUT_SECONDS=75
 readonly PROXY_HEALTH_PATH="/health"
-readonly PROXY_HEALTH_PORT=49983
+readonly PROXY_HEALTH_PORT="${AENV_ENVD_PORT}"
 
 wait_for_global_sandboxes_quiesced() {
   local timeout="${1:-20}"
@@ -55,7 +55,7 @@ wait_for_node_runtime_allocations_quiesced() {
   local attempt
 
   for ((attempt = 0; attempt < timeout * 2; attempt++)); do
-    api_admin_get "/nodes"
+    api_get "/nodes"
     if [[ "${HTTP_STATUS}" == "200" ]] &&
       echo "${HTTP_BODY}" | jq -e 'all(.[]; (.sandboxCount == 0 and .metrics.allocatedCPU == 0 and .metrics.allocatedMemoryBytes == 0))' >/dev/null 2>&1; then
       return 0
@@ -97,7 +97,7 @@ quiesce_runtime_state_before_baseline() {
 
 fetch_admin_nodes() {
   local base_url="${1:-${AENV_URL}}"
-  api_admin_get_at "${base_url}" "/nodes"
+  api_get_at "${base_url}" "/nodes"
   [[ "${HTTP_STATUS}" == "200" ]] || return 1
   printf '%s\n' "${HTTP_BODY}"
 }
@@ -138,7 +138,7 @@ wait_for_node_snapshot() {
   local create_successes
 
   for ((attempt = 0; attempt < timeout * 2; attempt++)); do
-    api_admin_get "/nodes"
+    api_get "/nodes"
     if [[ "${HTTP_STATUS}" == "200" ]]; then
       body="${HTTP_BODY}"
       sandbox_count="$(echo "${body}" | jq -r --arg id "${node_id}" '.[] | select(.id == $id) | .sandboxCount // empty' 2>/dev/null || true)"
@@ -164,7 +164,7 @@ wait_for_node_snapshot() {
 node_detail_sandbox_count() {
   local base_url="$1"
   local node_id="$2"
-  api_admin_get_at "${base_url}" "/nodes/${node_id}"
+  api_get_at "${base_url}" "/nodes/${node_id}"
   [[ "${HTTP_STATUS}" == "200" ]] || return 1
   echo "${HTTP_BODY}" | jq '.sandboxCount'
 }
@@ -192,7 +192,7 @@ quiesce_runtime_state_before_baseline ||
 wait_for_admin_nodes_count "${AENV_URL}" "${expected_nodes}" 60 ||
   die "Timed out waiting for gateway/admin nodes endpoint"
 
-api_admin_get "/nodes"
+api_get "/nodes"
 assert_status "${HTTP_STATUS}" "200" "admin /nodes returns 200"
 baseline_nodes_json="${HTTP_BODY}"
 
@@ -206,7 +206,7 @@ while IFS=$'\t' read -r node_id sandbox_count allocated_cpu allocated_memory cre
   BASELINE_ALLOCATED_MEMORY["${node_id}"]="${allocated_memory}"
   BASELINE_CREATE_SUCCESSES["${node_id}"]="${create_successes}"
 
-  api_admin_get "/nodes/${node_id}"
+  api_get "/nodes/${node_id}"
   assert_status "${HTTP_STATUS}" "200" "admin /nodes/${node_id} returns 200"
   BASELINE_DETAIL_SANDBOX_COUNT["${node_id}"]="$(echo "${HTTP_BODY}" | jq '.sandboxCount')"
 done < <(echo "${baseline_nodes_json}" | jq -r '.[] | [
@@ -222,7 +222,7 @@ if e2e_mode_is_clustered; then
     [[ -n "${node_url}" ]] || continue
     wait_for_admin_nodes_count "${node_url}" 1 45 ||
       die "Timed out waiting for ${node_url}/nodes"
-    api_admin_get_at "${node_url}" "/nodes"
+    api_get_at "${node_url}" "/nodes"
     assert_status "${HTTP_STATUS}" "200" "node-local admin /nodes returns 200 for $(node_label_for_url "${node_url}")"
     local_node_id="$(echo "${HTTP_BODY}" | jq -r '.[0].id')"
     assert_not_empty "${local_node_id}" "node-local admin /nodes exposes node id for $(node_label_for_url "${node_url}")"
@@ -316,14 +316,14 @@ for node_id in "${!BASELINE_SANDBOX_COUNT[@]}"; do
       30; then
     _pass "gateway /nodes metrics converge for ${node_id}"
   else
-    api_admin_get "/nodes"
+    api_get "/nodes"
     _fail \
       "gateway /nodes metrics converge for ${node_id}" \
       "sandboxCount=${expected_sandbox_count}, allocatedCPU=${expected_allocated_cpu}, allocatedMemoryBytes=${expected_allocated_memory}, createSuccesses>=${expected_create_successes_min}" \
       "${HTTP_BODY}"
   fi
 
-  api_admin_get "/nodes/${node_id}"
+  api_get "/nodes/${node_id}"
   assert_status "${HTTP_STATUS}" "200" "gateway /nodes/${node_id} returns 200 after workload"
   detail_sandboxes="$(echo "${HTTP_BODY}" | jq '.sandboxCount')"
   expected_detail_sandboxes=$((BASELINE_DETAIL_SANDBOX_COUNT["${node_id}"] + owned_count))
@@ -370,7 +370,7 @@ for node_id in "${!BASELINE_SANDBOX_COUNT[@]}"; do
       30; then
     _pass "gateway /nodes runtime allocation resets for ${node_id} after cleanup"
   else
-    api_admin_get "/nodes"
+    api_get "/nodes"
     _fail \
       "gateway /nodes runtime allocation resets for ${node_id} after cleanup" \
       "sandboxCount=${BASELINE_SANDBOX_COUNT[${node_id}]}, allocatedCPU=${BASELINE_ALLOCATED_CPU[${node_id}]}, allocatedMemoryBytes=${BASELINE_ALLOCATED_MEMORY[${node_id}]}, createSuccesses>=${expected_create_successes_min_after_cleanup}" \

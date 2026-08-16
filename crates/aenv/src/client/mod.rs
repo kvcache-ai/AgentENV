@@ -40,7 +40,7 @@ impl Client {
         sandbox_id: &str,
         envd_access_token: Option<&str>,
     ) -> Result<Transport> {
-        Transport::new(&self.base, &self.api_key, sandbox_id, envd_access_token)
+        Transport::new(&self.base, sandbox_id, envd_access_token)
     }
 
     fn url(&self, path: &str) -> String {

@@ -677,6 +677,22 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn managed_seed_continuity_only_applies_to_token_protected_sandboxes() {
+    let public_insecure = SandboxMetadata::default();
+    assert!(!persisted_sandboxes_require_managed_seed(
+        std::slice::from_ref(&public_insecure)
+    ));
+
+    let mut secure = public_insecure.clone();
+    secure.secure = true;
+    assert!(persisted_sandboxes_require_managed_seed(&[secure]));
+
+    let mut private = public_insecure;
+    private.network_policy.allow_public_traffic = false;
+    assert!(persisted_sandboxes_require_managed_seed(&[private]));
+}
+
 #[tokio::test]
 async fn new_returns_error_when_loading_persisted_sandboxes_fails() {
     setup();
@@ -1241,7 +1257,8 @@ async fn sandbox_network_policy_is_applied_and_persisted() -> Result<()> {
             Some(vec!["8.8.8.8".to_string()]),
             Some(vec!["203.0.113.0/24".to_string()]),
         )?,
-    );
+    )
+    .with_allow_public_traffic(false);
     let mut request = create_request(Some(60), &[]);
     request.network_policy = initial_policy.clone();
 
@@ -1252,8 +1269,9 @@ async fn sandbox_network_policy_is_applied_and_persisted() -> Result<()> {
         BaseSandboxNetworkPolicy::Allow,
         SandboxNetworkEgressPolicy::new(None, Some(vec!["198.51.100.0/24".to_string()]))?,
     );
+    let expected_policy = updated_policy.clone().with_allow_public_traffic(false);
     orchestrator
-        .replace_sandbox_network_policy(created.id, updated_policy.clone())
+        .replace_sandbox_network_policy(created.id, updated_policy)
         .await?;
     assert_eq!(behavior.update_network_calls(), 1);
 
@@ -1261,7 +1279,7 @@ async fn sandbox_network_policy_is_applied_and_persisted() -> Result<()> {
         .get_sandbox(&created.id)
         .await?
         .expect("sandbox metadata should exist");
-    assert_eq!(updated.network_policy, updated_policy);
+    assert_eq!(updated.network_policy, expected_policy);
 
     Ok(())
 }

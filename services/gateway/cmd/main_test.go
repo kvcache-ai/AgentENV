@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -73,5 +74,38 @@ func TestLoadAPIKeyRejectsMissingFile(t *testing.T) {
 	missing := filepath.Join(dir, "missing")
 	if _, err := loadAPIKeyFrom(func(string) (string, bool) { return "", false }, missing); err == nil {
 		t.Fatal("loadAPIKeyFrom() unexpectedly accepted a missing secret")
+	}
+}
+
+func TestLoadAPIKeyRejectsNonRegularFile(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "api-key")
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadAPIKeyFrom(func(string) (string, bool) { return "", false }, path); err == nil {
+		t.Fatal("loadAPIKeyFrom() unexpectedly accepted a FIFO")
+	}
+}
+
+func TestLoadAPIKeyAllowsSymlinkedSecret(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "..data-api-key")
+	path := filepath.Join(dir, "api-key")
+	if err := os.WriteFile(target, []byte(testAPIKey+"\n"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Base(target), path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadAPIKeyFrom(func(string) (string, bool) { return "", false }, path)
+	if err != nil {
+		t.Fatalf("loadAPIKeyFrom() error = %v", err)
+	}
+	if got != testAPIKey {
+		t.Fatalf("loadAPIKeyFrom() = %q, want %q", got, testAPIKey)
 	}
 }

@@ -13,7 +13,7 @@ Set `secure: true` when creating a sandbox through API or E2B-compatible SDKs to
 aenv start --secure <template-id>
 ```
 
-The API and SDKs return the sandbox's `envdAccessToken` where appropriate and attach it to envd requests automatically. The application proxy credential is independent and is sent as `e2b-traffic-access-token`. Forked sandboxes get independent credentials. Secure mode is preserved across pause, restart, and resume; legacy sandboxes remain non-secure unless created with `secure: true`.
+The API and SDKs return the sandbox's `envdAccessToken` where appropriate and attach it to envd requests automatically. Private application ingress has an independent `trafficAccessToken`, sent as `e2b-traffic-access-token`; public application ingress has no AgentENV credential. Forked sandboxes get independent credentials. Secure mode is preserved across pause, restart, and resume; legacy sandboxes remain non-secure unless created with `secure: true`.
 
 ## Access-Token Seed
 

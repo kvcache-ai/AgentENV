@@ -371,7 +371,7 @@ echo "  CLI    : ${INSTALL_DIR}/aenv"
 echo "  Server : ${INSTALL_DIR}/server"
 echo "  Data   : ${DATA_DIR}"
 echo "  Config : ${CONFIG_PATH}"
-echo "  API key: generated on first server start in ${DATA_DIR}/secrets/api-key"
+echo "  API key: ${DATA_DIR}/secrets/api-key (auto-generated when no API key is configured)"
 echo "  Mode   : ${VIRTUALIZATION_MODE}"
 if [[ -d /run/systemd/system ]]; then
     if [[ "$ENV_FILE_STATUS" == "written" ]]; then

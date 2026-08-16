@@ -27,7 +27,9 @@ impl ApiImpl {
         single_header(headers, API_KEY_HEADER).is_some_and(|value| {
             let candidate = value.as_bytes();
             let expected = self.api_key.as_bytes();
-            candidate.len() == expected.len() && bool::from(candidate.ct_eq(expected))
+            !expected.is_empty()
+                && candidate.len() == expected.len()
+                && bool::from(candidate.ct_eq(expected))
         })
     }
 
@@ -55,32 +57,59 @@ where
 {
     let proxy_request =
         proxy::is_sandbox_proxy_request(&request, api_impl.as_ref().sandbox_proxy_domains());
-    if request.uri().path() == "/health" && !proxy_request {
+    if matches!(request.uri().path(), "/health" | "/metrics") && !proxy_request {
         return next.run(request).await;
     }
 
     let api_impl = api_impl.as_ref();
-    let mut authorized = api_impl.has_valid_api_key(request.headers());
-    let mut envd_authorized = false;
-    if proxy_request {
-        if let Some((sandbox_id, target_port)) =
-            proxy::route_for_auth(&request, api_impl.sandbox_proxy_domains())
-        {
-            authorized |= api_impl.has_valid_traffic_access_token(request.headers(), sandbox_id);
-            let envd_candidate = single_header(request.headers(), ENVD_ACCESS_TOKEN_HEADER)
-                .and_then(|value| value.to_str().ok());
-            if let Some(candidate) = envd_candidate {
-                envd_authorized = proxy::has_valid_envd_access_token(
-                    api_impl,
-                    sandbox_id,
-                    target_port,
-                    candidate,
-                )
-                .await;
-                authorized |= envd_authorized;
-            }
-        }
+    if !proxy_request {
+        return if api_impl.has_valid_api_key(request.headers()) {
+            next.run(request).await
+        } else {
+            StatusCode::UNAUTHORIZED.into_response()
+        };
     }
+
+    let has_api_key = api_impl.has_valid_api_key(request.headers());
+
+    let Some((sandbox_id, target_port)) =
+        proxy::route_for_auth(&request, api_impl.sandbox_proxy_domains())
+    else {
+        request.headers_mut().remove(ENVD_ACCESS_TOKEN_HEADER);
+        return if proxy::has_proxy_prefix(request.uri().path()) || has_api_key {
+            next.run(request).await
+        } else {
+            StatusCode::UNAUTHORIZED.into_response()
+        };
+    };
+    if has_api_key {
+        request.headers_mut().remove(API_KEY_HEADER);
+    }
+    let metadata = match api_impl.orchestrator().get_sandbox(&sandbox_id).await {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => {
+            request.headers_mut().remove(ENVD_ACCESS_TOKEN_HEADER);
+            return proxy::sandbox_not_found_response(sandbox_id);
+        }
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+
+    let envd_request = target_port == proxy::effective_envd_port(&metadata);
+    let envd_authorized = envd_request
+        && metadata.secure
+        && single_header(request.headers(), ENVD_ACCESS_TOKEN_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|candidate| {
+                api_impl
+                    .orchestrator()
+                    .validate_envd_access_token(sandbox_id, candidate)
+            });
+    let authorized = if envd_request {
+        !metadata.secure || envd_authorized
+    } else {
+        metadata.network_policy.allow_public_traffic
+            || api_impl.has_valid_traffic_access_token(request.headers(), sandbox_id)
+    };
 
     if !authorized {
         return StatusCode::UNAUTHORIZED.into_response();

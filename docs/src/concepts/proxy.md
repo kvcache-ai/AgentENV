@@ -33,6 +33,23 @@ E2B-compatible aliases are also accepted:
 
 These routing headers are stripped before the request is forwarded to the sandbox.
 
+## Access Control
+
+Proxy authentication is independent from AgentENV API authentication:
+
+- Public application ingress (`allowPublicTraffic: true`, the default) requires
+  no AgentENV credential.
+- Private application ingress (`allowPublicTraffic: false`) requires the
+  sandbox's `trafficAccessToken` in `e2b-traffic-access-token`.
+- Secure envd traffic requires the sandbox's `envdAccessToken` in
+  `X-Access-Token`. Insecure envd traffic has no envd token.
+
+`X-API-Key` authenticates AgentENV control-plane APIs only. It does not grant
+access to private application ingress or secure envd. A matching platform key
+is stripped on proxy requests; other `X-API-Key` values remain available to
+sandbox applications. AgentENV also strips the traffic token, and forwards
+`X-Access-Token` only to the matching secure envd port.
+
 Host-based proxy requests derive both values from `Host`, for example
 `http://8080-<sandbox-uuid>.sandbox.example.com/health` targets port `8080`.
 The configured domain must route to the AgentENV server in single-node mode or

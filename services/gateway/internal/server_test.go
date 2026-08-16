@@ -221,7 +221,7 @@ func TestGatewayRequiresExactAPIKey(t *testing.T) {
 			addHeaders: func(headers http.Header) {
 				headers.Set(headerAPIKey, testAPIKey)
 			},
-			wantStatus: http.StatusNotFound,
+			wantStatus: http.StatusBadGateway,
 		},
 		{
 			name: "duplicate",
@@ -235,7 +235,7 @@ func TestGatewayRequiresExactAPIKey(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			req := httptest.NewRequest(http.MethodGet, "/nodes", nil)
 			tt.addHeaders(req.Header)
 			recorder := httptest.NewRecorder()
 
@@ -248,7 +248,18 @@ func TestGatewayRequiresExactAPIKey(t *testing.T) {
 	}
 }
 
-func TestGatewayForwardsSandboxTokensOnlyOnDataPlane(t *testing.T) {
+func TestGatewayMetricsPathDoesNotRequireAPIKey(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
+	recorder := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusNotFound)
+	}
+}
+
+func TestGatewayLeavesDataPlaneAuthorizationToRuntime(t *testing.T) {
 	const sandboxID = "0191f4d0-7b2a-7c11-9c2d-0123456789ab"
 	lookupCalls := 0
 	server := newTestServer(t, stubSchedulerClient{
@@ -259,44 +270,63 @@ func TestGatewayForwardsSandboxTokensOnlyOnDataPlane(t *testing.T) {
 	}, time.Second, 1024)
 	handler := server.Handler()
 
-	req := httptest.NewRequest(http.MethodGet, "/proxy", nil)
+	for i, tt := range []struct {
+		port, header, value string
+	}{
+		{port: "8080"},
+		{port: "49983", header: headerTrafficToken, value: "runtime-validates-this-token"},
+		{port: "49983", header: headerTrafficToken, value: "wrong-token"},
+		{port: "8080", header: headerEnvdAccessToken, value: "runtime-validates-this-token"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/proxy", nil)
+		req.Header.Set(headerE2BSandboxID, sandboxID)
+		req.Header.Set(headerE2BTargetPort, tt.port)
+		if tt.header != "" {
+			req.Header.Set(tt.header, tt.value)
+		}
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+		if recorder.Code == http.StatusUnauthorized || lookupCalls != i+1 {
+			t.Fatalf("data plane case %d: status=%d lookup calls=%d", i, recorder.Code, lookupCalls)
+		}
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/pause", nil)
 	req.Header.Set(headerE2BSandboxID, sandboxID)
-	req.Header.Set(headerE2BTargetPort, "49983")
 	req.Header.Set(headerTrafficToken, "runtime-validates-this-token")
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, req)
-	if recorder.Code == http.StatusUnauthorized || lookupCalls != 1 {
-		t.Fatalf("valid scoped token: status=%d lookup calls=%d", recorder.Code, lookupCalls)
-	}
 
-	req = httptest.NewRequest(http.MethodGet, "/proxy", nil)
-	req.Header.Set(headerE2BSandboxID, sandboxID)
-	req.Header.Set(headerE2BTargetPort, "49983")
-	req.Header.Set(headerTrafficToken, "wrong-token")
-	recorder = httptest.NewRecorder()
-	handler.ServeHTTP(recorder, req)
-	if recorder.Code == http.StatusUnauthorized || lookupCalls != 2 {
-		t.Fatalf("runtime-scoped token: status=%d lookup calls=%d", recorder.Code, lookupCalls)
-	}
-
-	req = httptest.NewRequest(http.MethodGet, "/proxy", nil)
-	req.Header.Set(headerE2BSandboxID, sandboxID)
-	req.Header.Set(headerE2BTargetPort, "8080")
-	req.Header.Set("X-Access-Token", "runtime-validates-this-token")
-	recorder = httptest.NewRecorder()
-	handler.ServeHTTP(recorder, req)
-	if recorder.Code == http.StatusUnauthorized || lookupCalls != 3 {
-		t.Fatalf("runtime-scoped envd token: status=%d lookup calls=%d", recorder.Code, lookupCalls)
-	}
-
-	req = httptest.NewRequest(http.MethodPost, "/sandboxes/"+sandboxID+"/pause", nil)
-	req.Header.Set(headerE2BSandboxID, sandboxID)
-	req.Header.Set(headerTrafficToken, "runtime-validates-this-token")
-	recorder = httptest.NewRecorder()
-	handler.ServeHTTP(recorder, req)
-
-	if recorder.Code != http.StatusUnauthorized || lookupCalls != 3 {
+	if recorder.Code != http.StatusUnauthorized || lookupCalls != 4 {
 		t.Fatalf("scoped token reached control plane: status=%d lookup calls=%d", recorder.Code, lookupCalls)
+	}
+}
+
+func TestGatewayRejectsIncompleteProxyRouteBeforeScheduling(t *testing.T) {
+	scheduleCalls := 0
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			scheduleCalls++
+			return nil, fmt.Errorf("schedule reached")
+		},
+	}, time.Second, 1024)
+	handler := server.Handler()
+
+	for _, headers := range []http.Header{
+		{},
+		{headerE2BSandboxID: []string{"sandbox-only"}},
+		{headerE2BTargetPort: []string{"8080"}},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/proxy", nil)
+		req.Header = headers
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+		}
+	}
+	if scheduleCalls != 0 {
+		t.Fatalf("schedule calls = %d, want 0", scheduleCalls)
 	}
 }
 

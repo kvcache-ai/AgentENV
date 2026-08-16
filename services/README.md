@@ -78,10 +78,13 @@ make run-gateway
 
 The default local config uses `127.0.0.1:9090` for the scheduler.
 
-The gateway and runtime nodes require the same API key. The gateway reads
-`AENV_API_KEY` or `/run/secrets/api-key`; it does not generate a key.
-Application proxy requests may additionally use the sandbox response's
-`trafficAccessToken` in the `e2b-traffic-access-token` header.
+The gateway and runtime nodes require the same API key for control-plane APIs.
+The gateway reads `AENV_API_KEY` or `/run/secrets/api-key`; it does not generate
+a key. The gateway routes data-plane requests without authenticating them
+because only the owning runtime has the sandbox policy needed to distinguish
+public ingress, private ingress, and secure envd. Private application proxy
+requests use the sandbox response's `trafficAccessToken` in the
+`e2b-traffic-access-token` header; secure envd requests use `X-Access-Token`.
 
 ## Scheduler configuration
 

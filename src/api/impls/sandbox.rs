@@ -145,7 +145,7 @@ impl From<&SandboxNetworkPolicy> for models::SandboxNetworkConfig {
     fn from(policy: &SandboxNetworkPolicy) -> Self {
         let egress = &policy.egress;
         Self {
-            allow_public_traffic: Some(true),
+            allow_public_traffic: Some(policy.allow_public_traffic),
             allow_out: (!egress.allowed_cidrs.is_empty() || !egress.allowed_domains.is_empty())
                 .then(|| {
                     egress
@@ -179,10 +179,9 @@ fn allow_internet_access_from_base_policy(policy: BaseSandboxNetworkPolicy) -> N
 
 impl From<SandboxMetadata> for models::SandboxDetail {
     fn from(m: SandboxMetadata) -> Self {
-        let network = m
-            .network_policy
-            .has_explicit_egress_rules()
-            .then(|| models::SandboxNetworkConfig::from(&m.network_policy));
+        let network = (!m.network_policy.allow_public_traffic
+            || m.network_policy.has_explicit_egress_rules())
+        .then(|| models::SandboxNetworkConfig::from(&m.network_policy));
         let allow_internet_access = Some(allow_internet_access_from_base_policy(
             m.network_policy.base_policy,
         ));
@@ -214,14 +213,18 @@ impl From<SandboxMetadata> for models::SandboxDetail {
 
 impl ApiImpl {
     fn sandbox_model(&self, metadata: SandboxMetadata) -> models::Sandbox {
-        let traffic_access_token = self.traffic_access_token(metadata.id);
+        let traffic_access_token = (!metadata.network_policy.allow_public_traffic)
+            .then(|| self.traffic_access_token(metadata.id));
         let envd_access_token = self
             .orchestrator
             .get_envd_access_token(&metadata)
             .map(|token| token.expose().to_owned());
         let mut sandbox = models::Sandbox::from(metadata);
         sandbox.envd_access_token = envd_access_token;
-        sandbox.traffic_access_token = Some(Nullable::Present(traffic_access_token));
+        sandbox.traffic_access_token = Some(match traffic_access_token {
+            Some(token) => Nullable::Present(token),
+            None => Nullable::Null,
+        });
         sandbox.domain = self
             .sandbox_proxy_domains()
             .first()
@@ -366,7 +369,11 @@ fn network_policy_from_create(
     let allow_out = network.and_then(|network| network.allow_out.clone());
     let deny_out = network.and_then(|network| network.deny_out.clone());
     let egress = SandboxNetworkEgressPolicy::new(allow_out, deny_out)?;
-    let policy = SandboxNetworkPolicy::new(base_policy, egress);
+    let allow_public_traffic = network
+        .and_then(|network| network.allow_public_traffic)
+        .unwrap_or(true);
+    let policy = SandboxNetworkPolicy::new(base_policy, egress)
+        .with_allow_public_traffic(allow_public_traffic);
     if policy.has_domain_allow_rules() {
         anyhow::bail!(
             "domain entries in allowOut are not supported until TCP egress proxy is enabled"
@@ -1503,6 +1510,20 @@ mod tests {
         assert_eq!(policy.base_policy, BaseSandboxNetworkPolicy::Deny);
         assert_eq!(policy.egress.allowed_cidrs, ["8.8.8.8/32"]);
         assert_eq!(policy.egress.denied_cidrs, ["203.0.113.0/24"]);
+    }
+
+    #[test]
+    fn network_create_preserves_private_ingress() {
+        let mut network = models::SandboxNetworkConfig::new();
+        network.allow_public_traffic = Some(false);
+
+        let policy = network_policy_from_create(None, Some(&network)).unwrap();
+
+        assert!(!policy.allow_public_traffic);
+        assert_eq!(
+            models::SandboxNetworkConfig::from(&policy).allow_public_traffic,
+            Some(false)
+        );
     }
 
     #[test]

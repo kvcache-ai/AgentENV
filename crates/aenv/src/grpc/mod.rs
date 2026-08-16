@@ -54,23 +54,16 @@ impl std::error::Error for RpcError {}
 pub struct Transport {
     http: HttpClient,
     base_url: String,
-    api_key: String,
     sandbox_id: String,
     envd_access_token: Option<String>,
 }
 
 impl Transport {
-    pub fn new(
-        base_url: &str,
-        api_key: &str,
-        sandbox_id: &str,
-        envd_access_token: Option<&str>,
-    ) -> Result<Self> {
+    pub fn new(base_url: &str, sandbox_id: &str, envd_access_token: Option<&str>) -> Result<Self> {
         let http = Self::http_client(base_url).context("building Connect-RPC HTTP client")?;
         Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_string(),
-            api_key: api_key.to_string(),
             sandbox_id: sandbox_id.to_string(),
             envd_access_token: envd_access_token.map(str::to_owned),
         })
@@ -102,7 +95,6 @@ impl Transport {
 
     fn auth(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         let builder = builder
-            .header("X-API-Key", &self.api_key)
             .header("x-agentenv-sandbox-id", &self.sandbox_id)
             .header("x-agentenv-target-port", ENVD_PORT_STR)
             .header("Connect-Protocol-Version", "1");
@@ -508,7 +500,7 @@ mod tests {
 
     #[test]
     fn unary_user_is_sent_as_basic_auth() {
-        let transport = Transport::new("http://127.0.0.1", "api-key", "sandbox-id", None).unwrap();
+        let transport = Transport::new("http://127.0.0.1", "sandbox-id", None).unwrap();
         let request = transport
             .unary_request("filesystem.Filesystem", "Stat", Some("app"))
             .build()
@@ -518,6 +510,7 @@ mod tests {
             request.headers().get(AUTHORIZATION).unwrap(),
             "Basic YXBwOg=="
         );
+        assert!(!request.headers().contains_key("x-api-key"));
 
         let request = transport
             .unary_request("filesystem.Filesystem", "Stat", None)
@@ -528,13 +521,8 @@ mod tests {
 
     #[test]
     fn envd_access_token_is_sent_on_connect_requests() {
-        let transport = Transport::new(
-            "http://127.0.0.1",
-            "api-key",
-            "sandbox-id",
-            Some("envd-token"),
-        )
-        .unwrap();
+        let transport =
+            Transport::new("http://127.0.0.1", "sandbox-id", Some("envd-token")).unwrap();
 
         let request = transport
             .unary_request("process.Process", "List", None)
