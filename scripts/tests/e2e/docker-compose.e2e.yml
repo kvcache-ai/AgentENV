@@ -1,4 +1,8 @@
 services:
-  agentenv-a: {}
+  agentenv-a:
+    ports:
+      - "8001:8000"
 
-  agentenv-b: {}
+  agentenv-b:
+    ports:
+      - "8002:8000"

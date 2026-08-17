@@ -16,7 +16,7 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
   : "${E2E_COMPOSE_FILE:=deploy/docker-compose.yml}"
   : "${E2E_COMPOSE_OVERRIDE_FILE:=scripts/tests/e2e/docker-compose.e2e.yml}"
   : "${E2E_COMPOSE_START_TIMEOUT:=120}"
-  : "${AENV_GATEWAY_PORT:=8080}"
+  : "${AENV_GATEWAY_PORT:=8000}"
   : "${AENV_NODE_A_PORT:=8001}"
   : "${AENV_NODE_B_PORT:=8002}"
   : "${E2E_K8S_NAMESPACE:=agentenv-system}"

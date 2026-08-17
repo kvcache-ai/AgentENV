@@ -55,8 +55,6 @@ services:
       timeout: 3s
       retries: 10
       start_period: 3s
-    ports:
-      - "9090:9090"
     restart: unless-stopped
 
   gateway:
@@ -75,7 +73,7 @@ services:
       GATEWAY_SCHEDULER_ADDR: scheduler:9090
       GATEWAY_SANDBOX_PROXY_DOMAINS: ${SANDBOX_PROXY_DOMAINS:-}
     ports:
-      - "8080:8080"
+      - "8000:8080"
     restart: unless-stopped
 
   agentenv-a:
@@ -89,8 +87,6 @@ services:
     environment:
       <<: *agentenv-environment
       AENV_NODE_ID: node-a
-    ports:
-      - "8001:8000"
 
   agentenv-b:
     <<: *agentenv-base
@@ -98,8 +94,6 @@ services:
     environment:
       <<: *agentenv-environment
       AENV_NODE_ID: node-b
-    ports:
-      - "8002:8000"
 
 volumes:
   agentenv-snapshot-store:

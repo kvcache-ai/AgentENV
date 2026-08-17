@@ -5,15 +5,6 @@ Run a full multi-node stack on a single host using Docker Compose. This simulate
 For a real multi-machine deployment without Kubernetes, see
 [Static Multi-Node](./static-multi-node.md).
 
-## What Gets Started
-
-| Service | Port | Description |
-|---------|------|-------------|
-| Gateway | `:8080` | HTTP/WebSocket reverse proxy |
-| Scheduler | `:9090` | gRPC node selection and sandbox binding |
-| agentenv-a | `:8001` | AgentENV runtime node A |
-| agentenv-b | `:8002` | AgentENV runtime node B |
-
 ## Prerequisites
 
 - Linux kernel 6.8+
@@ -44,6 +35,9 @@ sudo bash scripts/docker-setup.sh
 make deploy-up
 ```
 
+The Gateway is available at `http://127.0.0.1:8000` and forwards requests to
+the backend nodes.
+
 To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when starting the stack:
 
@@ -60,13 +54,10 @@ usually through wildcard DNS for `*.sandbox.example.com`.
 
 ```bash
 # Health check via gateway
-curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8000/health
 
 # Cluster node snapshots via gateway
-curl http://127.0.0.1:8080/nodes
-
-# Direct health check on a backend node
-curl http://127.0.0.1:8001/health
+curl http://127.0.0.1:8000/nodes
 ```
 
 ## Management Commands

@@ -25,6 +25,7 @@ Deploy AgentENV across a Kubernetes cluster with a gateway, scheduler, and runti
 - Docker
 - `build-essential` (`sudo apt install -y build-essential`)
 - `kubectl` with Kustomize support
+- shared storage across all runtime nodes, using either POSIXFS or OSS
 
 The provided manifests use standard KVM. To prepare a separate PVM node pool
 when standard KVM is unavailable, see [PVM Deployment](./pvm.md).

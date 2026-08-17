@@ -29,10 +29,11 @@ services directly to the public Internet.
 
 On every runtime node:
 
-- Ubuntu 24.04 with Linux kernel 6.8 or later
+- Linux kernel 6.8+
 - `/dev/kvm` access
 - root access for the AgentENV installation
 - network reachability to the Scheduler
+- shared storage across all runtime nodes, using either POSIXFS or OSS
 
 On the control-plane host:
 
