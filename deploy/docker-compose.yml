@@ -78,6 +78,22 @@ services:
       - "8080:8080"
     restart: unless-stopped
 
+  web:
+    build:
+      context: ../web
+      dockerfile: ../deploy/docker/Dockerfile.web
+    image: agentenv-web:latest
+    container_name: agentenv-web
+    depends_on:
+      - gateway
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      AENV_DEFAULT_GATEWAY_URL: ${AENV_DEFAULT_GATEWAY_URL:-http://127.0.0.1:8080}
+    restart: unless-stopped
+
   agentenv-a:
     <<: *agentenv-base
     build:

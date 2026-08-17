@@ -8,6 +8,7 @@ Deploy AgentENV across a Kubernetes cluster with a gateway, scheduler, and runti
 |----------|------|-------------|
 | `agentenv-gateway` | Deployment + ClusterIP Service | HTTP reverse proxy for client traffic |
 | `agentenv-scheduler` | Deployment (single replica) + ClusterIP Service | gRPC node selection and sandbox binding |
+| `agentenv-web` | Deployment + ClusterIP Service | Control-plane Web UI (Next.js) |
 | `agentenv-node` | DaemonSet (privileged) | One runtime Pod per Kubernetes node |
 | `agentenv-nodes` | Headless Service | Used by the scheduler for EndpointSlice discovery |
 
@@ -41,7 +42,7 @@ cd AgentENV
 make k8s-build
 ```
 
-This builds three images: `agentenv-runtime:latest`, `agentenv-gateway:latest`, and `agentenv-scheduler:latest`.
+This builds four images: `agentenv-runtime:latest`, `agentenv-gateway:latest`, `agentenv-scheduler:latest`, and `agentenv-web:latest`.
 
 ## Configure the Access-Token Seed (Optional)
 
@@ -73,6 +74,14 @@ The domain must resolve to the gateway Ingress or LoadBalancer, usually through
 wildcard DNS for `*.sandbox.example.com`.
 
 The default overlay is `deploy/k8s/overlays/default`, targeting the `agentenv-system` namespace. The gateway is exposed as ClusterIP by default. Add your own Ingress or LoadBalancer for external access.
+
+Access the Web UI with:
+
+```bash
+kubectl -n agentenv-system port-forward svc/agentenv-web 3000:3000
+```
+
+Then open [http://127.0.0.1:3000](http://127.0.0.1:3000). See [Web UI](../getting-started/web-ui.md).
 
 The make targets build a temporary Kustomize context so runtime Pods mount the repository's `config/default.toml` rather than a separate checked-in copy.
 

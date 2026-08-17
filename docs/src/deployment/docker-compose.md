@@ -11,6 +11,7 @@ For a real multi-machine deployment without Kubernetes, see
 |---------|------|-------------|
 | Gateway | `:8080` | HTTP/WebSocket reverse proxy |
 | Scheduler | `:9090` | gRPC node selection and sandbox binding |
+| Web UI | `:3000` | Control-plane console (Next.js) |
 | agentenv-a | `:8001` | AgentENV runtime node A |
 | agentenv-b | `:8002` | AgentENV runtime node B |
 
