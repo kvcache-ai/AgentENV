@@ -516,6 +516,8 @@ mod client_tests {
                     digest: "sha256:abc".to_string(),
                     size: 4096,
                 }),
+                data_stat: None,
+                ext4_used_bytes: None,
             },
             _ => DaemonResponse::Error {
                 message: "unexpected".into(),
@@ -524,12 +526,12 @@ mod client_tests {
         .await;
 
         let client = server.client();
-        let descriptor = client
+        let stats = client
             .restack_snapshot(2, Path::new("/snapshots/layer0"))
             .await
             .unwrap();
         assert_eq!(
-            descriptor,
+            stats.descriptor,
             Some(overlaybd::LayerDescriptor {
                 digest: "sha256:abc".to_string(),
                 size: 4096,
@@ -698,9 +700,11 @@ mod client_tests {
                     device_path: PathBuf::from("/dev/ublkb10"),
                 },
                 DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
-                DaemonRequest::RestackSnapshot { .. } => {
-                    DaemonResponse::RestackSnapshotCreated { descriptor: None }
-                }
+                DaemonRequest::RestackSnapshot { .. } => DaemonResponse::RestackSnapshotCreated {
+                    descriptor: None,
+                    data_stat: None,
+                    ext4_used_bytes: None,
+                },
                 DaemonRequest::Shutdown => DaemonResponse::Ok,
                 DaemonRequest::GetFeatures => DaemonResponse::Features { flags: 0 },
                 DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {

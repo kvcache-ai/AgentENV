@@ -470,6 +470,7 @@ async fn capture_live_overlaybd_snapshot(
     read_only: bool,
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
+    kind: &'static str,
 ) -> Result<LiveOverlaybdSnapshotState> {
     if read_only {
         debug!(
@@ -504,7 +505,7 @@ async fn capture_live_overlaybd_snapshot(
     };
 
     let descriptor = UblkDeviceManager::global()
-        .restack_snapshot_device(ublk_device, &live_snapshot_layer_path)
+        .restack_snapshot_device(ublk_device, &live_snapshot_layer_path, kind)
         .await
         .context("request overlaybd restack snapshot from ublk device")?;
 
@@ -591,6 +592,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     read_only: bool,
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
+    kind: &'static str,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -601,6 +603,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         read_only,
         live_runtime_image_config_path,
         output_dir,
+        kind,
     )
     .await?;
 
@@ -625,6 +628,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
         read_only,
         live_runtime_image_config_path,
         &snapshot_root.join("rootfs"),
+        "rootfs",
     )
     .await
 }

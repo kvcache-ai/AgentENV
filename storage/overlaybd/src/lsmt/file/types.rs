@@ -209,7 +209,7 @@ impl AppendDigestTracker {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DataStat {
     pub total_data_size: u64,
     pub valid_data_size: u64,

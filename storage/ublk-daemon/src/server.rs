@@ -1003,12 +1003,21 @@ async fn handle_restack_snapshot(
         )
     })?;
 
+    // Best-effort usage observability; never fails the restack itself.
+    let data_stat = image.data_stat().await.ok();
+    let image_vf: Arc<dyn overlaybd::virtual_file::VirtualFile> = image.clone();
+    let ext4_used_bytes = overlaybd::ext4_stat::ext4_used_bytes(&image_vf).await.ok();
+
     tracing::info!(
         dev_id,
         output = %output_layer_path.display(),
         "ublk daemon restack snapshot completed"
     );
-    Ok(DaemonResponse::RestackSnapshotCreated { descriptor })
+    Ok(DaemonResponse::RestackSnapshotCreated {
+        descriptor,
+        data_stat,
+        ext4_used_bytes,
+    })
 }
 
 // ── Pool handlers ───────────────────────────────────────────────────────────

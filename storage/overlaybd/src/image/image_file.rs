@@ -9,7 +9,7 @@ use crate::io::transient_io_ring::shared_transient_io_ring;
 use crate::io::virtual_file::VirtualFile;
 use crate::layer::layer_metadata::{read_overlaybd_layer_uuid, COMMIT_FILE_NAME, SEALED_FILE_NAME};
 use crate::lsmt::file::{
-    open_file_rw, open_files_ro_with_premerged_cache, stack_files, CommitArgs, LSMTFile,
+    open_file_rw, open_files_ro_with_premerged_cache, stack_files, CommitArgs, DataStat, LSMTFile,
     LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy, PARALLEL_LOAD_INDEX,
 };
 use crate::prefetch::{new_prefetcher, PrefetchMode, Prefetcher};
@@ -152,6 +152,18 @@ impl ImageFile {
     pub async fn is_read_only(&self) -> bool {
         let state = self.state.read().await;
         state.base.is_read_only()
+    }
+
+    /// Data usage of the live image: unique bytes mapped by the merged index
+    /// (`valid_data_size`) and the top layer's physical size
+    /// (`total_data_size`). Cheap in-memory index scan; feeds observability
+    /// of layer bloat and TRIM headroom.
+    pub async fn data_stat(&self) -> Result<DataStat> {
+        let state = self.state.read().await;
+        match &state.base {
+            ImageFileBase::ReadOnly(file) => Ok(file.data_stat()),
+            ImageFileBase::ReadWrite(file) => file.data_stat().await,
+        }
     }
 
     pub fn get_uuid(&self, layer_idx: usize) -> Result<Uuid> {
@@ -1488,6 +1500,53 @@ mod tests {
             !upper_index.exists(),
             "image-level sparse discard should not materialize an index file",
         );
+    }
+
+    #[tokio::test]
+    async fn test_data_stat_reports_mapped_and_upper_bytes() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lower_path = tmp.path().join("lower.data");
+        let lower_index = tmp.path().join("lower.index");
+        create_sealed_lower(&lower_path, &lower_index, &vec![0x11; 8192])
+            .await
+            .expect("build sealed lower");
+        let upper_data = tmp.path().join("upper.data");
+        let upper_index = tmp.path().join("upper.index");
+        create_initialized_upper(&upper_data, &upper_index, 8192)
+            .await
+            .expect("build initialized upper");
+        let image_cfg = ImageConfig {
+            repo_blob_url: String::new(),
+            lowers: vec![LayerConfig {
+                file: lower_path.to_string_lossy().into_owned(),
+                ..LayerConfig::default()
+            }],
+            upper: UpperConfig {
+                mode: None,
+                index: upper_index.to_string_lossy().into_owned(),
+                data: upper_data.to_string_lossy().into_owned(),
+                target: String::new(),
+                gzip_index: String::new(),
+            },
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+
+        let service = build_service(&tmp).await;
+        let image = ImageFile::open(image_cfg, service, None)
+            .await
+            .expect("open image");
+        // Overlay the first half of the lower: merged view must count it once.
+        image
+            .write_at(0, &vec![0x22; 4096])
+            .await
+            .expect("write overlay");
+
+        let stat = image.data_stat().await.expect("data stat");
+        assert_eq!(stat.valid_data_size, 8192);
+        assert!(stat.total_data_size >= 4096);
     }
 
     #[tokio::test]

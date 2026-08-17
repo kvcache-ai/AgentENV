@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
 use uvm_ublk_daemon::{
-    CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotTerminalFailure, UblkDaemonClient,
-    UblkDaemonSpawnConfig,
+    CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotStats, RestackSnapshotTerminalFailure,
+    UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 
 use super::overlaybd::OverlaybdConfig;
@@ -399,6 +399,7 @@ impl UblkDeviceManager {
         &self,
         device: &UblkDevice,
         output_layer_path: &Path,
+        kind: &'static str,
     ) -> Result<Option<overlaybd::LayerDescriptor>> {
         let client = self.require_client()?;
         debug!(
@@ -412,15 +413,16 @@ impl UblkDeviceManager {
             .await;
         metric.finish(&result);
         match result {
-            Ok(descriptor) => {
+            Ok(stats) => {
+                record_restack_usage_stats(device.dev_id, kind, &stats);
                 debug!(
                     dev_id = device.dev_id,
                     output = %output_layer_path.display(),
-                    digest = descriptor.as_ref().map(|d| d.digest.as_str()),
-                    size = descriptor.as_ref().map(|d| d.size),
+                    digest = stats.descriptor.as_ref().map(|d| d.digest.as_str()),
+                    size = stats.descriptor.as_ref().map(|d| d.size),
                     "overlaybd restack snapshot completed"
                 );
-                Ok(descriptor)
+                Ok(stats.descriptor)
             }
             Err(err) => {
                 if err
@@ -701,6 +703,36 @@ pub(crate) struct UblkDevice {
 impl UblkDevice {
     pub fn device_path(&self) -> &Path {
         &self.device_path
+    }
+}
+
+/// Record per-device overlaybd/ext4 usage gauges piggybacked on a restack RPC.
+fn record_restack_usage_stats(dev_id: u32, kind: &'static str, stats: &RestackSnapshotStats) {
+    let dev_id = dev_id.to_string();
+    if let Some(stat) = &stats.data_stat {
+        metrics::gauge!(
+            "agentenv_overlaybd_data_bytes",
+            "dev_id" => dev_id.clone(),
+            "kind" => kind,
+            "stat" => "valid",
+        )
+        .set(stat.valid_data_size as f64);
+    }
+    if let Some(used) = stats.ext4_used_bytes {
+        metrics::gauge!(
+            "agentenv_ext4_used_bytes",
+            "dev_id" => dev_id.clone(),
+            "kind" => kind,
+        )
+        .set(used as f64);
+        if let Some(stat) = &stats.data_stat {
+            metrics::gauge!(
+                "agentenv_trim_reclaimable_bytes",
+                "dev_id" => dev_id,
+                "kind" => kind,
+            )
+            .set(stat.valid_data_size.saturating_sub(used) as f64);
+        }
     }
 }
 

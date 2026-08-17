@@ -8,9 +8,10 @@ use tokio::net::UnixStream;
 use tokio::time::{Duration, Instant};
 use warm_pool::PoolConfig;
 
-use crate::protocol::{recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse};
+use crate::protocol::{
+    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, RestackSnapshotStats,
+};
 use overlaybd::config::UpperMode;
-use overlaybd::LayerDescriptor;
 
 /// Default timeout for daemon RPC calls.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -453,13 +454,21 @@ impl UblkDaemonClient {
         &self,
         dev_id: u32,
         output_layer_path: &Path,
-    ) -> Result<Option<LayerDescriptor>> {
+    ) -> Result<RestackSnapshotStats> {
         let request = DaemonRequest::RestackSnapshot {
             dev_id,
             output_layer_path: output_layer_path.to_path_buf(),
         };
         match self.call(request, SNAPSHOT_TIMEOUT).await? {
-            DaemonResponse::RestackSnapshotCreated { descriptor } => Ok(descriptor),
+            DaemonResponse::RestackSnapshotCreated {
+                descriptor,
+                data_stat,
+                ext4_used_bytes,
+            } => Ok(RestackSnapshotStats {
+                descriptor,
+                data_stat,
+                ext4_used_bytes,
+            }),
             DaemonResponse::TerminalError { message } => Err(
                 RestackSnapshotTerminalFailure::new(format!(
                     "daemon: restack snapshot dev_id={dev_id} failed after mutating live state: {message}"
