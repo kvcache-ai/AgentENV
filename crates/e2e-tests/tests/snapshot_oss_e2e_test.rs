@@ -123,6 +123,7 @@ fn test_oss_config(fixture: &MinioFixture, prefix: &str) -> OssBackendConfig {
         access_key_secret: Some(MINIO_PASS.to_string()),
         security_token: None,
         region: Some(fixture.region.clone()),
+        addressing_style: None,
         cache_max_size_gb: Some(1),
     }
 }

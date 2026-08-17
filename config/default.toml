@@ -237,6 +237,9 @@ p2p_enabled = true
 # endpoint = "https://oss-cn-beijing-internal.aliyuncs.com"
 # bucket = "agentenv-snapshots"
 # region = "cn-beijing"
+# Bucket addressing style: "virtual" or "path". Leave unset to use
+# endpoint-based auto-detection.
+# addressing_style = "virtual" # or "path"
 # prefix = "snapshots/"
 # credential_process = "/usr/local/bin/get-oss-credentials"
 # access_key_id = "..."

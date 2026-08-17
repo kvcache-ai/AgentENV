@@ -64,10 +64,15 @@ impl OssClient {
         region: String,
         prefix: String,
         credential_source: CredentialSource,
+        addressing_override: Option<AddressingStyle>,
     ) -> Result<Self> {
+        // Detection also validates the endpoint URL, so it always runs; an
+        // explicit config override then wins over the detected style.
+        let detected_style = detect_addressing_style(&endpoint, &bucket)?;
+        let addressing_style = addressing_override.unwrap_or(detected_style);
         Ok(Self {
             operator_config: ObjectStoreOperatorConfig {
-                addressing_style: detect_addressing_style(&endpoint, &bucket)?,
+                addressing_style,
                 bucket,
                 endpoint,
                 region,
@@ -446,4 +451,54 @@ async fn upload_file_to_operator(
 
 fn io_error_to_opendal(error: std::io::Error, message: &'static str) -> OpenDalError {
     OpenDalError::new(OpenDalErrorKind::Unexpected, message).set_source(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OssClient;
+    use object_store_operator::{AddressingStyle, CredentialSource};
+
+    #[test]
+    fn explicit_override_takes_precedence_over_detection() {
+        let detected = OssClient::new(
+            "snapshots".to_string(),
+            "https://t3.storage.dev".to_string(),
+            "auto".to_string(),
+            String::new(),
+            CredentialSource::Anonymous,
+            None,
+        )
+        .expect("build client with detected style");
+        assert_eq!(
+            detected.operator_config.addressing_style,
+            AddressingStyle::Path
+        );
+
+        let overridden = OssClient::new(
+            "snapshots".to_string(),
+            "https://t3.storage.dev".to_string(),
+            "auto".to_string(),
+            String::new(),
+            CredentialSource::Anonymous,
+            Some(AddressingStyle::Virtual),
+        )
+        .expect("build client with override");
+        assert_eq!(
+            overridden.operator_config.addressing_style,
+            AddressingStyle::Virtual
+        );
+    }
+
+    #[test]
+    fn explicit_override_still_validates_endpoint() {
+        OssClient::new(
+            "snapshots".to_string(),
+            "not a valid endpoint".to_string(),
+            "auto".to_string(),
+            String::new(),
+            CredentialSource::Anonymous,
+            Some(AddressingStyle::Virtual),
+        )
+        .expect_err("malformed endpoint must fail even with an explicit override");
+    }
 }

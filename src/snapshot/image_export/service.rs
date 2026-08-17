@@ -87,6 +87,7 @@ impl SnapshotImageService {
                         config.region().to_string(),
                         config.prefix().to_string(),
                         config.credential_source(),
+                        config.addressing_style(),
                     )?);
                     let repository = Arc::new(oss::OssSnapshotRepository::new(
                         Arc::clone(&client),

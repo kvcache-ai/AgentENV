@@ -211,6 +211,9 @@ pub struct OssConfig {
     pub credential_process: String,
     pub default_region: String,
     pub default_endpoint: String,
+    /// Bucket addressing style: `"virtual"`, `"path"`, or empty to use
+    /// endpoint-based auto-detection.
+    pub default_addressing_style: String,
     /// Per-request timeout in seconds (connect + transfer). Default 30.
     pub timeout_secs: u64,
     /// Number of retries on transient failures. Default 3.
@@ -227,6 +230,7 @@ impl Default for OssConfig {
             credential_process: String::new(),
             default_region: String::new(),
             default_endpoint: String::new(),
+            default_addressing_style: String::new(),
             timeout_secs: 30,
             retry_count: 3,
         }
@@ -643,6 +647,14 @@ pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
                 || (!cfg.oss_config.access_key_id.is_empty()
                     && !cfg.oss_config.secret_access_key.is_empty()),
             "ossConfig.securityToken requires accessKeyId and secretAccessKey"
+        );
+        ensure!(
+            matches!(
+                cfg.oss_config.default_addressing_style.trim(),
+                "" | "virtual" | "path"
+            ),
+            "ossConfig.defaultAddressingStyle must be 'virtual', 'path', or empty for auto-detection, got '{}'",
+            cfg.oss_config.default_addressing_style
         );
     }
 
