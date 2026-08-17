@@ -17,7 +17,16 @@ use url::Url;
 
 use crate::observability::prometheus::MetricGuard;
 
-const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+/// Multipart part size for streaming file uploads. S3/OSS caps a multipart
+/// upload at 10,000 parts, so this bounds the largest uploadable object
+/// (~625 GiB at 64 MiB). Must be passed explicitly to opendal via
+/// `writer_with().chunk()`: without it opendal falls back to the service's
+/// minimum multipart part size (5 MiB), capping uploads at ~50 GiB.
+const CHUNK_SIZE: usize = 64 * 1024 * 1024;
+/// Number of multipart parts uploaded concurrently per file. A single
+/// sequential stream tops out at roughly 100 MB/s to the OSS internal
+/// endpoint; concurrent parts multiply effective throughput.
+const UPLOAD_CONCURRENCY: usize = 8;
 const OSS_OPERATION_DURATION: &str = "agentenv_snapshot_oss_operation_duration_seconds";
 
 /// Snapshot artifacts uploaded to OSS. Used as the `artifact` label on upload
@@ -425,7 +434,11 @@ async fn upload_file_to_operator(
     key: &str,
     path: &Path,
 ) -> opendal::Result<()> {
-    let mut writer = operator.writer(key).await?;
+    let mut writer = operator
+        .writer_with(key)
+        .chunk(CHUNK_SIZE)
+        .concurrent(UPLOAD_CONCURRENCY)
+        .await?;
     let mut file = tokio::fs::File::open(path)
         .await
         .map_err(|err| io_error_to_opendal(err, "open upload source file"))?;
