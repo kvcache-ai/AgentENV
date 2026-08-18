@@ -1,8 +1,19 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use rocksdb::{Direction, IteratorMode, Options, WriteBatch, WriteOptions, DB};
+use tokio::time::Instant;
+use tracing::warn;
+
+/// Total time budget for retrying a RocksDB open that fails because the
+/// database lock is still held by a leftover process from a previous server
+/// incarnation (for example, an old container that has not finished
+/// terminating while a replacement pod already started on the same hostPath).
+/// Without this, a transient overlap turns into a CrashLoopBackOff even though
+/// the lock is released as soon as the previous process exits.
+const LOCK_RETRY_BUDGET: Duration = Duration::from_secs(120);
 
 /// Durability policy for writes made through [`LocalKvStore`].
 ///
@@ -80,23 +91,58 @@ impl LocalKvStore {
     ///
     /// The parent directory is created automatically. The database itself uses
     /// RocksDB's default column family and stores opaque byte keys and values.
+    ///
+    /// If the database lock is still held by a leftover process from a
+    /// previous server incarnation, the open is retried with exponential
+    /// backoff for up to [`LOCK_RETRY_BUDGET`] before failing.
     pub async fn open(
         path: impl Into<PathBuf>,
         durability: LocalStoreDurability,
     ) -> anyhow::Result<Self> {
-        let path = path.into();
+        Self::open_with_lock_retry_budget(path.into(), durability, LOCK_RETRY_BUDGET).await
+    }
+
+    async fn open_with_lock_retry_budget(
+        path: PathBuf,
+        durability: LocalStoreDurability,
+        lock_retry_budget: Duration,
+    ) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .with_context(|| format!("create RocksDB parent dir {}", parent.display()))?;
         }
-        let db = tokio::task::spawn_blocking(move || {
-            let mut options = Options::default();
-            options.create_if_missing(true);
-            DB::open(&options, &path).with_context(|| format!("open RocksDB {}", path.display()))
-        })
-        .await
-        .context("join RocksDB open task")??;
+
+        let started = Instant::now();
+        let mut backoff = Duration::from_millis(500);
+        let db = loop {
+            let attempt_path = path.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let mut options = Options::default();
+                options.create_if_missing(true);
+                DB::open(&options, &attempt_path)
+                    .with_context(|| format!("open RocksDB {}", attempt_path.display()))
+            })
+            .await
+            .context("join RocksDB open task")?;
+
+            match result {
+                Ok(db) => break db,
+                Err(err) => {
+                    let elapsed = started.elapsed();
+                    if !is_lock_contention(&err) || elapsed >= lock_retry_budget {
+                        return Err(err);
+                    }
+                    warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "RocksDB lock still held by another process; retrying"
+                    );
+                    tokio::time::sleep(backoff.min(lock_retry_budget - elapsed)).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+            }
+        };
 
         Ok(Self {
             db: Arc::new(db),
@@ -234,5 +280,87 @@ impl LocalKvStore {
         })
         .await
         .context("join RocksDB prefix scan task")?
+    }
+}
+
+/// Returns `true` when `err` looks like RocksDB failing to acquire the
+/// database `LOCK` file because another process still holds it. RocksDB
+/// surfaces this as an IO error such as
+/// `lock hold by current process ... /LOCK: No locks available` (same host)
+/// or `While lock file: <path>/LOCK: Resource temporarily unavailable`.
+fn is_lock_contention(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let message = cause.to_string().to_ascii_lowercase();
+        message.contains("lock")
+            && (message.contains("no locks available")
+                || message.contains("resource temporarily unavailable"))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn lock_contention_detection_matches_rocksdb_lock_errors() {
+        let lock_err = anyhow::anyhow!(
+            "IO error: While lock file: /var/lib/aenv/env/persisted-sandboxes/records.db/LOCK: Resource temporarily unavailable"
+        );
+        assert!(is_lock_contention(&lock_err));
+
+        let same_host_err = anyhow::anyhow!(
+            "IO error: lock hold by current process, acquire time 1700000000 acquiring thread 42: /var/lib/aenv/env/persisted-sandboxes/records.db/LOCK: No locks available"
+        );
+        assert!(is_lock_contention(&same_host_err));
+
+        let other_err = anyhow::anyhow!("IO error: No such file or directory");
+        assert!(!is_lock_contention(&other_err));
+    }
+
+    #[tokio::test]
+    async fn open_retries_until_lock_is_released() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("records.db");
+        let holder = LocalKvStore::open(&db_path, LocalStoreDurability::Memory).await?;
+
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(holder);
+        });
+        let reopened = LocalKvStore::open_with_lock_retry_budget(
+            db_path,
+            LocalStoreDurability::Memory,
+            Duration::from_secs(30),
+        )
+        .await?;
+        release.await?;
+
+        reopened.put(b"key".to_vec(), b"value".to_vec()).await?;
+        assert_eq!(
+            reopened.get(b"key".to_vec()).await?,
+            Some(b"value".to_vec())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_fails_after_lock_retry_budget_is_exhausted() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let db_path = temp.path().join("records.db");
+        let _holder = LocalKvStore::open(&db_path, LocalStoreDurability::Memory).await?;
+
+        let started = Instant::now();
+        let err = LocalKvStore::open_with_lock_retry_budget(
+            db_path,
+            LocalStoreDurability::Memory,
+            Duration::from_millis(1200),
+        )
+        .await
+        .expect_err("open should keep failing while the lock is held");
+
+        assert!(is_lock_contention(&err));
+        assert!(started.elapsed() >= Duration::from_millis(1200));
+        Ok(())
     }
 }
