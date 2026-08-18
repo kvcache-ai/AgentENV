@@ -199,10 +199,10 @@ impl NetworkManager {
     }
 
     fn cleanup_slot_and_release_bit(&self, slot: Slot) -> Result<()> {
-        self.cleanup_slot_and_release_bit_inner(slot, false)
+        self.cleanup_slot_and_release_bit_inner(&slot, false)
     }
 
-    fn cleanup_slot_and_release_bit_inner(&self, slot: Slot, sync_cleanup: bool) -> Result<()> {
+    fn cleanup_slot_and_release_bit_inner(&self, slot: &Slot, sync_cleanup: bool) -> Result<()> {
         let idx = slot.idx;
         let cleanup_result = slot.cleanup(sync_cleanup);
         let bitset_result = self.release_slot_bit(idx);
@@ -217,8 +217,15 @@ impl NetworkManager {
         }
     }
 
-    pub(crate) fn cleanup_allocated_slot(&self, slot: Slot, sync_cleanup: bool) -> Result<()> {
+    pub(crate) fn cleanup_allocated_slot(&self, slot: &Slot, sync_cleanup: bool) -> Result<()> {
         self.cleanup_slot_and_release_bit_inner(slot, sync_cleanup)
+    }
+
+    /// Redo only the resource teardown for a slot whose allocation bit was
+    /// already released. Never touches the allocation bitmap: the index may
+    /// have been reallocated to a live sandbox since the failed cleanup.
+    pub(crate) fn cleanup_slot_resources(&self, slot: &Slot, sync_cleanup: bool) -> Result<()> {
+        slot.cleanup(sync_cleanup).map_err(Into::into)
     }
 
     /// Find and allocate the next available slot.
@@ -395,7 +402,7 @@ impl NetworkManager {
             );
             for slot in drained_slots {
                 let idx = slot.idx;
-                if let Err(err) = self.cleanup_slot_and_release_bit_inner(slot, sync_cleanup) {
+                if let Err(err) = self.cleanup_slot_and_release_bit_inner(&slot, sync_cleanup) {
                     failures.push(format!("slot {idx} cleanup failed: {err}"));
                 }
             }

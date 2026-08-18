@@ -48,13 +48,91 @@ pub(crate) struct WarmFirecracker {
     pub work_dir: TempDir,
 }
 
+/// A dead warm entry waiting for network-slot teardown.
+enum DeadWarmEntry {
+    /// Full entry on the first teardown attempt.
+    Full(WarmFirecracker),
+    /// Retry after a failed first attempt. The allocation bit was already
+    /// released, so retries must redo only the resource teardown and never
+    /// touch the allocation bitmap: the index may have been reallocated to
+    /// a live sandbox.
+    SlotOnly(Slot),
+}
+
+impl DeadWarmEntry {
+    fn slot_idx(&self) -> u32 {
+        match self {
+            DeadWarmEntry::Full(warm) => warm.slot.idx,
+            DeadWarmEntry::SlotOnly(slot) => slot.idx,
+        }
+    }
+
+    /// Tear down the entry. The process is known dead, so skip the
+    /// graceful-stop path: dropping the instance best-effort kills any
+    /// residual handle before the network slot is released. On failure the
+    /// entry is returned so the caller can retain it for retry instead of
+    /// losing track of stale host network state.
+    fn attempt_cleanup(self) -> std::result::Result<(), DeadWarmCleanupError> {
+        let slot_idx = self.slot_idx();
+        let is_retry = matches!(self, DeadWarmEntry::SlotOnly(_));
+        let slot = match self {
+            DeadWarmEntry::Full(warm) => {
+                let WarmFirecracker {
+                    slot,
+                    fc_instance,
+                    work_dir,
+                } = warm;
+                drop(fc_instance);
+                drop(work_dir);
+                slot
+            }
+            DeadWarmEntry::SlotOnly(slot) => slot,
+        };
+
+        let network = NetworkManager::global();
+        // The first attempt also releases the allocation bit;
+        // `Slot::cleanup` re-arms itself on failure, so retries redo only
+        // the teardown and never touch the bitmap again.
+        let result = if is_retry {
+            network.cleanup_slot_resources(&slot, false)
+        } else {
+            network.cleanup_allocated_slot(&slot, false)
+        };
+        result.map_err(|error| DeadWarmCleanupError {
+            entry: DeadWarmEntry::SlotOnly(slot),
+            error: error.context(format!(
+                "firecracker pool: cleanup dead warm network slot {slot_idx}"
+            )),
+        })
+    }
+}
+
+/// Error from dead-entry teardown. Keeps the entry so the caller can retain
+/// it for retry.
+struct DeadWarmCleanupError {
+    entry: DeadWarmEntry,
+    error: anyhow::Error,
+}
+
+/// Dead warm entries queued for teardown, plus the shutdown state the
+/// enqueue path checks under the same lock.
+#[derive(Default)]
+struct DeadWarmQueue {
+    /// Set once shutdown starts; late entries must be cleaned up inline by
+    /// the caller because no consumer will run again.
+    closed: bool,
+    entries: Vec<DeadWarmEntry>,
+}
+
 pub struct FirecrackerPool {
     pool: WarmPool<WarmFirecracker>,
     /// Warm entries whose firecracker process died while parked, waiting for
     /// network-slot teardown on the maintenance thread. The acquire path runs
     /// in async snapshot-resume context and must not block on netlink/`ip`
-    /// teardown, so cleanup is deferred here.
-    dead_entries: Mutex<Vec<WarmFirecracker>>,
+    /// teardown, so cleanup is deferred here. The queue lock also serializes
+    /// enqueue against shutdown: once `closed` is set, a late enqueue cleans
+    /// up inline instead of queueing an entry no consumer will ever see.
+    dead_entries: Mutex<DeadWarmQueue>,
     binary: PathBuf,
     socket_timeout: Duration,
     socket_poll_interval: Duration,
@@ -123,7 +201,7 @@ impl FirecrackerPool {
 
         Self {
             pool: WarmPool::new(pool_config.pool),
-            dead_entries: Mutex::new(Vec::new()),
+            dead_entries: Mutex::new(DeadWarmQueue::default()),
             binary,
             socket_timeout,
             socket_poll_interval,
@@ -188,41 +266,107 @@ impl FirecrackerPool {
     /// The maintenance thread already owns all other pool teardown, so dead
     /// entries are deferred to it and the miss is returned immediately.
     fn enqueue_dead_warm(&self, warm: WarmFirecracker) {
+        let slot_idx = warm.slot.idx;
         warn!(
-            slot = warm.slot.idx,
+            slot = slot_idx,
             "firecracker pool: warm process exited while parked; queueing entry for cleanup"
         );
 
-        if !self.pool.config().maintenance_enabled {
-            // Without a maintenance worker nothing consumes the dead-entry
-            // queue, so clean up inline.
-            if let Err(err) = cleanup_dead_warm(warm) {
-                warn!(
-                    error = %err,
-                    "firecracker pool: cleanup of dead warm entry failed"
-                );
+        let entry = DeadWarmEntry::Full(warm);
+        {
+            let mut queue = self.dead_entries.lock().unwrap();
+            if queue.closed {
+                // Shutdown already drained the queue: no consumer will run
+                // again, so clean up inline. This is the shutdown path's own
+                // blocking teardown, consistent with the rest of shutdown
+                // cleanup.
+                drop(queue);
+                if let Err(err) = entry.attempt_cleanup() {
+                    warn!(
+                        slot = slot_idx,
+                        error = %err.error,
+                        "firecracker pool: cleanup of dead warm entry failed during shutdown"
+                    );
+                }
+                return;
             }
-            return;
+            if self.pool.config().maintenance_enabled {
+                queue.entries.push(entry);
+                drop(queue);
+                self.pool.request_maintenance();
+                return;
+            }
         }
 
-        self.dead_entries.lock().unwrap().push(warm);
-        self.pool.request_maintenance();
+        // Maintenance is disabled: no worker consumes the queue. Run the
+        // blocking teardown on a detached thread so the async acquire path
+        // never stalls on netlink/`ip` work. If the attempt fails, dropping
+        // the returned entry retries the teardown once more via `Slot::drop`.
+        if let Err(err) = std::thread::Builder::new()
+            .name("firecracker-pool-dead-cleanup".to_string())
+            .spawn(move || {
+                if let Err(err) = entry.attempt_cleanup() {
+                    warn!(
+                        error = %err.error,
+                        "firecracker pool: cleanup of dead warm entry failed"
+                    );
+                }
+            })
+        {
+            warn!(
+                error = %err,
+                "firecracker pool: failed to spawn dead-entry cleanup thread"
+            );
+        }
     }
 
-    /// Clean up queued dead entries on the maintenance thread.
+    /// Clean up queued dead entries. Runs on the maintenance thread.
+    ///
+    /// Entries whose teardown fails are retained in the queue so a later
+    /// cycle retries them; losing them would leave stale host network state
+    /// behind while the slot index is already back in the allocation bitmap.
     fn cleanup_dead_warm_entries(&self) -> Result<()> {
-        let dead = std::mem::take(&mut *self.dead_entries.lock().unwrap());
+        let dead = {
+            let mut queue = self.dead_entries.lock().unwrap();
+            std::mem::take(&mut queue.entries)
+        };
         let mut failures = Vec::new();
-        for warm in dead {
-            if let Err(err) = cleanup_dead_warm(warm) {
+        let mut failed = Vec::new();
+        for entry in dead {
+            if let Err(err) = entry.attempt_cleanup() {
                 warn!(
-                    error = %err,
-                    "firecracker pool: cleanup of dead warm entry failed"
+                    slot = err.entry.slot_idx(),
+                    error = %err.error,
+                    "firecracker pool: cleanup of dead warm entry failed; retaining for retry"
                 );
-                failures.push(err.to_string());
+                failures.push(err.error.to_string());
+                failed.push(err.entry);
+            }
+        }
+        if !failed.is_empty() {
+            let mut queue = self.dead_entries.lock().unwrap();
+            if queue.closed {
+                // Shutdown already closed the queue and no consumer remains;
+                // dropping retries the teardown once more via `Slot::drop`.
+                warn!(
+                    count = failed.len(),
+                    "firecracker pool: dropping dead warm entries that failed cleanup during shutdown"
+                );
+            } else {
+                queue.entries.append(&mut failed);
             }
         }
         firecracker_pool_cleanup_result(failures)
+    }
+
+    /// Mark the dead-entry queue closed and take its entries. An acquire
+    /// that popped its entry just before `drain_all` either enqueues before
+    /// this take, or observes `closed` under the same lock and cleans up
+    /// inline, so no entry is ever left queued without a consumer.
+    fn close_dead_queue(&self) -> Vec<DeadWarmEntry> {
+        let mut queue = self.dead_entries.lock().unwrap();
+        queue.closed = true;
+        std::mem::take(&mut queue.entries)
     }
 
     pub fn warm_len(&self) -> usize {
@@ -231,14 +375,25 @@ impl FirecrackerPool {
 
     pub async fn shutdown(&self) -> Result<()> {
         let drained = self.pool.drain_all();
+        // Close the dead-entry queue right after drain_all so a concurrent
+        // acquire that popped its entry just before shutdown either lands in
+        // this take, or observes `closed` and cleans up inline.
+        let dead = self.close_dead_queue();
         let mut failures = Vec::new();
         for warm in drained {
             if let Err(err) = self.cleanup_warm_async(warm).await {
                 failures.push(err.to_string());
             }
         }
-        if let Err(err) = self.cleanup_dead_warm_entries() {
-            failures.push(err.to_string());
+        for entry in dead {
+            if let Err(err) = entry.attempt_cleanup() {
+                warn!(
+                    slot = err.entry.slot_idx(),
+                    error = %err.error,
+                    "firecracker pool: cleanup of dead warm entry failed during shutdown"
+                );
+                failures.push(err.error.to_string());
+            }
         }
 
         firecracker_pool_cleanup_result(failures)
@@ -250,14 +405,22 @@ impl FirecrackerPool {
 
     fn shutdown_blocking(&self, sync_network_cleanup: bool) -> Result<()> {
         let drained = self.pool.drain_all();
+        let dead = self.close_dead_queue();
         let mut failures = Vec::new();
         for warm in drained {
             if let Err(err) = self.cleanup_warm_blocking(warm, sync_network_cleanup) {
                 failures.push(err.to_string());
             }
         }
-        if let Err(err) = self.cleanup_dead_warm_entries() {
-            failures.push(err.to_string());
+        for entry in dead {
+            if let Err(err) = entry.attempt_cleanup() {
+                warn!(
+                    slot = err.entry.slot_idx(),
+                    error = %err.error,
+                    "firecracker pool: cleanup of dead warm entry failed during shutdown"
+                );
+                failures.push(err.error.to_string());
+            }
         }
 
         firecracker_pool_cleanup_result(failures)
@@ -466,7 +629,7 @@ impl FirecrackerPool {
         drop(work_dir);
 
         NetworkManager::global()
-            .cleanup_allocated_slot(slot, sync_network_cleanup)
+            .cleanup_allocated_slot(&slot, sync_network_cleanup)
             .context("firecracker pool: cleanup warm network slot")
     }
 
@@ -489,7 +652,7 @@ impl FirecrackerPool {
         drop(work_dir);
 
         NetworkManager::global()
-            .cleanup_allocated_slot(slot, false)
+            .cleanup_allocated_slot(&slot, false)
             .context("firecracker pool: cleanup warm network slot")
     }
 }
@@ -503,28 +666,6 @@ fn firecracker_pool_cleanup_result(failures: Vec<String>) -> Result<()> {
             failures.join(" | ")
         ))
     }
-}
-
-/// Tear down a warm entry whose firecracker process already exited.
-///
-/// The process is known dead, so skip the graceful-stop path: dropping the
-/// instance best-effort kills any residual handle, and the network slot is
-/// released directly. Runs on the pool maintenance thread (or inline when
-/// maintenance is disabled), never on the acquire path.
-fn cleanup_dead_warm(warm: WarmFirecracker) -> Result<()> {
-    let WarmFirecracker {
-        slot,
-        fc_instance,
-        work_dir,
-    } = warm;
-    let slot_idx = slot.idx;
-
-    drop(fc_instance);
-    drop(work_dir);
-
-    NetworkManager::global()
-        .cleanup_allocated_slot(slot, false)
-        .with_context(|| format!("firecracker pool: cleanup dead warm network slot {slot_idx}"))
 }
 
 pub(crate) fn warm_stdout_path(work_dir: &Path) -> PathBuf {
