@@ -1658,6 +1658,7 @@ mod tests {
             high_watermark: 1,
             maintenance_enabled: false,
             startup_prewarm: false,
+            idle_ttl: None,
         }
     }
 

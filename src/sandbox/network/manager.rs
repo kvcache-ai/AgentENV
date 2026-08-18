@@ -115,6 +115,7 @@ impl NetworkManager {
                 high_watermark,
                 maintenance_enabled,
                 startup_prewarm: true,
+                idle_ttl: None,
             },
             address_plan: NetworkAddressPlan::default(),
             netns_dir: std::env::temp_dir().join("aenv-network-tests/netns"),
