@@ -4,10 +4,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::{LayerConfig, UpperMode};
-use overlaybd::index_file::{merge_files_ro, CommitArgs, DigestTrackingFile, OrderedWriter};
+use overlaybd::index_file::{merge_files_ro, CommitArgs};
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::zfile::{CompressArgs, CompressOptions, ZFileCompactWriter};
-use overlaybd::LayerDescriptor;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 use uuid::Uuid;
@@ -70,20 +69,6 @@ pub(crate) async fn create_commit_args(
     Ok(args)
 }
 
-/// Like [`create_commit_args`], but tracks a content descriptor (streaming
-/// sha256 + size) of the sealed output at no extra I/O cost. The descriptor
-/// is `None` when writes were not strictly ordered.
-pub(crate) async fn create_commit_args_with_digest(
-    output: Arc<dyn VirtualFile>,
-    mode: OverlaybdCompactOutput,
-    concurrency: usize,
-) -> Result<(CommitArgs, Arc<DigestTrackingFile>)> {
-    let tracker = Arc::new(DigestTrackingFile::new(output));
-    let mut args = create_commit_args(tracker.clone(), mode, concurrency).await?;
-    args.writer = Arc::new(OrderedWriter::new(args.writer.clone()));
-    Ok((args, tracker))
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OverlaybdConfig {
     pub image_config_path: PathBuf,
@@ -114,7 +99,7 @@ pub(crate) async fn compact_layers(
     layers: &[LayerConfig],
     output_path: &Path,
     mode: OverlaybdCompactOutput,
-) -> Result<Option<(PathBuf, Option<LayerDescriptor>)>> {
+) -> Result<Option<PathBuf>> {
     if layers.is_empty() {
         return Ok(None);
     }
@@ -141,14 +126,13 @@ pub(crate) async fn compact_layers(
     }
 
     let lower_tmp = output_path.with_extension(format!("commit.{}.tmp", Uuid::now_v7()));
-    let build_result: Result<Option<LayerDescriptor>> = async {
+    let build_result: Result<()> = async {
         let output_file: Arc<dyn VirtualFile> = Arc::new(
             LocalFile::new(&lower_tmp, io_ring)
                 .await
                 .context("create compacted layer output file")?,
         );
-        let (commit_args, digest_tracker) =
-            create_commit_args_with_digest(output_file, mode, 32).await?;
+        let commit_args = create_commit_args(output_file, mode, 32).await?;
         merge_files_ro(&src_files, commit_args)
             .await
             .context("merge layers")?;
@@ -160,21 +144,21 @@ pub(crate) async fn compact_layers(
                     output_path.display()
                 )
             })?;
-        Ok(digest_tracker.descriptor())
+        Ok(())
     }
     .await;
 
     if build_result.is_err() {
         let _ = tokio::fs::remove_file(&lower_tmp).await;
     }
-    let descriptor = build_result?;
+    build_result?;
 
     debug!(
         output = %output_path.display(),
         input_layers = layers.len(),
         "compacted overlaybd layers"
     );
-    Ok(Some((output_path.to_path_buf(), descriptor)))
+    Ok(Some(output_path.to_path_buf()))
 }
 
 #[cfg(test)]
@@ -332,22 +316,11 @@ mod tests {
             ),
         ] {
             let output_path = temp.path().join(format!("compacted-{name}.commit"));
-            let (published, descriptor) = compact_layers(&layers, &output_path, mode)
+            let published = compact_layers(&layers, &output_path, mode)
                 .await
-                .expect("compact mixed raw/lz4/zstd layers")
-                .expect("compaction produces an output");
-            assert_eq!(published, output_path);
+                .expect("compact mixed raw/lz4/zstd layers");
+            assert_eq!(published.as_deref(), Some(output_path.as_path()));
             assert!(!output_path.with_extension("commit.tmp").exists());
-
-            // The streamed digest must match a plain sha256 of the output file.
-            let descriptor = descriptor.expect("digest descriptor for compacted layer");
-            let file_bytes = std::fs::read(&output_path).expect("read compacted output");
-            assert_eq!(descriptor.size, file_bytes.len() as u64, "mode {name}");
-            assert_eq!(
-                descriptor.digest,
-                crate::digest::sha256_digest(&file_bytes),
-                "mode {name}"
-            );
 
             let (zfile_flag, data) = read_sealed_layer(&output_path, vsize as usize).await;
             assert_eq!(zfile_flag, expected_zfile, "mode {name}");

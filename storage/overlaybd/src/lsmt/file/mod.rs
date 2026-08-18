@@ -1,11 +1,9 @@
-mod digest_tracking;
 mod helper;
 mod readonly;
 mod readwrite;
 mod stack;
 mod types;
 
-pub use digest_tracking::{DigestTrackingFile, OrderedWriter};
 pub(crate) use helper::initialize_file_rw_paths;
 pub use helper::{compact_to, create_mappings_from_sparse, validate_rw_header_pair_paths};
 pub use readonly::LSMTReadOnlyFile;
