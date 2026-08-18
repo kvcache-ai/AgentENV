@@ -711,10 +711,39 @@ impl Slot {
         let output = crate::privileges::run_with_scoped_capabilities(
             &[crate::privileges::CAP_NET_ADMIN],
             || {
-                Command::new("ip")
+                // Hard timeout: this runs on shutdown/exit cleanup paths that
+                // are joined synchronously (e.g. the firecracker pool's dead
+                // entry cleanup worker), so a stuck `ip link del` must not
+                // block the caller forever.
+                const IP_LINK_DEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+                let mut child = Command::new("ip")
                     .args(["link", "del", &veth_name])
-                    .output()
-                    .context("Failed to execute ip link del")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .context("Failed to spawn ip link del")?;
+                let deadline = std::time::Instant::now() + IP_LINK_DEL_TIMEOUT;
+                loop {
+                    if child
+                        .try_wait()
+                        .context("Failed to poll ip link del")?
+                        .is_some()
+                    {
+                        return child
+                            .wait_with_output()
+                            .context("Failed to collect ip link del output");
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(anyhow!(
+                            "ip link del {} timed out after {:?}",
+                            veth_name,
+                            IP_LINK_DEL_TIMEOUT
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
             },
         )?;
 

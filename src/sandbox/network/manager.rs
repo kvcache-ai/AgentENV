@@ -185,7 +185,7 @@ impl NetworkManager {
     }
 
     /// Release only the bitmap bit for a slot index.
-    fn release_slot_bit(&self, idx: u32) -> Result<()> {
+    pub(crate) fn release_slot_bit(&self, idx: u32) -> Result<()> {
         if idx == 0 || idx as usize >= MAX_SLOTS {
             return Err(anyhow!("Slot index {} out of range", idx));
         }

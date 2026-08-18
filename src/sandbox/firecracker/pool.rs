@@ -30,6 +30,10 @@ const DEAD_WARM_CLEANUP_RETRY_MAX: Duration = Duration::from_secs(30);
 /// Upper bound for one backoff sleep slice in the dead-cleanup worker, so a
 /// shutdown `join` is never blocked for longer than this.
 const DEAD_WARM_CLEANUP_WORKER_POLL: Duration = Duration::from_secs(1);
+/// Upper bound for joining the dead-cleanup worker during shutdown. The
+/// worker sleeps in short slices and the synchronous `ip link del` fallback
+/// has its own timeout, but a stuck teardown must not hang shutdown forever.
+const DEAD_WARM_CLEANUP_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Exponential backoff between dead-entry teardown retries. Keeps a retained
 /// entry whose cleanup keeps failing from being retried on every maintenance
@@ -43,6 +47,12 @@ fn dead_warm_cleanup_backoff(failed_attempts: u32) -> Duration {
 }
 
 static POOL: OnceLock<Option<FirecrackerPool>> = OnceLock::new();
+
+/// Lock the dead-entry queue, recovering from poisoning: a panicked cleanup
+/// worker must not turn into a pool-wide panic on the next lock.
+fn lock_dead_queue(queue: &Mutex<DeadWarmQueue>) -> std::sync::MutexGuard<'_, DeadWarmQueue> {
+    queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 extern "C" fn firecracker_pool_exit_hook() {
     let _ = std::panic::catch_unwind(|| {
@@ -141,7 +151,10 @@ impl DeadWarmEntry {
 
         let result = network.cleanup_allocated_slot_retain_bit_on_failure(&slot, false);
         result.map_err(|error| {
-            let failed_attempts = failed_attempts + 1;
+            // Saturate: a permanently failing slot is retried indefinitely,
+            // and an overflowing counter would panic the cleanup worker in
+            // debug builds. The backoff saturates at the cap anyway.
+            let failed_attempts = failed_attempts.saturating_add(1);
             DeadWarmCleanupError {
                 entry: Box::new(DeadWarmEntry {
                     inner: DeadWarmEntryInner::SlotOnly(slot),
@@ -175,6 +188,46 @@ impl std::fmt::Debug for DeadWarmCleanupError {
     }
 }
 
+/// Finish teardown of an entry whose queue was closed while its cleanup was
+/// in flight. The entry cannot be requeued (no consumer remains), and simply
+/// dropping it would re-run `Slot::cleanup` via `Slot::drop` without ever
+/// releasing the allocation bit, leaking the index permanently. The teardown
+/// is retried once on the calling (blocking) thread; if it still fails, the
+/// bit is released explicitly as a last resort so the index is not leaked.
+/// Returns the failure message so shutdown can report it.
+fn finalize_closed_dead_entry(
+    network: &NetworkManager,
+    entry: DeadWarmEntry,
+    error: anyhow::Error,
+) -> String {
+    let slot_idx = entry.slot_idx();
+    let mut message = error.to_string();
+    match entry.attempt_cleanup(network) {
+        Ok(()) => {
+            // Teardown completed on the final attempt; the allocation bit
+            // was released by `attempt_cleanup`.
+        }
+        Err(err) => {
+            message = format!(
+                "{message}; final teardown during shutdown also failed: {}",
+                err.error
+            );
+            // Dropping the entry re-runs `Slot::cleanup` best-effort via
+            // `Slot::drop`, which never touches the bitmap; release the bit
+            // explicitly so the index is not leaked.
+            drop(err);
+            if let Err(bit_err) = network.release_slot_bit(slot_idx) {
+                warn!(
+                    slot = slot_idx,
+                    error = %bit_err,
+                    "firecracker pool: failed to release dead warm slot bit during shutdown"
+                );
+            }
+        }
+    }
+    message
+}
+
 /// Dead warm entries queued for teardown, plus the shutdown state the
 /// enqueue path checks under the same lock.
 #[derive(Default)]
@@ -188,6 +241,9 @@ struct DeadWarmQueue {
     /// joined by `close_dead_queue` so shutdown never reports completion
     /// while teardown is still running.
     worker: Option<std::thread::JoinHandle<()>>,
+    /// Failures finalized by the cleanup worker after the queue was closed;
+    /// collected by `close_dead_queue` so shutdown can report them.
+    failures: Vec<String>,
 }
 
 pub struct FirecrackerPool {
@@ -340,17 +396,20 @@ impl FirecrackerPool {
 
         let entry = DeadWarmEntry::new(warm);
         {
-            let mut queue = self.dead_entries.lock().unwrap();
+            let mut queue = lock_dead_queue(&self.dead_entries);
             if queue.closed {
                 // Shutdown already drained the queue: no consumer will run
-                // again, so clean up inline. This is the shutdown path's own
-                // blocking teardown, consistent with the rest of shutdown
-                // cleanup.
+                // again, so finish the teardown inline on this thread and
+                // make sure the allocation bit is released even on failure
+                // (dropping the entry would only re-run `Slot::cleanup` via
+                // `Slot::drop` and leak the bit).
                 drop(queue);
                 if let Err(err) = entry.attempt_cleanup(NetworkManager::global()) {
+                    let message =
+                        finalize_closed_dead_entry(NetworkManager::global(), *err.entry, err.error);
                     warn!(
                         slot = slot_idx,
-                        error = %err.error,
+                        error = %message,
                         "firecracker pool: cleanup of dead warm entry failed during shutdown"
                     );
                 }
@@ -419,7 +478,7 @@ impl FirecrackerPool {
     ) {
         loop {
             let next = {
-                let mut queue = shared.lock().unwrap();
+                let mut queue = lock_dead_queue(&shared);
                 if queue.closed {
                     return;
                 }
@@ -451,16 +510,24 @@ impl FirecrackerPool {
                     error = %err.error,
                     "firecracker pool: cleanup of dead warm entry failed; retaining for retry"
                 );
-                let mut queue = shared.lock().unwrap();
+                let mut queue = lock_dead_queue(&shared);
                 if queue.closed {
-                    // Shutdown drained the queue and no consumer remains;
-                    // dropping retries the teardown once more via `Slot::drop`,
-                    // here on the worker thread rather than the async acquire
-                    // path.
+                    // Shutdown closed the queue while this teardown was in
+                    // flight; the entry cannot be requeued. Finish it on this
+                    // worker thread and release the allocation bit explicitly
+                    // on failure: dropping the entry would only re-run
+                    // `Slot::cleanup` via `Slot::drop`, leaking the bit, and
+                    // the failure would never reach shutdown's result.
+                    let DeadWarmCleanupError { entry, error } = err;
+                    let slot_idx = entry.slot_idx();
+                    drop(queue);
+                    let message = finalize_closed_dead_entry(network, *entry, error);
                     warn!(
-                        slot = err.entry.slot_idx(),
-                        "firecracker pool: dropping dead warm entry that failed cleanup during shutdown"
+                        slot = slot_idx,
+                        error = %message,
+                        "firecracker pool: finalized dead warm entry after queue close"
                     );
+                    lock_dead_queue(&shared).failures.push(message);
                 } else {
                     queue.entries.push(*err.entry);
                 }
@@ -478,12 +545,15 @@ impl FirecrackerPool {
     fn cleanup_dead_warm_entries(&self) -> Result<()> {
         let now = Instant::now();
         let (due, mut retained): (Vec<DeadWarmEntry>, Vec<DeadWarmEntry>) = {
-            let mut queue = self.dead_entries.lock().unwrap();
+            let mut queue = lock_dead_queue(&self.dead_entries);
             std::mem::take(&mut queue.entries)
                 .into_iter()
                 .partition(|entry| entry.due(now))
         };
         let mut failures = Vec::new();
+        // Errors of retained entries, kept aligned with `retained` so the
+        // shutdown path can finalize teardown with the original error.
+        let mut retained_errors: Vec<anyhow::Error> = Vec::new();
         for entry in due {
             if let Err(err) = entry.attempt_cleanup(NetworkManager::global()) {
                 warn!(
@@ -491,20 +561,28 @@ impl FirecrackerPool {
                     error = %err.error,
                     "firecracker pool: cleanup of dead warm entry failed; retaining for retry"
                 );
-                failures.push(err.error.to_string());
                 retained.push(*err.entry);
+                retained_errors.push(err.error);
             }
         }
         if !retained.is_empty() {
-            let mut queue = self.dead_entries.lock().unwrap();
+            let mut queue = lock_dead_queue(&self.dead_entries);
             if queue.closed {
-                // Shutdown already closed the queue and no consumer remains;
-                // dropping retries the teardown once more via `Slot::drop`.
-                warn!(
-                    count = retained.len(),
-                    "firecracker pool: dropping dead warm entries that failed cleanup during shutdown"
-                );
+                // Shutdown already closed the queue and no consumer remains.
+                // Finish each teardown inline (this is the blocking
+                // maintenance thread) and release the allocation bit
+                // explicitly on failure: dropping the entries would only
+                // re-run `Slot::cleanup` via `Slot::drop` and leak the bits.
+                drop(queue);
+                for (entry, error) in retained.into_iter().zip(retained_errors) {
+                    failures.push(finalize_closed_dead_entry(
+                        NetworkManager::global(),
+                        entry,
+                        error,
+                    ));
+                }
             } else {
+                failures.extend(retained_errors.iter().map(|error| error.to_string()));
                 queue.entries.append(&mut retained);
             }
         }
@@ -517,23 +595,44 @@ impl FirecrackerPool {
     /// inline, so no entry is ever left queued without a consumer.
     ///
     /// A managed cleanup worker (maintenance-disabled mode) may be
-    /// mid-teardown; it is joined before returning so shutdown never reports
-    /// completion while teardown is still running.
-    fn close_dead_queue(&self) -> Vec<DeadWarmEntry> {
+    /// mid-teardown; it is joined (with a bounded wait) before returning so
+    /// shutdown only reports completion once in-flight teardown is done.
+    /// Failures the worker finalized after the queue closed are collected
+    /// and returned so shutdown can report them.
+    fn close_dead_queue(&self) -> (Vec<DeadWarmEntry>, Vec<String>) {
         let (entries, worker) = {
-            let mut queue = self.dead_entries.lock().unwrap();
+            let mut queue = lock_dead_queue(&self.dead_entries);
             queue.closed = true;
             (std::mem::take(&mut queue.entries), queue.worker.take())
         };
         if let Some(handle) = worker {
-            if let Err(err) = handle.join() {
-                warn!(
-                    ?err,
-                    "firecracker pool: dead-entry cleanup worker panicked during join"
-                );
+            // Bounded join: the worker sleeps in short slices between
+            // attempts and the synchronous `ip link del` fallback has its
+            // own timeout, but a stuck teardown must not hang shutdown
+            // forever.
+            let deadline = Instant::now() + DEAD_WARM_CLEANUP_JOIN_TIMEOUT;
+            loop {
+                if handle.is_finished() {
+                    if let Err(err) = handle.join() {
+                        warn!(
+                            ?err,
+                            "firecracker pool: dead-entry cleanup worker panicked during join"
+                        );
+                    }
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    warn!(
+                        timeout = ?DEAD_WARM_CLEANUP_JOIN_TIMEOUT,
+                        "firecracker pool: dead-entry cleanup worker did not finish before the join timeout; shutdown continues without it"
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
-        entries
+        let failures = std::mem::take(&mut lock_dead_queue(&self.dead_entries).failures);
+        (entries, failures)
     }
 
     pub fn warm_len(&self) -> usize {
@@ -545,8 +644,8 @@ impl FirecrackerPool {
         // Close the dead-entry queue right after drain_all so a concurrent
         // acquire that popped its entry just before shutdown either lands in
         // this take, or observes `closed` and cleans up inline.
-        let dead = self.close_dead_queue();
-        let mut failures = Vec::new();
+        let (dead, dead_failures) = self.close_dead_queue();
+        let mut failures = dead_failures;
         for warm in drained {
             if let Err(err) = self.cleanup_warm_async(warm).await {
                 failures.push(err.to_string());
@@ -554,12 +653,15 @@ impl FirecrackerPool {
         }
         for entry in dead {
             if let Err(err) = entry.attempt_cleanup(NetworkManager::global()) {
+                let slot = err.entry.slot_idx();
+                let message =
+                    finalize_closed_dead_entry(NetworkManager::global(), *err.entry, err.error);
                 warn!(
-                    slot = err.entry.slot_idx(),
-                    error = %err.error,
+                    slot,
+                    error = %message,
                     "firecracker pool: cleanup of dead warm entry failed during shutdown"
                 );
-                failures.push(err.error.to_string());
+                failures.push(message);
             }
         }
 
@@ -572,8 +674,8 @@ impl FirecrackerPool {
 
     fn shutdown_blocking(&self, sync_network_cleanup: bool) -> Result<()> {
         let drained = self.pool.drain_all();
-        let dead = self.close_dead_queue();
-        let mut failures = Vec::new();
+        let (dead, dead_failures) = self.close_dead_queue();
+        let mut failures = dead_failures;
         for warm in drained {
             if let Err(err) = self.cleanup_warm_blocking(warm, sync_network_cleanup) {
                 failures.push(err.to_string());
@@ -581,12 +683,15 @@ impl FirecrackerPool {
         }
         for entry in dead {
             if let Err(err) = entry.attempt_cleanup(NetworkManager::global()) {
+                let slot = err.entry.slot_idx();
+                let message =
+                    finalize_closed_dead_entry(NetworkManager::global(), *err.entry, err.error);
                 warn!(
-                    slot = err.entry.slot_idx(),
-                    error = %err.error,
+                    slot,
+                    error = %message,
                     "firecracker pool: cleanup of dead warm entry failed during shutdown"
                 );
-                failures.push(err.error.to_string());
+                failures.push(message);
             }
         }
 
@@ -940,20 +1045,20 @@ mod tests {
         let idx = slot.idx;
 
         {
-            let mut queue = shared.lock().unwrap();
+            let mut queue = lock_dead_queue(&shared);
             queue.entries.push(slot_only_entry(slot));
             FirecrackerPool::ensure_dead_cleanup_worker(&mut queue, &shared, manager);
             assert!(queue.worker.is_some());
         }
 
         let drained = wait_until(Duration::from_secs(5), || {
-            shared.lock().unwrap().entries.is_empty()
+            lock_dead_queue(&shared).entries.is_empty()
         });
         assert!(drained, "cleanup worker did not drain the queue");
 
         // Close + join, mirroring close_dead_queue: the join must complete.
         let worker = {
-            let mut queue = shared.lock().unwrap();
+            let mut queue = lock_dead_queue(&shared);
             queue.closed = true;
             queue.worker.take()
         };
@@ -975,7 +1080,7 @@ mod tests {
             // Back off far into the future so the worker parks in its sleep
             // slice instead of tearing the slot down.
             entry.not_before = Instant::now() + DEAD_WARM_CLEANUP_RETRY_MAX;
-            let mut queue = shared.lock().unwrap();
+            let mut queue = lock_dead_queue(&shared);
             queue.entries.push(entry);
             FirecrackerPool::ensure_dead_cleanup_worker(&mut queue, &shared, manager);
         }
@@ -985,7 +1090,7 @@ mod tests {
 
         let close_started = Instant::now();
         let worker = {
-            let mut queue = shared.lock().unwrap();
+            let mut queue = lock_dead_queue(&shared);
             queue.closed = true;
             queue.worker.take()
         };
@@ -995,5 +1100,59 @@ mod tests {
             close_started.elapsed() < DEAD_WARM_CLEANUP_WORKER_POLL + Duration::from_secs(4),
             "shutdown join was blocked by a backing-off entry"
         );
+    }
+
+    #[test]
+    fn failed_attempts_counter_saturates_instead_of_overflowing() {
+        let manager = test_manager();
+        let slot = manager.allocate_slot(47).unwrap();
+        // Force the teardown to fail at the bit-release step so the entry is
+        // retained; the counter must saturate rather than overflow (which
+        // would panic the cleanup worker in debug builds).
+        manager.cleanup_allocated_slot(&slot, false).unwrap();
+        let mut entry = slot_only_entry(slot);
+        entry.failed_attempts = u32::MAX;
+
+        let err = entry.attempt_cleanup(&manager).unwrap_err();
+
+        assert_eq!(err.entry.failed_attempts, u32::MAX);
+    }
+
+    #[test]
+    fn finalize_closed_entry_releases_bit_and_reports_failure() {
+        let manager = test_manager();
+        let slot = manager.allocate_slot(48).unwrap();
+        let idx = slot.idx;
+        // Make teardown fail at the bit-release step (bit already released):
+        // finalize must still leave the index allocatable and report the
+        // failure instead of silently dropping the entry.
+        manager.cleanup_allocated_slot(&slot, false).unwrap();
+
+        let message = finalize_closed_dead_entry(
+            &manager,
+            slot_only_entry(slot),
+            anyhow!("in-flight teardown failed"),
+        );
+
+        assert!(message.contains("in-flight teardown failed"));
+        // The index was not leaked: it can be allocated again.
+        let slot = manager.allocate_slot(idx).unwrap();
+        drop(slot);
+    }
+
+    #[test]
+    fn dead_queue_lock_recovers_from_poisoning() {
+        let shared = Arc::new(Mutex::new(DeadWarmQueue::default()));
+        let shared_in_thread = Arc::clone(&shared);
+        let handle = std::thread::spawn(move || {
+            let _guard = shared_in_thread.lock().unwrap();
+            panic!("intentional poisoning");
+        });
+        let _ = handle.join();
+
+        // A panicked cleanup worker must not turn into a pool-wide panic on
+        // the next lock.
+        lock_dead_queue(&shared).closed = true;
+        assert!(lock_dead_queue(&shared).closed);
     }
 }
