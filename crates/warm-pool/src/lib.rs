@@ -141,8 +141,21 @@ impl DemandState {
         if pool_len < fill_target {
             let to_fill = fill_target.saturating_sub(pool_len);
             if to_fill > 0 {
+                // Refilling to the decayed target completes the decay
+                // lifecycle: once the pool is back at the low watermark there
+                // is nothing left to drain.
+                self.decaying = false;
                 return PoolMaintenanceAction::Fill(to_fill);
             }
+        }
+        if self.decaying && pool_len <= fill_target {
+            // The pool is already at/below the decayed target (e.g. it was
+            // empty when the TTL expired): the decay lifecycle completes
+            // here, because `try_drain_one_for_maintenance` only runs for
+            // Drain actions and would never clear the flag otherwise — a
+            // later release would be drained immediately with no new idle
+            // period.
+            self.decaying = false;
         }
         // After an idle TTL decay the pool shrinks toward the decayed fill
         // target (the low watermark); otherwise only the high watermark caps
@@ -977,6 +990,34 @@ mod tests {
         // The stale drain must not remove resources held for resumed demand.
         assert!(pool.try_drain_one_for_maintenance().is_none());
         assert_eq!(pool.len(), 5);
+    }
+
+    #[test]
+    fn idle_ttl_decay_completes_without_drain_when_pool_at_decayed_target() {
+        // Regression: when the TTL expires while the pool is already at/below
+        // the decayed target, the decay lifecycle must complete without a
+        // Drain action — `try_drain_one_for_maintenance` only runs for Drain
+        // actions, so a lingering `decaying` flag would let a later release
+        // be drained immediately with no new idle period.
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 0,
+            high_watermark: 10,
+            maintenance_enabled: true,
+            startup_prewarm: false,
+            idle_ttl: Some(Duration::from_secs(60)),
+        });
+        expire_idle_ttl(&pool);
+        assert_eq!(
+            pool.compute_maintenance_action(0),
+            PoolMaintenanceAction::Idle
+        );
+        assert!(!pool.demand_state.lock().unwrap().decaying);
+
+        // A fresh release after the completed decay is normal idle capacity,
+        // not decay excess: maintenance must not drain it.
+        pool.release(1).unwrap();
+        assert!(pool.try_drain_one_for_maintenance().is_none());
+        assert_eq!(pool.len(), 1);
     }
 
     #[test]
