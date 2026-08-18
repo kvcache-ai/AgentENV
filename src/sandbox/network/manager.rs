@@ -221,11 +221,22 @@ impl NetworkManager {
         self.cleanup_slot_and_release_bit_inner(slot, sync_cleanup)
     }
 
-    /// Redo only the resource teardown for a slot whose allocation bit was
-    /// already released. Never touches the allocation bitmap: the index may
-    /// have been reallocated to a live sandbox since the failed cleanup.
-    pub(crate) fn cleanup_slot_resources(&self, slot: &Slot, sync_cleanup: bool) -> Result<()> {
-        slot.cleanup(sync_cleanup).map_err(Into::into)
+    /// Tear down an allocated slot, releasing the allocation bit only after
+    /// the resource teardown succeeds.
+    ///
+    /// Unlike `cleanup_allocated_slot`, a teardown failure keeps the bit set:
+    /// the index then cannot be reallocated while the caller retains the slot
+    /// for retry, so a later retry still owns the index-derived resources
+    /// (`veth-<idx>`) it tears down and can never delete networking that was
+    /// recreated for a different sandbox.
+    pub(crate) fn cleanup_allocated_slot_retain_bit_on_failure(
+        &self,
+        slot: &Slot,
+        sync_cleanup: bool,
+    ) -> Result<()> {
+        slot.cleanup(sync_cleanup)
+            .map_err(Into::<anyhow::Error>::into)?;
+        self.release_slot_bit(slot.idx)
     }
 
     /// Find and allocate the next available slot.
