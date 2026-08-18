@@ -19,7 +19,7 @@ use warm_pool::{PoolMaintenanceAction, WarmPool};
 use super::config::create_firecracker_work_dir;
 use super::FirecrackerInstance;
 use crate::cfg::{ConfigManager, ResolvedFirecrackerPoolConfig};
-use crate::sandbox::network::{NetworkManager, Slot};
+use crate::sandbox::network::{NetworkManager, Slot, SlotTeardownError};
 
 const POOL_FIRECRACKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const POOL_PRIME_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -123,16 +123,20 @@ impl DeadWarmEntry {
 
     /// Tear down the entry. The process is known dead, so skip the
     /// graceful-stop path: dropping the instance best-effort kills any
-    /// residual handle before the network slot is released. On failure the
-    /// entry is returned (with an updated backoff) so the caller can retain
-    /// it for retry instead of losing track of stale host network state. The
-    /// allocation bit is released only after teardown succeeds
+    /// residual handle before the network slot is released. On a teardown
+    /// failure the entry is returned (with an updated backoff) so the caller
+    /// can retain it for retry instead of losing track of stale host network
+    /// state. The allocation bit is released only after teardown succeeds
     /// (`cleanup_allocated_slot_retain_bit_on_failure`), so a retry can never
-    /// race a reallocation of the same index.
+    /// race a reallocation of the same index. A bit-release failure after a
+    /// successful teardown is terminal (`DeadWarmCleanupOutcome::Terminal`):
+    /// the slot is already disarmed and the bit already clear, so retaining
+    /// and retrying could release a bit that meanwhile belongs to a
+    /// different sandbox.
     fn attempt_cleanup(
         self,
         network: &NetworkManager,
-    ) -> std::result::Result<(), DeadWarmCleanupError> {
+    ) -> std::result::Result<DeadWarmCleanupOutcome, DeadWarmCleanupError> {
         let slot_idx = self.slot_idx();
         let failed_attempts = self.failed_attempts;
         let slot = match self.inner {
@@ -149,24 +153,48 @@ impl DeadWarmEntry {
             DeadWarmEntryInner::SlotOnly(slot) => slot,
         };
 
-        let result = network.cleanup_allocated_slot_retain_bit_on_failure(&slot, false);
-        result.map_err(|error| {
-            // Saturate: a permanently failing slot is retried indefinitely,
-            // and an overflowing counter would panic the cleanup worker in
-            // debug builds. The backoff saturates at the cap anyway.
-            let failed_attempts = failed_attempts.saturating_add(1);
-            DeadWarmCleanupError {
-                entry: Box::new(DeadWarmEntry {
-                    inner: DeadWarmEntryInner::SlotOnly(slot),
-                    failed_attempts,
-                    not_before: Instant::now() + dead_warm_cleanup_backoff(failed_attempts),
-                }),
-                error: error.context(format!(
-                    "firecracker pool: cleanup dead warm network slot {slot_idx}"
-                )),
+        match network.cleanup_allocated_slot_retain_bit_on_failure(&slot, false) {
+            Ok(()) => Ok(DeadWarmCleanupOutcome::Clean),
+            Err(SlotTeardownError::BitRelease(error)) => {
+                // Terminal: teardown already disarmed the slot and the bit is
+                // already clear, so the index is reallocatable right away. A
+                // retry would be a no-op cleanup followed by
+                // `release_slot_bit` against an index that can now belong to
+                // a different sandbox — report instead of retaining.
+                Ok(DeadWarmCleanupOutcome::Terminal(format!(
+                    "firecracker pool: cleanup dead warm network slot {slot_idx}: teardown completed but releasing the allocation bit failed: {error:#}"
+                )))
             }
-        })
+            Err(SlotTeardownError::Teardown(error)) => {
+                // Saturate: a permanently failing slot is retried
+                // indefinitely, and an overflowing counter would panic the
+                // cleanup worker in debug builds. The backoff saturates at
+                // the cap anyway.
+                let failed_attempts = failed_attempts.saturating_add(1);
+                Err(DeadWarmCleanupError {
+                    entry: Box::new(DeadWarmEntry {
+                        inner: DeadWarmEntryInner::SlotOnly(slot),
+                        failed_attempts,
+                        not_before: Instant::now() + dead_warm_cleanup_backoff(failed_attempts),
+                    }),
+                    error: error.context(format!(
+                        "firecracker pool: cleanup dead warm network slot {slot_idx}"
+                    )),
+                })
+            }
+        }
     }
+}
+
+/// Outcome of a dead-entry teardown attempt that is not retained for retry.
+#[derive(Debug)]
+enum DeadWarmCleanupOutcome {
+    /// Teardown and bit release both succeeded.
+    Clean,
+    /// Teardown completed but releasing the allocation bit failed. Terminal,
+    /// not retryable (see `SlotTeardownError::BitRelease`); the message must
+    /// be surfaced in the caller's failure reporting.
+    Terminal(String),
 }
 
 /// Error from dead-entry teardown. Keeps the entry so the caller can retain
@@ -203,10 +231,19 @@ fn finalize_closed_dead_entry(
 ) -> Option<String> {
     let slot_idx = entry.slot_idx();
     match entry.attempt_cleanup(network) {
-        Ok(()) => {
+        Ok(DeadWarmCleanupOutcome::Clean) => {
             // Teardown completed; the allocation bit was released by
             // `attempt_cleanup`. Report only a prior failure, if any.
             prior_error.map(|error| error.to_string())
+        }
+        Ok(DeadWarmCleanupOutcome::Terminal(message)) => {
+            // Teardown finished; only the bitmap release failed, which is
+            // terminal (not retryable). Surface it alongside any prior
+            // failure.
+            Some(match prior_error {
+                Some(prior) => format!("{prior:#}; {message}"),
+                None => message,
+            })
         }
         Err(err) => {
             let mut message = err.error.to_string();
@@ -414,17 +451,27 @@ impl FirecrackerPool {
                 // (dropping the entry would only re-run `Slot::cleanup` via
                 // `Slot::drop` and leak the bit).
                 drop(queue);
-                if let Err(err) = entry.attempt_cleanup(NetworkManager::global()) {
-                    if let Some(message) = finalize_closed_dead_entry(
-                        NetworkManager::global(),
-                        *err.entry,
-                        Some(err.error),
-                    ) {
+                match entry.attempt_cleanup(NetworkManager::global()) {
+                    Ok(DeadWarmCleanupOutcome::Clean) => {}
+                    Ok(DeadWarmCleanupOutcome::Terminal(message)) => {
                         warn!(
                             slot = slot_idx,
                             error = %message,
-                            "firecracker pool: cleanup of dead warm entry failed during shutdown"
+                            "firecracker pool: terminal cleanup failure of dead warm entry during shutdown"
                         );
+                    }
+                    Err(err) => {
+                        if let Some(message) = finalize_closed_dead_entry(
+                            NetworkManager::global(),
+                            *err.entry,
+                            Some(err.error),
+                        ) {
+                            warn!(
+                                slot = slot_idx,
+                                error = %message,
+                                "firecracker pool: cleanup of dead warm entry failed during shutdown"
+                            );
+                        }
                     }
                 }
                 return;
@@ -543,35 +590,47 @@ impl FirecrackerPool {
                     }
                 }
             };
-            if let Err(err) = next.attempt_cleanup(network) {
-                warn!(
-                    slot = err.entry.slot_idx(),
-                    error = %err.error,
-                    "firecracker pool: cleanup of dead warm entry failed; retaining for retry"
-                );
-                let mut queue = lock_dead_queue(&shared);
-                if queue.closed {
-                    // Shutdown closed the queue while this teardown was in
-                    // flight; the entry cannot be requeued. Finish it on this
-                    // worker thread and release the allocation bit explicitly
-                    // on failure: dropping the entry would only re-run
-                    // `Slot::cleanup` via `Slot::drop`, leaking the bit, and
-                    // the failure would never reach shutdown's result.
-                    let DeadWarmCleanupError { entry, error } = err;
-                    let slot_idx = entry.slot_idx();
-                    drop(queue);
-                    if let Some(message) =
-                        finalize_closed_dead_entry(network, *entry, Some(error))
-                    {
-                        warn!(
-                            slot = slot_idx,
-                            error = %message,
-                            "firecracker pool: finalized dead warm entry after queue close"
-                        );
-                        lock_dead_queue(&shared).failures.push(message);
+            match next.attempt_cleanup(network) {
+                Ok(DeadWarmCleanupOutcome::Clean) => {}
+                Ok(DeadWarmCleanupOutcome::Terminal(message)) => {
+                    // Terminal (bit release after a successful teardown):
+                    // not retryable; record it so shutdown can report it.
+                    warn!(
+                        error = %message,
+                        "firecracker pool: terminal cleanup failure of dead warm entry"
+                    );
+                    lock_dead_queue(&shared).failures.push(message);
+                }
+                Err(err) => {
+                    warn!(
+                        slot = err.entry.slot_idx(),
+                        error = %err.error,
+                        "firecracker pool: cleanup of dead warm entry failed; retaining for retry"
+                    );
+                    let mut queue = lock_dead_queue(&shared);
+                    if queue.closed {
+                        // Shutdown closed the queue while this teardown was in
+                        // flight; the entry cannot be requeued. Finish it on this
+                        // worker thread and release the allocation bit explicitly
+                        // on failure: dropping the entry would only re-run
+                        // `Slot::cleanup` via `Slot::drop`, leaking the bit, and
+                        // the failure would never reach shutdown's result.
+                        let DeadWarmCleanupError { entry, error } = err;
+                        let slot_idx = entry.slot_idx();
+                        drop(queue);
+                        if let Some(message) =
+                            finalize_closed_dead_entry(network, *entry, Some(error))
+                        {
+                            warn!(
+                                slot = slot_idx,
+                                error = %message,
+                                "firecracker pool: finalized dead warm entry after queue close"
+                            );
+                            lock_dead_queue(&shared).failures.push(message);
+                        }
+                    } else {
+                        queue.entries.push(*err.entry);
                     }
-                } else {
-                    queue.entries.push(*err.entry);
                 }
             }
         }
@@ -597,13 +656,21 @@ impl FirecrackerPool {
         let mut failures = Vec::new();
         let mut failed: Vec<(DeadWarmEntry, anyhow::Error)> = Vec::new();
         for entry in due {
-            if let Err(err) = entry.attempt_cleanup(NetworkManager::global()) {
-                warn!(
-                    slot = err.entry.slot_idx(),
-                    error = %err.error,
-                    "firecracker pool: cleanup of dead warm entry failed; retaining for retry"
-                );
-                failed.push((*err.entry, err.error));
+            match entry.attempt_cleanup(NetworkManager::global()) {
+                Ok(DeadWarmCleanupOutcome::Clean) => {}
+                Ok(DeadWarmCleanupOutcome::Terminal(message)) => {
+                    // Terminal (bit release after a successful teardown):
+                    // report it, but do not retain the entry for retry.
+                    failures.push(message);
+                }
+                Err(err) => {
+                    warn!(
+                        slot = err.entry.slot_idx(),
+                        error = %err.error,
+                        "firecracker pool: cleanup of dead warm entry failed; retaining for retry"
+                    );
+                    failed.push((*err.entry, err.error));
+                }
             }
         }
         if !backoff.is_empty() || !failed.is_empty() {
@@ -727,17 +794,29 @@ impl FirecrackerPool {
     fn shutdown_dead_entries_blocking(&self) -> Vec<String> {
         let (dead, mut failures) = self.close_dead_queue();
         for entry in dead {
-            if let Err(err) = entry.attempt_cleanup(NetworkManager::global()) {
-                let slot = err.entry.slot_idx();
-                if let Some(message) =
-                    finalize_closed_dead_entry(NetworkManager::global(), *err.entry, Some(err.error))
-                {
+            match entry.attempt_cleanup(NetworkManager::global()) {
+                Ok(DeadWarmCleanupOutcome::Clean) => {}
+                Ok(DeadWarmCleanupOutcome::Terminal(message)) => {
                     warn!(
-                        slot,
                         error = %message,
-                        "firecracker pool: cleanup of dead warm entry failed during shutdown"
+                        "firecracker pool: terminal cleanup failure of dead warm entry during shutdown"
                     );
                     failures.push(message);
+                }
+                Err(err) => {
+                    let slot = err.entry.slot_idx();
+                    if let Some(message) = finalize_closed_dead_entry(
+                        NetworkManager::global(),
+                        *err.entry,
+                        Some(err.error),
+                    ) {
+                        warn!(
+                            slot,
+                            error = %message,
+                            "firecracker pool: cleanup of dead warm entry failed during shutdown"
+                        );
+                        failures.push(message);
+                    }
                 }
             }
         }
@@ -1126,11 +1205,19 @@ mod tests {
             .fail_slot_teardown
             .store(true, std::sync::atomic::Ordering::Relaxed);
 
+        let before = Instant::now();
         let err = slot_only_entry(slot).attempt_cleanup(&manager).unwrap_err();
 
         assert_eq!(err.entry.failed_attempts, 1);
-        assert!(err.entry.due(Instant::now() + DEAD_WARM_CLEANUP_RETRY_MAX));
-        assert!(!err.entry.due(Instant::now()));
+        // Validate the retry delay on both sides against the reference
+        // instant captured before the attempt: not immediate, not a very
+        // short delay (rules out a zero/incorrect backoff), and within the
+        // expected first backoff plus slack for slow test execution.
+        let first_backoff = dead_warm_cleanup_backoff(1);
+        assert!(!err.entry.due(before));
+        assert!(!err.entry.due(before + Duration::from_millis(10)));
+        assert!(err.entry.due(before + first_backoff * 2));
+        assert!(err.entry.due(before + DEAD_WARM_CLEANUP_RETRY_MAX * 2));
         assert!(matches!(err.entry.inner, DeadWarmEntryInner::SlotOnly(_)));
         // The production invariant: the bit is still held, so the index
         // cannot be reallocated to a live sandbox while the entry is

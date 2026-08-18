@@ -78,6 +78,24 @@ pub(crate) struct NetworkManager {
     pub(crate) fail_slot_teardown: AtomicBool,
 }
 
+/// Failure of `cleanup_allocated_slot_retain_bit_on_failure`, typed so the
+/// caller can tell a retryable teardown failure from a terminal
+/// post-teardown bitmap error.
+pub(crate) enum SlotTeardownError {
+    /// `Slot::cleanup` failed: the allocation bit is still held, so the
+    /// caller must retain the slot and retry — the index cannot be
+    /// reallocated in between, and the retry still owns the index-derived
+    /// resources (`veth-<idx>`) it tears down.
+    Teardown(anyhow::Error),
+    /// Teardown succeeded but releasing the allocation bit failed: the slot
+    /// is already disarmed and the bit is already clear, so the index may be
+    /// reallocated immediately. Retrying would be a no-op cleanup followed
+    /// by `release_slot_bit` against an index that can now belong to a
+    /// different sandbox, so this failure is terminal: report it, never
+    /// retain the slot for retry.
+    BitRelease(anyhow::Error),
+}
+
 impl NetworkManager {
     /// Global network manager for slot allocation across all sandboxes.
     pub fn global() -> &'static Self {
@@ -245,18 +263,26 @@ impl NetworkManager {
     /// only provides idempotency against a repeated teardown by the same
     /// owner — it is not a guard against concurrent owners, which the type's
     /// ownership rules already exclude.
+    ///
+    /// The error is typed (`SlotTeardownError`) so callers can distinguish a
+    /// retryable teardown failure (bit still held) from a terminal
+    /// post-teardown bitmap error (slot already disarmed, bit already
+    /// clear), which must be reported but never retained for retry.
     pub(crate) fn cleanup_allocated_slot_retain_bit_on_failure(
         &self,
         slot: &Slot,
         sync_cleanup: bool,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), SlotTeardownError> {
         #[cfg(test)]
         if self.fail_slot_teardown.swap(false, Ordering::AcqRel) {
-            return Err(anyhow!("injected slot teardown failure"));
+            return Err(SlotTeardownError::Teardown(anyhow!(
+                "injected slot teardown failure"
+            )));
         }
         slot.cleanup(sync_cleanup)
-            .map_err(Into::<anyhow::Error>::into)?;
+            .map_err(|e| SlotTeardownError::Teardown(Into::<anyhow::Error>::into(e)))?;
         self.release_slot_bit(slot.idx)
+            .map_err(SlotTeardownError::BitRelease)
     }
 
     /// Find and allocate the next available slot.

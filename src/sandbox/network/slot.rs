@@ -4,7 +4,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Condvar, Mutex, Once, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -34,6 +34,63 @@ use super::{NetworkAddressPlan, NetworkError, HOST_VETH_PREFIX, MAX_SLOTS, NETNS
 /// Captured once from the current calling thread before any `unshare(CLONE_NEWNET)`.
 /// All subsequent slot creations move host-side interfaces back to this namespace.
 static HOST_NS_FD: OnceLock<OwnedFd> = OnceLock::new();
+
+/// Children that could not be reaped within the grace period after `kill`.
+///
+/// A single process-lifetime reaper thread polls them with `try_wait`, so a
+/// persistently stuck `ip` child never accumulates one blocked thread per
+/// timeout, and dropping a `Child` (which never reaps) cannot leak a zombie.
+static UNREAPED_CHILDREN: Mutex<Vec<std::process::Child>> = Mutex::new(Vec::new());
+static REAPER_CV: Condvar = Condvar::new();
+static REAPER_ONCE: Once = Once::new();
+
+/// Hand a killed-but-unreapable child to the centralized reaper thread.
+///
+/// The reaper is the only thread that ever blocks on these children; it owns
+/// no pool or slot state, and there is at most one reaper for the process
+/// lifetime regardless of how many teardown attempts time out.
+fn hand_off_unreaped_child(child: std::process::Child) {
+    REAPER_ONCE.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("network-slot-child-reaper".to_string())
+            .spawn(|| {
+                let mut pending: Vec<std::process::Child> = Vec::new();
+                loop {
+                    if pending.is_empty() {
+                        let mut guard = UNREAPED_CHILDREN
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner());
+                        while guard.is_empty() {
+                            guard = REAPER_CV.wait(guard).unwrap_or_else(|err| err.into_inner());
+                        }
+                        pending.append(&mut guard);
+                        drop(guard);
+                    }
+                    // `try_wait` reaps exited children; errored polls are
+                    // retried on the next pass.
+                    pending.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+                    if pending.is_empty() {
+                        continue;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                    // Pick up children handed off while polling.
+                    let mut guard = UNREAPED_CHILDREN
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner());
+                    pending.append(&mut guard);
+                    drop(guard);
+                }
+            });
+        if let Err(err) = spawned {
+            warn!(error = %err, "failed to spawn child reaper thread");
+        }
+    });
+    UNREAPED_CHILDREN
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .push(child);
+    REAPER_CV.notify_one();
+}
 
 const ARP_RETRANS_TIME_MS: &str = "100";
 const NEIGH_SYSCTL_RETRIES: usize = 5;
@@ -708,7 +765,7 @@ impl Slot {
     /// Tokio context may already be unavailable.
     fn delete_host_veth_interface_sync(idx: u32) -> Result<()> {
         let veth_name = Self::host_veth_name(idx);
-        let output = crate::privileges::run_with_scoped_capabilities(
+        let (status, stderr_bytes) = crate::privileges::run_with_scoped_capabilities(
             &[crate::privileges::CAP_NET_ADMIN],
             || {
                 // Hard timeout: this runs on shutdown/exit cleanup paths that
@@ -716,27 +773,31 @@ impl Slot {
                 // entry cleanup worker), so a stuck `ip link del` must not
                 // block the caller forever.
                 const IP_LINK_DEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+                // stderr goes to a temp file, not a pipe: the polling loop
+                // below never drains pipes, so a child whose diagnostics fill
+                // a pipe buffer would block on write and be misclassified as
+                // a timeout. A file is an unbounded sink, so diagnostics can
+                // never stall the child.
+                let stderr_path = std::env::temp_dir().join(format!(
+                    "agentenv-ip-link-del-{}-{veth_name}.stderr",
+                    std::process::id()
+                ));
+                let stderr_file = File::create(&stderr_path).with_context(|| {
+                    format!("Failed to create {}", stderr_path.display())
+                })?;
                 let mut child = Command::new("ip")
                     .args(["link", "del", &veth_name])
-                    // The polling loop below never drains the pipes, so a
-                    // child that filled its stdout buffer would block forever
-                    // on write. stdout carries nothing useful here; stderr
-                    // stays piped for the error message (it is a single
-                    // short line).
                     .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::from(stderr_file))
                     .spawn()
                     .context("Failed to spawn ip link del")?;
                 let deadline = std::time::Instant::now() + IP_LINK_DEL_TIMEOUT;
-                loop {
-                    if child
+                let status = loop {
+                    if let Some(status) = child
                         .try_wait()
                         .context("Failed to poll ip link del")?
-                        .is_some()
                     {
-                        return child
-                            .wait_with_output()
-                            .context("Failed to collect ip link del output");
+                        break status;
                     }
                     if std::time::Instant::now() >= deadline {
                         child.kill().context("Failed to kill timed-out ip link del")?;
@@ -762,12 +823,12 @@ impl Slot {
                             // A child stuck in uninterruptible sleep must not
                             // be dropped without `wait`: dropping `Child` does
                             // not reap it and would leak a zombie. Hand it to
-                            // a detached reaper thread that only blocks on
-                            // `wait` and owns no pool state.
-                            std::thread::spawn(move || {
-                                let _ = child.wait();
-                            });
+                            // the centralized reaper (a single thread for the
+                            // process lifetime) instead of spawning an
+                            // unbounded thread per timed-out attempt.
+                            hand_off_unreaped_child(child);
                         }
+                        let _ = fs::remove_file(&stderr_path);
                         return Err(anyhow!(
                             "ip link del {} timed out after {:?}",
                             veth_name,
@@ -775,15 +836,23 @@ impl Slot {
                         ));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(20));
+                };
+                // Bounded read of the diagnostics captured in the temp file.
+                let mut stderr_bytes = Vec::new();
+                if let Ok(file) = File::open(&stderr_path) {
+                    let mut limited = std::io::Read::take(file, 64 * 1024);
+                    let _ = std::io::Read::read_to_end(&mut limited, &mut stderr_bytes);
                 }
+                let _ = fs::remove_file(&stderr_path);
+                Ok((status, stderr_bytes))
             },
         )?;
 
-        if output.status.success() {
+        if status.success() {
             return Ok(());
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         let stderr_lower = stderr.to_lowercase();
         if stderr_lower.contains("cannot find device")
             || stderr_lower.contains("no such device")
