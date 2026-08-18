@@ -138,24 +138,24 @@ impl DemandState {
         }
 
         let fill_target = self.fill_target.min(config.high_watermark);
+        if self.decaying && pool_len <= fill_target {
+            // The live pool (this length is always read under the pool lock
+            // by `WarmPool::compute_maintenance_action`) is verifiably at or
+            // below the decayed target — including when it was empty when
+            // the TTL expired and no Drain action ever ran. The decay
+            // lifecycle completes only on this synchronized observation,
+            // never on a merely PLANNED refill: if the fill then fails or a
+            // concurrent release raises the pool again, `decaying` is
+            // already false only because the pool genuinely reached the
+            // target, and resources between the low and high watermarks are
+            // legitimately retained by the high watermark.
+            self.decaying = false;
+        }
         if pool_len < fill_target {
             let to_fill = fill_target.saturating_sub(pool_len);
             if to_fill > 0 {
-                // Refilling to the decayed target completes the decay
-                // lifecycle: once the pool is back at the low watermark there
-                // is nothing left to drain.
-                self.decaying = false;
                 return PoolMaintenanceAction::Fill(to_fill);
             }
-        }
-        if self.decaying && pool_len <= fill_target {
-            // The pool is already at/below the decayed target (e.g. it was
-            // empty when the TTL expired): the decay lifecycle completes
-            // here, because `try_drain_one_for_maintenance` only runs for
-            // Drain actions and would never clear the flag otherwise — a
-            // later release would be drained immediately with no new idle
-            // period.
-            self.decaying = false;
         }
         // After an idle TTL decay the pool shrinks toward the decayed fill
         // target (the low watermark); otherwise only the high watermark caps
