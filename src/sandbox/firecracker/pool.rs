@@ -136,11 +136,55 @@ impl FirecrackerPool {
     }
 
     pub(crate) fn try_acquire(&self) -> Option<WarmFirecracker> {
-        let warm = self.pool.try_acquire()?;
+        let warm = self.acquire_live_warm()?;
         if self.pool.len() < self.pool.config().low_watermark {
             self.pool.request_maintenance();
         }
         Some(warm)
+    }
+
+    /// Pop warm entries until a live one is found. Parked warm processes run
+    /// with `oom_score_adj=1000`, so they are the first OOM-kill candidates and
+    /// can die while idle; handing a dead process to snapshot resume would fail
+    /// the resume, so dead entries are discarded here instead.
+    fn acquire_live_warm(&self) -> Option<WarmFirecracker> {
+        loop {
+            let mut warm = self.pool.try_acquire()?;
+            if warm.fc_instance.is_process_running() {
+                return Some(warm);
+            }
+            self.discard_dead_warm(warm);
+        }
+    }
+
+    /// Discard a warm entry whose firecracker process already exited.
+    ///
+    /// The process is known dead, so skip the graceful-stop path: dropping the
+    /// instance best-effort kills any residual handle, and the network slot is
+    /// released synchronously. This keeps the acquire path free of runtime
+    /// `block_on` calls so it stays safe to call from async context.
+    fn discard_dead_warm(&self, warm: WarmFirecracker) {
+        let WarmFirecracker {
+            slot,
+            fc_instance,
+            work_dir,
+        } = warm;
+        let slot_idx = slot.idx;
+        warn!(
+            slot = slot_idx,
+            "firecracker pool: warm process exited while parked; discarding entry"
+        );
+
+        drop(fc_instance);
+        drop(work_dir);
+
+        if let Err(err) = NetworkManager::global().cleanup_allocated_slot(slot, false) {
+            warn!(
+                slot = slot_idx,
+                error = %err,
+                "firecracker pool: cleanup of dead warm network slot failed"
+            );
+        }
     }
 
     pub fn warm_len(&self) -> usize {

@@ -61,6 +61,18 @@ impl FirecrackerInstance {
         Ok(Pid::from_raw(raw_pid))
     }
 
+    /// Returns true while the firecracker process is still running.
+    ///
+    /// Warm pool entries park with `oom_score_adj=1000`, so they are the first
+    /// OOM-kill candidates and can die while idle. Callers must check this
+    /// before handing a parked instance to snapshot resume.
+    pub fn is_process_running(&mut self) -> bool {
+        match self.process.as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(None)),
+            None => false,
+        }
+    }
+
     pub async fn spawn_with_netns(
         &mut self,
         firecracker_binary: &Path,
