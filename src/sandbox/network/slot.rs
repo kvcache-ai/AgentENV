@@ -734,8 +734,23 @@ impl Slot {
                             .context("Failed to collect ip link del output");
                     }
                     if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        child.kill().context("Failed to kill timed-out ip link del")?;
+                        // `kill` only sends the termination request; reap
+                        // with bounded polling instead of a blocking `wait`
+                        // so a process stuck in uninterruptible sleep cannot
+                        // hang this shutdown path beyond the grace period.
+                        let reap_deadline = std::time::Instant::now()
+                            + std::time::Duration::from_secs(1);
+                        while std::time::Instant::now() < reap_deadline {
+                            if child
+                                .try_wait()
+                                .context("Failed to reap timed-out ip link del")?
+                                .is_some()
+                            {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
                         return Err(anyhow!(
                             "ip link del {} timed out after {:?}",
                             veth_name,

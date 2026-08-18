@@ -69,6 +69,13 @@ pub(crate) struct NetworkManager {
 
     /// Rejects new allocations once shutdown cleanup starts.
     shutting_down: AtomicBool,
+
+    /// Test hook: when set, the next
+    /// `cleanup_allocated_slot_retain_bit_on_failure` call fails before
+    /// touching slot resources, so tests can exercise a genuine teardown
+    /// failure while the allocation bit stays held.
+    #[cfg(test)]
+    pub(crate) fail_slot_teardown: AtomicBool,
 }
 
 impl NetworkManager {
@@ -128,6 +135,8 @@ impl NetworkManager {
             address_plan: config.address_plan,
             netns_dir: config.netns_dir,
             shutting_down: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_slot_teardown: AtomicBool::new(false),
         };
 
         // Reserve slot 0 (invalid for IP addresses)
@@ -234,6 +243,10 @@ impl NetworkManager {
         slot: &Slot,
         sync_cleanup: bool,
     ) -> Result<()> {
+        #[cfg(test)]
+        if self.fail_slot_teardown.swap(false, Ordering::AcqRel) {
+            return Err(anyhow!("injected slot teardown failure"));
+        }
         slot.cleanup(sync_cleanup)
             .map_err(Into::<anyhow::Error>::into)?;
         self.release_slot_bit(slot.idx)
