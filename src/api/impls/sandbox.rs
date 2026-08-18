@@ -372,8 +372,7 @@ fn network_policy_from_create(
     let allow_public_traffic = network
         .and_then(|network| network.allow_public_traffic)
         .unwrap_or(true);
-    let policy = SandboxNetworkPolicy::new(base_policy, egress)
-        .with_allow_public_traffic(allow_public_traffic);
+    let policy = SandboxNetworkPolicy::new(allow_public_traffic, base_policy, egress);
     if policy.has_domain_allow_rules() {
         anyhow::bail!(
             "domain entries in allowOut are not supported until TCP egress proxy is enabled"
@@ -392,6 +391,7 @@ fn network_policy_from_update(
         );
     }
     Ok(SandboxNetworkPolicy::new(
+        true,
         base_policy_from_allow_internet_access(body.allow_internet_access),
         policy,
     ))

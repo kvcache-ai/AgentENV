@@ -96,17 +96,16 @@ impl Default for SandboxNetworkPolicy {
 }
 
 impl SandboxNetworkPolicy {
-    pub fn new(base_policy: BaseSandboxNetworkPolicy, egress: SandboxNetworkEgressPolicy) -> Self {
+    pub fn new(
+        allow_public_traffic: bool,
+        base_policy: BaseSandboxNetworkPolicy,
+        egress: SandboxNetworkEgressPolicy,
+    ) -> Self {
         Self {
-            allow_public_traffic: true,
+            allow_public_traffic,
             base_policy,
             egress,
         }
-    }
-
-    pub fn with_allow_public_traffic(mut self, allow_public_traffic: bool) -> Self {
-        self.allow_public_traffic = allow_public_traffic;
-        self
     }
 
     pub(crate) fn runtime_policy(&self) -> Option<Self> {
@@ -351,13 +350,14 @@ mod tests {
     }
 
     #[test]
-    fn new_sets_base_policy() {
+    fn new_sets_explicit_policy() {
         let policy = SandboxNetworkPolicy::new(
+            false,
             BaseSandboxNetworkPolicy::Deny,
             SandboxNetworkEgressPolicy::new(Some(vec!["8.8.8.8/32".to_string()]), None).unwrap(),
         );
 
-        assert!(policy.allow_public_traffic);
+        assert!(!policy.allow_public_traffic);
         assert_eq!(policy.base_policy, BaseSandboxNetworkPolicy::Deny);
         assert!(policy.egress.denied_cidrs.is_empty());
         assert!(policy.has_runtime_egress_rules());

@@ -11,7 +11,6 @@ log "Suite: E2B Compatibility"
 export E2B_API_URL="${AENV_URL}"
 export E2B_SANDBOX_URL="${AENV_PROXY_URL}"
 export E2B_API_KEY="${AENV_API_KEY}"
-unset E2B_ACCESS_TOKEN
 export E2B_COMPAT_USER_IMAGE="${E2B_COMPAT_USER_IMAGE:-${E2E_TEMPLATE_USER_IMAGE:-ghcr.io/linuxserver/baseimage-ubuntu:noble}}"
 
 cli_available=0

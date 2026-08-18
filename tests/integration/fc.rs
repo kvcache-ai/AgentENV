@@ -537,6 +537,7 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
     common::setup().await;
     let mut sandbox_config = common::default_sandbox_config()?;
     sandbox_config.common.network_policy = Some(SandboxNetworkPolicy::new(
+        true,
         BaseSandboxNetworkPolicy::Deny,
         SandboxNetworkEgressPolicy::new(Some(vec!["8.8.8.8".to_string()]), None)?,
     ));
@@ -549,6 +550,7 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
 
     sandbox
         .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
             BaseSandboxNetworkPolicy::Deny,
             SandboxNetworkEgressPolicy::new(Some(vec!["1.1.1.1".to_string()]), None)?,
         )))
@@ -559,6 +561,7 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
 
     sandbox
         .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
             BaseSandboxNetworkPolicy::Allow,
             SandboxNetworkEgressPolicy::new(
                 Some(vec!["8.8.8.8".to_string()]),
@@ -578,6 +581,7 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
 
     sandbox
         .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
             BaseSandboxNetworkPolicy::Allow,
             SandboxNetworkEgressPolicy::new(Some(vec!["10.0.0.0/8".to_string()]), None)?,
         )))

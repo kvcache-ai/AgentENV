@@ -419,7 +419,7 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
       AENV_API_KEY="$(_compose_cmd exec -T agentenv-a cat /workspace/env/secrets/api-key)" ||
         die "Failed to read the Compose deployment API key"
     fi
-    [[ "${AENV_API_KEY}" =~ ^[A-Za-z0-9._~-]{32,4096}$ ]] ||
+    [[ "${AENV_API_KEY}" =~ ^[A-Za-z0-9._~-]{32,256}$ ]] ||
       die "Compose deployment returned an invalid API key"
     export AENV_API_KEY
 
@@ -463,7 +463,7 @@ if [[ -z "${E2E_RUNTIME_SH_LOADED:-}" ]]; then
       AENV_API_KEY="$(_read_k8s_api_key)" ||
         die "Failed to read the Kubernetes deployment API key"
     fi
-    [[ "${AENV_API_KEY}" =~ ^[A-Za-z0-9._~-]{32,4096}$ ]] ||
+    [[ "${AENV_API_KEY}" =~ ^[A-Za-z0-9._~-]{32,256}$ ]] ||
       die "Kubernetes deployment returned an invalid API key"
     export AENV_API_KEY
 

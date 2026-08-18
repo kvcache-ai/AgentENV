@@ -1252,13 +1252,13 @@ async fn sandbox_network_policy_is_applied_and_persisted() -> Result<()> {
         make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
             .await;
     let initial_policy = SandboxNetworkPolicy::new(
+        false,
         BaseSandboxNetworkPolicy::Deny,
         SandboxNetworkEgressPolicy::new(
             Some(vec!["8.8.8.8".to_string()]),
             Some(vec!["203.0.113.0/24".to_string()]),
         )?,
-    )
-    .with_allow_public_traffic(false);
+    );
     let mut request = create_request(Some(60), &[]);
     request.network_policy = initial_policy.clone();
 
@@ -1266,10 +1266,15 @@ async fn sandbox_network_policy_is_applied_and_persisted() -> Result<()> {
     assert_eq!(created.network_policy, initial_policy);
 
     let updated_policy = SandboxNetworkPolicy::new(
+        true,
         BaseSandboxNetworkPolicy::Allow,
         SandboxNetworkEgressPolicy::new(None, Some(vec!["198.51.100.0/24".to_string()]))?,
     );
-    let expected_policy = updated_policy.clone().with_allow_public_traffic(false);
+    let expected_policy = SandboxNetworkPolicy::new(
+        false,
+        BaseSandboxNetworkPolicy::Allow,
+        SandboxNetworkEgressPolicy::new(None, Some(vec!["198.51.100.0/24".to_string()]))?,
+    );
     orchestrator
         .replace_sandbox_network_policy(created.id, updated_policy)
         .await?;

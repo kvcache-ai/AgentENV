@@ -30,9 +30,6 @@ sudo bash scripts/docker-setup.sh
 make deploy-up
 ```
 
-The Gateway is available at `http://127.0.0.1:8000` and forwards requests to
-the backend nodes.
-
 On first startup, the runtime nodes atomically generate one API key and sandbox
 access-token seed in the shared `agentenv-auth` volume. The gateway mounts that
 volume read-only and reads the API key; sandbox tokens are validated by the
@@ -56,16 +53,13 @@ usually through wildcard DNS for `*.sandbox.example.com`.
 # Health check via gateway
 curl http://127.0.0.1:8000/health
 
-# Cluster node snapshots via gateway
-curl http://127.0.0.1:8000/nodes
-
 # Authenticated cluster node snapshots via gateway
 export AENV_API_KEY="$(docker compose -f deploy/docker-compose.yml exec -T agentenv-a \
   cat /workspace/env/secrets/api-key)"
 curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8080/nodes
 
 # Direct health check on a backend node
-curl http://127.0.0.1:8001/health
+curl http://127.0.0.1:8000/health
 ```
 
 ## Management Commands

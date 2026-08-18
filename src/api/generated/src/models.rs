@@ -5722,7 +5722,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxLifec
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxNetworkConfig {
-    /// Specify if the sandbox URLs should be accessible without a traffic access token.
+    /// Specify if the sandbox URLs should be accessible only with authentication.
     #[serde(rename = "allowPublicTraffic")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_public_traffic: Option<bool>,

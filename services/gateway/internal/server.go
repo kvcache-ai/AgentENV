@@ -113,11 +113,7 @@ func (s *Server) Handler() http.Handler {
 			http.Error(w, "target port header required", http.StatusBadRequest)
 			return
 		}
-		if r.URL.Path == "/metrics" {
-			http.NotFound(w, r)
-			return
-		}
-		if r.URL.Path == "/health" {
+		if r.URL.Path == "/health" || r.URL.Path == "/metrics" {
 			hostRoute, hostRouteErr := parseHostRoute(r.Host, s.sandboxProxyDomains)
 			if hostRoute != nil || hostRouteErr != nil {
 				s.handleProxy(w, r)

@@ -1,6 +1,7 @@
 use std::sync::{Arc, RwLock};
 
 use agentenv::api::{server, ApiImpl};
+use agentenv::api_key::ApiKey;
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
@@ -79,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
-    let api_key = agentenv::api_key::resolve(config)?;
+    let api_key = ApiKey::resolve(config)?;
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
     let identity = NodeIdentity::from_config(&config.node_identity);

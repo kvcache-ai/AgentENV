@@ -15,10 +15,6 @@ use uvm_ublk_daemon::{server::UblkDaemonServer, ResizeToolSpec};
 
 mod metrics_server;
 
-// Mirrors src/bin/server.rs.
-#[global_allocator]
-static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 #[derive(Debug, Parser)]
 #[command(
     name = "uvm-ublk-daemon",

@@ -28,7 +28,7 @@ import (
 const (
 	apiKeyEnv         = "AENV_API_KEY"
 	defaultAPIKeyPath = "/run/secrets/api-key"
-	maxAPIKeyLen      = 4096
+	maxAPIKeyLen      = 256
 	maxAPIKeyFileLen  = maxAPIKeyLen + 2
 )
 

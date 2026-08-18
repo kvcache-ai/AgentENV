@@ -8312,7 +8312,6 @@ dependencies = [
  "serde_json",
  "storage-util",
  "tempfile",
- "tikv-jemallocator",
  "tokio",
  "toml",
  "tracing",

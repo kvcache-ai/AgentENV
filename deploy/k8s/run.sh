@@ -172,8 +172,8 @@ if [[ "${MODE}" != "delete" ]]; then
       ensure_namespace || exit 1
       bootstrap_api_key || exit 1
     fi
-    if [[ ! "${API_KEY_VALUE}" =~ ^[A-Za-z0-9._~-]{32,4096}$ ]]; then
-      echo "AENV_API_KEY must contain between 32 and 4096 URL-safe characters" >&2
+    if [[ ! "${API_KEY_VALUE}" =~ ^[A-Za-z0-9._~-]{32,256}$ ]]; then
+      echo "AENV_API_KEY must contain between 32 and 256 URL-safe characters" >&2
       exit 1
     fi
   fi

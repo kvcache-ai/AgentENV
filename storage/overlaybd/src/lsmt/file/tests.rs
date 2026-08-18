@@ -2536,60 +2536,6 @@ async fn test_premerged_index_lock_map_drops_idle_entries() {
     release_premerged_index_lock(&stale_key, &replacement).await;
 }
 
-#[tokio::test]
-async fn test_premerged_index_prune_state_is_per_dir_and_elects_one_scan() {
-    let temp_dir = TempDir::new().unwrap();
-    let cache_a = temp_dir.path().join("cache-a");
-    let cache_b = temp_dir.path().join("cache-b");
-
-    let a = premerged_index_prune_state(&cache_a).await;
-    assert!(Arc::ptr_eq(
-        &a,
-        &premerged_index_prune_state(&cache_a).await
-    ));
-    let b = premerged_index_prune_state(&cache_b).await;
-    assert!(!Arc::ptr_eq(&a, &b));
-
-    // Budget 64 triggers one scan per 8 new bytes (`max_dir_bytes` / 8).
-    let budget = 64;
-    assert!(!a.elect_scan(7, budget));
-    // Growth charged to A leaves B below B's own trigger.
-    assert!(!b.elect_scan(7, budget));
-    // The winner's charge resets: the next scan needs a fresh trigger of
-    // post-election growth.
-    assert!(a.elect_scan(1, budget));
-
-    // Crossings while a scan runs lose the election but keep their charge:
-    // when they cross the trigger, scan_finished chains one follow-up scan
-    // instead of waiting for new writes.
-    assert!(!a.elect_scan(8, budget));
-    assert!(a.scan_finished(budget));
-    assert!(!a.elect_scan(1, budget));
-    // Below the trigger: the chain ends and the gate is released.
-    assert!(!a.scan_finished(budget));
-    assert!(a.elect_scan(8, budget));
-    // No growth during the scan: no follow-up.
-    assert!(!a.scan_finished(budget));
-
-    // A failed scan releases the gate but keeps concurrent charges.
-    assert!(a.elect_scan(8, budget));
-    assert!(!a.elect_scan(7, budget));
-    a.scan_aborted();
-    assert!(a.elect_scan(1, budget));
-    assert!(!a.scan_finished(budget));
-
-    // A sub-fraction budget floors the trigger at one byte instead of zero
-    // (which would elect a scan per write).
-    assert!(a.elect_scan(1, 0));
-    assert!(!a.scan_finished(0));
-
-    // Saturating accounting: a u64::MAX charge on a near-trigger counter
-    // must cross the trigger, not wrap 7 + MAX back below it.
-    assert!(!a.elect_scan(7, budget));
-    assert!(a.elect_scan(u64::MAX, budget));
-    assert!(!a.scan_finished(budget));
-}
-
 fn premerged_artifact_count(cache_dir: &std::path::Path) -> usize {
     let dir = cache_dir.join(PREMERGED_INDEX_DIR);
     match std::fs::read_dir(dir) {

@@ -24,7 +24,6 @@ tokio = { version = "1.44.2", features = ["full"] }
 tracing = "0.1.41"
 tracing-log = "0.2.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
-tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -38,7 +38,7 @@ If none exists, normal server startup generates and atomically stores a key at
 the managed path. The gateway checks only the first two sources and never
 generates a key.
 
-Custom keys must contain 32 to 4096 URL-safe characters. Generated keys use an
+Custom keys must contain 32 to 256 URL-safe characters. Generated keys use an
 E2B-compatible `e2b_` prefix. For example:
 
 ```bash

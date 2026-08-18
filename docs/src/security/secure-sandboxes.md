@@ -5,7 +5,7 @@ Secure sandboxes use an envd access token for control-plane communication. This 
 > [!NOTE]
 > Secure mode protects envd control-plane operations. Application traffic uses
 > the sandbox-scoped `trafficAccessToken` described in
-> [Authentication](../configuration/authentication.md).
+> [Authentication](./authentication.md).
 
 Set `secure: true` when creating a sandbox through API or E2B-compatible SDKs to enable secure mode. Or use the CLI:
 

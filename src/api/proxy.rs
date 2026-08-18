@@ -1232,12 +1232,16 @@ mod tests {
 
     use crate::{
         api::server,
+        api_key::ApiKey,
         cfg::AppConfig,
         image::ImageResolver,
         orchestrator::{FileBackedSandboxPersister, Orchestrator},
         snapshot::mock::mock_snapshot_manager,
         template::TemplateBuilder,
     };
+
+    const TEST_API_KEY: &str =
+        "e2b_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
     fn strip_host_port_handles_dns_and_ipv6_hosts() {
@@ -1622,7 +1626,7 @@ mod tests {
     }
 
     async fn build_api_with_sandbox_proxy_domains(domains: Vec<String>) -> Arc<ApiImpl> {
-        build_api_with_auth(domains, "test-key").await
+        build_api_with_auth(domains, TEST_API_KEY).await
     }
 
     async fn build_api_with_auth(domains: Vec<String>, api_key: &str) -> Arc<ApiImpl> {
@@ -1644,7 +1648,7 @@ mod tests {
             image_resolver,
             None,
             domains,
-            api_key.to_string(),
+            ApiKey::new(api_key).unwrap(),
         ))
     }
 
@@ -1862,7 +1866,10 @@ mod tests {
             vec![],
             vec![(header::AUTHORIZATION.as_str(), "Bearer test-key")],
             vec![(API_KEY_HEADER, "wrong-key")],
-            vec![(API_KEY_HEADER, "test-key"), (API_KEY_HEADER, "test-key")],
+            vec![
+                (API_KEY_HEADER, TEST_API_KEY),
+                (API_KEY_HEADER, TEST_API_KEY),
+            ],
         ] {
             assert_eq!(
                 get_status(&app, "/nonexistent/path", &headers).await,
@@ -1873,7 +1880,7 @@ mod tests {
         for (path, headers, expected) in [
             (
                 "/nonexistent/path",
-                vec![(API_KEY_HEADER, "test-key")],
+                vec![(API_KEY_HEADER, TEST_API_KEY)],
                 StatusCode::NOT_FOUND,
             ),
             ("/health", vec![], StatusCode::NO_CONTENT),
@@ -1882,12 +1889,6 @@ mod tests {
         }
         assert_ne!(
             get_status(&app, "/metrics", &[]).await,
-            StatusCode::UNAUTHORIZED
-        );
-
-        let empty_key_app = server::new(build_api_with_auth(Vec::new(), "").await);
-        assert_eq!(
-            get_status(&empty_key_app, "/sandboxes", &[(API_KEY_HEADER, "")]).await,
             StatusCode::UNAUTHORIZED
         );
 
@@ -1939,7 +1940,7 @@ mod tests {
 
         for credential in [
             None,
-            Some((API_KEY_HEADER, "test-key")),
+            Some((API_KEY_HEADER, TEST_API_KEY)),
             Some((TRAFFIC_ACCESS_TOKEN_HEADER, "incorrect")),
             Some((ENVD_ACCESS_TOKEN_HEADER, "envd-token")),
         ] {
@@ -1983,10 +1984,13 @@ mod tests {
             (SANDBOX_ID_HEADER, sandbox_id_text.as_str()),
             (TARGET_PORT_HEADER, target_port.as_str()),
         ];
-        assert_ne!(
-            get_status(&app, "/proxy/health", &route).await,
-            StatusCode::UNAUTHORIZED
-        );
+        let envd_paths = ["/proxy/health", "/proxy/metrics"];
+        for path in envd_paths {
+            assert_ne!(
+                get_status(&app, path, &route).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
 
         api.orchestrator()
             .set_secure_for_test(&sandbox_id, true)
@@ -2003,26 +2007,30 @@ mod tests {
 
         for credential in [
             None,
-            Some((API_KEY_HEADER, "test-key")),
+            Some((API_KEY_HEADER, TEST_API_KEY)),
             Some((TRAFFIC_ACCESS_TOKEN_HEADER, traffic_token.as_str())),
             Some((ENVD_ACCESS_TOKEN_HEADER, "incorrect")),
         ] {
-            let mut headers = route.to_vec();
-            if let Some((header_name, value)) = credential {
-                headers.push((header_name, value));
+            for path in envd_paths {
+                let mut headers = route.to_vec();
+                if let Some((header_name, value)) = credential {
+                    headers.push((header_name, value));
+                }
+                assert_eq!(
+                    get_status(&app, path, &headers).await,
+                    StatusCode::UNAUTHORIZED
+                );
             }
-            assert_eq!(
-                get_status(&app, "/proxy/health", &headers).await,
-                StatusCode::UNAUTHORIZED
-            );
         }
 
         let mut headers = route.to_vec();
         headers.push((ENVD_ACCESS_TOKEN_HEADER, envd_token.expose()));
-        assert_ne!(
-            get_status(&app, "/proxy/health", &headers).await,
-            StatusCode::UNAUTHORIZED
-        );
+        for path in envd_paths {
+            assert_ne!(
+                get_status(&app, path, &headers).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
     }
 
     #[tokio::test]
@@ -2487,7 +2495,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/nonexistent/path")
-                    .header(API_KEY_HEADER, "test-key")
+                    .header(API_KEY_HEADER, TEST_API_KEY)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -2873,7 +2881,7 @@ mod tests {
             .unwrap();
         request
             .headers_mut()
-            .insert("x-api-key", HeaderValue::from_static("test-key"));
+            .insert("x-api-key", HeaderValue::from_static(TEST_API_KEY));
         request.headers_mut().insert(
             SANDBOX_ID_HEADER,
             HeaderValue::from_str(&sandbox_id.to_string()).unwrap(),
@@ -2948,7 +2956,7 @@ mod tests {
             .unwrap();
         request
             .headers_mut()
-            .insert("x-api-key", HeaderValue::from_static("test-key"));
+            .insert("x-api-key", HeaderValue::from_static(TEST_API_KEY));
         request.headers_mut().insert(
             SANDBOX_ID_HEADER,
             HeaderValue::from_str(&sandbox_id.to_string()).unwrap(),

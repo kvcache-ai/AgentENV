@@ -9,7 +9,7 @@ use std::io::{self, ErrorKind};
 use std::mem::size_of;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
@@ -472,157 +472,50 @@ pub(super) fn decode_premerged_index_artifact(
     )))
 }
 
-/// Growth in artifact bytes that amortizes one full-dir prune scan.
-const PREMERGED_INDEX_PRUNE_SCAN_FRACTION: u64 = 8;
-
-/// Per-cache-dir growth accounting and scan serialization.
-pub(super) struct PremergedIndexPruneState {
-    account: StdMutex<PremergedIndexScanAccount>,
-}
-
-struct PremergedIndexScanAccount {
-    bytes_since_scan: u64,
-    scan_in_progress: bool,
-}
-
-pub(super) async fn premerged_index_prune_state(cache_dir: &Path) -> Arc<PremergedIndexPruneState> {
-    static STATES: OnceLock<Mutex<HashMap<PathBuf, Arc<PremergedIndexPruneState>>>> =
-        OnceLock::new();
-    STATES
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .await
-        .entry(cache_dir.to_path_buf())
-        .or_insert_with(|| {
-            Arc::new(PremergedIndexPruneState {
-                account: StdMutex::new(PremergedIndexScanAccount {
-                    bytes_since_scan: 0,
-                    scan_in_progress: false,
-                }),
-            })
-        })
-        .clone()
-}
-
-impl PremergedIndexPruneState {
-    /// Charge `written_bytes` and elect the single caller that runs the next scan.
-    pub(super) fn elect_scan(&self, written_bytes: u64, max_dir_bytes: u64) -> bool {
-        let threshold = (max_dir_bytes / PREMERGED_INDEX_PRUNE_SCAN_FRACTION).max(1);
-        let mut account = self.account.lock().unwrap_or_else(|err| err.into_inner());
-        account.bytes_since_scan = account.bytes_since_scan.saturating_add(written_bytes);
-        if account.bytes_since_scan >= threshold && !account.scan_in_progress {
-            account.bytes_since_scan = 0;
-            account.scan_in_progress = true;
-            return true;
-        }
-        false
-    }
-
-    /// End the scan; returns true when growth charged while it ran crosses
-    /// the trigger and a follow-up scan should run.
-    pub(super) fn scan_finished(&self, max_dir_bytes: u64) -> bool {
-        let threshold = (max_dir_bytes / PREMERGED_INDEX_PRUNE_SCAN_FRACTION).max(1);
-        let mut account = self.account.lock().unwrap_or_else(|err| err.into_inner());
-        account.scan_in_progress = false;
-        if account.bytes_since_scan >= threshold {
-            account.bytes_since_scan = 0;
-            account.scan_in_progress = true;
-            return true;
-        }
-        false
-    }
-
-    /// Release a failed scan; concurrent charges are kept so the next write
-    /// re-elects.
-    pub(super) fn scan_aborted(&self) {
-        let mut account = self.account.lock().unwrap_or_else(|err| err.into_inner());
-        account.scan_in_progress = false;
-    }
-}
-
-/// One blocking task for the whole scan: async `tokio::fs` would cost a
-/// blocking-pool round-trip per directory entry.
 async fn prune_premerged_index_dir(dir: &Path, max_dir_bytes: u64) -> Result<()> {
-    let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || prune_premerged_index_dir_blocking(&dir, max_dir_bytes))
-        .await
-        .context("join premerged index cache prune task")?
-}
-
-struct PremergedArtifactEntry {
-    path: PathBuf,
-    len: u64,
-    modified: SystemTime,
-}
-
-/// Delete oldest premerged index artifacts until `dir` fits `max_dir_bytes`.
-fn prune_premerged_index_dir_blocking(dir: &Path, max_dir_bytes: u64) -> Result<()> {
     let mut entries = Vec::new();
     let mut total = 0u64;
-    for entry in std::fs::read_dir(dir)
-        .with_context(|| format!("read premerged index cache dir {}", dir.display()))?
-    {
-        let entry = entry?;
+    let mut reader = tokio::fs::read_dir(dir).await?;
+
+    while let Some(entry) = reader.next_entry().await? {
         let path = entry.path();
         if path.extension().and_then(|v| v.to_str()) != Some(PREMERGED_INDEX_EXT) {
             continue;
         }
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            // Entries deleted concurrently with the scan only shrink it.
-            Err(err) if err.kind() == ErrorKind::NotFound => continue,
-            Err(err) => {
-                return Err(err).with_context(|| format!("stat {}", path.display()));
-            }
-        };
+        let metadata = entry.metadata().await?;
         if !metadata.is_file() {
             continue;
         }
         let len = metadata.len();
         let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
         total = total.saturating_add(len);
-        entries.push(PremergedArtifactEntry {
-            path,
-            len,
-            modified,
-        });
+        entries.push((path, len, modified));
     }
 
     if total <= max_dir_bytes {
         return Ok(());
     }
 
-    entries.sort_by_key(|entry| entry.modified);
-    for entry in entries {
+    entries.sort_by_key(|(_, _, modified): &(PathBuf, u64, SystemTime)| *modified);
+    for (path, len, _) in entries {
         if total <= max_dir_bytes {
             break;
         }
-        match std::fs::remove_file(&entry.path) {
-            Ok(()) => total = total.saturating_sub(entry.len),
-            // Already removed by someone else since the scan: those bytes
-            // left the dir too, so count them as freed.
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                total = total.saturating_sub(entry.len);
-            }
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => total = total.saturating_sub(len),
             Err(err) => {
-                tracing::warn!(
-                    ?err,
-                    path = %entry.path.display(),
-                    "remove premerged index artifact failed"
-                )
+                tracing::warn!(?err, path = %path.display(), "remove premerged index artifact failed")
             }
         }
     }
     Ok(())
 }
 
-/// Write the artifact atomically (tmp file + rename) and return its size in
-/// bytes so callers can account cache growth.
 async fn write_premerged_index_artifact(
     cache_dir: &Path,
     key: &PremergedIndexCacheKey,
     index: &ReadOnlyIndex,
-) -> Result<u64> {
+) -> Result<()> {
     let dir = cache_dir.join(PREMERGED_INDEX_DIR);
     tokio::fs::create_dir_all(&dir)
         .await
@@ -657,7 +550,7 @@ async fn write_premerged_index_artifact(
         });
     }
 
-    Ok(artifact.len() as u64)
+    Ok(())
 }
 
 pub(super) async fn try_read_premerged_index_artifact(
@@ -689,34 +582,6 @@ pub(super) async fn try_read_premerged_index_artifact(
     }
 }
 
-/// Charge `written` artifact bytes for `cache_dir` and run prune scans
-/// while the growth trigger keeps electing.
-async fn prune_premerged_index_cache(cache_dir: &Path, written: u64, max_dir_bytes: u64) {
-    let state = premerged_index_prune_state(cache_dir).await;
-    if !state.elect_scan(written, max_dir_bytes) {
-        return;
-    }
-    let dir = cache_dir.join(PREMERGED_INDEX_DIR);
-    loop {
-        match prune_premerged_index_dir(&dir, max_dir_bytes).await {
-            Ok(()) => {
-                if !state.scan_finished(max_dir_bytes) {
-                    return;
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    ?err,
-                    path = %dir.display(),
-                    "prune premerged index cache dir failed"
-                );
-                state.scan_aborted();
-                return;
-            }
-        }
-    }
-}
-
 pub(super) fn spawn_premerged_index_artifact_write(
     cache_dir: PathBuf,
     key: PremergedIndexCacheKey,
@@ -734,15 +599,18 @@ pub(super) fn spawn_premerged_index_artifact_write(
                 "write premerged index artifact failed"
             );
         }
-        // Release the merged index and the digest lock before the prune tail:
-        // the index can be hundreds of MB and the prune scan may pin it for
-        // the whole scan, while the held lock would block the next writer for
-        // the same digest.
-        drop(merged);
+        let key_digest = key.digest_hex.clone();
         drop(guard);
-        release_premerged_index_lock(&key.digest_hex, &lock).await;
-        if let Ok(written) = write_result {
-            prune_premerged_index_cache(&cache_dir, written, max_dir_bytes).await;
+        release_premerged_index_lock(&key_digest, &lock).await;
+        if write_result.is_ok() {
+            let dir = cache_dir.join(PREMERGED_INDEX_DIR);
+            if let Err(err) = prune_premerged_index_dir(&dir, max_dir_bytes).await {
+                tracing::warn!(
+                    ?err,
+                    path = %dir.display(),
+                    "prune premerged index cache dir failed"
+                );
+            }
         }
     });
 }

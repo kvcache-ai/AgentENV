@@ -1,3 +1,5 @@
+use super::{ApiImpl, Claims};
+use crate::{api::proxy, types::SandboxId};
 use agentenv_http_server::apis;
 use async_trait::async_trait;
 use axum::{
@@ -7,10 +9,6 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use subtle::ConstantTimeEq;
-
-use super::{ApiImpl, Claims};
-use crate::{api::proxy, types::SandboxId};
 
 pub(crate) const API_KEY_HEADER: &str = "x-api-key";
 pub(crate) const TRAFFIC_ACCESS_TOKEN_HEADER: &str = "e2b-traffic-access-token";
@@ -24,13 +22,8 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a HeaderVal
 
 impl ApiImpl {
     pub(crate) fn has_valid_api_key(&self, headers: &HeaderMap) -> bool {
-        single_header(headers, API_KEY_HEADER).is_some_and(|value| {
-            let candidate = value.as_bytes();
-            let expected = self.api_key.as_bytes();
-            !expected.is_empty()
-                && candidate.len() == expected.len()
-                && bool::from(candidate.ct_eq(expected))
-        })
+        single_header(headers, API_KEY_HEADER)
+            .is_some_and(|value| self.api_key.matches(value.as_bytes()))
     }
 
     pub(crate) fn traffic_access_token(&self, sandbox_id: SandboxId) -> String {

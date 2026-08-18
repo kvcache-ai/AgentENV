@@ -18,12 +18,12 @@
 
 # Configuration
 
-- [Authentication](./configuration/authentication.md)
 - [Configuration Reference](./configuration/reference.md)
 - [Environment Variables](./configuration/env-vars.md)
 
 # Security
 
+- [Authentication](./security/authentication.md)
 - [Secure Sandboxes](./security/secure-sandboxes.md)
 
 # Core Concepts
