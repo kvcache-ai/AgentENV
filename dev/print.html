@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-289f5a05.js";
+            window.path_to_searchindex_js = "searchindex-570618c3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-c346f288.js"></script>
@@ -642,20 +642,6 @@ that contains <code>debian</code>, <code>debian-security</code>, and <code>ubunt
 <p>Run a full multi-node stack on a single host using Docker Compose. This simulates a production-like topology with a gateway, scheduler, and multiple AgentENV backend nodes.</p>
 <p>For a real multi-machine deployment without Kubernetes, see
 <a href="#static-multi-node-without-kubernetes">Static Multi-Node</a>.</p>
-<h2 id="what-gets-started"><a class="header" href="#what-gets-started">What Gets Started</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Service</th><th>Port</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td>Gateway</td><td><code>:8080</code></td><td>HTTP/WebSocket reverse proxy</td></tr>
-<tr><td>Scheduler</td><td><code>:9090</code></td><td>gRPC node selection and sandbox binding</td></tr>
-<tr><td>agentenv-a</td><td><code>:8001</code></td><td>AgentENV runtime node A</td></tr>
-<tr><td>agentenv-b</td><td><code>:8002</code></td><td>AgentENV runtime node B</td></tr>
-</tbody>
-</table>
-</div>
 <h2 id="prerequisites-3"><a class="header" href="#prerequisites-3">Prerequisites</a></h2>
 <ul>
 <li>Linux kernel 6.8+</li>
@@ -677,6 +663,8 @@ if the deployment needs future cross-node sandbox recovery.</p>
 <pre><code class="language-bash">sudo bash scripts/docker-setup.sh
 make deploy-up
 </code></pre>
+<p>The Gateway is available at <code>http://127.0.0.1:8000</code> and forwards requests to
+the backend nodes.</p>
 <p>To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when starting the stack:</p>
 <pre><code class="language-bash">SANDBOX_PROXY_DOMAINS=sandbox.example.com \
@@ -687,13 +675,10 @@ nodes’ sandbox response metadata. The domain must resolve to the gateway,
 usually through wildcard DNS for <code>*.sandbox.example.com</code>.</p>
 <h2 id="verify-1"><a class="header" href="#verify-1">Verify</a></h2>
 <pre><code class="language-bash"># Health check via gateway
-curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8000/health
 
 # Cluster node snapshots via gateway
-curl http://127.0.0.1:8080/nodes
-
-# Direct health check on a backend node
-curl http://127.0.0.1:8001/health
+curl http://127.0.0.1:8000/nodes
 </code></pre>
 <h2 id="management-commands"><a class="header" href="#management-commands">Management Commands</a></h2>
 <pre><code class="language-bash">make deploy-ps      # Show container status
@@ -742,10 +727,11 @@ services directly to the public Internet.</p>
 <h2 id="prerequisites-4"><a class="header" href="#prerequisites-4">Prerequisites</a></h2>
 <p>On every runtime node:</p>
 <ul>
-<li>Ubuntu 24.04 with Linux kernel 6.8 or later</li>
+<li>Linux kernel 6.8+</li>
 <li><code>/dev/kvm</code> access</li>
 <li>root access for the AgentENV installation</li>
 <li>network reachability to the Scheduler</li>
+<li>shared storage across all runtime nodes, using either POSIXFS or OSS</li>
 </ul>
 <p>On the control-plane host:</p>
 <ul>
@@ -983,6 +969,7 @@ AENV_OBSERVABILITY_SCHEDULER_ENDPOINT = http://10.0.0.10:9090
 <li>Docker</li>
 <li><code>build-essential</code> (<code>sudo apt install -y build-essential</code>)</li>
 <li><code>kubectl</code> with Kustomize support</li>
+<li>shared storage across all runtime nodes, using either POSIXFS or OSS</li>
 </ul>
 <p>The provided manifests use standard KVM. To prepare a separate PVM node pool
 when standard KVM is unavailable, see <a href="#pvm-deployment">PVM Deployment</a>.</p>
@@ -1054,7 +1041,7 @@ make k8s-refresh-dev    # Build + load + rollout restart (all-in-one)
 <p>If you want to skip building from source, see <a href="#quick-start">Quick Start</a>.</p>
 <h2 id="prerequisites-6"><a class="header" href="#prerequisites-6">Prerequisites</a></h2>
 <ul>
-<li>Ubuntu 24.04 with Linux kernel 6.8+</li>
+<li>Linux kernel 6.8+</li>
 <li><code>/dev/kvm</code> access for Firecracker microVM execution</li>
 <li>Rust toolchain (stable) — install via <a href="https://rustup.rs">rustup</a></li>
 <li><code>sudo</code> access</li>
