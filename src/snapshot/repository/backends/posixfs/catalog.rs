@@ -6,6 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use tracing::warn;
 
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::snapshot::repository::SnapshotListFilter;
@@ -79,9 +80,9 @@ impl PosixFsCatalogStore {
     ///
     /// Flow:
     /// 1. acquire the alias lock when an alias is present
-    /// 2. bind the alias
-    /// 3. write the commit marker
-    /// 4. write the committed snapshot record
+    /// 2. write the commit marker
+    /// 3. write the committed snapshot record
+    /// 4. atomically bind the alias as the final visible operation
     pub(crate) fn commit_publish(
         &self,
         session: &PublishSession,
@@ -90,25 +91,30 @@ impl PosixFsCatalogStore {
     ) -> RepositoryResult<SnapshotRecord> {
         let now = now_unix_ms();
         let snapshot_id = metadata.id.clone();
+        let previous_record = self.load_record_by_id_unlocked(&snapshot_id)?;
         let write_result = if let Some(alias) = metadata.alias.as_ref() {
             self.with_alias_lock(alias, |store| {
                 let record = store.committed_record_unlocked(&metadata, committed.clone(), now)?;
                 let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias);
-                if let Some(existing) = store.load_alias_target(alias)? {
-                    if existing != snapshot_id {
-                        if store.load_record_by_id_unlocked(&existing)?.is_some() {
-                            return Err(RepositoryError::AliasConflict {
-                                alias: alias.to_string(),
-                                existing,
-                                new_id: snapshot_id.clone(),
-                            });
-                        }
-                        store.remove_file_if_exists(&alias_path)?;
-                    }
-                }
-                store.write_json(&alias_path, &snapshot_id)?;
+                let existing = store.load_alias_target(alias)?;
                 store.write_commit_marker(&session.snapshot_id)?;
                 store.write_committed_record_unlocked(&record)?;
+                // `write_json` uses an atomic rename. Keeping this as the final
+                // fallible operation means a failed rebuild leaves the old
+                // alias binding untouched. The tradeoff is a crash window: dying
+                // after the record write but before the alias write leaves a
+                // committed record whose `alias` field names an alias that still
+                // resolves to the previous snapshot, so readers of `record.alias`
+                // (listings) may observe the stale claim until the next rebind.
+                store.write_json(&alias_path, &snapshot_id)?;
+
+                if let Some(existing) = existing.filter(|existing| existing != &snapshot_id) {
+                    // The previous snapshot stays addressable by id, so running
+                    // sandboxes and explicit id references keep working. Alias
+                    // metadata cleanup is best effort because the binding has
+                    // already moved successfully.
+                    store.clear_moved_alias_on_previous_record(&existing, alias.as_ref(), now);
+                }
                 Ok(record)
             })
         } else {
@@ -123,17 +129,7 @@ impl PosixFsCatalogStore {
         match write_result {
             Ok(record) => Ok(record),
             Err(error) => {
-                if let Some(alias) = metadata.alias.as_ref() {
-                    let _ = self.with_alias_lock(alias, |store| {
-                        let alias_path =
-                            PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias);
-                        if store.load_alias_target(alias)?.as_ref() == Some(&snapshot_id) {
-                            store.remove_file_if_exists(&alias_path)?;
-                        }
-                        Ok(())
-                    });
-                }
-                let _ = self.cleanup_uncommitted_snapshot_dir(&session.snapshot_id);
+                self.rollback_failed_publish(&session.snapshot_id, previous_record.as_ref());
                 Err(error)
             }
         }
@@ -164,12 +160,35 @@ impl PosixFsCatalogStore {
 
         if let Some(alias) = record.alias.as_ref() {
             self.with_alias_lock(alias, |store| {
-                store.ensure_alias_available(alias, &record.id)?;
                 store.write_record_unlocked(&record)?;
-                store.write_json(
-                    &PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias),
-                    &record.id,
-                )
+                let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&store.root, alias);
+                let bind = (|| -> RepositoryResult<()> {
+                    match store.load_alias_target(alias)? {
+                        // The alias currently points at a live snapshot. Leave the
+                        // binding untouched so the existing template keeps resolving
+                        // while the new build runs; a successful commit moves the
+                        // alias to the new snapshot (E2B rebuild semantics).
+                        Some(existing)
+                            if existing != record.id
+                                && store.load_record_by_id_unlocked(&existing)?.is_some() =>
+                        {
+                            Ok(())
+                        }
+                        Some(existing) if existing != record.id => {
+                            store.remove_file_if_exists(&alias_path)?;
+                            store.write_json(&alias_path, &record.id)
+                        }
+                        _ => store.write_json(&alias_path, &record.id),
+                    }
+                })();
+                if let Err(error) = bind {
+                    // Keep creation all-or-nothing under the alias lock: a record
+                    // that survives a failed binding claims the alias in listings
+                    // with nothing left to reconcile it.
+                    let _ = store.remove_file_if_exists(&store.record_path(&record.id));
+                    return Err(error);
+                }
+                Ok(())
             })?;
         } else {
             self.write_record_unlocked(&record)?;
@@ -376,6 +395,67 @@ impl PosixFsCatalogStore {
         self.write_record_unlocked(&record)
     }
 
+    /// Clears `moved_alias` from the record that owned it before a rebind.
+    ///
+    /// Best effort: the alias binding has already moved, so a failure here only
+    /// leaves stale alias metadata on the previous owner's record.
+    fn clear_moved_alias_on_previous_record(
+        &self,
+        previous_id: &SnapshotId,
+        moved_alias: &str,
+        now: i64,
+    ) {
+        // Lock order is alias lock first, then record lock; nothing takes them
+        // in the reverse order today.
+        let _guard = match self.acquire_record_lock(previous_id) {
+            Ok(guard) => guard,
+            Err(error) => {
+                warn!(
+                    alias = %moved_alias,
+                    previous_snapshot_id = %previous_id,
+                    error = %error,
+                    "failed to lock previous snapshot record for alias cleanup"
+                );
+                return;
+            }
+        };
+
+        let mut previous = match self.load_record_by_id_unlocked(previous_id) {
+            Ok(Some(previous)) => previous,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    alias = %moved_alias,
+                    previous_snapshot_id = %previous_id,
+                    error = %error,
+                    "failed to load previous snapshot alias metadata"
+                );
+                return;
+            }
+        };
+
+        // Only clear the alias this publish actually moved; the previous owner
+        // may already claim a different name.
+        let claims_moved_alias = previous
+            .alias
+            .as_ref()
+            .is_some_and(|alias| alias.as_ref() == moved_alias);
+        if !claims_moved_alias {
+            return;
+        }
+
+        previous.alias = None;
+        previous.updated_at_unix_ms = now;
+        if let Err(error) = self.write_record_unlocked(&previous) {
+            warn!(
+                alias = %moved_alias,
+                previous_snapshot_id = %previous_id,
+                error = %error,
+                "failed to clear previous snapshot alias metadata"
+            );
+        }
+    }
+
     fn read_json<T>(&self, path: &Path) -> RepositoryResult<T>
     where
         T: DeserializeOwned,
@@ -497,6 +577,19 @@ impl PosixFsCatalogStore {
         }
         let snapshot_layout = self.layout(id);
         self.remove_dir_if_exists(&snapshot_layout.snapshot_dir())
+    }
+
+    fn rollback_failed_publish(&self, id: &SnapshotId, previous_record: Option<&SnapshotRecord>) {
+        if let Err(error) = self.remove_dir_if_exists(&self.layout(id).snapshot_dir()) {
+            warn!(snapshot_id = %id, error = %error, "failed to remove snapshot artifacts after publish failure");
+        }
+        let restore_result = match previous_record {
+            Some(record) => self.write_record_unlocked(record),
+            None => self.remove_file_if_exists(&self.record_path(id)),
+        };
+        if let Err(error) = restore_result {
+            warn!(snapshot_id = %id, error = %error, "failed to restore snapshot record after publish failure");
+        }
     }
 
     fn load_record_by_id_unlocked(
@@ -625,28 +718,6 @@ impl PosixFsCatalogStore {
     ) -> RepositoryResult<T> {
         let _guard = self.acquire_alias_lock(alias)?;
         action(self)
-    }
-
-    fn ensure_alias_available(
-        &self,
-        alias: &SnapshotAlias,
-        new_id: &SnapshotId,
-    ) -> RepositoryResult<()> {
-        let alias_path = PosixFsSnapshotArtifactLayout::alias_path(&self.root, alias);
-        if let Some(existing) = self.load_alias_target(alias)? {
-            if &existing == new_id {
-                return Ok(());
-            }
-            if self.load_record_by_id_unlocked(&existing)?.is_some() {
-                return Err(RepositoryError::AliasConflict {
-                    alias: alias.to_string(),
-                    existing,
-                    new_id: new_id.clone(),
-                });
-            }
-            self.remove_file_if_exists(&alias_path)?;
-        }
-        Ok(())
     }
 
     fn write_record_unlocked(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
