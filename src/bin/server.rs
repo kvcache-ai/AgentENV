@@ -79,6 +79,12 @@ async fn main() -> anyhow::Result<()> {
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
+    // Terminate firecracker/uvm-ublk-daemon processes orphaned by a previous
+    // server incarnation before they can wedge startup: they hold ublk devices
+    // and inherited fds that pin the RocksDB LOCK of the persisted-sandbox
+    // store.
+    agentenv::setup::reap_orphaned_runtime_processes(config).await?;
+
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
     let identity = NodeIdentity::from_config(&config.node_identity);
     let p2p_transport = agentenv::p2p::transport_from_config(config, &identity).await?;
