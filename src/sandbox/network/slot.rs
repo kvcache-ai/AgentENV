@@ -60,6 +60,10 @@ pub(crate) struct Slot {
     address_plan: NetworkAddressPlan,
     netns_dir: PathBuf,
     cleanup_armed: AtomicBool,
+    /// Whether this namespace's user egress chain currently contains rules.
+    /// Warm-pool reuse preserves the namespace, so the next tenant may need to
+    /// clear rules left by the previous tenant.
+    user_egress_rules_present: AtomicBool,
 }
 
 struct NamespaceSetup {
@@ -104,6 +108,7 @@ impl Slot {
             address_plan,
             netns_dir,
             cleanup_armed: AtomicBool::new(false),
+            user_egress_rules_present: AtomicBool::new(false),
         })
     }
 
@@ -449,6 +454,11 @@ impl Slot {
     }
 
     pub(crate) fn set_egress_policy(&self, policy: Option<&SandboxNetworkPolicy>) -> Result<()> {
+        let wants_rules = policy.is_some_and(SandboxNetworkPolicy::has_runtime_egress_rules);
+        if !wants_rules && !self.user_egress_rules_present.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
         let netns_path = self.namespace_path();
         let policy = policy.cloned();
         let handle = thread::spawn(move || -> Result<()> {
@@ -460,10 +470,15 @@ impl Slot {
             set_namespace_egress_policy(policy.as_ref())
         });
 
-        match handle.join() {
+        let result = match handle.join() {
             Ok(result) => result,
             Err(e) => Err(anyhow!("egress policy setup thread panicked: {:?}", e)),
+        };
+        if result.is_ok() {
+            self.user_egress_rules_present
+                .store(wants_rules, Ordering::Release);
         }
+        result
     }
 
     /// Configures iptables rules inside the namespace for VM traffic routing.
@@ -1058,6 +1073,41 @@ mod tests {
             parse_nameserver_ipv4(conf),
             Some(Ipv4Addr::new(10, 1, 2, 1))
         );
+    }
+
+    #[test]
+    fn empty_egress_policy_skips_known_clean_slot() {
+        let slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
+        let empty_policy = SandboxNetworkPolicy::default();
+
+        slot.set_egress_policy(None).unwrap();
+        slot.set_egress_policy(Some(&empty_policy)).unwrap();
+
+        assert!(!slot.user_egress_rules_present.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn failed_egress_cleanup_keeps_slot_marked_dirty() {
+        let slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
+        slot.user_egress_rules_present
+            .store(true, Ordering::Release);
+
+        assert!(slot.set_egress_policy(None).is_err());
+
+        assert!(slot.user_egress_rules_present.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn failed_egress_apply_keeps_clean_slot_marked_clean() {
+        let slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
+        let policy = SandboxNetworkPolicy::new(
+            crate::sandbox::network::BaseSandboxNetworkPolicy::Deny,
+            crate::sandbox::network::SandboxNetworkEgressPolicy::default(),
+        );
+
+        assert!(slot.set_egress_policy(Some(&policy)).is_err());
+
+        assert!(!slot.user_egress_rules_present.load(Ordering::Acquire));
     }
 
     #[test]
