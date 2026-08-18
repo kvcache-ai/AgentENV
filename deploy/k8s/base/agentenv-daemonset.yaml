@@ -75,20 +75,35 @@ spec:
                   - "-c"
                   - |
                     echo "preStop: waiting for sandboxes to drain..."
-                    while true; do
-                      count=$(curl -sf -H 'X-API-Key: preStop' http://localhost:8000/sandboxes | jq 'length') || count=""
+                    # Global deadline: give up well before
+                    # terminationGracePeriodSeconds so the kubelet still has
+                    # time to SIGTERM the agent and let it persist sandboxes.
+                    drain_timeout=240
+                    deadline=$(( $(date +%s) + drain_timeout ))
+                    failures=0
+                    max_failures=5
+                    while [ "$(date +%s)" -lt "$deadline" ]; do
+                      count=$(curl -sf --max-time 5 -H 'X-API-Key: preStop' http://localhost:8000/sandboxes | jq 'length') || count=""
                       if [ -z "$count" ]; then
-                        echo "preStop: failed to query sandbox count, retrying..."
-                        sleep 3
+                        failures=$((failures + 1))
+                        echo "preStop: failed to query sandbox count (attempt $failures/$max_failures)"
+                        if [ "$failures" -ge "$max_failures" ]; then
+                          echo "preStop: drain query unreachable; proceeding with termination"
+                          exit 0
+                        fi
+                        sleep $(( failures * 3 ))
                         continue
                       fi
+                      failures=0
                       echo "preStop: $count sandbox(es) remaining"
                       if [ "$count" = "0" ]; then
                         echo "preStop: all sandboxes drained, exiting"
-                        break
+                        exit 0
                       fi
                       sleep 3
                     done
+                    echo "preStop: drain deadline (${drain_timeout}s) reached; proceeding with termination"
+                    exit 0
             postStart:
               exec:
                 command:
