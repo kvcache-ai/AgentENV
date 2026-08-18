@@ -563,21 +563,39 @@ impl NetworkManager {
 
 fn global_host_iptables_commands(
     host_interaction_cidr: Ipv4Network,
-) -> [IptablesRestoreCommand; 3] {
+) -> [IptablesRestoreCommand; 5] {
     let cidr = host_interaction_cidr.to_string();
     [
+        // Guest replies to host-initiated proxy/envd connections must remain
+        // reachable, while all other guest-to-host traffic is rejected below.
+        IptablesRestoreCommand::Insert {
+            table: "filter",
+            chain: "INPUT",
+            position: 1,
+            rule: format!(
+                "-i {HOST_VETH_PREFIX}+ -s {cidr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+            ),
+        },
+        IptablesRestoreCommand::Insert {
+            table: "filter",
+            chain: "INPUT",
+            position: 2,
+            rule: format!("-i {HOST_VETH_PREFIX}+ -s {cidr} -j REJECT"),
+        },
         // Packets are SNATted to the host interaction CIDR inside the sandbox namespace before
         // they enter the host FORWARD chain, so hosts with a DROP FORWARD policy
         // need to accept this post-SNAT source range.
         IptablesRestoreCommand::Append {
             table: "filter",
             chain: "FORWARD",
-            rule: format!("-s {cidr} -j ACCEPT"),
+            rule: format!("-i {HOST_VETH_PREFIX}+ -s {cidr} -j ACCEPT"),
         },
         IptablesRestoreCommand::Append {
             table: "filter",
             chain: "FORWARD",
-            rule: format!("-d {cidr} -m state --state RELATED,ESTABLISHED -j ACCEPT"),
+            rule: format!(
+                "-o {HOST_VETH_PREFIX}+ -d {cidr} -m state --state RELATED,ESTABLISHED -j ACCEPT"
+            ),
         },
         IptablesRestoreCommand::Append {
             table: "nat",
@@ -589,18 +607,32 @@ fn global_host_iptables_commands(
 
 fn global_host_iptables_delete_commands(
     host_interaction_cidr: Ipv4Network,
-) -> [IptablesRestoreCommand; 3] {
+) -> [IptablesRestoreCommand; 5] {
     let cidr = host_interaction_cidr.to_string();
     [
         IptablesRestoreCommand::Delete {
             table: "filter",
-            chain: "FORWARD",
-            rule: format!("-s {cidr} -j ACCEPT"),
+            chain: "INPUT",
+            rule: format!(
+                "-i {HOST_VETH_PREFIX}+ -s {cidr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT"
+            ),
+        },
+        IptablesRestoreCommand::Delete {
+            table: "filter",
+            chain: "INPUT",
+            rule: format!("-i {HOST_VETH_PREFIX}+ -s {cidr} -j REJECT"),
         },
         IptablesRestoreCommand::Delete {
             table: "filter",
             chain: "FORWARD",
-            rule: format!("-d {cidr} -m state --state RELATED,ESTABLISHED -j ACCEPT"),
+            rule: format!("-i {HOST_VETH_PREFIX}+ -s {cidr} -j ACCEPT"),
+        },
+        IptablesRestoreCommand::Delete {
+            table: "filter",
+            chain: "FORWARD",
+            rule: format!(
+                "-o {HOST_VETH_PREFIX}+ -d {cidr} -m state --state RELATED,ESTABLISHED -j ACCEPT"
+            ),
         },
         IptablesRestoreCommand::Delete {
             table: "nat",

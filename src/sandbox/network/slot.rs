@@ -263,7 +263,6 @@ impl Slot {
         // IPTables Setup
         Self::configure_namespace_iptables_rules(
             host_interaction_ip,
-            veth_host_ip,
             address_plan.vm_ip(),
             &address_plan.internal_egress_denied_cidrs(),
         )
@@ -486,10 +485,9 @@ impl Slot {
     /// - Enabling IP forwarding so the namespace can route between tap0 and vpeer.
     /// - FORWARD rules to permit traffic between the VM (tap0) and the host veth (vpeer).
     /// - SNAT/DNAT for host<->VM communication via host_interaction_ip.
-    #[tracing::instrument(fields(vm_ip = %vm_ip, host_interaction_ip = %host_interaction_ip, veth_host_ip = %veth_host_ip))]
+    #[tracing::instrument(fields(vm_ip = %vm_ip, host_interaction_ip = %host_interaction_ip))]
     fn configure_namespace_iptables_rules(
         host_interaction_ip: Ipv4Addr,
-        veth_host_ip: Ipv4Addr,
         vm_ip: Ipv4Addr,
         internal_egress_denied_cidrs: &[String],
     ) -> Result<()> {
@@ -524,11 +522,7 @@ impl Slot {
         ];
 
         apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)?;
-        initialize_namespace_egress_chain(
-            veth_host_ip,
-            resolve_guest_dns_server(),
-            internal_egress_denied_cidrs,
-        )
+        initialize_namespace_egress_chain(resolve_guest_dns_server(), internal_egress_denied_cidrs)
     }
 
     fn tune_neigh_retrans_time_ms(interface: &str) {

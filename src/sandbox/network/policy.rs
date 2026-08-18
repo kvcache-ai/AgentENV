@@ -127,7 +127,6 @@ fn configured_always_denied_cidrs() -> &'static [String] {
 }
 
 pub(super) fn initialize_namespace_egress_chain(
-    veth_host_ip: Ipv4Addr,
     guest_dns_ip: Ipv4Addr,
     internal_egress_denied_cidrs: &[String],
 ) -> Result<()> {
@@ -152,7 +151,6 @@ pub(super) fn initialize_namespace_egress_chain(
         },
     ];
     commands.extend(build_static_egress_commands(
-        veth_host_ip,
         guest_dns_ip,
         internal_egress_denied_cidrs,
         configured_always_denied_cidrs(),
@@ -163,16 +161,22 @@ pub(super) fn initialize_namespace_egress_chain(
 }
 
 fn build_static_egress_commands(
-    veth_host_ip: Ipv4Addr,
     guest_dns_ip: Ipv4Addr,
     internal_egress_denied_cidrs: &[String],
     node_always_denied_cidrs: &[String],
 ) -> Vec<IptablesRestoreCommand> {
     let mut commands = Vec::new();
 
-    for cidr in [format!("{veth_host_ip}/32"), format!("{guest_dns_ip}/32")] {
+    // Host-initiated proxy/envd connections return through this chain after the
+    // namespace SNATs the guest response to its host interaction address.
+    commands.push(append_egress_command(
+        "-i tap0 -o vpeer -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT".to_string(),
+    ));
+
+    // Allow DNS traffic to the guest DNS server.
+    for protocol in ["udp", "tcp"] {
         commands.push(append_egress_command(format!(
-            "-i tap0 -o vpeer -d {cidr} -j ACCEPT"
+            "-i tap0 -o vpeer -d {guest_dns_ip}/32 -p {protocol} --dport 53 -j ACCEPT"
         )));
     }
 
@@ -416,27 +420,56 @@ mod tests {
         let denied_cidrs = NetworkConfig::default().egress.always_denied_cidrs;
         let internal_egress_denied_cidrs = Vec::new();
         let commands = build_static_egress_commands(
-            Ipv4Addr::new(10, 12, 0, 2),
             Ipv4Addr::new(10, 1, 2, 1),
             &internal_egress_denied_cidrs,
             &denied_cidrs,
         );
 
-        let host_allow_pos = commands
+        assert_eq!(
+            append_rule(&commands[0]),
+            Some("-i tap0 -o vpeer -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
+        );
+        let established_pos = commands
             .iter()
             .position(|command| {
-                append_rule(command) == Some("-i tap0 -o vpeer -d 10.12.0.2/32 -j ACCEPT")
+                append_rule(command)
+                    == Some("-i tap0 -o vpeer -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT")
             })
             .unwrap();
-        assert!(commands.iter().any(
-            |command| append_rule(command) == Some("-i tap0 -o vpeer -d 10.1.2.1/32 -j ACCEPT")
-        ));
+        let dns_udp_pos = commands
+            .iter()
+            .position(|command| {
+                append_rule(command)
+                    == Some("-i tap0 -o vpeer -d 10.1.2.1/32 -p udp --dport 53 -j ACCEPT")
+            })
+            .unwrap();
+        let dns_tcp_pos = commands
+            .iter()
+            .position(|command| {
+                append_rule(command)
+                    == Some("-i tap0 -o vpeer -d 10.1.2.1/32 -p tcp --dport 53 -j ACCEPT")
+            })
+            .unwrap();
+        assert!(commands.iter().any(|command| {
+            append_rule(command)
+                == Some("-i tap0 -o vpeer -d 10.1.2.1/32 -p udp --dport 53 -j ACCEPT")
+        }));
+        assert!(commands.iter().any(|command| {
+            append_rule(command)
+                == Some("-i tap0 -o vpeer -d 10.1.2.1/32 -p tcp --dport 53 -j ACCEPT")
+        }));
+        assert!(!commands.iter().any(|command| {
+            append_rule(command) == Some("-i tap0 -o vpeer -d 10.12.0.2/32 -j ACCEPT")
+        }));
         let hard_deny_pos = commands
             .iter()
             .position(|command| {
                 append_rule(command) == Some("-i tap0 -o vpeer -d 10.0.0.0/8 -j REJECT")
             })
             .unwrap();
+        assert!(established_pos < hard_deny_pos);
+        assert!(dns_udp_pos < hard_deny_pos);
+        assert!(dns_tcp_pos < hard_deny_pos);
         let shared_deny_pos = commands
             .iter()
             .position(|command| {
@@ -450,7 +483,6 @@ mod tests {
             })
             .unwrap();
 
-        assert!(host_allow_pos < hard_deny_pos);
         assert!(hard_deny_pos < shared_deny_pos);
         assert!(hard_deny_pos < user_chain_pos);
         assert!(shared_deny_pos < user_chain_pos);
@@ -461,7 +493,6 @@ mod tests {
         let denied_cidrs = vec!["203.0.113.0/24".to_string()];
         let internal_egress_denied_cidrs = Vec::new();
         let commands = build_static_egress_commands(
-            Ipv4Addr::new(10, 12, 0, 2),
             Ipv4Addr::new(10, 1, 2, 1),
             &internal_egress_denied_cidrs,
             &denied_cidrs,
