@@ -5,6 +5,7 @@
 //! entry to skip process spawn and API socket polling on the critical path.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -34,6 +35,34 @@ const DEAD_WARM_CLEANUP_WORKER_POLL: Duration = Duration::from_secs(1);
 /// worker sleeps in short slices and the synchronous `ip link del` fallback
 /// has its own timeout, but a stuck teardown must not hang shutdown forever.
 const DEAD_WARM_CLEANUP_JOIN_TIMEOUT: Duration = Duration::from_secs(15);
+/// Upper bound for draining in-flight warm-entry acquisitions before the
+/// dead-entry queue is closed at shutdown. In-flight sections are short
+/// (a process-state probe plus a lock-protected enqueue), so this is
+/// generous; on timeout shutdown proceeds and reports the incomplete drain.
+const ACQUIRE_INFLIGHT_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// RAII guard tracking an in-flight warm-entry acquisition: from the pop out
+/// of the warm pool until the entry is handed to the caller, released back,
+/// or queued for cleanup. Shutdown waits for these to drain before closing
+/// the dead-entry queue, so the closed-queue inline-cleanup fallback stays
+/// unreachable in the normal shutdown flow and every late entry is accounted
+/// for before shutdown reports.
+struct AcquireInflightGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl<'a> AcquireInflightGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self { counter }
+    }
+}
+
+impl Drop for AcquireInflightGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Exponential backoff between dead-entry teardown retries. Keeps a retained
 /// entry whose cleanup keeps failing from being retried on every maintenance
@@ -153,7 +182,7 @@ impl DeadWarmEntry {
             DeadWarmEntryInner::SlotOnly(slot) => slot,
         };
 
-        match network.cleanup_allocated_slot_retain_bit_on_failure(&slot, false) {
+        match network.cleanup_allocated_slot_retain_bit_on_failure(slot, false) {
             Ok(()) => Ok(DeadWarmCleanupOutcome::Clean),
             Err(SlotTeardownError::BitRelease(error)) => {
                 // Terminal: teardown already disarmed the slot and the bit is
@@ -165,7 +194,7 @@ impl DeadWarmEntry {
                     "firecracker pool: cleanup dead warm network slot {slot_idx}: teardown completed but releasing the allocation bit failed: {error:#}"
                 )))
             }
-            Err(SlotTeardownError::Teardown(error)) => {
+            Err(SlotTeardownError::Teardown { slot, error }) => {
                 // Saturate: a permanently failing slot is retried
                 // indefinitely, and an overflowing counter would panic the
                 // cleanup worker in debug builds. The backoff saturates at
@@ -219,11 +248,15 @@ impl std::fmt::Debug for DeadWarmCleanupError {
 /// Finish teardown of an entry whose queue was closed while its cleanup was
 /// in flight. The entry cannot be requeued (no consumer remains), and simply
 /// dropping it would re-run `Slot::cleanup` via `Slot::drop` without ever
-/// releasing the allocation bit, leaking the index permanently. The teardown
-/// is attempted once on the calling (blocking) thread; if it fails, the bit
-/// is released explicitly as a last resort so the index is not leaked.
-/// Returns the failure message to report, if any: a failed teardown always
-/// reports, while a successful teardown only reports a prior failure.
+/// releasing the allocation bit. The teardown is attempted once on the
+/// calling (blocking) thread; if it fails, the bit is RETAINED, not
+/// released: `Slot::cleanup` re-arms itself on failure because index-derived
+/// resources (`veth-<idx>`, the netns mount) may still exist, so releasing
+/// the bit would make the index reallocatable while stale networking owned
+/// by this entry remains. The index stays quarantined for the rest of the
+/// process lifetime and the failure is reported instead. Returns the failure
+/// message to report, if any: a failed teardown always reports, while a
+/// successful teardown only reports a prior failure.
 fn finalize_closed_dead_entry(
     network: &NetworkManager,
     entry: DeadWarmEntry,
@@ -250,17 +283,15 @@ fn finalize_closed_dead_entry(
             if let Some(prior) = prior_error {
                 message = format!("{prior:#}; final teardown during shutdown also failed: {message}");
             }
-            // Dropping the entry re-runs `Slot::cleanup` best-effort via
-            // `Slot::drop`, which never touches the bitmap; release the bit
-            // explicitly so the index is not leaked.
+            // Teardown failed, so the allocation bit stays set: the index is
+            // quarantined from reuse while index-derived network resources
+            // may remain. (Dropping the entry only re-runs `Slot::cleanup`
+            // best-effort via `Slot::drop`, which never touches the bitmap.)
             drop(err);
-            if let Err(bit_err) = network.release_slot_bit(slot_idx) {
-                warn!(
-                    slot = slot_idx,
-                    error = %bit_err,
-                    "firecracker pool: failed to release dead warm slot bit during shutdown"
-                );
-            }
+            warn!(
+                slot = slot_idx,
+                "firecracker pool: dead warm slot index quarantined after failed final teardown"
+            );
             Some(message)
         }
     }
@@ -293,6 +324,10 @@ pub struct FirecrackerPool {
     /// enqueue against shutdown: once `closed` is set, a late enqueue cleans
     /// up inline instead of queueing an entry no consumer will ever see.
     dead_entries: Arc<Mutex<DeadWarmQueue>>,
+    /// Warm entries currently popped by an in-flight acquisition but not yet
+    /// handed to the caller, released back, or queued for cleanup. Shutdown
+    /// waits for this to drain before closing the dead-entry queue.
+    acquire_inflight: AtomicUsize,
     binary: PathBuf,
     socket_timeout: Duration,
     socket_poll_interval: Duration,
@@ -362,6 +397,7 @@ impl FirecrackerPool {
         Self {
             pool: WarmPool::new(pool_config.pool),
             dead_entries: Arc::new(Mutex::new(DeadWarmQueue::default())),
+            acquire_inflight: AtomicUsize::new(0),
             binary,
             socket_timeout,
             socket_poll_interval,
@@ -402,6 +438,11 @@ impl FirecrackerPool {
             }
             attempts_left -= 1;
             let mut warm = self.pool.try_acquire()?;
+            // Track the entry until it is handed off, released back, or
+            // queued: shutdown drains these guards before closing the
+            // dead-entry queue, so a late enqueue never meets a closed queue
+            // in the normal shutdown flow.
+            let _inflight = AcquireInflightGuard::new(&self.acquire_inflight);
             match warm.fc_instance.is_process_running() {
                 Ok(true) => return Some(warm),
                 Ok(false) => self.enqueue_dead_warm(warm),
@@ -445,11 +486,13 @@ impl FirecrackerPool {
         {
             let mut queue = lock_dead_queue(&self.dead_entries);
             if queue.closed {
-                // Shutdown already drained the queue: no consumer will run
-                // again, so finish the teardown inline on this thread and
-                // make sure the allocation bit is released even on failure
-                // (dropping the entry would only re-run `Slot::cleanup` via
-                // `Slot::drop` and leak the bit).
+                // Defensive fallback: normally unreachable, because shutdown
+                // waits for in-flight acquisitions (see `acquire_inflight`)
+                // before closing the queue. Reachable only if the drain wait
+                // timed out or shutdown ran twice. No consumer will run
+                // again, so finish the teardown inline on this thread; on
+                // failure the allocation bit stays set (quarantined) and the
+                // failure is reported via the returned message.
                 drop(queue);
                 match entry.attempt_cleanup(NetworkManager::global()) {
                     Ok(DeadWarmCleanupOutcome::Clean) => {}
@@ -792,7 +835,30 @@ impl FirecrackerPool {
     /// queued entries. Kept separate so the async shutdown path can run it
     /// on a blocking thread instead of stalling a Tokio worker.
     fn shutdown_dead_entries_blocking(&self) -> Vec<String> {
-        let (dead, mut failures) = self.close_dead_queue();
+        // Wait for in-flight acquisitions to finish disposing of their
+        // popped entries: `WarmPool::drain_all` (already done by the caller)
+        // stops NEW acquisitions, but an acquire that popped an entry just
+        // before it can still be probing or enqueueing. Closing the queue
+        // only after these guards drain keeps the closed-queue inline
+        // fallback unreachable here and ensures every entry is accounted for
+        // before shutdown reports.
+        let mut failures = Vec::new();
+        let deadline = Instant::now() + ACQUIRE_INFLIGHT_DRAIN_TIMEOUT;
+        while self.acquire_inflight.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let remaining = self.acquire_inflight.load(Ordering::Acquire);
+        if remaining > 0 {
+            warn!(
+                remaining,
+                timeout = ?ACQUIRE_INFLIGHT_DRAIN_TIMEOUT,
+                "firecracker pool: in-flight acquisitions did not drain before dead-queue close"
+            );
+            failures.push(format!(
+                "firecracker pool: {remaining} in-flight acquisition(s) still pending after {ACQUIRE_INFLIGHT_DRAIN_TIMEOUT:?} drain timeout"
+            ));
+        }
+        let (dead, mut close_failures) = self.close_dead_queue();
         for entry in dead {
             match entry.attempt_cleanup(NetworkManager::global()) {
                 Ok(DeadWarmCleanupOutcome::Clean) => {}
@@ -820,6 +886,7 @@ impl FirecrackerPool {
                 }
             }
         }
+        failures.append(&mut close_failures);
         failures
     }
 
@@ -828,11 +895,12 @@ impl FirecrackerPool {
         // The dead-queue join and dead-entry teardown do blocking network
         // teardown (netlink/`ip`) plus bounded sleeps; run them on a
         // blocking thread so this awaited shutdown never stalls a Tokio
-        // worker and delays unrelated shutdown futures. The queue lock
-        // serializes with acquire exactly as before: a concurrent enqueue
-        // either lands before the queue is closed or observes `closed` and
-        // cleans up inline. `Self::global()` re-fetches the 'static pool
-        // reference for the blocking closure.
+        // worker and delays unrelated shutdown futures. The blocking part
+        // first waits for in-flight acquisitions (tracked via
+        // `acquire_inflight`) to finish disposing of entries popped before
+        // `drain_all`, so the queue is only closed once no late enqueue can
+        // arrive. `Self::global()` re-fetches the 'static pool reference for
+        // the blocking closure.
         let dead_failures = match tokio::task::spawn_blocking(|| {
             Self::global()
                 .map(|pool| pool.shutdown_dead_entries_blocking())
@@ -1329,13 +1397,14 @@ mod tests {
     }
 
     #[test]
-    fn finalize_closed_entry_releases_bit_and_reports_failure() {
+    fn finalize_closed_entry_quarantines_bit_and_reports_failure() {
         let manager = test_manager();
         let slot = manager.allocate_slot(48).unwrap();
         let idx = slot.idx;
         // Inject a genuine teardown failure while the bit is held: finalize
-        // must still leave the index allocatable (explicit bit release) and
-        // report the failure instead of silently dropping the entry.
+        // must keep the index quarantined (the failed teardown may have left
+        // index-derived resources behind) and report the failure instead of
+        // silently dropping the entry.
         manager
             .fail_slot_teardown
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1348,9 +1417,9 @@ mod tests {
         .expect("failed teardown must be reported");
 
         assert!(message.contains("in-flight teardown failed"));
-        // The index was not leaked: it can be allocated again.
-        let slot = manager.allocate_slot(idx).unwrap();
-        drop(slot);
+        // The index is quarantined: it must NOT be reallocatable while stale
+        // network resources may still exist.
+        assert!(manager.allocate_slot(idx).is_err());
     }
 
     #[test]

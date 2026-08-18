@@ -562,12 +562,14 @@ mod tests {
             startup_prewarm: false,
         });
 
-        pool.request_maintenance_after(Duration::from_millis(50));
+        // Widely separated delays keep the ordering assertions deterministic
+        // even if the test thread is descheduled between calls.
+        pool.request_maintenance_after(Duration::from_secs(60));
         let first = pool.maintenance_signal.lock().unwrap().wake_at;
         assert!(first.is_some());
 
         // A later instant must not push the scheduled wake back.
-        pool.request_maintenance_after(Duration::from_secs(60));
+        pool.request_maintenance_after(Duration::from_secs(120));
         assert_eq!(pool.maintenance_signal.lock().unwrap().wake_at, first);
 
         // An earlier instant wins.
@@ -632,17 +634,21 @@ mod tests {
             cycles.fetch_add(1, Ordering::Relaxed);
         });
 
-        // Wait for the startup cycle, then leave an already-expired wake
-        // behind and trigger an immediate cycle: the cycle must consume the
-        // stale instant instead of letting a later earliest-wins `min`
+        // Wait for the startup cycle, then install an already-expired wake
+        // TOGETHER with the pending signal under the same lock, so the worker
+        // deterministically takes the pending path: the cycle must consume
+        // the stale instant instead of letting a later earliest-wins `min`
         // resurrect it as an immediate extra cycle.
         let deadline = Instant::now() + Duration::from_secs(5);
         while cycles.load(Ordering::Relaxed) < 1 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        pool.maintenance_signal.lock().unwrap().wake_at =
-            Some(Instant::now() - Duration::from_millis(1));
-        pool.request_maintenance();
+        {
+            let mut signal = pool.maintenance_signal.lock().unwrap();
+            signal.wake_at = Some(Instant::now() - Duration::from_millis(1));
+            signal.pending = true;
+        }
+        pool.maintenance_cv.notify_one();
         let deadline = Instant::now() + Duration::from_secs(5);
         while cycles.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));

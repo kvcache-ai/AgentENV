@@ -85,8 +85,9 @@ pub(crate) enum SlotTeardownError {
     /// `Slot::cleanup` failed: the allocation bit is still held, so the
     /// caller must retain the slot and retry — the index cannot be
     /// reallocated in between, and the retry still owns the index-derived
-    /// resources (`veth-<idx>`) it tears down.
-    Teardown(anyhow::Error),
+    /// resources (`veth-<idx>`) it tears down. Ownership of the slot is
+    /// returned together with the error so it can be queued for retry.
+    Teardown { slot: Slot, error: anyhow::Error },
     /// Teardown succeeded but releasing the allocation bit failed: the slot
     /// is already disarmed and the bit is already clear, so the index may be
     /// reallocated immediately. Retrying would be a no-op cleanup followed
@@ -257,12 +258,16 @@ impl NetworkManager {
     /// (`veth-<idx>`) it tears down and can never delete networking that was
     /// recreated for a different sandbox.
     ///
-    /// The caller must hold exclusive ownership of the slot: every path that
-    /// reaches here consumes the `Slot` by value (release and dead-entry
-    /// cleanup alike), so the `cleanup_armed` flag inside `Slot::cleanup`
-    /// only provides idempotency against a repeated teardown by the same
-    /// owner — it is not a guard against concurrent owners, which the type's
-    /// ownership rules already exclude.
+    /// The slot is consumed by value to enforce exclusive ownership: after a
+    /// successful call the cleanup is disarmed and the bit is clear, so a
+    /// caller retaining the `Slot` could otherwise re-invoke this method and
+    /// `release_slot_bit` would clear a NEW owner's bit once the index is
+    /// reallocated. On a retryable teardown failure, ownership is returned
+    /// inside `SlotTeardownError::Teardown` so the caller can queue the slot
+    /// for retry. The `cleanup_armed` flag inside `Slot::cleanup` only
+    /// provides idempotency against a repeated teardown by the same owner —
+    /// it is not a guard against concurrent owners, which the type's
+    /// ownership rules exclude.
     ///
     /// The error is typed (`SlotTeardownError`) so callers can distinguish a
     /// retryable teardown failure (bit still held) from a terminal
@@ -270,18 +275,24 @@ impl NetworkManager {
     /// clear), which must be reported but never retained for retry.
     pub(crate) fn cleanup_allocated_slot_retain_bit_on_failure(
         &self,
-        slot: &Slot,
+        slot: Slot,
         sync_cleanup: bool,
     ) -> std::result::Result<(), SlotTeardownError> {
         #[cfg(test)]
         if self.fail_slot_teardown.swap(false, Ordering::AcqRel) {
-            return Err(SlotTeardownError::Teardown(anyhow!(
-                "injected slot teardown failure"
-            )));
+            return Err(SlotTeardownError::Teardown {
+                slot,
+                error: anyhow!("injected slot teardown failure"),
+            });
         }
-        slot.cleanup(sync_cleanup)
-            .map_err(|e| SlotTeardownError::Teardown(Into::<anyhow::Error>::into(e)))?;
-        self.release_slot_bit(slot.idx)
+        let idx = slot.idx;
+        if let Err(e) = slot.cleanup(sync_cleanup) {
+            return Err(SlotTeardownError::Teardown {
+                slot,
+                error: Into::<anyhow::Error>::into(e),
+            });
+        }
+        self.release_slot_bit(idx)
             .map_err(SlotTeardownError::BitRelease)
     }
 
