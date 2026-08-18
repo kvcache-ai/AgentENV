@@ -228,7 +228,7 @@ impl FirecrackerPool {
     }
 
     fn run_maintenance_cycle(&self) -> Result<()> {
-        match self.pool.compute_maintenance_action(self.pool.len()) {
+        match self.pool.compute_maintenance_action() {
             PoolMaintenanceAction::Fill(to_fill) => {
                 self.runtime.block_on(self.fill_warm_entries(to_fill))?;
             }

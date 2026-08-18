@@ -275,20 +275,24 @@ impl<T: Send> WarmPool<T> {
         self.len() == 0
     }
 
-    /// Compute the maintenance action based on current pool size.
+    /// Compute the maintenance action from the live pool length.
     ///
-    /// The returned action is a point-in-time plan computed from `pool_len`
-    /// and the demand state. A `Drain` plan can go stale before the caller
-    /// finishes executing it (an interleaved acquisition cancels an
-    /// in-progress decay; concurrent releases/acquisitions change the pool
-    /// length), so maintenance drains must claim each resource through
-    /// `try_drain_one_for_maintenance`, which re-validates the decision at
-    /// execution time.
-    pub fn compute_maintenance_action(&self, pool_len: usize) -> PoolMaintenanceAction {
-        self.demand_state
-            .lock()
-            .unwrap()
-            .compute_maintenance_action(&self.config, pool_len, Instant::now())
+    /// Locks in the crate-wide demand_state → pool order and reads the pool
+    /// length under the pool lock while holding the demand state, so decay
+    /// lifecycle transitions (which mutate `decaying`) and the returned plan
+    /// are always computed from a live, synchronized length — never from a
+    /// caller-supplied snapshot that may be stale.
+    ///
+    /// The returned action is still a point-in-time plan. A `Drain` plan can
+    /// go stale before the caller finishes executing it (an interleaved
+    /// acquisition cancels an in-progress decay; concurrent
+    /// releases/acquisitions change the pool length), so maintenance drains
+    /// must claim each resource through `try_drain_one_for_maintenance`,
+    /// which re-validates the decision at execution time.
+    pub fn compute_maintenance_action(&self) -> PoolMaintenanceAction {
+        let mut state = self.demand_state.lock().unwrap();
+        let pool_len = self.pool.lock().unwrap().len();
+        state.compute_maintenance_action(&self.config, pool_len, Instant::now())
     }
 
     /// Time until the idle TTL expires, if decay is configured.
@@ -301,10 +305,10 @@ impl<T: Send> WarmPool<T> {
     /// Wake maintenance when the pool is below its fill target. Called after
     /// the acquisition has been recorded under the demand-state lock and
     /// both locks have been released (`compute_maintenance_action` re-locks
-    /// the demand state).
-    fn request_maintenance_if_fill(&self, pool_len: usize) {
+    /// demand_state → pool).
+    fn request_maintenance_if_fill(&self) {
         if matches!(
-            self.compute_maintenance_action(pool_len),
+            self.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(_)
         ) {
             self.request_maintenance();
@@ -347,7 +351,7 @@ impl<T: Send> WarmPool<T> {
         state.record_acquisition(&self.config, next_pool_len, Instant::now());
         drop(pool);
         drop(state);
-        self.request_maintenance_if_fill(next_pool_len);
+        self.request_maintenance_if_fill();
         resource
     }
 
@@ -370,7 +374,7 @@ impl<T: Send> WarmPool<T> {
         state.record_acquisition(&self.config, next_pool_len, Instant::now());
         drop(pool);
         drop(state);
-        self.request_maintenance_if_fill(next_pool_len);
+        self.request_maintenance_if_fill();
         resource
     }
 
@@ -551,13 +555,10 @@ impl<T: Send> WarmPool<T> {
                 break;
             }
 
-            has_immediate_work = {
-                let pool_len = self.pool.lock().unwrap().len();
-                !matches!(
-                    self.compute_maintenance_action(pool_len),
-                    PoolMaintenanceAction::Idle
-                )
-            };
+            has_immediate_work = !matches!(
+                self.compute_maintenance_action(),
+                PoolMaintenanceAction::Idle
+            );
         }
     }
 
@@ -608,12 +609,19 @@ mod tests {
             startup_prewarm: false,
             idle_ttl: None,
         });
+        // Two idle resources below the low watermark: fill the missing two.
+        pool.release(1).unwrap();
+        pool.release(2).unwrap();
         assert_eq!(
-            pool.compute_maintenance_action(2),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(2)
         );
+        // Seven idle resources within the watermarks: no action.
+        for value in 3..=7 {
+            pool.release(value).unwrap();
+        }
         assert_eq!(
-            pool.compute_maintenance_action(7),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Idle
         );
     }
@@ -629,7 +637,7 @@ mod tests {
         });
 
         assert_eq!(
-            pool.compute_maintenance_action(0),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(2)
         );
 
@@ -637,13 +645,13 @@ mod tests {
         pool.release(2).unwrap();
         assert_eq!(pool.try_acquire(), Some(1));
         assert_eq!(
-            pool.compute_maintenance_action(1),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(3)
         );
 
         assert_eq!(pool.try_acquire(), Some(2));
         assert_eq!(
-            pool.compute_maintenance_action(0),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(8)
         );
     }
@@ -660,19 +668,19 @@ mod tests {
 
         assert_eq!(pool.try_acquire(), None);
         assert_eq!(
-            pool.compute_maintenance_action(0),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(4)
         );
 
         assert_eq!(pool.try_acquire(), None);
         assert_eq!(
-            pool.compute_maintenance_action(0),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(8)
         );
 
         assert_eq!(pool.try_acquire_where(|_| true), None);
         assert_eq!(
-            pool.compute_maintenance_action(0),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(10)
         );
     }
@@ -701,12 +709,20 @@ mod tests {
             startup_prewarm: false,
             idle_ttl: None,
         });
+        // Eight idle resources above the high watermark: drain the excess.
+        for value in 1..=8 {
+            pool.release(value).unwrap();
+        }
         assert_eq!(
-            pool.compute_maintenance_action(8),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Drain(4)
         );
+        // At the high watermark: no action.
+        for _ in 0..4 {
+            assert!(pool.try_drain_one().is_some());
+        }
         assert_eq!(
-            pool.compute_maintenance_action(4),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Idle
         );
     }
@@ -846,7 +862,7 @@ mod tests {
         assert_eq!(pool.try_acquire(), Some(1));
         assert_eq!(pool.try_acquire(), Some(2));
         assert_eq!(
-            pool.compute_maintenance_action(0),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(8)
         );
 
@@ -859,7 +875,7 @@ mod tests {
         // Idle past the TTL: excess drains toward the decayed fill target
         // (low watermark) instead of lingering below the high watermark.
         assert_eq!(
-            pool.compute_maintenance_action(6),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Drain(4)
         );
         // The decay is not consumed by the first computation: if a drain
@@ -867,18 +883,21 @@ mod tests {
         // toward the low watermark instead of retaining the excess for
         // another full TTL.
         assert_eq!(
-            pool.compute_maintenance_action(6),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Drain(4)
         );
+        // Simulate a partially successful drain cycle: after one verified
+        // removal, the computation keeps draining the remaining excess.
+        assert!(pool.try_drain_one_for_maintenance().is_some());
         assert_eq!(
-            pool.compute_maintenance_action(5),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Drain(3)
         );
 
-        // Execute the drain through the maintenance claim path: each removal
-        // is re-validated, and the decay completes only once the pool
-        // verifiably reaches the decayed target.
-        for _ in 0..4 {
+        // Execute the rest of the drain through the maintenance claim path:
+        // each removal is re-validated, and the decay completes only once
+        // the pool verifiably reaches the decayed target.
+        for _ in 0..3 {
             assert!(pool.try_drain_one_for_maintenance().is_some());
             assert_eq!(pool.demand_state.lock().unwrap().decaying, pool.len() > 2);
         }
@@ -886,12 +905,18 @@ mod tests {
         assert!(pool.try_drain_one_for_maintenance().is_none());
 
         // The decay cycle ended: the high watermark caps idle resources again.
+        for value in 7..=10 {
+            pool.release(value).unwrap();
+        }
         assert_eq!(
-            pool.compute_maintenance_action(6),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Idle
         );
+        for _ in 0..5 {
+            assert!(pool.try_drain_one().is_some());
+        }
         assert_eq!(
-            pool.compute_maintenance_action(1),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(1)
         );
     }
@@ -914,13 +939,13 @@ mod tests {
         let ttl = pool.config().idle_ttl.unwrap();
         pool.demand_state.lock().unwrap().last_acquisition = Instant::now() - ttl / 2;
         assert_eq!(
-            pool.compute_maintenance_action(0),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(8)
         );
 
         expire_idle_ttl(&pool);
         assert_eq!(
-            pool.compute_maintenance_action(0),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(2)
         );
     }
@@ -980,7 +1005,7 @@ mod tests {
         }
         expire_idle_ttl(&pool);
         assert_eq!(
-            pool.compute_maintenance_action(6),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Drain(4)
         );
 
@@ -1008,7 +1033,7 @@ mod tests {
         });
         expire_idle_ttl(&pool);
         assert_eq!(
-            pool.compute_maintenance_action(0),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Idle
         );
         assert!(!pool.demand_state.lock().unwrap().decaying);
@@ -1039,7 +1064,7 @@ mod tests {
         }
         expire_idle_ttl(&pool);
         assert_eq!(
-            pool.compute_maintenance_action(4),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Drain(2)
         );
 
@@ -1051,7 +1076,7 @@ mod tests {
         // The decay is still active and drains the extra resource too.
         assert!(pool.demand_state.lock().unwrap().decaying);
         assert_eq!(
-            pool.compute_maintenance_action(pool.len()),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Drain(2)
         );
         assert!(pool.try_drain_one_for_maintenance().is_some());
@@ -1072,7 +1097,7 @@ mod tests {
         })));
         pool.start_maintenance_worker(move || {
             if let PoolMaintenanceAction::Drain(to_drain) =
-                pool.compute_maintenance_action(pool.len())
+                pool.compute_maintenance_action()
             {
                 for _ in 0..to_drain {
                     if pool.try_drain_one_for_maintenance().is_none() {
@@ -1125,7 +1150,7 @@ mod tests {
 
         // TTL expired: the decay starts and drains toward the low watermark.
         assert_eq!(
-            pool.compute_maintenance_action(6),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Drain(4)
         );
 
@@ -1134,7 +1159,7 @@ mod tests {
         // high watermark caps idle resources again.
         assert!(pool.try_acquire().is_some());
         assert_eq!(
-            pool.compute_maintenance_action(5),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Idle
         );
     }
@@ -1159,7 +1184,7 @@ mod tests {
                 for value in 0..200u32 {
                     pool.release(value).unwrap();
                     let _ = pool.try_acquire();
-                    let action = pool.compute_maintenance_action(pool.len());
+                    let action = pool.compute_maintenance_action();
                     if let PoolMaintenanceAction::Drain(n) | PoolMaintenanceAction::Fill(n) = action
                     {
                         assert!(n <= 8, "action size beyond high watermark: {n}");
