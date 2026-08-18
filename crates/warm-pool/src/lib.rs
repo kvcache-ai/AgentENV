@@ -285,12 +285,11 @@ impl<T: Send> WarmPool<T> {
         Some(ttl.saturating_sub(elapsed))
     }
 
-    fn record_acquisition_pressure(&self, pool_len: usize) {
-        let now = Instant::now();
-        self.demand_state
-            .lock()
-            .unwrap()
-            .record_acquisition(&self.config, pool_len, now);
+    /// Wake maintenance when the pool is below its fill target. Called after
+    /// the acquisition has been recorded under the demand-state lock and
+    /// both locks have been released (`compute_maintenance_action` re-locks
+    /// the demand state).
+    fn request_maintenance_if_fill(&self, pool_len: usize) {
         if matches!(
             self.compute_maintenance_action(pool_len),
             PoolMaintenanceAction::Fill(_)
@@ -323,11 +322,19 @@ impl<T: Send> WarmPool<T> {
         if self.is_shutting_down() {
             return None;
         }
+        // Lock order is demand_state → pool everywhere (see
+        // `try_drain_one_for_maintenance`): the pop and the acquisition
+        // record must be atomic, otherwise a maintenance drain can lock
+        // `demand_state` in the gap, observe a stale `decaying`, and remove
+        // a resource that resumed demand has already claimed.
+        let mut state = self.demand_state.lock().unwrap();
         let mut pool = self.pool.lock().unwrap();
         let resource = pool.pop_front();
         let next_pool_len = pool.len();
+        state.record_acquisition(&self.config, next_pool_len, Instant::now());
         drop(pool);
-        self.record_acquisition_pressure(next_pool_len);
+        drop(state);
+        self.request_maintenance_if_fill(next_pool_len);
         resource
     }
 
@@ -338,14 +345,19 @@ impl<T: Send> WarmPool<T> {
         if self.is_shutting_down() {
             return None;
         }
+        // Same atomic pop-and-record under the demand_state → pool lock
+        // order as `try_acquire`.
+        let mut state = self.demand_state.lock().unwrap();
         let mut pool = self.pool.lock().unwrap();
         let resource = pool
             .iter()
             .position(&mut predicate)
             .and_then(|idx| pool.remove(idx));
         let next_pool_len = pool.len();
+        state.record_acquisition(&self.config, next_pool_len, Instant::now());
         drop(pool);
-        self.record_acquisition_pressure(next_pool_len);
+        drop(state);
+        self.request_maintenance_if_fill(next_pool_len);
         resource
     }
 
@@ -382,6 +394,11 @@ impl<T: Send> WarmPool<T> {
     /// as an acquisition cancels the decay, and decay completion is marked
     /// only once the pool is verifiably at/below the decayed target, so a
     /// stale length snapshot cannot end the cycle early and strand resources.
+    ///
+    /// The lock order here (demand_state → pool) is the same one acquisition
+    /// paths use to pop a resource and record the acquisition atomically
+    /// (`try_acquire`/`try_acquire_where`), so a drain can never observe a
+    /// half-recorded acquisition (resource popped but `decaying` still set).
     pub fn try_drain_one_for_maintenance(&self) -> Option<T> {
         let mut state = self.demand_state.lock().unwrap();
         let mut pool = self.pool.lock().unwrap();
