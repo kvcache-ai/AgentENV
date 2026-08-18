@@ -66,10 +66,14 @@ impl FirecrackerInstance {
     /// Warm pool entries park with `oom_score_adj=1000`, so they are the first
     /// OOM-kill candidates and can die while idle. Callers must check this
     /// before handing a parked instance to snapshot resume.
-    pub fn is_process_running(&mut self) -> bool {
+    ///
+    /// An I/O error from the probe means the process state is unknown, not
+    /// that the child exited, so it is propagated instead of being collapsed
+    /// into `false`.
+    pub fn is_process_running(&mut self) -> std::io::Result<bool> {
         match self.process.as_mut() {
-            Some(child) => matches!(child.try_wait(), Ok(None)),
-            None => false,
+            Some(child) => child.try_wait().map(|status| status.is_none()),
+            None => Ok(false),
         }
     }
 
