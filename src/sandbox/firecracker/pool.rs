@@ -355,7 +355,15 @@ impl FirecrackerPool {
     /// can die while idle; handing a dead process to snapshot resume would fail
     /// the resume, so dead entries are discarded here instead.
     fn acquire_live_warm(&self) -> Option<WarmFirecracker> {
+        // Bound the scan: probe errors release the entry back into the pool,
+        // so an unhealthy pool could otherwise be scanned forever — and a
+        // single failing probe must not mask healthy entries behind it.
+        let mut attempts_left = self.pool.len() + 1;
         loop {
+            if attempts_left == 0 {
+                return None;
+            }
+            attempts_left -= 1;
             let mut warm = self.pool.try_acquire()?;
             match warm.fc_instance.is_process_running() {
                 Ok(true) => return Some(warm),
@@ -363,8 +371,9 @@ impl FirecrackerPool {
                 Err(err) => {
                     // The probe failed, so the process state is unknown: an
                     // I/O error does not prove the child exited. Keep the
-                    // entry (and its network slot) and report a pool miss
-                    // instead of tearing down a process that may be alive.
+                    // entry (and its network slot) and move on to the next
+                    // entry instead of tearing down a process that may be
+                    // alive or masking healthy entries behind this one.
                     warn!(
                         slot = warm.slot.idx,
                         error = %err,
@@ -374,7 +383,7 @@ impl FirecrackerPool {
                         // Shutdown reclaimed the entry; queue it for cleanup.
                         self.enqueue_dead_warm(warm);
                     }
-                    return None;
+                    continue;
                 }
             }
         }
@@ -507,7 +516,15 @@ impl FirecrackerPool {
                 let now = Instant::now();
                 match queue.entries.iter().position(|entry| entry.due(now)) {
                     Some(pos) => queue.entries.remove(pos),
-                    None if queue.entries.is_empty() => return,
+                    None if queue.entries.is_empty() => {
+                        // Clear the worker slot under the same lock before
+                        // exiting: an enqueue that observed this handle as
+                        // not-yet-finished would otherwise skip spawning a
+                        // new worker, leaving the entry queued until the next
+                        // enqueue or shutdown (lost wakeup).
+                        queue.worker = None;
+                        return;
+                    }
                     None => {
                         // All retained entries are backing off. Sleep at most
                         // DEAD_WARM_CLEANUP_WORKER_POLL at a time so shutdown
@@ -620,6 +637,17 @@ impl FirecrackerPool {
                 queue
                     .entries
                     .extend(failed.into_iter().map(|(entry, _)| entry));
+                // The maintenance worker sleeps on a condvar between cycles,
+                // so retained backoff entries must schedule their own wakeup:
+                // without it they would only be retried when unrelated pool
+                // activity happens to trigger maintenance again.
+                let next_wake = queue.entries.iter().map(|entry| entry.not_before).min();
+                drop(queue);
+                if let Some(not_before) = next_wake {
+                    self.pool.request_maintenance_after(
+                        not_before.saturating_duration_since(Instant::now()),
+                    );
+                }
             }
         }
         firecracker_pool_cleanup_result(failures)
@@ -1135,13 +1163,27 @@ mod tests {
         });
         assert!(drained, "cleanup worker did not drain the queue");
 
-        // Close + join, mirroring close_dead_queue: the join must complete.
+        // Once the queue is empty the worker clears its own slot before
+        // exiting, so the next enqueue can spawn a fresh worker (no lost
+        // wakeup against a stale not-yet-finished handle).
+        let cleared = wait_until(Duration::from_secs(5), || {
+            lock_dead_queue(&shared).worker.is_none()
+        });
+        assert!(
+            cleared,
+            "cleanup worker did not release its worker slot on exit"
+        );
+
+        // Close + join, mirroring close_dead_queue: if the worker had not
+        // exited yet when the slot was checked, the join must still complete.
         let worker = {
             let mut queue = lock_dead_queue(&shared);
             queue.closed = true;
             queue.worker.take()
         };
-        worker.unwrap().join().unwrap();
+        if let Some(worker) = worker {
+            worker.join().unwrap();
+        }
 
         // Teardown ran and released the bit.
         let slot = manager.allocate_slot(idx).unwrap();

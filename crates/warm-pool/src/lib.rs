@@ -12,6 +12,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Action computed by watermark logic for the maintenance worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +32,9 @@ struct PoolMaintenanceSignal {
     pending: bool,
     /// Worker should exit.
     stop: bool,
+    /// Earliest instant the worker must wake even without a `pending`
+    /// signal, for work scheduled in the future (e.g. backoff retries).
+    wake_at: Option<Instant>,
 }
 
 /// Configuration for a warm pool.
@@ -206,6 +210,31 @@ impl<T: Send> WarmPool<T> {
         self.maintenance_cv.notify_one();
     }
 
+    /// Request the maintenance worker to wake up after `delay`.
+    ///
+    /// Used when work becomes due at a future time (e.g. backoff retries
+    /// scheduled by the cycle callback): the worker sleeps on the condvar
+    /// with a timeout instead of waiting for unrelated pool activity. The
+    /// earliest requested instant wins.
+    pub fn request_maintenance_after(&self, delay: Duration) {
+        if !self.config.maintenance_enabled || self.is_shutting_down() {
+            return;
+        }
+
+        let mut signal = self.maintenance_signal.lock().unwrap();
+        if signal.stop {
+            return;
+        }
+        let Some(wake_at) = Instant::now().checked_add(delay) else {
+            return;
+        };
+        signal.wake_at = Some(match signal.wake_at {
+            Some(existing) => existing.min(wake_at),
+            None => wake_at,
+        });
+        self.maintenance_cv.notify_one();
+    }
+
     /// Try to acquire a resource from the pool (fast path).
     ///
     /// Returns `Some(resource)` if one is available, `None` if the pool is empty.
@@ -342,8 +371,27 @@ impl<T: Send> WarmPool<T> {
         loop {
             if !has_immediate_work {
                 let mut signal = self.maintenance_signal.lock().unwrap();
-                while !signal.stop && !signal.pending {
-                    signal = self.maintenance_cv.wait(signal).unwrap();
+                loop {
+                    if signal.stop || signal.pending {
+                        break;
+                    }
+                    match signal.wake_at {
+                        Some(wake_at) => {
+                            let now = Instant::now();
+                            if wake_at <= now {
+                                // Scheduled future work is due.
+                                signal.wake_at = None;
+                                break;
+                            }
+                            let wait = wake_at - now;
+                            let (guard, _) =
+                                self.maintenance_cv.wait_timeout(signal, wait).unwrap();
+                            signal = guard;
+                        }
+                        None => {
+                            signal = self.maintenance_cv.wait(signal).unwrap();
+                        }
+                    }
                 }
                 if signal.stop {
                     break;
@@ -495,6 +543,71 @@ mod tests {
         assert!(!pool.maintenance_signal.lock().unwrap().pending);
         assert_eq!(pool.try_acquire(), None);
         assert!(pool.maintenance_signal.lock().unwrap().pending);
+    }
+
+    #[test]
+    fn request_maintenance_after_keeps_earliest_wake() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 10,
+            maintenance_enabled: true,
+            startup_prewarm: false,
+        });
+
+        pool.request_maintenance_after(Duration::from_millis(50));
+        let first = pool.maintenance_signal.lock().unwrap().wake_at;
+        assert!(first.is_some());
+
+        // A later instant must not push the scheduled wake back.
+        pool.request_maintenance_after(Duration::from_secs(60));
+        assert_eq!(pool.maintenance_signal.lock().unwrap().wake_at, first);
+
+        // An earlier instant wins.
+        pool.request_maintenance_after(Duration::from_millis(10));
+        let earlier = pool.maintenance_signal.lock().unwrap().wake_at;
+        assert!(earlier.is_some());
+        assert!(earlier < first);
+    }
+
+    #[test]
+    fn request_maintenance_after_ignored_when_maintenance_disabled() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 10,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+        });
+
+        pool.request_maintenance_after(Duration::from_millis(1));
+        assert_eq!(pool.maintenance_signal.lock().unwrap().wake_at, None);
+    }
+
+    #[test]
+    fn maintenance_worker_wakes_for_scheduled_work() {
+        let pool: &'static WarmPool<u32> = Box::leak(Box::new(WarmPool::new(PoolConfig {
+            low_watermark: 0,
+            high_watermark: 10,
+            maintenance_enabled: true,
+            startup_prewarm: false,
+        })));
+        let cycles: &'static std::sync::atomic::AtomicUsize =
+            Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0)));
+        pool.start_maintenance_worker(move || {
+            cycles.fetch_add(1, Ordering::Relaxed);
+        });
+
+        // No pending signal: the worker must wake solely from the scheduled
+        // instant instead of waiting for unrelated pool activity.
+        pool.request_maintenance_after(Duration::from_millis(50));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cycles.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // One cycle runs at worker start; the second must come from the
+        // scheduled wake.
+        assert!(cycles.load(Ordering::Relaxed) >= 2);
+
+        pool.drain_all();
     }
 
     #[test]

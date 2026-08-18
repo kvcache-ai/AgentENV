@@ -718,7 +718,12 @@ impl Slot {
                 const IP_LINK_DEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
                 let mut child = Command::new("ip")
                     .args(["link", "del", &veth_name])
-                    .stdout(std::process::Stdio::piped())
+                    // The polling loop below never drains the pipes, so a
+                    // child that filled its stdout buffer would block forever
+                    // on write. stdout carries nothing useful here; stderr
+                    // stays piped for the error message (it is a single
+                    // short line).
+                    .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::piped())
                     .spawn()
                     .context("Failed to spawn ip link del")?;
@@ -741,15 +746,27 @@ impl Slot {
                         // hang this shutdown path beyond the grace period.
                         let reap_deadline = std::time::Instant::now()
                             + std::time::Duration::from_secs(1);
+                        let mut reaped = false;
                         while std::time::Instant::now() < reap_deadline {
                             if child
                                 .try_wait()
                                 .context("Failed to reap timed-out ip link del")?
                                 .is_some()
                             {
+                                reaped = true;
                                 break;
                             }
                             std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        if !reaped {
+                            // A child stuck in uninterruptible sleep must not
+                            // be dropped without `wait`: dropping `Child` does
+                            // not reap it and would leak a zombie. Hand it to
+                            // a detached reaper thread that only blocks on
+                            // `wait` and owns no pool state.
+                            std::thread::spawn(move || {
+                                let _ = child.wait();
+                            });
                         }
                         return Err(anyhow!(
                             "ip link del {} timed out after {:?}",

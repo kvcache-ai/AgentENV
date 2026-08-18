@@ -238,6 +238,13 @@ impl NetworkManager {
     /// for retry, so a later retry still owns the index-derived resources
     /// (`veth-<idx>`) it tears down and can never delete networking that was
     /// recreated for a different sandbox.
+    ///
+    /// The caller must hold exclusive ownership of the slot: every path that
+    /// reaches here consumes the `Slot` by value (release and dead-entry
+    /// cleanup alike), so the `cleanup_armed` flag inside `Slot::cleanup`
+    /// only provides idempotency against a repeated teardown by the same
+    /// owner — it is not a guard against concurrent owners, which the type's
+    /// ownership rules already exclude.
     pub(crate) fn cleanup_allocated_slot_retain_bit_on_failure(
         &self,
         slot: &Slot,
