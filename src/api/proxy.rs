@@ -137,6 +137,13 @@ where
 {
     Router::new()
         .route(PROXY_ROUTE, any(proxy_via_prefix::<I>))
+        // `/proxy/` has nothing left after the prefix, so the wildcard route
+        // below cannot match it (catch-all params must be non-empty) and the
+        // exact route above does not either. Without this route it reaches
+        // `proxy_via_fallback`, which forwards the path unmodified and leaks
+        // the `/proxy` prefix into the sandbox. The distributed gateway builds
+        // exactly this shape whenever a client requests `/`.
+        .route("/proxy/", any(proxy_via_prefix::<I>))
         .route("/proxy/{*proxy_path}", any(proxy_via_prefix::<I>))
         .fallback(proxy_via_fallback::<I>)
         .with_state(api_impl)
@@ -457,7 +464,7 @@ async fn proxy_http_request(
         }
     };
 
-    map_upstream_response(upstream_response)
+    map_upstream_response(upstream_response, &upstream_uri_for_log)
 }
 
 fn track_request_body_activity(body: Body) -> (Body, watch::Receiver<()>) {
@@ -585,7 +592,7 @@ async fn proxy_websocket_request(
         Ok(Err(err)) => match err {
             tungstenite::Error::Http(response) => {
                 info!(sandbox_id = %sandbox_id, status = %response.status(), "upstream websocket handshake rejected");
-                return map_websocket_handshake_rejection_response(*response);
+                return map_websocket_handshake_rejection_response(*response, &upstream_uri);
             }
             err => {
                 warn!(sandbox_id = %sandbox_id, error = %err, "upstream websocket handshake failed");
@@ -643,9 +650,11 @@ async fn proxy_websocket_request(
 
 fn map_websocket_handshake_rejection_response(
     response: http::Response<Option<Vec<u8>>>,
+    upstream_uri: &Uri,
 ) -> Response<Body> {
     let (mut parts, body) = response.into_parts();
     remove_hop_by_hop_headers(&mut parts.headers);
+    rewrite_upstream_self_references(&mut parts.headers, upstream_uri);
     let body = body.map_or_else(Body::empty, Body::from);
     Response::from_parts(parts, body)
 }
@@ -1081,12 +1090,103 @@ fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
     headers.remove(HeaderName::from_static("keep-alive"));
 }
 
-fn map_upstream_response(response: Response<Incoming>) -> Response<Body> {
+fn map_upstream_response(response: Response<Incoming>, upstream_uri: &Uri) -> Response<Body> {
     let (mut parts, body) = response.into_parts();
     // Mirror the request-side filtering on the way back so connection-scoped
     // headers from the upstream do not leak through this proxy hop.
     remove_hop_by_hop_headers(&mut parts.headers);
+    rewrite_upstream_self_references(&mut parts.headers, upstream_uri);
     Response::from_parts(parts, Body::new(body.map_err(axum::Error::new)))
+}
+
+/// Turns redirect targets that point back at the sandbox's own address into
+/// path-relative ones.
+///
+/// The upstream authority is an internal runtime address (`10.x.y.z:5173`):
+/// it is reachable from this node only, and the request carries it to the
+/// upstream in `Host`, so applications that build absolute URLs from `Host`
+/// hand it right back in `Location`. Passing that through both leaks the
+/// sandbox network layout to the client and points the client's next request
+/// at an address it cannot reach — a redirect loop that looks like the
+/// application misbehaving.
+///
+/// Only self-references are rewritten: an absolute URL to any other host is the
+/// application's own business (an OAuth hop, a CDN) and must survive verbatim.
+fn rewrite_upstream_self_references(headers: &mut HeaderMap, upstream_uri: &Uri) {
+    for name in [header::LOCATION, header::CONTENT_LOCATION] {
+        let Some(rewritten) = headers
+            .get(&name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| relative_self_reference(value, upstream_uri))
+            .and_then(|rewritten| HeaderValue::from_str(&rewritten).ok())
+        else {
+            continue;
+        };
+
+        headers.insert(name, rewritten);
+    }
+}
+
+/// Returns the path-relative form of `value` when it addresses the sandbox
+/// itself, or `None` when the value must be left untouched.
+fn relative_self_reference(value: &str, upstream_uri: &Uri) -> Option<String> {
+    // `Uri` parses fragments away, so keep the fragment out of the parse and
+    // append it verbatim afterwards instead of dropping it.
+    let (absolute, fragment) = match value.split_once('#') {
+        Some((absolute, fragment)) => (absolute, Some(fragment)),
+        None => (value, None),
+    };
+
+    // A scheme-relative reference (`//host/path`) names an authority too, so
+    // borrow the upstream scheme to parse it as the absolute URL it stands for.
+    let target = match absolute.strip_prefix("//") {
+        Some(scheme_relative) => {
+            format!("{}://{scheme_relative}", upstream_uri.scheme_str()?).parse::<Uri>()
+        }
+        None => absolute.parse::<Uri>(),
+    }
+    .ok()?;
+
+    if !points_at_same_endpoint(&target, upstream_uri) {
+        return None;
+    }
+
+    // `path()` is `/` for an empty path, which keeps a query-only URL an
+    // absolute-path reference instead of a query-relative one that would leave
+    // the client on its current path.
+    let mut relative = target.path().to_owned();
+    if let Some(query) = target.query() {
+        relative.push('?');
+        relative.push_str(query);
+    }
+    if let Some(fragment) = fragment {
+        relative.push('#');
+        relative.push_str(fragment);
+    }
+
+    Some(relative)
+}
+
+/// Compares two URLs by host and effective port rather than by authority text,
+/// so a self-reference that omits the scheme's default port still matches.
+///
+/// The upstream URL always carries an explicit port, so a target whose port
+/// cannot be determined never compares equal.
+fn points_at_same_endpoint(target: &Uri, upstream_uri: &Uri) -> bool {
+    let (Some(target_host), Some(upstream_host)) = (target.host(), upstream_uri.host()) else {
+        return false;
+    };
+
+    target_host.eq_ignore_ascii_case(upstream_host)
+        && effective_port(target) == effective_port(upstream_uri)
+}
+
+fn effective_port(uri: &Uri) -> Option<u16> {
+    uri.port_u16().or_else(|| match uri.scheme_str() {
+        Some("http") | Some("ws") => Some(80),
+        Some("https") | Some("wss") => Some(443),
+        _ => None,
+    })
 }
 
 async fn bridge_websocket_streams(
@@ -2031,6 +2131,177 @@ mod tests {
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["path"], "/");
         assert_eq!(payload["query"], "foo=bar");
+    }
+
+    #[tokio::test]
+    async fn proxy_root_with_trailing_slash_forwards_to_upstream_root_path() {
+        let upstream_addr = start_upstream_server().await;
+        let sandbox_id = SandboxId::new();
+        let app = proxy_app_for_sandbox(&sandbox_id).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/proxy/?foo=bar")
+                    .header("x-api-key", "test-key")
+                    .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
+                    .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["path"], "/");
+        assert_eq!(payload["query"], "foo=bar");
+    }
+
+    #[tokio::test]
+    async fn proxy_preserves_trailing_slash_in_wildcard_path() {
+        let upstream_addr = start_upstream_server().await;
+        let sandbox_id = SandboxId::new();
+        let app = proxy_app_for_sandbox(&sandbox_id).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/proxy/api/")
+                    .header("x-api-key", "test-key")
+                    .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
+                    .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["path"], "/api/");
+    }
+
+    async fn start_redirecting_upstream() -> SocketAddr {
+        async fn redirect_handler(headers: HeaderMap, uri: Uri) -> Response<Body> {
+            // Mirror what a dev server does: build the absolute URL out of the
+            // Host header it was handed, which is the sandbox's own address.
+            let host = headers
+                .get(HOST)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let location = match uri.path() {
+                "/external" => "https://example.invalid/elsewhere".to_owned(),
+                "/relative" => "/already-relative".to_owned(),
+                "/fragment" => format!("http://{host}/next?a=1#section"),
+                "/query-only" => format!("http://{host}?x=1"),
+                _ => format!("http://{host}/next?x=1"),
+            };
+
+            Response::builder()
+                .status(StatusCode::TEMPORARY_REDIRECT)
+                .header(header::LOCATION, location)
+                .body(Body::empty())
+                .expect("redirect response is valid")
+        }
+
+        spawn_upstream(
+            axum::Router::new()
+                .route("/", any(redirect_handler))
+                .route("/{*path}", any(redirect_handler)),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn proxy_rewrites_redirects_that_point_back_at_the_sandbox() {
+        let upstream_addr = start_redirecting_upstream().await;
+        let sandbox_id = SandboxId::new();
+
+        for (path, expected) in [
+            // Self-reference: the internal ip:port must not reach the client.
+            ("/proxy/", "/next?x=1"),
+            // A fragment survives the rewrite.
+            ("/proxy/fragment", "/next?a=1#section"),
+            // A query-only self-reference stays an absolute-path reference.
+            ("/proxy/query-only", "/?x=1"),
+            // Anything else is the application's own business.
+            ("/proxy/external", "https://example.invalid/elsewhere"),
+            ("/proxy/relative", "/already-relative"),
+        ] {
+            let app = proxy_app_for_sandbox(&sandbox_id).await;
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(path)
+                        .header("x-api-key", "test-key")
+                        .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
+                        .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|value| value.to_str().ok()),
+                Some(expected),
+                "unexpected Location for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_self_reference_matches_the_sandbox_endpoint_not_the_authority_text() {
+        let upstream: Uri = "http://10.0.0.1:5173/current".parse().unwrap();
+
+        for (value, expected) in [
+            ("http://10.0.0.1:5173/next", Some("/next")),
+            // A query-only URL must not become a query-relative reference.
+            ("http://10.0.0.1:5173?x=1", Some("/?x=1")),
+            // Fragments are preserved verbatim.
+            ("http://10.0.0.1:5173/next#section", Some("/next#section")),
+            // Scheme-relative references name the same endpoint.
+            ("//10.0.0.1:5173/next", Some("/next")),
+            // Other hosts, other ports, and relative values stay untouched.
+            ("https://example.invalid/next", None),
+            ("http://10.0.0.2:5173/next", None),
+            ("http://10.0.0.1:5174/next", None),
+            ("/already-relative", None),
+        ] {
+            assert_eq!(
+                relative_self_reference(value, &upstream).as_deref(),
+                expected,
+                "unexpected rewrite for {value}"
+            );
+        }
+
+        // An application that drops the scheme's default port still points at
+        // the sandbox.
+        let upstream: Uri = "http://10.0.0.1:80/current".parse().unwrap();
+        assert_eq!(
+            relative_self_reference("http://10.0.0.1/next", &upstream).as_deref(),
+            Some("/next")
+        );
+
+        // Hosts compare case-insensitively.
+        let upstream: Uri = "http://sandbox.invalid:5173/current".parse().unwrap();
+        assert_eq!(
+            relative_self_reference("http://SANDBOX.INVALID:5173/next", &upstream).as_deref(),
+            Some("/next")
+        );
     }
 
     #[tokio::test]
