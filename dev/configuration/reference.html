@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-ba4d9073.js";
+            window.path_to_searchindex_js = "../searchindex-54f86eab.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-a79017d2.js"></script>
@@ -807,7 +807,7 @@ the default path on every startup.</p>
 </thead>
 <tbody>
 <tr><td><code>overlaybd_global_config_path</code></td><td>string</td><td><code>"$AENV_HOME/overlaybd/mem-overlaybd-global.json"</code></td><td>Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file.</td></tr>
-<tr><td><code>track_dirty_pages</code></td><td>bool</td><td><code>false</code></td><td>Enable Firecracker KVM dirty-page tracking for memory snapshots. It defaults to false. The option is temporarily disabled in PVM mode because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set <code>AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=true</code> to enable it.</td></tr>
+<tr><td><code>track_dirty_pages</code></td><td>bool</td><td><code>true</code></td><td>Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set <code>AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false</code> to disable it.</td></tr>
 <tr><td><code>compression_enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable compression for memory snapshot layers. When disabled, <code>compression_algorithm</code> is still parsed but has no effect. This setting affects only memory layers; the physical file name remains <code>overlaybd.commit</code>.</td></tr>
 <tr><td><code>compression_algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm for memory snapshot layers. Valid values are only <code>lz4</code> and <code>zstd</code>.</td></tr>
 </tbody>

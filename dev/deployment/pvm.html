@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-ba4d9073.js";
+            window.path_to_searchindex_js = "../searchindex-54f86eab.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-a79017d2.js"></script>
@@ -343,7 +343,7 @@ make start-server
 <pre><code class="language-toml">virtualization_mode = "pvm"
 </code></pre>
 <p>The environment variable takes precedence over the TOML value.</p>
-<p>Memory snapshot dirty-page tracking (<code>memory_snapshot.track_dirty_pages = true</code>) is temporarily disabled in PVM mode because this combination has not been tested.</p>
+<p>Memory snapshot dirty-page tracking is enabled by default for KVM and automatically disabled in PVM mode because this combination has not been tested.</p>
 <p>To build a PVM Docker image:</p>
 <pre><code class="language-bash">docker build \
   --build-arg AENV_VIRTUALIZATION_MODE=pvm \
