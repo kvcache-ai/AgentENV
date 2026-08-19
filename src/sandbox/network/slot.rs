@@ -1095,6 +1095,7 @@ mod tests {
     fn failed_egress_apply_keeps_clean_slot_marked_clean() {
         let slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
         let policy = SandboxNetworkPolicy::new(
+            true,
             crate::sandbox::network::BaseSandboxNetworkPolicy::Deny,
             crate::sandbox::network::SandboxNetworkEgressPolicy::default(),
         );
