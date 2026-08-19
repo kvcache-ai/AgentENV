@@ -329,12 +329,16 @@ Optional scheduler heartbeat reporting for multi-node control plane integration.
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | Enable periodic scheduler heartbeat reporting. Requires `[cluster].scheduler_endpoint` |
 | `interval_secs` | integer | `5` | Heartbeat report interval in seconds |
+| `node_endpoint` | string | unset | Node HTTP endpoint advertised for heartbeat discovery |
+| `registration_token` | string | unset | Shared secret used to authenticate heartbeat discovery registration |
 
 Environment variable overrides:
 
 - `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED`
 - `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT`
 - `AENV_OBSERVABILITY_REPORT_INTERVAL_SECS`
+- `AENV_OBSERVABILITY_NODE_ENDPOINT`
+- `AENV_OBSERVABILITY_REGISTRATION_TOKEN`
 
 `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` overrides `[cluster].scheduler_endpoint` for the reporter process only.
 

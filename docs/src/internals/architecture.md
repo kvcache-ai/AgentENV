@@ -146,8 +146,8 @@ The node observability path combines request-time host collection with request-t
 - `src/observability/machine.rs` captures static machine descriptors from `/proc/cpuinfo`.
 - `src/observability/host.rs` collects host CPU, memory, and disk usage each time a node snapshot is requested. CPU percent is derived from two `/proc/stat` samples; on the first request it takes both samples with a 100ms window to avoid returning a synthetic zero.
 - `src/observability/service.rs` merges the latest orchestrator counters, identity, machine info, request-time host metrics, and current sandbox ID roster into a `NodeSnapshot` returned by the admin endpoints and reused by heartbeat reporting.
-- `src/observability/reporter.rs` optionally sends periodic heartbeat reports to scheduler over gRPC (`Heartbeat`) and performs best-effort `UnregisterNode` on shutdown.
-- Scheduler report config can be provided from TOML (`[observability.scheduler_report]`) and uses `[cluster].scheduler_endpoint` as the shared scheduler address. The reporter enable flag, address, and interval can be overridden by env vars (`AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED`, `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT`, `AENV_OBSERVABILITY_REPORT_INTERVAL_SECS`).
+- `src/observability/reporter.rs` optionally sends periodic heartbeat reports to scheduler over gRPC (`Heartbeat`) and performs best-effort `UnregisterNode` on shutdown. Heartbeat discovery also carries the node's HTTP endpoint and registration token.
+- Scheduler report config can be provided from TOML (`[observability.scheduler_report]`) and uses `[cluster].scheduler_endpoint` as the shared scheduler address. The reporter enable flag, address, interval, advertised node endpoint, and registration token can be overridden by env vars (`AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED`, `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT`, `AENV_OBSERVABILITY_REPORT_INTERVAL_SECS`, `AENV_OBSERVABILITY_NODE_ENDPOINT`, `AENV_OBSERVABILITY_REGISTRATION_TOKEN`).
 - If a P2P transport exposes a local endpoint, the reporter includes it in the scheduler heartbeat so other nodes can discover it.
 
 This keeps node requests lightweight on orchestrator data: they avoid re-listing and sorting all sandboxes on every API call while still returning fresh host metrics.
@@ -201,7 +201,7 @@ flowchart LR
 
 **Gateway** (`services/gateway/`): HTTP reverse proxy. Extracts sandbox data-plane routes from headers (`x-agentenv-sandbox-id` / `e2b-sandbox-id`) or configured host-based proxy domains (`{port}-{sandboxID}.{domain}`). Host-based routes are only enabled for explicit `gateway.sandbox_proxy_domains` entries, require RFC 952/1123 DNS-label-compatible sandbox IDs, and require the full `{port}-{sandboxID}` label to fit the 63-character DNS label limit. Runtime nodes have their own `[sandbox_proxy].domains` setting for the same host-based URL shape and return the first configured domain in sandbox metadata. In multi-node deployments, repository helpers can apply one `SANDBOX_PROXY_DOMAINS` value to both gateway and runtime node configuration. Sandbox control-plane routes such as `/sandboxes/{id}/pause` are routed by sandbox ID from the URL path; sandbox data-plane traffic is not inferred from URL path alone. For new sandboxes, calls `Schedule()` to pick a node. For existing sandboxes, calls `LookupNode()`. After sandbox creation, calls `RecordAssignment()` to seed a sandbox-to-node binding. Without explicit routing headers, it also handles cluster aggregation of `GET /sandboxes`, `GET /v2/sandboxes`, `GET /nodes`, and resolves `GET /nodes/{id}` via scheduler before proxying to the resolved node.
 
-**Scheduler** (`services/scheduler/`): gRPC service with pluggable node discovery and in-memory sandbox-to-node bindings, plus observed-node snapshots reported by runtime nodes. RPCs include `Schedule`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ListObservedNodes`, `ListP2pPeers`, `GetNode`, and `UnregisterNode`. Strategies: round_robin (default), random. Proto contract: `services/api/proto/scheduler.proto`. For P2P, scheduler stores and returns opaque peer endpoints from heartbeat records; artifact catalog lookup and byte transfer stay node-to-node.
+**Scheduler** (`services/scheduler/`): gRPC service with pluggable node discovery and in-memory sandbox-to-node bindings, plus observed-node snapshots and provider-neutral fleet plans. RPCs include `Schedule`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ListObservedNodes`, `ListP2pPeers`, `GetNode`, `UnregisterNode`, `GetFleetPlan`, `CordonNode`, and `UncordonNode`. Strategies: round_robin (default), random. Proto contract: `services/api/proto/scheduler.proto`. For P2P, scheduler stores and returns opaque peer endpoints from heartbeat records; artifact catalog lookup and byte transfer stay node-to-node.
 
 Binding lifecycle:
 
@@ -214,6 +214,9 @@ Discovery modes:
 
 - `static`: explicit `scheduler.nodes` list from config
 - `kubernetes`: EndpointSlice watch over the headless `agentenv-nodes` Service, using ready DaemonSet Pod IPs as backend endpoints
+- `heartbeat`: authenticated self-registration using the endpoint reported by each runtime heartbeat
+
+Fleet planning is split from infrastructure execution. Scheduler uses AgentENV sandbox and memory state to produce desired capacity plus exact node-generation cordon and delete candidates. A stateless provider adapter lists infrastructure members and applies the plan. Paused sandboxes count as occupied, so parking must finish before a node can be removed.
 
 **Limitations**: All bindings are in-memory (lost on scheduler restart). After a scheduler restart, bindings are rebuilt from new sandbox creations plus the next heartbeat roster from each runtime node. Kubernetes discovery updates the schedulable node set dynamically, but binding persistence is still not replicated.
 
