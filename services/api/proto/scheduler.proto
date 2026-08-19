@@ -18,6 +18,9 @@ service Scheduler {
   rpc LookupP2pArtifact(LookupP2pArtifactRequest) returns (LookupP2pArtifactResponse);
   rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
   rpc UnregisterNode(UnregisterNodeRequest) returns (UnregisterNodeResponse);
+  rpc GetFleetPlan(GetFleetPlanRequest) returns (GetFleetPlanResponse);
+  rpc CordonNode(CordonNodeRequest) returns (CordonNodeResponse);
+  rpc UncordonNode(UncordonNodeRequest) returns (UncordonNodeResponse);
 }
 
 message Node {
@@ -168,6 +171,11 @@ message HeartbeatRequest {
   NodeSnapshot snapshot = 7;
   repeated string sandbox_ids = 8;
   P2pEndpoint p2p_endpoint = 9;
+  // HTTP endpoint used by heartbeat discovery, for example
+  // http://10.0.0.10:8000. Static and Kubernetes discovery ignore it.
+  string endpoint = 10;
+  // Shared secret required when the scheduler uses heartbeat discovery.
+  string registration_token = 11;
 }
 
 message HeartbeatResponse {
@@ -269,3 +277,39 @@ message UnregisterNodeRequest {
 }
 
 message UnregisterNodeResponse {}
+
+message GetFleetPlanRequest {
+  // Current infrastructure members, including VMs that have not completed
+  // AgentENV registration. The scheduler uses the difference from observed
+  // node IDs to count booting capacity without probing hosts.
+  repeated string fleet_node_ids = 1;
+}
+
+message FleetNodeReference {
+  string node_id = 1;
+  string service_instance_id = 2;
+}
+
+message GetFleetPlanResponse {
+  uint32 desired_nodes = 1;
+  uint32 ready_nodes = 2;
+  uint32 provisioning_nodes = 3;
+  repeated FleetNodeReference cordon_candidates = 4;
+  repeated FleetNodeReference delete_candidates = 5;
+  repeated FleetNodeReference uncordon_candidates = 6;
+  string reason = 7;
+}
+
+message CordonNodeRequest {
+  string node_id = 1;
+  string service_instance_id = 2;
+}
+
+message CordonNodeResponse {}
+
+message UncordonNodeRequest {
+  string node_id = 1;
+  string service_instance_id = 2;
+}
+
+message UncordonNodeResponse {}
