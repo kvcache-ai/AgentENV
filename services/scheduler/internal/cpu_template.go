@@ -77,7 +77,8 @@ func IntersectCpuConfigs(jsons []string) (string, error) {
 }
 
 var kvmReadOnlyLeafIDs = map[uint32]bool{
-	0xb: true,
+	0xb:  true,
+	0x1f: true,
 }
 
 func intersectCpuidModifiers(configs []cpuConfig) ([]cpuidModifier, error) {
