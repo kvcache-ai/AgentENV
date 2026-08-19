@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-01177bd2.js";
+            window.path_to_searchindex_js = "../searchindex-ba4d9073.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-a79017d2.js"></script>
@@ -231,6 +231,10 @@ access_key_secret = "YOUR_ACCESS_KEY_SECRET"
 [image.cache.remote_blocks]
 max_size_gb = 100
 </code></pre>
+<p>If your provider requires or prefers virtual-host bucket addressing — for
+example <a href="https://www.tigrisdata.com/docs/">Tigris</a> or a Cloudflare R2
+deployment — also set <code>addressing_style = "virtual"</code>; see the
+<a href="../configuration/reference.html#backendoss">configuration reference</a> for details.</p>
 <h2 id="3-apply-the-configuration"><a class="header" href="#3-apply-the-configuration">3. Apply the configuration</a></h2>
 <p>If AgentENV is running as a systemd service, restart it:</p>
 <pre><code class="language-bash">sudo systemctl restart aenv

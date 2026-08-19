@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-01177bd2.js";
+            window.path_to_searchindex_js = "searchindex-ba4d9073.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a79017d2.js"></script>
@@ -359,6 +359,10 @@ access_key_secret = "YOUR_ACCESS_KEY_SECRET"
 [image.cache.remote_blocks]
 max_size_gb = 100
 </code></pre>
+<p>If your provider requires or prefers virtual-host bucket addressing — for
+example <a href="https://www.tigrisdata.com/docs/">Tigris</a> or a Cloudflare R2
+deployment — also set <code>addressing_style = "virtual"</code>; see the
+<a href="#backendoss">configuration reference</a> for details.</p>
 <h2 id="3-apply-the-configuration"><a class="header" href="#3-apply-the-configuration">3. Apply the configuration</a></h2>
 <p>If AgentENV is running as a systemd service, restart it:</p>
 <pre><code class="language-bash">sudo systemctl restart aenv
@@ -1911,6 +1915,7 @@ snapshot publication/runtime resolution as an optional acceleration path.</p>
 <tr><td><code>access_key_secret</code></td><td>string</td><td>unset</td><td>Static OSS access key secret. Required when <code>credential_process</code> is not set</td></tr>
 <tr><td><code>security_token</code></td><td>string</td><td>unset</td><td>Optional session token paired with static access key credentials</td></tr>
 <tr><td><code>region</code></td><td>string</td><td>none</td><td>Region passed to the S3-compatible object-store client; required for current OSS backend</td></tr>
+<tr><td><code>addressing_style</code></td><td>string</td><td>auto-detect</td><td>Bucket addressing style, <code>"virtual"</code> or <code>"path"</code>. When unset, the backend auto-detects: Alibaba OSS and bucket-in-endpoint hosts use virtual-host style, other endpoints default to path style. Set either value when a provider’s required or preferred style differs from the detected default</td></tr>
 <tr><td><code>cache_max_size_gb</code></td><td>integer</td><td><code>10</code></td><td>Maximum size of the node-local OSS artifact cache in GiB</td></tr>
 </tbody>
 </table>
@@ -1920,7 +1925,16 @@ snapshot publication/runtime resolution as an optional acceleration path.</p>
 <li><code>credential_process</code> and static access key settings are mutually exclusive in practice; when <code>credential_process</code> is set, the backend ignores static credential fields.</li>
 <li><code>credential_process</code> should be written as a portable argv-style command line. Avoid <code>$VAR</code>, backticks, <code>$(...)</code>, pipes, and shell builtins.</li>
 <li>Although the config section is still named <code>oss</code>, the runtime path is implemented via a shared S3-compatible client, so <code>region</code> must be configured.</li>
+<li>Leave <code>addressing_style</code> unset when endpoint-based detection is correct. Set it to <code>"virtual"</code> or <code>"path"</code> when the provider’s required or preferred style differs from the detected default; for example, some Tigris or Cloudflare R2 deployments use virtual-host addressing.</li>
+<li>The setting covers both halves of the data path: the snapshot repository client (metadata and artifact upload/download) and the generated OverlayBD runtime config (<code>ossConfig.defaultAddressingStyle</code>), which the runtime uses when reading remote managed snapshot layers during sandbox restore.</li>
 </ul>
+<p>For an S3-compatible provider where virtual-host addressing is required or preferred — for example <a href="https://www.tigrisdata.com/docs/">Tigris</a> — set <code>addressing_style</code> explicitly:</p>
+<pre><code class="language-toml">[backend.oss]
+endpoint = "https://t3.storage.dev"
+bucket = "agentenv-snapshots"
+region = "auto"
+addressing_style = "virtual"
+</code></pre>
 <p>Other path override:</p>
 <ul>
 <li><code>AENV_DEPS_PATH</code></li>
