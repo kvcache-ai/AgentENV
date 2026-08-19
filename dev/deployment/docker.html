@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-570618c3.js";
+            window.path_to_searchindex_js = "../searchindex-01177bd2.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c346f288.js"></script>
+        <script src="../toc-a79017d2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -212,11 +212,19 @@ that contains <code>debian</code>, <code>debian-security</code>, and <code>ubunt
 </code></pre>
 <h2 id="run"><a class="header" href="#run">Run</a></h2>
 <pre><code class="language-bash">docker run --rm -it \
+  --name aenv-server \
   --device /dev/kvm --privileged -v /dev:/dev \
   -p 8000:8000 \
   ghcr.io/kvcache-ai/aenv-server:latest   # or aenv:latest if built from source
 </code></pre>
 <p>The <code>--privileged</code> flag is required for Firecracker’s network namespace operations (veth pairs, iptables). The server auto-downloads runtime assets on first start and is accessible at <code>http://127.0.0.1:8000</code> once ready.</p>
+<p>On normal startup, the server generates the API key inside the container at
+<code>/workspace/env/secrets/api-key</code>. Read it while the container is running with:</p>
+<pre><code class="language-bash">docker exec aenv-server cat /workspace/env/secrets/api-key
+</code></pre>
+<p>Removing the container also removes this generated key. Supply an explicit
+<code>AENV_API_KEY</code> or a secret at <code>/run/secrets/api-key</code> when the key must remain
+stable across container replacements.</p>
 <h2 id="verify"><a class="header" href="#verify">Verify</a></h2>
 <pre><code class="language-bash">curl http://127.0.0.1:8000/health
 </code></pre>

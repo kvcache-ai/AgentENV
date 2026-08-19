@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-570618c3.js";
+            window.path_to_searchindex_js = "../searchindex-01177bd2.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c346f288.js"></script>
+        <script src="../toc-a79017d2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -366,10 +366,11 @@ sandbox proxy hosts reverse proxy to sandbox services</li>
 </ul>
 <p><strong>Limitations</strong>: All bindings are in-memory (lost on scheduler restart). After a scheduler restart, bindings are rebuilt from new sandbox creations plus the next heartbeat roster from each runtime node. Kubernetes discovery updates the schedulable node set dynamically, but binding persistence is still not replicated.</p>
 <p><strong>Deployment</strong>:</p>
-<pre><code class="language-bash"># local dev (single node)
+<pre><code class="language-bash">export AENV_API_KEY="e2b_$(openssl rand -hex 32)" # shared by local runtime and gateway processes
+# local dev (single node)
 make start-server &amp;&amp; make -C services run-scheduler &amp;&amp; make -C services run-gateway
 
-# docker compose (multi-node)
+# docker compose (multi-node; shared auth volume is provisioned automatically)
 make deploy-up     # gateway + scheduler + 2 backend nodes
 make deploy-down   # teardown
 

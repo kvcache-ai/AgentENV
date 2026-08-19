@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-570618c3.js";
+            window.path_to_searchindex_js = "../searchindex-01177bd2.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c346f288.js"></script>
+        <script src="../toc-a79017d2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -489,12 +489,12 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 <tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>access_token_hash_seed</code></td><td>string</td><td>auto-generated</td><td>Optional override for the secret used to derive secure sandbox envd access tokens. When unset, normal server startup creates and reuses <code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code>. Configure an explicit shared value when the deployment needs to recover the same sandbox ID on another node.</td></tr>
+<tr><td><code>access_token_hash_seed</code></td><td>string</td><td>auto-generated</td><td>Optional override for the secret used to derive sandbox envd and traffic access tokens. When unset, normal server startup creates and reuses <code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code>. Configure an explicit shared value for clustered deployments.</td></tr>
 </tbody>
 </table>
 </div>
-<p>The managed seed is node-local persistent state and must be included in backups of <code>$AENV_HOME</code>. AgentENV refuses to generate a replacement when persisted secure sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates access tokens for existing secure sandboxes.</p>
-<p>Configure <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> with the same value on every node when cross-node recovery of the same sandbox is required. Nodes use their own managed seed when it is unset.</p>
+<p>The managed seed is node-local persistent state and must be included in backups of <code>$AENV_HOME</code>. AgentENV refuses to generate a replacement when persisted secure or private-ingress sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates existing sandbox access tokens.</p>
+<p>Configure <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> with the same value on every runtime node in a clustered deployment. Standalone runtime nodes use their managed seed when it is unset.</p>
 <h2 id="orchestrator"><a class="header" href="#orchestrator"><code>[orchestrator]</code></a></h2>
 <p>Sandbox lifecycle management.</p>
 <div class="table-wrapper">

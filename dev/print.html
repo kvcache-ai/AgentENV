@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-570618c3.js";
+            window.path_to_searchindex_js = "searchindex-01177bd2.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-c346f288.js"></script>
+        <script src="toc-a79017d2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -259,6 +259,7 @@ default. Transient namespace and daemon-socket state lives under <code>/run/aenv
 <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/docker-setup.sh | sudo bash
 docker pull ghcr.io/kvcache-ai/aenv-server:latest
 docker run --rm -it \
+  --name aenv-server \
   --device /dev/kvm --privileged -v /dev:/dev \
   -p 8000:8000 \
   ghcr.io/kvcache-ai/aenv-server:latest
@@ -267,6 +268,7 @@ docker run --rm -it \
 <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/config/default.toml -o config.toml
 vim config.toml
 docker run --rm -it \
+  --name aenv-server \
   --device /dev/kvm --privileged -v /dev:/dev \
   -v "$PWD/config.toml:/workspace/config/default.toml:ro" \
   -p 8000:8000 \
@@ -282,11 +284,18 @@ docker run --rm -it \
 <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install-cli.sh | bash
 </code></pre>
 <h3 id="3-authenticate"><a class="header" href="#3-authenticate">3. Authenticate</a></h3>
+<p>The server generates the key on its first normal startup. Native installations
+reuse the managed key; a normal Docker container keeps it in its writable
+container layer:</p>
+<pre><code class="language-bash"># Native
+sudo cat /var/lib/aenv/secrets/api-key
+# Docker
+docker exec aenv-server cat /workspace/env/secrets/api-key
+</code></pre>
 <pre><code class="language-bash">aenv auth
 # AENV server URL [http://localhost:8000]: http://127.0.0.1:8000
-# API key: dummy
+# API key: &lt;paste the generated key&gt;
 </code></pre>
-<p>For local development, any non-empty string works as the API key.</p>
 <h3 id="4-pull-a-template-and-run-a-sandbox"><a class="header" href="#4-pull-a-template-and-run-a-sandbox">4. Pull a template and run a sandbox</a></h3>
 <pre><code class="language-bash">aenv pull ubuntu:22.04 --name ubuntu
 aenv start ubuntu            # starts a sandbox and attaches an interactive shell
@@ -384,7 +393,7 @@ make install-aenv
 <p>Save the server URL and API key. Credentials are stored at <code>~/.config/aenv/credentials</code> (mode <code>0600</code>).</p>
 <pre><code class="language-bash">aenv auth
 # AENV server URL [http://localhost:8000]: The address of the AgentENV server
-# API key: dummy (Any non-empty string works for local development.)
+# API key: &lt;the server's configured or generated API key&gt;
 </code></pre>
 <hr>
 <h2 id="templates"><a class="header" href="#templates">Templates</a></h2>
@@ -629,11 +638,19 @@ that contains <code>debian</code>, <code>debian-security</code>, and <code>ubunt
 </code></pre>
 <h2 id="run"><a class="header" href="#run">Run</a></h2>
 <pre><code class="language-bash">docker run --rm -it \
+  --name aenv-server \
   --device /dev/kvm --privileged -v /dev:/dev \
   -p 8000:8000 \
   ghcr.io/kvcache-ai/aenv-server:latest   # or aenv:latest if built from source
 </code></pre>
 <p>The <code>--privileged</code> flag is required for Firecracker’s network namespace operations (veth pairs, iptables). The server auto-downloads runtime assets on first start and is accessible at <code>http://127.0.0.1:8000</code> once ready.</p>
+<p>On normal startup, the server generates the API key inside the container at
+<code>/workspace/env/secrets/api-key</code>. Read it while the container is running with:</p>
+<pre><code class="language-bash">docker exec aenv-server cat /workspace/env/secrets/api-key
+</code></pre>
+<p>Removing the container also removes this generated key. Supply an explicit
+<code>AENV_API_KEY</code> or a secret at <code>/run/secrets/api-key</code> when the key must remain
+stable across container replacements.</p>
 <h2 id="verify"><a class="header" href="#verify">Verify</a></h2>
 <pre><code class="language-bash">curl http://127.0.0.1:8000/health
 </code></pre>
@@ -656,15 +673,14 @@ configuration.</p>
 <pre><code class="language-bash">git clone https://github.com/kvcache-ai/AgentENV.git
 cd AgentENV
 </code></pre>
-<h2 id="configure-the-access-token-seed-optional"><a class="header" href="#configure-the-access-token-seed-optional">Configure the Access-Token Seed (Optional)</a></h2>
-<p>See <a href="#secure-sandboxes">Secure Sandboxes</a>
-if the deployment needs future cross-node sandbox recovery.</p>
 <h2 id="start-the-cluster"><a class="header" href="#start-the-cluster">Start the Cluster</a></h2>
 <pre><code class="language-bash">sudo bash scripts/docker-setup.sh
 make deploy-up
 </code></pre>
-<p>The Gateway is available at <code>http://127.0.0.1:8000</code> and forwards requests to
-the backend nodes.</p>
+<p>On first startup, the runtime nodes atomically generate one API key and sandbox
+access-token seed in the shared <code>agentenv-auth</code> volume. The gateway mounts that
+volume read-only and reads the API key; sandbox tokens are validated by the
+runtime nodes. Normal <code>make deploy-down</code> calls preserve both values.</p>
 <p>To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when starting the stack:</p>
 <pre><code class="language-bash">SANDBOX_PROXY_DOMAINS=sandbox.example.com \
@@ -677,14 +693,40 @@ usually through wildcard DNS for <code>*.sandbox.example.com</code>.</p>
 <pre><code class="language-bash"># Health check via gateway
 curl http://127.0.0.1:8000/health
 
-# Cluster node snapshots via gateway
-curl http://127.0.0.1:8000/nodes
+# Authenticated cluster node snapshots via gateway
+export AENV_API_KEY="$(docker compose -f deploy/docker-compose.yml exec -T agentenv-a \
+  cat /workspace/env/secrets/api-key)"
+curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8080/nodes
+
+# Direct health check on a backend node
+curl http://127.0.0.1:8000/health
 </code></pre>
 <h2 id="management-commands"><a class="header" href="#management-commands">Management Commands</a></h2>
 <pre><code class="language-bash">make deploy-ps      # Show container status
 make deploy-logs    # Stream logs from all services
 make deploy-down    # Tear down the cluster
 </code></pre>
+<p>Removing Compose volumes with <code>docker compose down -v</code> also removes both
+secrets. The next startup generates new values, so existing clients and sandbox
+access tokens are invalidated.</p>
+<p>To provide an existing key through Docker Compose secrets, add a file-backed
+secret in an override file and mount it with <code>target: api-key</code> on the gateway
+and both runtime nodes. AgentENV automatically reads <code>/run/secrets/api-key</code>;
+no file-path environment variable is needed.</p>
+<pre><code class="language-yaml">services:
+  gateway:
+    secrets: [api-key]
+  agentenv-a:
+    secrets: [api-key]
+  agentenv-b:
+    secrets: [api-key]
+
+secrets:
+  api-key:
+    file: ./api-key
+</code></pre>
+<p>The secret name is also its default target filename, so this mounts the key at
+<code>/run/secrets/api-key</code> in each service.</p>
 <h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
 <p>Container deployments use <code>deploy/docker/config/default.json</code>. Scheduler and backend node endpoints are configured for the Docker network.</p>
 <p>The runtime image includes <code>uvm-ublk</code> at <code>/usr/local/bin/uvm-ublk</code>. Compose uses that path instead of a host-built <code>env/ublk/uvm-ublk</code> binary.</p>
@@ -721,9 +763,9 @@ AgentENV runtime nodes:</p>
 </tbody>
 </table>
 </div>
-<p>Use private addresses or an otherwise trusted network. AgentENV does not
-currently provide an authentication boundary suitable for exposing these
-services directly to the public Internet.</p>
+<p>AgentENV authenticates HTTP requests but does not encrypt them. Use private
+addresses, a VPN, or TLS termination before traffic crosses an untrusted
+network.</p>
 <h2 id="prerequisites-4"><a class="header" href="#prerequisites-4">Prerequisites</a></h2>
 <p>On every runtime node:</p>
 <ul>
@@ -756,12 +798,19 @@ services directly to the public Internet.</p>
 <p>The examples keep metrics listeners on loopback. Open their ports separately if
 an external metrics collector needs them.</p>
 <h2 id="1-install-the-runtime-nodes"><a class="header" href="#1-install-the-runtime-nodes">1. Install the runtime nodes</a></h2>
-<p>Run the installation on each runtime node:</p>
-<pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install.sh \
-  | sudo bash
+<p>Generate one API key and one sandbox access-token seed through your normal
+secret-management channel. Use the API key on the gateway and every runtime
+node; use the seed only on runtime nodes:</p>
+<pre><code class="language-bash">export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
+export AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED="$(openssl rand -hex 32)"
 </code></pre>
-<p>Edit <code>/etc/default/aenv</code> on each machine without removing the paths written by the installer.
-See <a href="#secure-sandboxes">Secure Sandboxes</a> if the deployment needs future cross-node sandbox recovery.</p>
+<p>Run the installation on each runtime node:</p>
+<pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install.sh | sudo bash
+</code></pre>
+<p>Edit <code>/etc/default/aenv</code> on each machine without removing the paths written by
+the installer, and add both shared values before starting the services. A
+multi-node deployment must not let each node generate independent managed
+secrets.</p>
 <p>Node A uses:</p>
 <pre><code class="language-bash">API_ADDR="0.0.0.0:8000"
 AENV_NODE_ID="node-a"
@@ -790,6 +839,12 @@ sudo install -m 0755 services/bin/scheduler /usr/local/bin/agentenv-scheduler
 sudo install -m 0755 services/bin/gateway /usr/local/bin/agentenv-gateway
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin agentenv-control
 sudo install -d -o root -g agentenv-control -m 0750 /etc/agentenv
+</code></pre>
+<p>Create <code>/etc/agentenv/auth.env</code> with the API key used on the runtime nodes:</p>
+<pre><code class="language-bash">sudo install -o root -g agentenv-control -m 0640 /dev/null /etc/agentenv/auth.env
+sudoedit /etc/agentenv/auth.env
+</code></pre>
+<pre><code class="language-text">AENV_API_KEY=&lt;same shared key&gt;
 </code></pre>
 <p>If the <code>agentenv-control</code> account already exists, the <code>useradd</code> command reports
 that fact and can be skipped.</p>
@@ -861,6 +916,7 @@ After=network-online.target agentenv-scheduler.service
 [Service]
 User=agentenv-control
 Group=agentenv-control
+EnvironmentFile=/etc/agentenv/auth.env
 ExecStart=/usr/local/bin/agentenv-gateway -config /etc/agentenv/control-plane.json
 Restart=on-failure
 RestartSec=5
@@ -881,13 +937,14 @@ curl http://10.0.0.22:8000/health
 curl http://127.0.0.1:8080/health
 
 # Wait for node heartbeats, then inspect the cluster through the Gateway
-curl http://127.0.0.1:8080/nodes
+export AENV_API_KEY="$(sudo sed -n 's/^AENV_API_KEY=//p' /etc/agentenv/auth.env)"
+curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8080/nodes
 </code></pre>
 <p>The node list should contain <code>node-a</code> and <code>node-b</code>. Point clients at the
 Gateway, not directly at a runtime node:</p>
 <pre><code class="language-bash">aenv auth
 # AENV server URL: http://10.0.0.10:8080
-# API key: dummy
+# API key: &lt;the same shared key&gt;
 </code></pre>
 <p>Sandbox create, list, lifecycle, and data-plane requests can then be routed
 through the Gateway.</p>
@@ -981,7 +1038,7 @@ cd AgentENV
 <pre><code class="language-bash">make k8s-build
 </code></pre>
 <p>This builds three images: <code>agentenv-runtime:latest</code>, <code>agentenv-gateway:latest</code>, and <code>agentenv-scheduler:latest</code>.</p>
-<h2 id="configure-the-access-token-seed-optional-1"><a class="header" href="#configure-the-access-token-seed-optional-1">Configure the Access-Token Seed (Optional)</a></h2>
+<h2 id="configure-the-access-token-seed-optional"><a class="header" href="#configure-the-access-token-seed-optional">Configure the Access-Token Seed (Optional)</a></h2>
 <p>See <a href="#secure-sandboxes">Secure Sandboxes</a> for the optional shared seed configuration and Kubernetes Secret example.</p>
 <h2 id="deploy"><a class="header" href="#deploy">Deploy</a></h2>
 <pre><code class="language-bash"># Run on each worker node before deploying
@@ -993,6 +1050,17 @@ make k8s-render
 # Apply to cluster
 make k8s-apply
 </code></pre>
+<p><code>make k8s-apply</code> generates a 256-bit API key on the first deployment and stores
+it in <code>Secret/agentenv-auth</code>. Later applies reuse it. Read the key locally when
+configuring clients:</p>
+<pre><code class="language-bash">kubectl -n agentenv-system get secret agentenv-auth \
+  -o go-template='{{index .data "AENV_API_KEY" | base64decode}}{{"\n"}}'
+</code></pre>
+<p>Set <code>AENV_API_KEY</code> when applying to supply your own value. A standalone
+<code>make k8s-render</code> uses an invalid <code>REDACTED</code> placeholder so preview output never
+contains a deployable API key. The optional runtime seed keeps its existing
+<code>agentenv-runtime-secrets</code> contract described in
+<a href="#secure-sandboxes">Secure Sandboxes</a>.</p>
 <p>To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when rendering or applying manifests:</p>
 <pre><code class="language-bash">SANDBOX_PROXY_DOMAINS=sandbox.example.com make k8s-apply
@@ -1021,9 +1089,9 @@ make k8s-delete
 </code></pre>
 <h2 id="local-development-k3s"><a class="header" href="#local-development-k3s">Local Development (k3s)</a></h2>
 <p>A dedicated <code>local-dev</code> overlay mounts the repository’s <code>env/</code> directory directly into the DaemonSet at <code>/workspace/env</code>, avoiding runtime asset copies:</p>
-<p>This overlay also generates <code>agentenv-runtime-secrets</code> with a fixed test-only
-seed so local and E2E deployments do not require production secret management.
-Do not reuse that value outside local development.</p>
+<p>The apply helper provisions the same generated API key used by the default
+overlay. The local development overlay retains its fixed test-only runtime seed;
+do not reuse that seed outside local development.</p>
 <pre><code class="language-bash">make k8s-build
 make k8s-load-dev       # Import images into k3s/containerd
 make k8s-render-dev     # Preview manifests
@@ -1060,16 +1128,23 @@ make
 make release
 </code></pre>
 <h2 id="start-the-server"><a class="header" href="#start-the-server">Start the Server</a></h2>
+<p>Start the server. On first normal startup it generates an API key under
+<code>$AENV_HOME/secrets/api-key</code> and reuses it on later starts:</p>
 <pre><code class="language-bash"># Debug build
 API_ADDR=0.0.0.0:8000 make start-server
 
 # Release build
 API_ADDR=0.0.0.0:8000 make start-server-release
 </code></pre>
-<p>The server auto-downloads runtime assets (Firecracker binary, kernel, rootfs) on first start. Once ready, it listens at <code>http://127.0.0.1:8000</code>.</p>
+<p>The server auto-downloads runtime assets (Firecracker binary, kernel, rootfs) on first start. Once ready, it listens at <code>http://127.0.0.1:8000</code>. Read the generated key before making authenticated requests:</p>
+<pre><code class="language-bash">export AENV_API_KEY="$(cat "${AENV_HOME_PATH:-/var/lib/aenv}/secrets/api-key")"
+</code></pre>
 <h2 id="verify-2"><a class="header" href="#verify-2">Verify</a></h2>
 <pre><code class="language-bash">curl http://127.0.0.1:8000/health
+curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8000/sandboxes
 </code></pre>
+<p>HTTP does not protect the key in transit. Use a trusted network, VPN, or
+TLS-terminating reverse proxy for remote clients.</p>
 <h2 id="configuration-1"><a class="header" href="#configuration-1">Configuration</a></h2>
 <p>The server reads <code>config/default.toml</code> by default. Override with:</p>
 <pre><code class="language-bash">AENV_CONFIG_PATH=/path/to/config.toml make start-server
@@ -1217,7 +1292,7 @@ sudo systemctl start aenv
 <p>Use the dedicated PVM image:</p>
 <pre><code class="language-bash">docker pull ghcr.io/kvcache-ai/aenv-server:latest-pvm
 
-docker run --rm -it \
+docker run --rm -it --name aenv-server \
   --device /dev/kvm \
   --privileged \
   -v /dev:/dev \
@@ -1232,6 +1307,8 @@ docker run --rm -it \
 cargo run --bin server -- --setup-only
 make start-server
 </code></pre>
+<p>The server generates and persists the API key under
+<code>$AENV_HOME/secrets/api-key</code> on its first normal startup.</p>
 <p>You can also set the mode in the TOML configuration:</p>
 <pre><code class="language-toml">virtualization_mode = "pvm"
 </code></pre>
@@ -1619,12 +1696,12 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 <tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>access_token_hash_seed</code></td><td>string</td><td>auto-generated</td><td>Optional override for the secret used to derive secure sandbox envd access tokens. When unset, normal server startup creates and reuses <code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code>. Configure an explicit shared value when the deployment needs to recover the same sandbox ID on another node.</td></tr>
+<tr><td><code>access_token_hash_seed</code></td><td>string</td><td>auto-generated</td><td>Optional override for the secret used to derive sandbox envd and traffic access tokens. When unset, normal server startup creates and reuses <code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code>. Configure an explicit shared value for clustered deployments.</td></tr>
 </tbody>
 </table>
 </div>
-<p>The managed seed is node-local persistent state and must be included in backups of <code>$AENV_HOME</code>. AgentENV refuses to generate a replacement when persisted secure sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates access tokens for existing secure sandboxes.</p>
-<p>Configure <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> with the same value on every node when cross-node recovery of the same sandbox is required. Nodes use their own managed seed when it is unset.</p>
+<p>The managed seed is node-local persistent state and must be included in backups of <code>$AENV_HOME</code>. AgentENV refuses to generate a replacement when persisted secure or private-ingress sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates existing sandbox access tokens.</p>
+<p>Configure <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> with the same value on every runtime node in a clustered deployment. Standalone runtime nodes use their managed seed when it is unset.</p>
 <h2 id="orchestrator"><a class="header" href="#orchestrator"><code>[orchestrator]</code></a></h2>
 <p>Sandbox lifecycle management.</p>
 <div class="table-wrapper">
@@ -1997,6 +2074,7 @@ and are then re-fetched on demand.</p>
 <tr><th>Variable</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
+<tr><td><code>AENV_API_KEY</code></td><td>generated under <code>$AENV_HOME/secrets/api-key</code></td><td>Optional API-key override. Runtime nodes also check <code>/run/secrets/api-key</code> before creating a managed key. Use one shared value or secret in multi-node deployments.</td></tr>
 <tr><td><code>API_ADDR</code></td><td><code>0.0.0.0:8000</code></td><td>Address and port the API server listens on</td></tr>
 <tr><td><code>AENV_CONFIG_PATH</code></td><td><code>config/default.toml</code></td><td>Path to the TOML configuration file</td></tr>
 <tr><td><code>AENV_LOG_FORMAT</code></td><td><code>compact</code></td><td>Server log output format: <code>compact</code>, <code>pretty</code>, or <code>json</code></td></tr>
@@ -2008,7 +2086,7 @@ and are then re-fetched on demand.</p>
 <tr><td><code>AENV_OBSERVABILITY_SCHEDULER_ENDPOINT</code></td><td>unset</td><td>Override scheduler heartbeat reporting endpoint</td></tr>
 <tr><td><code>AENV_OBSERVABILITY_REPORT_INTERVAL_SECS</code></td><td><code>5</code></td><td>Override heartbeat reporting interval in seconds</td></tr>
 <tr><td><code>AENV_CUSTOM_EXTENSION_URL</code></td><td>unset</td><td>Override <code>[custom_extension].url</code>, the HTTP base URL of the custom extension service</td></tr>
-<tr><td><code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code></td><td>auto-generated under <code>$AENV_HOME/secrets</code></td><td>Optional override for the secret used to derive secure sandbox envd access tokens. Configure the same value on every node when cross-node recovery of the same sandbox ID is required; otherwise each node uses its own managed seed.</td></tr>
+<tr><td><code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code></td><td>auto-generated under <code>$AENV_HOME/secrets</code></td><td>Optional runtime override for the secret used to derive sandbox envd and traffic access tokens. Configure the same value on every runtime node in clustered deployments.</td></tr>
 <tr><td><code>AENV_SANDBOX_PROXY_DOMAINS</code></td><td>from config</td><td>Comma-separated DNS domains that enable server-side host-based sandbox proxy URLs like <code>{port}-{sandboxID}.{domain}</code> and populate the sandbox response <code>domain</code> field. Empty or unset keeps <code>[sandbox_proxy].domains</code>.</td></tr>
 <tr><td><code>AENV_HOME_PATH</code></td><td><code>/var/lib/aenv</code></td><td>Override the base directory from which AgentENV derives local state, caches, logs, generated configs, and downloaded dependencies. Component-specific path settings remain available as advanced overrides.</td></tr>
 <tr><td><code>AENV_RUNTIME_PATH</code></td><td><code>/run/aenv</code></td><td>Override the transient runtime directory used for network namespace mount points and the default ublk daemon socket.</td></tr>
@@ -2035,8 +2113,7 @@ and are then re-fetched on demand.</p>
 <tbody>
 <tr><td><code>E2B_API_URL</code></td><td>AgentENV server API base URL</td></tr>
 <tr><td><code>E2B_SANDBOX_URL</code></td><td>Sandbox proxy URL (for WebSocket and process interaction)</td></tr>
-<tr><td><code>E2B_API_KEY</code></td><td>API key for authentication</td></tr>
-<tr><td><code>E2B_ACCESS_TOKEN</code></td><td>Access token (used by <code>e2b template</code> commands)</td></tr>
+<tr><td><code>E2B_API_KEY</code></td><td>Set to the deployment’s <code>AENV_API_KEY</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -2044,23 +2121,19 @@ and are then re-fetched on demand.</p>
 <p><strong>Manual compile (single node)</strong>:</p>
 <pre><code class="language-bash">export E2B_API_URL=http://127.0.0.1:8000
 export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=e2b_000000
-export E2B_ACCESS_TOKEN=dummy
+export E2B_API_KEY=${AENV_API_KEY}
 </code></pre>
 <p><strong>Docker Compose / Kubernetes (multi-node)</strong>:</p>
 <pre><code class="language-bash">export E2B_API_URL=http://127.0.0.1:8080
 export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=e2b_000000
-export E2B_ACCESS_TOKEN=dummy
+export E2B_API_KEY=${AENV_API_KEY}
 </code></pre>
 <blockquote>
 <p>In both modes, sandbox data-plane requests can use routing headers with
 <code>E2B_SANDBOX_URL=${E2B_API_URL}</code>. The explicit <code>/proxy</code> prefix
 (<code>${E2B_API_URL}/proxy</code>) is still accepted for back-compat.</p>
 </blockquote>
-<blockquote>
-<p>For local development, any non-empty value works for <code>E2B_API_KEY</code> and <code>E2B_ACCESS_TOKEN</code> because the server only checks that the auth header is present.</p>
-</blockquote>
+<p>See <a href="#authentication-1">Authentication</a> for key generation and storage.</p>
 <h2 id="gateway-and-scheduler"><a class="header" href="#gateway-and-scheduler">Gateway and Scheduler</a></h2>
 <p>These variables apply to both the gateway and scheduler processes.</p>
 <div class="table-wrapper">
@@ -2081,6 +2154,7 @@ export E2B_ACCESS_TOKEN=dummy
 <tr><th>Variable</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
+<tr><td><code>AENV_API_KEY</code></td><td>unset</td><td>Shared single-tenant API key. The gateway uses the environment value when set, otherwise it reads <code>/run/secrets/api-key</code>.</td></tr>
 <tr><td><code>GATEWAY_HTTP_LISTEN_ADDR</code></td><td><code>:8080</code></td><td>HTTP listen address</td></tr>
 <tr><td><code>GATEWAY_METRICS_LISTEN_ADDR</code></td><td><code>:9102</code></td><td>Prometheus metrics listen address</td></tr>
 <tr><td><code>GATEWAY_SCHEDULER_ADDR</code></td><td><code>127.0.0.1:9090</code></td><td>Scheduler gRPC address for routing and node lookup</td></tr>
@@ -2109,27 +2183,85 @@ export E2B_ACCESS_TOKEN=dummy
 </table>
 </div>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="authentication-1"><a class="header" href="#authentication-1">Authentication</a></h1>
+<p>AgentENV uses one shared API key for a single-tenant deployment. The gateway
+and every runtime node must use the same value.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Credential</th><th>Scope</th><th>Header</th></tr>
+</thead>
+<tbody>
+<tr><td>API key</td><td>AgentENV lifecycle and management APIs</td><td><code>X-API-Key</code></td></tr>
+<tr><td><code>trafficAccessToken</code></td><td>Application ingress when <code>allowPublicTraffic</code> is <code>false</code></td><td><code>e2b-traffic-access-token</code></td></tr>
+<tr><td><code>envdAccessToken</code></td><td>Direct envd access for secure sandboxes</td><td><code>X-Access-Token</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>The credentials are not interchangeable. Public application ingress and envd
+in insecure sandboxes need no AgentENV credential. <code>Authorization</code> remains an
+application header and does not authenticate AgentENV. On sandbox routes,
+<code>X-API-Key</code> is also treated as application data unless it exactly matches the
+AgentENV API key, in which case it is removed to avoid forwarding the platform
+credential.</p>
+<p><code>GET /health</code> and node <code>GET /metrics</code> are outside API-key authentication. The
+gateway exposes Prometheus metrics on its separate metrics listener. Protect
+these endpoints with the network and authentication controls used by your
+Prometheus deployment. They are distinct from E2B’s authenticated sandbox
+metrics API.</p>
+<p>E2B SDK users set <code>E2B_API_KEY</code> to the AgentENV API key. Sandbox credentials
+are derived from the sandbox ID and
+<code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code>, independently of the API key.</p>
+<h2 id="key-resolution"><a class="header" href="#key-resolution">Key Resolution</a></h2>
+<p>A runtime node checks these sources in order:</p>
+<ol>
+<li><code>AENV_API_KEY</code></li>
+<li><code>/run/secrets/api-key</code></li>
+<li><code>$AENV_HOME/secrets/api-key</code></li>
+</ol>
+<p>If none exists, normal server startup generates and atomically stores a key at
+the managed path. The gateway checks only the first two sources and never
+generates a key.</p>
+<p>Custom keys must contain 32 to 256 URL-safe characters. Generated keys use an
+E2B-compatible <code>e2b_</code> prefix. For example:</p>
+<pre><code class="language-bash">export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
+</code></pre>
+<p>Docker Compose shares one managed-secret volume between runtime nodes and
+mounts it read-only on the gateway. Kubernetes stores the key in
+<code>Secret/agentenv-auth</code>. See the corresponding deployment guide for commands to
+read or supply those values. Multi-node deployments must also share one
+<code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> across runtime nodes.</p>
+<h2 id="security-and-rotation"><a class="header" href="#security-and-rotation">Security and Rotation</a></h2>
+<p>API-key authentication does not encrypt traffic. Use HTTPS termination, a VPN,
+loopback, or a trusted private network.</p>
+<p>Changing <code>AENV_API_KEY</code> invalidates API clients without changing sandbox
+credentials. Changing <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> rotates both
+sandbox token types. Apply either change to all relevant processes together.</p>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="secure-sandboxes"><a class="header" href="#secure-sandboxes">Secure Sandboxes</a></h1>
 <p>Secure sandboxes use an envd access token for control-plane communication. This protects envd operations such as command execution and file access.</p>
-<blockquote class="blockquote-tag blockquote-tag-warning">
-<p class="blockquote-tag-title"><svg viewbox="0 0 16 16" width="18" height="18"><path d="M6.457 1.047c.659-1.234 2.427-1.234 3.086 0l6.082 11.378A1.75 1.75 0 0 1 14.082 15H1.918a1.75 1.75 0 0 1-1.543-2.575Zm1.763.707a.25.25 0 0 0-.44 0L1.698 13.132a.25.25 0 0 0 .22.368h12.164a.25.25 0 0 0 .22-.368Zm.53 3.996v2.5a.75.75 0 0 1-1.5 0v-2.5a.75.75 0 0 1 1.5 0ZM9 11a1 1 0 1 1-2 0 1 1 0 0 1 2 0Z"></path></svg>Warning</p>
-<p>This feature does not add authentication to application ports exposed by the sandbox.</p>
+<blockquote class="blockquote-tag blockquote-tag-note">
+<p class="blockquote-tag-title"><svg viewbox="0 0 16 16" width="18" height="18"><path d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"></path></svg>Note</p>
+<p>Secure mode protects envd control-plane operations. Application traffic uses
+the sandbox-scoped <code>trafficAccessToken</code> described in
+<a href="#authentication-1">Authentication</a>.</p>
 </blockquote>
 <p>Set <code>secure: true</code> when creating a sandbox through API or E2B-compatible SDKs to enable secure mode. Or use the CLI:</p>
 <pre><code class="language-bash">aenv start --secure &lt;template-id&gt;
 </code></pre>
-<p>The API and SDKs return the sandbox’s <code>envdAccessToken</code> where appropriate and attach it to envd requests automatically. Forked sandboxes get independent tokens. Secure mode is preserved across pause, restart, and resume; legacy sandboxes remain non-secure unless created with <code>secure: true</code>.</p>
+<p>The API and SDKs return the sandbox’s <code>envdAccessToken</code> where appropriate and attach it to envd requests automatically. Private application ingress has an independent <code>trafficAccessToken</code>, sent as <code>e2b-traffic-access-token</code>; public application ingress has no AgentENV credential. Forked sandboxes get independent credentials. Secure mode is preserved across pause, restart, and resume; legacy sandboxes remain non-secure unless created with <code>secure: true</code>.</p>
 <h2 id="access-token-seed"><a class="header" href="#access-token-seed">Access-Token Seed</a></h2>
-<p>A seed is a random value used to derive the access token for each sandbox. This seed is optional. When it is unset, each runtime node automatically creates and persists a node-local seed under <code>$AENV_HOME/secrets</code>.
+<p>A seed is a random value used to derive each sandbox’s envd and traffic access tokens. This seed is optional for a standalone runtime. When it is unset, the runtime automatically creates and persists a seed under <code>$AENV_HOME/secrets</code>.
 This is sufficient for normal single-node operation and does not require additional setup.</p>
-<p>Configure the same explicit seed on every runtime node when the deployment needs to recover the same sandbox ID on another node in the future. Generate it once and store it in the deployment’s secret manager:</p>
+<p>Configure the same explicit seed on every runtime node in a clustered deployment. Generate it once and store it in the deployment’s secret manager:</p>
 <pre><code class="language-bash">openssl rand -hex 32
 </code></pre>
 <p>Set the value as <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> on every runtime node.
 For TOML configuration, use <code>[sandbox].access_token_hash_seed</code> instead.</p>
-<p>Preserve the seed across upgrades; changing it rotates access tokens for existing secure sandboxes.</p>
+<p>Preserve the seed across upgrades; changing it rotates both sandbox access tokens.</p>
 <h3 id="kubernetes"><a class="header" href="#kubernetes">Kubernetes</a></h3>
-<p>The runtime DaemonSet reads the optional <code>agentenv-runtime-secrets</code> Secret. To configure a shared seed for all runtime Pods, create it before applying the runtime manifests:</p>
+<p>The runtime DaemonSet retains the existing optional <code>agentenv-runtime-secrets</code>
+contract. Create one shared seed before applying the runtime manifests:</p>
 <pre><code class="language-bash">kubectl apply -f deploy/k8s/base/namespace.yaml
 
 AENV_ACCESS_TOKEN_HASH_SEED="$(openssl rand -hex 32)"
@@ -2138,7 +2270,8 @@ kubectl -n agentenv-system create secret generic agentenv-runtime-secrets \
   --dry-run=client -o yaml | kubectl apply -f -
 unset AENV_ACCESS_TOKEN_HASH_SEED
 </code></pre>
-<p>Run this once for a new cluster and preserve the existing Secret during upgrades. An external secret manager may be used instead, provided it creates the same Secret name and key:</p>
+<p>Preserve this Secret during upgrades. An external secret manager may provide
+the same name and key:</p>
 <pre><code class="language-yaml">apiVersion: v1
 kind: Secret
 metadata:
@@ -2147,7 +2280,7 @@ metadata:
 stringData:
   sandbox-access-token-hash-seed: &lt;shared-secret&gt;
 </code></pre>
-<p>If the Secret is not created, the DaemonSet still starts and each runtime Pod uses its automatically managed node-local seed.</p>
+<p>If the Secret is absent, each runtime Pod uses its managed node-local seed.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="how-agentenv-works"><a class="header" href="#how-agentenv-works">How AgentENV Works</a></h1>
 <p>AgentENV runs AI agents inside isolated Firecracker microVMs. Each sandbox is a lightweight Linux VM with its own kernel, filesystem, and network namespace.</p>
@@ -2375,7 +2508,7 @@ aenv start -d &lt;template-id-or-name&gt;   # detach: print sandbox ID and exit
 <pre><code class="language-bash">aenv start --cold ubuntu:24.04
 </code></pre>
 <p>The cold-start API accepts an optional <code>diskSizeMB</code> field to set the root filesystem’s virtual size in MiB. Explicit values must be at least 1024 MiB and divisible by 1024 because the current resize tool operates at 1 GiB granularity. Growth is allowed by default; shrinking below the source image size requires <code>ublk.overlaybd.allow_shrink = true</code>. If omitted, the image’s built-in virtual size is used. Resizing applies only when creating a fresh writable root filesystem, not to read-only images, images with an existing upper, or snapshot resume. Sandbox responses also report disk size as <code>diskSizeMB</code>.</p>
-<p>Use <code>aenv start --secure</code> with either warm or cold starts to require an envd access token for command and file operations. The CLI obtains and sends the token automatically. Secure mode protects the envd control port only; it does not add authentication to application ports. Each fork derives a distinct envd token from the child sandbox ID.</p>
+<p>Use <code>aenv start --secure</code> with either warm or cold starts to require an envd access token for command and file operations. The CLI obtains and sends the token automatically. Secure mode protects the envd control port, while application proxy requests use the independent sandbox-scoped traffic token. Each fork derives distinct envd and traffic credentials from the child sandbox ID.</p>
 <hr>
 <h2 id="working-with-sandboxes"><a class="header" href="#working-with-sandboxes">Working with Sandboxes</a></h2>
 <h3 id="shell-and-command-execution"><a class="header" href="#shell-and-command-execution">Shell and command execution</a></h3>
@@ -2823,6 +2956,21 @@ headers.</li>
 </table>
 </div>
 <p>These routing headers are stripped before the request is forwarded to the sandbox.</p>
+<h2 id="access-control"><a class="header" href="#access-control">Access Control</a></h2>
+<p>Proxy authentication is independent from AgentENV API authentication:</p>
+<ul>
+<li>Public application ingress (<code>allowPublicTraffic: true</code>, the default) requires
+no AgentENV credential.</li>
+<li>Private application ingress (<code>allowPublicTraffic: false</code>) requires the
+sandbox’s <code>trafficAccessToken</code> in <code>e2b-traffic-access-token</code>.</li>
+<li>Secure envd traffic requires the sandbox’s <code>envdAccessToken</code> in
+<code>X-Access-Token</code>. Insecure envd traffic has no envd token.</li>
+</ul>
+<p><code>X-API-Key</code> authenticates AgentENV control-plane APIs only. It does not grant
+access to private application ingress or secure envd. A matching platform key
+is stripped on proxy requests; other <code>X-API-Key</code> values remain available to
+sandbox applications. AgentENV also strips the traffic token, and forwards
+<code>X-Access-Token</code> only to the matching secure envd port.</p>
 <p>Host-based proxy requests derive both values from <code>Host</code>, for example
 <code>http://8080-&lt;sandbox-uuid&gt;.sandbox.example.com/health</code> targets port <code>8080</code>.
 The configured domain must route to the AgentENV server in single-node mode or
@@ -2855,9 +3003,14 @@ document.getElementById('swagger-frame').addEventListener('load', function () {
 <pre><code class="language-bash"># Single-node example
 export E2B_API_URL=http://127.0.0.1:8000
 export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=e2b_000000
-export E2B_ACCESS_TOKEN=dummy
+export E2B_API_KEY=${AENV_API_KEY}
 </code></pre>
+<p>AgentENV returns <code>trafficAccessToken</code> when <code>network.allowPublicTraffic</code> is false
+and (for secure sandboxes)
+<code>envdAccessToken</code> for envd control traffic. These credentials have different
+headers and trust boundaries: use <code>e2b-traffic-access-token</code> for private
+application routes and <code>X-Access-Token</code> only for envd. Public application
+routes require neither token.</p>
 <h3 id="typescript-sdk"><a class="header" href="#typescript-sdk">TypeScript SDK</a></h3>
 <h4 id="setup-1"><a class="header" href="#setup-1">Setup</a></h4>
 <p>Install the SDK:</p>
@@ -3168,10 +3321,11 @@ sandbox proxy hosts reverse proxy to sandbox services</li>
 </ul>
 <p><strong>Limitations</strong>: All bindings are in-memory (lost on scheduler restart). After a scheduler restart, bindings are rebuilt from new sandbox creations plus the next heartbeat roster from each runtime node. Kubernetes discovery updates the schedulable node set dynamically, but binding persistence is still not replicated.</p>
 <p><strong>Deployment</strong>:</p>
-<pre><code class="language-bash"># local dev (single node)
+<pre><code class="language-bash">export AENV_API_KEY="e2b_$(openssl rand -hex 32)" # shared by local runtime and gateway processes
+# local dev (single node)
 make start-server &amp;&amp; make -C services run-scheduler &amp;&amp; make -C services run-gateway
 
-# docker compose (multi-node)
+# docker compose (multi-node; shared auth volume is provisioned automatically)
 make deploy-up     # gateway + scheduler + 2 backend nodes
 make deploy-down   # teardown
 
@@ -4278,7 +4432,7 @@ network namespaces are missing</li>
 <tr><td><code>home_path</code></td><td><code>/var/lib/aenv</code></td><td><code>src/cfg.rs</code></td><td>Base for paths containing the literal <code>$AENV_HOME</code> placeholder. <code>AENV_HOME_PATH</code> overrides it before placeholder expansion.</td></tr>
 <tr><td><code>runtime_path</code></td><td><code>/run/aenv</code></td><td><code>src/cfg.rs</code>, <code>src/sandbox/network/*</code></td><td>Base for transient namespace mount points and daemon sockets. <code>AENV_RUNTIME_PATH</code> overrides it.</td></tr>
 <tr><td><code>deps_path</code></td><td><code>$AENV_HOME/deps</code></td><td><code>src/cfg.rs</code>, <code>src/setup/*</code></td><td>Base for downloaded runtime dependencies. <code>AENV_DEPS_PATH</code> can place these rebuildable assets outside <code>home_path</code>.</td></tr>
-<tr><td>Managed envd access-token seed</td><td><code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code></td><td><code>src/sandbox/access.rs</code></td><td>Node-local secret used when <code>[sandbox].access_token_hash_seed</code> is unset. It must be preserved with persisted secure sandboxes.</td></tr>
+<tr><td>Managed sandbox access-token seed</td><td><code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code></td><td><code>src/sandbox/access.rs</code></td><td>Node-local secret used to derive envd and traffic tokens when <code>[sandbox].access_token_hash_seed</code> is unset. It must be preserved with persisted secure or private-ingress sandboxes.</td></tr>
 <tr><td>Firecracker sandbox work dirs</td><td><code>$AENV_HOME/firecracker-work</code> with <code>agentenv-fc-</code> children</td><td><code>src/sandbox/firecracker/*</code></td><td>Per-sandbox runtime directories for sockets, symlinks, ublk runtime dirs, local logs, and writable OverlayBD upper layer data (<code>overlaybd/upper.data</code>, <code>overlaybd/upper.index</code>). An explicit <code>[firecracker].work_dir</code> overrides the root.</td></tr>
 <tr><td><code>firecracker.serial_dir</code></td><td><code>$AENV_HOME/logs/serial</code></td><td><code>src/sandbox/firecracker/*</code></td><td>Durable Firecracker stdout/stderr root, grouped by sandbox ID. An explicit <code>[firecracker].serial_dir</code> overrides the root.</td></tr>
 <tr><td><code>managed_snapshot_root</code></td><td><code>&lt;firecracker-work-base&gt;/managed-snapshots</code></td><td><code>src/sandbox/firecracker/*</code></td><td>In-process live snapshot artifact root used to keep captured snapshots alive until publish or drop.</td></tr>
@@ -4310,7 +4464,7 @@ network namespaces are missing</li>
 <tr><td>Overlaybd package downloads</td><td><code>&lt;deps_path&gt;/overlaybd/downloads/*</code></td><td>Temporary downloaded package archives</td><td>Setup staging for overlaybd release packages</td><td>Removed after a successful install.</td></tr>
 <tr><td>Generated overlaybd config</td><td><code>$AENV_HOME/overlaybd/overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/mem-overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/convert-overlaybd-global.json</code>, <code>$AENV_HOME/overlaybd/resize-overlaybd-global.json</code></td><td>Runtime global config, cache path, credentials config</td><td>Configures overlaybd runtime, memory snapshot overlaybd access, and the offline C++ tools (<code>overlaybd-apply</code>, <code>overlaybd-resize</code>), which get dedicated configs with isolated cacheDirs (<code>convert-blocks</code>, <code>resize-blocks</code>) and download disabled</td><td>Rewritten during setup/startup.</td></tr>
 <tr><td>Overlaybd runtime log</td><td><code>$AENV_HOME/overlaybd/overlaybd.log</code></td><td>Overlaybd runtime logs</td><td>Debugging</td><td>Appended by overlaybd runtime; no automatic GC.</td></tr>
-<tr><td>Managed envd access-token seed</td><td><code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code></td><td>32 random bytes encoded as lowercase hexadecimal</td><td>Derives stable per-sandbox envd access tokens when no explicit seed is configured</td><td>Atomically created with mode <code>0600</code> during normal startup and reused thereafter. Must not be deleted while secure sandboxes are persisted.</td></tr>
+<tr><td>Managed sandbox access-token seed</td><td><code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code></td><td>32 random bytes encoded as lowercase hexadecimal</td><td>Derives stable per-sandbox envd and traffic access tokens when no explicit seed is configured</td><td>Atomically created with mode <code>0600</code> during normal startup and reused thereafter. Must not be deleted while secure or private-ingress sandboxes are persisted.</td></tr>
 </tbody>
 </table>
 </div>
@@ -4534,6 +4688,22 @@ scheduler and forwards data-plane requests to the owning node’s proxy surface.
 <li>Sandbox ID must be a valid UUID format.</li>
 <li>Target port must parse as <code>u16</code> and be greater than <code>0</code>.</li>
 </ul>
+<p>Authorization is evaluated by the owning runtime after route parsing:</p>
+<ul>
+<li>Control-plane routes require the deployment <code>X-API-Key</code> and do not accept
+sandbox credentials.</li>
+<li>Node Prometheus <code>/metrics</code> and health <code>/health</code> are public to application
+auth and should be protected separately at the deployment boundary.</li>
+<li>Non-envd application routes require <code>e2b-traffic-access-token</code> only when the
+sandbox has private ingress (<code>allowPublicTraffic: false</code>).</li>
+<li>The envd port requires <code>X-Access-Token</code> only for secure sandboxes.</li>
+<li><code>X-API-Key</code> is never a data-plane credential.</li>
+</ul>
+<p>The distributed gateway deliberately does not make sandbox authorization
+decisions. It routes data-plane requests, including public ingress and insecure
+envd requests with no credential, to the owning runtime. The runtime has the
+sandbox metadata needed to apply the policy and performs the authoritative
+token validation.</p>
 <p>Host-based routing derives both fields from <code>Host</code>. The configured domain must
 match exactly after lowercase normalization and optional trailing-dot removal.
 Sandbox IDs in host routes must be valid UUIDs and the target port must fit in
@@ -4565,7 +4735,7 @@ Sandbox IDs in host routes must be valid UUIDs and the target port must fit in
 <h2 id="paused-sandbox-auto-resume"><a class="header" href="#paused-sandbox-auto-resume">Paused Sandbox Auto-Resume</a></h2>
 <p><code>/proxy</code> can auto-resume paused sandboxes when lifecycle policy enables it.</p>
 <ul>
-<li>Proxy never reads sandbox metadata directly.</li>
+<li>Proxy route resolution does not read sandbox instance internals.</li>
 <li>Orchestrator lookup returns <code>Paused { auto_resume }</code>, and proxy decides behavior from that signal.</li>
 <li>Auto-resume is attempted once per request.</li>
 <li>Resume timeout update uses <code>EnsureMinimum(5 minutes)</code>:
@@ -4637,6 +4807,14 @@ resembles a control-plane API.</li>
 <li><code>e2b-sandbox-id</code></li>
 <li><code>e2b-sandbox-port</code></li>
 </ul>
+<p>Sandbox credential handling:</p>
+<ul>
+<li><code>e2b-traffic-access-token</code> is stripped before forwarding.</li>
+<li>A successfully validated secure-envd <code>X-Access-Token</code> is forwarded to envd;
+otherwise that header is stripped.</li>
+<li>A value matching the platform <code>X-API-Key</code> is stripped; other values are
+forwarded as application headers.</li>
+</ul>
 <p>Hop-by-hop headers are stripped on both request and response paths, including:</p>
 <ul>
 <li>Standard hop-by-hop headers (<code>Connection</code>, <code>Upgrade</code>, <code>TE</code>, <code>Trailer</code>, <code>Transfer-Encoding</code>, <code>Proxy-Authenticate</code>, <code>Proxy-Authorization</code>, <code>Keep-Alive</code>)</li>
@@ -4702,7 +4880,7 @@ resembles a control-plane API.</li>
 <h2 id="usage-examples"><a class="header" href="#usage-examples">Usage Examples</a></h2>
 <h3 id="http"><a class="header" href="#http">HTTP</a></h3>
 <pre><code class="language-bash">curl -i \
-  -H 'X-API-Key: test-key' \
+  -H 'e2b-traffic-access-token: &lt;trafficAccessToken&gt;' \
   -H 'x-agentenv-sandbox-id: &lt;sandbox-uuid&gt;' \
   -H 'x-agentenv-target-port: 8080' \
   'http://127.0.0.1:8000/proxy/health?full=true'
@@ -4760,7 +4938,8 @@ make proto      # regenerate protobuf
 <pre><code class="language-bash"># Start scheduler (default: 127.0.0.1:9090)
 make -C services run-scheduler
 
-# Start gateway
+# Start gateway (use the same key on runtime nodes)
+export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
 make -C services run-gateway
 </code></pre>
 <h2 id="discovery-modes"><a class="header" href="#discovery-modes">Discovery Modes</a></h2>
@@ -4771,7 +4950,8 @@ make -C services run-gateway
 </ul>
 <h2 id="deployment"><a class="header" href="#deployment">Deployment</a></h2>
 <h3 id="docker-compose"><a class="header" href="#docker-compose">Docker Compose</a></h3>
-<pre><code class="language-bash">make deploy-up      # gateway + scheduler + 2 backend nodes
+<pre><code class="language-bash"># Run scripts/docker-setup.sh first for host prerequisites.
+make deploy-up      # gateway + scheduler + 2 backend nodes
 make deploy-ps      # status
 make deploy-logs    # logs
 make deploy-down    # teardown

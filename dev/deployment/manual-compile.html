@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-570618c3.js";
+            window.path_to_searchindex_js = "../searchindex-01177bd2.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c346f288.js"></script>
+        <script src="../toc-a79017d2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -205,16 +205,23 @@ make
 make release
 </code></pre>
 <h2 id="start-the-server"><a class="header" href="#start-the-server">Start the Server</a></h2>
+<p>Start the server. On first normal startup it generates an API key under
+<code>$AENV_HOME/secrets/api-key</code> and reuses it on later starts:</p>
 <pre><code class="language-bash"># Debug build
 API_ADDR=0.0.0.0:8000 make start-server
 
 # Release build
 API_ADDR=0.0.0.0:8000 make start-server-release
 </code></pre>
-<p>The server auto-downloads runtime assets (Firecracker binary, kernel, rootfs) on first start. Once ready, it listens at <code>http://127.0.0.1:8000</code>.</p>
+<p>The server auto-downloads runtime assets (Firecracker binary, kernel, rootfs) on first start. Once ready, it listens at <code>http://127.0.0.1:8000</code>. Read the generated key before making authenticated requests:</p>
+<pre><code class="language-bash">export AENV_API_KEY="$(cat "${AENV_HOME_PATH:-/var/lib/aenv}/secrets/api-key")"
+</code></pre>
 <h2 id="verify"><a class="header" href="#verify">Verify</a></h2>
 <pre><code class="language-bash">curl http://127.0.0.1:8000/health
+curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8000/sandboxes
 </code></pre>
+<p>HTTP does not protect the key in transit. Use a trusted network, VPN, or
+TLS-terminating reverse proxy for remote clients.</p>
 <h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
 <p>The server reads <code>config/default.toml</code> by default. Override with:</p>
 <pre><code class="language-bash">AENV_CONFIG_PATH=/path/to/config.toml make start-server

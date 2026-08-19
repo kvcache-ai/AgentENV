@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-570618c3.js";
+            window.path_to_searchindex_js = "../searchindex-01177bd2.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c346f288.js"></script>
+        <script src="../toc-a79017d2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -189,9 +189,14 @@
 <pre><code class="language-bash"># Single-node example
 export E2B_API_URL=http://127.0.0.1:8000
 export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=e2b_000000
-export E2B_ACCESS_TOKEN=dummy
+export E2B_API_KEY=${AENV_API_KEY}
 </code></pre>
+<p>AgentENV returns <code>trafficAccessToken</code> when <code>network.allowPublicTraffic</code> is false
+and (for secure sandboxes)
+<code>envdAccessToken</code> for envd control traffic. These credentials have different
+headers and trust boundaries: use <code>e2b-traffic-access-token</code> for private
+application routes and <code>X-Access-Token</code> only for envd. Public application
+routes require neither token.</p>
 <h3 id="typescript-sdk"><a class="header" href="#typescript-sdk">TypeScript SDK</a></h3>
 <h4 id="setup"><a class="header" href="#setup">Setup</a></h4>
 <p>Install the SDK:</p>

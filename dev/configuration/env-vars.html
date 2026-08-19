@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-570618c3.js";
+            window.path_to_searchindex_js = "../searchindex-01177bd2.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c346f288.js"></script>
+        <script src="../toc-a79017d2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -201,6 +201,7 @@
 <tr><th>Variable</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
+<tr><td><code>AENV_API_KEY</code></td><td>generated under <code>$AENV_HOME/secrets/api-key</code></td><td>Optional API-key override. Runtime nodes also check <code>/run/secrets/api-key</code> before creating a managed key. Use one shared value or secret in multi-node deployments.</td></tr>
 <tr><td><code>API_ADDR</code></td><td><code>0.0.0.0:8000</code></td><td>Address and port the API server listens on</td></tr>
 <tr><td><code>AENV_CONFIG_PATH</code></td><td><code>config/default.toml</code></td><td>Path to the TOML configuration file</td></tr>
 <tr><td><code>AENV_LOG_FORMAT</code></td><td><code>compact</code></td><td>Server log output format: <code>compact</code>, <code>pretty</code>, or <code>json</code></td></tr>
@@ -212,7 +213,7 @@
 <tr><td><code>AENV_OBSERVABILITY_SCHEDULER_ENDPOINT</code></td><td>unset</td><td>Override scheduler heartbeat reporting endpoint</td></tr>
 <tr><td><code>AENV_OBSERVABILITY_REPORT_INTERVAL_SECS</code></td><td><code>5</code></td><td>Override heartbeat reporting interval in seconds</td></tr>
 <tr><td><code>AENV_CUSTOM_EXTENSION_URL</code></td><td>unset</td><td>Override <code>[custom_extension].url</code>, the HTTP base URL of the custom extension service</td></tr>
-<tr><td><code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code></td><td>auto-generated under <code>$AENV_HOME/secrets</code></td><td>Optional override for the secret used to derive secure sandbox envd access tokens. Configure the same value on every node when cross-node recovery of the same sandbox ID is required; otherwise each node uses its own managed seed.</td></tr>
+<tr><td><code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code></td><td>auto-generated under <code>$AENV_HOME/secrets</code></td><td>Optional runtime override for the secret used to derive sandbox envd and traffic access tokens. Configure the same value on every runtime node in clustered deployments.</td></tr>
 <tr><td><code>AENV_SANDBOX_PROXY_DOMAINS</code></td><td>from config</td><td>Comma-separated DNS domains that enable server-side host-based sandbox proxy URLs like <code>{port}-{sandboxID}.{domain}</code> and populate the sandbox response <code>domain</code> field. Empty or unset keeps <code>[sandbox_proxy].domains</code>.</td></tr>
 <tr><td><code>AENV_HOME_PATH</code></td><td><code>/var/lib/aenv</code></td><td>Override the base directory from which AgentENV derives local state, caches, logs, generated configs, and downloaded dependencies. Component-specific path settings remain available as advanced overrides.</td></tr>
 <tr><td><code>AENV_RUNTIME_PATH</code></td><td><code>/run/aenv</code></td><td>Override the transient runtime directory used for network namespace mount points and the default ublk daemon socket.</td></tr>
@@ -239,8 +240,7 @@
 <tbody>
 <tr><td><code>E2B_API_URL</code></td><td>AgentENV server API base URL</td></tr>
 <tr><td><code>E2B_SANDBOX_URL</code></td><td>Sandbox proxy URL (for WebSocket and process interaction)</td></tr>
-<tr><td><code>E2B_API_KEY</code></td><td>API key for authentication</td></tr>
-<tr><td><code>E2B_ACCESS_TOKEN</code></td><td>Access token (used by <code>e2b template</code> commands)</td></tr>
+<tr><td><code>E2B_API_KEY</code></td><td>Set to the deployment’s <code>AENV_API_KEY</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -248,23 +248,19 @@
 <p><strong>Manual compile (single node)</strong>:</p>
 <pre><code class="language-bash">export E2B_API_URL=http://127.0.0.1:8000
 export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=e2b_000000
-export E2B_ACCESS_TOKEN=dummy
+export E2B_API_KEY=${AENV_API_KEY}
 </code></pre>
 <p><strong>Docker Compose / Kubernetes (multi-node)</strong>:</p>
 <pre><code class="language-bash">export E2B_API_URL=http://127.0.0.1:8080
 export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=e2b_000000
-export E2B_ACCESS_TOKEN=dummy
+export E2B_API_KEY=${AENV_API_KEY}
 </code></pre>
 <blockquote>
 <p>In both modes, sandbox data-plane requests can use routing headers with
 <code>E2B_SANDBOX_URL=${E2B_API_URL}</code>. The explicit <code>/proxy</code> prefix
 (<code>${E2B_API_URL}/proxy</code>) is still accepted for back-compat.</p>
 </blockquote>
-<blockquote>
-<p>For local development, any non-empty value works for <code>E2B_API_KEY</code> and <code>E2B_ACCESS_TOKEN</code> because the server only checks that the auth header is present.</p>
-</blockquote>
+<p>See <a href="../security/authentication.html">Authentication</a> for key generation and storage.</p>
 <h2 id="gateway-and-scheduler"><a class="header" href="#gateway-and-scheduler">Gateway and Scheduler</a></h2>
 <p>These variables apply to both the gateway and scheduler processes.</p>
 <div class="table-wrapper">
@@ -285,6 +281,7 @@ export E2B_ACCESS_TOKEN=dummy
 <tr><th>Variable</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
+<tr><td><code>AENV_API_KEY</code></td><td>unset</td><td>Shared single-tenant API key. The gateway uses the environment value when set, otherwise it reads <code>/run/secrets/api-key</code>.</td></tr>
 <tr><td><code>GATEWAY_HTTP_LISTEN_ADDR</code></td><td><code>:8080</code></td><td>HTTP listen address</td></tr>
 <tr><td><code>GATEWAY_METRICS_LISTEN_ADDR</code></td><td><code>:9102</code></td><td>Prometheus metrics listen address</td></tr>
 <tr><td><code>GATEWAY_SCHEDULER_ADDR</code></td><td><code>127.0.0.1:9090</code></td><td>Scheduler gRPC address for routing and node lookup</td></tr>
@@ -321,7 +318,7 @@ export E2B_ACCESS_TOKEN=dummy
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../security/secure-sandboxes.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../security/authentication.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -335,7 +332,7 @@ export E2B_ACCESS_TOKEN=dummy
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../security/secure-sandboxes.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../security/authentication.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

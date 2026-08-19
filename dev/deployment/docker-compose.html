@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-570618c3.js";
+            window.path_to_searchindex_js = "../searchindex-01177bd2.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c346f288.js"></script>
+        <script src="../toc-a79017d2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -199,15 +199,14 @@ configuration.</p>
 <pre><code class="language-bash">git clone https://github.com/kvcache-ai/AgentENV.git
 cd AgentENV
 </code></pre>
-<h2 id="configure-the-access-token-seed-optional"><a class="header" href="#configure-the-access-token-seed-optional">Configure the Access-Token Seed (Optional)</a></h2>
-<p>See <a href="../security/secure-sandboxes.html">Secure Sandboxes</a>
-if the deployment needs future cross-node sandbox recovery.</p>
 <h2 id="start-the-cluster"><a class="header" href="#start-the-cluster">Start the Cluster</a></h2>
 <pre><code class="language-bash">sudo bash scripts/docker-setup.sh
 make deploy-up
 </code></pre>
-<p>The Gateway is available at <code>http://127.0.0.1:8000</code> and forwards requests to
-the backend nodes.</p>
+<p>On first startup, the runtime nodes atomically generate one API key and sandbox
+access-token seed in the shared <code>agentenv-auth</code> volume. The gateway mounts that
+volume read-only and reads the API key; sandbox tokens are validated by the
+runtime nodes. Normal <code>make deploy-down</code> calls preserve both values.</p>
 <p>To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when starting the stack:</p>
 <pre><code class="language-bash">SANDBOX_PROXY_DOMAINS=sandbox.example.com \
@@ -220,14 +219,40 @@ usually through wildcard DNS for <code>*.sandbox.example.com</code>.</p>
 <pre><code class="language-bash"># Health check via gateway
 curl http://127.0.0.1:8000/health
 
-# Cluster node snapshots via gateway
-curl http://127.0.0.1:8000/nodes
+# Authenticated cluster node snapshots via gateway
+export AENV_API_KEY="$(docker compose -f deploy/docker-compose.yml exec -T agentenv-a \
+  cat /workspace/env/secrets/api-key)"
+curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8080/nodes
+
+# Direct health check on a backend node
+curl http://127.0.0.1:8000/health
 </code></pre>
 <h2 id="management-commands"><a class="header" href="#management-commands">Management Commands</a></h2>
 <pre><code class="language-bash">make deploy-ps      # Show container status
 make deploy-logs    # Stream logs from all services
 make deploy-down    # Tear down the cluster
 </code></pre>
+<p>Removing Compose volumes with <code>docker compose down -v</code> also removes both
+secrets. The next startup generates new values, so existing clients and sandbox
+access tokens are invalidated.</p>
+<p>To provide an existing key through Docker Compose secrets, add a file-backed
+secret in an override file and mount it with <code>target: api-key</code> on the gateway
+and both runtime nodes. AgentENV automatically reads <code>/run/secrets/api-key</code>;
+no file-path environment variable is needed.</p>
+<pre><code class="language-yaml">services:
+  gateway:
+    secrets: [api-key]
+  agentenv-a:
+    secrets: [api-key]
+  agentenv-b:
+    secrets: [api-key]
+
+secrets:
+  api-key:
+    file: ./api-key
+</code></pre>
+<p>The secret name is also its default target filename, so this mounts the key at
+<code>/run/secrets/api-key</code> in each service.</p>
 <h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
 <p>Container deployments use <code>deploy/docker/config/default.json</code>. Scheduler and backend node endpoints are configured for the Docker network.</p>
 <p>The runtime image includes <code>uvm-ublk</code> at <code>/usr/local/bin/uvm-ublk</code>. Compose uses that path instead of a host-built <code>env/ublk/uvm-ublk</code> binary.</p>

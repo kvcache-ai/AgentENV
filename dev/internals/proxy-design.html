@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-570618c3.js";
+            window.path_to_searchindex_js = "../searchindex-01177bd2.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c346f288.js"></script>
+        <script src="../toc-a79017d2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -224,6 +224,22 @@ scheduler and forwards data-plane requests to the owning node’s proxy surface.
 <li>Sandbox ID must be a valid UUID format.</li>
 <li>Target port must parse as <code>u16</code> and be greater than <code>0</code>.</li>
 </ul>
+<p>Authorization is evaluated by the owning runtime after route parsing:</p>
+<ul>
+<li>Control-plane routes require the deployment <code>X-API-Key</code> and do not accept
+sandbox credentials.</li>
+<li>Node Prometheus <code>/metrics</code> and health <code>/health</code> are public to application
+auth and should be protected separately at the deployment boundary.</li>
+<li>Non-envd application routes require <code>e2b-traffic-access-token</code> only when the
+sandbox has private ingress (<code>allowPublicTraffic: false</code>).</li>
+<li>The envd port requires <code>X-Access-Token</code> only for secure sandboxes.</li>
+<li><code>X-API-Key</code> is never a data-plane credential.</li>
+</ul>
+<p>The distributed gateway deliberately does not make sandbox authorization
+decisions. It routes data-plane requests, including public ingress and insecure
+envd requests with no credential, to the owning runtime. The runtime has the
+sandbox metadata needed to apply the policy and performs the authoritative
+token validation.</p>
 <p>Host-based routing derives both fields from <code>Host</code>. The configured domain must
 match exactly after lowercase normalization and optional trailing-dot removal.
 Sandbox IDs in host routes must be valid UUIDs and the target port must fit in
@@ -255,7 +271,7 @@ Sandbox IDs in host routes must be valid UUIDs and the target port must fit in
 <h2 id="paused-sandbox-auto-resume"><a class="header" href="#paused-sandbox-auto-resume">Paused Sandbox Auto-Resume</a></h2>
 <p><code>/proxy</code> can auto-resume paused sandboxes when lifecycle policy enables it.</p>
 <ul>
-<li>Proxy never reads sandbox metadata directly.</li>
+<li>Proxy route resolution does not read sandbox instance internals.</li>
 <li>Orchestrator lookup returns <code>Paused { auto_resume }</code>, and proxy decides behavior from that signal.</li>
 <li>Auto-resume is attempted once per request.</li>
 <li>Resume timeout update uses <code>EnsureMinimum(5 minutes)</code>:
@@ -327,6 +343,14 @@ resembles a control-plane API.</li>
 <li><code>e2b-sandbox-id</code></li>
 <li><code>e2b-sandbox-port</code></li>
 </ul>
+<p>Sandbox credential handling:</p>
+<ul>
+<li><code>e2b-traffic-access-token</code> is stripped before forwarding.</li>
+<li>A successfully validated secure-envd <code>X-Access-Token</code> is forwarded to envd;
+otherwise that header is stripped.</li>
+<li>A value matching the platform <code>X-API-Key</code> is stripped; other values are
+forwarded as application headers.</li>
+</ul>
 <p>Hop-by-hop headers are stripped on both request and response paths, including:</p>
 <ul>
 <li>Standard hop-by-hop headers (<code>Connection</code>, <code>Upgrade</code>, <code>TE</code>, <code>Trailer</code>, <code>Transfer-Encoding</code>, <code>Proxy-Authenticate</code>, <code>Proxy-Authorization</code>, <code>Keep-Alive</code>)</li>
@@ -392,7 +416,7 @@ resembles a control-plane API.</li>
 <h2 id="usage-examples"><a class="header" href="#usage-examples">Usage Examples</a></h2>
 <h3 id="http"><a class="header" href="#http">HTTP</a></h3>
 <pre><code class="language-bash">curl -i \
-  -H 'X-API-Key: test-key' \
+  -H 'e2b-traffic-access-token: &lt;trafficAccessToken&gt;' \
   -H 'x-agentenv-sandbox-id: &lt;sandbox-uuid&gt;' \
   -H 'x-agentenv-target-port: 8080' \
   'http://127.0.0.1:8000/proxy/health?full=true'

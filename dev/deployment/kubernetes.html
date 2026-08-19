@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-570618c3.js";
+            window.path_to_searchindex_js = "../searchindex-01177bd2.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c346f288.js"></script>
+        <script src="../toc-a79017d2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -235,6 +235,17 @@ make k8s-render
 # Apply to cluster
 make k8s-apply
 </code></pre>
+<p><code>make k8s-apply</code> generates a 256-bit API key on the first deployment and stores
+it in <code>Secret/agentenv-auth</code>. Later applies reuse it. Read the key locally when
+configuring clients:</p>
+<pre><code class="language-bash">kubectl -n agentenv-system get secret agentenv-auth \
+  -o go-template='{{index .data "AENV_API_KEY" | base64decode}}{{"\n"}}'
+</code></pre>
+<p>Set <code>AENV_API_KEY</code> when applying to supply your own value. A standalone
+<code>make k8s-render</code> uses an invalid <code>REDACTED</code> placeholder so preview output never
+contains a deployable API key. The optional runtime seed keeps its existing
+<code>agentenv-runtime-secrets</code> contract described in
+<a href="../security/secure-sandboxes.html">Secure Sandboxes</a>.</p>
 <p>To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when rendering or applying manifests:</p>
 <pre><code class="language-bash">SANDBOX_PROXY_DOMAINS=sandbox.example.com make k8s-apply
@@ -263,9 +274,9 @@ make k8s-delete
 </code></pre>
 <h2 id="local-development-k3s"><a class="header" href="#local-development-k3s">Local Development (k3s)</a></h2>
 <p>A dedicated <code>local-dev</code> overlay mounts the repository’s <code>env/</code> directory directly into the DaemonSet at <code>/workspace/env</code>, avoiding runtime asset copies:</p>
-<p>This overlay also generates <code>agentenv-runtime-secrets</code> with a fixed test-only
-seed so local and E2E deployments do not require production secret management.
-Do not reuse that value outside local development.</p>
+<p>The apply helper provisions the same generated API key used by the default
+overlay. The local development overlay retains its fixed test-only runtime seed;
+do not reuse that seed outside local development.</p>
 <pre><code class="language-bash">make k8s-build
 make k8s-load-dev       # Import images into k3s/containerd
 make k8s-render-dev     # Preview manifests

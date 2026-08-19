@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-570618c3.js";
+            window.path_to_searchindex_js = "../searchindex-01177bd2.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-c346f288.js"></script>
+        <script src="../toc-a79017d2.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -322,7 +322,7 @@ sudo systemctl start aenv
 <p>Use the dedicated PVM image:</p>
 <pre><code class="language-bash">docker pull ghcr.io/kvcache-ai/aenv-server:latest-pvm
 
-docker run --rm -it \
+docker run --rm -it --name aenv-server \
   --device /dev/kvm \
   --privileged \
   -v /dev:/dev \
@@ -337,6 +337,8 @@ docker run --rm -it \
 cargo run --bin server -- --setup-only
 make start-server
 </code></pre>
+<p>The server generates and persists the API key under
+<code>$AENV_HOME/secrets/api-key</code> on its first normal startup.</p>
 <p>You can also set the mode in the TOML configuration:</p>
 <pre><code class="language-toml">virtualization_mode = "pvm"
 </code></pre>
