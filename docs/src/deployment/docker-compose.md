@@ -9,8 +9,8 @@ For a real multi-machine deployment without Kubernetes, see
 
 - Linux kernel 6.8+
 - `/dev/kvm` access (passed into the runtime containers)
-- Docker and Docker Compose
-- `build-essential` (`sudo apt install -y build-essential`)
+- Docker Engine with Docker Compose v2 (`docker compose version`)
+- `curl` for the verification commands
 
 The checked-in Compose setup uses standard KVM. If the host does not support
 it, read [PVM Deployment](./pvm.md) before adapting the runtime image and host
@@ -28,6 +28,21 @@ cd AgentENV
 ```bash
 sudo bash scripts/docker-setup.sh
 make deploy-up
+```
+
+`make deploy-up` builds the runtime, gateway, and scheduler images with Docker Compose
+before starting the stack. The Rust and Go toolchains are installed in the image
+build stages, so they are not required on the host.
+
+To build without starting, run `make deploy-build`. To start images that are
+already built, run `make deploy-up-no-build`:
+
+```bash
+# Build only
+make deploy-build
+
+# Start previously built images
+make deploy-up-no-build
 ```
 
 On first startup, the runtime nodes atomically generate one API key and sandbox
@@ -56,10 +71,11 @@ curl http://127.0.0.1:8000/health
 # Authenticated cluster node snapshots via gateway
 export AENV_API_KEY="$(docker compose -f deploy/docker-compose.yml exec -T agentenv-a \
   cat /workspace/env/secrets/api-key)"
-curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8080/nodes
+curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8000/nodes
 
-# Direct health check on a backend node
-curl http://127.0.0.1:8000/health
+# Health check from inside a backend container
+docker compose -f deploy/docker-compose.yml exec -T agentenv-a \
+  curl -fsS http://127.0.0.1:8000/health
 ```
 
 ## Management Commands
@@ -74,33 +90,18 @@ Removing Compose volumes with `docker compose down -v` also removes both
 secrets. The next startup generates new values, so existing clients and sandbox
 access tokens are invalidated.
 
-To provide an existing key through Docker Compose secrets, add a file-backed
-secret in an override file and mount it with `target: api-key` on the gateway
-and both runtime nodes. AgentENV automatically reads `/run/secrets/api-key`;
-no file-path environment variable is needed.
+To use an existing API key instead of the generated value, export
+`AENV_API_KEY` before starting the stack. Compose passes it to the gateway and
+both runtime nodes:
 
-```yaml
-services:
-  gateway:
-    secrets: [api-key]
-  agentenv-a:
-    secrets: [api-key]
-  agentenv-b:
-    secrets: [api-key]
-
-secrets:
-  api-key:
-    file: ./api-key
+```bash
+export AENV_API_KEY="e2b_..."
+make deploy-up
 ```
-
-The secret name is also its default target filename, so this mounts the key at
-`/run/secrets/api-key` in each service.
 
 ## Configuration
 
 Container deployments use `deploy/docker/config/default.json`. Scheduler and backend node endpoints are configured for the Docker network.
-
-The runtime image includes `uvm-ublk` at `/usr/local/bin/uvm-ublk`. Compose uses that path instead of a host-built `env/ublk/uvm-ublk` binary.
 
 The compose manifest also wires node heartbeat reporting from runtime nodes to scheduler:
 
