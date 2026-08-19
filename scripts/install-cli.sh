@@ -165,6 +165,103 @@ fi
 
 echo "Installed: ${DEST}"
 
+install_completion_files() {
+    local marker='# managed by aenv completion installer'
+    local prefix home user_mode=0 quoted_binary
+    local bash_path zsh_path fish_path
+    prefix="$(dirname "$INSTALL_DIR")"
+    home="${HOME:-}"
+    canonical_dir() {
+        local path="$1" parent name
+        [[ "$path" == /* ]] || path="$PWD/$path"
+        if [[ -d "$path" ]]; then
+            (cd "$path" && pwd -P)
+            return
+        fi
+        parent="${path%/*}"
+        name="${path##*/}"
+        [[ "$parent" == "$path" ]] && parent="."
+        parent="$(cd "$parent" 2>/dev/null && pwd -P)" || return 1
+        printf '%s/%s\n' "$parent" "$name"
+    }
+    prefix="$(canonical_dir "$prefix")" || { echo "warning: could not resolve completion prefix; skipping" >&2; return 0; }
+    home_real=""
+    if [[ -n "$home" ]]; then
+        home_real="$(canonical_dir "$home")" || home_real=""
+    fi
+    if [[ -n "$home_real" && ( "$prefix" == "$home_real" || "$prefix" == "$home_real"/* ) ]]; then
+        user_mode=1
+    fi
+    if ((user_mode)); then
+        [[ -n "$home" ]] || { echo "warning: HOME is unset; skipping completion setup" >&2; return 0; }
+        bash_path="$home/.local/share/bash-completion/completions/aenv"
+        zsh_path="$home/.local/share/zsh/site-functions/_aenv"
+        fish_path="$home/.config/fish/completions/aenv.fish"
+    else
+        bash_path="$prefix/share/bash-completion/completions/aenv"
+        zsh_path="$prefix/share/zsh/site-functions/_aenv"
+        fish_path="$prefix/share/fish/vendor_completions.d/aenv.fish"
+    fi
+    if [[ "$DEST" == *"'"* || "$DEST" == *$'\n'* || "$DEST" == *$'\r'* ]]; then
+        echo "warning: completion binary path contains unsupported characters; skipping" >&2
+        return 0
+    fi
+    quoted_binary="'$DEST'"
+
+    put_loader() {
+        local path="$1" body="$2" dir tmp
+        dir="${path%/*}"
+        if [[ -L "$path" ]]; then
+            echo "warning: refusing to replace symlink ${path}" >&2
+            return 0
+        fi
+        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
+            echo "warning: leaving unmanaged completion file ${path} untouched" >&2
+            return 0
+        fi
+        local runner=()
+        if ! (mkdir -p "$dir" 2>/dev/null && [[ -w "$dir" ]]); then
+            runner=(run_privileged)
+        fi
+        "${runner[@]}" mkdir -p "$dir" || { echo "warning: could not create ${dir}" >&2; return 0; }
+        tmp="$("${runner[@]}" mktemp "$dir/.aenv-completion.XXXXXX")" || {
+            echo "warning: could not stage ${path}" >&2
+            return 0
+        }
+        if [[ "$path" == "$zsh_path" ]]; then
+            if ! printf '%s\n%s\n' "$body" "$marker" | "${runner[@]}" tee "$tmp" >/dev/null; then
+                "${runner[@]}" rm -f "$tmp"
+                echo "warning: could not stage ${path}" >&2
+                return 0
+            fi
+        else
+            if ! printf '%s\n%s\n' "$marker" "$body" | "${runner[@]}" tee "$tmp" >/dev/null; then
+                "${runner[@]}" rm -f "$tmp"
+                echo "warning: could not stage ${path}" >&2
+                return 0
+            fi
+        fi
+        if ! "${runner[@]}" chmod 0644 "$tmp" || ! "${runner[@]}" mv -f "$tmp" "$path"; then
+            "${runner[@]}" rm -f "$tmp"
+            echo "warning: could not install ${path}" >&2
+        fi
+    }
+
+    put_loader "$bash_path" "if [[ -x $quoted_binary ]]; then source <($quoted_binary completion bash); fi"
+    zsh_body="#compdef aenv
+if [[ -x $quoted_binary ]]; then eval \"\$($quoted_binary completion zsh)\"; fi"
+    put_loader "$zsh_path" "$zsh_body"
+    put_loader "$fish_path" "if test -x $quoted_binary; $quoted_binary completion fish | source; end"
+    if ((user_mode)); then
+        echo "If Zsh does not find the completion, add this before compinit:"
+        echo "  fpath=(~/.local/share/zsh/site-functions \$fpath)"
+        echo "  autoload -Uz compinit"
+        echo "  compinit"
+    fi
+}
+
+install_completion_files
+
 if ! command -v aenv &>/dev/null; then
     echo ""
     echo "Note: ${INSTALL_DIR} is not on your PATH."
