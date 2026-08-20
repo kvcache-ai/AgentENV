@@ -2411,7 +2411,6 @@ pub async fn is_zfile(file: Arc<dyn VirtualFile>) -> Result<i32> {
 mod tests {
     use super::*;
     use crate::backend::local::LocalFile;
-    use crate::test_utils::test_io_ring;
     use rand::{rngs::StdRng, Rng, RngExt, SeedableRng};
     use std::sync::Arc;
     use tempfile::NamedTempFile;
@@ -2439,11 +2438,7 @@ mod tests {
         let tmp = NamedTempFile::new().expect("create temp file");
         let path = tmp.path().to_path_buf();
         drop(tmp);
-        Arc::new(
-            LocalFile::new(path, test_io_ring())
-                .await
-                .expect("create local vfile"),
-        )
+        Arc::new(LocalFile::new(path).expect("create local vfile"))
     }
 
     fn sample_data(size: usize) -> Vec<u8> {
@@ -2740,11 +2735,7 @@ mod tests {
         let tmp = NamedTempFile::new().expect("create temp file");
         let path = tmp.path().to_path_buf();
         drop(tmp);
-        let local = Arc::new(
-            LocalFile::new(&path, test_io_ring())
-                .await
-                .expect("create local file"),
-        );
+        let local = Arc::new(LocalFile::new(&path).expect("create local file"));
         let mut builder = ZFileBuilder::new(local.clone(), &args)
             .await
             .expect("create builder over local file");

@@ -22,8 +22,8 @@ pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 /// Per-IO context that lets callers pass a specific io_uring instance down
 /// through the `VirtualFile` stack. The `_with_ctx` variants of read/write
 /// methods accept this so that, e.g., ublk queue threads can submit IO via
-/// their own [`AsyncIoRing`] instead of forwarding through a `LocalFile`'s
-/// background `IoRingHandle` worker.
+/// their own [`AsyncIoRing`] instead of falling back to synchronous positional
+/// I/O in [`VirtualFile::read_at`] and [`VirtualFile::write_at`].
 #[derive(Clone, Copy)]
 pub struct IoCtx<'a> {
     ring: &'a AsyncIoRing,

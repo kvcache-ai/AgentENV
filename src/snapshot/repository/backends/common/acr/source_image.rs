@@ -271,7 +271,6 @@ mod tests {
 
     use overlaybd::backend::local::LocalFile;
     use overlaybd::index_file::LSMTFile;
-    use overlaybd::transient_io_ring::shared_transient_io_ring;
     use overlaybd::virtual_file::VirtualFile;
     use serde_json::json;
     use tempfile::TempDir;
@@ -387,11 +386,7 @@ mod tests {
     async fn plans_descriptorless_sparse_overlaybd_delta_for_dense_export() {
         let dir = TempDir::new().unwrap();
         let delta = dir.path().join("snapshot.commit");
-        let data_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&delta, shared_transient_io_ring())
-                .await
-                .unwrap(),
-        );
+        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&delta).unwrap());
         let lsmt = LSMTFile::create(data_file, None, 64 * 1024, true)
             .await
             .unwrap();

@@ -369,7 +369,8 @@ pub struct GlobalConfig {
     pub user_agent: String,
     pub credential_config: CredentialConfig,
 
-    /// The number of io urings
+    /// Legacy compatibility field. Local files no longer allocate io_uring
+    /// workers through `ImageService`; ublk owns its queue-local rings.
     pub nr_io_rings: usize,
 }
 
@@ -657,8 +658,6 @@ pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
             cfg.oss_config.default_addressing_style
         );
     }
-
-    ensure!(cfg.nr_io_rings != 0, "nr_io_rings cannot be zero");
 
     Ok(())
 }

@@ -19,7 +19,6 @@ use overlaybd::backend::local::LocalFile;
 use overlaybd::config::{ImageConfig, LayerConfig};
 use overlaybd::index::{Segment, SegmentMapping};
 use overlaybd::index_file::compact_to;
-use overlaybd::transient_io_ring::shared_transient_io_ring;
 use overlaybd::virtual_file::VirtualFile;
 use tracing::{debug, warn};
 
@@ -643,10 +642,8 @@ async fn publish_memory_overlaybd_layer(
 ) -> Result<()> {
     let lower_tmp = output_path.with_extension("commit.tmp");
     let build_result = async {
-        let io_ring = shared_transient_io_ring();
         let output_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&lower_tmp, io_ring)
-                .await
+            LocalFile::new(&lower_tmp)
                 .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
         );
         let commit_args = create_commit_args(output_file, mode, concurrency).await?;

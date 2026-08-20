@@ -820,10 +820,10 @@ impl FileCacheBackend {
     // -------------------------------------------------------------------
     // Public-ish entry points called from CachedFile.
     //
-    // The non-`_with_ctx` variants drive the source through the global
-    // `IoRingHandle` workers (default `FileReader`) and yield `Send` futures,
-    // matching the historical behaviour for background callers (refill from
-    // tests, write_at_with_flags, prefetch, etc.).
+    // The non-`_with_ctx` variants use the source's ordinary `VirtualFile`
+    // methods (default `FileReader`) and yield `Send` futures. Local files use
+    // synchronous positional I/O on this fallback path; remote sources remain
+    // asynchronous.
     //
     // The `_with_ctx` variants accept an [`IoCtx`] and dispatch source IO
     // through it. The returned future is `!Send` because [`IoCtx`] borrows a

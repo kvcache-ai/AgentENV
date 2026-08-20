@@ -234,21 +234,12 @@ mod tests {
     use overlaybd::index_file::{create_file_rw, LayerInfo};
     use overlaybd::virtual_file::VirtualFile;
     use std::sync::Arc;
-    use storage_util::io_ring::spawn_io_ring_worker;
 
     async fn write_sealed_layer(path: &Path, uuid: Uuid) {
         let index_path = path.with_extension("index");
-        let (io_ring, _join_handle) = spawn_io_ring_worker::<io_uring::squeue::Entry>(0);
-        let data_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(path, io_ring.clone())
-                .await
-                .expect("data file"),
-        );
-        let index_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(index_path, io_ring)
-                .await
-                .expect("index file"),
-        );
+        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path).expect("data file"));
+        let index_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::new(index_path).expect("index file"));
         let mut info = LayerInfo::new(data_file, Some(index_file), 8192);
         info.uuid = uuid;
         let file = create_file_rw(info).await.expect("create rw layer");

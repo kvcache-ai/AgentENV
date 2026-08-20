@@ -8,7 +8,6 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use storage_util::io_ring::IoRingHandle;
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::full_file_cache::cache_pool::FileCacheBackend;
@@ -81,14 +80,12 @@ pub trait CachedFsSource: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct LocalFsSource {
     root: PathBuf,
-    io_ring: IoRingHandle,
 }
 
 impl LocalFsSource {
-    pub fn new(root: impl AsRef<Path>, io_ring: IoRingHandle) -> Self {
+    pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
-            io_ring,
         }
     }
 
@@ -126,14 +123,13 @@ impl CachedFsSource for LocalFsSource {
                 tokio::fs::create_dir_all(parent).await?;
             }
         }
-        let file = LocalFile::builder(self.io_ring.clone())
+        let file = LocalFile::builder()
             .read(read)
             .write(write)
             .create(create)
             .truncate(truncate)
             .mode(mode)
-            .open(&path)
-            .await?;
+            .open(&path)?;
         Ok(Arc::new(file))
     }
 
