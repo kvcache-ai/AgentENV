@@ -1451,7 +1451,7 @@ fn schedule_idle_pool_refill(
         pool.refill_inflight.store(false, Ordering::Release);
 
         if matches!(
-            pool.idle.compute_maintenance_action(pool.idle.len()),
+            pool.idle.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(_)
         ) {
             schedule_idle_pool_refill(pool, ctrl_ring, virtual_size);
@@ -1464,9 +1464,7 @@ async fn refill_idle_pool(
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     virtual_size: u64,
 ) -> Result<()> {
-    let PoolMaintenanceAction::Fill(to_create) =
-        pool.idle.compute_maintenance_action(pool.idle.len())
-    else {
+    let PoolMaintenanceAction::Fill(to_create) = pool.idle.compute_maintenance_action() else {
         return Ok(());
     };
 
@@ -1667,6 +1665,7 @@ mod tests {
             high_watermark: 1,
             maintenance_enabled: false,
             startup_prewarm: false,
+            idle_ttl: None,
         }
     }
 

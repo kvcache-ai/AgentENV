@@ -301,6 +301,10 @@ enabled = true
 startup_prewarm = true
 # Maximum concurrent process creations in one refill batch.
 fill_concurrency = 4
+# Seconds without warm-process acquisitions before the pool decays its refill
+# target back to the low watermark and drains the excess warm processes
+# (0 = never decay).
+idle_ttl_secs = 600
 
 [memory_snapshot]
 # Generated OverlayBD config dedicated to memory snapshot devices.

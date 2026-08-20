@@ -228,13 +228,16 @@ impl FirecrackerPool {
     }
 
     fn run_maintenance_cycle(&self) -> Result<()> {
-        match self.pool.compute_maintenance_action(self.pool.len()) {
+        match self.pool.compute_maintenance_action() {
             PoolMaintenanceAction::Fill(to_fill) => {
                 self.runtime.block_on(self.fill_warm_entries(to_fill))?;
             }
             PoolMaintenanceAction::Drain(to_drain) => {
                 for _ in 0..to_drain {
-                    let Some(warm) = self.pool.try_drain_one() else {
+                    // Re-validate each removal at execution time: the computed
+                    // drain count can be stale if an acquisition cancelled an
+                    // in-progress decay or the pool length changed.
+                    let Some(warm) = self.pool.try_drain_one_for_maintenance() else {
                         break;
                     };
                     self.cleanup_warm_blocking(warm, false)?;
