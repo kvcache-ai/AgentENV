@@ -37,7 +37,7 @@ dependencies = [
 
 [[package]]
 name = "aenv"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "bytes",
@@ -94,7 +94,7 @@ dependencies = [
 
 [[package]]
 name = "agentenv"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "agentenv-observability",
  "agentenv_http_server",
