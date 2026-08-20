@@ -191,11 +191,11 @@ impl ScriptedStoreControl {
         *self.claim_gate.lock().expect("claim gate mutex poisoned") = Some(gate);
     }
 
-    fn claim_gate(&self) -> Option<StoreClaimGate> {
+    fn take_claim_gate(&self) -> Option<StoreClaimGate> {
         self.claim_gate
             .lock()
             .expect("claim gate mutex poisoned")
-            .clone()
+            .take()
     }
 
     fn set_list_gate(&self, gate: StoreListGate) {
@@ -293,7 +293,7 @@ impl MetadataStore for ScriptedStore {
                 SandboxState::Pausing | SandboxState::Killing
             )
         }) {
-            if let Some(gate) = self.control.claim_gate() {
+            if let Some(gate) = self.control.take_claim_gate() {
                 gate.claimed.wait().await;
                 gate.release.wait().await;
             }
@@ -3107,7 +3107,12 @@ async fn auto_evict_revalidates_later_candidate_after_prior_claim() -> Result<()
         assert_eq!(renewed_metadata.timeout, Some(Duration::from_secs(60)));
         assert!(!renewed_metadata.is_expired(std::time::SystemTime::now()));
         assert_proxy_ready(&orchestrator, &renewed.id).await?;
-        orchestrator.delete_sandbox(renewed.id).await?;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            orchestrator.delete_sandbox(renewed.id),
+        )
+        .await
+        .expect("renewed sandbox cleanup should not block on the consumed claim gate")?;
     }
 
     Ok(())
@@ -3174,7 +3179,12 @@ async fn auto_evict_claim_prevents_late_keep_alive_success() -> Result<()> {
                     .await?
                     .expect("auto-paused sandbox metadata should remain");
                 assert_eq!(metadata.state, SandboxState::Paused);
-                orchestrator.delete_sandbox(sandbox_id).await?;
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    orchestrator.delete_sandbox(sandbox_id),
+                )
+                .await
+                .expect("paused sandbox cleanup should not block on the consumed claim gate")?;
             }
             SandboxTimeoutAction::Delete => {
                 assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
