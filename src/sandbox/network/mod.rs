@@ -9,7 +9,7 @@ use std::path::Path;
 use anyhow::Context;
 
 pub(crate) use address_plan::NetworkAddressPlan;
-pub(crate) use manager::NetworkManager;
+pub(crate) use manager::{NetworkManager, SlotTeardownError};
 pub use policy::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 pub(crate) use slot::Slot;
 

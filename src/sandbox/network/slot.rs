@@ -4,7 +4,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -34,6 +34,141 @@ use super::{NetworkAddressPlan, NetworkError, HOST_VETH_PREFIX, MAX_SLOTS, NETNS
 /// Captured once from the current calling thread before any `unshare(CLONE_NEWNET)`.
 /// All subsequent slot creations move host-side interfaces back to this namespace.
 static HOST_NS_FD: OnceLock<OwnedFd> = OnceLock::new();
+
+/// Children that could not be reaped within the grace period after `kill`.
+///
+/// A single process-lifetime reaper thread polls them with `try_wait`, so a
+/// persistently stuck `ip` child never accumulates one blocked thread per
+/// timeout, and dropping a `Child` (which never reaps) cannot leak a zombie.
+static UNREAPED_CHILDREN: Mutex<Vec<UnreapedChild>> = Mutex::new(Vec::new());
+static REAPER_CV: Condvar = Condvar::new();
+static REAPER_SPAWNED: AtomicBool = AtomicBool::new(false);
+static REAPER_SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+/// A child owned by the reaper thread, with its consecutive `try_wait` poll
+/// errors so a persistently unobservable process is surfaced and eventually
+/// dropped instead of retained forever.
+struct UnreapedChild {
+    child: std::process::Child,
+    poll_errors: u32,
+}
+
+/// Consecutive `try_wait` errors after which the reaper drops the child
+/// handle (at 20ms per poll this is ~10s). A persistently erroring poll
+/// means the process state is unobservable (e.g. ECHILD — already reaped),
+/// so retaining the handle no longer prevents anything.
+const REAPER_MAX_POLL_ERRORS: u32 = 500;
+
+/// Hand a killed-but-unreapable child to the centralized reaper thread.
+///
+/// The reaper is the only thread that ever blocks on these children; it owns
+/// no pool or slot state, and there is at most one reaper for the process
+/// lifetime regardless of how many teardown attempts time out. If spawning
+/// the reaper fails, the spawned flag stays clear so the next handoff
+/// retries instead of enqueueing into a queue nobody drains.
+fn hand_off_unreaped_child(child: std::process::Child) {
+    ensure_child_reaper();
+    UNREAPED_CHILDREN
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .push(UnreapedChild {
+            child,
+            poll_errors: 0,
+        });
+    REAPER_CV.notify_one();
+}
+
+fn ensure_child_reaper() {
+    if REAPER_SPAWNED.load(Ordering::Acquire) {
+        return;
+    }
+    // Serialize spawn attempts so a spawn-failure race cannot start two
+    // reapers.
+    let _guard = REAPER_SPAWN_LOCK
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if REAPER_SPAWNED.load(Ordering::Acquire) {
+        return;
+    }
+    match std::thread::Builder::new()
+        .name("network-slot-child-reaper".to_string())
+        .spawn(child_reaper_loop)
+    {
+        Ok(_) => REAPER_SPAWNED.store(true, Ordering::Release),
+        Err(err) => {
+            warn!(error = %err, "failed to spawn child reaper thread; will retry on next handoff");
+        }
+    }
+}
+
+fn child_reaper_loop() {
+    let mut pending: Vec<UnreapedChild> = Vec::new();
+    loop {
+        if pending.is_empty() {
+            let mut guard = UNREAPED_CHILDREN
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            while guard.is_empty() {
+                guard = REAPER_CV.wait(guard).unwrap_or_else(|err| err.into_inner());
+            }
+            pending.append(&mut guard);
+            drop(guard);
+        }
+        // `try_wait` reaps exited children. Errored polls are retried, but
+        // bounded: past REAPER_MAX_POLL_ERRORS the process state is
+        // unobservable, so the handle is dropped (and the error surfaced)
+        // instead of retained forever.
+        pending.retain_mut(|entry| match entry.child.try_wait() {
+            Ok(Some(_)) => false,
+            Ok(None) => {
+                entry.poll_errors = 0;
+                true
+            }
+            Err(err) => {
+                entry.poll_errors += 1;
+                if entry.poll_errors % 100 == 1 || entry.poll_errors >= REAPER_MAX_POLL_ERRORS {
+                    warn!(
+                        error = %err,
+                        poll_errors = entry.poll_errors,
+                        "child reaper: try_wait keeps failing for handed-off child"
+                    );
+                }
+                entry.poll_errors < REAPER_MAX_POLL_ERRORS
+            }
+        });
+        if pending.is_empty() {
+            continue;
+        }
+        thread::sleep(Duration::from_millis(20));
+        // Pick up children handed off while polling.
+        let mut guard = UNREAPED_CHILDREN
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        pending.append(&mut guard);
+        drop(guard);
+    }
+}
+
+/// Grace period for reaping a killed `ip link del` child before it is handed
+/// to the centralized reaper.
+const CHILD_REAP_GRACE: Duration = Duration::from_secs(1);
+
+/// Poll `try_wait` until the child exits or the grace period elapses.
+/// Returns true only when the child was verifiably reaped; a poll error
+/// returns false so the caller hands the child to the reaper instead of
+/// dropping it unreaped.
+fn reap_child_bounded(child: &mut std::process::Child, grace: Duration) -> bool {
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    false
+}
 
 const ARP_RETRANS_TIME_MS: &str = "100";
 const NEIGH_SYSCTL_RETRIES: usize = 5;
@@ -717,21 +852,96 @@ impl Slot {
     /// Tokio context may already be unavailable.
     fn delete_host_veth_interface_sync(idx: u32) -> Result<()> {
         let veth_name = Self::host_veth_name(idx);
-        let output = crate::privileges::run_with_scoped_capabilities(
+        let (status, stderr_bytes) = crate::privileges::run_with_scoped_capabilities(
             &[crate::privileges::CAP_NET_ADMIN],
             || {
-                Command::new("ip")
+                // Hard timeout: this runs on shutdown/exit cleanup paths that
+                // are joined synchronously (e.g. the firecracker pool's dead
+                // entry cleanup worker), so a stuck `ip link del` must not
+                // block the caller forever.
+                const IP_LINK_DEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+                // stderr goes to a uniquely-named temp file, not a pipe: the
+                // polling loop below never drains pipes, so a child whose
+                // diagnostics fill a pipe buffer would block on write and be
+                // misclassified as a timeout. `NamedTempFile` creation is
+                // atomic and unpredictable (no symlink pre-creation against a
+                // privileged writer), each attempt gets its own file, and the
+                // file is removed automatically on drop.
+                let stderr_file = tempfile::NamedTempFile::new()
+                    .context("Failed to create ip link del stderr capture file")?;
+                let child_stderr = stderr_file
+                    .reopen()
+                    .context("Failed to clone ip link del stderr capture file")?;
+                let mut child = Command::new("ip")
                     .args(["link", "del", &veth_name])
-                    .output()
-                    .context("Failed to execute ip link del")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::from(child_stderr))
+                    .spawn()
+                    .context("Failed to spawn ip link del")?;
+                let deadline = std::time::Instant::now() + IP_LINK_DEL_TIMEOUT;
+                let status = loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => break status,
+                        Ok(None) => {}
+                        Err(err) => {
+                            // Poll failed; the child state is unknown and it
+                            // may still be running. Never drop it unreaped:
+                            // best-effort kill, bounded reap, then hand off
+                            // to the centralized reaper before returning the
+                            // original error.
+                            let _ = child.kill();
+                            if !reap_child_bounded(&mut child, CHILD_REAP_GRACE) {
+                                hand_off_unreaped_child(child);
+                            }
+                            return Err(err).context("Failed to poll ip link del");
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        if let Err(err) = child.kill() {
+                            // `kill` can race with process exit (e.g. ESRCH):
+                            // the child may still need reaping, so route it
+                            // through the same bounded-reap/hand-off path
+                            // instead of dropping it.
+                            if !reap_child_bounded(&mut child, CHILD_REAP_GRACE) {
+                                hand_off_unreaped_child(child);
+                            }
+                            return Err(err)
+                                .context(format!("Failed to kill timed-out ip link del {veth_name}"));
+                        }
+                        // `kill` only sends the termination request; reap
+                        // with bounded polling instead of a blocking `wait`
+                        // so a process stuck in uninterruptible sleep cannot
+                        // hang this shutdown path beyond the grace period. An
+                        // unreaped child is handed to the centralized reaper
+                        // (a single thread for the process lifetime) instead
+                        // of being dropped, which would leak a zombie.
+                        if !reap_child_bounded(&mut child, CHILD_REAP_GRACE) {
+                            hand_off_unreaped_child(child);
+                        }
+                        return Err(anyhow!(
+                            "ip link del {} timed out after {:?}",
+                            veth_name,
+                            IP_LINK_DEL_TIMEOUT
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                };
+                // Bounded read of the captured diagnostics; the temp file is
+                // removed automatically when `stderr_file` drops.
+                let mut stderr_bytes = Vec::new();
+                if let Ok(file) = stderr_file.reopen() {
+                    let mut limited = std::io::Read::take(file, 64 * 1024);
+                    let _ = std::io::Read::read_to_end(&mut limited, &mut stderr_bytes);
+                }
+                Ok((status, stderr_bytes))
             },
         )?;
 
-        if output.status.success() {
+        if status.success() {
             return Ok(());
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         let stderr_lower = stderr.to_lowercase();
         if stderr_lower.contains("cannot find device")
             || stderr_lower.contains("no such device")
