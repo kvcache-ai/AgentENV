@@ -965,8 +965,7 @@ where
             }
         };
 
-        self.delete_sandbox_after_claim(sandbox_id, previous_state)
-            .await
+        self.delete_sandbox_impl(sandbox_id, previous_state).await
     }
 
     async fn delete_expired_sandbox_inner(
@@ -981,7 +980,7 @@ where
             return Ok(false);
         }
 
-        self.delete_sandbox_after_claim(sandbox_id, SandboxState::Running)
+        self.delete_sandbox_impl(sandbox_id, SandboxState::Running)
             .await?;
         Ok(true)
     }
@@ -1025,7 +1024,7 @@ where
         }
     }
 
-    async fn delete_sandbox_after_claim(
+    async fn delete_sandbox_impl(
         self: &Arc<Self>,
         sandbox_id: SandboxId,
         previous_state: SandboxState,
@@ -1154,7 +1153,7 @@ where
             Err(err) => return Err(OrchestratorError::from(err)),
         }
 
-        self.pause_sandbox_after_claim(sandbox_id).await
+        self.pause_sandbox_impl(sandbox_id).await
     }
 
     async fn pause_expired_sandbox_inner(
@@ -1169,11 +1168,11 @@ where
             return Ok(false);
         }
 
-        self.pause_sandbox_after_claim(sandbox_id).await?;
+        self.pause_sandbox_impl(sandbox_id).await?;
         Ok(true)
     }
 
-    async fn pause_sandbox_after_claim(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+    async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         // Pin paused runtime artifacts before detaching from the running set.
         let runtime_artifacts = {
             let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
