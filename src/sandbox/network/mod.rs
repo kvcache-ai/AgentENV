@@ -1,4 +1,5 @@
 mod address_plan;
+mod egress_proxy;
 mod iptables_util;
 mod manager;
 mod policy;
@@ -10,7 +11,10 @@ use anyhow::Context;
 
 pub(crate) use address_plan::NetworkAddressPlan;
 pub(crate) use manager::NetworkManager;
-pub use policy::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
+pub use policy::{
+    BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+    ALL_INTERNET_TRAFFIC_CIDR,
+};
 pub(crate) use slot::Slot;
 
 pub(crate) const MAX_SLOTS: usize = crate::cfg::network::NETWORK_MAX_SLOTS;

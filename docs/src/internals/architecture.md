@@ -123,16 +123,7 @@ PVM currently requires x86_64 and the `kvm_pvm` host module.
 
 ### Sandbox Networking
 
-Sandbox networking is managed by a process-wide `NetworkManager` (`src/sandbox/network/manager.rs`) plus per-slot `Slot` objects (`src/sandbox/network/slot.rs`).
-
-- Each slot owns a stable index-derived address bundle from `[network.internal]` (defaulting to `10.11.0.0/16` and `10.12.0.0/16`) plus the fixed VM tap link `169.254.0.20/30`, together with the host veth name, namespace path, and iptables rules for one sandbox network namespace.
-- Network policy supports base allow/deny plus explicit egress rules. The `/sandboxes/{sandboxID}/network` endpoint replaces per-sandbox `allowOut` (CIDR/IP/domain patterns) and `denyOut` (CIDR/IP only) rules at runtime; allow rules always take precedence.
-- `allocate_any()` first tries a warm-slot pool and falls back to creating a new namespace/veth/tap/iptables setup on demand.
-- Warm-pool maintenance uses a single Condvar-driven background worker with low/high watermarks.
-- `release()` enqueues slots back to the warm pool; when maintenance is enabled, even releases above high watermark are first enqueued and then drained asynchronously by the worker.
-- `[pool]` provides shared watermarks and `[pool.network].maintenance_enabled` controls network worker behavior.
-- Because the manager is a process-wide singleton, orchestrator shutdown explicitly calls `NetworkManager::shutdown()` after deleting remaining sandboxes so cached slots are drained and no new allocations race with teardown.
-- Although calling `NetworkManager::shutdown()` on exit is recommended for clean teardown, the manager also has a `Drop` and `libc::atexit` handler to best-effort cleanup of any remaining namespaces and veth interfaces on unexpected shutdown and during testing.
+The network subsystem is managed by a process-wide `NetworkManager` and per-slot `Slot` objects. See [Sandbox Network Architecture](./networking.md) for the namespace topology, address plan, packet paths, firewall ordering, egress proxy, policy replacement, warm-pool behavior, and verification steps.
 
 Snapshot resume can also use `[pool.firecracker]` to pre-spawn `(network slot, Firecracker process)` pairs. A warm entry transfers its network slot, process, and Firecracker CWD to the resumed sandbox, which avoids the spawn and API-socket wait in the resume critical path. `[pool.block]` controls the ublk daemon's overlaybd warm-device pool; it shares the same top-level watermarks but performs async refill from request paths because reusable block devices are image/size-specific.
 
