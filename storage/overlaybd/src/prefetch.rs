@@ -251,7 +251,7 @@ impl PrefetcherInner {
 
         let mut checksum: u32 = 0;
         let mut queue = VecDeque::new();
-        for chunk in raw[TRACE_HEADER_SIZE..].chunks_exact(TRACE_RECORD_SIZE) {
+        for chunk in raw[TRACE_HEADER_SIZE..].as_chunks::<TRACE_RECORD_SIZE>().0 {
             checksum = crc32c::crc32c_append(checksum, chunk);
             queue.push_back(TraceRecord::decode(chunk)?);
         }

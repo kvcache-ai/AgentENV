@@ -1317,8 +1317,8 @@ async fn load_jump_table(file: Arc<dyn VirtualFile>) -> Result<(HeaderTrailer, J
     );
 
     let mut ibuf = Vec::with_capacity(nindex);
-    for chunk in index_raw.chunks_exact(4) {
-        ibuf.push(u32::from_le_bytes(chunk.try_into().expect("u32 chunk")));
+    for chunk in index_raw.as_chunks::<4>().0 {
+        ibuf.push(u32::from_le_bytes(*chunk));
     }
 
     let mut jump_table = JumpTable::default();

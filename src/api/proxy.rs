@@ -77,6 +77,7 @@ enum ProxyRequestError {
     AutoResumeTimedOut(SandboxId),
     MissingRuntimeRoute(SandboxId),
     InvalidUpstreamUri,
+    InternalServerError,
 }
 
 const PROXY_ROUTE: &str = "/proxy";
@@ -306,7 +307,7 @@ async fn proxy_request(
     let resolved =
         match resolve_proxy_request(api_impl, &forward_path, &parts, is_websocket_request).await {
             Ok(resolved) => resolved,
-            Err(response) => return response,
+            Err(error) => return proxy_error_response(&error),
         };
 
     if is_websocket_request {
@@ -713,57 +714,44 @@ async fn resolve_proxy_request(
     proxy_path: &str,
     parts: &http::request::Parts,
     is_websocket_request: bool,
-) -> Result<ResolvedProxyRequest, Response<Body>> {
-    let sandbox_id =
-        parse_sandbox_id_header(&parts.headers).map_err(|err| proxy_error_response(&err))?;
-    let target_port =
-        parse_target_port_header(&parts.headers).map_err(|err| proxy_error_response(&err))?;
+) -> Result<ResolvedProxyRequest, ProxyRequestError> {
+    let sandbox_id = parse_sandbox_id_header(&parts.headers)?;
+    let target_port = parse_target_port_header(&parts.headers)?;
 
     let mut auto_resume_attempted = false;
     let target = loop {
         match api_impl.orchestrator().proxy_lookup_for(&sandbox_id).await {
             Ok(ProxyLookupResult::Ready(target)) => break target,
             Ok(ProxyLookupResult::NotFound) => {
-                return Err(proxy_error_response(&ProxyRequestError::SandboxNotFound(
-                    sandbox_id,
-                )))
+                return Err(ProxyRequestError::SandboxNotFound(sandbox_id))
             }
             Ok(ProxyLookupResult::Paused { auto_resume: true }) => {
                 if auto_resume_attempted {
-                    return Err(proxy_error_response(&ProxyRequestError::AutoResumeFailed(
-                        sandbox_id,
-                    )));
+                    return Err(ProxyRequestError::AutoResumeFailed(sandbox_id));
                 }
                 try_auto_resume(api_impl, sandbox_id).await?;
                 auto_resume_attempted = true;
                 continue;
             }
             Ok(ProxyLookupResult::Paused { auto_resume: false }) => {
-                return Err(proxy_error_response(
-                    &ProxyRequestError::SandboxUnavailable(sandbox_id, SandboxState::Paused),
+                return Err(ProxyRequestError::SandboxUnavailable(
+                    sandbox_id,
+                    SandboxState::Paused,
                 ))
             }
             Ok(ProxyLookupResult::Unavailable(_)) | Ok(ProxyLookupResult::RouteMissing)
                 if auto_resume_attempted =>
             {
-                return Err(proxy_error_response(&ProxyRequestError::AutoResumeFailed(
-                    sandbox_id,
-                )))
+                return Err(ProxyRequestError::AutoResumeFailed(sandbox_id))
             }
             Ok(ProxyLookupResult::Unavailable(state)) => {
-                return Err(proxy_error_response(
-                    &ProxyRequestError::SandboxUnavailable(sandbox_id, state),
-                ))
+                return Err(ProxyRequestError::SandboxUnavailable(sandbox_id, state))
             }
             Ok(ProxyLookupResult::RouteMissing) => {
-                return Err(proxy_error_response(
-                    &ProxyRequestError::MissingRuntimeRoute(sandbox_id),
-                ))
+                return Err(ProxyRequestError::MissingRuntimeRoute(sandbox_id))
             }
             Err(OrchestratorError::SandboxNotFound(_)) => {
-                return Err(proxy_error_response(&ProxyRequestError::SandboxNotFound(
-                    sandbox_id,
-                )))
+                return Err(ProxyRequestError::SandboxNotFound(sandbox_id))
             }
             Err(err) if auto_resume_attempted => {
                 warn!(
@@ -771,13 +759,11 @@ async fn resolve_proxy_request(
                     error = %err,
                     "failed to resolve proxy target after auto-resume"
                 );
-                return Err(proxy_error_response(&ProxyRequestError::AutoResumeFailed(
-                    sandbox_id,
-                )));
+                return Err(ProxyRequestError::AutoResumeFailed(sandbox_id));
             }
             Err(err) => {
                 warn!(sandbox_id = %sandbox_id, error = %err, "failed to resolve proxy target");
-                return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                return Err(ProxyRequestError::InternalServerError);
             }
         }
     };
@@ -787,7 +773,7 @@ async fn resolve_proxy_request(
     } else {
         build_upstream_uri_with_scheme("http", &target, target_port, proxy_path, parts.uri.query())
     }
-    .map_err(|_| proxy_error_response(&ProxyRequestError::InvalidUpstreamUri))?;
+    .map_err(|_| ProxyRequestError::InvalidUpstreamUri)?;
 
     Ok(ResolvedProxyRequest {
         sandbox_id,
@@ -796,7 +782,10 @@ async fn resolve_proxy_request(
     })
 }
 
-async fn try_auto_resume(api_impl: &ApiImpl, sandbox_id: SandboxId) -> Result<(), Response<Body>> {
+async fn try_auto_resume(
+    api_impl: &ApiImpl,
+    sandbox_id: SandboxId,
+) -> Result<(), ProxyRequestError> {
     match timeout(
         PROXY_AUTO_RESUME_TIMEOUT,
         api_impl.orchestrator().resume_sandbox(
@@ -812,9 +801,7 @@ async fn try_auto_resume(api_impl: &ApiImpl, sandbox_id: SandboxId) -> Result<()
         }
         Ok(Err(err)) => {
             warn!(sandbox_id = %sandbox_id, error = %err, "sandbox auto-resume failed");
-            Err(proxy_error_response(&ProxyRequestError::AutoResumeFailed(
-                sandbox_id,
-            )))
+            Err(ProxyRequestError::AutoResumeFailed(sandbox_id))
         }
         Err(_) => {
             warn!(
@@ -822,9 +809,7 @@ async fn try_auto_resume(api_impl: &ApiImpl, sandbox_id: SandboxId) -> Result<()
                 timeout_ms = PROXY_AUTO_RESUME_TIMEOUT.as_millis(),
                 "sandbox auto-resume timed out"
             );
-            Err(proxy_error_response(
-                &ProxyRequestError::AutoResumeTimedOut(sandbox_id),
-            ))
+            Err(ProxyRequestError::AutoResumeTimedOut(sandbox_id))
         }
     }
 }
@@ -886,7 +871,12 @@ fn proxy_error_response(error: &ProxyRequestError) -> Response<Body> {
         ProxyRequestError::InvalidUpstreamUri => {
             (StatusCode::BAD_REQUEST, "failed to construct upstream URI")
         }
+        ProxyRequestError::InternalServerError => (StatusCode::INTERNAL_SERVER_ERROR, ""),
     };
+
+    if matches!(error, ProxyRequestError::InternalServerError) {
+        return status.into_response();
+    }
 
     match error {
         ProxyRequestError::MissingSandboxId
@@ -912,6 +902,7 @@ fn proxy_error_response(error: &ProxyRequestError) -> Response<Body> {
         ProxyRequestError::MissingRuntimeRoute(sandbox_id) => {
             warn!(sandbox_id = %sandbox_id, status = %status, message, "sandbox route missing for running sandbox")
         }
+        ProxyRequestError::InternalServerError => unreachable!("handled above"),
     }
 
     Response::builder()
