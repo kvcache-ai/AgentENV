@@ -1,11 +1,14 @@
 use anyhow::{anyhow, bail, Result};
+// Aliased to `_`: the trait methods are what we want, and the name `Context` is
+// already taken by `std::task::Context` below.
+use anyhow::Context as _;
 use bytes::Bytes;
-use nix::fcntl::FallocateFlags;
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::future::Future;
+use std::os::fd::AsFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -16,6 +19,7 @@ use super::super::meta::{
     fsync, now_unix_nanos, BlockLoadState, CacheMetaDisk, CacheMetaDiskHeader, EntryPaths,
 };
 use super::cache_pool::FileCacheBackendOptions;
+use crate::sys;
 use storage_util::MMapRegion;
 
 /// The core per-cache-entry object. One per remote file (keyed by cache_id).
@@ -85,8 +89,11 @@ pub(crate) enum AcquireRefillResult {
 pub(crate) enum RangeAllocation {
     /// Disk blocks are reserved; a punch can roll the range back.
     Reserved,
-    /// The filesystem does not support fallocate; nothing was reserved and
-    /// writes through the mmap keep the pre-reservation behavior.
+    /// The platform or filesystem cannot reserve a range; nothing was reserved
+    /// and writes through the mmap keep the pre-reservation behavior — meaning
+    /// the SIGBUS-on-full-disk hazard this reservation exists to remove is
+    /// still present. This is the case on **all** of macOS, not just exotic
+    /// filesystems; see [`sys::reserve_space`] for why.
     Unsupported,
 }
 
@@ -95,6 +102,10 @@ pub(crate) enum RangeAllocation {
 /// back to a hole so a failed or cancelled refill leaves no allocated disk
 /// blocks that capacity accounting never saw. Call
 /// [`commit`](Self::commit) once the covered blocks are published.
+///
+/// The guard is armed only when the reservation actually happened, so on a
+/// platform reporting [`RangeAllocation::Unsupported`] the whole mechanism is
+/// inert — including the partially-written-page cleanup it provides on drop.
 pub(crate) struct ReservedRange<'a> {
     entry: &'a CacheEntry,
     offset: u64,
@@ -118,12 +129,9 @@ impl Drop for ReservedRange<'_> {
         }
         // Best-effort: the range was never published, so leaving it allocated
         // only wastes disk until the entry is evicted (whole-file punch).
-        if let Err(err) = nix::fcntl::fallocate(
-            &self.entry.data_file,
-            FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
-            self.offset as i64,
-            self.len as i64,
-        ) {
+        if let Err(err) =
+            sys::release_space_hint(self.entry.data_file.as_fd(), self.offset, self.len)
+        {
             tracing::warn!(
                 cache_id = %self.entry.cache_id,
                 offset = self.offset,
@@ -350,8 +358,9 @@ impl CacheEntry {
     /// space that fault fails and the process gets SIGBUS instead of an error
     /// return. Allocating up front turns disk exhaustion into a plain ENOSPC
     /// that the refill path can surface, after which reads fall back to the
-    /// source. Filesystems without fallocate support keep the old behavior
-    /// and report [`RangeAllocation::Unsupported`].
+    /// source. Platforms and filesystems that cannot reserve a range keep the
+    /// old behavior and report [`RangeAllocation::Unsupported`]; that covers
+    /// all of macOS, so this protection is Linux-only in practice.
     ///
     /// Call this directly only when no fallible or cancellable step sits
     /// between the reservation and publication of the covered blocks;
@@ -361,18 +370,16 @@ impl CacheEntry {
         if len == 0 {
             return Ok(RangeAllocation::Unsupported);
         }
-        // KEEP_SIZE: allocation must never move the file length; the entry is
-        // rejected on reload if the data file size drifts from source_size.
-        match nix::fcntl::fallocate(
-            &self.data_file,
-            FallocateFlags::FALLOC_FL_KEEP_SIZE,
-            offset as i64,
-            len as i64,
-        ) {
+        // The reservation never moves the file length; the entry is rejected on
+        // reload if the data file size drifts from source_size.
+        match sys::reserve_space(self.data_file.as_fd(), offset, len) {
             Ok(()) => Ok(RangeAllocation::Reserved),
-            Err(nix::errno::Errno::EOPNOTSUPP | nix::errno::Errno::ENOSYS) => {
-                Ok(RangeAllocation::Unsupported)
-            }
+            // The platform or filesystem cannot reserve a range. Not an error:
+            // the caller has to keep working without a reservation, which is
+            // the pre-reservation behavior. Whole platforms land here — macOS
+            // has no interior-range equivalent of `fallocate` at all — so
+            // failing instead would break every refill there.
+            Err(err) if err.is_unsupported() => Ok(RangeAllocation::Unsupported),
             Err(err) => Err(anyhow!(
                 "preallocate cache range failed: offset={offset}, len={len}: {err}"
             )),
@@ -469,12 +476,12 @@ impl CacheEntry {
                 Err(err) => return Err(err.into()),
             }
             if source_size > 0 {
-                nix::fcntl::fallocate(
-                    &data_file,
-                    FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
-                    0,
-                    source_size as i64,
-                )?;
+                // The bitmap was cleared above, so the bytes are already
+                // logically gone; this is purely about getting the disk space
+                // back. Failure still propagates: an eviction that cannot
+                // reclaim must not look like it succeeded.
+                sys::release_space_hint(data_file.as_fd(), 0, source_size)
+                    .with_context(|| format!("release {source_size} cached bytes"))?;
             }
             Ok(())
         })

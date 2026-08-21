@@ -6,7 +6,7 @@ use std::cmp::min;
 use std::ffi::CString;
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use std::sync::Arc;
 use crate::io::virtual_file::VirtualFile;
 #[cfg(feature = "io-uring")]
 use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
+use crate::sys;
 #[cfg(feature = "io-uring")]
 use storage_util::io_ring::{self, IoUringSubmitter};
 use storage_util::AlignedBuffer;
@@ -106,11 +107,24 @@ impl LocalFileBuilder {
             .create(self.create)
             .truncate(self.truncate)
             .mode(self.mode);
+
         if self.direct_io {
-            options.custom_flags(libc::O_DIRECT);
+            if let Some(flag) = sys::direct_io_open_flag() {
+                options.custom_flags(flag);
+            }
         }
 
         let file = options.open(&path)?;
+        if self.direct_io {
+            // Platforms with no open-time flag finish the job here (macOS
+            // `fcntl(F_NOCACHE)`). Propagating the failure rather than quietly
+            // handing back a cached file keeps `direct_io(true)` meaning one
+            // thing everywhere, including the alignment rules enforced in
+            // `write_at_sync`.
+            sys::enable_direct_io(&file)
+                .with_context(|| format!("enable direct io on {}", path.display()))?;
+        }
+
         Ok(LocalFile {
             inner: Arc::new(LocalFileInner {
                 path,
@@ -241,33 +255,6 @@ impl LocalFileInner {
 
     fn to_off_t(offset: u64) -> Result<libc::off_t> {
         libc::off_t::try_from(offset).context(format!("offset {offset} does not fit in off_t"))
-    }
-
-    fn posix_fadvise_dontneed(fd: i32, offset: u64, len: u64) -> Result<()> {
-        let offset = Self::to_off_t(offset)?;
-        let len = Self::to_off_t(len)?;
-        let ret = unsafe { libc::posix_fadvise(fd, offset, len, libc::POSIX_FADV_DONTNEED) };
-        if ret == 0 {
-            return Ok(());
-        }
-        Err(Errno::from_raw(ret).into())
-    }
-
-    fn punch_hole_keep_size(fd: i32, offset: u64, len: u64) -> Result<()> {
-        let offset = Self::to_off_t(offset)?;
-        let len = Self::to_off_t(len)?;
-        let ret = unsafe {
-            libc::fallocate(
-                fd,
-                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                offset,
-                len,
-            )
-        };
-        if ret == 0 {
-            return Ok(());
-        }
-        Err(Errno::last().into())
     }
 
     /// Read as most `buf.len()` bytes into `buf`.
@@ -737,36 +724,51 @@ impl VirtualFile for LocalFile {
         Ok(Some(val))
     }
 
-    /// Offloaded: `FALLOC_FL_PUNCH_HOLE` is real filesystem work (freeing
-    /// extents plus a journal commit), not a hint, and it sits on a
-    /// guest-triggerable path — a guest `fstrim` reaches here in a loop from
+    /// Offloaded: releasing space is real filesystem work — on Linux, freeing
+    /// extents plus a journal commit — not a hint, and it sits on a
+    /// guest-triggerable path: a guest `fstrim` reaches here in a loop from
     /// `LSMTFile::discard_range`. Inline it would stall every in-flight I/O on
     /// the ublk queue thread.
     ///
     /// The yield point this adds only widens an existing window:
     /// `discard_range` takes the index write lock *after* this call returns, so
-    /// a concurrent read could already see the punched-but-not-yet-remapped
-    /// range. Such a read resolves through the old mapping into the punched
-    /// region and gets zeros, which is what a completed discard means anyway.
+    /// a concurrent read can already resolve through the pre-discard mapping.
+    /// What it finds there is unspecified — Linux's punch zeroes the range,
+    /// macOS's `F_PUNCHHOLE` does not — but a read racing an in-flight discard
+    /// has no defined result either way.
     async fn discard(&self, offset: u64, len: u64) -> Result<()> {
         if len == 0 {
             return Ok(());
         }
+        // A hint about space only: it makes no promise that the range reads back
+        // as zeros, and a range too small to cover a block releases nothing and
+        // still succeeds. Real syscall failures are still propagated, unlike the
+        // eviction hints below.
         self.offload("discard", move |inner| {
-            LocalFileInner::punch_hole_keep_size(inner.file.as_raw_fd(), offset, len)
+            sys::release_space_hint(inner.file.as_fd(), offset, len)
+                .with_context(|| format!("discard {len} bytes at offset {offset}"))
         })
         .await
     }
 
-    /// Offloaded: `POSIX_FADV_DONTNEED` is a hint, but servicing it still walks
-    /// the page cache over the range and can queue behind writeback of any
-    /// dirty page it finds. No caller is on a hot path — the only in-tree ones
-    /// are the ZFile checksum/decompress retry branches — so the offload costs
-    /// nothing. Awaiting it keeps the ordering those retries rely on: the
+    /// Offloaded: dropping page-cache residency is advisory, but servicing it
+    /// still walks the cache over the range and can queue behind writeback of
+    /// any dirty page it finds. No caller is on a hot path — the only in-tree
+    /// ones are the ZFile checksum/decompress retry branches — so the offload
+    /// costs nothing. Awaiting it keeps the ordering those retries rely on: the
     /// eviction completes before the range is re-read.
     async fn evict_range(&self, offset: u64, len: u64) -> Result<()> {
         self.offload("evict_range", move |inner| {
-            LocalFileInner::posix_fadvise_dontneed(inner.file.as_raw_fd(), offset, len)
+            match sys::evict_page_cache(inner.file.as_fd(), offset, len) {
+                // Advisory, so an unsupported platform is not a failure: dropping
+                // cache residency never changes what a read returns. It has to be
+                // swallowed rather than propagated because `zfile` calls
+                // `evict_range`/`evict_all` with `?` while writing, so turning "this
+                // platform has no posix_fadvise" into an error would break ZFile
+                // writes on macOS outright. Real errno failures still propagate.
+                Err(err) if err.is_unsupported() => Ok(()),
+                other => other.map_err(Into::into),
+            }
         })
         .await
     }
@@ -775,96 +777,36 @@ impl VirtualFile for LocalFile {
     /// `len == 0` means "to end of file", so this walks the page cache of an
     /// entire layer file.
     async fn evict_all(&self) -> Result<()> {
+        // A zero length means "through end of file". Unsupported is swallowed for
+        // the same reason as in `evict_range`.
         self.offload("evict_all", |inner| {
-            LocalFileInner::posix_fadvise_dontneed(inner.file.as_raw_fd(), 0, 0)
+            match sys::evict_page_cache(inner.file.as_fd(), 0, 0) {
+                Err(err) if err.is_unsupported() => Ok(()),
+                other => other.map_err(Into::into),
+            }
         })
         .await
     }
 
     async fn fgetxattr(&self, name: &str) -> Result<Vec<u8>> {
         let cname = CString::new(name).context("xattr name contains interior NUL byte")?;
-        let fd = self.inner.file.as_raw_fd();
-
-        // SAFETY: fd and C string are valid; null buffer with size 0 is allowed to query length.
-        let need = unsafe { libc::fgetxattr(fd, cname.as_ptr(), std::ptr::null_mut(), 0) };
-        if need < 0 {
-            return Err(Errno::last().into());
-        }
-        let need = usize::try_from(need).context("xattr length overflow")?;
-        let mut buf = vec![0u8; need];
-        // SAFETY: destination buffer is valid for `need` bytes; fd/name unchanged.
-        let got = unsafe {
-            libc::fgetxattr(
-                fd,
-                cname.as_ptr(),
-                buf.as_mut_ptr() as *mut libc::c_void,
-                need,
-            )
-        };
-        if got < 0 {
-            return Err(Errno::last().into());
-        }
-        let got = usize::try_from(got).context("xattr length overflow")?;
-        buf.truncate(got);
-        Ok(buf)
+        sys::fgetxattr(self.inner.file.as_fd(), &cname).with_context(|| format!("fgetxattr {name}"))
     }
 
     async fn flistxattr(&self) -> Result<Vec<String>> {
-        let fd = self.inner.file.as_raw_fd();
-
-        // SAFETY: fd is valid; null buffer with size 0 is allowed to query length.
-        let need = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
-        if need < 0 {
-            return Err(Errno::last().into());
-        }
-        let need = usize::try_from(need).context("xattr list length overflow")?;
-        if need == 0 {
-            return Ok(Vec::new());
-        }
-        let mut buf = vec![0u8; need];
-        // SAFETY: destination buffer is valid for `need` bytes.
-        let got = unsafe { libc::flistxattr(fd, buf.as_mut_ptr() as *mut libc::c_char, need) };
-        if got < 0 {
-            return Err(Errno::last().into());
-        }
-        let got = usize::try_from(got).context("xattr list length overflow")?;
-        buf.truncate(got);
-
-        let mut out = Vec::new();
-        for raw in buf.split(|b| *b == 0).filter(|s| !s.is_empty()) {
-            out.push(String::from_utf8_lossy(raw).into_owned());
-        }
-        Ok(out)
+        sys::flistxattr(self.inner.file.as_fd()).context("flistxattr")
     }
 
     async fn fsetxattr(&self, name: &str, value: &[u8], flags: i32) -> Result<()> {
         let cname = CString::new(name).context("xattr name contains interior NUL byte")?;
-        let fd = self.inner.file.as_raw_fd();
-        // SAFETY: fd/name/value pointers are valid for the supplied length.
-        let ret = unsafe {
-            libc::fsetxattr(
-                fd,
-                cname.as_ptr(),
-                value.as_ptr() as *const libc::c_void,
-                value.len(),
-                flags,
-            )
-        };
-        if ret != 0 {
-            return Err(Errno::last().into());
-        }
-        Ok(())
+        sys::fsetxattr(self.inner.file.as_fd(), &cname, value, flags)
+            .with_context(|| format!("fsetxattr {name}"))
     }
 
     async fn fremovexattr(&self, name: &str) -> Result<()> {
         let cname = CString::new(name).context("xattr name contains interior NUL byte")?;
-        let fd = self.inner.file.as_raw_fd();
-        // SAFETY: fd/name are valid.
-        let ret = unsafe { libc::fremovexattr(fd, cname.as_ptr()) };
-        if ret != 0 {
-            return Err(Errno::last().into());
-        }
-        Ok(())
+        sys::fremovexattr(self.inner.file.as_fd(), &cname)
+            .with_context(|| format!("fremovexattr {name}"))
     }
 }
 

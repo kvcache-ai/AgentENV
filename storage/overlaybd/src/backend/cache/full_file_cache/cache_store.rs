@@ -942,6 +942,16 @@ impl FileCacheBackend {
 // CachedFile — per-open handle (unchanged public API)
 // ---------------------------------------------------------------------------
 
+/// What [`CachedFile::fadvise`] should do with a range.
+///
+/// Deliberately not a `libc` advice value: `POSIX_FADV_*` does not exist on
+/// Darwin, and the method only ever accepted one of them anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheAdvice {
+    /// Pull the range into the local cache now.
+    WillNeed,
+}
+
 pub struct CachedFile {
     pub(crate) backend: FileCacheBackend,
     pub(crate) source: Arc<RwLock<Option<Arc<dyn VirtualFile>>>>,
@@ -1272,9 +1282,16 @@ impl CachedFile {
         self.try_refill_range(offset, count).await
     }
 
-    pub async fn fadvise(&self, offset: u64, len: u64, advice: i32) -> Result<()> {
-        if advice != libc::POSIX_FADV_WILLNEED {
-            bail!("advice {advice} is not supported");
+    /// Prefetch `[offset, offset + len)` into the local cache.
+    ///
+    /// Despite the name this never calls `posix_fadvise`; it refills cache
+    /// blocks from the source. It used to take a raw `libc` advice value and
+    /// reject anything but `POSIX_FADV_WILLNEED`, which both leaked a
+    /// Linux-only constant into the signature and misdescribed the behaviour.
+    /// [`CacheAdvice`] names the one thing that was ever accepted.
+    pub async fn fadvise(&self, offset: u64, len: u64, advice: CacheAdvice) -> Result<()> {
+        match advice {
+            CacheAdvice::WillNeed => {}
         }
 
         let page_size = 4096;

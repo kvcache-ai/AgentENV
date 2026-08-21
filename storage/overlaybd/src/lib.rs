@@ -38,6 +38,7 @@ pub mod snapshot {
     #[cfg(feature = "full")]
     pub use crate::image::snapshot::*;
 }
+mod sys;
 pub mod tools;
 pub mod vfile_io {
     pub use crate::io::vfile_io::*;

@@ -16,7 +16,10 @@ pub use full_file_cache::cache_pool::{
     CacheListType, CachePoolStat, CacheStats, CachedFileStats, FileCacheBackend,
     FileCacheBackendOptions,
 };
-pub use full_file_cache::cache_store::CachedFile;
+// `CacheAdvice` is re-exported alongside `CachedFile` because it is the argument
+// type of the public `CachedFile::fadvise`: without it here, that method cannot
+// be called from outside the crate at all, since `full_file_cache` is private.
+pub use full_file_cache::cache_store::{CacheAdvice, CachedFile};
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const META_MAGIC: u32 = 0x4f42_4348; // "OBCH"

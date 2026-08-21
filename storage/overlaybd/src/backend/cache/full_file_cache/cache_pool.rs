@@ -10,13 +10,11 @@ use super::cache_store::CachedFile;
 use crate::config::CacheConfig;
 use crate::io::virtual_file::VirtualFile;
 use crate::lsmt::file::PREMERGED_INDEX_DIR;
-use anyhow::{anyhow, bail, Context, Result};
+use crate::sys;
+use anyhow::{anyhow, bail, Result};
 use dashmap::DashMap;
-use nix::errno::Errno;
 use parking_lot::{Mutex, RwLock};
-use std::ffi::CString;
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tokio::sync::Notify;
@@ -446,33 +444,20 @@ impl FileCacheBackend {
         Self::risk_mark_for_options(&self.options)
     }
 
-    fn statvfs_for_path(path: &Path) -> Result<libc::statvfs> {
-        let cpath =
-            CString::new(path.as_os_str().as_bytes()).context("path contains interior NUL byte")?;
-        let mut st = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-        let ret = unsafe { libc::statvfs(cpath.as_ptr(), st.as_mut_ptr()) };
-        if ret != 0 {
-            return Err(Errno::last().into());
-        }
-        Ok(unsafe { st.assume_init() })
-    }
-
     fn capture_disk_pressure(options: &FileCacheBackendOptions) -> DiskPressureSnapshot {
         let water_mark = Self::calc_water_mark(options.capacity_bytes);
-        let Ok(st) = Self::statvfs_for_path(&options.cache_dir) else {
+        let Ok(space) = sys::fs_space(&options.cache_dir) else {
             return DiskPressureSnapshot::default();
         };
-        let fs_capacity = st.f_frsize.saturating_mul(st.f_blocks);
-        let disk_avail = st.f_bavail.saturating_mul(st.f_frsize);
-        if disk_avail < DEFAULT_DISK_AVAIL_BYTES {
+        if space.avail_bytes < DEFAULT_DISK_AVAIL_BYTES {
             DiskPressureSnapshot {
-                evict_bytes: DEFAULT_DISK_AVAIL_BYTES.saturating_sub(disk_avail),
+                evict_bytes: DEFAULT_DISK_AVAIL_BYTES.saturating_sub(space.avail_bytes),
                 suppress_cache_pressure: false,
             }
         } else {
             DiskPressureSnapshot {
                 evict_bytes: 0,
-                suppress_cache_pressure: fs_capacity <= water_mark,
+                suppress_cache_pressure: space.capacity_bytes <= water_mark,
             }
         }
     }

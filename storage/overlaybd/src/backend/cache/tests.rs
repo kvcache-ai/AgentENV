@@ -1,6 +1,8 @@
 use super::super::local::LocalFile;
 use super::*;
+use crate::backend::cache::full_file_cache::cache_store::CacheAdvice;
 use crate::io::virtual_file::VirtualFile;
+use crate::sys;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -1456,14 +1458,14 @@ async fn test_ro_cached_fs_basic() {
     assert_eq!(prefetched.as_ref(), &payload[page_size..page_size * 3]);
 
     cached
-        .fadvise(234, (5000 * page_size) as u64, libc::POSIX_FADV_WILLNEED)
+        .fadvise(234, (5000 * page_size) as u64, CacheAdvice::WillNeed)
         .await
         .expect("fadvise large prefetch");
     cached
         .fadvise(
             (aligned_size - page_size) as u64,
             (5000 * page_size) as u64,
-            libc::POSIX_FADV_WILLNEED,
+            CacheAdvice::WillNeed,
         )
         .await
         .expect("fadvise tail prefetch");
@@ -1609,38 +1611,27 @@ async fn test_ro_cached_fs_xattr() {
     let name = CString::new("user.testxattr").expect("name cstr");
     let value = b"yes";
 
-    unsafe {
-        // SAFETY: pointers are valid and lengths are exact for libc xattr calls.
-        let ret = libc::setxattr(
-            path_c.as_ptr(),
-            name.as_ptr(),
-            value.as_ptr() as *const libc::c_void,
-            value.len(),
-            0,
-        );
-        if ret != 0 {
-            let err = Errno::last();
-            let unsupported = err == Errno::ENOTSUP
-                || (libc::EOPNOTSUPP != libc::ENOTSUP && err == Errno::EOPNOTSUPP);
-            if unsupported {
-                return;
-            }
+    // Set the attribute out of band so the cached-fs layer has a real one to
+    // read back. Going through `crate::sys` rather than raw libc keeps this
+    // portable and drops the `unsafe` block.
+    if let Err(err) = sys::setxattr(&path_c, &name, value, 0) {
+        let sys::SysError::Errno(errno) = err else {
             panic!("setxattr failed: {err}");
+        };
+        // Compared rather than matched: `ENOTSUP` and `EOPNOTSUPP` share a value
+        // on Linux, so listing both as match arms would be an unreachable arm
+        // there while still being two distinct codes elsewhere.
+        if errno == Errno::ENOTSUP || errno == Errno::EOPNOTSUPP {
+            // This filesystem has no xattr support; nothing to exercise.
+            return;
         }
-
-        let mut out = [0u8; 32];
-        let got = libc::getxattr(
-            path_c.as_ptr(),
-            name.as_ptr(),
-            out.as_mut_ptr() as *mut libc::c_void,
-            out.len(),
-        );
-        assert_eq!(got as usize, value.len());
-        assert_eq!(&out[..value.len()], value);
-
-        let ret = libc::removexattr(path_c.as_ptr(), name.as_ptr());
-        assert_eq!(ret, 0);
+        panic!("setxattr failed: {errno}");
     }
+
+    let got = sys::getxattr(&path_c, &name).expect("getxattr");
+    assert_eq!(got, value);
+
+    sys::removexattr(&path_c, &name).expect("removexattr");
 
     let source = Arc::new(LocalFile::open_rw(&path, false).expect("open source"));
     let backend = FileCacheBackend::with_options(test_options(tmp.path()))
