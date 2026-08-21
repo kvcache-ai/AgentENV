@@ -800,6 +800,11 @@ impl Sandboxes<()> for ApiImpl {
                     ),
                 ));
             }
+            Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
+                return Ok(SandboxesSandboxIdConnectPostResponse::Status409_Conflict(
+                    Self::error(409, err.to_string()),
+                ));
+            }
             Err(err) => {
                 return Ok(
                     SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()),
@@ -1290,12 +1295,22 @@ impl Sandboxes<()> for ApiImpl {
                     sandbox_not_found(id),
                 ));
             }
+            Err(OrchestratorError::InvalidTimeout { timeout, .. }) => {
+                return Ok(SandboxesSandboxIdResumePostResponse::Status400_BadRequest(
+                    Self::error(400, format!("invalid timeout: {timeout}")),
+                ));
+            }
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
                 return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
                     Self::error(
                         409,
                         format!("sandbox cannot be resumed from {} state", state),
                     ),
+                ));
+            }
+            Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
+                return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
+                    Self::error(409, err.to_string()),
                 ));
             }
             Err(err) => {
@@ -1358,6 +1373,9 @@ impl Sandboxes<()> for ApiImpl {
             // treat it as no state filter (i.e. return all sandboxes regardless of state)
             None
         };
+        let include_running = states
+            .as_ref()
+            .is_none_or(|states| states.contains(&SandboxState::Running));
 
         let filter = SandboxListFilter {
             states,
@@ -1385,6 +1403,14 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
+        let x_total_running = include_running.then(|| {
+            list.iter()
+                .filter(|sandbox| sandbox.state == SandboxState::Running)
+                .count()
+                .try_into()
+                .unwrap_or(i32::MAX)
+        });
+
         let page = cursor.paginate(
             list,
             query_params.limit,
@@ -1410,6 +1436,7 @@ impl Sandboxes<()> for ApiImpl {
             V2SandboxesGetResponse::Status200_SuccessfullyReturnedAllRunningSandboxes {
                 body: out,
                 x_next_token: page.next_token,
+                x_total_running,
             },
         )
     }

@@ -504,8 +504,8 @@ impl Templates<()> for ApiImpl {
         let updated_at = datetime_from_unix_ms(record.updated_at_unix_ms);
 
         Ok(
-            TemplatesTemplateIdGetResponse::Status200_SuccessfullyReturnedTheTemplateWithItsBuilds(
-                models::TemplateWithBuilds::new(
+            TemplatesTemplateIdGetResponse::Status200_SuccessfullyReturnedTheTemplateWithItsBuilds {
+                body: models::TemplateWithBuilds::new(
                     record.id.to_string(),
                     true,
                     build_record_names(&record),
@@ -515,7 +515,8 @@ impl Templates<()> for ApiImpl {
                     0,
                     builds,
                 ),
-            ),
+                x_next_token: None,
+            },
         )
     }
 

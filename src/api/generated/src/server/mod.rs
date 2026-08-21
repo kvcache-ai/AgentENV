@@ -1156,6 +1156,24 @@ where
                                                       })).await.unwrap()?;
                                                   response.body(Body::from(body_content))
                                                 },
+                                                apis::sandboxes::SandboxesSandboxIdConnectPostResponse::Status409_Conflict
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(409);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
                                                 apis::sandboxes::SandboxesSandboxIdConnectPostResponse::Status500_ServerError
                                                     (body)
                                                 => {
@@ -2683,6 +2701,24 @@ where
                                                       })).await.unwrap()?;
                                                   response.body(Body::from(body_content))
                                                 },
+                                                apis::sandboxes::SandboxesSandboxIdResumePostResponse::Status400_BadRequest
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(400);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
                                                 apis::sandboxes::SandboxesSandboxIdResumePostResponse::Status401_AuthenticationError
                                                     (body)
                                                 => {
@@ -3139,7 +3175,8 @@ where
                                                 apis::sandboxes::V2SandboxesGetResponse::Status200_SuccessfullyReturnedAllRunningSandboxes
                                                     {
                                                         body,
-                                                        x_next_token
+                                                        x_next_token,
+                                                        x_total_running
                                                     }
                                                 => {
                                                     if let Some(x_next_token) = x_next_token {
@@ -3158,6 +3195,25 @@ where
                                                       response_headers.insert(
                                                           HeaderName::from_static("x-next-token"),
                                                           x_next_token
+                                                      );
+                                                    }
+                                                    }
+                                                    if let Some(x_total_running) = x_total_running {
+                                                    let x_total_running = match header::IntoHeaderValue(x_total_running).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_total_running header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-total-running"),
+                                                          x_total_running
                                                       );
                                                     }
                                                     }
@@ -4241,8 +4297,30 @@ where
     let resp = match result {
                                             Ok(rsp) => match rsp {
                                                 apis::templates::TemplatesTemplateIdGetResponse::Status200_SuccessfullyReturnedTheTemplateWithItsBuilds
-                                                    (body)
+                                                    {
+                                                        body,
+                                                        x_next_token
+                                                    }
                                                 => {
+                                                    if let Some(x_next_token) = x_next_token {
+                                                    let x_next_token = match header::IntoHeaderValue(x_next_token).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_next_token header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-next-token"),
+                                                          x_next_token
+                                                      );
+                                                    }
+                                                    }
                                                   let mut response = response.status(200);
                                                   {
                                                     let mut response_headers = response.headers_mut().unwrap();
