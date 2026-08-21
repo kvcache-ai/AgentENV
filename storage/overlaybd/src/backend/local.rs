@@ -208,6 +208,28 @@ impl LocalFile {
     pub fn write_at_sync_pwrite(&self, offset: u64, buf: &[u8]) -> Result<usize> {
         self.inner.write_at_sync_pwrite(offset, buf)
     }
+
+    /// Run one blocking file operation on the Tokio blocking pool.
+    ///
+    /// The closure receives an owned `Arc<LocalFileInner>` clone rather than a
+    /// borrow of `self`, which is what lets it satisfy `spawn_blocking`'s
+    /// `'static` bound.
+    ///
+    /// On the ublk queue threads (`current_thread` runtime driving a
+    /// `LocalSet`) awaiting the join handle parks the runtime, which runs the
+    /// `on_thread_park` io_uring submit and lets the other queue tasks make
+    /// progress — the whole point of not running these syscalls inline.
+    async fn offload<F, T>(&self, op: &'static str, f: F) -> Result<T>
+    where
+        F: FnOnce(&LocalFileInner) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || f(&inner))
+            .await
+            .map_err(|e| anyhow!("LocalFile {op} join blocking task failed: {e:?}"))
+            .flatten()
+    }
 }
 
 impl LocalFileInner {
@@ -569,11 +591,8 @@ impl VirtualFile for LocalFile {
         if len == 0 {
             return Ok(Bytes::new());
         }
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || inner.read_at_sync(offset, len))
+        self.offload("read_at", move |inner| inner.read_at_sync(offset, len))
             .await
-            .map_err(|e| anyhow!("LocalFile read_at join blocking task failed: {e:?}"))
-            .flatten()
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -605,11 +624,10 @@ impl VirtualFile for LocalFile {
         if data.is_empty() {
             return Ok(0);
         }
-        let inner = self.inner.clone();
-        tokio::task::spawn_blocking(move || inner.write_at_sync(offset, &data))
-            .await
-            .map_err(|e| anyhow!("LocalFile write_bytes_at join blocking task failed: {e:?}"))
-            .flatten()
+        self.offload("write_bytes_at", move |inner| {
+            inner.write_at_sync(offset, &data)
+        })
+        .await
     }
 
     #[cfg(feature = "io-uring")]
@@ -656,18 +674,35 @@ impl VirtualFile for LocalFile {
         })
     }
 
+    /// Deliberately inline: this is a bare `fstat`, served from the cached
+    /// inode with no I/O, and callers hit it often enough (LSMT stack open,
+    /// cache-store size refresh) that a `spawn_blocking` round trip would cost
+    /// more than the syscall it offloads.
     async fn size(&self) -> Result<u64> {
         Ok(self.inner.file.metadata()?.len())
     }
 
+    /// Offloaded: `ftruncate` is cheap when growing a sparse file, but a shrink
+    /// has to invalidate page cache and free extents while holding the inode
+    /// lock exclusively, so it can queue behind in-flight writeback or a
+    /// journal commit. It is never on the per-I/O path here (only LSMT
+    /// create/resize), so the offload is free.
     async fn truncate(&self, size: u64) -> Result<()> {
-        self.inner.file.set_len(size)?;
-        Ok(())
+        self.offload("truncate", move |inner| {
+            inner.file.set_len(size)?;
+            Ok(())
+        })
+        .await
     }
 
+    /// Offloaded: `fsync` has unbounded latency — it waits for writeback of
+    /// every dirty page plus a device flush.
     async fn sync(&self) -> Result<()> {
-        self.inner.file.sync_all()?;
-        Ok(())
+        self.offload("sync", |inner| {
+            inner.file.sync_all()?;
+            Ok(())
+        })
+        .await
     }
 
     async fn seek_data(&self, offset: u64) -> Result<Option<u64>> {
@@ -702,19 +737,48 @@ impl VirtualFile for LocalFile {
         Ok(Some(val))
     }
 
+    /// Offloaded: `FALLOC_FL_PUNCH_HOLE` is real filesystem work (freeing
+    /// extents plus a journal commit), not a hint, and it sits on a
+    /// guest-triggerable path — a guest `fstrim` reaches here in a loop from
+    /// `LSMTFile::discard_range`. Inline it would stall every in-flight I/O on
+    /// the ublk queue thread.
+    ///
+    /// The yield point this adds only widens an existing window:
+    /// `discard_range` takes the index write lock *after* this call returns, so
+    /// a concurrent read could already see the punched-but-not-yet-remapped
+    /// range. Such a read resolves through the old mapping into the punched
+    /// region and gets zeros, which is what a completed discard means anyway.
     async fn discard(&self, offset: u64, len: u64) -> Result<()> {
         if len == 0 {
             return Ok(());
         }
-        LocalFileInner::punch_hole_keep_size(self.inner.file.as_raw_fd(), offset, len)
+        self.offload("discard", move |inner| {
+            LocalFileInner::punch_hole_keep_size(inner.file.as_raw_fd(), offset, len)
+        })
+        .await
     }
 
+    /// Offloaded: `POSIX_FADV_DONTNEED` is a hint, but servicing it still walks
+    /// the page cache over the range and can queue behind writeback of any
+    /// dirty page it finds. No caller is on a hot path — the only in-tree ones
+    /// are the ZFile checksum/decompress retry branches — so the offload costs
+    /// nothing. Awaiting it keeps the ordering those retries rely on: the
+    /// eviction completes before the range is re-read.
     async fn evict_range(&self, offset: u64, len: u64) -> Result<()> {
-        LocalFileInner::posix_fadvise_dontneed(self.inner.file.as_raw_fd(), offset, len)
+        self.offload("evict_range", move |inner| {
+            LocalFileInner::posix_fadvise_dontneed(inner.file.as_raw_fd(), offset, len)
+        })
+        .await
     }
 
+    /// Offloaded for the same reason as [`Self::evict_range`], and more so:
+    /// `len == 0` means "to end of file", so this walks the page cache of an
+    /// entire layer file.
     async fn evict_all(&self) -> Result<()> {
-        LocalFileInner::posix_fadvise_dontneed(self.inner.file.as_raw_fd(), 0, 0)
+        self.offload("evict_all", |inner| {
+            LocalFileInner::posix_fadvise_dontneed(inner.file.as_raw_fd(), 0, 0)
+        })
+        .await
     }
 
     async fn fgetxattr(&self, name: &str) -> Result<Vec<u8>> {
