@@ -155,7 +155,10 @@ pub async fn write_dense_layer_to(path: &Path, writer: Arc<dyn CompactWriter>) -
         .with_context(|| format!("dense-export sparse overlaybd layer '{}'", path.display()))
 }
 
-#[cfg(test)]
+// Every test in this module builds a sparse LSMT layer, which is rejected where
+// the filesystem does not guarantee that unwritten regions read back as holes;
+// see `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::sync::Arc;
 

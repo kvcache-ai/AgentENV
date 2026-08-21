@@ -1443,6 +1443,10 @@ mod tests {
         assert!(!image.is_read_only().await);
     }
 
+    // Sparse LSMT files are rejected where the filesystem does not guarantee
+    // that unwritten regions read back as holes; see
+    // `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_image_file_stack_lower_and_existing_sparse_upper() {
         let tmp = TempDir::new().expect("tempdir");
@@ -1502,6 +1506,10 @@ mod tests {
         assert!(!image.is_read_only().await);
     }
 
+    // Sparse LSMT files are rejected where the filesystem does not guarantee
+    // that unwritten regions read back as holes; see
+    // `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_image_file_sparse_discard_passthrough() {
         let tmp = TempDir::new().expect("tempdir");
@@ -1691,6 +1699,10 @@ mod tests {
         assert_eq!(got_snapshot.as_ref(), first_overlay.as_slice());
     }
 
+    // Sparse LSMT files are rejected where the filesystem does not guarantee
+    // that unwritten regions read back as holes; see
+    // `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn test_create_snapshot_and_restack_keeps_sparse_image_writable() {
         let tmp = TempDir::new().expect("tempdir");

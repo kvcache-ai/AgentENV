@@ -679,6 +679,7 @@ pub(crate) fn initialize_file_rw_paths(
     virtual_size: u64,
     rw_layout: RwLayout,
 ) -> Result<()> {
+    let rw_layout = rw_layout.ensure_supported()?;
     let uuid = Uuid::new_v4();
     let header = rw_header(virtual_size, rw_layout, uuid, None, None);
     let data_file = open_truncated_rw_file(data_path)?;
@@ -718,6 +719,35 @@ pub(crate) fn initialize_file_rw_paths(
 ///   the logic offset in the SegmentMapping. For example, if start_offset is 4K, then the
 ///   logic offset in the returned SegmentMapping will minus 4K from physical offset from the
 ///   file.
+///
+/// # The caller decides what "this range is data" is allowed to mean
+///
+/// The extent map is accurate about what it actually claims: which ranges are
+/// *allocated*. The trap is that allocated is not the same as written. APFS
+/// speculatively allocates around scattered writes — a gap smaller than roughly
+/// 16-20 MiB between two written blocks gets allocated whole, see
+/// [`crate::sys::sparse_extents_are_reliable`] — so a range can be reported as
+/// data without anyone ever having written it.
+///
+/// This function therefore reports allocation and leaves the interpretation to
+/// the caller, because the two callers need different things from it:
+///
+/// - Recovering a Sparse upper's index (`LSMTFile::open`) needs **written**, and
+///   reading allocation as written is **catastrophic**: a speculatively
+///   allocated block gets claimed as owned by the upper, the upper holds a hole
+///   there, so the read returns zeros and masks every lower layer. That caller
+///   gates on [`crate::sys::sparse_extents_are_reliable`].
+/// - Packaging a raw image into a sealed layer
+///   ([`crate::tools::package_raw_as_overlaybd`]) only needs **allocated**, and
+///   is happy to copy more than necessary: every reported range is read out of
+///   the source, where an unwritten block reads as zeros, then written to the
+///   output and indexed as ordinary data. The result is byte-for-byte correct
+///   and merely larger. That caller deliberately does not gate — refusing would
+///   leave a fully dense copy as the only option.
+///
+/// The reverse error — written data reported as a hole — would be silent data
+/// loss for both callers, but that would be a filesystem bug rather than a
+/// documented allocation heuristic.
 pub async fn create_mappings_from_sparse(
     file: &Arc<dyn VirtualFile>,
     start_offset: u64,

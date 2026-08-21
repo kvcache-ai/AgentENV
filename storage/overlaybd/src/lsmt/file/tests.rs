@@ -11,7 +11,8 @@ use crate::backend::local::LocalFile;
 use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
 use crate::io::virtual_file::{VirtualFile, VirtualFileWriter};
 use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer};
-use crate::lsmt::index::{ReadOnlyIndex, Segment, SegmentMapping};
+use crate::lsmt::index::Segment;
+use crate::lsmt::index::{ReadOnlyIndex, SegmentMapping};
 use anyhow::{bail, ensure, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -204,9 +205,14 @@ async fn prepared_log_and_hybrid_uppers_use_compatible_index_offset() {
     }
 }
 
+// The two log-structured layouts are portable, so they are validated on every
+// target. Only the sparse case needs a filesystem that reports unwritten regions
+// as holes, so it is included exactly when that capability is present — keyed
+// off the same predicate the production guard uses, rather than a second copy of
+// the platform test that could drift away from it.
 #[test]
-fn validate_rw_header_pair_paths_accepts_all_layouts() {
-    for (mode, layout) in [
+fn validate_rw_header_pair_paths_accepts_all_supported_layouts() {
+    let mut cases = vec![
         (
             crate::config::UpperMode::LogStructured,
             RwLayout::LogStructured,
@@ -215,8 +221,12 @@ fn validate_rw_header_pair_paths_accepts_all_layouts() {
             crate::config::UpperMode::HybridLogStructured,
             RwLayout::HybridLogStructured,
         ),
-        (crate::config::UpperMode::Sparse, RwLayout::Sparse),
-    ] {
+    ];
+    if crate::sys::sparse_extents_are_reliable() {
+        cases.push((crate::config::UpperMode::Sparse, RwLayout::Sparse));
+    }
+
+    for (mode, layout) in cases {
         let dir = TempDir::new().unwrap();
         let data = dir.path().join("upper.data");
         let index = dir.path().join("upper.index");
@@ -224,6 +234,64 @@ fn validate_rw_header_pair_paths_accepts_all_layouts() {
         crate::image::helper::prepare_runtime_upper(&data, index_path, 8192, mode).unwrap();
         validate_rw_header_pair_paths(&data, index_path, 8192, layout).unwrap();
     }
+}
+
+/// The layout guard tracks the extent capability exactly: both log-structured
+/// layouts are always available, and sparse is available precisely when extent
+/// maps can be trusted.
+///
+/// This runs on every target. The sparse tests further down are compiled only on
+/// Linux because they need a filesystem that really reports holes, which would
+/// otherwise leave the *rejecting* half of this behaviour — the entire point of
+/// the guard — untested exactly where it takes effect.
+#[test]
+fn ensure_supported_tracks_the_extent_capability() {
+    RwLayout::LogStructured
+        .ensure_supported()
+        .expect("a log-structured upper is portable");
+    RwLayout::HybridLogStructured
+        .ensure_supported()
+        .expect("a hybrid upper is portable");
+    assert_eq!(
+        RwLayout::Sparse.ensure_supported().is_ok(),
+        crate::sys::sparse_extents_are_reliable(),
+        "sparse must be accepted exactly where extent maps are trustworthy"
+    );
+}
+
+/// Creating a sparse upper must fail *before* anything is written, on a platform
+/// whose extent maps cannot be trusted.
+///
+/// This pins the failure mode that motivated putting the guard on every entry
+/// point rather than only on the recovery scan: without it the upper is created,
+/// written to successfully, and only fails when it is reopened — by which point
+/// the guest's data is already in it.
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "Linux reports holes reliably, so a sparse upper is supported here"
+)]
+fn preparing_a_sparse_upper_is_refused_where_extents_are_unreliable() {
+    assert!(
+        !crate::sys::sparse_extents_are_reliable(),
+        "this test describes platforms without trustworthy extent maps"
+    );
+
+    let dir = TempDir::new().unwrap();
+    let data = dir.path().join("upper.data");
+    let err = crate::image::helper::prepare_runtime_upper(
+        &data,
+        None,
+        8192,
+        crate::config::UpperMode::Sparse,
+    )
+    .expect_err("a sparse upper must be refused where extents are unreliable");
+
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("sparse RW layout is not supported"),
+        "expected the layout guard to reject this, got: {rendered}"
+    );
 }
 
 #[test]
@@ -329,6 +397,8 @@ async fn created_log_and_hybrid_uppers_use_compatible_index_offset() {
     }
 }
 
+// Only used by the Linux-gated sparse tests.
+#[cfg(target_os = "linux")]
 async fn create_sparse_lsmt_env(dir: &TempDir, vsize: u64) -> (Arc<LocalFile>, LSMTFile) {
     let data_path = dir.path().join("sparse-data.lsmt");
     let data_file = Arc::new(LocalFile::new(&data_path).expect("create sparse data file"));
@@ -407,6 +477,8 @@ async fn create_sealed_layer(
     data
 }
 
+// Only used by the Linux-gated sparse tests below.
+#[cfg(target_os = "linux")]
 async fn open_sparse_lsmt_env(
     data_file: Arc<LocalFile>,
     lower_layers: Vec<Arc<dyn VirtualFile>>,
@@ -877,6 +949,10 @@ async fn test_create_open() {
     assert_eq!(lsmt2.size().await.unwrap(), vsize);
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sparse_rw() {
     let temp_dir = TempDir::new().unwrap();
@@ -1415,6 +1491,10 @@ async fn test_stack_files() {
     assert_eq!(read_new[0], 0xCC);
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_stack_files_with_sparse_upper_and_sparse_lower() {
     let temp_dir = TempDir::new().unwrap();
@@ -1451,6 +1531,10 @@ async fn test_stack_files_with_sparse_upper_and_sparse_lower() {
     assert_eq!(lsmt_stacked.file_type(), LSMTFileType::SparseReadWrite);
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_stack_files_with_sparse_upper_and_multiple_sparse_lowers() {
     let base_dir = TempDir::new().unwrap();
@@ -1489,6 +1573,10 @@ async fn test_stack_files_with_sparse_upper_and_multiple_sparse_lowers() {
     assert_eq!(got12k.as_ref(), vec![0xAB; 4096].as_slice());
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sparse_restack_twice_preserves_lower_chain() {
     let temp_dir = TempDir::new().unwrap();
@@ -1615,6 +1703,10 @@ async fn test_update_vsize_after_write_preserves_close_seal_descriptor() {
     );
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sparse_close_seal_and_commit_roundtrip() {
     let temp_dir = TempDir::new().unwrap();
@@ -1871,6 +1963,10 @@ async fn test_hybrid_append_cursor_survives_reopen() {
     assert_eq!(lsmt.read_at(8192, 4096).await.unwrap()[0], 0xB4);
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sparse_discard_range_persists_via_hole_punch() {
     let temp_dir = TempDir::new().unwrap();
@@ -2257,6 +2353,10 @@ async fn test_compact_to_rejects_short_reads() {
     assert_err_contains(&err, "failed to read");
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sparse_factory_without_index() {
     let temp_dir = TempDir::new().unwrap();
@@ -3096,6 +3196,10 @@ async fn test_lsmt_size() {
     assert_eq!(lsmt.size().await.unwrap(), 8192);
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sparse_write_read() {
     let dir = TempDir::new().unwrap();
@@ -3106,6 +3210,10 @@ async fn test_sparse_write_read() {
     assert_eq!(buf[0], 0xAA);
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sparse_commit_matches_logical_content_of_log_structured() {
     let temp_dir = TempDir::new().unwrap();
@@ -3245,6 +3353,10 @@ async fn test_direct_io_close_seal() {
     }
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 /// `LSMTFile::create` with `sparse_rw = true` on an O_DIRECT data file
 /// (no index file required for sparse mode).  Verifies that the
 /// 4096-byte aligned header write path works for sparse files too, and

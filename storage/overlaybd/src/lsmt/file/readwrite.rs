@@ -87,7 +87,7 @@ impl LSMTFile {
         let data_file_size = rw_data_file.size().await?;
 
         let header = verify_ht(&rw_data_file, false, data_file_size).await?;
-        let rw_layout = Self::rw_layout_from_header(&header)?;
+        let rw_layout = Self::rw_layout_from_header(&header)?.ensure_supported()?;
 
         if data_file_size >= HEADER_SIZE + 4096
             && verify_ht(&rw_data_file, true, data_file_size).await.is_ok()
@@ -105,6 +105,21 @@ impl LSMTFile {
         let mut rw_index_append_offset = HEADER_SIZE;
 
         if rw_layout == RwLayout::Sparse {
+            // Redundant with the `ensure_supported` above, and kept anyway: the
+            // hazard is not "this layout is Sparse", it is "we are about to let
+            // an extent map tell us which blocks this layer owns". Guarding the
+            // point where that trust is actually placed keeps the check attached
+            // to the reason it exists, so a future refactor of the layout
+            // plumbing cannot quietly drop it. See
+            // `create_mappings_from_sparse` for why its other caller
+            // (raw-image packaging) is deliberately not gated.
+            ensure!(
+                crate::sys::sparse_extents_are_reliable(),
+                "cannot recover a sparse upper's index on this platform: it does \
+                 not guarantee that unwritten regions are reported as holes, so \
+                 the extent map cannot tell us which blocks the upper owns, and \
+                 over-reported blocks would mask the lower layers with zeros"
+            );
             let mappings = create_mappings_from_sparse(&rw_data_file, HEADER_SIZE).await?;
             for m in mappings {
                 mutable_index.insert(m);
@@ -196,6 +211,7 @@ impl LSMTFile {
         parent_uuid: Option<Uuid>,
         user_tag: Option<&[u8]>,
     ) -> Result<Self> {
+        let rw_layout = rw_layout.ensure_supported()?;
         let header = rw_header(virtual_size, rw_layout, uuid, parent_uuid, user_tag);
         write_header_block(&rw_data_file, &header).await?;
 

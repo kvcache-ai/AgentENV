@@ -127,6 +127,29 @@ impl RwLayout {
             RwLayout::HybridLogStructured => LSMTFileType::HybridReadWrite,
         }
     }
+
+    /// Reject a layout the current platform cannot support.
+    ///
+    /// `Sparse` pre-sizes the upper to the whole virtual disk and recovers "which
+    /// blocks were written" from the filesystem's extent map, so it only works
+    /// where unwritten regions are guaranteed to be reportable holes — see
+    /// [`crate::sys::sparse_extents_are_reliable`].
+    ///
+    /// Called from every entry point that creates *or* opens an upper, not just
+    /// from the recovery scan in `create_mappings_from_sparse`. Guarding only the
+    /// scan would let an unsupported platform create a sparse upper, write to it
+    /// successfully, and then fail to reopen it on the next restart — surfacing
+    /// the problem after the data is already there instead of before.
+    pub(super) fn ensure_supported(self) -> Result<Self> {
+        ensure!(
+            self != RwLayout::Sparse || crate::sys::sparse_extents_are_reliable(),
+            "sparse RW layout is not supported on this platform: it does not \
+             guarantee that unwritten regions are reported as holes, so the \
+             upper's extent map cannot be used to recover which blocks were \
+             written"
+        );
+        Ok(self)
+    }
 }
 
 impl From<crate::config::UpperMode> for RwLayout {
