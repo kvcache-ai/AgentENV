@@ -6,7 +6,7 @@ on:
       tools_version:
         description: Immutable SemVer tag for the tools drive
         required: true
-        default: "0.1.0"
+        default: "0.1.0-tonbo.1"
         type: string
       envd_ref:
         description: e2b-dev/infra ref used to build envd

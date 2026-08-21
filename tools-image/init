@@ -23,13 +23,15 @@ $BB mount -n -o rw /dev/vdb /mnt/user || die "mount /dev/vdb"
 
 # Minimal user images may not ship the directories that become mount targets
 # after pivot_root. Create them on the mounted user rootfs before switching.
+# Do not touch /mnt/user/var/run here. Distros such as Ubuntu make it an
+# absolute symlink to /run, which resolves against the tools root before the
+# pivot. pivot-init prepares /var/run after the root switch instead.
 $BB mkdir -p \
     /mnt/user/proc \
     /mnt/user/dev \
     /mnt/user/sys \
     /mnt/user/run \
     /mnt/user/tmp \
-    /mnt/user/var/run \
     /mnt/user/var/log/agentenv \
     /mnt/user/agentenv
 $BB chmod 1777 /mnt/user/tmp 2>/dev/null || true

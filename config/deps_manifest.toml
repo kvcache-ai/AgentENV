@@ -15,8 +15,11 @@ version = "6.12.33-pvm"
 url = "https://github.com/kvcache-ai/linux/releases/download/pvm-kernel-6.12.33/vmlinux-guest-6.12.33-pvm"
 
 [tools]
-version = "0.1.0"
-url = "ghcr.io/kvcache-ai/agentenv-tools:{version}"
+# The tools drive contains this fork's pre-pivot init. Pointing at the upstream
+# package would silently keep running the unfixed script even when the server
+# image is built from a Tonbo commit.
+version = "0.1.0-tonbo.1"
+url = "ghcr.io/tonbo-io/agentenv-tools:{version}"
 
 [overlaybd]
 version = "v1.0.18-aenv.1"
