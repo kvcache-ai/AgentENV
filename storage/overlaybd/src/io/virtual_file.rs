@@ -3,10 +3,13 @@
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+#[cfg(feature = "io-uring")]
 use std::future::Future;
+#[cfg(feature = "io-uring")]
 use std::pin::Pin;
 use std::sync::Arc;
 
+#[cfg(feature = "io-uring")]
 use storage_util::io_ring::AsyncIoRing;
 use storage_util::{CompactBuffer, CompactWriter};
 
@@ -17,6 +20,7 @@ use storage_util::{CompactBuffer, CompactWriter};
 /// `#[async_trait]`) keep returning `Send` futures because `async_trait`
 /// only rewrites `async fn` signatures, leaving these hand-rolled methods
 /// untouched.
+#[cfg(feature = "io-uring")]
 pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 /// Per-IO context that lets callers pass a specific io_uring instance down
@@ -24,11 +28,13 @@ pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 /// methods accept this so that, e.g., ublk queue threads can submit IO via
 /// their own [`AsyncIoRing`] instead of falling back to synchronous positional
 /// I/O in [`VirtualFile::read_at`] and [`VirtualFile::write_at`].
+#[cfg(feature = "io-uring")]
 #[derive(Clone, Copy)]
 pub struct IoCtx<'a> {
     ring: &'a AsyncIoRing,
 }
 
+#[cfg(feature = "io-uring")]
 impl<'a> IoCtx<'a> {
     pub fn new(ring: &'a AsyncIoRing) -> Self {
         Self { ring }
@@ -76,6 +82,7 @@ pub trait VirtualFile: Send + Sync {
     /// Returned future is **not** `Send` because `AsyncIoRing` is `!Send`
     /// (holds `Rc<...>`). The whole ublk dispatch path runs on a
     /// `LocalSet` single-thread runtime so this matches the execution model.
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         _ctx: IoCtx<'a>,
@@ -89,6 +96,7 @@ pub trait VirtualFile: Send + Sync {
     /// implementation mirrors `read_at_into`'s default but goes through
     /// [`Self::read_at_with_ctx`] so subclasses only need to override the
     /// bytes-returning variant when a single propagation point suffices.
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -107,6 +115,7 @@ pub trait VirtualFile: Send + Sync {
     }
 
     /// Context-aware write. Default forwards to [`Self::write_at`].
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         _ctx: IoCtx<'a>,
@@ -119,6 +128,7 @@ pub trait VirtualFile: Send + Sync {
     /// Context-aware variant of [`Self::write_bytes_at`]. The default
     /// implementation forwards through [`Self::write_at_with_ctx`] so a
     /// single override is enough for most implementations.
+    #[cfg(feature = "io-uring")]
     fn write_bytes_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,

@@ -11,11 +11,15 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile};
+use crate::io::virtual_file::VirtualFile;
+#[cfg(feature = "io-uring")]
+use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
+#[cfg(feature = "io-uring")]
 use storage_util::io_ring::{self, IoUringSubmitter};
 use storage_util::AlignedBuffer;
 
 const DIRECT_IO_ALIGNMENT: usize = 512;
+#[cfg(any(test, feature = "io-uring"))]
 const BUFFERED_PWRITE_FAST_PATH_MAX: usize = 4096;
 
 /// Builder for constructing a [`LocalFile`] with a fluent API.
@@ -36,6 +40,12 @@ pub struct LocalFileBuilder {
     truncate: bool,
     mode: u32,
     direct_io: bool,
+}
+
+impl Default for LocalFileBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LocalFileBuilder {
@@ -368,6 +378,7 @@ impl LocalFileInner {
 /*
  * Async read via IO URing
  */
+#[cfg(feature = "io-uring")]
 impl LocalFileInner {
     async fn read_buffered_at_via<S>(&self, submitter: &S, offset: u64, len: usize) -> Result<Bytes>
     where
@@ -571,8 +582,9 @@ impl VirtualFile for LocalFile {
 
     /// TODO: this blocks the calling thread for the duration of the `pread`.
     /// It cannot be offloaded with [`tokio::task::spawn_blocking`] because the
-    /// closure would have to capture `dst: &mut [u8]`, which is neither `Send`
-    /// nor `'static`; and because a `spawn_blocking` task cannot be cancelled,
+    /// closure would have to capture `dst: &mut [u8]`, which does not satisfy
+    /// `spawn_blocking`'s `'static` bound; and because a `spawn_blocking` task
+    /// cannot be cancelled,
     /// a raw-pointer workaround would let the blocking write outlive a dropped
     /// future and scribble over freed memory. Making this properly async needs
     /// either an ownership-passing variant of the trait method (hand the buffer
@@ -600,6 +612,7 @@ impl VirtualFile for LocalFile {
             .flatten()
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -609,6 +622,7 @@ impl VirtualFile for LocalFile {
         Box::pin(self.inner.read_at_via(ctx.ring(), offset, len))
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -618,6 +632,7 @@ impl VirtualFile for LocalFile {
         Box::pin(self.inner.read_at_into_via(ctx.ring(), offset, dst))
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -627,6 +642,7 @@ impl VirtualFile for LocalFile {
         Box::pin(self.inner.write_at_via(ctx.ring(), offset, data))
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_bytes_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,

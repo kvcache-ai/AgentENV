@@ -751,6 +751,7 @@ impl VirtualFile for ImageFile {
         Ok(written)
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: crate::io::virtual_file::IoCtx<'a>,
@@ -770,6 +771,7 @@ impl VirtualFile for ImageFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: crate::io::virtual_file::IoCtx<'a>,
@@ -790,6 +792,7 @@ impl VirtualFile for ImageFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         ctx: crate::io::virtual_file::IoCtx<'a>,
@@ -809,6 +812,7 @@ impl VirtualFile for ImageFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_bytes_at_with_ctx<'a>(
         &'a self,
         ctx: crate::io::virtual_file::IoCtx<'a>,

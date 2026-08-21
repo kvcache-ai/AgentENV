@@ -14,7 +14,9 @@ use super::full_file_cache::cache_pool::FileCacheBackend;
 use super::full_file_cache::cache_store::CachedFile;
 use super::O_CACHE_ONLY;
 use crate::backend::local::LocalFile;
-use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile};
+use crate::io::virtual_file::VirtualFile;
+#[cfg(feature = "io-uring")]
+use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
 
 #[async_trait]
 pub trait CachedFsSource: Send + Sync {
@@ -414,6 +416,7 @@ impl VirtualFile for LazySourceFile {
         self.open_if_needed().await?.fremovexattr(name).await
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -426,6 +429,7 @@ impl VirtualFile for LazySourceFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -438,6 +442,7 @@ impl VirtualFile for LazySourceFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -450,6 +455,7 @@ impl VirtualFile for LazySourceFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_bytes_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,

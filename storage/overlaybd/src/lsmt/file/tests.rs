@@ -7,7 +7,9 @@ use super::stack::{
 };
 use super::types::*;
 use crate::backend::local::LocalFile;
-use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile, VirtualFileWriter};
+#[cfg(feature = "io-uring")]
+use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
+use crate::io::virtual_file::{VirtualFile, VirtualFileWriter};
 use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer};
 use crate::lsmt::index::{ReadOnlyIndex, Segment, SegmentMapping};
 use anyhow::{bail, ensure, Result};
@@ -75,6 +77,7 @@ impl VirtualFile for CountingSizeFile {
         self.inner.write_bytes_at(offset, data).await
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -84,6 +87,7 @@ impl VirtualFile for CountingSizeFile {
         self.inner.read_at_with_ctx(ctx, offset, len)
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -93,6 +97,7 @@ impl VirtualFile for CountingSizeFile {
         self.inner.read_at_into_with_ctx(ctx, offset, dst)
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -102,6 +107,7 @@ impl VirtualFile for CountingSizeFile {
         self.inner.write_at_with_ctx(ctx, offset, data)
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_bytes_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,

@@ -8,8 +8,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::io::vfile_io::{read_exact, CtxRead, DirectRead, FileReader};
-use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile, VirtualFileWriter};
+#[cfg(feature = "io-uring")]
+use crate::io::vfile_io::CtxRead;
+use crate::io::vfile_io::{read_exact, DirectRead, FileReader};
+#[cfg(feature = "io-uring")]
+use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
+use crate::io::virtual_file::{VirtualFile, VirtualFileWriter};
 use crate::lsmt::index::{LogIndex, ReadOnlyIndex, Segment, SegmentMapping};
 use storage_util::CompactWriter;
 
@@ -306,6 +310,7 @@ impl LSMTReadOnlyFile {
             .await
     }
 
+    #[cfg(feature = "io-uring")]
     async fn read_internal_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -349,6 +354,7 @@ impl VirtualFile for LSMTReadOnlyFile {
         Ok(self.virtual_size)
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -369,6 +375,7 @@ impl VirtualFile for LSMTReadOnlyFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,

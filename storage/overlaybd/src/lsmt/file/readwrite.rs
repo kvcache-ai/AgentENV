@@ -13,10 +13,12 @@ use uuid::Uuid;
 use zerocopy::little_endian::U64;
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::io::vfile_io::{
-    read_exact, CtxRead, CtxWrite, DirectRead, DirectWrite, FileReader, FileWriter,
-};
-use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile};
+use crate::io::vfile_io::{read_exact, DirectRead, DirectWrite, FileReader, FileWriter};
+#[cfg(feature = "io-uring")]
+use crate::io::vfile_io::{CtxRead, CtxWrite};
+use crate::io::virtual_file::VirtualFile;
+#[cfg(feature = "io-uring")]
+use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
 use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer};
 use crate::lsmt::index::{
     ComboIndex, LogIndex, MutableIndex, ReadOnlyIndex, Segment, SegmentMapping,
@@ -845,6 +847,7 @@ impl LSMTFile {
             .await
     }
 
+    #[cfg(feature = "io-uring")]
     async fn write_internal_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -1149,6 +1152,7 @@ impl LSMTFile {
             .await
     }
 
+    #[cfg(feature = "io-uring")]
     async fn read_internal_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -1212,6 +1216,7 @@ impl VirtualFile for LSMTFile {
         Ok(())
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -1233,6 +1238,7 @@ impl VirtualFile for LSMTFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -1247,6 +1253,7 @@ impl VirtualFile for LSMTFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
