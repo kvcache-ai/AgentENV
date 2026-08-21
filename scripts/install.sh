@@ -93,8 +93,16 @@ if ((${#missing_packages[@]} > 0)); then
         echo "Installing required commands: ${missing_packages[*]} ..."
         sudo apt-get update
         sudo apt-get install -y "${missing_packages[@]}"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "Installing required commands: ${missing_packages[*]} ..."
+        sudo dnf install -y "${missing_packages[@]}"
+    elif command -v yum >/dev/null 2>&1; then
+        echo "Installing required commands: ${missing_packages[*]} ..."
+        sudo yum install -y "${missing_packages[@]}"
     else
-        echo "error: missing required commands and apt-get is unavailable: ${missing_packages[*]}" >&2
+        echo \
+            "error: missing required commands and no supported package manager is available: ${missing_packages[*]}" \
+            >&2
         exit 1
     fi
 fi
