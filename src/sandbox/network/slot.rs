@@ -4,7 +4,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -23,6 +23,7 @@ use rtnetlink::packet_core::{
 use rtnetlink::{new_connection, Handle};
 use tracing::{debug, info, warn};
 
+use super::egress_proxy::EgressProxy;
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
 use super::policy::{
     initialize_namespace_egress_chain, set_namespace_egress_policy, SandboxNetworkPolicy,
@@ -59,6 +60,7 @@ pub(crate) struct Slot {
     pub veth_vm_ip: Ipv4Addr,   // The IP on the VM/NS side interface (vpeer)
     address_plan: NetworkAddressPlan,
     netns_dir: PathBuf,
+    egress_proxy: Arc<EgressProxy>,
     cleanup_armed: AtomicBool,
     /// Whether this namespace's user egress chain currently contains rules.
     /// Warm-pool reuse preserves the namespace, so the next tenant may need to
@@ -85,6 +87,7 @@ impl Slot {
         idx: u32,
         address_plan: NetworkAddressPlan,
         netns_dir: PathBuf,
+        egress_proxy: Arc<EgressProxy>,
     ) -> Result<Self, NetworkError> {
         // Validation for zero and overflow.
         if idx == 0 || idx >= (MAX_SLOTS as u32) {
@@ -107,6 +110,7 @@ impl Slot {
             veth_vm_ip,
             address_plan,
             netns_dir,
+            egress_proxy,
             cleanup_armed: AtomicBool::new(false),
             user_egress_rules_present: AtomicBool::new(false),
         })
@@ -263,6 +267,7 @@ impl Slot {
         // IPTables Setup
         Self::configure_namespace_iptables_rules(
             host_interaction_ip,
+            veth_vm_ip,
             address_plan.vm_ip(),
             &address_plan.internal_egress_denied_cidrs(),
         )
@@ -453,12 +458,33 @@ impl Slot {
     }
 
     pub(crate) fn set_egress_policy(&self, policy: Option<&SandboxNetworkPolicy>) -> Result<()> {
+        // Policy updates run through the owning FirecrackerSandbox's mutable
+        // operation lock; cleanup owns this Slot exclusively. Avoid holding a
+        // second lock across namespace I/O, iptables, or proxy joins.
         let wants_rules = policy.is_some_and(SandboxNetworkPolicy::has_runtime_egress_rules);
         if !wants_rules && !self.user_egress_rules_present.load(Ordering::Acquire) {
             return Ok(());
         }
 
+        let requires_egress_proxy = policy.is_some_and(SandboxNetworkPolicy::requires_egress_proxy);
+        let had_active_proxy_policy = self.egress_proxy.has_active(self.host_interaction_ip);
+        if requires_egress_proxy {
+            self.egress_proxy
+                .ensure_listener(self.host_interaction_ip, &self.namespace_path())?;
+            self.egress_proxy.prepare(
+                self.host_interaction_ip,
+                policy.expect("proxy policy must be present when interception is requested"),
+            );
+            // There was no old proxy policy to preserve. Activating before the
+            // redirect is installed keeps the old default-allow behavior while
+            // the namespace rules are being committed.
+            if !had_active_proxy_policy {
+                self.egress_proxy.activate(self.host_interaction_ip);
+            }
+        }
+
         let netns_path = self.namespace_path();
+        let egress_proxy_port = self.egress_proxy.port();
         let policy = policy.cloned();
         let handle = thread::spawn(move || -> Result<()> {
             let netns = File::open(&netns_path).with_context(|| {
@@ -466,7 +492,7 @@ impl Slot {
             })?;
             nix::sched::setns(netns.as_fd(), CloneFlags::CLONE_NEWNET)
                 .context("failed to enter sandbox network namespace")?;
-            set_namespace_egress_policy(policy.as_ref())
+            set_namespace_egress_policy(policy.as_ref(), egress_proxy_port)
         });
 
         let result = match handle.join() {
@@ -476,6 +502,17 @@ impl Slot {
         if result.is_ok() {
             self.user_egress_rules_present
                 .store(wants_rules, Ordering::Release);
+            if requires_egress_proxy && had_active_proxy_policy {
+                self.egress_proxy.activate(self.host_interaction_ip);
+            } else if !requires_egress_proxy {
+                self.egress_proxy.deactivate(self.host_interaction_ip);
+            }
+        } else if requires_egress_proxy {
+            if had_active_proxy_policy {
+                self.egress_proxy.discard_pending(self.host_interaction_ip);
+            } else {
+                self.egress_proxy.teardown(self.host_interaction_ip);
+            }
         }
         result
     }
@@ -488,6 +525,7 @@ impl Slot {
     #[tracing::instrument(fields(vm_ip = %vm_ip, host_interaction_ip = %host_interaction_ip))]
     fn configure_namespace_iptables_rules(
         host_interaction_ip: Ipv4Addr,
+        veth_vm_ip: Ipv4Addr,
         vm_ip: Ipv4Addr,
         internal_egress_denied_cidrs: &[String],
     ) -> Result<()> {
@@ -511,6 +549,14 @@ impl Slot {
                 table: "nat",
                 chain: "POSTROUTING",
                 rule: format!("-o vpeer -s {} -j SNAT --to {}", vm_ip, host_interaction_ip),
+            },
+            // Namespace-local egress proxy connections originate from vpeer's
+            // address rather than the guest address above. Give them the same
+            // routable slot identity so host FORWARD/MASQUERADE rules apply.
+            IptablesRestoreCommand::Append {
+                table: "nat",
+                chain: "POSTROUTING",
+                rule: format!("-o vpeer -s {veth_vm_ip} -j SNAT --to {host_interaction_ip}"),
             },
             // DNAT: Rewrite destination IP from the host interaction IP to the VM.
             // This allows the host to reach the VM using the unique HostIP.
@@ -792,6 +838,11 @@ impl Slot {
             return Ok(());
         }
 
+        // A namespace-local listener pins the namespace. Stop proxy acceptance
+        // before removing the veth and unmounting the namespace, including
+        // panic/drop cleanup paths that bypass the normal release path.
+        self.egress_proxy.teardown(self.host_interaction_ip);
+
         // 1. Delete Host Veth Interface (this destroys the pair)
         let delete_result = if force_sync {
             Self::delete_host_veth_interface_sync(self.idx)
@@ -935,6 +986,7 @@ mod tests {
             idx,
             address_plan,
             std::env::temp_dir().join("aenv-network-tests/netns"),
+            EgressProxy::new(),
         )
     }
 
