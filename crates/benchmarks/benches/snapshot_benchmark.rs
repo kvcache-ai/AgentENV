@@ -29,6 +29,13 @@ const HEAVY_DATA_SIZE_MIB: u32 = 1024;
 const HEAVY_MEM_SIZE_MIB: u32 = HEAVY_DATA_SIZE_MIB + 512;
 const BENCH_UPPER_MODE_ENV: &str = "AENV_BENCH_UPPER_MODE";
 
+// TODO(#120): Add a repeated non-terminal capture benchmark that rewrites a
+// fixed hot-page set between checkpoints. Report per-capture pause latency,
+// emitted memory-layer bytes, chain depth, and the change in each metric when
+// the configured compaction threshold is crossed (for example at 10 and 100
+// captures). Keep every checkpoint alive so the measurement includes the
+// artifact-retention cost of a real linear chain.
+
 fn bench_upper_mode() -> UpperMode {
     match std::env::var(BENCH_UPPER_MODE_ENV) {
         Ok(value) => match value.as_str() {

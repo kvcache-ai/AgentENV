@@ -166,6 +166,11 @@ pub(super) fn managed_snapshot_base() -> PathBuf {
 pub struct FirecrackerSandbox {
     id: SandboxId,
     launch: LaunchMode,
+    /// Memory image used as the parent of the next capture. Unlike `launch`,
+    /// this advances after each locally successful non-terminal capture.
+    // TODO(#120): Move the parent path and its artifact pin into a lineage/lease
+    // object before captures can outlive the current managed snapshot root.
+    current_memory_parent: Option<PathBuf>,
     work_dir: TempDir,
     fc_instance: FirecrackerInstance,
     runtime_policy: FirecrackerRuntimePolicy,
@@ -311,7 +316,7 @@ impl SandboxBackend for FirecrackerSandbox {
             .map_err(SandboxCaptureError::from)?;
         let snapshot_dir = live_snapshot_root.path().join(Uuid::now_v7().to_string());
 
-        let (_, manifest) = match self.pause_to_dir(&snapshot_dir).await {
+        let (snapshot_config, manifest) = match self.pause_to_dir(&snapshot_dir).await {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 let snapshot_err = SandboxCaptureError::from(err);
@@ -328,6 +333,10 @@ impl SandboxBackend for FirecrackerSandbox {
                 return Err(snapshot_err);
             }
         };
+        // TODO(#120): Couple this update to an atomic mem_image.json commit and
+        // the dirty-epoch acknowledgement. Fork captures must use the same
+        // transaction before write-based dirty tracking can safely reset.
+        self.advance_memory_parent(&snapshot_config);
         FirecrackerSandbox::resume(self)
             .await
             .map_err(SandboxCaptureError::terminal)?;
@@ -458,6 +467,10 @@ impl SandboxExecutor for FirecrackerSandbox {
 // ── FirecrackerSandbox public API ────────────────────────────────────────────
 
 impl FirecrackerSandbox {
+    fn advance_memory_parent(&mut self, snapshot: &FirecrackerSnapshotConfig) {
+        self.current_memory_parent = Some(snapshot.mem_overlaybd_config.image_config_path.clone());
+    }
+
     fn snapshot_rootfs_virtual_size(&self) -> Result<u64> {
         self.current_rootfs_virtual_size.context(
             "rootfs virtual size cache missing; sandbox must record the user image block-device size before snapshot; ensure start() was called before pause() or snapshot",
@@ -690,17 +703,10 @@ impl FirecrackerSandbox {
             .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, memory_output)
             .await?;
 
-        // Build the memory image config: collect parent layers, make runtime
-        // lowers local to this snapshot dir, and compact only if the layer
-        // count exceeds the configured maximum.
-        let resume_mem_image_config_path = match &self.launch {
-            LaunchMode::Resume(config) => {
-                Some(config.mem_overlaybd_config.image_config_path.as_path())
-            }
-            LaunchMode::Fresh(_) => None,
-        };
+        // Build this capture over the latest locally complete memory image, not
+        // necessarily the image used to launch the Firecracker process.
         let mem_image_config = build_mem_snapshot_image_config(
-            resume_mem_image_config_path,
+            self.current_memory_parent.as_deref(),
             &mem_layer_path,
             snapshot_dir,
             memory_output,
@@ -1162,6 +1168,9 @@ impl FirecrackerSandbox {
         let runtime_policy = launch.common().runtime_policy;
         let current_network_policy = launch.common().network_policy.clone();
         let current_custom_extension_params = launch.common().custom_extension_params.clone();
+        let current_memory_parent = launch
+            .initial_memory_parent_image_config_path()
+            .map(Path::to_path_buf);
         debug!(work_dir = %work_dir.path().display(), "sandbox work directory prepared");
 
         Ok(Self {
@@ -1172,6 +1181,7 @@ impl FirecrackerSandbox {
                 LaunchMode::Resume(config) => config.common.rootfs_virtual_size,
             },
             launch,
+            current_memory_parent,
             work_dir,
             fc_instance,
             network_slot: None,
@@ -1870,6 +1880,15 @@ impl LaunchMode {
         }
     }
 
+    fn initial_memory_parent_image_config_path(&self) -> Option<&Path> {
+        match self {
+            LaunchMode::Fresh(_) => None,
+            LaunchMode::Resume(config) => {
+                Some(config.mem_overlaybd_config.image_config_path.as_path())
+            }
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         match self {
             LaunchMode::Fresh(config) => config.validate(),
@@ -2052,6 +2071,44 @@ mod tests {
         assert_eq!(bw.size, 100 << 20);
         assert_eq!(ops.refill_time, RATE_LIMIT_REFILL_TIME_MS);
         assert_eq!(ops.size, 3000);
+    }
+
+    #[test]
+    fn current_memory_parent_advances_without_changing_launch_provenance() -> Result<()> {
+        let fresh = FirecrackerSandbox::new(fresh_config())?;
+        assert!(fresh.current_memory_parent.is_none());
+
+        let launch_parent = PathBuf::from("launch/mem_image.json");
+        let snapshot = FirecrackerSnapshotConfig {
+            common: fresh_config().common,
+            vm_state_path: "launch/vm_state.bin".into(),
+            mem_overlaybd_config: OverlaybdConfig {
+                image_config_path: launch_parent.clone(),
+                read_only: true,
+                runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+            },
+            mem_virtual_size: 4096,
+            managed_snapshot_root: None,
+        };
+        let mut sandbox = FirecrackerSandbox::from_snapshot_config(&snapshot)?;
+
+        assert_eq!(
+            sandbox.current_memory_parent.as_deref(),
+            Some(launch_parent.as_path())
+        );
+        let captured_parent = PathBuf::from("capture/mem_image.json");
+        let mut captured = snapshot.clone();
+        captured.mem_overlaybd_config.image_config_path = captured_parent.clone();
+        sandbox.advance_memory_parent(&captured);
+        assert_eq!(
+            sandbox.current_memory_parent.as_deref(),
+            Some(captured_parent.as_path())
+        );
+        assert_eq!(
+            sandbox.launch.initial_memory_parent_image_config_path(),
+            Some(launch_parent.as_path())
+        );
+        Ok(())
     }
 
     #[test]
