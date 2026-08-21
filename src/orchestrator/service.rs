@@ -965,6 +965,70 @@ where
             }
         };
 
+        self.delete_sandbox_impl(sandbox_id, previous_state).await
+    }
+
+    async fn delete_expired_sandbox_inner(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        cutoff: SystemTime,
+    ) -> Result<bool> {
+        if !self
+            .claim_expired_running_sandbox(sandbox_id, cutoff, SandboxState::Killing)
+            .await?
+        {
+            return Ok(false);
+        }
+
+        self.delete_sandbox_impl(sandbox_id, SandboxState::Running)
+            .await?;
+        Ok(true)
+    }
+
+    async fn claim_expired_running_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        cutoff: SystemTime,
+        claimed_state: SandboxState,
+    ) -> Result<bool> {
+        match self
+            .store
+            .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
+                if metadata.is_expired(cutoff) {
+                    metadata.state = claimed_state;
+                }
+            })
+            .await
+        {
+            Ok(update) if update.current.state == claimed_state => Ok(true),
+            Ok(update) => {
+                debug!(
+                    expires_at = ?update.current.expires_at,
+                    ?cutoff,
+                    "skipping auto-eviction because sandbox expiry was updated"
+                );
+                Ok(false)
+            }
+            Err(StoreError::StateConflict { actual_state, .. }) => {
+                debug!(
+                    state = ?actual_state,
+                    "skipping auto-eviction because sandbox state changed"
+                );
+                Ok(false)
+            }
+            Err(StoreError::SandboxNotFound { .. }) => {
+                debug!("skipping auto-eviction because sandbox no longer exists");
+                Ok(false)
+            }
+            Err(err) => Err(OrchestratorError::from(err)),
+        }
+    }
+
+    async fn delete_sandbox_impl(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        previous_state: SandboxState,
+    ) -> Result<()> {
         let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
 
         // If the sandbox is still in memory, attempt to stop it.
@@ -1089,6 +1153,26 @@ where
             Err(err) => return Err(OrchestratorError::from(err)),
         }
 
+        self.pause_sandbox_impl(sandbox_id).await
+    }
+
+    async fn pause_expired_sandbox_inner(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        cutoff: SystemTime,
+    ) -> Result<bool> {
+        if !self
+            .claim_expired_running_sandbox(sandbox_id, cutoff, SandboxState::Pausing)
+            .await?
+        {
+            return Ok(false);
+        }
+
+        self.pause_sandbox_impl(sandbox_id).await?;
+        Ok(true)
+    }
+
+    async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         // Pin paused runtime artifacts before detaching from the running set.
         let runtime_artifacts = {
             let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
@@ -1861,26 +1945,34 @@ where
             return Ok(Vec::new());
         }
 
-        let expired = self.store.list_expired(SystemTime::now()).await?;
+        let eviction_cutoff = SystemTime::now();
+        let expired = self.store.list_expired(eviction_cutoff).await?;
         let mut evicted_ids = Vec::new();
 
         for metadata in expired {
             if metadata.state != SandboxState::Running {
                 continue;
             }
-            if let Err(err) = match metadata.timeout_action {
-                SandboxTimeoutAction::Pause => self.pause_sandbox_inner(metadata.id).await,
-                SandboxTimeoutAction::Delete => self.delete_sandbox_inner(metadata.id).await,
-            } {
-                warn!(
+            let result = match metadata.timeout_action {
+                SandboxTimeoutAction::Pause => {
+                    self.pause_expired_sandbox_inner(metadata.id, eviction_cutoff)
+                        .await
+                }
+                SandboxTimeoutAction::Delete => {
+                    self.delete_expired_sandbox_inner(metadata.id, eviction_cutoff)
+                        .await
+                }
+            };
+            match result {
+                Ok(true) => evicted_ids.push(metadata.id),
+                Ok(false) => continue,
+                Err(err) => warn!(
                     sandbox_id = %metadata.id,
                     action = ?metadata.timeout_action,
                     error = ?err,
                     "failed to auto-evict expired sandbox"
-                );
-                continue;
+                ),
             }
-            evicted_ids.push(metadata.id);
         }
 
         Ok(evicted_ids)
