@@ -289,7 +289,7 @@ Component sections:
 |---------|-----|------|---------|-------------|
 | `[pool.network]` | `maintenance_enabled` | boolean | `true` | Enable the background network-slot maintenance worker |
 | `[pool.block]` | `enabled` | boolean | `true` | Enable the ublk overlaybd warm-device pool |
-| `[pool.block]` | `startup_prewarm` | boolean | `true` | Prewarm block devices after the first reusable image shape is known |
+| `[pool.block]` | `startup_prewarm` | boolean | capability-based | Prewarm block devices after the first reusable image shape is known. When omitted, it is enabled only if the kernel supports `UBLK_F_UPDATE_SIZE`; an explicit value overrides detection |
 | `[pool.firecracker]` | `enabled` | boolean | `true` | Enable pre-spawned Firecracker processes for snapshot resume |
 | `[pool.firecracker]` | `maintenance_enabled` | boolean | `true` | Enable the background Firecracker process maintenance worker |
 | `[pool.firecracker]` | `startup_prewarm` | boolean | `true` | Spawn warm Firecracker entries up to the low watermark during server startup |
