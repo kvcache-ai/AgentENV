@@ -21,8 +21,6 @@ use std::time::{Duration, Instant};
 const EXIT_SANDBOX_PAUSED: i32 = 130;
 const WATCHDOG_INTERVAL: Duration = Duration::from_secs(1);
 const PAUSE_STATE_PROBE_INTERVAL: Duration = Duration::from_secs(5);
-const SESSION_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
-const SESSION_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const INPUT_OUTPUT_STALL_TIMEOUT: Duration = Duration::from_millis(500);
 // agentenv proxy has PROXY_REQUEST_BODY_IDLE_TIMEOUT of 30s
 const STREAM_INPUT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -51,8 +49,18 @@ pub fn run(args: Args) -> Result<()> {
 }
 
 pub(crate) async fn attach(client: &Client, sandbox_id: &str) -> Result<i32> {
-    let sandbox = client.connect_sandbox(sandbox_id, DEFAULT_TIMEOUT_SECS)?;
-
+    let connect_client = client.clone();
+    let connect_sandbox_id = sandbox_id.to_owned();
+    let sandbox = tokio::task::spawn_blocking(move || {
+        connect_client.connect_sandbox(&connect_sandbox_id, DEFAULT_TIMEOUT_SECS)
+    })
+    .await??;
+    let state = SessionState::new();
+    let _keepalive_task = super::keepalive::spawn_periodic(
+        client.clone(),
+        sandbox_id.to_owned(),
+        Arc::clone(&state.activity_generation),
+    );
     let (cols, rows) = terminal_size();
     let transport = Arc::new(client.transport(sandbox_id, sandbox.envd_access_token.as_deref())?);
     let mut last_error = None;
@@ -88,13 +96,11 @@ pub(crate) async fn attach(client: &Client, sandbox_id: &str) -> Result<i32> {
     let (stream, pid) = started.ok_or_else(|| {
         last_error.unwrap_or_else(|| anyhow::anyhow!("no shell candidates configured"))
     })?;
-
     let raw = RawModeGuard::enter()?;
     let selector = ProcessSelector {
         selector: Some(process_selector::Selector::Pid(pid)),
     };
 
-    let state = SessionState::new();
     let (stdin_tx, stdin_rx) = mpsc::unbounded();
     let (reconnect_tx, reconnect_rx) = mpsc::unbounded();
     let (reconnect_ack_tx, reconnect_ack_rx) = mpsc::unbounded();
@@ -222,6 +228,10 @@ impl SessionState {
         self.reconnect_generation.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_activity(&self) {
+        self.activity_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn output_generation(&self) -> u64 {
         self.output_activity.load(Ordering::Relaxed)
     }
@@ -229,14 +239,6 @@ impl SessionState {
     fn record_output(&self) {
         self.output_activity.fetch_add(1, Ordering::Relaxed);
         self.recovery_mode.store(false, Ordering::Relaxed);
-    }
-
-    fn activity_generation(&self) -> u64 {
-        self.activity_generation.load(Ordering::Relaxed)
-    }
-
-    fn record_activity(&self) {
-        self.activity_generation.fetch_add(1, Ordering::Relaxed);
     }
 
     fn finish_recovery(&self) {
@@ -695,8 +697,6 @@ async fn watchdog_loop(
     let mut unhealthy_since: Option<Instant> = None;
     let mut pending_input: Option<InputStallProbe> = None;
     let mut next_pause_probe = Instant::now() + PAUSE_STATE_PROBE_INTERVAL;
-    let mut next_keepalive = Instant::now() + SESSION_KEEPALIVE_INTERVAL;
-    let mut last_keepalive_activity = state.activity_generation();
 
     while !state.is_done() {
         tokio::time::sleep(WATCHDOG_INTERVAL).await;
@@ -772,13 +772,6 @@ async fn watchdog_loop(
             }
         }
 
-        if Instant::now() >= next_keepalive {
-            next_keepalive = Instant::now() + SESSION_KEEPALIVE_INTERVAL;
-            if should_refresh_session_keepalive(&state, &mut last_keepalive_activity) {
-                refresh_session_keepalive(client.clone(), sandbox_id.clone()).await;
-            }
-        }
-
         if Instant::now() >= next_pause_probe {
             next_pause_probe = Instant::now() + PAUSE_STATE_PROBE_INTERVAL;
             let pause_client = client.clone();
@@ -816,22 +809,6 @@ async fn envd_ready_probe(transport: Arc<Transport>) -> Result<bool> {
         Ok(Ok(())) => Ok(true),
         Ok(Err(_)) | Err(_) => Ok(false),
     }
-}
-
-fn should_refresh_session_keepalive(state: &SessionState, last_activity: &mut u64) -> bool {
-    let current_activity = state.activity_generation();
-    if current_activity == *last_activity {
-        return false;
-    }
-    *last_activity = current_activity;
-    true
-}
-
-async fn refresh_session_keepalive(client: Client, sandbox_id: String) {
-    let keepalive = tokio::task::spawn_blocking(move || {
-        let _ = client.refresh_sandbox(&sandbox_id, Some(DEFAULT_TIMEOUT_SECS));
-    });
-    let _ = tokio::time::timeout(SESSION_KEEPALIVE_TIMEOUT, keepalive).await;
 }
 
 #[derive(Copy, Clone)]
@@ -908,30 +885,6 @@ mod tests {
         .await;
 
         assert!(matches!(drained, OutputDrain::Disconnected));
-    }
-
-    #[test]
-    fn session_keepalive_refresh_requires_new_activity() {
-        let state = SessionState::new();
-        let mut last_activity = state.activity_generation();
-
-        assert!(!should_refresh_session_keepalive(
-            &state,
-            &mut last_activity
-        ));
-
-        state.record_activity();
-        assert!(should_refresh_session_keepalive(&state, &mut last_activity));
-        assert!(!should_refresh_session_keepalive(
-            &state,
-            &mut last_activity
-        ));
-
-        state.finish_recovery();
-        assert!(!should_refresh_session_keepalive(
-            &state,
-            &mut last_activity
-        ));
     }
 
     #[test]
