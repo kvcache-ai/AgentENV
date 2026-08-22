@@ -3,6 +3,7 @@ mod egress_proxy;
 mod iptables_util;
 mod manager;
 mod policy;
+mod resolver;
 mod slot;
 
 use std::path::Path;

@@ -49,7 +49,8 @@ The process contains one global `NetworkManager` and one global `EgressProxy` re
 | `Slot` | `src/sandbox/network/slot.rs` | One namespace, veth/TAP setup, address plan, namespace iptables, policy application, cleanup |
 | Address plan | `src/sandbox/network/address_plan.rs` | Slot-derived host interaction, veth, and VM-link addresses and internal deny ranges |
 | Policy | `src/sandbox/network/policy.rs` | API-normalized base/allow/deny semantics, absolute deny checks, proxy interception ports |
-| Egress proxy | `src/sandbox/network/egress_proxy.rs` | Namespace-local listener, original-destination inspection, Host/SNI parsing, trusted resolution, relay, staged policy state |
+| Egress proxy | `src/sandbox/network/egress_proxy.rs` | Namespace-local listener, original-destination inspection, Host/SNI parsing, relay, staged policy state |
+| Host resolver | `src/sandbox/network/resolver.rs` | Process-wide long-lived host-netns DNS worker used for trusted domain resolution |
 | Firecracker backend | `src/sandbox/firecracker/sandbox.rs` | Allocates/releases slots and applies the launch or updated policy at VM lifecycle boundaries |
 | Orchestrator/API | `src/orchestrator/`, `src/api/impls/sandbox.rs` | Validates requests, persists policy, and replaces the running sandbox policy |
 
@@ -161,7 +162,7 @@ The egress proxy is namespace-local and transparent. It does not terminate TLS o
 2. The listener accepts a connection and copies the active policy for that connection.
 3. The connection handler reads `SO_ORIGINAL_DST` to recover the destination altered by `REDIRECT`.
 4. It buffers the initial request/handshake up to 64 KiB and extracts HTTP `Host` or TLS ClientHello SNI. TLS handshake bytes are accumulated across record boundaries.
-5. A domain match is resolved through host-side DNS. Each candidate IPv4 address is checked by `SandboxNetworkPolicy::is_domain_allowed`, including absolute platform and internal-range denies, before it is selected.
+5. A domain match is sent to the process-wide resolver worker, which remains in the host network namespace. Each candidate IPv4 address is checked by `SandboxNetworkPolicy::is_domain_allowed`, including absolute platform and internal-range denies, before it is selected.
 6. A domain connection is dialed to the selected trusted address. An IP/CIDR connection uses the original destination after `is_ip_allowed`.
 7. The buffered preface is written to the upstream and both directions are relayed with half-close handling.
 

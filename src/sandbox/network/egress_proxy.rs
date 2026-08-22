@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -16,7 +16,7 @@ use nix::sched::{setns, CloneFlags};
 use tls_parser::{parse_tls_handshake_msg_client_hello, parse_tls_raw_record, TlsRecordType};
 use tracing::{debug, warn};
 
-use super::slot::host_ns_fd;
+use super::resolver::HostNetResolver;
 use super::SandboxNetworkPolicy;
 
 const MAX_PREFACE_BYTES: usize = 64 * 1024;
@@ -62,6 +62,7 @@ pub(crate) struct EgressProxy {
     listeners: Mutex<HashMap<Ipv4Addr, ListenerHandle>>,
     listener_start: Mutex<()>,
     active_connections: Arc<AtomicUsize>,
+    resolver: HostNetResolver,
 }
 
 impl fmt::Debug for EgressProxy {
@@ -100,6 +101,7 @@ impl EgressProxy {
             listeners: Mutex::new(HashMap::new()),
             listener_start: Mutex::new(()),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            resolver: HostNetResolver::new(),
         })
     }
 
@@ -247,6 +249,7 @@ impl EgressProxy {
             let _ = listener.stop.send(());
             let _ = listener.join.join();
         }
+        self.resolver.shutdown();
     }
 
     fn stop_listener(&self, host_interaction_ip: Ipv4Addr) {
@@ -377,8 +380,12 @@ fn handle_connection(
                 Err(_) => return,
             }
         };
-        let upstream = match select_upstream(&active_policy.policy, &hostname, original_addr)
-        {
+        let upstream = match select_upstream(
+            &active_policy.policy,
+            &proxy.resolver,
+            &hostname,
+            original_addr,
+        ) {
             UpstreamDecision::Forward(upstream) => upstream,
             UpstreamDecision::Deny => {
                 debug!(
@@ -438,6 +445,7 @@ fn handle_connection(
 /// semantics. IP/CIDR matches continue to use the guest's original destination.
 fn select_upstream(
     policy: &SandboxNetworkPolicy,
+    resolver: &HostNetResolver,
     hostname: &str,
     original_destination: SocketAddr,
 ) -> UpstreamDecision {
@@ -457,7 +465,7 @@ fn select_upstream(
         if !policy.is_domain_allowed(hostname, None) {
             return UpstreamDecision::Deny;
         }
-        return resolve_trusted_upstream(policy, hostname, original_destination.port())
+        return resolve_trusted_upstream(policy, resolver, hostname, original_destination.port())
             .map_or(UpstreamDecision::Unavailable, UpstreamDecision::Forward);
     }
     UpstreamDecision::Deny
@@ -465,33 +473,19 @@ fn select_upstream(
 
 fn resolve_trusted_upstream(
     policy: &SandboxNetworkPolicy,
+    resolver: &HostNetResolver,
     hostname: &str,
     port: u16,
 ) -> Option<SocketAddr> {
-    // The proxy connection thread is in the sandbox namespace. Resolve from
-    // the host namespace so guest-controlled /etc/hosts or DNS cannot redirect
-    // an allowed domain to an arbitrary endpoint.
-    let sandbox_ns = File::open("/proc/thread-self/ns/net").ok()?;
-    if let Err(error) = setns(host_ns_fd(), CloneFlags::CLONE_NEWNET) {
-        debug!(%error, %hostname, "egress proxy could not enter host namespace for trusted DNS resolution");
-        return None;
-    }
-
-    let resolved = (hostname, port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|addresses| {
-            addresses.into_iter().find(|address| {
-                matches!(address, SocketAddr::V4(address)
-                if policy.is_domain_allowed(hostname, Some(*address.ip())))
-            })
-        });
-
-    if let Err(error) = setns(sandbox_ns.as_fd(), CloneFlags::CLONE_NEWNET) {
-        warn!(%error, %hostname, "egress proxy could not restore sandbox namespace after trusted DNS resolution");
-        return None;
-    }
-    resolved
+    // The resolver worker stays in the host namespace, so guest-controlled
+    // /etc/hosts, DNS configuration, and routes cannot redirect this lookup.
+    resolver
+        .resolve(hostname, port)?
+        .into_iter()
+        .find(|address| {
+            matches!(address, SocketAddr::V4(address)
+            if policy.is_domain_allowed(hostname, Some(*address.ip())))
+        })
 }
 
 fn relay(mut client: TcpStream, mut upstream: TcpStream) {
@@ -733,10 +727,12 @@ mod tests {
             )
             .unwrap(),
         );
+        let resolver = HostNetResolver::new();
 
         assert!(matches!(
             select_upstream(
                 &policy,
+                &resolver,
                 "",
                 SocketAddr::from(([203, 0, 113, 10], 443)),
             ),
@@ -755,10 +751,12 @@ mod tests {
             )
             .unwrap(),
         );
+        let resolver = HostNetResolver::new();
 
         assert!(matches!(
             select_upstream(
                 &policy,
+                &resolver,
                 "",
                 SocketAddr::from(([8, 8, 8, 8], 443)),
             ),
