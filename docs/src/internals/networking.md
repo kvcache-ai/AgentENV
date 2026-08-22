@@ -179,7 +179,7 @@ The running policy update is a replacement operation:
 5. When proxy mediation is being enabled for a namespace with no active proxy policy, activate the prepared policy before installing the redirect. This preserves the namespace's previous default-allow behavior until the atomic iptables batch has completed; no connection can reach the listener through `REDIRECT` before that batch succeeds.
 6. If an update fails while an active proxy policy exists, discard the pending policy and retain the previous active policy.
 
-Each accepted connection holds a copy of the active policy selected at accept time. Therefore updates primarily affect new connections; existing relays are not proactively terminated.
+Each accepted connection holds a copy of the active policy selected at accept time. Therefore updates primarily affect new connections; existing relays are not proactively terminated. Removing a policy or a slot closes tracked handler sockets and joins their threads before namespace resources are removed.
 
 ### Namespace ownership
 

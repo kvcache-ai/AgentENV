@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -48,6 +48,18 @@ struct ConnectionPermit {
     active: Arc<AtomicUsize>,
 }
 
+struct ConnectionSockets {
+    client: TcpStream,
+    upstream: Option<TcpStream>,
+    cancel: Arc<AtomicBool>,
+    closed: bool,
+}
+
+struct ConnectionState {
+    sockets: HashMap<usize, Arc<Mutex<ConnectionSockets>>>,
+    joins: HashMap<usize, JoinHandle<()>>,
+}
+
 impl Drop for ConnectionPermit {
     fn drop(&mut self) {
         self.active.fetch_sub(1, Ordering::Relaxed);
@@ -62,6 +74,8 @@ pub(crate) struct EgressProxy {
     listeners: Mutex<HashMap<Ipv4Addr, ListenerHandle>>,
     listener_start: Mutex<()>,
     active_connections: Arc<AtomicUsize>,
+    next_connection_id: AtomicUsize,
+    connections: Mutex<HashMap<Ipv4Addr, ConnectionState>>,
     resolver: HostNetResolver,
 }
 
@@ -101,6 +115,8 @@ impl EgressProxy {
             listeners: Mutex::new(HashMap::new()),
             listener_start: Mutex::new(()),
             active_connections: Arc::new(AtomicUsize::new(0)),
+            next_connection_id: AtomicUsize::new(0),
+            connections: Mutex::new(HashMap::new()),
             resolver: HostNetResolver::new(),
         })
     }
@@ -229,6 +245,7 @@ impl EgressProxy {
             .expect("egress proxy active lock poisoned")
             .remove(&host_interaction_ip);
         self.stop_listener(host_interaction_ip);
+        self.stop_connections(host_interaction_ip);
     }
 
     pub(crate) fn has_active(&self, host_interaction_ip: Ipv4Addr) -> bool {
@@ -248,6 +265,16 @@ impl EgressProxy {
         for (_, listener) in listeners {
             let _ = listener.stop.send(());
             let _ = listener.join.join();
+        }
+        let hosts = self
+            .connections
+            .lock()
+            .expect("egress proxy connection lock poisoned")
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for host_interaction_ip in hosts {
+            self.stop_connections(host_interaction_ip);
         }
         self.resolver.shutdown();
     }
@@ -271,6 +298,131 @@ impl EgressProxy {
             .get(&host_interaction_ip)
             .cloned()
     }
+
+    fn register_connection(
+        &self,
+        host_interaction_ip: Ipv4Addr,
+        client: &TcpStream,
+    ) -> std::io::Result<(usize, Arc<AtomicBool>)> {
+        let id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sockets = Arc::new(Mutex::new(ConnectionSockets {
+            client: client.try_clone()?,
+            upstream: None,
+            cancel: Arc::clone(&cancel),
+            closed: false,
+        }));
+        self.connections
+            .lock()
+            .expect("egress proxy connection lock poisoned")
+            .entry(host_interaction_ip)
+            .or_insert_with(|| ConnectionState {
+                sockets: HashMap::new(),
+                joins: HashMap::new(),
+            })
+            .sockets
+            .insert(id, sockets);
+        Ok((id, cancel))
+    }
+
+    fn register_join(
+        &self,
+        host_interaction_ip: Ipv4Addr,
+        id: usize,
+        join: JoinHandle<()>,
+    ) -> Option<JoinHandle<()>> {
+        let mut connections = self
+            .connections
+            .lock()
+            .expect("egress proxy connection lock poisoned");
+        let Some(state) = connections.get_mut(&host_interaction_ip) else {
+            return Some(join);
+        };
+        state.joins.insert(id, join);
+        None
+    }
+
+    fn set_upstream_connection(
+        &self,
+        host_interaction_ip: Ipv4Addr,
+        id: usize,
+        upstream: &TcpStream,
+    ) {
+        let entry = self.connections.lock().ok().and_then(|connections| {
+            connections
+                .get(&host_interaction_ip)?
+                .sockets
+                .get(&id)
+                .cloned()
+        });
+        let Some(entry) = entry else { return };
+        let Ok(upstream) = upstream.try_clone() else {
+            return;
+        };
+        let Ok(mut sockets) = entry.lock() else {
+            return;
+        };
+        if sockets.closed {
+            let _ = upstream.shutdown(Shutdown::Both);
+        } else {
+            sockets.upstream = Some(upstream);
+        }
+    }
+
+    fn unregister_connection(&self, host_interaction_ip: Ipv4Addr, id: usize) {
+        if let Ok(mut connections) = self.connections.lock() {
+            if let Some(state) = connections.get_mut(&host_interaction_ip) {
+                state.sockets.remove(&id);
+            }
+        }
+    }
+
+    fn reap_finished(&self, host_interaction_ip: Ipv4Addr) {
+        let joins = self
+            .connections
+            .lock()
+            .ok()
+            .and_then(|mut connections| {
+                let state = connections.get_mut(&host_interaction_ip)?;
+                let finished = state
+                    .joins
+                    .iter()
+                    .filter_map(|(id, join)| join.is_finished().then_some(*id))
+                    .collect::<Vec<_>>();
+                Some(
+                    finished
+                        .into_iter()
+                        .filter_map(|id| state.joins.remove(&id))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .unwrap_or_default();
+        for join in joins {
+            let _ = join.join();
+        }
+    }
+
+    fn stop_connections(&self, host_interaction_ip: Ipv4Addr) {
+        let state = self
+            .connections
+            .lock()
+            .expect("egress proxy connection lock poisoned")
+            .remove(&host_interaction_ip);
+        let Some(state) = state else { return };
+        for sockets in state.sockets.values() {
+            if let Ok(mut sockets) = sockets.lock() {
+                sockets.closed = true;
+                sockets.cancel.store(true, Ordering::Release);
+                let _ = sockets.client.shutdown(Shutdown::Both);
+                if let Some(upstream) = sockets.upstream.as_ref() {
+                    let _ = upstream.shutdown(Shutdown::Both);
+                }
+            }
+        }
+        for join in state.joins.into_values() {
+            let _ = join.join();
+        }
+    }
 }
 
 impl Drop for EgressProxy {
@@ -284,6 +436,16 @@ impl Drop for EgressProxy {
             let _ = listener.stop.send(());
             let _ = listener.join.join();
         }
+        let hosts = self
+            .connections
+            .get_mut()
+            .expect("egress proxy connection lock poisoned")
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        for host_interaction_ip in hosts {
+            self.stop_connections(host_interaction_ip);
+        }
     }
 }
 
@@ -294,6 +456,7 @@ fn run_namespace_listener(
     host_interaction_ip: Ipv4Addr,
 ) {
     loop {
+        proxy.reap_finished(host_interaction_ip);
         if stop_rx.try_recv().is_ok() {
             break;
         }
@@ -313,17 +476,44 @@ fn run_namespace_listener(
                         continue;
                     }
                 };
-                let proxy = Arc::clone(&proxy);
-                if let Err(error) = thread::Builder::new()
+                let (connection_id, cancel) = match proxy
+                    .register_connection(host_interaction_ip, &stream)
+                {
+                    Ok(connection) => connection,
+                    Err(error) => {
+                        warn!(%host_interaction_ip, %error, "clone egress proxy connection failed");
+                        drop(permit);
+                        drop(stream);
+                        continue;
+                    }
+                };
+                let handler_proxy = Arc::clone(&proxy);
+                let join = thread::Builder::new()
                     .name("agentenv-egress-proxy-conn".to_string())
                     .spawn(move || {
                         let _permit = permit;
-                        handle_connection(stream, host_interaction_ip, proxy);
-                    })
-                {
-                    warn!(%host_interaction_ip, %error, "spawn egress proxy connection handler failed");
-                    // Dropping the stream rejects this connection and dropping
-                    // the permit makes the bounded handler count recover.
+                        handle_connection(
+                            stream,
+                            host_interaction_ip,
+                            connection_id,
+                            cancel,
+                            handler_proxy,
+                        );
+                    });
+                match join {
+                    Ok(join) => {
+                        if let Some(join) =
+                            proxy.register_join(host_interaction_ip, connection_id, join)
+                        {
+                            let _ = join.join();
+                        }
+                    }
+                    Err(error) => {
+                        proxy.unregister_connection(host_interaction_ip, connection_id);
+                        warn!(%host_interaction_ip, %error, "spawn egress proxy connection handler failed");
+                        // Dropping the stream rejects this connection and dropping
+                        // the permit makes the bounded handler count recover.
+                    }
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -340,11 +530,21 @@ fn run_namespace_listener(
 fn handle_connection(
     mut client: TcpStream,
     host_interaction_ip: Ipv4Addr,
+    connection_id: usize,
+    cancel: Arc<AtomicBool>,
     proxy: Arc<EgressProxy>,
 ) {
+    let _registration = ConnectionRegistration {
+        proxy: Arc::clone(&proxy),
+        host_interaction_ip,
+        connection_id,
+    };
     let Some(active_policy) = proxy.active_policy(host_interaction_ip) else {
         return;
     };
+    if cancel.load(Ordering::Acquire) {
+        return;
+    }
 
     let _ = client.set_read_timeout(Some(PREFACE_TIMEOUT));
     let mut preface = Vec::with_capacity(4096);
@@ -385,6 +585,7 @@ fn handle_connection(
             &proxy.resolver,
             &hostname,
             original_addr,
+            Some(&cancel),
         ) {
             UpstreamDecision::Forward(upstream) => upstream,
             UpstreamDecision::Deny => {
@@ -410,6 +611,9 @@ fn handle_connection(
         };
         (Some(hostname), upstream)
     };
+    if cancel.load(Ordering::Acquire) {
+        return;
+    }
 
     let mut upstream_stream = match TcpStream::connect_timeout(&upstream, UPSTREAM_TIMEOUT) {
         Ok(stream) => stream,
@@ -424,6 +628,11 @@ fn handle_connection(
             return;
         }
     };
+    if cancel.load(Ordering::Acquire) {
+        let _ = upstream_stream.shutdown(Shutdown::Both);
+        return;
+    }
+    proxy.set_upstream_connection(host_interaction_ip, connection_id, &upstream_stream);
     let _ = upstream_stream.set_read_timeout(None);
     let _ = client.set_read_timeout(None);
     if let Err(error) = upstream_stream.write_all(&preface) {
@@ -439,6 +648,19 @@ fn handle_connection(
     relay(client, upstream_stream);
 }
 
+struct ConnectionRegistration {
+    proxy: Arc<EgressProxy>,
+    host_interaction_ip: Ipv4Addr,
+    connection_id: usize,
+}
+
+impl Drop for ConnectionRegistration {
+    fn drop(&mut self) {
+        self.proxy
+            .unregister_connection(self.host_interaction_ip, self.connection_id);
+    }
+}
+
 /// Applies the proxy-backed capabilities in the active policy and selects the
 /// upstream connection. Domain matches are resolved in the host namespace and
 /// connected to the selected trusted address, matching E2B's trusted-resolution
@@ -448,6 +670,7 @@ fn select_upstream(
     resolver: &HostNetResolver,
     hostname: &str,
     original_destination: SocketAddr,
+    cancel: Option<&AtomicBool>,
 ) -> UpstreamDecision {
     let SocketAddr::V4(original_destination) = original_destination else {
         return UpstreamDecision::Unavailable;
@@ -465,8 +688,14 @@ fn select_upstream(
         if !policy.is_domain_allowed(hostname, None) {
             return UpstreamDecision::Deny;
         }
-        return resolve_trusted_upstream(policy, resolver, hostname, original_destination.port())
-            .map_or(UpstreamDecision::Unavailable, UpstreamDecision::Forward);
+        return resolve_trusted_upstream(
+            policy,
+            resolver,
+            hostname,
+            original_destination.port(),
+            cancel,
+        )
+        .map_or(UpstreamDecision::Unavailable, UpstreamDecision::Forward);
     }
     UpstreamDecision::Deny
 }
@@ -476,11 +705,12 @@ fn resolve_trusted_upstream(
     resolver: &HostNetResolver,
     hostname: &str,
     port: u16,
+    cancel: Option<&AtomicBool>,
 ) -> Option<SocketAddr> {
     // The resolver worker stays in the host namespace, so guest-controlled
     // /etc/hosts, DNS configuration, and routes cannot redirect this lookup.
     resolver
-        .resolve(hostname, port)?
+        .resolve(hostname, port, cancel)?
         .into_iter()
         .find(|address| {
             matches!(address, SocketAddr::V4(address)
@@ -735,6 +965,7 @@ mod tests {
                 &resolver,
                 "",
                 SocketAddr::from(([203, 0, 113, 10], 443)),
+                None,
             ),
             UpstreamDecision::Deny
         ));
@@ -759,6 +990,7 @@ mod tests {
                 &resolver,
                 "",
                 SocketAddr::from(([8, 8, 8, 8], 443)),
+                None,
             ),
             UpstreamDecision::Forward(SocketAddr::V4(destination))
                 if destination.ip() == &Ipv4Addr::new(8, 8, 8, 8)

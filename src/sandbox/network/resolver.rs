@@ -2,7 +2,7 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::sched::{setns, CloneFlags};
 use tracing::warn;
@@ -87,13 +87,21 @@ impl HostNetResolver {
         }
         let requests = (!joins.is_empty()).then_some(request_tx);
         Self {
+            // A failed thread spawn must not leave a queue with no consumer;
+            // resolve() then fails immediately instead of waiting for its
+            // response timeout on every request.
             requests: Mutex::new(requests),
             stopped: AtomicBool::new(false),
             joins: Mutex::new(joins),
         }
     }
 
-    pub(super) fn resolve(&self, hostname: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    pub(super) fn resolve(
+        &self,
+        hostname: &str,
+        port: u16,
+        cancel: Option<&AtomicBool>,
+    ) -> Option<Vec<SocketAddr>> {
         if self.stopped.load(Ordering::Acquire) {
             return None;
         }
@@ -111,10 +119,21 @@ impl HostNetResolver {
                 response: response_tx,
             })
             .ok()?;
-        response_rx
-            .recv_timeout(RESOLVER_RESPONSE_TIMEOUT)
-            .ok()
-            .flatten()
+        let deadline = Instant::now() + RESOLVER_RESPONSE_TIMEOUT;
+        loop {
+            if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match response_rx.recv_timeout(remaining.min(RESOLVER_STOP_POLL)) {
+                Ok(resolved) => return resolved,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
     }
 
     pub(super) fn shutdown(&self) {

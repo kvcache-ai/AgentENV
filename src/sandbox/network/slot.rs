@@ -464,7 +464,7 @@ impl Slot {
         let _transition = self
             .policy_transition
             .lock()
-            .expect("network policy transition lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let wants_rules = policy.is_some_and(SandboxNetworkPolicy::has_runtime_egress_rules);
         if !wants_rules && !self.user_egress_rules_present.load(Ordering::Acquire) {
             return Ok(());
@@ -839,7 +839,7 @@ impl Slot {
         let _transition = self
             .policy_transition
             .lock()
-            .expect("network policy transition lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Skip cleanup for slots that never attempted network setup.
         // This avoids touching host networking state for logical-only Slot values.
         if !self.cleanup_armed.swap(false, Ordering::AcqRel) {
