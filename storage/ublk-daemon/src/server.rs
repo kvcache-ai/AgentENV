@@ -321,23 +321,19 @@ impl UblkDaemonServer {
         self.resize_tool = Some(resize_tool);
     }
 
+    pub async fn detect_ublk_features(&self) -> Result<u64> {
+        detect_ublk_features(&self.ctrl_ring).await
+    }
+
     /// Enable warm pooling with the given configuration.
     /// Must be called before `run()`.
-    pub async fn enable_pool(&mut self, config: PoolConfig) -> Result<()> {
-        // Detect ublk features at startup.
-        let features = detect_ublk_features(&self.ctrl_ring).await?;
-        tracing::info!(
-            features = format!("{:#x}", features),
-            update_size_supported = features & ublk_caps::UBLK_F_UPDATE_SIZE != 0,
-            "detected ublk features"
-        );
+    pub fn enable_pool(&mut self, config: PoolConfig, features: u64) {
         self.pool_state = Some(Arc::new(PoolState::new(
             config,
             features,
             self.default_image_service.clone(),
             self.pool_placeholder_dir(),
         )));
-        Ok(())
     }
 
     /// Daemon-owned directory for warm-pool placeholder images, kept separate
