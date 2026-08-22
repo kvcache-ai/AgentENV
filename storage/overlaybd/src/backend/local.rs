@@ -1,27 +1,32 @@
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use nix::errno::Errno;
 use std::cmp::min;
 use std::ffi::CString;
 use std::fmt;
-use std::os::fd::{AsRawFd, RawFd};
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use tokio::fs::{File, OpenOptions};
-use tokio::sync::Mutex;
+use std::sync::Arc;
 
-use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile};
-use storage_util::io_ring::{self, IoRingHandle, IoUringSubmitter};
+use crate::io::virtual_file::VirtualFile;
+#[cfg(feature = "io-uring")]
+use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
+#[cfg(feature = "io-uring")]
+use storage_util::io_ring::{self, IoUringSubmitter};
 use storage_util::AlignedBuffer;
 
 const DIRECT_IO_ALIGNMENT: usize = 512;
+#[cfg(any(test, feature = "io-uring"))]
 const BUFFERED_PWRITE_FAST_PATH_MAX: usize = 4096;
 
 /// Builder for constructing a [`LocalFile`] with a fluent API.
 ///
 /// # Example
 /// ```ignore
-/// let file = LocalFile::builder(io_ring_handle)
+/// let file = LocalFile::builder()
 ///     .read(true)
 ///     .write(true)
 ///     .create(true)
@@ -35,11 +40,16 @@ pub struct LocalFileBuilder {
     truncate: bool,
     mode: u32,
     direct_io: bool,
-    io_ring: IoRingHandle,
+}
+
+impl Default for LocalFileBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LocalFileBuilder {
-    pub fn new(io_ring: IoRingHandle) -> Self {
+    pub fn new() -> Self {
         Self {
             read: true,
             write: true,
@@ -47,7 +57,6 @@ impl LocalFileBuilder {
             truncate: false,
             mode: 0o644,
             direct_io: false,
-            io_ring,
         }
     }
 
@@ -88,7 +97,7 @@ impl LocalFileBuilder {
     }
 
     /// Open the file at the given path with the configured options.
-    pub async fn open(self, path: impl AsRef<Path>) -> Result<LocalFile> {
+    pub fn open(self, path: impl AsRef<Path>) -> Result<LocalFile> {
         let path = path.as_ref().to_path_buf();
         let mut options = OpenOptions::new();
         options
@@ -101,80 +110,132 @@ impl LocalFileBuilder {
             options.custom_flags(libc::O_DIRECT);
         }
 
-        let file = options.open(&path).await?;
+        let file = options.open(&path)?;
         Ok(LocalFile {
-            path,
-            file: Mutex::new(file),
-            direct_io: self.direct_io,
-            io_ring: self.io_ring,
-            #[cfg(test)]
-            write_calls: std::sync::atomic::AtomicU64::new(0),
+            inner: Arc::new(LocalFileInner {
+                path,
+                file,
+                direct_io: self.direct_io,
+                #[cfg(test)]
+                write_calls: std::sync::atomic::AtomicU64::new(0),
+            }),
         })
     }
 }
 
-pub struct LocalFile {
+/// Shared state of a [`LocalFile`], held behind an `Arc`.
+///
+/// Split out from `LocalFile` so that the `'static` closures handed to
+/// [`tokio::task::spawn_blocking`] can own a cheap `Arc` clone. A closure that
+/// borrowed `&self` instead would not outlive the async method's frame, which
+/// `spawn_blocking`'s `'static` bound rejects.
+struct LocalFileInner {
     path: PathBuf,
-    file: Mutex<File>,
+    file: File,
     direct_io: bool,
-    io_ring: IoRingHandle,
-    /// Test-only probe counting synchronous pwrite submissions (the
+    /// Test-only probe counting synchronous positional-write submissions (the
     /// buffered small-write fast path plus explicit sync-pwrite calls).
     #[cfg(test)]
     write_calls: std::sync::atomic::AtomicU64,
 }
 
+pub struct LocalFile {
+    inner: Arc<LocalFileInner>,
+}
+
 impl fmt::Debug for LocalFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("LocalFile")
-            .field("path", &self.path)
+            .field("path", &self.inner.path)
             .finish_non_exhaustive()
     }
 }
 
 impl LocalFile {
-    /// Create a [`LocalFileBuilder`] with the given `IoRingHandle`.
+    /// Create a [`LocalFileBuilder`].
     ///
     /// The builder defaults to read+write+create, mode 0o644, no truncate, no
     /// direct I/O – the same defaults the old `LocalFileOpenOptions::default()`
     /// had.
-    pub fn builder(io_ring: IoRingHandle) -> LocalFileBuilder {
-        LocalFileBuilder::new(io_ring)
+    pub fn builder() -> LocalFileBuilder {
+        LocalFileBuilder::new()
     }
 
     /// Convenience: create-and-truncate (equivalent to the old `LocalFile::new`).
-    pub async fn new(path: impl AsRef<Path>, io_ring: IoRingHandle) -> Result<Self> {
-        Self::builder(io_ring).truncate(true).open(path).await
+    pub fn new(path: impl AsRef<Path>) -> Result<Self> {
+        Self::builder().truncate(true).open(path)
     }
 
     /// Convenience: open read-only (equivalent to the old `LocalFile::open_ro`).
-    pub async fn open_ro(path: impl AsRef<Path>, io_ring: IoRingHandle) -> Result<Self> {
-        Self::builder(io_ring)
-            .write(false)
-            .create(false)
-            .open(path)
-            .await
+    pub fn open_ro(path: impl AsRef<Path>) -> Result<Self> {
+        Self::builder().write(false).create(false).open(path)
     }
 
     /// Convenience: open read-write with optional create (equivalent to the old
     /// `LocalFile::open_rw`).
-    pub async fn open_rw(
-        path: impl AsRef<Path>,
-        create: bool,
-        io_ring: IoRingHandle,
-    ) -> Result<Self> {
-        Self::builder(io_ring).create(create).open(path).await
+    pub fn open_rw(path: impl AsRef<Path>, create: bool) -> Result<Self> {
+        Self::builder().create(create).open(path)
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.inner.path
     }
 
-    /// Test-only probe: number of synchronous pwrite submissions issued
+    /// Test-only probe: number of synchronous positional-write submissions issued
     /// through the buffered small-write fast path and
     /// [`Self::write_at_sync_pwrite`].
     #[cfg(test)]
     pub fn write_calls(&self) -> u64 {
+        self.inner.write_calls()
+    }
+
+    /// Write the whole buffer with one synchronous positional write, bypassing
+    /// io_uring.
+    ///
+    /// This intentionally blocks the current thread for the duration of the
+    /// syscall. The caller guarantees all of the following:
+    /// - exclusive access to the file (no concurrent operations through this
+    ///   `LocalFile`);
+    /// - the file lives on local storage backed by page cache (buffered, not
+    ///   O_DIRECT, not a network filesystem), so the syscall returns quickly;
+    /// - blocking the calling thread (typically a Tokio `LocalSet` thread)
+    ///   for one syscall is acceptable.
+    ///
+    /// For large buffered local writes this is cheaper than the io_uring
+    /// submit/completion round trip; slow storage can still stall the
+    /// thread, which is why the entry point is explicit rather than part of
+    /// the async `write_at` path.
+    pub fn write_at_sync_pwrite(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        self.inner.write_at_sync_pwrite(offset, buf)
+    }
+
+    /// Run one blocking file operation on the Tokio blocking pool.
+    ///
+    /// The closure receives an owned `Arc<LocalFileInner>` clone rather than a
+    /// borrow of `self`, which is what lets it satisfy `spawn_blocking`'s
+    /// `'static` bound.
+    ///
+    /// On the ublk queue threads (`current_thread` runtime driving a
+    /// `LocalSet`) awaiting the join handle parks the runtime, which runs the
+    /// `on_thread_park` io_uring submit and lets the other queue tasks make
+    /// progress — the whole point of not running these syscalls inline.
+    async fn offload<F, T>(&self, op: &'static str, f: F) -> Result<T>
+    where
+        F: FnOnce(&LocalFileInner) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || f(&inner))
+            .await
+            .map_err(|e| anyhow!("LocalFile {op} join blocking task failed: {e:?}"))
+            .flatten()
+    }
+}
+
+impl LocalFileInner {
+    /// Test-only probe, see [`LocalFile::write_calls`].
+    #[cfg(test)]
+    fn write_calls(&self) -> u64 {
         self.write_calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -209,70 +270,35 @@ impl LocalFile {
         Err(Errno::last().into())
     }
 
-    /// Synchronous small-write helper used only for the buffered fast path below.
+    /// Read as most `buf.len()` bytes into `buf`.
     ///
-    /// This intentionally blocks the current thread. For tiny buffered local
-    /// writes, the syscall cost is lower than the io_uring submit/completion
-    /// wakeup path, but slow storage can still stall the Tokio LocalSet thread.
-    fn pwrite_all(fd: RawFd, offset: u64, buf: &[u8]) -> Result<usize> {
-        let mut written = 0;
-        while written < buf.len() {
-            let write_offset = offset
-                .checked_add(written as u64)
-                .context("pwrite offset overflow")?;
-            let write_offset = Self::to_off_t(write_offset)?;
-            let remaining = &buf[written..];
-
-            let ret = unsafe {
-                libc::pwrite(
-                    fd,
-                    remaining.as_ptr() as *const libc::c_void,
-                    remaining.len(),
-                    write_offset,
-                )
-            };
-
-            if ret < 0 {
-                let err = Errno::last();
-                if err == Errno::EINTR {
+    /// Return the number of read bytes.
+    fn read_into_at(file: &File, offset: u64, buf: &mut [u8]) -> Result<usize> {
+        let mut read = 0;
+        while read < buf.len() {
+            let read_offset = offset
+                .checked_add(read as u64)
+                .context("read_up_to_at offset overflow")?;
+            match file.read_at(&mut buf[read..], read_offset) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
                     continue;
                 }
-                return Err(err.into());
+                Err(error) => return Err(error.into()),
             }
-            if ret == 0 {
-                bail!("pwrite returned zero bytes");
-            }
-
-            written += usize::try_from(ret).context("pwrite byte count overflow")?;
         }
-        Ok(written)
+        Ok(read)
     }
 
-    /// Write the whole buffer with one synchronous `pwrite`, bypassing
-    /// io_uring.
-    ///
-    /// This intentionally blocks the current thread for the duration of the
-    /// syscall. The caller guarantees all of the following:
-    /// - exclusive access to the file (no concurrent operations through this
-    ///   `LocalFile`), so the file mutex is always uncontended;
-    /// - the file lives on local storage backed by page cache (buffered, not
-    ///   O_DIRECT, not a network filesystem), so the syscall returns quickly;
-    /// - blocking the calling thread (typically a Tokio `LocalSet` thread)
-    ///   for one syscall is acceptable.
-    ///
-    /// For large buffered local writes this is cheaper than the io_uring
-    /// submit/completion round trip; slow storage can still stall the
-    /// thread, which is why the entry point is explicit rather than part of
-    /// the async `write_at` path.
-    pub fn write_at_sync_pwrite(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+    /// Synchronous positional write of the whole buffer, see
+    /// [`LocalFile::write_at_sync_pwrite`].
+    fn write_at_sync_pwrite(&self, offset: u64, buf: &[u8]) -> Result<usize> {
         #[cfg(test)]
         self.write_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let file = self
-            .file
-            .try_lock()
-            .context("write_at_sync_pwrite requires exclusive access to the file")?;
-        Self::pwrite_all(file.as_raw_fd(), offset, buf)
+        self.file.write_all_at(buf, offset)?;
+        Ok(buf.len())
     }
 
     fn align_down(value: u64, alignment: u64) -> u64 {
@@ -285,29 +311,18 @@ impl LocalFile {
         value.saturating_add(alignment - 1) & !(alignment - 1)
     }
 
-    /// Get the raw fd by locking the file mutex.
-    async fn raw_fd(&self) -> std::os::fd::RawFd {
-        let file = self.file.lock().await;
-        file.as_raw_fd()
-    }
-
-    async fn read_buffered_at<S>(&self, submitter: &S, offset: u64, len: usize) -> Result<Bytes>
-    where
-        S: IoUringSubmitter + ?Sized,
-    {
-        let fd = self.raw_fd().await;
+    /// Read at most `len` bytes (as much as possible) started at `offset`.
+    ///
+    /// Note the returned Bytes might be shorter than `len`.
+    fn read_buffered_at(&self, offset: u64, len: usize) -> Result<Bytes> {
         let mut buf = vec![0u8; len];
-        let n = io_ring::read_exact_at(submitter, fd, &mut buf, offset).await?;
+        let n = Self::read_into_at(&self.file, offset, &mut buf)?;
         buf.truncate(n);
         Ok(Bytes::from(buf))
     }
 
-    async fn read_direct_at<S>(&self, submitter: &S, offset: u64, len: usize) -> Result<Bytes>
-    where
-        S: IoUringSubmitter + ?Sized,
-    {
-        let file = self.file.lock().await;
-        let size = file.metadata().await?.len();
+    fn read_direct_at(&self, offset: u64, len: usize) -> Result<Bytes> {
+        let size = self.file.metadata()?.len();
         if offset >= size {
             return Ok(Bytes::new());
         }
@@ -320,8 +335,102 @@ impl LocalFile {
         let aligned_end = Self::align_up(offset + expected as u64, alignment);
         let aligned_len = usize::try_from(aligned_end.saturating_sub(aligned_offset))
             .context("aligned read length overflow")?;
-        let fd = file.as_raw_fd();
-        drop(file);
+        let mut buffer = AlignedBuffer::new(aligned_len, DIRECT_IO_ALIGNMENT)?;
+        let got = Self::read_into_at(&self.file, aligned_offset, buffer.as_mut())?;
+        if got <= head {
+            return Ok(Bytes::new());
+        }
+        let tail = (head + expected).min(got);
+        let buffer = buffer.into_sub_range(head..tail)?;
+        Ok(Bytes::from_owner(buffer))
+    }
+
+    fn read_at_sync(&self, offset: u64, len: usize) -> Result<Bytes> {
+        if len == 0 {
+            return Ok(Bytes::new());
+        }
+        if self.direct_io {
+            return self.read_direct_at(offset, len);
+        }
+        self.read_buffered_at(offset, len)
+    }
+
+    fn read_at_into_sync(&self, offset: u64, dst: &mut [u8]) -> Result<usize> {
+        if dst.is_empty() {
+            return Ok(0);
+        }
+        if self.direct_io {
+            let data = self.read_direct_at(offset, dst.len())?;
+            let n = data.len();
+            dst[..n].copy_from_slice(&data);
+            return Ok(n);
+        }
+        Self::read_into_at(&self.file, offset, dst)
+    }
+
+    fn write_at_sync(&self, offset: u64, buf: &[u8]) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.direct_io {
+            ensure!(
+                offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64),
+                "write_at_sync: offset {offset} is not aligned to {DIRECT_IO_ALIGNMENT}"
+            );
+            ensure!(
+                buf.len().is_multiple_of(DIRECT_IO_ALIGNMENT),
+                "write_at_sync: buf len {} is not aligned to {DIRECT_IO_ALIGNMENT}",
+                buf.len()
+            );
+        }
+        #[cfg(test)]
+        self.write_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.direct_io && !(buf.as_ptr() as usize).is_multiple_of(DIRECT_IO_ALIGNMENT) {
+            let mut aligned = AlignedBuffer::new(buf.len(), DIRECT_IO_ALIGNMENT)?;
+            aligned.as_mut().copy_from_slice(buf);
+            self.file.write_all_at(aligned.as_ref(), offset)?;
+            return Ok(buf.len());
+        }
+        self.file.write_all_at(buf, offset)?;
+        Ok(buf.len())
+    }
+}
+
+/*
+ * Async read via IO URing
+ */
+#[cfg(feature = "io-uring")]
+impl LocalFileInner {
+    async fn read_buffered_at_via<S>(&self, submitter: &S, offset: u64, len: usize) -> Result<Bytes>
+    where
+        S: IoUringSubmitter + ?Sized,
+    {
+        let fd = self.file.as_raw_fd();
+        let mut buf = vec![0u8; len];
+        let n = io_ring::read_exact_at(submitter, fd, &mut buf, offset).await?;
+        buf.truncate(n);
+        Ok(Bytes::from(buf))
+    }
+
+    async fn read_direct_at_via<S>(&self, submitter: &S, offset: u64, len: usize) -> Result<Bytes>
+    where
+        S: IoUringSubmitter + ?Sized,
+    {
+        let size = self.file.metadata()?.len();
+        if offset >= size {
+            return Ok(Bytes::new());
+        }
+
+        let expected = min((size - offset) as usize, len);
+        let alignment = DIRECT_IO_ALIGNMENT as u64;
+        let aligned_offset = Self::align_down(offset, alignment);
+        let head =
+            usize::try_from(offset - aligned_offset).context("read offset delta overflow")?;
+        let aligned_end = Self::align_up(offset + expected as u64, alignment);
+        let aligned_len = usize::try_from(aligned_end.saturating_sub(aligned_offset))
+            .context("aligned read length overflow")?;
+        let fd = self.file.as_raw_fd();
 
         let mut buffer = AlignedBuffer::new(aligned_len, DIRECT_IO_ALIGNMENT)?;
         // For O_DIRECT, we must use aligned memory.  io_uring still requires
@@ -345,7 +454,7 @@ impl LocalFile {
     /// If the caller's buffer pointer is already 512-byte aligned the write is submitted
     /// directly with no extra allocation or copy.  If the pointer is unaligned, the data is
     /// first copied into a temporary [`AlignedBuffer`] before the io_uring submission.
-    async fn write_direct_at<S>(&self, submitter: &S, offset: u64, buf: &[u8]) -> Result<usize>
+    async fn write_direct_at_via<S>(&self, submitter: &S, offset: u64, buf: &[u8]) -> Result<usize>
     where
         S: IoUringSubmitter + ?Sized,
     {
@@ -359,7 +468,7 @@ impl LocalFile {
             buf.len()
         );
 
-        let fd = self.raw_fd().await;
+        let fd = self.file.as_raw_fd();
 
         if (buf.as_ptr() as usize).is_multiple_of(DIRECT_IO_ALIGNMENT) {
             // Buffer pointer is already aligned — submit directly, no copy.
@@ -381,9 +490,9 @@ impl LocalFile {
             return Ok(Bytes::new());
         }
         if self.direct_io {
-            return self.read_direct_at(submitter, offset, len).await;
+            return self.read_direct_at_via(submitter, offset, len).await;
         }
-        self.read_buffered_at(submitter, offset, len).await
+        self.read_buffered_at_via(submitter, offset, len).await
     }
 
     /// Shared implementation of `read_at_into` parameterised on the submitter.
@@ -394,7 +503,7 @@ impl LocalFile {
         if dst.is_empty() {
             return Ok(0);
         }
-        let fd = self.raw_fd().await;
+        let fd = self.file.as_raw_fd();
 
         if self.direct_io {
             let dst_ptr = dst.as_mut_ptr() as usize;
@@ -409,7 +518,9 @@ impl LocalFile {
             } else {
                 // if dst not aligned, we need allocate an aligned buffer
                 // and copy into dst instead.
-                let data = self.read_direct_at(submitter, offset, dst.len()).await?;
+                let data = self
+                    .read_direct_at_via(submitter, offset, dst.len())
+                    .await?;
                 let n = data.len();
                 dst[..n].copy_from_slice(&data);
                 Ok(n)
@@ -428,10 +539,10 @@ impl LocalFile {
             return Ok(0);
         }
         if self.direct_io {
-            return self.write_direct_at(submitter, offset, buf).await;
+            return self.write_direct_at_via(submitter, offset, buf).await;
         }
 
-        self.write_buffered_at(submitter, offset, buf).await
+        self.write_buffered_at_via(submitter, offset, buf).await
     }
 
     /// Shared implementation of `write_bytes_at` parameterised on the submitter.
@@ -443,17 +554,21 @@ impl LocalFile {
             return Ok(0);
         }
         if self.direct_io {
-            return self.write_direct_at(submitter, offset, data).await;
+            return self.write_direct_at_via(submitter, offset, data).await;
         }
 
-        self.write_buffered_at(submitter, offset, data).await
+        self.write_buffered_at_via(submitter, offset, data).await
     }
 
-    async fn write_buffered_at<S>(&self, submitter: &S, offset: u64, buf: &[u8]) -> Result<usize>
+    async fn write_buffered_at_via<S>(
+        &self,
+        submitter: &S,
+        offset: u64,
+        buf: &[u8],
+    ) -> Result<usize>
     where
         S: IoUringSubmitter + ?Sized,
     {
-        let fd = self.raw_fd().await;
         if buf.len() <= BUFFERED_PWRITE_FAST_PATH_MAX {
             // Tradeoff: this is a synchronous syscall inside async code. It avoids
             // io_uring submit/completion overhead for 4 KiB data writes and tiny
@@ -461,9 +576,11 @@ impl LocalFile {
             #[cfg(test)]
             self.write_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return Self::pwrite_all(fd, offset, buf);
+            self.file.write_all_at(buf, offset)?;
+            return Ok(buf.len());
         }
 
+        let fd = self.file.as_raw_fd();
         Ok(io_ring::write_exact_at(submitter, fd, buf, offset).await?)
     }
 }
@@ -471,82 +588,126 @@ impl LocalFile {
 #[async_trait]
 impl VirtualFile for LocalFile {
     async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
-        self.read_at_via(&self.io_ring, offset, len).await
+        if len == 0 {
+            return Ok(Bytes::new());
+        }
+        self.offload("read_at", move |inner| inner.read_at_sync(offset, len))
+            .await
     }
 
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         Some(self)
     }
 
+    /// TODO: this blocks the calling thread for the duration of the `pread`.
+    /// It cannot be offloaded with [`tokio::task::spawn_blocking`] because the
+    /// closure would have to capture `dst: &mut [u8]`, which does not satisfy
+    /// `spawn_blocking`'s `'static` bound; and because a `spawn_blocking` task
+    /// cannot be cancelled,
+    /// a raw-pointer workaround would let the blocking write outlive a dropped
+    /// future and scribble over freed memory. Making this properly async needs
+    /// either an ownership-passing variant of the trait method (hand the buffer
+    /// in and get it back, like `tokio-uring` does) or `block_in_place` gated
+    /// on the runtime flavor.
     async fn read_at_into(&self, offset: u64, dst: &mut [u8]) -> Result<usize> {
-        self.read_at_into_via(&self.io_ring, offset, dst).await
+        self.inner.read_at_into_sync(offset, dst)
     }
 
+    /// TODO: blocks the calling thread — see [`Self::read_at_into`] for why the
+    /// borrowed `buf` keeps this off `spawn_blocking`. Callers that already own
+    /// their payload should prefer [`Self::write_bytes_at`], which does offload.
     async fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize> {
-        self.write_at_via(&self.io_ring, offset, buf).await
+        self.inner.write_at_sync(offset, buf)
     }
 
     async fn write_bytes_at(&self, offset: u64, data: Bytes) -> Result<usize> {
-        self.write_bytes_at_via(&self.io_ring, offset, &data).await
+        if data.is_empty() {
+            return Ok(0);
+        }
+        self.offload("write_bytes_at", move |inner| {
+            inner.write_at_sync(offset, &data)
+        })
+        .await
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
         offset: u64,
         len: usize,
     ) -> LocalBoxFuture<'a, Result<Bytes>> {
-        Box::pin(self.read_at_via(ctx.ring(), offset, len))
+        Box::pin(self.inner.read_at_via(ctx.ring(), offset, len))
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
         offset: u64,
         dst: &'a mut [u8],
     ) -> LocalBoxFuture<'a, Result<usize>> {
-        Box::pin(self.read_at_into_via(ctx.ring(), offset, dst))
+        Box::pin(self.inner.read_at_into_via(ctx.ring(), offset, dst))
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
         offset: u64,
         data: &'a [u8],
     ) -> LocalBoxFuture<'a, Result<usize>> {
-        Box::pin(self.write_at_via(ctx.ring(), offset, data))
+        Box::pin(self.inner.write_at_via(ctx.ring(), offset, data))
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_bytes_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
         offset: u64,
         data: Bytes,
     ) -> LocalBoxFuture<'a, Result<usize>> {
-        Box::pin(async move { self.write_bytes_at_via(ctx.ring(), offset, &data).await })
+        Box::pin(async move {
+            self.inner
+                .write_bytes_at_via(ctx.ring(), offset, &data)
+                .await
+        })
     }
 
+    /// Deliberately inline: this is a bare `fstat`, served from the cached
+    /// inode with no I/O, and callers hit it often enough (LSMT stack open,
+    /// cache-store size refresh) that a `spawn_blocking` round trip would cost
+    /// more than the syscall it offloads.
     async fn size(&self) -> Result<u64> {
-        let file = self.file.lock().await;
-        Ok(file.metadata().await?.len())
+        Ok(self.inner.file.metadata()?.len())
     }
 
+    /// Offloaded: `ftruncate` is cheap when growing a sparse file, but a shrink
+    /// has to invalidate page cache and free extents while holding the inode
+    /// lock exclusively, so it can queue behind in-flight writeback or a
+    /// journal commit. It is never on the per-I/O path here (only LSMT
+    /// create/resize), so the offload is free.
     async fn truncate(&self, size: u64) -> Result<()> {
-        let file = self.file.lock().await;
-        file.set_len(size).await?;
-        Ok(())
+        self.offload("truncate", move |inner| {
+            inner.file.set_len(size)?;
+            Ok(())
+        })
+        .await
     }
 
+    /// Offloaded: `fsync` has unbounded latency — it waits for writeback of
+    /// every dirty page plus a device flush.
     async fn sync(&self) -> Result<()> {
-        let file = self.file.lock().await;
-        file.sync_all().await?;
-        Ok(())
+        self.offload("sync", |inner| {
+            inner.file.sync_all()?;
+            Ok(())
+        })
+        .await
     }
 
     async fn seek_data(&self, offset: u64) -> Result<Option<u64>> {
-        let file = self.file.lock().await;
-        let fd = file.as_raw_fd();
-        let off = Self::to_off_t(offset)?;
+        let fd = self.inner.file.as_raw_fd();
+        let off = LocalFileInner::to_off_t(offset)?;
         let result = unsafe { libc::lseek(fd, off, libc::SEEK_DATA) };
         if result < 0 {
             let err = Errno::last();
@@ -561,9 +722,8 @@ impl VirtualFile for LocalFile {
     }
 
     async fn seek_hole(&self, offset: u64) -> Result<Option<u64>> {
-        let file = self.file.lock().await;
-        let fd = file.as_raw_fd();
-        let off = Self::to_off_t(offset)?;
+        let fd = self.inner.file.as_raw_fd();
+        let off = LocalFileInner::to_off_t(offset)?;
         let result = unsafe { libc::lseek(fd, off, libc::SEEK_HOLE) };
         if result < 0 {
             let err = Errno::last();
@@ -577,28 +737,53 @@ impl VirtualFile for LocalFile {
         Ok(Some(val))
     }
 
+    /// Offloaded: `FALLOC_FL_PUNCH_HOLE` is real filesystem work (freeing
+    /// extents plus a journal commit), not a hint, and it sits on a
+    /// guest-triggerable path — a guest `fstrim` reaches here in a loop from
+    /// `LSMTFile::discard_range`. Inline it would stall every in-flight I/O on
+    /// the ublk queue thread.
+    ///
+    /// The yield point this adds only widens an existing window:
+    /// `discard_range` takes the index write lock *after* this call returns, so
+    /// a concurrent read could already see the punched-but-not-yet-remapped
+    /// range. Such a read resolves through the old mapping into the punched
+    /// region and gets zeros, which is what a completed discard means anyway.
     async fn discard(&self, offset: u64, len: u64) -> Result<()> {
         if len == 0 {
             return Ok(());
         }
-        let file = self.file.lock().await;
-        Self::punch_hole_keep_size(file.as_raw_fd(), offset, len)
+        self.offload("discard", move |inner| {
+            LocalFileInner::punch_hole_keep_size(inner.file.as_raw_fd(), offset, len)
+        })
+        .await
     }
 
+    /// Offloaded: `POSIX_FADV_DONTNEED` is a hint, but servicing it still walks
+    /// the page cache over the range and can queue behind writeback of any
+    /// dirty page it finds. No caller is on a hot path — the only in-tree ones
+    /// are the ZFile checksum/decompress retry branches — so the offload costs
+    /// nothing. Awaiting it keeps the ordering those retries rely on: the
+    /// eviction completes before the range is re-read.
     async fn evict_range(&self, offset: u64, len: u64) -> Result<()> {
-        let file = self.file.lock().await;
-        Self::posix_fadvise_dontneed(file.as_raw_fd(), offset, len)
+        self.offload("evict_range", move |inner| {
+            LocalFileInner::posix_fadvise_dontneed(inner.file.as_raw_fd(), offset, len)
+        })
+        .await
     }
 
+    /// Offloaded for the same reason as [`Self::evict_range`], and more so:
+    /// `len == 0` means "to end of file", so this walks the page cache of an
+    /// entire layer file.
     async fn evict_all(&self) -> Result<()> {
-        let file = self.file.lock().await;
-        Self::posix_fadvise_dontneed(file.as_raw_fd(), 0, 0)
+        self.offload("evict_all", |inner| {
+            LocalFileInner::posix_fadvise_dontneed(inner.file.as_raw_fd(), 0, 0)
+        })
+        .await
     }
 
     async fn fgetxattr(&self, name: &str) -> Result<Vec<u8>> {
         let cname = CString::new(name).context("xattr name contains interior NUL byte")?;
-        let file = self.file.lock().await;
-        let fd = file.as_raw_fd();
+        let fd = self.inner.file.as_raw_fd();
 
         // SAFETY: fd and C string are valid; null buffer with size 0 is allowed to query length.
         let need = unsafe { libc::fgetxattr(fd, cname.as_ptr(), std::ptr::null_mut(), 0) };
@@ -625,8 +810,7 @@ impl VirtualFile for LocalFile {
     }
 
     async fn flistxattr(&self) -> Result<Vec<String>> {
-        let file = self.file.lock().await;
-        let fd = file.as_raw_fd();
+        let fd = self.inner.file.as_raw_fd();
 
         // SAFETY: fd is valid; null buffer with size 0 is allowed to query length.
         let need = unsafe { libc::flistxattr(fd, std::ptr::null_mut(), 0) };
@@ -655,8 +839,7 @@ impl VirtualFile for LocalFile {
 
     async fn fsetxattr(&self, name: &str, value: &[u8], flags: i32) -> Result<()> {
         let cname = CString::new(name).context("xattr name contains interior NUL byte")?;
-        let file = self.file.lock().await;
-        let fd = file.as_raw_fd();
+        let fd = self.inner.file.as_raw_fd();
         // SAFETY: fd/name/value pointers are valid for the supplied length.
         let ret = unsafe {
             libc::fsetxattr(
@@ -675,8 +858,7 @@ impl VirtualFile for LocalFile {
 
     async fn fremovexattr(&self, name: &str) -> Result<()> {
         let cname = CString::new(name).context("xattr name contains interior NUL byte")?;
-        let file = self.file.lock().await;
-        let fd = file.as_raw_fd();
+        let fd = self.inner.file.as_raw_fd();
         // SAFETY: fd/name are valid.
         let ret = unsafe { libc::fremovexattr(fd, cname.as_ptr()) };
         if ret != 0 {
@@ -689,20 +871,15 @@ impl VirtualFile for LocalFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::test_io_ring;
     use storage_util::AlignedBuffer;
     use tempfile::{NamedTempFile, TempDir};
 
     /// Open a fresh O_DIRECT file at `path` (truncated).
-    async fn open_direct_io_file(
-        path: impl AsRef<std::path::Path>,
-        ring: IoRingHandle,
-    ) -> LocalFile {
-        LocalFile::builder(ring)
+    fn open_direct_io_file(path: impl AsRef<std::path::Path>) -> LocalFile {
+        LocalFile::builder()
             .direct_io(true)
             .truncate(true)
             .open(path)
-            .await
             .expect("open direct-io file")
     }
 
@@ -710,10 +887,7 @@ mod tests {
     async fn test_local_file_write_at_preserves_offset_semantics() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("offset.bin");
-        let ring = test_io_ring();
-        let file = LocalFile::new(&path, ring)
-            .await
-            .expect("create local file");
+        let file = LocalFile::new(&path).expect("create local file");
 
         file.write_at(4096, &[0x22; 512])
             .await
@@ -740,9 +914,7 @@ mod tests {
     async fn test_local_file_small_buffered_write_at() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("small-write-at.bin");
-        let file = LocalFile::new(&path, test_io_ring())
-            .await
-            .expect("create local file");
+        let file = LocalFile::new(&path).expect("create local file");
 
         let payload = vec![0x5A; BUFFERED_PWRITE_FAST_PATH_MAX];
         let written = file
@@ -759,9 +931,7 @@ mod tests {
     async fn test_local_file_small_buffered_write_bytes_at() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("small-write-bytes-at.bin");
-        let file = LocalFile::new(&path, test_io_ring())
-            .await
-            .expect("create local file");
+        let file = LocalFile::new(&path).expect("create local file");
 
         let payload = Bytes::from(vec![0x6B; 257]);
         let written = file
@@ -778,9 +948,7 @@ mod tests {
     async fn test_local_file_large_buffered_write_at() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("large-write-at.bin");
-        let file = LocalFile::new(&path, test_io_ring())
-            .await
-            .expect("create local file");
+        let file = LocalFile::new(&path).expect("create local file");
 
         let payload = vec![0x7C; BUFFERED_PWRITE_FAST_PATH_MAX + 1];
         let written = file
@@ -799,8 +967,7 @@ mod tests {
     async fn test_write_direct_at_aligned_ptr_fast_path() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("aligned.bin");
-        let ring = test_io_ring();
-        let file = open_direct_io_file(&path, ring).await;
+        let file = open_direct_io_file(&path);
 
         // AlignedBuffer guarantees a 512-byte-aligned pointer — fast path.
         let mut wbuf = AlignedBuffer::new(512, DIRECT_IO_ALIGNMENT).expect("alloc");
@@ -822,8 +989,7 @@ mod tests {
     async fn test_write_direct_at_unaligned_ptr_bounce() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("bounce.bin");
-        let ring = test_io_ring();
-        let file = open_direct_io_file(&path, ring).await;
+        let file = open_direct_io_file(&path);
 
         // Allocate 513 bytes with 512-byte alignment.  The base pointer is
         // aligned, but sub_range(1..513) shifts it by one byte — guaranteed unaligned.
@@ -850,8 +1016,7 @@ mod tests {
     async fn test_write_direct_at_unaligned_offset_rejected() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("bad_offset.bin");
-        let ring = test_io_ring();
-        let file = open_direct_io_file(&path, ring).await;
+        let file = open_direct_io_file(&path);
 
         let err = file
             .write_at(1, &[0u8; 512])
@@ -870,8 +1035,7 @@ mod tests {
     async fn test_write_direct_at_unaligned_len_rejected() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("bad_len.bin");
-        let ring = test_io_ring();
-        let file = open_direct_io_file(&path, ring).await;
+        let file = open_direct_io_file(&path);
 
         let err = file
             .write_at(0, &[0u8; 100])
@@ -890,8 +1054,7 @@ mod tests {
     async fn test_write_bytes_at_direct_io() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("bytes_at.bin");
-        let ring = test_io_ring();
-        let file = open_direct_io_file(&path, ring).await;
+        let file = open_direct_io_file(&path);
 
         let data = bytes::Bytes::from(vec![0xBB_u8; 512]);
         file.write_bytes_at(0, data).await.expect("write_bytes_at");
@@ -906,7 +1069,7 @@ mod tests {
         let path = tmp.path().to_path_buf();
         drop(tmp);
 
-        let file = LocalFile::new(&path, test_io_ring()).await.unwrap();
+        let file = LocalFile::new(&path).unwrap();
         let data = file.read_at(0, 100).await.unwrap();
         assert_eq!(data.len(), 0);
     }
@@ -917,7 +1080,7 @@ mod tests {
         let path = tmp.path().to_path_buf();
         drop(tmp);
 
-        let file = LocalFile::new(&path, test_io_ring()).await.unwrap();
+        let file = LocalFile::new(&path).unwrap();
         file.write_at(0, &[0xAA; 512]).await.unwrap();
         file.sync().await.unwrap();
 

@@ -7,23 +7,18 @@ use anyhow::{Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::dense_export;
 use overlaybd::index_file::CommitArgs;
-use overlaybd::transient_io_ring::shared_transient_io_ring;
 use overlaybd::virtual_file::VirtualFile;
 
 pub(crate) async fn write_dense_overlaybd_layer_to_file(
     source: &Path,
     destination: &Path,
 ) -> Result<dense_export::DenseLayerDescriptor> {
-    let file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::new(destination, shared_transient_io_ring())
-            .await
-            .with_context(|| {
-                format!(
-                    "create dense overlaybd layer destination '{}'",
-                    destination.display()
-                )
-            })?,
-    );
+    let file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(destination).with_context(|| {
+        format!(
+            "create dense overlaybd layer destination '{}'",
+            destination.display()
+        )
+    })?);
     dense_export::write_dense_layer_to(source, CommitArgs::new(file.clone()).writer).await?;
     file.sync()
         .await

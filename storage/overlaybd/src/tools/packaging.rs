@@ -5,7 +5,6 @@ use anyhow::{bail, Context, Result};
 use tokio::io::AsyncReadExt;
 
 use crate::backend::local::LocalFile;
-use crate::io::transient_io_ring::shared_transient_io_ring;
 use crate::io::virtual_file::VirtualFile;
 use crate::lsmt::file::{
     compact_to, create_file_rw, create_mappings_from_sparse, CommitArgs, LayerInfo,
@@ -30,20 +29,17 @@ pub async fn package_ext4_as_overlaybd(
 
     let lower_tmp = output.with_extension("commit.tmp");
     let index_tmp = index.with_extension("index.tmp");
-    let io_ring = shared_transient_io_ring();
     let build_result = async {
         let virtual_size = tokio::fs::metadata(source)
             .await
             .with_context(|| format!("stat source rootfs failed: {}", source.display()))?
             .len();
         let data_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&lower_tmp, io_ring.clone())
-                .await
+            LocalFile::new(&lower_tmp)
                 .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
         );
         let index_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&index_tmp, io_ring)
-                .await
+            LocalFile::new(&index_tmp)
                 .with_context(|| format!("create temp index failed: {}", index_tmp.display()))?,
         );
         let lsmt = create_file_rw(LayerInfo::new(data_file, Some(index_file), virtual_size))
@@ -117,10 +113,8 @@ pub async fn package_raw_as_overlaybd_with_args(
         .await
         .with_context(|| format!("stat source raw file failed: {}", source.display()))?
         .len();
-    let io_ring = shared_transient_io_ring();
     let source_file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::open_ro(source, io_ring)
-            .await
+        LocalFile::open_ro(source)
             .with_context(|| format!("open source raw file failed: {}", source.display()))?,
     );
     let mappings = create_mappings_from_sparse(&source_file, 0)
@@ -143,10 +137,8 @@ pub async fn package_raw_as_overlaybd(source: &Path, output: &Path) -> Result<()
 
     let lower_tmp = output.with_extension("commit.tmp");
     let build_result = async {
-        let io_ring = shared_transient_io_ring();
         let output_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&lower_tmp, io_ring)
-                .await
+            LocalFile::new(&lower_tmp)
                 .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
         );
         let mut commit_args = CommitArgs::new(output_file);

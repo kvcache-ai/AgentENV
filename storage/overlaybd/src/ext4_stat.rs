@@ -60,7 +60,6 @@ pub async fn ext4_used_bytes(file: &Arc<dyn VirtualFile>) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::backend::local::LocalFile;
-    use crate::test_utils::test_io_ring;
 
     fn put16(buf: &mut [u8], offset: usize, value: u16) {
         buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
@@ -89,7 +88,7 @@ mod tests {
     async fn open_image(dir: &tempfile::TempDir, bytes: &[u8]) -> Arc<dyn VirtualFile> {
         let path = dir.path().join("dev.img");
         std::fs::write(&path, bytes).unwrap();
-        Arc::new(LocalFile::open_ro(&path, test_io_ring()).await.unwrap())
+        Arc::new(LocalFile::open_ro(&path).unwrap())
     }
 
     #[tokio::test]

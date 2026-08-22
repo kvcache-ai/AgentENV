@@ -18,7 +18,7 @@ use crate::lsmt::file::CommitArgs;
 
 #[cfg(feature = "full")]
 pub async fn export_upper_as_snapshot_layer(
-    image_service: &ImageService,
+    _image_service: &ImageService,
     image: &ImageFile,
     output_layer_path: &Path,
 ) -> Result<()> {
@@ -26,16 +26,13 @@ pub async fn export_upper_as_snapshot_layer(
         return Ok(());
     }
 
-    let output_file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::new(output_layer_path, image_service.io_ring(output_layer_path))
-            .await
-            .with_context(|| {
-                format!(
-                    "create overlaybd snapshot output failed: {}",
-                    output_layer_path.display()
-                )
-            })?,
-    );
+    let output_file: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(output_layer_path).with_context(|| {
+            format!(
+                "create overlaybd snapshot output failed: {}",
+                output_layer_path.display()
+            )
+        })?);
     image
         .export_upper_as_sealed(CommitArgs::new(output_file))
         .await
@@ -60,7 +57,6 @@ mod tests {
     use serde_json::json;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
-    use storage_util::io_ring::spawn_io_ring_worker;
     use tempfile::TempDir;
 
     fn write_global_config(temp: &TempDir) -> anyhow::Result<PathBuf> {
@@ -81,10 +77,8 @@ mod tests {
         index_path: &Path,
         payload: &[u8],
     ) -> anyhow::Result<()> {
-        let (io_ring, _join_handle) = spawn_io_ring_worker::<io_uring::squeue::Entry>(0);
-        let data_file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::new(path, io_ring.clone()).await?);
-        let index_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(index_path, io_ring).await?);
+        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path)?);
+        let index_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(index_path)?);
         let args = LayerInfo::new(data_file, Some(index_file), payload.len() as u64);
         let lower = create_file_rw(args).await?;
         lower.write_at(0, payload).await?;
@@ -145,9 +139,7 @@ mod tests {
         let snapshot_path = temp.path().join("snapshot.commit");
         export_upper_as_snapshot_layer(&image_service, &image, &snapshot_path).await?;
 
-        let snapshot_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_ro(&snapshot_path, image_service.io_ring(&snapshot_path)).await?,
-        );
+        let snapshot_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_ro(&snapshot_path)?);
         let snapshot = LSMTReadOnlyFile::open(snapshot_file).await?;
         let content = snapshot.read_at(0, 4096).await?;
         assert_eq!(content.as_ref(), &[0xAB; 4096]);

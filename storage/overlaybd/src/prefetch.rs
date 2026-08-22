@@ -1,4 +1,6 @@
-use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile};
+use crate::io::virtual_file::VirtualFile;
+#[cfg(feature = "io-uring")]
+use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
 use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -529,6 +531,7 @@ impl VirtualFile for PrefetchFile {
         self.src_file.fremovexattr(name).await
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -546,6 +549,7 @@ impl VirtualFile for PrefetchFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -567,6 +571,7 @@ impl VirtualFile for PrefetchFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -576,6 +581,7 @@ impl VirtualFile for PrefetchFile {
         Box::pin(self.src_file.write_at_with_ctx(ctx, offset, data))
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_bytes_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,

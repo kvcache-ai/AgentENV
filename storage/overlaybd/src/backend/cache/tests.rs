@@ -1,7 +1,6 @@
 use super::super::local::LocalFile;
 use super::*;
 use crate::io::virtual_file::VirtualFile;
-use crate::test_utils::test_io_ring;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -414,7 +413,7 @@ fn uniform_char_random_data(size: usize, seed: u64) -> Vec<u8> {
 }
 
 async fn write_local_file(path: &Path, data: &[u8]) -> Result<()> {
-    let file = LocalFile::new(path, test_io_ring()).await?;
+    let file = LocalFile::new(path)?;
     let _ = file.write_at(0, data).await?;
     file.sync().await?;
     Ok(())
@@ -685,11 +684,7 @@ async fn test_background_download_saturated_scheduler_completes_all_tasks() {
         write_local_file(&src_path, &payload)
             .await
             .expect("write source");
-        let source = Arc::new(
-            LocalFile::open_ro(&src_path, test_io_ring())
-                .await
-                .expect("open source"),
-        );
+        let source = Arc::new(LocalFile::open_ro(&src_path).expect("open source"));
         let file = backend
             .open_file_with_source_size(format!("saturated-{index}"), source, payload.len() as u64)
             .await
@@ -1327,11 +1322,7 @@ async fn test_ro_cached_fs_basic() {
         .await
         .expect("write source");
 
-    let source = Arc::new(
-        LocalFile::open_ro(&src_path, test_io_ring())
-            .await
-            .expect("open source"),
-    );
+    let source = Arc::new(LocalFile::open_ro(&src_path).expect("open source"));
     let mut opt = test_options(tmp.path());
     opt.block_size = 1024 * 1024;
     opt.capacity_bytes = 512 * 1024 * 1024;
@@ -1408,11 +1399,7 @@ async fn test_ro_cached_fs_basic() {
     write_local_file(&small_path, &small_payload)
         .await
         .expect("write small source");
-    let small_source = Arc::new(
-        LocalFile::open_ro(&small_path, test_io_ring())
-            .await
-            .expect("open small"),
-    );
+    let small_source = Arc::new(LocalFile::open_ro(&small_path).expect("open small"));
     let small_cached = backend
         .open_file("/testDir/small", small_source)
         .await
@@ -1433,11 +1420,7 @@ async fn test_ro_cached_fs_basic() {
     write_local_file(&refill_path, &refill_payload)
         .await
         .expect("write refill source");
-    let refill_source = Arc::new(
-        LocalFile::open_ro(&refill_path, test_io_ring())
-            .await
-            .expect("open refill"),
-    );
+    let refill_source = Arc::new(LocalFile::open_ro(&refill_path).expect("open refill"));
     let refill_cached = backend
         .open_file("/testDir/refill", refill_source)
         .await
@@ -1659,11 +1642,7 @@ async fn test_ro_cached_fs_xattr() {
         assert_eq!(ret, 0);
     }
 
-    let source = Arc::new(
-        LocalFile::open_rw(&path, false, test_io_ring())
-            .await
-            .expect("open source"),
-    );
+    let source = Arc::new(LocalFile::open_rw(&path, false).expect("open source"));
     let backend = FileCacheBackend::with_options(test_options(tmp.path()))
         .await
         .expect("backend");
@@ -2108,7 +2087,7 @@ async fn test_cached_fs_facade_open_access_rename_and_unlink() {
     let backend = FileCacheBackend::with_options(test_options(&tmp.path().join("cache")))
         .await
         .expect("backend");
-    let source_fs = Arc::new(LocalFsSource::new(&src_root, test_io_ring()));
+    let source_fs = Arc::new(LocalFsSource::new(&src_root));
     let cached_fs = CachedFs::new(Some(source_fs.clone()), backend.clone());
 
     let cached = cached_fs.open("/dir/file", 0).await.expect("open cached");
@@ -2212,7 +2191,7 @@ async fn test_cached_fs_facade_unlink_prefers_source_fs_status() {
     let backend = FileCacheBackend::with_options(test_options(&tmp.path().join("cache")))
         .await
         .expect("backend");
-    let source_fs = Arc::new(LocalFsSource::new(&src_root, test_io_ring()));
+    let source_fs = Arc::new(LocalFsSource::new(&src_root));
     let cached_fs = CachedFs::new(Some(source_fs), backend.clone());
 
     let cached = cached_fs.open("/unlink-me", 0).await.expect("open cached");
@@ -2249,7 +2228,7 @@ async fn test_cached_fs_facade_path_xattr_passthrough() {
     let backend = FileCacheBackend::with_options(test_options(&tmp.path().join("cache")))
         .await
         .expect("backend");
-    let source_fs = Arc::new(LocalFsSource::new(&src_root, test_io_ring()));
+    let source_fs = Arc::new(LocalFsSource::new(&src_root));
     let cached_fs = CachedFs::new(Some(source_fs), backend);
 
     let name = "user.cachedfsxattr";
@@ -2310,7 +2289,7 @@ async fn test_cached_fs_facade_source_fs_passthrough_misc() {
     let backend = FileCacheBackend::with_options(test_options(&tmp.path().join("cache")))
         .await
         .expect("backend");
-    let source_fs = Arc::new(LocalFsSource::new(&src_root, test_io_ring()));
+    let source_fs = Arc::new(LocalFsSource::new(&src_root));
     let cached_fs = CachedFs::new(Some(source_fs), backend);
 
     cached_fs

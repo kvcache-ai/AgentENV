@@ -5317,7 +5317,6 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "futures-util",
- "io-uring",
  "libc",
  "lz4-sys",
  "metrics",

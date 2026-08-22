@@ -10,7 +10,6 @@ use agentenv::sandbox::{
 use anyhow::{bail, Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::ImageConfig;
-use overlaybd::transient_io_ring::shared_transient_io_ring;
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::zfile::{is_zfile, zfile_open_ro, CompressOptions};
 
@@ -128,8 +127,7 @@ async fn assert_memory_layer_matches_config(snapshot: &FirecrackerSnapshotConfig
     };
 
     let file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::open_ro(&lower_path, shared_transient_io_ring())
-            .await
+        LocalFile::open_ro(&lower_path)
             .with_context(|| format!("open memory lower {}", lower_path.display()))?,
     );
     let zfile_flag = is_zfile(file.clone())

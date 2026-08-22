@@ -15,7 +15,6 @@ use agentenv_test_support::minio::{MinioFixture, MINIO_PASS, MINIO_USER};
 use anyhow::{Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::index_file::{CommitArgs, LSMTFile};
-use overlaybd::transient_io_ring::shared_transient_io_ring;
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::zfile::{CompressArgs, CompressOptions, ZFileCompactWriter};
 use sha2::{Digest, Sha256};
@@ -33,13 +32,12 @@ fn test_runtime_versions() -> SnapshotRuntimeVersions {
 /// Write a real ZFile-compressed sealed LSMT layer, mirroring the memory
 /// snapshot output when `[memory_snapshot].compression_enabled = true`.
 async fn write_zfile_memory_lower(path: &Path) -> Result<()> {
-    let io_ring = shared_transient_io_ring();
-    let data = Arc::new(LocalFile::new(path.with_extension("data"), io_ring.clone()).await?);
-    let index = Arc::new(LocalFile::new(path.with_extension("index"), io_ring.clone()).await?);
+    let data = Arc::new(LocalFile::new(path.with_extension("data"))?);
+    let index = Arc::new(LocalFile::new(path.with_extension("index"))?);
     let layer = LSMTFile::create(data, Some(index), 2 * 4096, false).await?;
     layer.write_at(0, &[0x5A; 4096]).await?;
     layer.write_at(4096, &[0xA5; 4096]).await?;
-    let output = Arc::new(LocalFile::new(path, io_ring).await?);
+    let output = Arc::new(LocalFile::new(path)?);
     let compress_args = CompressArgs::new(CompressOptions::new(
         CompressOptions::LZ4,
         CompressOptions::DEFAULT_BLOCK_SIZE,
