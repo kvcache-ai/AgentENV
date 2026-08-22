@@ -784,6 +784,20 @@ pub async fn create_mappings_from_sparse(
             continue;
         }
 
+        // The block arithmetic below truncates, and `end` is clamped to the file
+        // size, so an extent boundary that is not a multiple of ALIGNMENT would
+        // silently drop the trailing partial block: it would read back as zeros
+        // with no error raised anywhere. Both platforms report extent boundaries
+        // at filesystem-block granularity, so in practice this only fires on a
+        // source whose *size* is not a multiple of ALIGNMENT — which is worth
+        // rejecting loudly rather than truncating.
+        ensure!(
+            begin.is_multiple_of(ALIGNMENT) && end.is_multiple_of(ALIGNMENT),
+            "unaligned data extent [{begin}, {end}) reported for a file scanned by \
+             create_mappings_from_sparse: extent boundaries must be multiples of \
+             {ALIGNMENT} bytes"
+        );
+
         let mut logical = (begin - start_offset) / ALIGNMENT;
         let mut physical = begin / ALIGNMENT;
         let mut blocks = (end - begin) / ALIGNMENT;

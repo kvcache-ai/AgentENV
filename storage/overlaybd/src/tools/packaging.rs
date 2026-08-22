@@ -159,3 +159,124 @@ pub async fn package_raw_as_overlaybd(source: &Path, output: &Path) -> Result<()
 
     build_result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsmt::file::open_file_ro;
+    use std::os::unix::fs::FileExt;
+    use tempfile::TempDir;
+
+    const SECTOR: u64 = 512;
+
+    /// Create a `len`-byte file, then write `data_at` ranges into it, leaving the
+    /// rest unwritten. Whether the unwritten parts stay holes is up to the
+    /// filesystem — that is precisely the variable these tests must tolerate.
+    fn sparse_source(dir: &TempDir, len: u64, data_at: &[(u64, u8)]) -> std::path::PathBuf {
+        let path = dir.path().join("source.raw");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(len).unwrap();
+        for &(offset, fill) in data_at {
+            file.write_all_at(&vec![fill; SECTOR as usize], offset)
+                .unwrap();
+        }
+        file.sync_all().unwrap();
+        path
+    }
+
+    /// Read the whole sealed layer back in sector-aligned chunks.
+    async fn read_layer(path: &Path, len: u64) -> Vec<u8> {
+        let layer = open_file_ro(Arc::new(LocalFile::open_ro(path).unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(
+            layer.size().await.unwrap(),
+            len,
+            "virtual size must survive"
+        );
+
+        let chunk = 1024 * 1024;
+        let mut out = Vec::with_capacity(len as usize);
+        let mut offset = 0u64;
+        while offset < len {
+            let want = chunk.min((len - offset) as usize);
+            out.extend_from_slice(&layer.read_at(offset, want).await.unwrap());
+            offset += want as u64;
+        }
+        out
+    }
+
+    /// The property that makes it safe to run this packager where allocation is
+    /// speculative: however much the filesystem allocated beyond what was
+    /// written, the packaged layer reads back byte-for-byte identical to the
+    /// source. Copying an allocated-but-never-written range costs space, never
+    /// correctness, because it is read out of the source, where it reads as
+    /// zeros.
+    #[tokio::test]
+    async fn package_raw_preserves_source_content_whatever_the_extent_map_says() {
+        let dir = TempDir::new().unwrap();
+        let len = 8 * 1024 * 1024;
+        let source = sparse_source(
+            &dir,
+            len,
+            &[(0, 0xAA), (1024 * 1024, 0xBB), (len - SECTOR, 0xCC)],
+        );
+        let output = dir.path().join("layer.commit");
+
+        package_raw_as_overlaybd(&source, &output).await.unwrap();
+
+        assert_eq!(
+            read_layer(&output, len).await,
+            std::fs::read(&source).unwrap(),
+            "packaged layer must read back identical to the source"
+        );
+
+        // Only assert the space saving where the filesystem actually guarantees
+        // it. APFS allocates across gaps below a ~16-20 MiB threshold, so this
+        // 8 MiB source is legitimately fully allocated there.
+        #[cfg(target_os = "linux")]
+        {
+            let packaged = std::fs::metadata(&output).unwrap().len();
+            assert!(
+                packaged < len / 2,
+                "sparse scan should have skipped the holes, but packaged {packaged} of {len}"
+            );
+        }
+    }
+
+    /// A source with nothing written at all: the scan yields no mappings, and
+    /// every absent mapping reads back as zeros.
+    #[tokio::test]
+    async fn package_raw_handles_a_source_with_no_data_at_all() {
+        let dir = TempDir::new().unwrap();
+        let len = 2 * 1024 * 1024;
+        let source = sparse_source(&dir, len, &[]);
+        let output = dir.path().join("layer.commit");
+
+        package_raw_as_overlaybd(&source, &output).await.unwrap();
+
+        assert!(
+            read_layer(&output, len).await.iter().all(|&b| b == 0),
+            "an all-holes source must read back as all zeros"
+        );
+    }
+
+    /// The block arithmetic in `create_mappings_from_sparse` truncates, so an
+    /// unaligned source size would drop its trailing partial sector from the
+    /// index and read back as zeros. That must be an error, not silent loss.
+    #[tokio::test]
+    async fn package_raw_rejects_a_source_whose_size_is_not_sector_aligned() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("source.raw");
+        std::fs::write(&path, vec![0xAB; 1000]).unwrap();
+
+        let err = package_raw_as_overlaybd(&path, &dir.path().join("layer.commit"))
+            .await
+            .expect_err("an unaligned source size must be rejected");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("unaligned data extent"),
+            "expected an unaligned-extent error, got: {rendered}"
+        );
+    }
+}
