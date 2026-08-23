@@ -64,6 +64,7 @@ libc = "0.2"
 rtnetlink = "0.20"
 netlink-packet-route = "0.28"
 ipnetwork = { version = "0.21", features = ["serde"] }
+hickory-resolver = "0.26.1"
 futures = "0.3"
 tonic = "0.14.2"
 tonic-prost = "0.14.2"
