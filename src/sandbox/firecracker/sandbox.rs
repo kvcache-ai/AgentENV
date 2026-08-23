@@ -424,7 +424,7 @@ impl SandboxBackend for FirecrackerSandbox {
     }
 
     async fn update_network_policy(&mut self, policy: Option<SandboxNetworkPolicy>) -> Result<()> {
-        if let Some(slot) = self.network_slot.as_ref() {
+        if let Some(slot) = self.network_slot.as_mut() {
             slot.set_egress_policy(policy.as_ref())
                 .context("configure sandbox network policy")?;
             self.current_network_policy = policy;
@@ -1303,7 +1303,7 @@ impl FirecrackerSandbox {
         let netns = slot.namespace_path();
         self.network_slot = Some(slot);
         self.network_slot
-            .as_ref()
+            .as_mut()
             .expect("network slot was just assigned")
             .set_egress_policy(config.common.network_policy.as_ref())
             .context("Failed to configure sandbox egress policy")?;
@@ -1507,7 +1507,7 @@ impl FirecrackerSandbox {
 
             interaction_ip
         };
-        if let Some(slot) = self.network_slot.as_ref() {
+        if let Some(slot) = self.network_slot.as_mut() {
             slot.set_egress_policy(config.common.network_policy.as_ref())
                 .context("Failed to configure sandbox egress policy for resume")?;
         }

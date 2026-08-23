@@ -3,7 +3,6 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
@@ -61,11 +60,11 @@ pub(crate) struct Slot {
     address_plan: NetworkAddressPlan,
     netns_dir: PathBuf,
     egress_proxy: Arc<EgressProxy>,
-    cleanup_armed: AtomicBool,
+    cleanup_armed: bool,
     /// Whether this namespace's user egress chain currently contains rules.
     /// Warm-pool reuse preserves the namespace, so the next tenant may need to
     /// clear rules left by the previous tenant.
-    user_egress_rules_present: AtomicBool,
+    user_egress_rules_present: bool,
 }
 
 struct NamespaceSetup {
@@ -111,8 +110,8 @@ impl Slot {
             address_plan,
             netns_dir,
             egress_proxy,
-            cleanup_armed: AtomicBool::new(false),
-            user_egress_rules_present: AtomicBool::new(false),
+            cleanup_armed: false,
+            user_egress_rules_present: false,
         })
     }
 
@@ -127,10 +126,10 @@ impl Slot {
             host_interaction_ip = %self.host_interaction_ip
         )
     )]
-    pub(super) fn create_network(&self) -> Result<(), NetworkError> {
+    pub(super) fn create_network(&mut self) -> Result<(), NetworkError> {
         // Arm drop cleanup as soon as we begin touching kernel networking state.
         // If setup fails midway, Drop can still perform best-effort cleanup.
-        self.cleanup_armed.store(true, Ordering::Release);
+        self.cleanup_armed = true;
 
         // Capture individual fields rather than cloning `self`. Slot is not Clone
         // intentionally — a clone would carry Drop semantics and tear down the live
@@ -457,12 +456,15 @@ impl Slot {
         self.netns_dir.join(&self.namespace_id)
     }
 
-    pub(crate) fn set_egress_policy(&self, policy: Option<&SandboxNetworkPolicy>) -> Result<()> {
+    pub(crate) fn set_egress_policy(
+        &mut self,
+        policy: Option<&SandboxNetworkPolicy>,
+    ) -> Result<()> {
         // Policy updates run through the owning FirecrackerSandbox's mutable
         // operation lock; cleanup owns this Slot exclusively. Avoid holding a
         // second lock across namespace I/O, iptables, or proxy joins.
         let wants_rules = policy.is_some_and(SandboxNetworkPolicy::has_runtime_egress_rules);
-        if !wants_rules && !self.user_egress_rules_present.load(Ordering::Acquire) {
+        if !wants_rules && !self.user_egress_rules_present {
             return Ok(());
         }
 
@@ -500,8 +502,7 @@ impl Slot {
             Err(e) => Err(anyhow!("egress policy setup thread panicked: {:?}", e)),
         };
         if result.is_ok() {
-            self.user_egress_rules_present
-                .store(wants_rules, Ordering::Release);
+            self.user_egress_rules_present = wants_rules;
             if requires_egress_proxy && had_active_proxy_policy {
                 self.egress_proxy.activate(self.host_interaction_ip);
             } else if !requires_egress_proxy {
@@ -831,12 +832,13 @@ impl Slot {
             force_sync
         )
     )]
-    pub(super) fn cleanup(&self, force_sync: bool) -> Result<(), NetworkError> {
+    pub(super) fn cleanup(&mut self, force_sync: bool) -> Result<(), NetworkError> {
         // Skip cleanup for slots that never attempted network setup.
         // This avoids touching host networking state for logical-only Slot values.
-        if !self.cleanup_armed.swap(false, Ordering::AcqRel) {
+        if !self.cleanup_armed {
             return Ok(());
         }
+        self.cleanup_armed = false;
 
         // A namespace-local listener pins the namespace. Stop proxy acceptance
         // before removing the veth and unmounting the namespace, including
@@ -850,7 +852,7 @@ impl Slot {
             Self::delete_host_veth_interface(self.idx)
         };
         if let Err(e) = delete_result {
-            self.cleanup_armed.store(true, Ordering::Release);
+            self.cleanup_armed = true;
             return Err(NetworkError::NamespaceError(e));
         }
 
@@ -864,7 +866,7 @@ impl Slot {
                     Err(nix::errno::Errno::EINVAL) => break, // Not mounted anymore
                     Err(nix::errno::Errno::ENOENT) => break, // File removed by another process
                     Err(e) => {
-                        self.cleanup_armed.store(true, Ordering::Release);
+                        self.cleanup_armed = true;
                         return Err(NetworkError::NamespaceError(anyhow!(
                             "Failed to unmount netns: {}",
                             e
@@ -878,7 +880,7 @@ impl Slot {
                 Ok(_) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    self.cleanup_armed.store(true, Ordering::Release);
+                    self.cleanup_armed = true;
                     return Err(NetworkError::IoError(e));
                 }
             }
@@ -1123,29 +1125,28 @@ mod tests {
 
     #[test]
     fn empty_egress_policy_skips_known_clean_slot() {
-        let slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
+        let mut slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
         let empty_policy = SandboxNetworkPolicy::default();
 
         slot.set_egress_policy(None).unwrap();
         slot.set_egress_policy(Some(&empty_policy)).unwrap();
 
-        assert!(!slot.user_egress_rules_present.load(Ordering::Acquire));
+        assert!(!slot.user_egress_rules_present);
     }
 
     #[test]
     fn failed_egress_cleanup_keeps_slot_marked_dirty() {
-        let slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
-        slot.user_egress_rules_present
-            .store(true, Ordering::Release);
+        let mut slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
+        slot.user_egress_rules_present = true;
 
         assert!(slot.set_egress_policy(None).is_err());
 
-        assert!(slot.user_egress_rules_present.load(Ordering::Acquire));
+        assert!(slot.user_egress_rules_present);
     }
 
     #[test]
     fn failed_egress_apply_keeps_clean_slot_marked_clean() {
-        let slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
+        let mut slot = test_slot(1, NetworkAddressPlan::default()).unwrap();
         let policy = SandboxNetworkPolicy::new(
             true,
             crate::sandbox::network::BaseSandboxNetworkPolicy::Deny,
@@ -1154,7 +1155,7 @@ mod tests {
 
         assert!(slot.set_egress_policy(Some(&policy)).is_err());
 
-        assert!(!slot.user_egress_rules_present.load(Ordering::Acquire));
+        assert!(!slot.user_egress_rules_present);
     }
 
     #[test]
@@ -1164,7 +1165,7 @@ mod tests {
 
         // Use a free high slot ID to avoid collisions with dev/prod and stale
         // devices from interrupted test runs.
-        let slot = unused_test_slot();
+        let mut slot = unused_test_slot();
 
         // 1. Create Network
         // This requires CAP_NET_ADMIN and CAP_SYS_ADMIN.

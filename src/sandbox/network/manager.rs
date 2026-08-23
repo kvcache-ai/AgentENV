@@ -210,7 +210,7 @@ impl NetworkManager {
         self.cleanup_slot_and_release_bit_inner(slot, false)
     }
 
-    fn cleanup_slot_and_release_bit_inner(&self, slot: Slot, sync_cleanup: bool) -> Result<()> {
+    fn cleanup_slot_and_release_bit_inner(&self, mut slot: Slot, sync_cleanup: bool) -> Result<()> {
         let idx = slot.idx;
         let cleanup_result = slot.cleanup(sync_cleanup);
         let bitset_result = self.release_slot_bit(idx);
@@ -270,7 +270,7 @@ impl NetworkManager {
 
         match self.allocated.set_next_free_bit() {
             Some(idx) => {
-                let slot = Slot::new(
+                let mut slot = Slot::new(
                     idx as u32,
                     self.address_plan,
                     self.netns_dir.clone(),
