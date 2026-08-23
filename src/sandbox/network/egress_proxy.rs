@@ -651,6 +651,9 @@ fn handle_connection(
         );
         return;
     }
+    // Domain inspection is intentionally per TCP connection, matching E2B's
+    // initial Host/SNI inspection. Keep-alive HTTP requests on this relay are
+    // not reparsed independently after the connection has been authorized.
     relay(client, upstream_stream);
 }
 
@@ -760,9 +763,27 @@ fn parse_http_host(preface: &[u8]) -> Result<Option<String>> {
     let mut request = httparse::Request::new(&mut headers);
     match request.parse(preface).context("parse HTTP request")? {
         Status::Partial => Ok(None),
-        Status::Complete(_) => Ok(request.headers.iter().find_map(|header| {
-            (header.name.eq_ignore_ascii_case("host")).then(|| normalize_host(header.value))
-        })),
+        Status::Complete(_) => {
+            let host_headers = request
+                .headers
+                .iter()
+                .filter(|header| header.name.eq_ignore_ascii_case("host"))
+                .collect::<Vec<_>>();
+            match host_headers.as_slice() {
+                [] => Ok(None),
+                [header]
+                    if !header
+                        .value
+                        .iter()
+                        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace()) =>
+                {
+                    Ok(Some(normalize_host(header.value)))
+                }
+                // A malformed or duplicate Host header must not be authorized
+                // using only the first value; empty is fail-closed in policy.
+                _ => Ok(Some(String::new())),
+            }
+        }
     }
 }
 
@@ -902,6 +923,12 @@ mod tests {
                 .unwrap(),
             ""
         );
+    }
+
+    #[test]
+    fn duplicate_http_host_is_rejected() {
+        let request = b"GET / HTTP/1.1\r\nHost: example.com\r\nHost: other.example\r\n\r\n";
+        assert_eq!(parse_http_host(request).unwrap(), Some(String::new()));
     }
 
     #[test]
