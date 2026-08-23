@@ -1,5 +1,6 @@
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 pub const MAX_LAYER_CNT: usize = 256;
@@ -448,6 +449,8 @@ impl GlobalConfig {
 #[serde(default, rename_all = "camelCase")]
 pub struct AuthConfig {
     pub auths: serde_json::Value,
+    pub cred_helpers: HashMap<String, String>,
+    pub creds_store: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

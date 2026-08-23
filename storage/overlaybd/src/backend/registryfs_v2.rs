@@ -17,8 +17,11 @@ use std::cmp::min;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 use tokio::sync::{Mutex, Notify};
 
 const MIN_TOKEN_LIFE: Duration = Duration::from_secs(30);
@@ -277,7 +280,7 @@ impl RegistryFSImplV2 {
                 let raw = fs::read_to_string(path).context("read credential file")?;
                 let cfg: AuthConfig =
                     serde_json::from_str(&raw).context("parse credential file json failed")?;
-                Ok(parse_auths(&cfg.auths, remote_url))
+                resolve_docker_config_credentials(&cfg, remote_url, self.timeout).await
             }
             CredentialMode::Http { endpoint, timeout } => {
                 let mut url = Url::parse(endpoint)
@@ -1848,6 +1851,108 @@ fn parse_auths(auths: &Value, remote_url: &str) -> (String, String) {
     (String::new(), String::new())
 }
 
+/// Resolve Docker-compatible credentials from one config file.
+///
+/// Static `auths` entries win, matching Docker and regctl. When none matches,
+/// invoke the registry-specific `credHelpers` entry or the global `credsStore`
+/// helper. Invoking the helper on every resolution is deliberate: cloud
+/// registry credentials such as ECR tokens expire, while the helper can use a
+/// refreshable workload identity. The command is executed directly, never via
+/// a shell, and the helper suffix cannot name a path.
+async fn resolve_docker_config_credentials(
+    config: &AuthConfig,
+    remote_url: &str,
+    timeout: Duration,
+) -> Result<(String, String)> {
+    let static_credentials = parse_auths(&config.auths, remote_url);
+    if !static_credentials.0.is_empty() || !static_credentials.1.is_empty() {
+        return Ok(static_credentials);
+    }
+
+    let registry = registry_server(remote_url)?;
+    let helper = config
+        .cred_helpers
+        .get(&registry)
+        .filter(|value| !value.is_empty())
+        .or_else(|| (!config.creds_store.is_empty()).then_some(&config.creds_store));
+    let Some(helper) = helper else {
+        return Ok((String::new(), String::new()));
+    };
+
+    run_credential_helper(helper, &registry, timeout).await
+}
+
+fn registry_server(remote_url: &str) -> Result<String> {
+    let url = Url::parse(remote_url).context("parse registry URL for credential helper")?;
+    let host = url
+        .host_str()
+        .context("registry URL has no host for credential helper")?;
+    Ok(match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    })
+}
+
+async fn run_credential_helper(
+    helper: &str,
+    registry: &str,
+    timeout: Duration,
+) -> Result<(String, String)> {
+    if !helper
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("invalid Docker credential helper name {helper:?}");
+    }
+
+    let binary = format!("docker-credential-{helper}");
+    run_credential_helper_command(&binary, registry, timeout).await
+}
+
+async fn run_credential_helper_command(
+    binary: &str,
+    registry: &str,
+    timeout: Duration,
+) -> Result<(String, String)> {
+    let mut child = Command::new(binary)
+        .arg("get")
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("start Docker credential helper {binary}"))?;
+    child
+        .stdin
+        .take()
+        .context("credential helper stdin was not piped")?
+        .write_all(format!("{registry}\n").as_bytes())
+        .await
+        .context("write registry to Docker credential helper")?;
+
+    let output = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .with_context(|| format!("Docker credential helper {binary} timed out"))??;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("Docker credential helper {binary} failed: {stderr}");
+    }
+
+    let value: Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| format!("parse Docker credential helper {binary} response"))?;
+    let username = value
+        .get("Username")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("Docker credential helper response has no Username")?;
+    let secret = value
+        .get("Secret")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .context("Docker credential helper response has no Secret")?;
+    Ok((username.to_string(), secret.to_string()))
+}
+
 fn parse_blob_segments(remote_url: &str) -> Vec<String> {
     let without_scheme = if let Some(v) = remote_url.strip_prefix("http://") {
         v
@@ -2784,6 +2889,89 @@ mod tests {
         );
         assert_eq!(u, "alice");
         assert_eq!(p, "secret");
+    }
+
+    #[tokio::test]
+    async fn docker_credential_helper_receives_the_registry_and_returns_credentials() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let helper = temp.path().join("docker-credential-fixture");
+        fs::write(
+            &helper,
+            "#!/bin/sh\n[ \"$1\" = get ] || exit 20\nIFS= read -r registry\n[ \"$registry\" = 123456789012.dkr.ecr.us-east-1.amazonaws.com ] || exit 21\nprintf '%s\\n' '{\"Username\":\"AWS\",\"Secret\":\"short-lived-token\"}'\n",
+        )
+        .expect("write helper");
+        let mut permissions = fs::metadata(&helper)
+            .expect("helper metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&helper, permissions).expect("make helper executable");
+
+        let (username, password) = run_credential_helper_command(
+            helper.to_str().expect("UTF-8 helper path"),
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com",
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("credential helper result");
+
+        assert_eq!(username, "AWS");
+        assert_eq!(password, "short-lived-token");
+    }
+
+    #[tokio::test]
+    async fn static_docker_auth_wins_over_an_unavailable_helper() {
+        let config: AuthConfig = serde_json::from_value(json!({
+            "auths": {
+                "registry.example.com": {
+                    "username": "static-user",
+                    "password": "static-password"
+                }
+            },
+            "credHelpers": {
+                "registry.example.com": "this-helper-must-not-run"
+            }
+        }))
+        .expect("Docker config");
+
+        let credentials = resolve_docker_config_credentials(
+            &config,
+            "https://registry.example.com/v2/team/image/blobs/sha256:abc",
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("static credentials");
+
+        assert_eq!(
+            credentials,
+            ("static-user".to_string(), "static-password".to_string())
+        );
+    }
+
+    #[test]
+    fn docker_credential_helper_names_cannot_escape_to_a_path() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let error = runtime
+            .block_on(run_credential_helper(
+                "../../malicious",
+                "registry.example.com",
+                Duration::from_secs(1),
+            ))
+            .expect_err("path-like helper must be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("invalid Docker credential helper"));
+    }
+
+    #[test]
+    fn registry_server_preserves_an_explicit_port() {
+        assert_eq!(
+            registry_server("https://registry.example.com:5443/v2/team/image/blobs/sha256:abc")
+                .expect("registry server"),
+            "registry.example.com:5443"
+        );
     }
 
     #[test]

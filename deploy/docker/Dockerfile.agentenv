@@ -63,6 +63,7 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        amazon-ecr-credential-helper \
         curl \
         e2fsprogs \
         iproute2 \
