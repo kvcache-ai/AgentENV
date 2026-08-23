@@ -6,17 +6,20 @@ use std::{
     sync::OnceLock,
 };
 
+use ipnetwork::{IpNetwork, Ipv4Network};
+
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
 use crate::cfg::network::normalize_dns_name;
 
-pub const ALL_INTERNET_TRAFFIC_CIDR: &str = "0.0.0.0/0";
+pub const ALL_INTERNET_TRAFFIC_CIDR: IpNetwork =
+    IpNetwork::V4(Ipv4Network::new_checked(Ipv4Addr::UNSPECIFIED, 0).unwrap());
 
 const EGRESS_CHAIN: &str = "AGENTENV-EGRESS";
 const USER_EGRESS_CHAIN: &str = "AGENTENV-USER-EGRESS";
 const EGRESS_PROXY_CHAIN: &str = "AGENTENV-EGRESS-PROXY";
 const DOMAIN_INSPECTION_TCP_PORTS: &[u16] = &[80, 443];
 
-static PLATFORM_DENIED_CIDRS: OnceLock<Box<[String]>> = OnceLock::new();
+static PLATFORM_DENIED_CIDRS: OnceLock<Box<[Ipv4Network]>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BaseSandboxNetworkPolicy {
@@ -29,9 +32,9 @@ pub enum BaseSandboxNetworkPolicy {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SandboxNetworkEgressPolicy {
-    pub allowed_cidrs: Vec<String>,
+    pub allowed_cidrs: Vec<IpNetwork>,
     pub allowed_domains: Vec<String>,
-    pub denied_cidrs: Vec<String>,
+    pub denied_cidrs: Vec<IpNetwork>,
 }
 
 impl SandboxNetworkEgressPolicy {
@@ -43,7 +46,7 @@ impl SandboxNetworkEgressPolicy {
 
         for entry in allow_out.unwrap_or_default() {
             if let Some(cidr) = try_normalize_ip_or_cidr(&entry)? {
-                if allowed_cidrs.insert(cidr.clone()) {
+                if allowed_cidrs.insert(cidr) {
                     policy.allowed_cidrs.push(cidr);
                 }
             } else {
@@ -59,7 +62,7 @@ impl SandboxNetworkEgressPolicy {
             let Some(cidr) = try_normalize_ip_or_cidr(&entry)? else {
                 bail!("denyOut entry {entry:?} must be an IP address or CIDR block");
             };
-            if denied_cidrs.insert(cidr.clone()) {
+            if denied_cidrs.insert(cidr) {
                 policy.denied_cidrs.push(cidr);
             }
         }
@@ -157,7 +160,7 @@ impl SandboxNetworkPolicy {
             .egress
             .allowed_cidrs
             .iter()
-            .any(|cidr| cidr_contains(cidr, ip))
+            .any(|cidr| matches!(cidr, IpNetwork::V4(network) if network.contains(ip)))
         {
             return true;
         }
@@ -165,7 +168,7 @@ impl SandboxNetworkPolicy {
             .egress
             .denied_cidrs
             .iter()
-            .any(|cidr| cidr_contains(cidr, ip))
+            .any(|cidr| matches!(cidr, IpNetwork::V4(network) if network.contains(ip)))
         {
             return false;
         }
@@ -207,13 +210,13 @@ impl SandboxNetworkPolicy {
                     .egress
                     .always_denied_cidrs
                     .iter()
-                    .cloned()
-                    .chain(address_plan.internal_egress_denied_cidrs())
+                    .chain(address_plan.internal_egress_denied_cidrs().iter())
+                    .filter_map(|cidr| cidr.parse::<Ipv4Network>().ok())
                     .collect::<Vec<_>>()
                     .into_boxed_slice()
             })
             .iter()
-            .any(|cidr| cidr_contains(cidr, ip))
+            .any(|cidr| cidr.contains(ip))
     }
 }
 
@@ -253,12 +256,6 @@ fn domain_matches(hostname: &str, pattern: &str) -> bool {
             };
             !prefix.is_empty() && prefix.ends_with('.') && host_suffix.eq_ignore_ascii_case(suffix)
         })
-}
-
-fn cidr_contains(cidr: &str, ip: Ipv4Addr) -> bool {
-    cidr.parse::<ipnetwork::Ipv4Network>()
-        .map(|network| network.contains(ip))
-        .unwrap_or(false)
 }
 
 pub(super) fn initialize_namespace_egress_chain(
@@ -362,13 +359,19 @@ fn build_user_egress_commands(
         Vec::new()
     };
 
-    for cidr in policy.egress.allowed_cidrs.iter().map(String::as_str) {
+    for cidr in &policy.egress.allowed_cidrs {
+        let IpNetwork::V4(cidr) = cidr else {
+            continue;
+        };
         commands.push(append_user_egress_command(format!(
             "-i tap0 -o vpeer -d {cidr} -j ACCEPT"
         )));
     }
 
-    for cidr in policy.egress.denied_cidrs.iter().map(String::as_str) {
+    for cidr in &policy.egress.denied_cidrs {
+        let IpNetwork::V4(cidr) = cidr else {
+            continue;
+        };
         commands.push(append_user_egress_command(format!(
             "-i tap0 -o vpeer -d {cidr} -j REJECT"
         )));
@@ -419,16 +422,16 @@ fn append_user_egress_command(rule: String) -> IptablesRestoreCommand {
     }
 }
 
-fn try_normalize_ip_or_cidr(s: &str) -> Result<Option<String>> {
+fn try_normalize_ip_or_cidr(s: &str) -> Result<Option<IpNetwork>> {
     if let Ok(ip) = s.parse::<IpAddr>() {
         return Ok(Some(match ip {
-            IpAddr::V4(ip) => format!("{ip}/32"),
-            IpAddr::V6(ip) => format!("{ip}/128"),
+            IpAddr::V4(ip) => IpNetwork::V4(Ipv4Network::new(ip, 32)?),
+            IpAddr::V6(ip) => IpNetwork::V6(ipnetwork::Ipv6Network::new(ip, 128)?),
         }));
     }
 
     match s.parse::<ipnetwork::IpNetwork>() {
-        Ok(network) => Ok(Some(network.to_string())),
+        Ok(network) => Ok(Some(network)),
         Err(err) if s.contains('/') => {
             Err(err).with_context(|| format!("invalid IP or CIDR entry {s:?}"))
         }
@@ -475,9 +478,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(policy.allowed_cidrs, ["8.8.8.8/32", "1.1.1.0/24"]);
+        assert_eq!(
+            policy.allowed_cidrs,
+            ["8.8.8.8/32".parse().unwrap(), "1.1.1.0/24".parse().unwrap()]
+        );
         assert_eq!(policy.allowed_domains, ["*.example.com"]);
-        assert_eq!(policy.denied_cidrs, ["203.0.113.0/24"]);
+        assert_eq!(policy.denied_cidrs, ["203.0.113.0/24".parse().unwrap()]);
     }
 
     #[test]
@@ -498,9 +504,41 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(policy.allowed_cidrs, ["8.8.8.8/32", "1.1.1.1/32"]);
+        assert_eq!(
+            policy.allowed_cidrs,
+            ["8.8.8.8/32".parse().unwrap(), "1.1.1.1/32".parse().unwrap()]
+        );
         assert_eq!(policy.allowed_domains, ["example.com"]);
-        assert_eq!(policy.denied_cidrs, ["203.0.113.1/32", "203.0.113.0/24"]);
+        assert_eq!(
+            policy.denied_cidrs,
+            [
+                "203.0.113.1/32".parse().unwrap(),
+                "203.0.113.0/24".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn structured_cidrs_keep_string_wire_format() {
+        let policy = SandboxNetworkEgressPolicy::new(
+            Some(vec!["8.8.8.8".to_string(), "2001:db8::1/128".to_string()]),
+            Some(vec!["0.0.0.0/0".to_string()]),
+        )
+        .unwrap();
+
+        let value = serde_json::to_value(&policy).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "allowed_cidrs": ["8.8.8.8/32", "2001:db8::1/128"],
+                "allowed_domains": [],
+                "denied_cidrs": ["0.0.0.0/0"]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<SandboxNetworkEgressPolicy>(value).unwrap(),
+            policy
+        );
     }
 
     #[test]
@@ -536,7 +574,7 @@ mod tests {
             allow_public_traffic: true,
             base_policy: BaseSandboxNetworkPolicy::Deny,
             egress: SandboxNetworkEgressPolicy {
-                allowed_cidrs: vec!["8.8.8.8/32".to_string()],
+                allowed_cidrs: vec!["8.8.8.8/32".parse().unwrap()],
                 denied_cidrs: Vec::new(),
                 allowed_domains: Vec::new(),
             },
@@ -565,8 +603,8 @@ mod tests {
             allow_public_traffic: true,
             base_policy: BaseSandboxNetworkPolicy::Deny,
             egress: SandboxNetworkEgressPolicy {
-                allowed_cidrs: vec!["8.8.8.8/32".to_string()],
-                denied_cidrs: vec!["203.0.113.0/24".to_string()],
+                allowed_cidrs: vec!["8.8.8.8/32".parse().unwrap()],
+                denied_cidrs: vec!["203.0.113.0/24".parse().unwrap()],
                 allowed_domains: Vec::new(),
             },
         };
@@ -588,6 +626,21 @@ mod tests {
                 "-i tap0 -o vpeer -d 0.0.0.0/0 -j REJECT",
             ]
         );
+    }
+
+    #[test]
+    fn build_user_rules_ignores_ipv6_for_ipv4_iptables() {
+        let policy = SandboxNetworkPolicy {
+            allow_public_traffic: true,
+            base_policy: BaseSandboxNetworkPolicy::Allow,
+            egress: SandboxNetworkEgressPolicy {
+                allowed_cidrs: vec!["2001:db8::/32".parse().unwrap()],
+                denied_cidrs: vec!["2001:db8:1::/48".parse().unwrap()],
+                allowed_domains: Vec::new(),
+            },
+        };
+
+        assert!(build_user_egress_commands(&policy, false).is_empty());
     }
 
     #[test]

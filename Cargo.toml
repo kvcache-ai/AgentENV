@@ -63,7 +63,7 @@ nix = { version = "0.31", features = ["sched", "mount", "fs", "signal", "user", 
 libc = "0.2"
 rtnetlink = "0.20"
 netlink-packet-route = "0.28"
-ipnetwork = "0.21"
+ipnetwork = { version = "0.21", features = ["serde"] }
 futures = "0.3"
 tonic = "0.14.2"
 tonic-prost = "0.14.2"
