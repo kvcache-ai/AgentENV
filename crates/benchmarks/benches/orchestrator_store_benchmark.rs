@@ -112,8 +112,7 @@ fn bench_orchestrator_store_list(c: &mut Criterion) {
 
     let running_filter = SandboxListFilter {
         states: Some(vec![SandboxState::Running]),
-        excluded_states: None,
-        user_metadata: None,
+        ..SandboxListFilter::matches_all()
     };
     group.bench_with_input(
         BenchmarkId::new("list_filtered_running", "naive_scanning"),

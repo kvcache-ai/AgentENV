@@ -2622,8 +2622,7 @@ async fn orchestrator_list_empty_returns_empty() -> Result<()> {
     let filtered = orchestrator
         .list_sandboxes_filtered(SandboxListFilter {
             states: Some(vec![SandboxState::Running]),
-            excluded_states: None,
-            user_metadata: None,
+            ..SandboxListFilter::matches_all()
         })
         .await?;
     assert!(
@@ -2875,8 +2874,8 @@ async fn orchestrator_list_filtered_returns_empty_on_non_matching_metadata() -> 
     let filtered = orchestrator
         .list_sandboxes_filtered(SandboxListFilter {
             states: Some(vec![SandboxState::Running]),
-            excluded_states: None,
             user_metadata: Some(required_metadata),
+            ..SandboxListFilter::matches_all()
         })
         .await?;
     assert!(

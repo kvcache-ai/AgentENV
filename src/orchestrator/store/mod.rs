@@ -50,6 +50,16 @@ pub struct SandboxListFilter {
     pub states: Option<Vec<SandboxState>>,
     pub excluded_states: Option<Vec<SandboxState>>,
     pub user_metadata: Option<HashMap<String, String>>,
+    /// Include only sandboxes created at or after this instant.
+    pub started_after: Option<SystemTime>,
+    /// Include only sandboxes whose snapshot ID or alias matches this value.
+    pub template: Option<String>,
+}
+
+impl SandboxListFilter {
+    pub fn matches_all() -> Self {
+        Self::default()
+    }
 }
 
 #[async_trait]

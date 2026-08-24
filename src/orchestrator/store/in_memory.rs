@@ -274,6 +274,8 @@ impl MetadataStore for InMemoryMetadataStore {
         let states_filter = filter.states;
         let excluded_states_filter = filter.excluded_states;
         let user_metadata_filter = filter.user_metadata;
+        let started_after_filter = filter.started_after;
+        let template_filter = filter.template;
         let inner = self.inner.read().await;
 
         let matched = inner
@@ -289,7 +291,20 @@ impl MetadataStore for InMemoryMetadataStore {
                     .is_some_and(|states| states.contains(&metadata.state));
                 let user_metadata_matches =
                     Self::user_metadata_matches(metadata, user_metadata_filter.as_ref());
-                state_matches && !excluded_state_matches && user_metadata_matches
+                let started_after_matches = started_after_filter
+                    .is_none_or(|started_after| metadata.created_at >= started_after);
+                let template_matches = template_filter.as_ref().is_none_or(|template| {
+                    metadata.snapshot_id == *template
+                        || metadata
+                            .snapshot_alias
+                            .as_deref()
+                            .is_some_and(|alias| alias == template)
+                });
+                state_matches
+                    && !excluded_state_matches
+                    && user_metadata_matches
+                    && started_after_matches
+                    && template_matches
             })
             .map(|record| record.metadata.clone())
             .collect();
@@ -514,14 +529,81 @@ mod tests {
         let filtered = store
             .list_filtered(SandboxListFilter {
                 states: Some(vec![SandboxState::Running]),
-                excluded_states: None,
                 user_metadata: Some(required),
+                ..SandboxListFilter::matches_all()
             })
             .await
             .unwrap();
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, match_id);
+    }
+
+    #[tokio::test]
+    async fn list_filtered_matches_started_after_and_template_id_or_alias() {
+        let store = InMemoryMetadataStore::new();
+        let base = UNIX_EPOCH + Duration::from_secs(1_000);
+        let matching_after_id = SandboxId::new();
+        let matching_at_id = SandboxId::new();
+        let before_id = SandboxId::new();
+
+        store
+            .add(SandboxMetadata {
+                id: matching_after_id,
+                snapshot_id: "template-id".to_string(),
+                snapshot_alias: Some("template-alias".to_string()),
+                created_at: base + Duration::from_secs(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .add(SandboxMetadata {
+                id: matching_at_id,
+                snapshot_id: "template-id".to_string(),
+                snapshot_alias: Some("template-alias".to_string()),
+                created_at: base,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .add(SandboxMetadata {
+                id: before_id,
+                snapshot_id: "template-id".to_string(),
+                snapshot_alias: Some("template-alias".to_string()),
+                created_at: base - Duration::from_secs(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        store
+            .add(SandboxMetadata {
+                snapshot_id: "other-template".to_string(),
+                created_at: base,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        for template in ["template-id", "template-alias"] {
+            let filtered = store
+                .list_filtered(SandboxListFilter {
+                    started_after: Some(base),
+                    template: Some(template.to_string()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(filtered.len(), 2);
+            assert!(filtered
+                .iter()
+                .any(|metadata| metadata.id == matching_after_id));
+            assert!(filtered
+                .iter()
+                .any(|metadata| metadata.id == matching_at_id));
+            assert!(!filtered.iter().any(|metadata| metadata.id == before_id));
+        }
     }
 
     #[tokio::test]
@@ -560,8 +642,7 @@ mod tests {
         let filtered = store
             .list_filtered(SandboxListFilter {
                 states: Some(vec![SandboxState::Running, SandboxState::Paused]),
-                excluded_states: None,
-                user_metadata: None,
+                ..SandboxListFilter::matches_all()
             })
             .await
             .unwrap();
@@ -606,9 +687,8 @@ mod tests {
 
         let filtered = store
             .list_filtered(SandboxListFilter {
-                states: None,
                 excluded_states: Some(vec![SandboxState::Paused]),
-                user_metadata: None,
+                ..SandboxListFilter::matches_all()
             })
             .await
             .unwrap();
@@ -640,8 +720,7 @@ mod tests {
         let running = store
             .list_filtered(SandboxListFilter {
                 states: Some(vec![SandboxState::Running]),
-                excluded_states: None,
-                user_metadata: None,
+                ..SandboxListFilter::matches_all()
             })
             .await
             .unwrap();
@@ -650,8 +729,7 @@ mod tests {
         let paused = store
             .list_filtered(SandboxListFilter {
                 states: Some(vec![SandboxState::Paused]),
-                excluded_states: None,
-                user_metadata: None,
+                ..SandboxListFilter::matches_all()
             })
             .await
             .unwrap();

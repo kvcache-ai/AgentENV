@@ -184,6 +184,18 @@ pub struct V2SandboxesGetQueryParams {
     #[serde(rename = "state")]
     #[serde(default)]
     pub state: Vec<models::SandboxState>,
+    /// Sort direction by sandbox start time. Defaults to desc (newest first).
+    #[serde(rename = "order")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order: Option<models::OrderDirection>,
+    /// Return sandboxes started at or after this timestamp.
+    #[serde(rename = "startedAfter")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_after: Option<chrono::DateTime<chrono::Utc>>,
+    /// Filter sandboxes by a template ID or alias.
+    #[serde(rename = "template")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
     /// Cursor to start the list from
     #[serde(rename = "nextToken")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4201,6 +4213,50 @@ impl std::str::FromStr for NodeStatus {
             "draining" => std::result::Result::Ok(NodeStatus::NodeStatusDraining),
             "connecting" => std::result::Result::Ok(NodeStatus::NodeStatusConnecting),
             "unhealthy" => std::result::Result::Ok(NodeStatus::NodeStatusUnhealthy),
+            _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
+        }
+    }
+}
+
+/// Sort direction
+/// Enumeration of values.
+/// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
+/// which helps with FFI.
+#[allow(non_camel_case_types, clippy::large_enum_variant)]
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[cfg_attr(feature = "conversion", derive(frunk_enum_derive::LabelledGenericEnum))]
+pub enum OrderDirection {
+    #[serde(rename = "asc")]
+    Asc,
+    #[serde(rename = "desc")]
+    Desc,
+}
+
+impl validator::Validate for OrderDirection {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        std::result::Result::Ok(())
+    }
+}
+
+impl std::fmt::Display for OrderDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            OrderDirection::Asc => write!(f, "asc"),
+            OrderDirection::Desc => write!(f, "desc"),
+        }
+    }
+}
+
+impl std::str::FromStr for OrderDirection {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "asc" => std::result::Result::Ok(OrderDirection::Asc),
+            "desc" => std::result::Result::Ok(OrderDirection::Desc),
             _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
         }
     }

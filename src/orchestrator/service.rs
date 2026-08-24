@@ -723,6 +723,10 @@ where
     /// - If `states` is provided, only sandboxes in those states will be included.
     /// - If `user_metadata` is provided, only sandboxes whose user metadata contains
     ///   all the specified key-value pairs will be included.
+    /// - If `started_after` is provided, only sandboxes created at or after that instant
+    ///   will be included.
+    /// - If `template` is provided, only sandboxes using the matching snapshot ID or alias
+    ///   will be included.
     #[tracing::instrument(skip(self, filter))]
     pub async fn list_sandboxes_filtered(
         &self,
@@ -2366,9 +2370,8 @@ where
             let sandboxes = self
                 .store
                 .list_filtered(SandboxListFilter {
-                    states: None,
                     excluded_states: Some(vec![SandboxState::Paused]),
-                    user_metadata: None,
+                    ..SandboxListFilter::matches_all()
                 })
                 .await?;
             if sandboxes.is_empty() {
