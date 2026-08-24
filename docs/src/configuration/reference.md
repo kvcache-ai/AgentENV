@@ -48,6 +48,7 @@ Firecracker VM binary and boot configuration.
 | `work_dir` | string | `"$AENV_HOME/firecracker-work"` | Parent directory for per-sandbox Firecracker work directories. These dirs contain runtime sockets, symlinks, local logs, and writable OverlayBD upper layer data such as `overlaybd/upper.data` and `overlaybd/upper.index` |
 | `serial_dir` | string | `"$AENV_HOME/logs/serial"` | Directory for persistent Firecracker logs when enabled (per-sandbox subdirectories). Setting this path alone does not enable logging |
 | `log_level` | string | unset (disabled) | Optional Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`, case-insensitive). A non-empty value enables `firecracker.log` and stdout/stderr capture in each sandbox's log directory. Empty/unset discards stdout/stderr and creates no log files or per-sandbox log directories. Explicit Rust stdout/stderr destinations still enable the requested stream |
+| `managed_snapshot_max_total_bytes` | integer | unset (unlimited) | Reject new managed snapshot/fork captures when allocated bytes under the sandbox managed root reach this limit; existing artifacts are retained |
 
 ## `[kernel]`
 
