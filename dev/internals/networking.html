@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Static Multi-Node (Without Kubernetes) - AgentENV Documentation</title>
+        <title>Sandbox Network Architecture - AgentENV Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -147,7 +147,7 @@
                         <a href="https://github.com/kvcache-ai/AgentENV" title="Git repository" aria-label="Git repository">
                             <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
                         </a>
-                        <a href="https://github.com/kvcache-ai/AgentENV/edit/main/docs/src/deployment/static-multi-node.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                        <a href="https://github.com/kvcache-ai/AgentENV/edit/main/docs/src/internals/networking.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
                             <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
                         </a>
 
@@ -181,272 +181,180 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="static-multi-node-without-kubernetes"><a class="header" href="#static-multi-node-without-kubernetes">Static Multi-Node (Without Kubernetes)</a></h1>
-<p>Run AgentENV across multiple physical or virtual machines without Kubernetes.
-This deployment uses the Go Gateway and Scheduler with a statically configured
-runtime-node list.</p>
-<p>Static discovery is appropriate when node membership changes infrequently. The
-Scheduler does not automatically register an unknown node from its heartbeat:
-each runtime node must appear in <code>scheduler.nodes</code>, and changing that list
-requires a Scheduler restart.</p>
-<h2 id="architecture"><a class="header" href="#architecture">Architecture</a></h2>
-<p>This example co-locates the Gateway and Scheduler on <code>10.0.0.10</code> and runs two
-AgentENV runtime nodes:</p>
+                        <h1 id="sandbox-network-architecture"><a class="header" href="#sandbox-network-architecture">Sandbox Network Architecture</a></h1>
+<p>This document describes the network data plane for one AgentENV node. It covers the Linux network namespaces used by Firecracker sandboxes, host and namespace iptables, runtime egress policy updates, and the namespace-local egress proxy.</p>
+<p>The user-facing policy contract is documented in <a href="../concepts/sandboxes.html#network-access">Sandbox Network Access</a>. This page explains how that contract is implemented.</p>
+<h2 id="topology"><a class="header" href="#topology">Topology</a></h2>
+<p>Each running sandbox has a dedicated network namespace. The Firecracker VM is connected to the namespace through a TAP device. The namespace is connected to the host through a veth pair; the namespace side is named <code>vpeer</code> and the host side is named <code>veth-{slot}</code>.</p>
+<pre class="mermaid">flowchart LR
+    subgraph sandbox["Sandbox network namespace"]
+        direction LR
+        subgraph vm["Firecracker VM"]
+            direction LR
+            eth0["eth0\n169.254.0.21"]
+        end
+        tap["tap0\n169.254.0.22"]
+        vpeer["vpeer\nveth pool 10.12.0.0/16\n/31 per slot"]
+        proxy["EgressProxy listener\n0.0.0.0:15000"]
+        eth0 &lt;--&gt; tap
+        tap &lt;--&gt; vpeer
+        tap -. "TCP 80/443 REDIRECT" .-&gt; proxy
+        proxy --&gt; vpeer
+    end
+    style sandbox fill:transparent,stroke:gray
+
+    subgraph host["Host network namespace"]
+        direction LR
+        veth["veth-{slot}\n10.12.0.0/16\n/31 per slot"]
+        host-interaction["Host interaction IP\n10.11.0.0/16\n/31 per slot"]
+        internet["Internet"]
+        veth &lt;-- "Host routing" --&gt; host-interaction
+        veth -- "Host routing" --&gt; internet
+    end
+    style host fill:transparent,stroke:gray
+
+    vpeer &lt;--&gt; veth
+</pre>
+
+<p>The process contains one global <code>NetworkManager</code> and one global <code>EgressProxy</code> registry. The registry is shared for lifecycle and policy bookkeeping, but each namespace that uses proxy-backed policy has its own listener socket and listener thread. The fixed port <code>15000</code> is therefore reusable across namespaces without a host-port collision.</p>
+<h2 id="ownership"><a class="header" href="#ownership">Ownership</a></h2>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Component</th><th>Address</th><th>Purpose</th></tr>
+<tr><th>Owner</th><th>Source</th><th>Responsibility</th></tr>
 </thead>
 <tbody>
-<tr><td>Gateway</td><td><code>10.0.0.10:8080</code></td><td>Client-facing HTTP and WebSocket entry point</td></tr>
-<tr><td>Scheduler</td><td><code>10.0.0.10:9090</code></td><td>gRPC placement, heartbeat, and sandbox binding service</td></tr>
-<tr><td>Runtime node A</td><td><code>10.0.0.21:8000</code></td><td>Runs Firecracker sandboxes as <code>node-a</code></td></tr>
-<tr><td>Runtime node B</td><td><code>10.0.0.22:8000</code></td><td>Runs Firecracker sandboxes as <code>node-b</code></td></tr>
+<tr><td><code>NetworkManager</code></td><td><code>src/sandbox/network/manager.rs</code></td><td>Process-wide slot bitmap, warm pool, global host iptables, proxy registry, shutdown</td></tr>
+<tr><td><code>Slot</code></td><td><code>src/sandbox/network/slot.rs</code></td><td>One namespace, veth/TAP setup, address plan, namespace iptables, policy application, cleanup</td></tr>
+<tr><td>Address plan</td><td><code>src/sandbox/network/address_plan.rs</code></td><td>Slot-derived host interaction, veth, and VM-link addresses and internal deny ranges</td></tr>
+<tr><td>Policy</td><td><code>src/sandbox/network/policy.rs</code></td><td>API-normalized base/allow/deny semantics, absolute deny checks, proxy interception ports</td></tr>
+<tr><td>Egress proxy</td><td><code>src/sandbox/network/egress_proxy.rs</code></td><td>Namespace-local listener, original-destination inspection, Host/SNI parsing, relay, staged policy state</td></tr>
+<tr><td>Host resolver</td><td><code>src/sandbox/network/resolver.rs</code></td><td>Process-wide long-lived host-netns DNS worker used for trusted domain resolution</td></tr>
+<tr><td>Firecracker backend</td><td><code>src/sandbox/firecracker/sandbox.rs</code></td><td>Allocates/releases slots and applies the launch or updated policy at VM lifecycle boundaries</td></tr>
+<tr><td>Orchestrator/API</td><td><code>src/orchestrator/</code>, <code>src/api/impls/sandbox.rs</code></td><td>Validates requests, persists policy, and replaces the running sandbox policy</td></tr>
 </tbody>
 </table>
 </div>
-<p>AgentENV authenticates HTTP requests but does not encrypt them. Use private
-addresses, a VPN, or TLS termination before traffic crosses an untrusted
-network.</p>
-<h2 id="prerequisites"><a class="header" href="#prerequisites">Prerequisites</a></h2>
-<p>On every runtime node:</p>
+<h2 id="address-plan"><a class="header" href="#address-plan">Address Plan</a></h2>
+<p><code>NetworkAddressPlan</code> derives addresses from <code>[network.internal]</code> and allocates them from the slot index:</p>
 <ul>
-<li>Linux kernel 6.8+</li>
-<li><code>/dev/kvm</code> access</li>
-<li>root access for the AgentENV installation</li>
-<li>network reachability to the Scheduler</li>
-<li>shared storage across all runtime nodes, using either POSIXFS or OSS</li>
+<li><code>host_interaction_ip</code>: one address per slot from <code>host_interaction_cidr</code>. Host routes use this address to reach the VM through the namespace.</li>
+<li><code>veth_host_ip</code> and <code>veth_vm_ip</code>: the two endpoints of the slot’s <code>/31</code> veth link. The host endpoint is assigned to <code>veth-{slot}</code> and the namespace endpoint is assigned to <code>vpeer</code>.</li>
+<li><code>vm_ip</code> and <code>tap_ip</code>: fixed endpoints of the VM link on <code>vm_link_cidr</code>. The VM receives <code>vm_ip</code>; the namespace TAP interface receives <code>tap_ip</code>.</li>
 </ul>
-<p>On the control-plane host:</p>
-<ul>
-<li>Go 1.21 or later</li>
-<li>network reachability to every runtime node</li>
-<li>a checkout of the AgentENV repository</li>
-</ul>
-<p>Allow the following TCP flows:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Source</th><th>Destination</th><th>Port</th></tr>
-</thead>
-<tbody>
-<tr><td>Clients</td><td>Gateway</td><td><code>8080</code></td></tr>
-<tr><td>Gateway</td><td>Scheduler</td><td><code>9090</code></td></tr>
-<tr><td>Runtime nodes</td><td>Scheduler</td><td><code>9090</code></td></tr>
-<tr><td>Gateway</td><td>Runtime nodes</td><td><code>8000</code></td></tr>
-</tbody>
-</table>
-</div>
-<p>The examples keep metrics listeners on loopback. Open their ports separately if
-an external metrics collector needs them.</p>
-<h2 id="1-install-the-runtime-nodes"><a class="header" href="#1-install-the-runtime-nodes">1. Install the runtime nodes</a></h2>
-<p>Generate one API key and one sandbox access-token seed through your normal
-secret-management channel. Use the API key on the gateway and every runtime
-node; use the seed only on runtime nodes:</p>
-<pre><code class="language-bash">export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
-export AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED="$(openssl rand -hex 32)"
-</code></pre>
-<p>Run the installation on each runtime node:</p>
-<pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install.sh | sudo bash
-</code></pre>
-<p>Edit <code>/etc/default/aenv</code> on each machine without removing the paths written by
-the installer, and add both shared values before starting the services. A
-multi-node deployment must not let each node generate independent managed
-secrets.</p>
-<p>Node A uses:</p>
-<pre><code class="language-bash">API_ADDR="0.0.0.0:8000"
-AENV_NODE_ID="node-a"
-AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED="true"
-AENV_OBSERVABILITY_SCHEDULER_ENDPOINT="http://10.0.0.10:9090"
-</code></pre>
-<p>Node B uses the same values except for its unique node ID:</p>
-<pre><code class="language-bash">API_ADDR="0.0.0.0:8000"
-AENV_NODE_ID="node-b"
-AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED="true"
-AENV_OBSERVABILITY_SCHEDULER_ENDPOINT="http://10.0.0.10:9090"
-</code></pre>
-<p>The <code>AENV_NODE_ID</code> values must exactly match the corresponding IDs in the
-Scheduler configuration below. Restart and verify each runtime:</p>
-<pre><code class="language-bash">sudo systemctl restart aenv
-sudo systemctl status aenv
-curl http://127.0.0.1:8000/health
-</code></pre>
-<h2 id="2-build-and-install-the-control-plane-binaries"><a class="header" href="#2-build-and-install-the-control-plane-binaries">2. Build and install the control-plane binaries</a></h2>
-<p>On the control-plane host:</p>
-<pre><code class="language-bash">git clone https://github.com/kvcache-ai/AgentENV.git
-cd AgentENV
-make -C services build
-
-sudo install -m 0755 services/bin/scheduler /usr/local/bin/agentenv-scheduler
-sudo install -m 0755 services/bin/gateway /usr/local/bin/agentenv-gateway
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin agentenv-control
-sudo install -d -o root -g agentenv-control -m 0750 /etc/agentenv
-</code></pre>
-<p>Create <code>/etc/agentenv/auth.env</code> with the API key used on the runtime nodes:</p>
-<pre><code class="language-bash">sudo install -o root -g agentenv-control -m 0640 /dev/null /etc/agentenv/auth.env
-sudoedit /etc/agentenv/auth.env
-</code></pre>
-<pre><code class="language-text">AENV_API_KEY=&lt;same shared key&gt;
-</code></pre>
-<p>If the <code>agentenv-control</code> account already exists, the <code>useradd</code> command reports
-that fact and can be skipped.</p>
-<h2 id="3-configure-static-discovery"><a class="header" href="#3-configure-static-discovery">3. Configure static discovery</a></h2>
-<p>Create <code>/etc/agentenv/control-plane.json</code>:</p>
-<pre><code class="language-json">{
-  "log_level": "info",
-  "log_format": "json",
-  "scheduler": {
-    "grpc_listen_addr": "0.0.0.0:9090",
-    "metrics_listen_addr": "127.0.0.1:9101",
-    "strategy": "round_robin",
-    "report_ttl": "30s",
-    "binding_ttl": "30s",
-    "discovery": {
-      "mode": "static"
-    },
-    "nodes": [
-      {
-        "id": "node-a",
-        "endpoint": "http://10.0.0.21:8000"
-      },
-      {
-        "id": "node-b",
-        "endpoint": "http://10.0.0.22:8000"
-      }
-    ]
-  },
-  "gateway": {
-    "http_listen_addr": "0.0.0.0:8080",
-    "metrics_listen_addr": "127.0.0.1:9102",
-    "scheduler_addr": "10.0.0.10:9090",
-    "request_timeout": "90s",
-    "forward_response_size": 4194304,
-    "sandbox_proxy_domains": []
-  }
-}
-</code></pre>
-<p>Protect the configuration after editing it:</p>
-<pre><code class="language-bash">sudo chown root:agentenv-control /etc/agentenv/control-plane.json
-sudo chmod 0640 /etc/agentenv/control-plane.json
-</code></pre>
-<p>Each node endpoint must be reachable from the Gateway. The Scheduler returns
-that endpoint to the Gateway when it selects a node.</p>
-<h2 id="4-run-the-scheduler-and-gateway-with-systemd"><a class="header" href="#4-run-the-scheduler-and-gateway-with-systemd">4. Run the Scheduler and Gateway with systemd</a></h2>
-<p>Create <code>/etc/systemd/system/agentenv-scheduler.service</code>:</p>
-<pre><code class="language-ini">[Unit]
-Description=AgentENV Scheduler
-Wants=network-online.target
-After=network-online.target
-
-[Service]
-User=agentenv-control
-Group=agentenv-control
-ExecStart=/usr/local/bin/agentenv-scheduler -config /etc/agentenv/control-plane.json
-Restart=on-failure
-RestartSec=5
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-</code></pre>
-<p>Create <code>/etc/systemd/system/agentenv-gateway.service</code>:</p>
-<pre><code class="language-ini">[Unit]
-Description=AgentENV Gateway
-Wants=network-online.target
-After=network-online.target agentenv-scheduler.service
-
-[Service]
-User=agentenv-control
-Group=agentenv-control
-EnvironmentFile=/etc/agentenv/auth.env
-ExecStart=/usr/local/bin/agentenv-gateway -config /etc/agentenv/control-plane.json
-Restart=on-failure
-RestartSec=5
-NoNewPrivileges=true
-
-[Install]
-WantedBy=multi-user.target
-</code></pre>
-<p>Start both services:</p>
-<pre><code class="language-bash">sudo systemctl daemon-reload
-sudo systemctl enable --now agentenv-scheduler agentenv-gateway
-</code></pre>
-<h2 id="5-verify-the-cluster"><a class="header" href="#5-verify-the-cluster">5. Verify the cluster</a></h2>
-<p>Check every network hop before creating a sandbox:</p>
-<pre><code class="language-bash"># On the control-plane host
-curl http://10.0.0.21:8000/health
-curl http://10.0.0.22:8000/health
-curl http://127.0.0.1:8080/health
-
-# Wait for node heartbeats, then inspect the cluster through the Gateway
-export AENV_API_KEY="$(sudo sed -n 's/^AENV_API_KEY=//p' /etc/agentenv/auth.env)"
-curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8080/nodes
-</code></pre>
-<p>The node list should contain <code>node-a</code> and <code>node-b</code>. Point clients at the
-Gateway, not directly at a runtime node:</p>
-<pre><code class="language-bash">aenv auth
-# AENV server URL: http://10.0.0.10:8080
-# API key: &lt;the same shared key&gt;
-</code></pre>
-<p>Sandbox create, list, lifecycle, and data-plane requests can then be routed
-through the Gateway.</p>
-<h2 id="operations"><a class="header" href="#operations">Operations</a></h2>
-<p>Follow service logs:</p>
-<pre><code class="language-bash">sudo journalctl -u agentenv-scheduler -f
-sudo journalctl -u agentenv-gateway -f
-
-# On a runtime node
-sudo journalctl -u aenv -f
-</code></pre>
-<p>To add, remove, rename, or change the endpoint of a static node:</p>
+<p>The namespace adds a default route through <code>veth_host_ip</code>. Firecracker receives an <code>ip=</code> boot argument containing the VM address, TAP link, netmask, and the guest DNS server selected from the host resolver configuration.</p>
+<p>The complete internal pools are denied before user egress rules. This prevents a sandbox from reaching another slot’s host-interaction address, veth link, or VM link even when a user policy otherwise allows the destination.</p>
+<h2 id="namespace-setup"><a class="header" href="#namespace-setup">Namespace Setup</a></h2>
+<p><code>Slot::create_network()</code> performs namespace setup on a dedicated thread because network namespace membership is thread-local:</p>
 <ol>
-<li>Update <code>scheduler.nodes</code> in <code>/etc/agentenv/control-plane.json</code>.</li>
-<li>Ensure the runtime’s <code>AENV_NODE_ID</code> matches its configured ID.</li>
-<li>Restart the Scheduler.</li>
+<li>Create and bind-mount a persistent namespace file under the configured runtime <code>netns</code> directory.</li>
+<li>Unshare <code>CLONE_NEWNET</code> and create the veth pair.</li>
+<li>Move the host endpoint to the process’s baseline host namespace.</li>
+<li>Configure <code>lo</code>, <code>vpeer</code>, <code>tap0</code>, addresses, link state, and the namespace default route.</li>
+<li>Enable namespace IPv4 forwarding and configure namespace NAT/filter rules.</li>
+<li>Configure the host veth address and a host route for the slot’s <code>host_interaction_ip</code>.</li>
 </ol>
-<pre><code class="language-bash">sudo systemctl restart agentenv-scheduler
+<p>The baseline namespace rules are installed once during setup. Per-sandbox user rules and proxy redirects are replaced later by <code>set_egress_policy()</code>.</p>
+<h2 id="packet-paths"><a class="header" href="#packet-paths">Packet Paths</a></h2>
+<pre class="mermaid">flowchart TB
+    vm["Firecracker VM"] --&gt; tap["tap0"]
+    tap --&gt; prerouting["namespace nat/PREROUTING"]
+    prerouting -. "TCP 80/443 REDIRECT" .-&gt; proxy["Namespace-local\nEgressProxy"]
+    prerouting --&gt; forward["namespace filter/FORWARD\nAGENTENV-EGRESS"]
+    proxy --&gt; upstream_proxy["Proxy upstream connection"]
+    forward --&gt; nsnat["namespace POSTROUTING\nSNAT to host_interaction_ip"]
+    upstream_proxy --&gt; nsnat
+    nsnat --&gt; vpeer["vpeer / veth"]
+    vpeer --&gt; host["Host FORWARD + POSTROUTING\nMASQUERADE"]
+    host --&gt; internet["External destination"]
+    internet -. "return traffic" .-&gt; host
+    host -. "ESTABLISHED,RELATED" .-&gt; vpeer
+    vpeer -. "return traffic" .-&gt; tap
+    tap -. "return traffic" .-&gt; vm
+</pre>
+
+<h3 id="sandbox-originated-internet-traffic"><a class="header" href="#sandbox-originated-internet-traffic">Sandbox-originated internet traffic</a></h3>
+<ol>
+<li>The VM sends a packet through <code>eth0</code> to <code>tap0</code>.</li>
+<li>The namespace NAT <code>PREROUTING</code> chain may redirect TCP ports 80 and 443 to the namespace-local proxy.</li>
+<li>Packets that continue as routed traffic traverse <code>filter/FORWARD</code> from <code>tap0</code> to <code>vpeer</code>, entering <code>AGENTENV-EGRESS</code>.</li>
+<li>The namespace <code>POSTROUTING</code> chain SNATs VM-originated traffic to the slot’s <code>host_interaction_ip</code>. Proxy-originated upstream connections are SNATed from the namespace <code>vpeer</code> address to the same slot identity.</li>
+<li>The host <code>FORWARD</code> and <code>POSTROUTING</code> rules accept the slot source range and MASQUERADE it for the external route.</li>
+</ol>
+<h3 id="return-traffic"><a class="header" href="#return-traffic">Return traffic</a></h3>
+<p>Return packets are classified as <code>ESTABLISHED,RELATED</code> and are accepted before the user egress chain in the namespace. The host also accepts established traffic returning to <code>veth-{slot}</code>. This preserves host/envd/proxy responses and existing outbound flows while policy rules are replaced.</p>
+<h3 id="host-to-vm-traffic"><a class="header" href="#host-to-vm-traffic">Host-to-VM traffic</a></h3>
+<p>Host-side proxy and envd traffic targets the slot’s <code>host_interaction_ip</code>. Namespace <code>PREROUTING</code> on <code>vpeer</code> DNATs that address to the VM’s fixed <code>vm_ip</code>. The corresponding return path is accepted by the established/related rules.</p>
+<h2 id="host-firewall"><a class="header" href="#host-firewall">Host Firewall</a></h2>
+<p><code>NetworkManager</code> installs one process-wide set of host rules for the configured host interaction CIDR. The rules are inserted/appended symmetrically and removed during manager shutdown:</p>
+<pre><code class="language-text">INPUT      -i veth-+ -s &lt;host_interaction_cidr&gt; -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+INPUT      -i veth-+ -s &lt;host_interaction_cidr&gt; -j REJECT
+FORWARD    -i veth-+ -s &lt;host_interaction_cidr&gt; -j ACCEPT
+FORWARD    -o veth-+ -d &lt;host_interaction_cidr&gt; --state ESTABLISHED,RELATED -j ACCEPT
+POSTROUTING -s &lt;host_interaction_cidr&gt; -j MASQUERADE
 </code></pre>
-<p>Restarting the Scheduler temporarily interrupts routing that depends on its
-in-memory state. Runtime heartbeats repopulate observed sandbox assignments
-after the Scheduler comes back.</p>
-<h2 id="troubleshooting"><a class="header" href="#troubleshooting">Troubleshooting</a></h2>
-<h3 id="a-runtime-is-healthy-but-absent-from-nodes"><a class="header" href="#a-runtime-is-healthy-but-absent-from-nodes">A runtime is healthy but absent from <code>/nodes</code></a></h3>
+<p>The <code>INPUT</code> pair prevents guest-originated new connections from reaching arbitrary host services while preserving established host-originated traffic. The <code>FORWARD</code> and <code>MASQUERADE</code> rules handle namespace-to-internet forwarding after namespace SNAT.</p>
+<h2 id="namespace-firewall"><a class="header" href="#namespace-firewall">Namespace Firewall</a></h2>
+<p>Each namespace has three managed chains:</p>
 <ul>
-<li>Confirm that <code>AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED</code> is <code>true</code>.</li>
-<li>Include the <code>http://</code> scheme in
-<code>AENV_OBSERVABILITY_SCHEDULER_ENDPOINT</code>.</li>
-<li>Verify that <code>AENV_NODE_ID</code> exactly matches a configured
-<code>scheduler.nodes[].id</code>.</li>
-<li>Check that the runtime can reach Scheduler port <code>9090</code>.</li>
-<li>Inspect <code>journalctl -u aenv</code> for heartbeat rejection or connection errors.</li>
+<li><code>AGENTENV-EGRESS</code> is the static chain reached from <code>FORWARD</code> for guest traffic.</li>
+<li><code>AGENTENV-USER-EGRESS</code> contains the replaceable user policy.</li>
+<li><code>AGENTENV-EGRESS-PROXY</code> is the replaceable NAT chain reached from <code>nat/PREROUTING</code> for proxy-backed traffic.</li>
 </ul>
-<p>Heartbeats from IDs not present in the static node list are rejected; they do
-not register new nodes.</p>
-<h3 id="the-gateway-returns-no-available-nodes"><a class="header" href="#the-gateway-returns-no-available-nodes">The Gateway returns no available nodes</a></h3>
-<ul>
-<li>Verify both runtime health endpoints from the control-plane host.</li>
-<li>Verify the static endpoint addresses are reachable from the Gateway.</li>
-<li>Check Scheduler logs for expired heartbeat reports.</li>
-<li>Check that host firewalls allow runtime-to-Scheduler and
-Gateway-to-runtime traffic.</li>
-</ul>
-<h3 id="the-gateway-cannot-connect-to-the-scheduler"><a class="header" href="#the-gateway-cannot-connect-to-the-scheduler">The Gateway cannot connect to the Scheduler</a></h3>
-<p>The Gateway’s <code>scheduler_addr</code> is a gRPC target and does not use an <code>http://</code>
-prefix. Runtime heartbeat configuration uses a URL and does require that
-prefix:</p>
-<pre><code class="language-text">gateway.scheduler_addr = 10.0.0.10:9090
-AENV_OBSERVABILITY_SCHEDULER_ENDPOINT = http://10.0.0.10:9090
-</code></pre>
+<p>The static filter chain is ordered as follows:</p>
+<ol>
+<li>Accept <code>ESTABLISHED,RELATED</code> traffic from <code>tap0</code> to <code>vpeer</code>.</li>
+<li>Allow UDP/TCP DNS traffic to the configured guest DNS address on port 53.</li>
+<li>Reject the complete internal address pools and configured <code>always_denied_cidrs</code>.</li>
+<li>Jump to <code>AGENTENV-USER-EGRESS</code>.</li>
+</ol>
+<p>The user chain is rendered in this order:</p>
+<ol>
+<li>Explicit <code>allowOut</code> CIDR/IP rules (<code>ACCEPT</code>).</li>
+<li>Explicit <code>denyOut</code> CIDR/IP rules (<code>REJECT</code>).</li>
+<li>A <code>0.0.0.0/0</code> reject when the base policy is <code>Deny</code>.</li>
+</ol>
+<p>This ordering gives user allow rules precedence over overlapping user denies, while static internal/platform denies remain non-overridable.</p>
+<h2 id="egress-proxy"><a class="header" href="#egress-proxy">Egress Proxy</a></h2>
+<p>The egress proxy is namespace-local and transparent. It does not terminate TLS or rewrite HTTP. A policy that requires proxy mediation redirects only TCP ports 80 and 443 to <code>0.0.0.0:15000</code> inside that namespace.</p>
+<h3 id="connection-flow"><a class="header" href="#connection-flow">Connection flow</a></h3>
+<ol>
+<li><code>EgressProxy::ensure_listener()</code> enters the target namespace with <code>setns</code>, binds the listener, and starts a nonblocking accept loop.</li>
+<li>The listener accepts a connection and copies the active policy for that connection.</li>
+<li>The connection handler reads <code>SO_ORIGINAL_DST</code> to recover the destination altered by <code>REDIRECT</code>.</li>
+<li>It buffers the initial request/handshake up to 64 KiB and extracts HTTP <code>Host</code> or TLS ClientHello SNI. TLS handshake bytes are accumulated across record boundaries.</li>
+<li>A domain match is sent to the process-wide resolver worker, which remains in the host network namespace. Each candidate IPv4 address is checked by <code>SandboxNetworkPolicy::is_domain_allowed</code>, including absolute platform and internal-range denies, before it is selected.</li>
+<li>A domain connection is dialed to the selected trusted address. An IP/CIDR connection uses the original destination after <code>is_ip_allowed</code>.</li>
+<li>The buffered preface is written to the upstream and both directions are relayed with half-close handling.</li>
+</ol>
+<p>An empty or unrecognized hostname cannot fall back to the base allow policy when a domain allowlist is present. This keeps domain policies fail-closed. Domain allow rules require the API request to include an explicit <code>denyOut: ["0.0.0.0/0"]</code>.</p>
+<h3 id="policy-replacement"><a class="header" href="#policy-replacement">Policy replacement</a></h3>
+<p>The running policy update is a replacement operation:</p>
+<ol>
+<li>Stage the new policy in the proxy’s <code>pending</code> map.</li>
+<li>Ensure the namespace listener exists when proxy mediation is required.</li>
+<li>Apply the filter and NAT chain replacement as one <code>iptables-restore</code> batch.</li>
+<li>When an active proxy policy already exists, activate the pending policy only after the namespace batch succeeds.</li>
+<li>When proxy mediation is being enabled for a namespace with no active proxy policy, activate the prepared policy before installing the redirect. This preserves the namespace’s previous default-allow behavior until the atomic iptables batch has completed; no connection can reach the listener through <code>REDIRECT</code> before that batch succeeds.</li>
+<li>If an update fails while an active proxy policy exists, discard the pending policy and retain the previous active policy.</li>
+</ol>
+<p>Each accepted connection holds a copy of the active policy selected at accept time. Therefore updates primarily affect new connections; existing relays are not proactively terminated. Removing a policy or a slot closes tracked handler sockets and joins their threads before namespace resources are removed.</p>
+<h3 id="namespace-ownership"><a class="header" href="#namespace-ownership">Namespace ownership</a></h3>
+<p>The process-global registry is keyed by <code>host_interaction_ip</code>, but listeners are not shared between namespaces. Every namespace has its own listener thread and socket. When a policy no longer requires proxy mediation, the listener and active/pending policy are removed. Full slot cleanup stops the listener before deleting the veth and unmounting the namespace.</p>
+<h2 id="lifecycle-and-warm-pool"><a class="header" href="#lifecycle-and-warm-pool">Lifecycle and Warm Pool</a></h2>
+<p><code>NetworkManager::allocate_any()</code> first acquires a warm <code>Slot</code>. If none is available it allocates a new slot index and creates the namespace/veth/TAP resources. The Firecracker backend then applies the launch policy before boot or resume continues.</p>
+<p>On stop, a slot may return to the warm pool. The namespace and baseline networking remain available for reuse; <code>user_egress_rules_present</code> tracks whether the next tenant needs a user-chain replacement. The next policy application clears or replaces stale user rules and removes stale proxy policy as appropriate. Slots drained from the pool are fully cleaned up.</p>
+<p>On shutdown, the manager stops pool maintenance, drains warm slots, stops all proxy listeners, removes global host rules, and removes namespace/veth state. An <code>atexit</code> hook and <code>Drop</code> path provide best-effort cleanup for abnormal exits.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../deployment/docker-compose.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../internals/architecture.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../deployment/kubernetes.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../internals/sandbox-testing.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -456,11 +364,11 @@ AENV_OBSERVABILITY_SCHEDULER_ENDPOINT = http://10.0.0.10:9090
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../deployment/docker-compose.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../internals/architecture.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../deployment/kubernetes.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../internals/sandbox-testing.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

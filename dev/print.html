@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-a31e12ad.js";
+            window.path_to_searchindex_js = "searchindex-0b68ea43.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-a79017d2.js"></script>
+        <script src="toc-5437f69c.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -2595,7 +2595,7 @@ aenv timeout &lt;sandbox-id&gt; 600
 </code></pre>
 <p>For fine-grained egress control, pass a <code>network</code> object when creating the sandbox. Within user-configured egress rules, traffic is allow-by-default, and <code>allowOut</code> entries take precedence over matching <code>denyOut</code> entries. <code>allowOut</code> by itself does not create an allowlist: destinations that do not match a deny rule remain reachable.</p>
 <ul>
-<li><code>allowOut</code> — CIDR or IP. Domain patterns are currently not supported.</li>
+<li><code>allowOut</code> — CIDR, IP, or domain pattern. Domain patterns apply to new TCP connections on ports 80 and 443 and require <code>denyOut: ["0.0.0.0/0"]</code>. Exact names, <code>*.example.com</code>, and <code>*</code> are supported; a wildcard does not match the apex domain.</li>
 <li><code>denyOut</code> — CIDR or IP</li>
 </ul>
 <p>The following diagram illustrates how the rules are evaluated:</p>
@@ -2631,6 +2631,8 @@ aenv timeout &lt;sandbox-id&gt; 600
   http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/network
 </code></pre>
 <p>Omitting both fields clears all per-sandbox egress rules and restores the default allow behavior.</p>
+<p>Updating a policy primarily affects new connections; existing connections are not actively terminated. During replacement, the previous policy remains active until the new namespace rules are committed.</p>
+<p>For domain rules, the proxy matches the inspected Host/SNI and re-resolves the hostname using the host-side trusted resolver before connecting; the guest’s DNS answer and original destination IP are not authoritative for domain policy.</p>
 <hr>
 <h2 id="data-storage"><a class="header" href="#data-storage">Data Storage</a></h2>
 <div class="table-wrapper">
@@ -3256,17 +3258,7 @@ PVM currently requires x86_64 and the <code>kvm_pvm</code> host module.</p>
 </table>
 </div>
 <h3 id="sandbox-networking"><a class="header" href="#sandbox-networking">Sandbox Networking</a></h3>
-<p>Sandbox networking is managed by a process-wide <code>NetworkManager</code> (<code>src/sandbox/network/manager.rs</code>) plus per-slot <code>Slot</code> objects (<code>src/sandbox/network/slot.rs</code>).</p>
-<ul>
-<li>Each slot owns a stable index-derived address bundle from <code>[network.internal]</code> (defaulting to <code>10.11.0.0/16</code> and <code>10.12.0.0/16</code>) plus the fixed VM tap link <code>169.254.0.20/30</code>, together with the host veth name, namespace path, and iptables rules for one sandbox network namespace.</li>
-<li>Network policy supports base allow/deny plus explicit egress rules. The <code>/sandboxes/{sandboxID}/network</code> endpoint replaces per-sandbox <code>allowOut</code> (CIDR/IP/domain patterns) and <code>denyOut</code> (CIDR/IP only) rules at runtime; allow rules always take precedence.</li>
-<li><code>allocate_any()</code> first tries a warm-slot pool and falls back to creating a new namespace/veth/tap/iptables setup on demand.</li>
-<li>Warm-pool maintenance uses a single Condvar-driven background worker with low/high watermarks.</li>
-<li><code>release()</code> enqueues slots back to the warm pool; when maintenance is enabled, even releases above high watermark are first enqueued and then drained asynchronously by the worker.</li>
-<li><code>[pool]</code> provides shared watermarks and <code>[pool.network].maintenance_enabled</code> controls network worker behavior.</li>
-<li>Because the manager is a process-wide singleton, orchestrator shutdown explicitly calls <code>NetworkManager::shutdown()</code> after deleting remaining sandboxes so cached slots are drained and no new allocations race with teardown.</li>
-<li>Although calling <code>NetworkManager::shutdown()</code> on exit is recommended for clean teardown, the manager also has a <code>Drop</code> and <code>libc::atexit</code> handler to best-effort cleanup of any remaining namespaces and veth interfaces on unexpected shutdown and during testing.</li>
-</ul>
+<p>The network subsystem is managed by a process-wide <code>NetworkManager</code> and per-slot <code>Slot</code> objects. See <a href="#sandbox-network-architecture">Sandbox Network Architecture</a> for the namespace topology, address plan, packet paths, firewall ordering, egress proxy, policy replacement, warm-pool behavior, and verification steps.</p>
 <p>Snapshot resume can also use <code>[pool.firecracker]</code> to pre-spawn <code>(network slot, Firecracker process)</code> pairs. A warm entry transfers its network slot, process, and Firecracker CWD to the resumed sandbox, which avoids the spawn and API-socket wait in the resume critical path. <code>[pool.block]</code> controls the ublk daemon’s overlaybd warm-device pool; it shares the same top-level watermarks but performs async refill from request paths because reusable block devices are image/size-specific.</p>
 <h3 id="observability-data-flow"><a class="header" href="#observability-data-flow">Observability Data Flow</a></h3>
 <p>The node observability path combines request-time host collection with request-time projection:</p>
@@ -3411,6 +3403,171 @@ services/                       # distributed control plane (Go)
 ├── api/proto/                  # protobuf contracts
 └── shared/                     # config, logging
 </code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="sandbox-network-architecture"><a class="header" href="#sandbox-network-architecture">Sandbox Network Architecture</a></h1>
+<p>This document describes the network data plane for one AgentENV node. It covers the Linux network namespaces used by Firecracker sandboxes, host and namespace iptables, runtime egress policy updates, and the namespace-local egress proxy.</p>
+<p>The user-facing policy contract is documented in <a href="#network-access">Sandbox Network Access</a>. This page explains how that contract is implemented.</p>
+<h2 id="topology"><a class="header" href="#topology">Topology</a></h2>
+<p>Each running sandbox has a dedicated network namespace. The Firecracker VM is connected to the namespace through a TAP device. The namespace is connected to the host through a veth pair; the namespace side is named <code>vpeer</code> and the host side is named <code>veth-{slot}</code>.</p>
+<pre class="mermaid">flowchart LR
+    subgraph sandbox["Sandbox network namespace"]
+        direction LR
+        subgraph vm["Firecracker VM"]
+            direction LR
+            eth0["eth0\n169.254.0.21"]
+        end
+        tap["tap0\n169.254.0.22"]
+        vpeer["vpeer\nveth pool 10.12.0.0/16\n/31 per slot"]
+        proxy["EgressProxy listener\n0.0.0.0:15000"]
+        eth0 &lt;--&gt; tap
+        tap &lt;--&gt; vpeer
+        tap -. "TCP 80/443 REDIRECT" .-&gt; proxy
+        proxy --&gt; vpeer
+    end
+    style sandbox fill:transparent,stroke:gray
+
+    subgraph host["Host network namespace"]
+        direction LR
+        veth["veth-{slot}\n10.12.0.0/16\n/31 per slot"]
+        host-interaction["Host interaction IP\n10.11.0.0/16\n/31 per slot"]
+        internet["Internet"]
+        veth &lt;-- "Host routing" --&gt; host-interaction
+        veth -- "Host routing" --&gt; internet
+    end
+    style host fill:transparent,stroke:gray
+
+    vpeer &lt;--&gt; veth
+</pre>
+
+<p>The process contains one global <code>NetworkManager</code> and one global <code>EgressProxy</code> registry. The registry is shared for lifecycle and policy bookkeeping, but each namespace that uses proxy-backed policy has its own listener socket and listener thread. The fixed port <code>15000</code> is therefore reusable across namespaces without a host-port collision.</p>
+<h2 id="ownership"><a class="header" href="#ownership">Ownership</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Owner</th><th>Source</th><th>Responsibility</th></tr>
+</thead>
+<tbody>
+<tr><td><code>NetworkManager</code></td><td><code>src/sandbox/network/manager.rs</code></td><td>Process-wide slot bitmap, warm pool, global host iptables, proxy registry, shutdown</td></tr>
+<tr><td><code>Slot</code></td><td><code>src/sandbox/network/slot.rs</code></td><td>One namespace, veth/TAP setup, address plan, namespace iptables, policy application, cleanup</td></tr>
+<tr><td>Address plan</td><td><code>src/sandbox/network/address_plan.rs</code></td><td>Slot-derived host interaction, veth, and VM-link addresses and internal deny ranges</td></tr>
+<tr><td>Policy</td><td><code>src/sandbox/network/policy.rs</code></td><td>API-normalized base/allow/deny semantics, absolute deny checks, proxy interception ports</td></tr>
+<tr><td>Egress proxy</td><td><code>src/sandbox/network/egress_proxy.rs</code></td><td>Namespace-local listener, original-destination inspection, Host/SNI parsing, relay, staged policy state</td></tr>
+<tr><td>Host resolver</td><td><code>src/sandbox/network/resolver.rs</code></td><td>Process-wide long-lived host-netns DNS worker used for trusted domain resolution</td></tr>
+<tr><td>Firecracker backend</td><td><code>src/sandbox/firecracker/sandbox.rs</code></td><td>Allocates/releases slots and applies the launch or updated policy at VM lifecycle boundaries</td></tr>
+<tr><td>Orchestrator/API</td><td><code>src/orchestrator/</code>, <code>src/api/impls/sandbox.rs</code></td><td>Validates requests, persists policy, and replaces the running sandbox policy</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="address-plan"><a class="header" href="#address-plan">Address Plan</a></h2>
+<p><code>NetworkAddressPlan</code> derives addresses from <code>[network.internal]</code> and allocates them from the slot index:</p>
+<ul>
+<li><code>host_interaction_ip</code>: one address per slot from <code>host_interaction_cidr</code>. Host routes use this address to reach the VM through the namespace.</li>
+<li><code>veth_host_ip</code> and <code>veth_vm_ip</code>: the two endpoints of the slot’s <code>/31</code> veth link. The host endpoint is assigned to <code>veth-{slot}</code> and the namespace endpoint is assigned to <code>vpeer</code>.</li>
+<li><code>vm_ip</code> and <code>tap_ip</code>: fixed endpoints of the VM link on <code>vm_link_cidr</code>. The VM receives <code>vm_ip</code>; the namespace TAP interface receives <code>tap_ip</code>.</li>
+</ul>
+<p>The namespace adds a default route through <code>veth_host_ip</code>. Firecracker receives an <code>ip=</code> boot argument containing the VM address, TAP link, netmask, and the guest DNS server selected from the host resolver configuration.</p>
+<p>The complete internal pools are denied before user egress rules. This prevents a sandbox from reaching another slot’s host-interaction address, veth link, or VM link even when a user policy otherwise allows the destination.</p>
+<h2 id="namespace-setup"><a class="header" href="#namespace-setup">Namespace Setup</a></h2>
+<p><code>Slot::create_network()</code> performs namespace setup on a dedicated thread because network namespace membership is thread-local:</p>
+<ol>
+<li>Create and bind-mount a persistent namespace file under the configured runtime <code>netns</code> directory.</li>
+<li>Unshare <code>CLONE_NEWNET</code> and create the veth pair.</li>
+<li>Move the host endpoint to the process’s baseline host namespace.</li>
+<li>Configure <code>lo</code>, <code>vpeer</code>, <code>tap0</code>, addresses, link state, and the namespace default route.</li>
+<li>Enable namespace IPv4 forwarding and configure namespace NAT/filter rules.</li>
+<li>Configure the host veth address and a host route for the slot’s <code>host_interaction_ip</code>.</li>
+</ol>
+<p>The baseline namespace rules are installed once during setup. Per-sandbox user rules and proxy redirects are replaced later by <code>set_egress_policy()</code>.</p>
+<h2 id="packet-paths"><a class="header" href="#packet-paths">Packet Paths</a></h2>
+<pre class="mermaid">flowchart TB
+    vm["Firecracker VM"] --&gt; tap["tap0"]
+    tap --&gt; prerouting["namespace nat/PREROUTING"]
+    prerouting -. "TCP 80/443 REDIRECT" .-&gt; proxy["Namespace-local\nEgressProxy"]
+    prerouting --&gt; forward["namespace filter/FORWARD\nAGENTENV-EGRESS"]
+    proxy --&gt; upstream_proxy["Proxy upstream connection"]
+    forward --&gt; nsnat["namespace POSTROUTING\nSNAT to host_interaction_ip"]
+    upstream_proxy --&gt; nsnat
+    nsnat --&gt; vpeer["vpeer / veth"]
+    vpeer --&gt; host["Host FORWARD + POSTROUTING\nMASQUERADE"]
+    host --&gt; internet["External destination"]
+    internet -. "return traffic" .-&gt; host
+    host -. "ESTABLISHED,RELATED" .-&gt; vpeer
+    vpeer -. "return traffic" .-&gt; tap
+    tap -. "return traffic" .-&gt; vm
+</pre>
+
+<h3 id="sandbox-originated-internet-traffic"><a class="header" href="#sandbox-originated-internet-traffic">Sandbox-originated internet traffic</a></h3>
+<ol>
+<li>The VM sends a packet through <code>eth0</code> to <code>tap0</code>.</li>
+<li>The namespace NAT <code>PREROUTING</code> chain may redirect TCP ports 80 and 443 to the namespace-local proxy.</li>
+<li>Packets that continue as routed traffic traverse <code>filter/FORWARD</code> from <code>tap0</code> to <code>vpeer</code>, entering <code>AGENTENV-EGRESS</code>.</li>
+<li>The namespace <code>POSTROUTING</code> chain SNATs VM-originated traffic to the slot’s <code>host_interaction_ip</code>. Proxy-originated upstream connections are SNATed from the namespace <code>vpeer</code> address to the same slot identity.</li>
+<li>The host <code>FORWARD</code> and <code>POSTROUTING</code> rules accept the slot source range and MASQUERADE it for the external route.</li>
+</ol>
+<h3 id="return-traffic"><a class="header" href="#return-traffic">Return traffic</a></h3>
+<p>Return packets are classified as <code>ESTABLISHED,RELATED</code> and are accepted before the user egress chain in the namespace. The host also accepts established traffic returning to <code>veth-{slot}</code>. This preserves host/envd/proxy responses and existing outbound flows while policy rules are replaced.</p>
+<h3 id="host-to-vm-traffic"><a class="header" href="#host-to-vm-traffic">Host-to-VM traffic</a></h3>
+<p>Host-side proxy and envd traffic targets the slot’s <code>host_interaction_ip</code>. Namespace <code>PREROUTING</code> on <code>vpeer</code> DNATs that address to the VM’s fixed <code>vm_ip</code>. The corresponding return path is accepted by the established/related rules.</p>
+<h2 id="host-firewall"><a class="header" href="#host-firewall">Host Firewall</a></h2>
+<p><code>NetworkManager</code> installs one process-wide set of host rules for the configured host interaction CIDR. The rules are inserted/appended symmetrically and removed during manager shutdown:</p>
+<pre><code class="language-text">INPUT      -i veth-+ -s &lt;host_interaction_cidr&gt; -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+INPUT      -i veth-+ -s &lt;host_interaction_cidr&gt; -j REJECT
+FORWARD    -i veth-+ -s &lt;host_interaction_cidr&gt; -j ACCEPT
+FORWARD    -o veth-+ -d &lt;host_interaction_cidr&gt; --state ESTABLISHED,RELATED -j ACCEPT
+POSTROUTING -s &lt;host_interaction_cidr&gt; -j MASQUERADE
+</code></pre>
+<p>The <code>INPUT</code> pair prevents guest-originated new connections from reaching arbitrary host services while preserving established host-originated traffic. The <code>FORWARD</code> and <code>MASQUERADE</code> rules handle namespace-to-internet forwarding after namespace SNAT.</p>
+<h2 id="namespace-firewall"><a class="header" href="#namespace-firewall">Namespace Firewall</a></h2>
+<p>Each namespace has three managed chains:</p>
+<ul>
+<li><code>AGENTENV-EGRESS</code> is the static chain reached from <code>FORWARD</code> for guest traffic.</li>
+<li><code>AGENTENV-USER-EGRESS</code> contains the replaceable user policy.</li>
+<li><code>AGENTENV-EGRESS-PROXY</code> is the replaceable NAT chain reached from <code>nat/PREROUTING</code> for proxy-backed traffic.</li>
+</ul>
+<p>The static filter chain is ordered as follows:</p>
+<ol>
+<li>Accept <code>ESTABLISHED,RELATED</code> traffic from <code>tap0</code> to <code>vpeer</code>.</li>
+<li>Allow UDP/TCP DNS traffic to the configured guest DNS address on port 53.</li>
+<li>Reject the complete internal address pools and configured <code>always_denied_cidrs</code>.</li>
+<li>Jump to <code>AGENTENV-USER-EGRESS</code>.</li>
+</ol>
+<p>The user chain is rendered in this order:</p>
+<ol>
+<li>Explicit <code>allowOut</code> CIDR/IP rules (<code>ACCEPT</code>).</li>
+<li>Explicit <code>denyOut</code> CIDR/IP rules (<code>REJECT</code>).</li>
+<li>A <code>0.0.0.0/0</code> reject when the base policy is <code>Deny</code>.</li>
+</ol>
+<p>This ordering gives user allow rules precedence over overlapping user denies, while static internal/platform denies remain non-overridable.</p>
+<h2 id="egress-proxy"><a class="header" href="#egress-proxy">Egress Proxy</a></h2>
+<p>The egress proxy is namespace-local and transparent. It does not terminate TLS or rewrite HTTP. A policy that requires proxy mediation redirects only TCP ports 80 and 443 to <code>0.0.0.0:15000</code> inside that namespace.</p>
+<h3 id="connection-flow"><a class="header" href="#connection-flow">Connection flow</a></h3>
+<ol>
+<li><code>EgressProxy::ensure_listener()</code> enters the target namespace with <code>setns</code>, binds the listener, and starts a nonblocking accept loop.</li>
+<li>The listener accepts a connection and copies the active policy for that connection.</li>
+<li>The connection handler reads <code>SO_ORIGINAL_DST</code> to recover the destination altered by <code>REDIRECT</code>.</li>
+<li>It buffers the initial request/handshake up to 64 KiB and extracts HTTP <code>Host</code> or TLS ClientHello SNI. TLS handshake bytes are accumulated across record boundaries.</li>
+<li>A domain match is sent to the process-wide resolver worker, which remains in the host network namespace. Each candidate IPv4 address is checked by <code>SandboxNetworkPolicy::is_domain_allowed</code>, including absolute platform and internal-range denies, before it is selected.</li>
+<li>A domain connection is dialed to the selected trusted address. An IP/CIDR connection uses the original destination after <code>is_ip_allowed</code>.</li>
+<li>The buffered preface is written to the upstream and both directions are relayed with half-close handling.</li>
+</ol>
+<p>An empty or unrecognized hostname cannot fall back to the base allow policy when a domain allowlist is present. This keeps domain policies fail-closed. Domain allow rules require the API request to include an explicit <code>denyOut: ["0.0.0.0/0"]</code>.</p>
+<h3 id="policy-replacement"><a class="header" href="#policy-replacement">Policy replacement</a></h3>
+<p>The running policy update is a replacement operation:</p>
+<ol>
+<li>Stage the new policy in the proxy’s <code>pending</code> map.</li>
+<li>Ensure the namespace listener exists when proxy mediation is required.</li>
+<li>Apply the filter and NAT chain replacement as one <code>iptables-restore</code> batch.</li>
+<li>When an active proxy policy already exists, activate the pending policy only after the namespace batch succeeds.</li>
+<li>When proxy mediation is being enabled for a namespace with no active proxy policy, activate the prepared policy before installing the redirect. This preserves the namespace’s previous default-allow behavior until the atomic iptables batch has completed; no connection can reach the listener through <code>REDIRECT</code> before that batch succeeds.</li>
+<li>If an update fails while an active proxy policy exists, discard the pending policy and retain the previous active policy.</li>
+</ol>
+<p>Each accepted connection holds a copy of the active policy selected at accept time. Therefore updates primarily affect new connections; existing relays are not proactively terminated. Removing a policy or a slot closes tracked handler sockets and joins their threads before namespace resources are removed.</p>
+<h3 id="namespace-ownership"><a class="header" href="#namespace-ownership">Namespace ownership</a></h3>
+<p>The process-global registry is keyed by <code>host_interaction_ip</code>, but listeners are not shared between namespaces. Every namespace has its own listener thread and socket. When a policy no longer requires proxy mediation, the listener and active/pending policy are removed. Full slot cleanup stops the listener before deleting the veth and unmounting the namespace.</p>
+<h2 id="lifecycle-and-warm-pool"><a class="header" href="#lifecycle-and-warm-pool">Lifecycle and Warm Pool</a></h2>
+<p><code>NetworkManager::allocate_any()</code> first acquires a warm <code>Slot</code>. If none is available it allocates a new slot index and creates the namespace/veth/TAP resources. The Firecracker backend then applies the launch policy before boot or resume continues.</p>
+<p>On stop, a slot may return to the warm pool. The namespace and baseline networking remain available for reuse; <code>user_egress_rules_present</code> tracks whether the next tenant needs a user-chain replacement. The next policy application clears or replaces stale user rules and removes stale proxy policy as appropriate. Slots drained from the pool are fully cleaned up.</p>
+<p>On shutdown, the manager stops pool maintenance, drains warm slots, stops all proxy listeners, removes global host rules, and removes namespace/veth state. An <code>atexit</code> hook and <code>Drop</code> path provide best-effort cleanup for abnormal exits.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="sandbox-and-test-flow-guide"><a class="header" href="#sandbox-and-test-flow-guide">Sandbox and Test Flow Guide</a></h1>
 <p>This document describes the public sandbox API, the global <code>ConfigManager</code> under
