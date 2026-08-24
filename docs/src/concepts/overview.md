@@ -1,6 +1,48 @@
 # How AgentENV Works
 
-AgentENV runs AI agents inside isolated Firecracker microVMs. Each sandbox is a lightweight Linux VM with its own kernel, filesystem, and network namespace.
+AgentENV runs AI agents and their tools inside isolated, snapshot-capable Linux
+environments. Each environment, called a **sandbox**, is backed by a Firecracker
+microVM with its own kernel, filesystem, processes, and network stack.
+
+## User Workflow
+
+```mermaid
+flowchart LR
+    image["OCI image"] -->|"aenv pull"| template["Template"]
+    dockerfile["Dockerfile"] -->|"aenv build"| template
+    image -->|"aenv start --cold"| sandbox
+    template -->|"aenv start"| sandbox["Running<br/>sandbox"]
+    sandbox -->|"aenv connect / aenv exec"| work["Run code, tools, and services"]
+    work --> sandbox
+    sandbox -->|"aenv snapshot create"| snapshot["Snapshot"]
+    snapshot -->|"aenv start"| newSandbox["New sandbox"]
+```
+
+A typical workflow is:
+
+1. Create a reusable template from an OCI image or Dockerfile.
+2. Start an isolated sandbox from the template, or cold start one directly
+   from an OCI image.
+3. Run command in the sandbox.
+4. Pause the sandbox when you want to preserve the same sandbox for later, or
+   create a snapshot when you want a reusable checkpoint that can launch new
+   sandboxes.
+5. Delete sandboxes and snapshots when they are no longer needed.
+
+## Templates, Sandboxes, and Snapshots
+
+These three concepts describe the reusable and running forms of an environment:
+
+| Concept | Purpose |
+|---|---|
+| **Template** | A named, reusable starting point used to launch sandboxes. A template build produces a committed snapshot underneath. |
+| **Sandbox** | A running, isolated Linux environment where you execute code, modify files, and start services. |
+| **Snapshot** | A durable checkpoint captured from a sandbox. It can be started repeatedly to create new sandboxes with the captured state. |
+
+- Building a template produces a snapshot-backed starting point.
+- Starting a template or snapshot creates a sandbox.
+- Capturing a running sandbox creates a snapshot without replacing the source
+  sandbox.
 
 ## System Overview
 
@@ -16,37 +58,20 @@ flowchart TD
 
 ## Request Flow
 
-1. A client sends an HTTP request to the AgentENV API (for example, `POST /sandboxes`).
-2. The **API layer** validates the request, checks authentication, and forwards it to the **orchestrator**.
-3. The **orchestrator** manages the sandbox lifecycle: it creates a Firecracker VM, sets up networking, and attaches block devices.
-4. The VM boots with a **layered block device** (overlaybd) that stacks read-only base image layers with a writable upper layer. Multiple sandboxes share the same base layers.
-5. Inside the VM, an **envd** daemon handles command execution, file operations, and health reporting.
-6. Clients interact with running sandboxes via the **reverse proxy** (`/proxy`, routing headers, or configured sandbox proxy domains), which forwards HTTP and WebSocket traffic to services inside the VM.
+1. A client sends an HTTP request to the AgentENV API (for example,
+   `POST /sandboxes`).
+2. The **API layer** validates the request, checks authentication, and forwards
+   it to the **orchestrator**.
+3. The **orchestrator** manages the sandbox lifecycle: it creates a Firecracker
+   VM, sets up networking, and attaches block devices.
+4. The VM boots with a **layered block device** (overlaybd) that stacks read-only
+   base image layers with a writable upper layer. Multiple sandboxes share the
+   same base layers.
+5. Inside the VM, an **envd** daemon handles command execution, file operations,
+   and health reporting.
+6. Clients interact with running sandboxes via the **reverse proxy** (`/proxy`,
+   routing headers, or configured sandbox proxy domains), which forwards HTTP
+   and WebSocket traffic to services inside the VM.
 
-## Key Components
-
-| Component | What It Does |
-|-----------|-------------|
-| **API Server** | HTTP server exposing E2B-compatible endpoints for sandbox and template management |
-| **Orchestrator** | State machine managing sandbox lifecycle transitions (create, pause, resume, delete) |
-| **Firecracker VM** | Lightweight microVM providing kernel-level isolation per sandbox |
-| **Block Device Layer** | overlaybd (layered images) + ublk (userspace block devices) for efficient storage |
-| **envd** | In-guest daemon for executing commands, streaming output, and managing processes |
-| **Reverse Proxy** | Routes HTTP/WebSocket traffic from clients to services running inside sandboxes |
-| **Snapshot Manager** | Manages committed snapshots for efficient sandbox creation and reuse |
-| **Template Builder** | User-facing build layer that declaratively produces committed snapshots with pre-installed software |
-
-## Multi-Node Architecture
-
-For multi-node deployments, a **gateway** and **scheduler** sit in front of multiple AgentENV nodes:
-
-```mermaid
-flowchart LR
-    client["Client"] -->|HTTP| gateway["Gateway<br/>(:8080)"]
-    gateway -->|gRPC| scheduler["Scheduler<br/>(:9090)"]
-    gateway -->|proxy HTTP| nodeA["Node A<br/>(:8000)"]
-    gateway -->|proxy HTTP| nodeB["Node B<br/>(:8000)"]
-    scheduler -.->|node selection /<br/> lookup result| gateway
-```
-
-The gateway routes requests by sandbox ID. For new sandboxes, the scheduler picks a node. For existing sandboxes, the scheduler looks up the node that owns it. See [Deployment](../deployment/docker-compose.md) for setup instructions.
+Continue with [Templates](./templates.md), [Sandboxes](./sandboxes.md), and
+[Snapshots](./snapshots.md) for the commands and options for each workflow.

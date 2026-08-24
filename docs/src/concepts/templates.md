@@ -1,37 +1,48 @@
 # Templates
 
-A template is the user-facing wrapper around a committed snapshot. Instead of
-booting a fresh VM and installing software every time, you build a template
-once and later create sandboxes from it in milliseconds.
-
-## How Templates Work
-
-1. **Define**: specify an overlaybd-backed base rootfs and ordered steps such as `run`, `env`, and `workdir`.
-2. **Build**: AgentENV boots a temporary sandbox and executes those steps inside it.
-3. **Finalize**: optional startup commands can be started and checked for readiness before the snapshot is captured.
-4. **Publish**: the result is committed as a snapshot in the snapshot repository.
-5. **Launch**: creating a sandbox from a template resolves the committed snapshot and resumes from it.
+A template is a reusable starting point for launching sandboxes. Build or
+import it once, then use it to create sandboxes whenever you need the same
+software and configuration.
 
 ## Create Your Template
 
 There are two ways to create a template: `aenv pull` imports an OCI image directly, and `aenv build` runs Dockerfile instructions inside a temporary build sandbox.
 
+Some defaults below come from your AgentENV config file. This is
+`config/default.toml` by default, or the file specified by
+`AENV_CONFIG_PATH`.
+
 ### aenv pull
 
-Pulling an existing OCI image as a template:
+Pull an existing OCI image as a template and optionally give it a memorable name:
+
+Usage:
+
+```bash
+aenv pull <image> [options]
+```
+
+Example:
 
 ```bash
 aenv pull ubuntu:24.04
+aenv pull ubuntu:24.04 --name my-base
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--name <name>` | Template name. Defaults to the repository segment of the image |
-| `--start-cmd <cmd>` | Command to run before capturing the snapshot |
-| `--ready-cmd <cmd>` | Shell command polled every 2 s until exit 0; gates snapshot capture |
-| `--probe <port>` | Readiness check: wait for TCP on `localhost:<port>` |
-| `-d`, `--detach` | Submit the build and return without waiting |
-| `--timeout <secs>` | Maximum time to wait for the build to complete |
+`--name` is optional. Without it, AgentENV uses the image repository name. A template name can
+be used anywhere a template ID is accepted.
+
+| Argument or option | Default | Description |
+|---|---|---|
+| `<image>` | Required | OCI image reference. Short names such as `ubuntu:24.04` and full references are supported. |
+| `--name <name>` | Image repository name | Assign a human-readable template name. |
+| `--cpu <count>` | `[machine].vcpu_count` from your config file | Set the template's vCPU count. Alias: `--cpu-count`. |
+| `--memory <MiB>` | `[machine].mem_size_mib` from your config file | Set the template's memory. Aliases: `--memory-mb`, `--mem`. |
+| `--start-cmd <cmd>` | None | Run a command before capturing the template snapshot. |
+| `--ready-cmd <cmd>` | `sleep 20` when `--start-cmd` is set; otherwise none | Poll a shell command every two seconds until it exits successfully. |
+| `--probe <port>` | None | Wait for TCP on `localhost:<port>`. Cannot be combined with `--ready-cmd`. |
+| `-d`, `--detach` | Off | Submit the build and return immediately instead of waiting. |
+| `--timeout <seconds>` | No timeout | Limit how long the CLI waits for the build. Cannot be combined with `--detach`. |
 
 `Env`, `WorkingDir`, and `User` are automatically inherited from the OCI image config. See [Runtime Configuration](#runtime-configuration) for the full field list.
 
@@ -42,13 +53,26 @@ aenv pull ubuntu:24.04
 Build a template by running Dockerfile instructions inside a temporary sandbox:
 
 ```bash
-aenv build ./Dockerfile --name my-template
+aenv build <dockerfile> --name <name> [options]
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--name <name>` | Required template name |
-| `--image <ref>` | Override the `FROM` image |
+| Argument or option | Default | Description |
+|---|---|---|
+| `<dockerfile>` | Required | Path to the Dockerfile. |
+| `--name <name>` | Required | Assign the template name. |
+| `--image <ref>` | First concrete `FROM` image | Override the base image. If the Dockerfile has no usable `FROM`, `[image.resolver].default_image` from your config file is used. Alias: `--user-image`. |
+| `--cpu <count>` | `[machine].vcpu_count` from your config file | Set the template's vCPU count. Alias: `--cpu-count`. |
+| `--memory <MiB>` | `[machine].mem_size_mib` from your config file | Set the template's memory. Aliases: `--memory-mb`, `--mem`. |
+
+`aenv build` and `aenv pull --detach` submit the build and return immediately. Watch it until it
+succeeds or fails by passing the template name or ID:
+
+```bash
+aenv template watch my-template
+```
+
+`aenv template watch` has no timeout option. Stop the
+local watch with `Ctrl-C`; the remote build continues.
 
 Supported Dockerfile instructions:
 
@@ -79,52 +103,24 @@ corresponding Dockerfile instructions executed during the build. The following f
 | `Volumes` | `VOLUME` | Stored as metadata only |
 | `Labels` | `LABEL` | Stored as metadata only |
 
-### Aliases
-
-Each template is identified by a UUID. Pass `--name` at creation time to assign
-a human-readable alias:
-
-```bash
-aenv pull ubuntu:24.04 --name my-base
-aenv build ./Dockerfile --name my-service
-```
-
-The alias can be used wherever a template ID is accepted:
-
-```bash
-aenv start my-base
-aenv template delete my-service
-```
-
 ## Manage Templates
 
 ### List templates
 
 ```bash
 aenv template list        # alias: aenv template ls
+aenv template list --output json
 ```
 
-Displays all templates with their ID, name, build status, CPU, memory, disk size, and last-updated timestamp.
+Displays all templates with their ID, name, build status, CPU, memory, disk
+size, and last-updated timestamp. `--output` accepts `table` or `json`. It
+defaults to `table` in an interactive terminal and `json` when output is piped
+or redirected.
 
 ### Delete a template
 
 ```bash
 aenv template delete <template-id-or-name>   # alias: aenv template rm
-```
-
-### Watch a build
-
-`aenv build` always detaches immediately after submitting. Use `watch` to follow the build status until it succeeds or fails:
-
-```bash
-aenv template watch <template-id-or-name>
-```
-
-### Start a sandbox from a template
-
-```bash
-aenv start <template-id-or-name>      # start and attach an interactive shell
-aenv start -d <template-id-or-name>   # detach: print sandbox ID and exit
 ```
 
 ## Relationship to Snapshots

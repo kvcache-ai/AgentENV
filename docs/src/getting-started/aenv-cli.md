@@ -45,12 +45,14 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 
 | Flag | Description |
 |------|-------------|
-| `--name <name>` | Override the template name |
+| `--name <name>` | Override the template name. Defaults to the image's repository segment. |
+| `--cpu <count>` | CPU cores for the template. Defaults to `[machine].vcpu_count` on the server. Alias: `--cpu-count`. |
+| `--memory <MiB>` | Memory for the template. Defaults to `[machine].mem_size_mib` on the server. Aliases: `--memory-mb`, `--mem`. |
 | `--start-cmd <cmd>` | Shell command to run inside the sandbox before capturing the template snapshot |
-| `--ready-cmd <cmd>` | Shell command used to wait until the sandbox is ready (polled until it exits 0) |
-| `--probe <PORT>` | Wait until `localhost:<PORT>` accepts TCP connections |
+| `--ready-cmd <cmd>` | Shell command polled until it exits 0. Defaults to `sleep 20` when `--start-cmd` is set; otherwise unset. |
+| `--probe <PORT>` | Wait until `localhost:<PORT>` accepts TCP connections. Conflicts with `--ready-cmd`. |
 | `-d, --detach` | Submit the build and return immediately without waiting |
-| `--timeout <SECS>` | Maximum seconds to wait for the build to complete |
+| `--timeout <SECS>` | Maximum seconds to wait for the build to complete. No timeout by default. Conflicts with `--detach`. |
 
 ### `aenv build <dockerfile> --name <name>`
 
@@ -64,7 +66,12 @@ aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
 | Flag | Description |
 |------|-------------|
 | `--name <name>` | Required template name |
-| `--image <image>` | Override the `FROM` image used as the rootfs base |
+| `--cpu <count>` | CPU cores for the template. Defaults to `[machine].vcpu_count` on the server. Alias: `--cpu-count`. |
+| `--memory <MiB>` | Memory for the template. Defaults to `[machine].mem_size_mib` on the server. Aliases: `--memory-mb`, `--mem`. |
+| `--image <image>` | Override the rootfs base. Defaults to the first concrete `FROM` image, then the server's `[image.resolver].default_image` if none is usable. Alias: `--user-image`. |
+
+`aenv build` submits the build and returns immediately. Use
+`aenv template watch <template>` to wait for completion.
 
 ### `aenv template list`
 
@@ -74,6 +81,10 @@ List all templates. Alias: `aenv template ls`, `aenv templates list`.
 aenv template list
 aenv template list --output json
 ```
+
+| Flag | Description |
+|------|-------------|
+| `--output <table\|json>` | Output format. Defaults to table on a TTY and JSON when redirected. |
 
 ### `aenv template watch <template>`
 
@@ -99,7 +110,8 @@ aenv template delete <template-id>
 
 ### `aenv start <target>`
 
-Start a sandbox and attach an interactive shell. `<target>` is a template name or template UUID.
+Start a sandbox and attach an interactive shell. `<target>` accepts a template
+or snapshot ID or alias, or an OCI image reference with `--cold`.
 
 ```bash
 aenv start my-ubuntu
@@ -112,11 +124,12 @@ aenv start --cold ubuntu:24.04              # start directly from an OCI image
 | `--cold` | Start directly from an external OCI image instead of a template |
 | `--secure` | Require token authentication for envd control communication |
 | `--timeout <secs>` | Sandbox TTL in seconds (default: 300) |
-| `--cpu-count <n>` / `--cpu` | CPU cores — only valid with `--cold` |
-| `--memory-mb <n>` / `--mem` | Memory in MiB — only valid with `--cold` |
+| `--cpu <count>` | CPU cores; only valid with `--cold`. Defaults to `[machine].vcpu_count` on the server. Alias: `--cpu-count`. |
+| `--memory <MiB>` | Memory in MiB; only valid with `--cold`. Defaults to `[machine].mem_size_mib` on the server. Aliases: `--memory-mb`, `--mem`. |
+| `--disk-size-mb <MiB>` | Root filesystem size; only valid with `--cold`. Defaults to the source image's virtual size; an explicit value must be at least 1024 and divisible by 1024 MiB. Alias: `--disk-mb`. |
 | `-d, --detach` | Print the sandbox ID and exit without attaching a shell |
 
-`<target>` accepts a template UUID, template name, or (with `--cold`) an OCI image reference.
+CPU, memory, and disk overrides are supported only for cold starts.
 
 ### `aenv pause <sandbox-id>`
 
@@ -136,7 +149,7 @@ aenv resume <sandbox-id>
 
 | Flag | Description |
 |------|-------------|
-| `--timeout <secs>` | TTL in seconds from now (default: 300) |
+| `--timeout <secs>` | TTL in seconds from now (default: 300). Must be longer than the sandbox's current remaining TTL. |
 
 ### `aenv timeout <sandbox-id> <seconds>`
 
@@ -228,7 +241,9 @@ List all sandboxes. Alias: `aenv ls`.
 aenv list
 ```
 
-Outputs a table on a TTY and JSON when piped. Override with `--output table|json`.
+| Flag | Description |
+|------|-------------|
+| `--output <table\|json>` | Output format. Defaults to table on a TTY and JSON when redirected. |
 
 ### `aenv delete <sandbox-id>`
 
@@ -254,7 +269,7 @@ aenv snapshot create <sandbox-id> --name my-base
 
 | Flag | Description |
 |------|-------------|
-| `--name <name>` | Snapshot name or alias |
+| `--name <name>` | Snapshot name or alias. If omitted, the generated snapshot ID identifies the snapshot. |
 
 When source-registry image publication is enabled on the server, the command also prints the published OverlayBD-native image reference on an `Image:` line; that tag can be used directly as a `userImage`.
 
@@ -270,7 +285,7 @@ aenv snapshot list --sandbox-id <sandbox-id>
 | Flag | Description |
 |------|-------------|
 | `--sandbox-id <id>` | Filter snapshots by source sandbox ID |
-| `--output <format>` | Output format: `table` (default on TTY) or `json` |
+| `--output <table\|json>` | Output format. Defaults to table on a TTY and JSON when redirected. |
 
 The table output includes an `IMAGE REF` column (`-` when no image was published); JSON output includes the optional `imageRef` field.
 

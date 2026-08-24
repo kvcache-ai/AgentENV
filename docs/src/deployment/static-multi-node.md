@@ -21,6 +21,17 @@ AgentENV runtime nodes:
 | Runtime node A | `10.0.0.21:8000` | Runs Firecracker sandboxes as `node-a` |
 | Runtime node B | `10.0.0.22:8000` | Runs Firecracker sandboxes as `node-b` |
 
+```mermaid
+flowchart LR
+    client["Client"] -->|"HTTP / WebSocket"| gateway["Gateway<br/>10.0.0.10:8080"]
+    gateway -->|"gRPC"| scheduler["Scheduler<br/>10.0.0.10:9090"]
+    gateway -->|"HTTP proxy"| nodeA["Runtime node A<br/>10.0.0.21:8000"]
+    gateway -->|"HTTP proxy"| nodeB["Runtime node B<br/>10.0.0.22:8000"]
+    nodeA -.->|"heartbeat"| scheduler
+    nodeB -.->|"heartbeat"| scheduler
+    scheduler -.->|"placement and lookup"| gateway
+```
+
 AgentENV authenticates HTTP requests but does not encrypt them. Use private
 addresses, a VPN, or TLS termination before traffic crosses an untrusted
 network.

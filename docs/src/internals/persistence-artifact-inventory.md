@@ -78,6 +78,35 @@ Owned by `src/sandbox/extra_drive.rs` and Firecracker snapshot code.
 | Extra-drive symlink           | sandbox work dir `extra-drive-{drive_id}`          | Symlink to `/dev/ublkbN` device path             | Firecracker drive attachment path                            | Created after ublk runtime device creation. Removed on rollback or work dir cleanup. | Yes.                                      |
 | Extra-drive snapshot artifact | snapshot artifact dir `drives/{drive_id}/...`      | Captured drive overlaybd config and commit layer | Preserve attached-drive writable state across pause/resume/publish | Created during sandbox snapshot/pause. Later owned by persister, managed root, or repository publish flow. | No.                                       |
 
+## Snapshot Storage Model
+
+Snapshot data passes through three storage layers with different ownership and
+lifetime rules:
+
+1. **Builder staging** is a manager-owned temporary workspace under
+   `<snapshot.local_cache_path>/snapshots/<id>/`. It holds local rootfs,
+   memory, VM-state, and attached-drive artifacts while a build or capture is
+   in progress. It is not the durable snapshot record.
+2. **The committed snapshot repository** stores the snapshot catalog,
+   aliases, `snapshot.json`, `firecracker-manifest.json`, `vm_state.bin`, and
+   referenced managed layers. This is the durable source of truth exposed by
+   the template and snapshot APIs.
+3. **The node-local runtime cache** materializes runnable rootfs, memory, and
+   drive `image.json` files under
+   `<snapshot.local_cache_path>/runtime/<id>/` before launch. These files are
+   derived runtime inputs and can be rebuilt from committed state.
+
+The committed `snapshot.json` records the captured runtime context, startup
+configuration, and rootfs, drive, and memory layer references. The Firecracker
+manifest records launch metadata such as virtual sizes and attached-drive
+configuration. Temporary upper files and generated `image.json` files are not
+committed snapshot truth.
+
+During runtime resolution, AgentENV converts the committed layer references
+into node-local rootfs, memory, and attached-drive configs, hydrates the
+Firecracker manifest with node-local paths, and resolves the committed
+`vm_state.bin` into a runnable path.
+
 ## Image Resolver
 
 Owned by `src/image/*`.

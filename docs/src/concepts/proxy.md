@@ -15,9 +15,25 @@ The reverse proxy lets you reach services running inside a sandbox from outside.
 
 Query strings are forwarded unchanged.
 
-## Required Headers
+For example, start an HTTP server on port `8080` inside a running sandbox:
 
-Each proxied request must identify the target sandbox and port:
+```bash
+aenv exec <sandbox-id> sh -c 'echo "Hello from AgentENV" > /tmp/index.html'
+aenv exec <sandbox-id> python3 -m http.server 8080 --directory /tmp
+```
+
+Access the service through the AgentENV proxy:
+
+```bash
+curl http://127.0.0.1:8000/proxy/index.html \
+  -H "x-agentenv-sandbox-id: <sandbox-id>" \
+  -H "x-agentenv-target-port: 8080"
+```
+
+## Header-Based Routing
+
+When using `/proxy` or routing an otherwise unmatched path with headers,
+identify the target sandbox and port with these headers:
 
 | Header | Description |
 |--------|-------------|
@@ -37,12 +53,11 @@ These routing headers are stripped before the request is forwarded to the sandbo
 
 Proxy authentication is independent from AgentENV API authentication:
 
-- Public application ingress (`allowPublicTraffic: true`, the default) requires
-  no AgentENV credential.
-- Private application ingress (`allowPublicTraffic: false`) requires the
-  sandbox's `trafficAccessToken` in `e2b-traffic-access-token`.
-- Secure envd traffic requires the sandbox's `envdAccessToken` in
-  `X-Access-Token`. Insecure envd traffic has no envd token.
+| Traffic | When it applies | Required credential |
+| --- | --- | --- |
+| Public application ingress | The sandbox uses `allowPublicTraffic: true`, which is the default. | None |
+| Private application ingress | The sandbox uses `allowPublicTraffic: false`. | `e2b-traffic-access-token: <trafficAccessToken>` |
+| Secure envd traffic | The sandbox was created with secure communication enabled. | `X-Access-Token: <envdAccessToken>` |
 
 `X-API-Key` authenticates AgentENV control-plane APIs only. It does not grant
 access to private application ingress or secure envd. A matching platform key

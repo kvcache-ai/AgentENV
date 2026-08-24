@@ -16,19 +16,10 @@
 - [Manual Compile (Single Node)](./deployment/manual-compile.md)
 - [PVM Deployment (When KVM Is Unavailable)](./deployment/pvm.md)
 
-# Configuration
-
-- [Configuration Reference](./configuration/reference.md)
-- [Environment Variables](./configuration/env-vars.md)
-
-# Security
-
-- [Authentication](./security/authentication.md)
-- [Secure Sandboxes](./security/secure-sandboxes.md)
-
 # Core Concepts
 
 - [How AgentENV Works](./concepts/overview.md)
+- [Authentication](./concepts/authentication.md)
 - [Templates](./concepts/templates.md)
 - [Sandboxes](./concepts/sandboxes.md)
 - [Snapshots](./concepts/snapshots.md)
@@ -46,6 +37,11 @@
 # Troubleshooting
 
 - [Common Issues](./troubleshooting/common-issues.md)
+
+# Configuration
+
+- [Configuration Reference](./configuration/reference.md)
+- [Environment Variables](./configuration/env-vars.md)
 
 ---
 

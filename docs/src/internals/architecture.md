@@ -27,6 +27,19 @@ flowchart TD
     style node fill:transparent,stroke:gray
 ```
 
+## Key Components
+
+| Component | Location | Responsibility |
+|---|---|---|
+| **API Server** | `src/api/` | Exposes the E2B-compatible HTTP API and reverse proxy endpoints. |
+| **Orchestrator** | `src/orchestrator/` | Coordinates sandbox lifecycle transitions, persistence, and cleanup. |
+| **Firecracker Runtime** | `src/sandbox/firecracker/` | Creates and controls the microVM used by each sandbox. |
+| **Block Device Layer** | `storage/overlaybd/`, `storage/ublk/` | Provides layered root filesystems, attached drives, and snapshot-backed block devices. |
+| **envd Integration** | `thirdparty/envd/`, `src/sandbox/` | Handles in-guest command execution, file operations, process interaction, and health reporting. |
+| **Reverse Proxy** | `src/api/proxy.rs` | Routes HTTP, SSE, and WebSocket traffic to services inside sandboxes. |
+| **Snapshot Manager** | `src/snapshot/` | Commits, resolves, and deletes durable sandbox snapshots. |
+| **Template Builder** | `src/template/` | Builds user-facing templates and publishes their committed snapshots. |
+
 ## Storage 
 
 The storage subsystem turns layered image files into block devices mountable by VMs, and provides ublk-backed memory snapshot restore for snapshot resume. Four crates compose the active subsystem:

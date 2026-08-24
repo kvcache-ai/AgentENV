@@ -46,7 +46,8 @@ This builds three images: `agentenv-runtime:latest`, `agentenv-gateway:latest`, 
 
 ## Configure the Access-Token Seed (Optional)
 
-See [Secure Sandboxes](../security/secure-sandboxes.md) for the optional shared seed configuration and Kubernetes Secret example.
+See [Authentication](../concepts/authentication.md#sandbox-access-token-seed)
+for the shared sandbox access-token seed configuration.
 
 ## Deploy
 
@@ -74,7 +75,7 @@ Set `AENV_API_KEY` when applying to supply your own value. A standalone
 `make k8s-render` uses an invalid `REDACTED` placeholder so preview output never
 contains a deployable API key. The optional runtime seed keeps its existing
 `agentenv-runtime-secrets` contract described in
-[Secure Sandboxes](../security/secure-sandboxes.md).
+[Authentication](../concepts/authentication.md#sandbox-access-token-seed).
 
 To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when rendering or applying manifests:
