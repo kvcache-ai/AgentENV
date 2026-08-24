@@ -95,12 +95,16 @@ fi
 # Expose envd as a stable guest command.
 $BB ln -sf /agentenv/envd /usr/local/bin/envd
 
-# envd 0.5.x starts guest processes through /usr/bin/nice. Minimal user images
-# do not always ship coreutils, so provide a BusyBox-backed fallback without
-# overriding an image that already has a real nice(1).
+# envd wraps guest processes in `/usr/bin/ionice ... /usr/bin/nice ...`. Minimal
+# user images (Alpine/musl, distroless, FROM scratch) do not always ship
+# coreutils or util-linux, so provide BusyBox-backed fallbacks without
+# overriding an image that already has real nice(1)/ionice(1).
 $BB mkdir -p /usr/bin
 if [ ! -x /usr/bin/nice ]; then
     $BB ln -sf /agentenv/bin/busybox /usr/bin/nice
+fi
+if [ ! -x /usr/bin/ionice ]; then
+    $BB ln -sf /agentenv/bin/busybox /usr/bin/ionice
 fi
 
 # Prepare remaining runtime directories envd and the guest init commonly
