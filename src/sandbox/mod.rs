@@ -35,7 +35,10 @@ pub use firecracker::{
     FirecrackerSandboxFactory, FirecrackerSnapshotConfig, FirecrackerSnapshotManifest,
 };
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
-pub use network::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
+pub use network::{
+    BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+    ALL_INTERNET_TRAFFIC_CIDR,
+};
 pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
 pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
 

@@ -625,7 +625,6 @@ mod tests {
     use overlaybd::backend::local::LocalFile;
     use overlaybd::config::GlobalConfig;
     use overlaybd::index_file::{create_file_rw, LayerInfo};
-    use storage_util::io_ring::spawn_io_ring_worker;
 
     async fn test_cache(dir: &Path) -> (ImageServiceCache, PathBuf) {
         let global_config = dir.join("global.json");
@@ -646,11 +645,8 @@ mod tests {
     }
 
     async fn create_sealed_lower(path: &Path, index_path: &Path, payload: &[u8]) {
-        let (io_ring, _join_handle) = spawn_io_ring_worker::<io_uring::squeue::Entry>(0);
-        let data_file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::new(path, io_ring.clone()).await.unwrap());
-        let index_file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::new(index_path, io_ring).await.unwrap());
+        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path).unwrap());
+        let index_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(index_path).unwrap());
         let args = LayerInfo::new(data_file, Some(index_file), payload.len() as u64);
         let lower = create_file_rw(args).await.unwrap();
         lower.write_at(0, payload).await.unwrap();
@@ -774,11 +770,8 @@ mod tests {
         let (cache, global_config) = test_cache(temp.path()).await;
         let lower_path = temp.path().join("lower.data");
         let lower_index_path = temp.path().join("lower.index");
-        let (io_ring, _join_handle) = spawn_io_ring_worker::<io_uring::squeue::Entry>(0);
-        let data_file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::new(&lower_path, io_ring.clone()).await.unwrap());
-        let index_file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::new(&lower_index_path, io_ring).await.unwrap());
+        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&lower_path).unwrap());
+        let index_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&lower_index_path).unwrap());
         let lower = create_file_rw(LayerInfo::new(data_file, Some(index_file), GIB))
             .await
             .unwrap();

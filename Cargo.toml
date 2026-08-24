@@ -50,6 +50,8 @@ opendal = { version = "0.55.0", features = ["services-s3"] }
 object-store-operator = { path = "crates/object-store-operator" }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+httparse = "1.10"
+tls-parser = "0.12.2"
 http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -61,7 +63,8 @@ nix = { version = "0.31", features = ["sched", "mount", "fs", "signal", "user", 
 libc = "0.2"
 rtnetlink = "0.20"
 netlink-packet-route = "0.28"
-ipnetwork = "0.21"
+ipnetwork = { version = "0.21", features = ["serde"] }
+hickory-resolver = "0.26.1"
 futures = "0.3"
 tonic = "0.14.2"
 tonic-prost = "0.14.2"

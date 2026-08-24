@@ -18,7 +18,9 @@
 //!
 //! [`AsyncIoRing`]: storage_util::io_ring::AsyncIoRing
 
-use crate::io::virtual_file::{IoCtx, VirtualFile};
+#[cfg(feature = "io-uring")]
+use crate::io::virtual_file::IoCtx;
+use crate::io::virtual_file::VirtualFile;
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use std::future::Future;
@@ -83,10 +85,12 @@ impl FileReader for DirectRead {
 /// Context-aware read strategy — dispatches to
 /// [`VirtualFile::read_at_into_with_ctx`]. The captured [`IoCtx`] makes the
 /// future `!Send`; use this on the ublk queue thread.
+#[cfg(feature = "io-uring")]
 pub struct CtxRead<'c> {
     pub ctx: IoCtx<'c>,
 }
 
+#[cfg(feature = "io-uring")]
 impl<'c> FileReader for CtxRead<'c> {
     fn read<'a>(
         &'a self,
@@ -123,10 +127,12 @@ impl FileWriter for DirectWrite {
 
 /// Context-aware write strategy — dispatches to
 /// [`VirtualFile::write_at_with_ctx`].
+#[cfg(feature = "io-uring")]
 pub struct CtxWrite<'c> {
     pub ctx: IoCtx<'c>,
 }
 
+#[cfg(feature = "io-uring")]
 impl<'c> FileWriter for CtxWrite<'c> {
     fn write<'a>(
         &'a self,

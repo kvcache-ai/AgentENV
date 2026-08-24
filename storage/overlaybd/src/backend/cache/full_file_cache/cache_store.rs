@@ -13,8 +13,12 @@ use super::super::{
 };
 use super::cache_entry::{AcquireRefillResult, CacheEntry};
 use super::cache_pool::FileCacheBackend;
-use crate::io::vfile_io::{CtxRead, DirectRead, FileReader};
-use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile};
+#[cfg(feature = "io-uring")]
+use crate::io::vfile_io::CtxRead;
+use crate::io::vfile_io::{DirectRead, FileReader};
+use crate::io::virtual_file::VirtualFile;
+#[cfg(feature = "io-uring")]
+use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
 
 #[derive(Clone, Copy)]
 struct ReadCtx {
@@ -820,10 +824,10 @@ impl FileCacheBackend {
     // -------------------------------------------------------------------
     // Public-ish entry points called from CachedFile.
     //
-    // The non-`_with_ctx` variants drive the source through the global
-    // `IoRingHandle` workers (default `FileReader`) and yield `Send` futures,
-    // matching the historical behaviour for background callers (refill from
-    // tests, write_at_with_flags, prefetch, etc.).
+    // The non-`_with_ctx` variants use the source's ordinary `VirtualFile`
+    // methods (default `FileReader`) and yield `Send` futures. Local files use
+    // synchronous positional I/O on this fallback path; remote sources remain
+    // asynchronous.
     //
     // The `_with_ctx` variants accept an [`IoCtx`] and dispatch source IO
     // through it. The returned future is `!Send` because [`IoCtx`] borrows a
@@ -845,6 +849,7 @@ impl FileCacheBackend {
             .await
     }
 
+    #[cfg(feature = "io-uring")]
     async fn do_preadv2_with_ctx<'a>(
         &'a self,
         io_ctx: IoCtx<'a>,
@@ -870,6 +875,7 @@ impl FileCacheBackend {
             .await
     }
 
+    #[cfg(feature = "io-uring")]
     async fn do_preadv2_into_with_ctx<'a>(
         &'a self,
         io_ctx: IoCtx<'a>,
@@ -902,6 +908,7 @@ impl FileCacheBackend {
         .await
     }
 
+    #[cfg(feature = "io-uring")]
     async fn cache_refill_with_data_with_ctx<'a>(
         &'a self,
         io_ctx: IoCtx<'a>,
@@ -1388,6 +1395,7 @@ impl VirtualFile for CachedFile {
         self.write_at_with_flags(offset, data, 0).await
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -1414,6 +1422,7 @@ impl VirtualFile for CachedFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -1443,6 +1452,7 @@ impl VirtualFile for CachedFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,

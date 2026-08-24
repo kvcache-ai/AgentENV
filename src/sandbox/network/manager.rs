@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
 #[cfg(test)]
@@ -13,6 +13,7 @@ use nix::libc;
 use tracing::{debug, trace, warn};
 use warm_pool::{PoolConfig, PoolMaintenanceAction, WarmPool};
 
+use super::egress_proxy::EgressProxy;
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
 use super::{NetworkAddressPlan, NetworkError, Slot, HOST_VETH_PREFIX, MAX_SLOTS};
 
@@ -44,16 +45,6 @@ struct NetworkManagerConfig {
     netns_dir: PathBuf,
 }
 
-fn get_network_manager_config() -> NetworkManagerConfig {
-    let cfg = crate::cfg::ConfigManager::global_config();
-    NetworkManagerConfig {
-        pool: cfg.network_pool_config(),
-        address_plan: NetworkAddressPlan::from_config(&cfg.network)
-            .expect("validated network.internal config should produce an address plan"),
-        netns_dir: cfg.runtime_path.join("netns"),
-    }
-}
-
 pub(crate) struct NetworkManager {
     /// Bitmap tracking allocated slots.
     allocated: AtomicBitSet<{ slot_count::from_bits(MAX_SLOTS) }>,
@@ -66,6 +57,10 @@ pub(crate) struct NetworkManager {
 
     /// Directory containing persistent namespace bind mounts.
     netns_dir: PathBuf,
+
+    /// Namespace-local transparent proxy for egress capabilities that require
+    /// connection inspection or mediation.
+    egress_proxy: Arc<EgressProxy>,
 
     /// Rejects new allocations once shutdown cleanup starts.
     shutting_down: AtomicBool,
@@ -88,7 +83,13 @@ impl NetworkManager {
                 );
             }
 
-            Self::with_config(get_network_manager_config())
+            let cfg = crate::cfg::ConfigManager::global_config();
+            Self::with_config(NetworkManagerConfig {
+                pool: cfg.network_pool_config(),
+                address_plan: NetworkAddressPlan::from_config(&cfg.network)
+                    .expect("validated network.internal config should produce an address plan"),
+                netns_dir: cfg.runtime_path.join("netns"),
+            })
         });
 
         manager.ensure_pool_maintenance_worker_started();
@@ -122,11 +123,13 @@ impl NetworkManager {
     }
 
     fn with_config(config: NetworkManagerConfig) -> Self {
+        let egress_proxy = EgressProxy::new();
         let manager = Self {
             allocated: AtomicBitSet::new(),
             pool: WarmPool::new(config.pool),
             address_plan: config.address_plan,
             netns_dir: config.netns_dir,
+            egress_proxy,
             shutting_down: AtomicBool::new(false),
         };
 
@@ -167,8 +170,13 @@ impl NetworkManager {
 
         match self.allocated.insert(idx as usize) {
             // insert returns true when the bit WAS already set (duplicate)
-            Some(false) => Ok(Slot::new(idx, self.address_plan, self.netns_dir.clone())
-                .expect("Slot index just validated")),
+            Some(false) => Ok(Slot::new(
+                idx,
+                self.address_plan,
+                self.netns_dir.clone(),
+                Arc::clone(&self.egress_proxy),
+            )
+            .expect("Slot index just validated")),
             Some(true) => Err(anyhow!("Slot {} already allocated", idx)),
             None => Err(anyhow!("Slot index {} out of range", idx)),
         }
@@ -202,7 +210,7 @@ impl NetworkManager {
         self.cleanup_slot_and_release_bit_inner(slot, false)
     }
 
-    fn cleanup_slot_and_release_bit_inner(&self, slot: Slot, sync_cleanup: bool) -> Result<()> {
+    fn cleanup_slot_and_release_bit_inner(&self, mut slot: Slot, sync_cleanup: bool) -> Result<()> {
         let idx = slot.idx;
         let cleanup_result = slot.cleanup(sync_cleanup);
         let bitset_result = self.release_slot_bit(idx);
@@ -262,8 +270,13 @@ impl NetworkManager {
 
         match self.allocated.set_next_free_bit() {
             Some(idx) => {
-                let slot = Slot::new(idx as u32, self.address_plan, self.netns_dir.clone())
-                    .expect("BitSet index within valid range");
+                let mut slot = Slot::new(
+                    idx as u32,
+                    self.address_plan,
+                    self.netns_dir.clone(),
+                    Arc::clone(&self.egress_proxy),
+                )
+                .expect("BitSet index within valid range");
                 if let Err(e) = slot.create_network() {
                     self.allocated.remove(idx);
                     return Err(anyhow!("Failed to create network: {e}"));
@@ -401,6 +414,7 @@ impl NetworkManager {
             }
         }
 
+        self.egress_proxy.shutdown();
         self.cleanup_global_host_iptables();
 
         if failures.is_empty() {
@@ -738,6 +752,7 @@ mod tests {
             idx,
             NetworkAddressPlan::default(),
             std::env::temp_dir().join("aenv-network-tests/netns"),
+            EgressProxy::new(),
         )
         .unwrap()
     }

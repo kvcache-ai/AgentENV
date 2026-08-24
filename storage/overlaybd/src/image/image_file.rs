@@ -5,7 +5,6 @@ use crate::config::{DownloadConfig, ImageConfig, LayerConfig, UpperConfig, Upper
 use crate::image::helper::prepare_runtime_upper;
 use crate::image::image_service::CacheDownloadRequest;
 use crate::image::image_service::ImageService;
-use crate::io::transient_io_ring::shared_transient_io_ring;
 use crate::io::virtual_file::VirtualFile;
 use crate::layer::layer_metadata::{read_overlaybd_layer_uuid, COMMIT_FILE_NAME, SEALED_FILE_NAME};
 use crate::lsmt::file::{
@@ -22,7 +21,6 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use storage_util::io_ring::IoRingHandle;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -254,13 +252,10 @@ impl ImageFile {
             )
             .context("prepare fresh upper after restack")?;
 
-            let io_ring = shared_transient_io_ring();
             let new_upper_data: Arc<dyn VirtualFile> = Arc::new(
-                LocalFile::open_rw(&upper_data_path, false, io_ring.clone())
-                    .await
-                    .with_context(|| {
-                        format!("open fresh upper data {}", upper_data_path.display())
-                    })?,
+                LocalFile::open_rw(&upper_data_path, false).with_context(|| {
+                    format!("open fresh upper data {}", upper_data_path.display())
+                })?,
             );
             let new_upper_index = match upper_mode {
                 UpperMode::Sparse => None,
@@ -268,13 +263,11 @@ impl ImageFile {
                     let upper_index_path = upper_index_path
                         .as_ref()
                         .context("log-structured upper lost its index path during restack")?;
-                    Some(Arc::new(
-                        LocalFile::open_rw(upper_index_path, false, io_ring)
-                            .await
-                            .with_context(|| {
-                                format!("open fresh upper index {}", upper_index_path.display())
-                            })?,
-                    ) as Arc<dyn VirtualFile>)
+                    Some(
+                        Arc::new(LocalFile::open_rw(upper_index_path, false).with_context(
+                            || format!("open fresh upper index {}", upper_index_path.display()),
+                        )?) as Arc<dyn VirtualFile>,
+                    )
                 }
             };
             let new_upper = open_file_rw(new_upper_data, new_upper_index)
@@ -360,8 +353,7 @@ impl ImageFile {
             prefetcher.as_ref(),
         )
         .await?;
-        let upper_file =
-            Self::open_upper(&config.upper, image_service.io_ring(&config.upper.index)).await?;
+        let upper_file = Self::open_upper(&config.upper).await?;
         let replay_prefetch = prefetcher
             .as_ref()
             .map(|prefetcher| prefetcher.mode() == PrefetchMode::Replay)
@@ -536,7 +528,7 @@ impl ImageFile {
         Ok(opened)
     }
 
-    async fn open_upper(upper: &UpperConfig, io_ring: IoRingHandle) -> Result<Option<LSMTFile>> {
+    async fn open_upper(upper: &UpperConfig) -> Result<Option<LSMTFile>> {
         if upper.data.is_empty() {
             return Ok(None);
         }
@@ -546,18 +538,14 @@ impl ImageFile {
             ));
         }
 
-        let data_file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::open_rw(&upper.data, false, io_ring.clone()).await?);
+        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(&upper.data, false)?);
         let idx_file = match upper.writable_mode() {
             UpperMode::Sparse => None,
             UpperMode::LogStructured | UpperMode::HybridLogStructured => {
                 if upper.index.is_empty() {
                     bail!("log-structured upper requires upper.index");
                 }
-                Some(
-                    Arc::new(LocalFile::open_rw(&upper.index, false, io_ring).await?)
-                        as Arc<dyn VirtualFile>,
-                )
+                Some(Arc::new(LocalFile::open_rw(&upper.index, false)?) as Arc<dyn VirtualFile>)
             }
         };
         Ok(Some(open_file_rw(data_file, idx_file).await?))
@@ -591,12 +579,11 @@ impl ImageFile {
         let path_display = path.to_string_lossy().into_owned();
         let direct_io = image_service.io_engine() == IO_ENGINE_LIBAIO;
         let file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::builder(image_service.io_ring(path))
+            LocalFile::builder()
                 .write(false)
                 .create(false)
                 .direct_io(direct_io)
-                .open(path)
-                .await?,
+                .open(path)?,
         );
         let tar_file = new_tar_file_adaptor(file).await?;
         let switch = new_switch_file(tar_file, true, Some(path_display.as_str())).await?;
@@ -764,6 +751,7 @@ impl VirtualFile for ImageFile {
         Ok(written)
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: crate::io::virtual_file::IoCtx<'a>,
@@ -783,6 +771,7 @@ impl VirtualFile for ImageFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: crate::io::virtual_file::IoCtx<'a>,
@@ -803,6 +792,7 @@ impl VirtualFile for ImageFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         ctx: crate::io::virtual_file::IoCtx<'a>,
@@ -822,6 +812,7 @@ impl VirtualFile for ImageFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_bytes_at_with_ctx<'a>(
         &'a self,
         ctx: crate::io::virtual_file::IoCtx<'a>,
@@ -924,7 +915,6 @@ mod tests {
     use crate::config::DownloadConfig;
     use crate::lsmt::file::{create_file_rw, LayerInfo, RwLayout};
     use crate::prefetch::new_prefetcher;
-    use crate::test_utils::test_io_ring;
     use axum::body::Body;
     use axum::extract::{Request, State};
     use axum::http::header::CONTENT_RANGE as CONTENT_RANGE_RAW;
@@ -941,9 +931,8 @@ mod tests {
     use tokio::time::{sleep, Duration};
 
     async fn create_sealed_lower(path: &Path, index_path: &Path, payload: &[u8]) -> Result<()> {
-        let ring = test_io_ring();
-        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path, ring.clone()).await?);
-        let index_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(index_path, ring).await?);
+        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path)?);
+        let index_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(index_path)?);
         let args = LayerInfo::new(data_file.clone(), Some(index_file), payload.len() as u64);
         let lsmt = create_file_rw(args).await?;
         lsmt.write_at(0, payload).await?;
@@ -1061,15 +1050,13 @@ mod tests {
         virtual_size: u64,
         mode: UpperMode,
     ) -> Result<()> {
-        let ring = test_io_ring();
-        let data_file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::new(data_path, ring.clone()).await?);
+        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(data_path)?);
         let index_file = match mode {
             UpperMode::Sparse => None,
             UpperMode::LogStructured | UpperMode::HybridLogStructured => {
                 let index_path =
                     index_path.context("log-structured test upper requires an index path")?;
-                Some(Arc::new(LocalFile::new(index_path, ring).await?) as Arc<dyn VirtualFile>)
+                Some(Arc::new(LocalFile::new(index_path)?) as Arc<dyn VirtualFile>)
             }
         };
         let mut args = LayerInfo::new(data_file, index_file, virtual_size);
@@ -1626,11 +1613,8 @@ mod tests {
         assert_eq!(&got_full[..4096], first_overlay.as_slice());
         assert_eq!(&got_full[4096..8192], second_overlay.as_slice());
 
-        let snapshot_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_ro(&snapshot_path, service.io_ring(&snapshot_path))
-                .await
-                .expect("open snapshot file"),
-        );
+        let snapshot_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_ro(&snapshot_path).expect("open snapshot file"));
         let snapshot = LSMTReadOnlyFile::open(snapshot_file)
             .await
             .expect("open snapshot lower");
@@ -1710,11 +1694,8 @@ mod tests {
             "restacked sparse upper should not materialize an index file",
         );
 
-        let snapshot_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_ro(&snapshot_path, service.io_ring(&snapshot_path))
-                .await
-                .expect("open snapshot file"),
-        );
+        let snapshot_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_ro(&snapshot_path).expect("open snapshot file"));
         let snapshot = LSMTReadOnlyFile::open(snapshot_file)
             .await
             .expect("open snapshot lower");
@@ -1807,11 +1788,8 @@ mod tests {
             "restacked hybrid upper should keep an index file",
         );
 
-        let snapshot_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_ro(&snapshot_path, service.io_ring(&snapshot_path))
-                .await
-                .expect("open snapshot file"),
-        );
+        let snapshot_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_ro(&snapshot_path).expect("open snapshot file"));
         let snapshot = LSMTReadOnlyFile::open(snapshot_file)
             .await
             .expect("open snapshot lower");

@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-storage-util = { path = "../util" }
-overlaybd = { path = "../overlaybd" }
+storage-util = { path = "../util", features = ["io-uring"] }
+overlaybd = { path = "../overlaybd", features = ["io-uring"] }
 
 anyhow = "1.0"
 ublk-sys = { package = "libublk-rs-sys", git = "https://github.com/ublk-org/libublk-rs.git", rev = "c6a3e06" }
@@ -31,4 +31,4 @@ tracing-bunyan-formatter = "0.3.10"
 tempfile = "3"
 axum = "0.8.6"
 sha2 = "0.10.9"
-storage-util = { path = "../util" }
+storage-util = { path = "../util", features = ["io-uring"] }

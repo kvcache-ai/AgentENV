@@ -3,15 +3,23 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr},
+    sync::OnceLock,
 };
+
+use ipnetwork::{IpNetwork, Ipv4Network};
 
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
 use crate::cfg::network::normalize_dns_name;
 
-pub const ALL_INTERNET_TRAFFIC_CIDR: &str = "0.0.0.0/0";
+pub const ALL_INTERNET_TRAFFIC_CIDR: IpNetwork =
+    IpNetwork::V4(Ipv4Network::new_checked(Ipv4Addr::UNSPECIFIED, 0).unwrap());
 
 const EGRESS_CHAIN: &str = "AGENTENV-EGRESS";
 const USER_EGRESS_CHAIN: &str = "AGENTENV-USER-EGRESS";
+const EGRESS_PROXY_CHAIN: &str = "AGENTENV-EGRESS-PROXY";
+const DOMAIN_INSPECTION_TCP_PORTS: &[u16] = &[80, 443];
+
+static PLATFORM_DENIED_CIDRS: OnceLock<Box<[Ipv4Network]>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BaseSandboxNetworkPolicy {
@@ -24,9 +32,9 @@ pub enum BaseSandboxNetworkPolicy {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SandboxNetworkEgressPolicy {
-    pub allowed_cidrs: Vec<String>,
+    pub allowed_cidrs: Vec<IpNetwork>,
     pub allowed_domains: Vec<String>,
-    pub denied_cidrs: Vec<String>,
+    pub denied_cidrs: Vec<IpNetwork>,
 }
 
 impl SandboxNetworkEgressPolicy {
@@ -38,7 +46,7 @@ impl SandboxNetworkEgressPolicy {
 
         for entry in allow_out.unwrap_or_default() {
             if let Some(cidr) = try_normalize_ip_or_cidr(&entry)? {
-                if allowed_cidrs.insert(cidr.clone()) {
+                if allowed_cidrs.insert(cidr) {
                     policy.allowed_cidrs.push(cidr);
                 }
             } else {
@@ -54,7 +62,7 @@ impl SandboxNetworkEgressPolicy {
             let Some(cidr) = try_normalize_ip_or_cidr(&entry)? else {
                 bail!("denyOut entry {entry:?} must be an IP address or CIDR block");
             };
-            if denied_cidrs.insert(cidr.clone()) {
+            if denied_cidrs.insert(cidr) {
                 policy.denied_cidrs.push(cidr);
             }
         }
@@ -123,20 +131,104 @@ impl SandboxNetworkPolicy {
     pub(crate) fn has_domain_allow_rules(&self) -> bool {
         self.egress.has_domain_allow_rules()
     }
+
+    /// Whether this policy needs traffic interception by the namespace-local
+    /// egress proxy. Domain allowlists are the first proxy-backed capability;
+    /// future proxy capabilities should extend this decision at this boundary.
+    pub(crate) fn requires_egress_proxy(&self) -> bool {
+        self.has_domain_allow_rules()
+    }
+
+    /// TCP destination ports intercepted for the proxy-backed capabilities in this policy.
+    pub(crate) fn egress_proxy_tcp_ports(&self) -> &'static [u16] {
+        if self.has_domain_allow_rules() {
+            DOMAIN_INSPECTION_TCP_PORTS
+        } else {
+            &[]
+        }
+    }
+
+    /// Decide whether an original IP destination may leave the sandbox.
+    /// The runtime dataplane currently supplies IPv4 original destinations;
+    /// retain IPv6 CIDRs for wire compatibility without pretending this
+    /// method provides IPv6 iptables enforcement.
+    pub(crate) fn is_ip_allowed(&self, ip: Ipv4Addr) -> bool {
+        if self.is_absolutely_denied(ip) {
+            return false;
+        }
+        if self
+            .egress
+            .allowed_cidrs
+            .iter()
+            .any(|cidr| matches!(cidr, IpNetwork::V4(network) if network.contains(ip)))
+        {
+            return true;
+        }
+        if self
+            .egress
+            .denied_cidrs
+            .iter()
+            .any(|cidr| matches!(cidr, IpNetwork::V4(network) if network.contains(ip)))
+        {
+            return false;
+        }
+        // A domain allowlist is an opt-in capability. If the inspected host is
+        // absent or does not match, do not fall back to the base policy.
+        if self.has_domain_allow_rules() {
+            return false;
+        }
+        self.base_policy != BaseSandboxNetworkPolicy::Deny
+    }
+
+    /// Decide whether a host-side resolved address may leave the sandbox for
+    /// an allowed domain. Passing `None` checks only the hostname branch before
+    /// DNS resolution; the proxy passes `Some(resolved_ip)` before connecting.
+    /// User CIDR denies do not override an explicit domain allow, matching
+    /// E2B's allow precedence; absolute platform and slot denies remain
+    /// effective.
+    pub(crate) fn is_domain_allowed(&self, hostname: &str, resolved_ip: Option<Ipv4Addr>) -> bool {
+        if hostname.is_empty()
+            || !self
+                .egress
+                .allowed_domains
+                .iter()
+                .any(|pattern| domain_matches(hostname, pattern))
+        {
+            return false;
+        }
+        resolved_ip.is_none_or(|ip| !self.is_absolutely_denied(ip))
+    }
+
+    fn is_absolutely_denied(&self, ip: Ipv4Addr) -> bool {
+        PLATFORM_DENIED_CIDRS
+            .get_or_init(|| {
+                let config = crate::cfg::ConfigManager::global_config();
+                let address_plan = super::NetworkAddressPlan::from_config(&config.network)
+                    .expect("validated network config should produce an address plan");
+                config
+                    .network
+                    .egress
+                    .always_denied_cidrs
+                    .iter()
+                    .chain(address_plan.internal_egress_denied_cidrs().iter())
+                    .filter_map(|cidr| cidr.parse::<Ipv4Network>().ok())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            })
+            .iter()
+            .any(|cidr| cidr.contains(ip))
+    }
 }
 
-pub(super) fn set_namespace_egress_policy(policy: Option<&SandboxNetworkPolicy>) -> Result<()> {
+pub(super) fn set_namespace_egress_policy(
+    policy: Option<&SandboxNetworkPolicy>,
+    egress_proxy_port: u16,
+) -> Result<()> {
     let default_policy = SandboxNetworkPolicy::default();
     let policy = policy.unwrap_or(&default_policy);
 
-    if !policy.egress.allowed_domains.is_empty() {
-        bail!(
-            "domain entries in allowOut require the TCP egress proxy, which is not enabled yet: {:?}",
-            policy.egress.allowed_domains
-        );
-    }
-
-    let commands = build_user_egress_commands(policy, true);
+    let mut commands = build_user_egress_commands(policy, true);
+    commands.extend(build_egress_proxy_commands(policy, egress_proxy_port));
     apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)
 }
 
@@ -145,6 +237,25 @@ fn configured_always_denied_cidrs() -> &'static [String] {
         .network
         .egress
         .always_denied_cidrs
+}
+
+fn domain_matches(hostname: &str, pattern: &str) -> bool {
+    let hostname = hostname.trim_end_matches('.');
+    let pattern = pattern.trim_end_matches('.');
+    pattern == "*"
+        || pattern.eq_ignore_ascii_case(hostname)
+        || pattern.strip_prefix("*.").is_some_and(|suffix| {
+            let Some(suffix_start) = hostname.len().checked_sub(suffix.len()) else {
+                return false;
+            };
+            let Some(prefix) = hostname.get(..suffix_start) else {
+                return false;
+            };
+            let Some(host_suffix) = hostname.get(suffix_start..) else {
+                return false;
+            };
+            !prefix.is_empty() && prefix.ends_with('.') && host_suffix.eq_ignore_ascii_case(suffix)
+        })
 }
 
 pub(super) fn initialize_namespace_egress_chain(
@@ -176,6 +287,22 @@ pub(super) fn initialize_namespace_egress_chain(
         internal_egress_denied_cidrs,
         configured_always_denied_cidrs(),
     ));
+    commands.extend([
+        IptablesRestoreCommand::NewChain {
+            table: "nat",
+            chain: EGRESS_PROXY_CHAIN,
+        },
+        IptablesRestoreCommand::Insert {
+            table: "nat",
+            chain: "PREROUTING",
+            position: 1,
+            rule: format!("-i tap0 -j {EGRESS_PROXY_CHAIN}"),
+        },
+        IptablesRestoreCommand::FlushChain {
+            table: "nat",
+            chain: EGRESS_PROXY_CHAIN,
+        },
+    ]);
 
     apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)
         .context("initialize AgentENV namespace egress iptables chains")
@@ -232,13 +359,19 @@ fn build_user_egress_commands(
         Vec::new()
     };
 
-    for cidr in policy.egress.allowed_cidrs.iter().map(String::as_str) {
+    for cidr in &policy.egress.allowed_cidrs {
+        let IpNetwork::V4(cidr) = cidr else {
+            continue;
+        };
         commands.push(append_user_egress_command(format!(
             "-i tap0 -o vpeer -d {cidr} -j ACCEPT"
         )));
     }
 
-    for cidr in policy.egress.denied_cidrs.iter().map(String::as_str) {
+    for cidr in &policy.egress.denied_cidrs {
+        let IpNetwork::V4(cidr) = cidr else {
+            continue;
+        };
         commands.push(append_user_egress_command(format!(
             "-i tap0 -o vpeer -d {cidr} -j REJECT"
         )));
@@ -250,6 +383,26 @@ fn build_user_egress_commands(
         )));
     }
 
+    commands
+}
+
+fn build_egress_proxy_commands(
+    policy: &SandboxNetworkPolicy,
+    egress_proxy_port: u16,
+) -> Vec<IptablesRestoreCommand> {
+    let mut commands = vec![IptablesRestoreCommand::FlushChain {
+        table: "nat",
+        chain: EGRESS_PROXY_CHAIN,
+    }];
+    for port in policy.egress_proxy_tcp_ports() {
+        commands.push(IptablesRestoreCommand::Append {
+            table: "nat",
+            chain: EGRESS_PROXY_CHAIN,
+            rule: format!(
+                "-i tap0 -p tcp --dport {port} -j REDIRECT --to-ports {egress_proxy_port}"
+            ),
+        });
+    }
     commands
 }
 
@@ -269,16 +422,16 @@ fn append_user_egress_command(rule: String) -> IptablesRestoreCommand {
     }
 }
 
-fn try_normalize_ip_or_cidr(s: &str) -> Result<Option<String>> {
+fn try_normalize_ip_or_cidr(s: &str) -> Result<Option<IpNetwork>> {
     if let Ok(ip) = s.parse::<IpAddr>() {
         return Ok(Some(match ip {
-            IpAddr::V4(ip) => format!("{ip}/32"),
-            IpAddr::V6(ip) => format!("{ip}/128"),
+            IpAddr::V4(ip) => IpNetwork::V4(Ipv4Network::new(ip, 32)?),
+            IpAddr::V6(ip) => IpNetwork::V6(ipnetwork::Ipv6Network::new(ip, 128)?),
         }));
     }
 
     match s.parse::<ipnetwork::IpNetwork>() {
-        Ok(network) => Ok(Some(network.to_string())),
+        Ok(network) => Ok(Some(network)),
         Err(err) if s.contains('/') => {
             Err(err).with_context(|| format!("invalid IP or CIDR entry {s:?}"))
         }
@@ -325,9 +478,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(policy.allowed_cidrs, ["8.8.8.8/32", "1.1.1.0/24"]);
+        assert_eq!(
+            policy.allowed_cidrs,
+            ["8.8.8.8/32".parse().unwrap(), "1.1.1.0/24".parse().unwrap()]
+        );
         assert_eq!(policy.allowed_domains, ["*.example.com"]);
-        assert_eq!(policy.denied_cidrs, ["203.0.113.0/24"]);
+        assert_eq!(policy.denied_cidrs, ["203.0.113.0/24".parse().unwrap()]);
     }
 
     #[test]
@@ -348,9 +504,41 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(policy.allowed_cidrs, ["8.8.8.8/32", "1.1.1.1/32"]);
+        assert_eq!(
+            policy.allowed_cidrs,
+            ["8.8.8.8/32".parse().unwrap(), "1.1.1.1/32".parse().unwrap()]
+        );
         assert_eq!(policy.allowed_domains, ["example.com"]);
-        assert_eq!(policy.denied_cidrs, ["203.0.113.1/32", "203.0.113.0/24"]);
+        assert_eq!(
+            policy.denied_cidrs,
+            [
+                "203.0.113.1/32".parse().unwrap(),
+                "203.0.113.0/24".parse().unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn structured_cidrs_keep_string_wire_format() {
+        let policy = SandboxNetworkEgressPolicy::new(
+            Some(vec!["8.8.8.8".to_string(), "2001:db8::1/128".to_string()]),
+            Some(vec!["0.0.0.0/0".to_string()]),
+        )
+        .unwrap();
+
+        let value = serde_json::to_value(&policy).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "allowed_cidrs": ["8.8.8.8/32", "2001:db8::1/128"],
+                "allowed_domains": [],
+                "denied_cidrs": ["0.0.0.0/0"]
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<SandboxNetworkEgressPolicy>(value).unwrap(),
+            policy
+        );
     }
 
     #[test]
@@ -386,7 +574,7 @@ mod tests {
             allow_public_traffic: true,
             base_policy: BaseSandboxNetworkPolicy::Deny,
             egress: SandboxNetworkEgressPolicy {
-                allowed_cidrs: vec!["8.8.8.8/32".to_string()],
+                allowed_cidrs: vec!["8.8.8.8/32".parse().unwrap()],
                 denied_cidrs: Vec::new(),
                 allowed_domains: Vec::new(),
             },
@@ -415,8 +603,8 @@ mod tests {
             allow_public_traffic: true,
             base_policy: BaseSandboxNetworkPolicy::Deny,
             egress: SandboxNetworkEgressPolicy {
-                allowed_cidrs: vec!["8.8.8.8/32".to_string()],
-                denied_cidrs: vec!["203.0.113.0/24".to_string()],
+                allowed_cidrs: vec!["8.8.8.8/32".parse().unwrap()],
+                denied_cidrs: vec!["203.0.113.0/24".parse().unwrap()],
                 allowed_domains: Vec::new(),
             },
         };
@@ -438,6 +626,21 @@ mod tests {
                 "-i tap0 -o vpeer -d 0.0.0.0/0 -j REJECT",
             ]
         );
+    }
+
+    #[test]
+    fn build_user_rules_ignores_ipv6_for_ipv4_iptables() {
+        let policy = SandboxNetworkPolicy {
+            allow_public_traffic: true,
+            base_policy: BaseSandboxNetworkPolicy::Allow,
+            egress: SandboxNetworkEgressPolicy {
+                allowed_cidrs: vec!["2001:db8::/32".parse().unwrap()],
+                denied_cidrs: vec!["2001:db8:1::/48".parse().unwrap()],
+                allowed_domains: Vec::new(),
+            },
+        };
+
+        assert!(build_user_egress_commands(&policy, false).is_empty());
     }
 
     #[test]
@@ -542,5 +745,76 @@ mod tests {
         assert!(!commands.iter().any(
             |command| append_rule(command) == Some("-i tap0 -o vpeer -d 10.0.0.0/8 -j REJECT")
         ));
+    }
+
+    #[test]
+    fn egress_proxy_redirects_domain_inspection_ports() {
+        let policy = SandboxNetworkPolicy::new(
+            true,
+            BaseSandboxNetworkPolicy::Deny,
+            SandboxNetworkEgressPolicy::new(
+                Some(vec!["example.com".to_string()]),
+                Some(vec![ALL_INTERNET_TRAFFIC_CIDR.to_string()]),
+            )
+            .unwrap(),
+        );
+        let commands = build_egress_proxy_commands(&policy, 43210);
+        let rules = commands.iter().filter_map(append_rule).collect::<Vec<_>>();
+        assert_eq!(rules.len(), 2);
+        assert!(rules[0].contains("--dport 80"));
+        assert!(rules[1].contains("--dport 443"));
+        assert!(rules.iter().all(|rule| rule.contains("--to-ports 43210")));
+    }
+
+    #[test]
+    fn egress_proxy_chain_is_cleared_when_policy_needs_no_proxy() {
+        let commands = build_egress_proxy_commands(&SandboxNetworkPolicy::default(), 43210);
+        assert!(matches!(
+            commands.as_slice(),
+            [IptablesRestoreCommand::FlushChain {
+                table: "nat",
+                chain: EGRESS_PROXY_CHAIN,
+            }]
+        ));
+    }
+
+    #[test]
+    fn authorization_uses_platform_denied_ranges() {
+        let policy = SandboxNetworkPolicy::new(
+            true,
+            BaseSandboxNetworkPolicy::Allow,
+            SandboxNetworkEgressPolicy::default(),
+        );
+
+        assert!(policy.is_ip_allowed(Ipv4Addr::new(198, 51, 100, 10)));
+        assert!(!policy.is_ip_allowed(Ipv4Addr::new(10, 12, 1, 1)));
+    }
+
+    #[test]
+    fn domain_authorization_checks_hostname_and_resolved_ip() {
+        let policy = SandboxNetworkPolicy::new(
+            true,
+            BaseSandboxNetworkPolicy::Default,
+            SandboxNetworkEgressPolicy::new(
+                Some(vec!["example.com".to_string()]),
+                Some(Vec::new()),
+            )
+            .unwrap(),
+        );
+
+        assert!(policy.is_domain_allowed("example.com", None));
+        assert!(policy.is_domain_allowed("example.com", Some(Ipv4Addr::new(192, 0, 2, 10))));
+        assert!(!policy.is_domain_allowed("other.example", None));
+        assert!(!policy.is_domain_allowed("example.com", Some(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(!policy.is_domain_allowed("example.com", Some(Ipv4Addr::new(10, 12, 1, 1))));
+    }
+
+    #[test]
+    fn domain_matching_handles_non_ascii_hostnames_without_panicking() {
+        assert!(std::panic::catch_unwind(|| domain_matches("é.com", "*.com")).is_ok());
+        assert!(
+            std::panic::catch_unwind(|| domain_matches("é.example.com", "*.example.com")).is_ok()
+        );
+        assert!(domain_matches("API.Example.COM", "*.example.com"));
     }
 }

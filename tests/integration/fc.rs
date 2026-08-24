@@ -10,7 +10,6 @@ use agentenv::sandbox::{
 use anyhow::{bail, Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::ImageConfig;
-use overlaybd::transient_io_ring::shared_transient_io_ring;
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::zfile::{is_zfile, zfile_open_ro, CompressOptions};
 
@@ -128,8 +127,7 @@ async fn assert_memory_layer_matches_config(snapshot: &FirecrackerSnapshotConfig
     };
 
     let file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::open_ro(&lower_path, shared_transient_io_ring())
-            .await
+        LocalFile::open_ro(&lower_path)
             .with_context(|| format!("open memory lower {}", lower_path.display()))?,
     );
     let zfile_flag = is_zfile(file.clone())
@@ -497,6 +495,41 @@ async fn assert_tcp_connect(
     Ok(())
 }
 
+async fn assert_curl(
+    sandbox: &mut FirecrackerSandbox,
+    url: &str,
+    should_succeed: bool,
+) -> Result<()> {
+    let output = sandbox
+        .run_command(
+            "curl",
+            &[
+                "--noproxy",
+                "*",
+                "-4",
+                "-sS",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                "10",
+                "-o",
+                "/dev/null",
+                "--",
+                url,
+            ],
+        )
+        .await?;
+    assert_eq!(
+        output.exit_code == 0,
+        should_succeed,
+        "curl expectation failed for {url}; exit={}, stdout={}, stderr={}",
+        output.exit_code,
+        output.stdout,
+        output.stderr
+    );
+    Ok(())
+}
+
 async fn test_network(sandbox: &mut FirecrackerSandbox, after_resume: bool) -> Result<()> {
     let checks = [("tcp_ip", "8.8.8.8/53"), ("tcp_dns", "www.baidu.com/443")];
 
@@ -587,6 +620,39 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
         )))
         .await?;
     assert_tcp_connect(&mut sandbox, "10.255.255.254/80", false).await?;
+
+    sandbox
+        .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
+            BaseSandboxNetworkPolicy::Default,
+            SandboxNetworkEgressPolicy::new(
+                Some(vec!["www.baidu.com".to_string()]),
+                Some(vec!["0.0.0.0/0".to_string()]),
+            )?,
+        )))
+        .await?;
+
+    assert_curl(&mut sandbox, "http://www.baidu.com/", true).await?;
+    assert_curl(&mut sandbox, "https://www.baidu.com/", true).await?;
+    assert_curl(&mut sandbox, "https://www.qq.com/", false).await?;
+
+    sandbox
+        .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
+            BaseSandboxNetworkPolicy::Default,
+            SandboxNetworkEgressPolicy::new(
+                Some(vec!["www.qq.com".to_string()]),
+                Some(vec!["0.0.0.0/0".to_string()]),
+            )?,
+        )))
+        .await?;
+
+    assert_curl(&mut sandbox, "https://www.baidu.com/", false).await?;
+    assert_curl(&mut sandbox, "https://www.qq.com/", true).await?;
+
+    sandbox.update_network_policy(None).await?;
+    assert_curl(&mut sandbox, "https://www.baidu.com/", true).await?;
+    assert_curl(&mut sandbox, "https://www.qq.com/", true).await?;
 
     sandbox.stop().await?;
     Ok(())

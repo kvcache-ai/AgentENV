@@ -710,7 +710,6 @@ mod tests {
 
     use overlaybd::backend::local::LocalFile;
     use overlaybd::index_file::{CommitArgs, LSMTFile};
-    use overlaybd::transient_io_ring::shared_transient_io_ring;
     use overlaybd::virtual_file::VirtualFile;
     use overlaybd::zfile::{is_zfile, CompressArgs, CompressOptions, ZFileCompactWriter};
     use serde_json::json;
@@ -1007,16 +1006,10 @@ mod tests {
     /// Write a real ZFile-compressed sealed LSMT layer, mirroring the memory
     /// snapshot output when `[memory_snapshot].compression_enabled = true`.
     async fn write_zfile_lsmt_layer(path: &std::path::Path) {
-        let io_ring = shared_transient_io_ring();
-        let data = Arc::new(
-            LocalFile::new(path.with_extension("data"), io_ring.clone())
-                .await
-                .expect("create layer data file"),
-        );
+        let data =
+            Arc::new(LocalFile::new(path.with_extension("data")).expect("create layer data file"));
         let index = Arc::new(
-            LocalFile::new(path.with_extension("index"), io_ring.clone())
-                .await
-                .expect("create layer index file"),
+            LocalFile::new(path.with_extension("index")).expect("create layer index file"),
         );
         let layer = LSMTFile::create(data, Some(index), 2 * 4096, false)
             .await
@@ -1029,11 +1022,7 @@ mod tests {
             .write_at(4096, &[0xA5; 4096])
             .await
             .expect("write layer page 1");
-        let output = Arc::new(
-            LocalFile::new(path, io_ring)
-                .await
-                .expect("create zfile layer output"),
-        );
+        let output = Arc::new(LocalFile::new(path).expect("create zfile layer output"));
         let compress_args = CompressArgs::new(CompressOptions::new(
             CompressOptions::LZ4,
             CompressOptions::DEFAULT_BLOCK_SIZE,
@@ -1101,11 +1090,7 @@ mod tests {
                 .len()
         );
         // The stored bytes still probe as a ZFile with the source algorithm.
-        let managed_file = Arc::new(
-            LocalFile::open_ro(&managed_path, shared_transient_io_ring())
-                .await
-                .expect("open managed layer"),
-        );
+        let managed_file = Arc::new(LocalFile::open_ro(&managed_path).expect("open managed layer"));
         assert_eq!(
             is_zfile(managed_file).await.expect("probe managed layer"),
             1

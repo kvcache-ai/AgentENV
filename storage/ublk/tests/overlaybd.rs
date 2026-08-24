@@ -15,7 +15,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use storage_util::io_ring::IoRingHandle;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
@@ -283,16 +282,13 @@ async fn create_initialized_upper(
     data_path: &Path,
     index_path: &Path,
     virtual_size: u64,
-    io_ring: IoRingHandle,
 ) -> Result<()> {
     let data_file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::new(data_path, io_ring.clone())
-            .await
+        LocalFile::new(data_path)
             .with_context(|| format!("create upper data failed: {}", data_path.display()))?,
     );
     let index_file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::new(index_path, io_ring)
-            .await
+        LocalFile::new(index_path)
             .with_context(|| format!("create upper index failed: {}", index_path.display()))?,
     );
     let args = LayerInfo::new(data_file, Some(index_file), virtual_size);
@@ -444,10 +440,9 @@ async fn create_image_file_with_retry(
 /// full-file cache. For overlaybd remote layers that blob is a tar archive
 /// whose payload is the actual `overlaybd.commit` zfile. Validate that wrapper
 /// rather than assuming the cached bytes are a bare LSMT commit.
-async fn validate_downloaded_commit_blob(path: &Path, io_ring: IoRingHandle) -> Result<()> {
+async fn validate_downloaded_commit_blob(path: &Path) -> Result<()> {
     let local: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::open_ro(path, io_ring)
-            .await
+        LocalFile::open_ro(path)
             .with_context(|| format!("open downloaded commit blob failed: {}", path.display()))?,
     );
     let tar = new_tar_file_adaptor(local).await.with_context(|| {
@@ -561,7 +556,7 @@ async fn test_registry_e2e_read_download_verify() -> Result<()> {
         bail!("download is enabled but no remote lowers exist to cache");
     }
     for cached_blob in &cached_blobs {
-        validate_downloaded_commit_blob(cached_blob, service.io_ring(cached_blob))
+        validate_downloaded_commit_blob(cached_blob)
             .await
             .with_context(|| format!("cached blob validation failed: {}", cached_blob.display()))?;
     }
@@ -611,7 +606,7 @@ async fn test_registry_e2e_upper_write_sync_reopen_persist() -> Result<()> {
 
     let upper_data = work_root.join("upper.data");
     let upper_index = work_root.join("upper.index");
-    create_initialized_upper(&upper_data, &upper_index, 0, service.io_ring(&upper_data)).await?;
+    create_initialized_upper(&upper_data, &upper_index, 0).await?;
     let upper_data_len_before = fs::metadata(&upper_data)
         .with_context(|| format!("stat upper data failed: {}", upper_data.display()))?
         .len();
@@ -750,7 +745,7 @@ async fn test_registry_e2e_upper_compact_to_local_lower() -> Result<()> {
 
     let upper_data = work_root.join("compact-upper.data");
     let upper_index = work_root.join("compact-upper.index");
-    create_initialized_upper(&upper_data, &upper_index, 0, service.io_ring(&upper_data)).await?;
+    create_initialized_upper(&upper_data, &upper_index, 0).await?;
     rw_cfg.upper = UpperConfig {
         mode: None,
         index: upper_index.to_string_lossy().into_owned(),
@@ -788,8 +783,7 @@ async fn test_registry_e2e_upper_compact_to_local_lower() -> Result<()> {
 
     let compact_path = work_root.join("flattened-lower.data");
     let compact_dest: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::new(&compact_path, service.io_ring(&compact_path))
-            .await
+        LocalFile::new(&compact_path)
             .with_context(|| format!("create compact dest failed: {}", compact_path.display()))?,
     );
     image

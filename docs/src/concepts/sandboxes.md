@@ -169,7 +169,7 @@ curl -X POST \
 
 For fine-grained egress control, pass a `network` object when creating the sandbox. Within user-configured egress rules, traffic is allow-by-default, and `allowOut` entries take precedence over matching `denyOut` entries. `allowOut` by itself does not create an allowlist: destinations that do not match a deny rule remain reachable.
 
-- `allowOut` — CIDR or IP. Domain patterns are currently not supported.
+- `allowOut` — CIDR, IP, or domain pattern. Domain patterns apply to new TCP connections on ports 80 and 443 and require `denyOut: ["0.0.0.0/0"]`. Exact names, `*.example.com`, and `*` are supported; a wildcard does not match the apex domain.
 - `denyOut` — CIDR or IP
 
 The following diagram illustrates how the rules are evaluated:
@@ -214,6 +214,10 @@ curl -X PUT \
 ```
 
 Omitting both fields clears all per-sandbox egress rules and restores the default allow behavior.
+
+Updating a policy primarily affects new connections; existing connections are not actively terminated. During replacement, the previous policy remains active until the new namespace rules are committed.
+
+For domain rules, the proxy matches the inspected Host/SNI and re-resolves the hostname using the host-side trusted resolver before connecting; the guest's DNS answer and original destination IP are not authoritative for domain policy.
 
 ---
 
