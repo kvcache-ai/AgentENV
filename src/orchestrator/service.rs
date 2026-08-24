@@ -968,23 +968,6 @@ where
         self.delete_sandbox_impl(sandbox_id, previous_state).await
     }
 
-    async fn delete_expired_sandbox_inner(
-        self: &Arc<Self>,
-        sandbox_id: SandboxId,
-        cutoff: SystemTime,
-    ) -> Result<bool> {
-        if !self
-            .claim_expired_running_sandbox(sandbox_id, cutoff, SandboxState::Killing)
-            .await?
-        {
-            return Ok(false);
-        }
-
-        self.delete_sandbox_impl(sandbox_id, SandboxState::Running)
-            .await?;
-        Ok(true)
-    }
-
     async fn claim_expired_running_sandbox(
         &self,
         sandbox_id: SandboxId,
@@ -1154,22 +1137,6 @@ where
         }
 
         self.pause_sandbox_impl(sandbox_id).await
-    }
-
-    async fn pause_expired_sandbox_inner(
-        self: &Arc<Self>,
-        sandbox_id: SandboxId,
-        cutoff: SystemTime,
-    ) -> Result<bool> {
-        if !self
-            .claim_expired_running_sandbox(sandbox_id, cutoff, SandboxState::Pausing)
-            .await?
-        {
-            return Ok(false);
-        }
-
-        self.pause_sandbox_impl(sandbox_id).await?;
-        Ok(true)
     }
 
     async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
@@ -1953,15 +1920,24 @@ where
             if metadata.state != SandboxState::Running {
                 continue;
             }
-            let result = match metadata.timeout_action {
-                SandboxTimeoutAction::Pause => {
-                    self.pause_expired_sandbox_inner(metadata.id, eviction_cutoff)
-                        .await
+            let claimed_state = match metadata.timeout_action {
+                SandboxTimeoutAction::Pause => SandboxState::Pausing,
+                SandboxTimeoutAction::Delete => SandboxState::Killing,
+            };
+            let result = match self
+                .claim_expired_running_sandbox(metadata.id, eviction_cutoff, claimed_state)
+                .await
+            {
+                Ok(true) => match metadata.timeout_action {
+                    SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
+                    SandboxTimeoutAction::Delete => {
+                        self.delete_sandbox_impl(metadata.id, SandboxState::Running)
+                            .await
+                    }
                 }
-                SandboxTimeoutAction::Delete => {
-                    self.delete_expired_sandbox_inner(metadata.id, eviction_cutoff)
-                        .await
-                }
+                .map(|_| true),
+                Ok(false) => Ok(false),
+                Err(err) => Err(err),
             };
             match result {
                 Ok(true) => evicted_ids.push(metadata.id),
