@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-95d9780b.js";
+            window.path_to_searchindex_js = "searchindex-a31e12ad.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a79017d2.js"></script>
@@ -1742,7 +1742,7 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 <tbody>
 <tr><td><code>[pool.network]</code></td><td><code>maintenance_enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable the background network-slot maintenance worker</td></tr>
 <tr><td><code>[pool.block]</code></td><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable the ublk overlaybd warm-device pool</td></tr>
-<tr><td><code>[pool.block]</code></td><td><code>startup_prewarm</code></td><td>boolean</td><td><code>true</code></td><td>Prewarm block devices after the first reusable image shape is known</td></tr>
+<tr><td><code>[pool.block]</code></td><td><code>startup_prewarm</code></td><td>boolean</td><td>capability-based</td><td>Prewarm block devices after the first reusable image shape is known. When omitted, it is enabled only if the kernel supports <code>UBLK_F_UPDATE_SIZE</code>; an explicit value overrides detection</td></tr>
 <tr><td><code>[pool.firecracker]</code></td><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable pre-spawned Firecracker processes for snapshot resume</td></tr>
 <tr><td><code>[pool.firecracker]</code></td><td><code>maintenance_enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable the background Firecracker process maintenance worker</td></tr>
 <tr><td><code>[pool.firecracker]</code></td><td><code>startup_prewarm</code></td><td>boolean</td><td><code>true</code></td><td>Spawn warm Firecracker entries up to the low watermark during server startup</td></tr>
