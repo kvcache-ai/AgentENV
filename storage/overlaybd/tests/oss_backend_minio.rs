@@ -3,6 +3,11 @@ use anyhow::Error;
 use overlaybd::backend::oss::OssBackend;
 use overlaybd::config::OssConfig;
 
+/// Upload shape for the probes. 16 MiB is what a layer upload uses in practice;
+/// the seam assertions below are derived from it rather than hardcoded.
+const PROBE_PART_SIZE: usize = 16 * 1024 * 1024;
+const PROBE_CONCURRENCY: usize = 4;
+
 // Run with: cargo test -p overlaybd --test oss_backend_minio -- --ignored
 
 fn backend(fixture: &MinioFixture) -> OssBackend {
@@ -176,5 +181,77 @@ async fn minio_read_nonexistent_object_returns_error() {
             || error_chain_contains(&err, "Not Found")
             || error_chain_contains(&err, "NotFound"),
         "expected not-found error, got: {err}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn minio_upload_path_streams_a_file_larger_than_one_part() {
+    let fixture = MinioFixture::start().await.expect("start minio");
+    let backend = backend(&fixture);
+    let url = fixture.object_url("stream-test/layer");
+
+    // Larger than the part size, so the upload actually takes the multipart
+    // path rather than a single PUT. A byte pattern that varies with
+    // the offset would catch parts being uploaded in the wrong order.
+    let size = 70 * 1024 * 1024usize;
+    let temp = tempfile::NamedTempFile::new().expect("create upload source");
+    let payload: Vec<u8> = (0..size).map(|offset| (offset % 251) as u8).collect();
+    std::fs::write(temp.path(), &payload).expect("write upload source");
+
+    backend
+        .upload_path(&url, temp.path(), PROBE_PART_SIZE, PROBE_CONCURRENCY)
+        .await
+        .expect("stream upload to minio");
+
+    let file = backend
+        .open_with_size_hint(&url, None)
+        .expect("open the streamed object");
+    assert_eq!(file.size().await.expect("size"), size as u64);
+    let head = file.read_at(0, 4096).await.expect("read the first chunk");
+    assert_eq!(head.as_ref(), &payload[..4096]);
+    // Straddles the first part boundary, where a mis-ordered or truncated part
+    // would show up.
+    let seam = PROBE_PART_SIZE - 2048;
+    let got = file
+        .read_at(seam as u64, 4096)
+        .await
+        .expect("read the seam");
+    assert_eq!(got.as_ref(), &payload[seam..seam + 4096]);
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn minio_object_size_distinguishes_missing_from_empty() {
+    let fixture = MinioFixture::start().await.expect("start minio");
+    let backend = backend(&fixture);
+
+    let missing = fixture.object_url("size-probe/absent");
+    assert_eq!(
+        backend.object_size(&missing).await.expect("probe missing"),
+        None,
+        "a missing object must be None rather than an error"
+    );
+
+    // An empty object exists and has length zero, which must not be confused
+    // with absence: callers skip an upload on Some(_) and perform one on None.
+    let empty = fixture.object_url("size-probe/empty");
+    backend
+        .upload_bytes(&empty, Vec::new())
+        .await
+        .expect("upload an empty object");
+    assert_eq!(
+        backend.object_size(&empty).await.expect("probe empty"),
+        Some(0)
+    );
+
+    let present = fixture.object_url("size-probe/present");
+    backend
+        .upload_bytes(&present, b"twelve bytes".to_vec())
+        .await
+        .expect("upload");
+    assert_eq!(
+        backend.object_size(&present).await.expect("probe present"),
+        Some(12)
     );
 }

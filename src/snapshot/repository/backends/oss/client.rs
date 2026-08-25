@@ -10,7 +10,8 @@ use object_store_operator::{
     CredentialSource, ObjectStoreOperatorConfig, ObjectStoreOperatorError, OperatorWithCredential,
 };
 use opendal::{Error as OpenDalError, ErrorKind as OpenDalErrorKind, Operator};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use overlaybd::backend::oss::upload_file_streaming;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use tracing::info;
 use url::Url;
@@ -22,6 +23,12 @@ use crate::observability::prometheus::MetricGuard;
 /// (~625 GiB at 64 MiB). Must be passed explicitly to opendal via
 /// `writer_with().chunk()`: without it opendal falls back to the service's
 /// minimum multipart part size (5 MiB), capping uploads at ~50 GiB.
+///
+/// Note the memory cost, which is `(2 * UPLOAD_CONCURRENCY + 2) * CHUNK_SIZE`
+/// rather than the product of the two — **measured at 1040 MiB for these
+/// figures**. See `overlaybd::backend::oss::upload_file_streaming` for why.
+/// Deliberately left as it was when the upload loop moved there: shrinking it
+/// would also shrink the largest uploadable object.
 const CHUNK_SIZE: usize = 64 * 1024 * 1024;
 /// Number of multipart parts uploaded concurrently per file. A single
 /// sequential stream tops out at roughly 100 MB/s to the OSS internal
@@ -243,7 +250,16 @@ impl OssClient {
             self.run_with_operator(|operator| {
                 let oss_key = oss_key.clone();
                 let path = path.clone();
-                async move { upload_file_to_operator(&operator, &oss_key, &path).await }
+                async move {
+                    upload_file_streaming(
+                        &operator,
+                        &oss_key,
+                        &path,
+                        CHUNK_SIZE,
+                        UPLOAD_CONCURRENCY,
+                    )
+                    .await
+                }
             })
             .await
             .with_context(|| format!("oss put file '{key}'"))?;
@@ -432,34 +448,6 @@ async fn write_bytes_to_operator(
     data: Bytes,
 ) -> opendal::Result<()> {
     operator.write(key, data).await.map(|_| ())
-}
-
-async fn upload_file_to_operator(
-    operator: &Operator,
-    key: &str,
-    path: &Path,
-) -> opendal::Result<()> {
-    let mut writer = operator
-        .writer_with(key)
-        .chunk(CHUNK_SIZE)
-        .concurrent(UPLOAD_CONCURRENCY)
-        .await?;
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .map_err(|err| io_error_to_opendal(err, "open upload source file"))?;
-    let mut buf = vec![0_u8; CHUNK_SIZE];
-    loop {
-        let read = file
-            .read(&mut buf)
-            .await
-            .map_err(|err| io_error_to_opendal(err, "read upload source file"))?;
-        if read == 0 {
-            break;
-        }
-        writer.write(buf[..read].to_vec()).await?;
-    }
-    writer.close().await?;
-    Ok(())
 }
 
 fn io_error_to_opendal(error: std::io::Error, message: &'static str) -> OpenDalError {

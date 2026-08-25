@@ -23,6 +23,21 @@ use uuid::Uuid;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Upload shape for [`ImageService::export_upper_as_oss_sealed`].
+///
+/// Sized for the ceiling rather than for memory, because this entry point is
+/// library surface: it can be handed an image of any size, and the part size is
+/// what bounds how large that may be. S3 allows 10,000 parts, so 64 MiB caps a
+/// single object at ~625 GiB, where 16 MiB would cap it at 156 GiB — and
+/// exceeding the cap is not caught up front, it fails partway through the upload.
+///
+/// The price is memory: peak is `(2 * concurrency + 2) * part_size`, so ~640 MiB
+/// here. Concurrency stays at 4 to keep that from doubling; past the point where
+/// it covers the round-trip time, more parts in flight buy little. See
+/// `backend::oss::upload_file_streaming` for both derivations.
+const OSS_SEALED_UPLOAD_PART_SIZE: usize = 64 * 1024 * 1024;
+const OSS_SEALED_UPLOAD_CONCURRENCY: usize = 4;
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum RemoteOpenMode {
     Direct,
@@ -484,7 +499,14 @@ impl ImageService {
         }
 
         stage_file.sync().await?;
-        let upload_result = oss.upload_path(dest_url, &stage_path).await;
+        let upload_result = oss
+            .upload_path(
+                dest_url,
+                &stage_path,
+                OSS_SEALED_UPLOAD_PART_SIZE,
+                OSS_SEALED_UPLOAD_CONCURRENCY,
+            )
+            .await;
         // Always clean up the staging file regardless of upload outcome.
         // The staging file is a full copy of the sealed upper layer and can
         // be large; leaving it on disk across failures would accumulate waste.
