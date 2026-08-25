@@ -257,6 +257,7 @@ impl OssClient {
                         &path,
                         CHUNK_SIZE,
                         UPLOAD_CONCURRENCY,
+                        None,
                     )
                     .await
                 }

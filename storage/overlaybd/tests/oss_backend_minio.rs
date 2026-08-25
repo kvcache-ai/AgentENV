@@ -200,7 +200,7 @@ async fn minio_upload_path_streams_a_file_larger_than_one_part() {
     std::fs::write(temp.path(), &payload).expect("write upload source");
 
     backend
-        .upload_path(&url, temp.path(), PROBE_PART_SIZE, PROBE_CONCURRENCY)
+        .upload_path(&url, temp.path(), PROBE_PART_SIZE, PROBE_CONCURRENCY, None)
         .await
         .expect("stream upload to minio");
 

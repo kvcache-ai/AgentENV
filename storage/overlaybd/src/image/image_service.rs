@@ -505,6 +505,7 @@ impl ImageService {
                 &stage_path,
                 OSS_SEALED_UPLOAD_PART_SIZE,
                 OSS_SEALED_UPLOAD_CONCURRENCY,
+                None,
             )
             .await;
         // Always clean up the staging file regardless of upload outcome.

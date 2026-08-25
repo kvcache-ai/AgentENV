@@ -14,6 +14,7 @@ use reqwest::Url;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
@@ -136,12 +137,16 @@ impl OssBackend {
     /// credential refresh restarts the upload from byte zero rather than
     /// resuming a partly written multipart, which is the only outcome the object
     /// store guarantees is coherent.
+    ///
+    /// `progress`, when supplied, is polled by the caller while this runs; see
+    /// [`upload_file_streaming`] for what it holds and what it does not.
     pub async fn upload_path(
         &self,
         url: impl AsRef<str>,
         path: impl AsRef<Path>,
         part_size: usize,
         concurrency: usize,
+        progress: Option<&AtomicU64>,
     ) -> Result<()> {
         let location = ParsedOssUrl::parse(
             url.as_ref(),
@@ -157,7 +162,8 @@ impl OssBackend {
                 let key = key.clone();
                 let path = path.clone();
                 async move {
-                    upload_file_streaming(&operator, &key, &path, part_size, concurrency).await
+                    upload_file_streaming(&operator, &key, &path, part_size, concurrency, progress)
+                        .await
                 }
             })
             .await
@@ -559,6 +565,32 @@ impl VirtualFile for OssFile {
 /// the writer buffers up to the part size itself, so the part boundaries the
 /// endpoint sees do not follow the read boundaries here.
 ///
+/// # Progress
+///
+/// `progress`, when supplied, holds the bytes handed to the writer so far, for a
+/// caller reporting on an upload measured in GiB — a layer-sized upload is
+/// otherwise a single `await` that returns nothing for minutes, which reads the
+/// same as a hang.
+///
+/// A counter the caller *polls* rather than a callback it is pushed to, because
+/// the one consumer samples on a timer. That also keeps the caller's reporting
+/// cadence independent of the write rate: it still prints during `close()`, where
+/// the multipart is completed and no bytes move at all, which is exactly the phase
+/// where a large upload was seen to stall.
+///
+/// Two things it is not:
+///
+/// - **Not bytes the endpoint has taken.** Parts are buffered and uploaded
+///   concurrently, so this runs ahead of anything durable.
+/// - **Not monotonic.** It is reset at entry, because *this function* is the unit
+///   [`OssBackend::upload_path`] retries: on a `PermissionDenied` the credential is
+///   refreshed and the whole upload restarts from byte zero
+///   (`object-store-operator/src/operator.rs:121-148`). So the counter is the
+///   position within the current attempt and can drop back to zero once. A reader
+///   must treat it as an absolute position and never difference two samples —
+///   letting it accumulate across the retry instead would report ~169 % of a
+///   file's size as uploaded.
+///
 /// # Memory
 ///
 /// **Peak memory is roughly `(2 * concurrency + 2) * part_size`, not the product
@@ -587,7 +619,13 @@ pub async fn upload_file_streaming(
     path: &Path,
     part_size: usize,
     concurrency: usize,
+    progress: Option<&AtomicU64>,
 ) -> OpenDalResult<()> {
+    // First statement of the retried unit, so the count always describes the
+    // attempt now underway. See the `# Progress` section above.
+    if let Some(progress) = progress {
+        progress.store(0, Ordering::Relaxed);
+    }
     let mut writer = operator
         .writer_with(key)
         .chunk(part_size)
@@ -608,6 +646,10 @@ pub async fn upload_file_streaming(
             break;
         }
         writer.write(buf[..read].to_vec()).await?;
+        // After the writer accepts it: "handed off", not "acknowledged".
+        if let Some(progress) = progress {
+            progress.fetch_add(read as u64, Ordering::Relaxed);
+        }
     }
 
     // Only `close` completes the multipart upload. Dropping the writer abandons
