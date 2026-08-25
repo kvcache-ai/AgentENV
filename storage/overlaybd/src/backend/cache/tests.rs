@@ -2669,3 +2669,100 @@ async fn test_eviction_clears_bitmap_before_destroying_data() {
         "reads after a failed eviction must fall back to the source"
     );
 }
+
+#[tokio::test]
+async fn test_reserve_range_guard_punches_unless_committed() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let source = Arc::new(ControlledSource::new(vec![1u8; 8192], 4096));
+    let _file = backend
+        .open_file_with_source_size("reserve-guard", source, 8192)
+        .await
+        .expect("open cached file");
+    let entry = backend
+        .get_cache_entry(&super::cache_key_digest("reserve-guard"))
+        .expect("entry");
+    let data_path = entry.paths.data_path.clone();
+    let allocated_blocks = move || {
+        std::fs::metadata(&data_path)
+            .expect("stat cache data file")
+            .blocks()
+    };
+
+    let baseline = allocated_blocks();
+    let reservation = entry.reserve_range(0, 4096).expect("reserve");
+    if allocated_blocks() == baseline {
+        // Filesystem without fallocate support: reservation and punch are
+        // no-ops and there is nothing further to verify.
+        return;
+    }
+
+    drop(reservation);
+    assert_eq!(
+        allocated_blocks(),
+        baseline,
+        "dropping an uncommitted reservation must punch the range back"
+    );
+
+    entry.reserve_range(0, 4096).expect("reserve").commit();
+    assert!(
+        allocated_blocks() > baseline,
+        "a committed reservation must keep the disk blocks"
+    );
+}
+
+#[tokio::test]
+async fn test_failed_foreground_refill_leaves_no_reserved_blocks() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let payload = uniform_char_random_data(8192, 42);
+    let source = Arc::new(ControlledSource::new(payload.clone(), 4096));
+    // Fail the refill's source read once; the foreground read then falls
+    // back to a second, successful source read.
+    source.fail_block(0, 1);
+    let file = backend
+        .open_file_with_source_size("refill-rollback", source.clone(), payload.len() as u64)
+        .await
+        .expect("open cached file");
+
+    let bytes = file
+        .read_at(0, 4096)
+        .await
+        .expect("read must fall back to the source after the failed refill");
+    assert_eq!(bytes.as_ref(), &payload[..4096]);
+    assert_eq!(source.calls(0), 2, "refill attempt plus fallback read");
+
+    // The failed refill must neither publish the block nor account bytes...
+    let stats = backend.file_stats("refill-rollback").expect("file stats");
+    assert_eq!(stats.bytes_used, 0, "failed refill must not publish blocks");
+    assert_eq!(
+        backend.stats().bytes_used,
+        0,
+        "failed refill must not change capacity accounting"
+    );
+
+    // ...and must roll its reservation back: no allocated disk blocks may
+    // remain in the sparse data file.
+    let entry = backend
+        .get_cache_entry(&super::cache_key_digest("refill-rollback"))
+        .expect("entry");
+    assert_eq!(
+        std::fs::metadata(&entry.paths.data_path)
+            .expect("stat cache data file")
+            .blocks(),
+        0,
+        "failed refill must leave the data file fully sparse"
+    );
+}

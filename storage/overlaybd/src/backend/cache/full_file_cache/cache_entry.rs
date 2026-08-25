@@ -78,6 +78,64 @@ pub(crate) enum AcquireRefillResult {
 }
 
 // ---------------------------------------------------------------------------
+// Disk range reservation
+// ---------------------------------------------------------------------------
+
+/// Outcome of preallocating a byte range of the sparse data file.
+pub(crate) enum RangeAllocation {
+    /// Disk blocks are reserved; a punch can roll the range back.
+    Reserved,
+    /// The filesystem does not support fallocate; nothing was reserved and
+    /// writes through the mmap keep the pre-reservation behavior.
+    Unsupported,
+}
+
+/// RAII guard for a reserved-but-not-yet-published disk range, returned by
+/// [`CacheEntry::reserve_range`]. Dropping an armed guard punches the range
+/// back to a hole so a failed or cancelled refill leaves no allocated disk
+/// blocks that capacity accounting never saw. Call
+/// [`commit`](Self::commit) once the covered blocks are published.
+pub(crate) struct ReservedRange<'a> {
+    entry: &'a CacheEntry,
+    offset: u64,
+    len: u64,
+    armed: bool,
+}
+
+impl ReservedRange<'_> {
+    /// Keep the reservation. Call this after the covered data is fully
+    /// written and before publishing the blocks in the bitmap, so an armed
+    /// guard never coexists with published blocks.
+    pub(crate) fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReservedRange<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Best-effort: the range was never published, so leaving it allocated
+        // only wastes disk until the entry is evicted (whole-file punch).
+        if let Err(err) = nix::fcntl::fallocate(
+            &self.entry.data_file,
+            FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
+            self.offset as i64,
+            self.len as i64,
+        ) {
+            tracing::warn!(
+                cache_id = %self.entry.cache_id,
+                offset = self.offset,
+                len = self.len,
+                %err,
+                "failed to punch back reserved cache range"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AcquireRefillFut — custom Future for block load deduplication
 // ---------------------------------------------------------------------------
 
@@ -284,7 +342,77 @@ impl CacheEntry {
         Ok(Some(Bytes::from_owner(slice)))
     }
 
+    /// Reserve disk blocks for `[offset, offset + len)` of the sparse data
+    /// file before writing through the mmap region.
+    ///
+    /// Writing into an unallocated hole of a shared file mapping makes the
+    /// kernel allocate blocks at page-fault time; if the filesystem is out of
+    /// space that fault fails and the process gets SIGBUS instead of an error
+    /// return. Allocating up front turns disk exhaustion into a plain ENOSPC
+    /// that the refill path can surface, after which reads fall back to the
+    /// source. Filesystems without fallocate support keep the old behavior
+    /// and report [`RangeAllocation::Unsupported`].
+    ///
+    /// Call this directly only when no fallible or cancellable step sits
+    /// between the reservation and publication of the covered blocks;
+    /// otherwise use [`reserve_range`](Self::reserve_range) so a failure
+    /// rolls the reservation back.
+    pub(crate) fn ensure_range_allocated(&self, offset: u64, len: u64) -> Result<RangeAllocation> {
+        if len == 0 {
+            return Ok(RangeAllocation::Unsupported);
+        }
+        // KEEP_SIZE: allocation must never move the file length; the entry is
+        // rejected on reload if the data file size drifts from source_size.
+        match nix::fcntl::fallocate(
+            &self.data_file,
+            FallocateFlags::FALLOC_FL_KEEP_SIZE,
+            offset as i64,
+            len as i64,
+        ) {
+            Ok(()) => Ok(RangeAllocation::Reserved),
+            Err(nix::errno::Errno::EOPNOTSUPP | nix::errno::Errno::ENOSYS) => {
+                Ok(RangeAllocation::Unsupported)
+            }
+            Err(err) => Err(anyhow!(
+                "preallocate cache range failed: offset={offset}, len={len}: {err}"
+            )),
+        }
+    }
+
+    /// Reserve `[offset, offset + len)` and return a guard that punches the
+    /// range back to a hole on drop unless [`ReservedRange::commit`] is
+    /// called first.
+    ///
+    /// Use this when a fallible or cancellable step (such as an async source
+    /// read into the mmap) runs between reservation and publication: the
+    /// guard guarantees a failed refill leaves neither allocated-but-
+    /// unaccounted disk blocks nor partially written pages behind.
+    ///
+    /// # Punch invariant
+    ///
+    /// While the guard is armed, no block overlapping the range may be
+    /// published in the bitmap and the caller must be the sole elected
+    /// loader for every covered block — dropping the guard zeroes the range.
+    pub(crate) fn reserve_range(&self, offset: u64, len: u64) -> Result<ReservedRange<'_>> {
+        let armed = matches!(
+            self.ensure_range_allocated(offset, len)?,
+            RangeAllocation::Reserved
+        );
+        Ok(ReservedRange {
+            entry: self,
+            offset,
+            len,
+            armed,
+        })
+    }
+
     /// Write a block via the mmap region and mark it in the bitmap.
+    ///
+    /// The block's disk range is preallocated first so a full disk surfaces
+    /// as ENOSPC instead of SIGBUS. No rollback is needed: nothing between
+    /// the reservation and the bitmap publication below can fail or be
+    /// cancelled, and callers may overwrite already cached blocks, which a
+    /// punch-based rollback would corrupt.
     ///
     /// # Safety invariant
     /// The acquire/finish refill protocol guarantees at most one writer per
@@ -292,6 +420,7 @@ impl CacheEntry {
     /// writers for the same byte range.
     pub(crate) fn write_block(&self, block_id: u64, data: &[u8]) -> Result<()> {
         let offset = block_id.saturating_mul(self.block_size);
+        self.ensure_range_allocated(offset, data.len() as u64)?;
 
         let buf = unsafe {
             self.mem_region.get_mut(offset, data.len()).ok_or_else(|| {
@@ -368,6 +497,12 @@ impl CacheEntry {
     /// The caller must ensure exclusive access to this block. In the cache
     /// system this is guaranteed by the acquire_refill/finish_refill protocol
     /// (at most one loader per block).
+    ///
+    /// The caller must also reserve the block's disk range first (via
+    /// [`reserve_range`](Self::reserve_range) or
+    /// [`ensure_range_allocated`](Self::ensure_range_allocated)); writing the
+    /// returned slice over an unallocated hole raises SIGBUS when the disk
+    /// is full.
     #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn mmap_mut_for_block(
         &self,

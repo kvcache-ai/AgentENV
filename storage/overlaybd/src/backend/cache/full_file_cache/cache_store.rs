@@ -588,6 +588,13 @@ impl FileCacheBackend {
             return Err(Errno::ENOSPC.into());
         }
 
+        // Reserve the block's disk range up front so writing the mmap below
+        // never allocates at page-fault time (SIGBUS when the disk is full).
+        // The guard punches the range back if the source read fails, is
+        // short, or the future is cancelled, so a failed refill leaves
+        // neither unaccounted disk blocks nor partially written pages.
+        let reservation = entry.reserve_range(offset, want as u64)?;
+
         // The caller holds the entry's refill barrier and passes the stable
         // entry reference. Never look up by cache_id here: that would allow a
         // stale task to populate a replacement entry after an ABA recycle.
@@ -608,6 +615,10 @@ impl FileCacheBackend {
                 "short refill read for cache_id={cache_id}, offset={offset}, got {n}, want {buf_len}"
             );
         }
+
+        // Commit before publishing: prevent RAII from punching holes in case
+        // of error (rollback).
+        reservation.commit();
 
         // Just update the bitmap — data is already in place via mmap.
         entry.mark_block_cached(block_id);
@@ -709,7 +720,6 @@ impl FileCacheBackend {
             entry.set_source_size(new_size)?;
         }
 
-        let mut bytes_added = 0u64;
         for block_id in start_block..=end_block {
             let block_start = block_id.saturating_mul(block_size);
             let in_write_start = offset.max(block_start);
@@ -767,16 +777,14 @@ impl FileCacheBackend {
             let was_cached = entry.index.read().contains(block_id as u32);
             entry.write_block(block_id, &block[..valid])?;
             if !was_cached {
-                bytes_added += valid as u64;
+                // Account immediately after each publication: an error on a
+                // later block (source read, reservation) must not leave the
+                // bytes already visible in the bitmap untracked.
+                self.add_current_bytes(valid as u64);
             }
         }
 
         entry.record_refill();
-
-        // Update global capacity and pressure state atomically as a pair.
-        if bytes_added > 0 {
-            self.add_current_bytes(bytes_added);
-        }
 
         // Trigger eviction check asynchronously.
         self.eviction_inner().await;
@@ -1159,6 +1167,13 @@ impl CachedFile {
             n as u64 == read_len,
             "short background chunk read at offset {offset}: got {n}, want {read_len}"
         );
+        // No rollback guard is needed: nothing past this point awaits or fails.
+        // Reserve the whole run before publishing any block: the mmap copies
+        // below must never allocate at page-fault time (SIGBUS when the disk
+        // is full), and a reservation failure returns before the first
+        // publication so the batched accounting below stays consistent.
+        entry.ensure_range_allocated(offset, read_len)?;
+
         let mut committed = 0u64;
         for (block_id, guard) in run {
             let want = source_size
