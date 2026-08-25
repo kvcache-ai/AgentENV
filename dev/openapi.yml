@@ -1,10 +1,7 @@
 openapi: 3.0.0
 info:
   version: 0.1.0
-  title: E2B API
-
-servers:
-  - url: https://api.e2b.app
+  title: AgentENV API
 
 components:
   securitySchemes:
@@ -109,6 +106,19 @@ components:
       schema:
         type: string
 
+  headers:
+    XNextToken:
+      description: Cursor to fetch the next page of results, if more exist
+      schema:
+        type: string
+    XTotalRunning:
+      description: >
+        Number of running sandboxes matching the filters, before pagination is applied.
+        Only present when running sandboxes were requested.
+      schema:
+        type: integer
+        format: int32
+
   responses:
     "400":
       description: Bad request
@@ -181,6 +191,14 @@ components:
       enum:
         - running
         - paused
+
+    OrderDirection:
+      type: string
+      description: Sort direction
+      default: desc
+      enum:
+        - asc
+        - desc
 
     SnapshotInfo:
       type: object
@@ -1211,7 +1229,6 @@ components:
         - clusterID
         - status
         - sandboxCount
-        - cachedBuilds
         - createSuccesses
         - createFails
         - sandboxPausedCount
@@ -1245,11 +1262,6 @@ components:
           description: Number of sandboxes running on the node
         metrics:
           $ref: "#/components/schemas/NodeMetrics"
-        cachedBuilds:
-          type: array
-          description: List of cached builds id on the node
-          items:
-            type: string
         createSuccesses:
           type: integer
           format: uint64
@@ -1432,16 +1444,35 @@ paths:
               $ref: "#/components/schemas/SandboxState"
           style: form
           explode: false
+        - name: order
+          in: query
+          description: Sort direction by sandbox start time. Defaults to desc (newest first).
+          required: false
+          schema:
+            $ref: "#/components/schemas/OrderDirection"
+        - name: startedAfter
+          in: query
+          description: Return sandboxes started at or after this timestamp.
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: template
+          in: query
+          description: Filter sandboxes by a template ID or alias.
+          required: false
+          schema:
+            type: string
         - $ref: "#/components/parameters/paginationNextToken"
         - $ref: "#/components/parameters/paginationLimit"
       responses:
         "200":
           description: Successfully returned all running sandboxes
           headers:
-            x-next-token:
-              description: Pagination token for the next page. Returned only when more results are available.
-              schema:
-                type: string
+            X-Next-Token:
+              $ref: "#/components/headers/XNextToken"
+            X-Total-Running:
+              $ref: "#/components/headers/XTotalRunning"
           content:
             application/json:
               schema:
@@ -1561,6 +1592,8 @@ paths:
           $ref: "#/components/responses/409"
         "404":
           $ref: "#/components/responses/404"
+        "400":
+          $ref: "#/components/responses/400"
         "401":
           $ref: "#/components/responses/401"
         "500":
@@ -1652,6 +1685,8 @@ paths:
           $ref: "#/components/responses/401"
         "404":
           $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1884,10 +1919,8 @@ paths:
         "200":
           description: Successfully returned snapshots
           headers:
-            x-next-token:
-              description: Pagination token for the next page. Returned only when more results are available.
-              schema:
-                type: string
+            X-Next-Token:
+              $ref: "#/components/headers/XNextToken"
           content:
             application/json:
               schema:
@@ -1986,9 +2019,7 @@ paths:
           description: Successfully returned all templates
           headers:
             X-Next-Token:
-              description: Cursor to fetch the next page of results, if more exist
-              schema:
-                type: string
+              $ref: "#/components/headers/XNextToken"
           content:
             application/json:
               schema:
@@ -2056,6 +2087,9 @@ paths:
       responses:
         "200":
           description: Successfully returned the template with its builds
+          headers:
+            X-Next-Token:
+              $ref: "#/components/headers/XNextToken"
           content:
             application/json:
               schema:
