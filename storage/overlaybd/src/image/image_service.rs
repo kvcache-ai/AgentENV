@@ -211,6 +211,22 @@ impl ImageService {
         &self.inner.global_config
     }
 
+    /// The object-store backend, or `None` when `ossConfig.enable` is false.
+    ///
+    /// Exposed so a caller that needs object storage for its own purposes — reading
+    /// a metadata object, uploading a sealed layer — shares this one instead of
+    /// constructing a second `OssBackend` from the same `ossConfig`. A second one
+    /// would work, but it would carry its own operator cache and its own resolved
+    /// credentials, and a `credentialProcess` costs a subprocess per cache miss.
+    /// `OssBackend` is `Arc`-backed, so a clone of the returned value shares both.
+    ///
+    /// **This initializes the whole remote runtime**, including the registry client
+    /// and the file cache, because they share one `OnceCell` with the backend. A
+    /// caller serving only local images should check `ossConfig.enable` and not ask.
+    pub async fn oss_backend(&self) -> Result<Option<&OssBackend>> {
+        Ok(self.remote_runtime().await?.oss_backend.as_ref())
+    }
+
     pub fn io_engine(&self) -> u32 {
         self.inner.global_config.io_engine
     }
