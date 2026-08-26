@@ -31,8 +31,9 @@ use crate::sandbox::ublk::{
 };
 use crate::sandbox::SandboxCaptureError;
 
-/// Default maximum number of overlaybd snapshot layers before compaction triggers.
-/// Well below the hard limit of 255 (`MAX_STACK_LAYERS`) in overlaybd.
+/// Base budget of runtime-owned overlaybd snapshot lowers before compaction
+/// triggers; the effective budget shrinks as the stable prefix grows. Well
+/// below the hard limit of 255 (`MAX_STACK_LAYERS`) in overlaybd.
 const DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS: usize = 32;
 const INHERITED_LAYERS_DIR: &str = "inherited-layers";
 const MANAGED_BASE_LAYER_FILE: &str = "managed-base.commit";
@@ -418,12 +419,18 @@ async fn rewrite_lowers_with_runtime_roots(
     let (mut lowers, mut runtime_owned_lowers) =
         split_runtime_suffix(existing_lowers, runtime_owned_roots);
 
-    // If the total number of lowers exceeds the default maximum, try to compact the
-    // runtime-owned suffix and appended layers into a single layer.
+    // Compact the runtime-owned suffix plus the appended layer once their count
+    // exceeds a budget that shrinks as the stable prefix grows: the full
+    // `DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS` with an empty prefix, one less per
+    // 4 prefix lowers (e.g. 24 with a 32-layer prefix), clamped to 1 so a lone
+    // layer is never pointlessly rewritten into itself. This keeps the total
+    // stack well below overlaybd's 255-layer hard limit without compacting on
+    // every pause when the prefix is already large.
+    let max_runtime_owned_layers = DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS
+        .saturating_sub(lowers.len() / 4)
+        .max(1);
     let compactable_count = runtime_owned_lowers.len() + usize::from(appended_layer.is_some());
-    if compactable_count > 1
-        && lowers.len() + compactable_count > DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS
-    {
+    if compactable_count > max_runtime_owned_layers {
         let mut runtime_suffix = runtime_owned_lowers;
         if let Some(layer) = appended_layer {
             runtime_suffix.push(layer);
@@ -993,6 +1000,132 @@ mod tests {
             assert_eq!(source_metadata.dev(), adopted_metadata.dev());
             assert_eq!(source_metadata.ino(), adopted_metadata.ino());
         }
+    }
+
+    #[tokio::test]
+    async fn rewrite_deep_stable_prefix_adopts_without_compaction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        // A stable prefix deeper than DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS must
+        // not trigger compaction on its own: only the runtime-owned suffix counts
+        // toward the budget (32 - 33/4 = 24 here, and the suffix is just 2).
+        let mut lowers: Vec<LayerConfig> = (0..33)
+            .map(|index| LayerConfig {
+                file: String::new(),
+                digest: format!("sha256:base-{index}"),
+                size: 4096,
+                ..Default::default()
+            })
+            .collect();
+        let runtime_a = runtime_root.join("a.commit");
+        let runtime_b = runtime_root.join("b.commit");
+        std::fs::write(&runtime_a, b"runtime a").expect("write runtime layer a");
+        std::fs::write(&runtime_b, b"runtime b").expect("write runtime layer b");
+        lowers.push(local_layer_config(&runtime_a));
+        lowers.push(local_layer_config(&runtime_b));
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            lowers,
+            &output_dir,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+        )
+        .await
+        .expect("rewrite with deep stable prefix");
+
+        assert_eq!(rewritten.len(), 35);
+        assert!(rewritten[..33].iter().all(|lower| lower.file.is_empty()));
+        assert_eq!(rewritten[0].digest, "sha256:base-0");
+        for (index, rewritten_lower) in rewritten[33..].iter().enumerate() {
+            let adopted = PathBuf::from(&rewritten_lower.file);
+            let expected_parent = output_dir
+                .join(INHERITED_LAYERS_DIR)
+                .join(format!("{index:04}"));
+            assert!(adopted.starts_with(expected_parent));
+        }
+        assert!(!output_dir.join(MANAGED_BASE_LAYER_FILE).exists());
+    }
+
+    /// Seal a tiny raw overlaybd commit for compaction tests.
+    async fn seal_raw_test_layer(
+        dir: &Path,
+        name: &str,
+        vsize: u64,
+        writes: &[(u64, u8)],
+    ) -> PathBuf {
+        let data = Arc::new(
+            LocalFile::new(dir.join(format!("{name}.data"))).expect("create layer data file"),
+        );
+        let index = Arc::new(
+            LocalFile::new(dir.join(format!("{name}.index"))).expect("create layer index file"),
+        );
+        let layer = overlaybd::index_file::LSMTFile::create(data, Some(index), vsize, false)
+            .await
+            .expect("create layer");
+        for (offset, byte) in writes {
+            layer
+                .write_at(*offset, &[*byte; 4096])
+                .await
+                .expect("write layer page");
+        }
+        let commit_path = dir.join(format!("{name}.commit"));
+        let output: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::new(&commit_path).expect("create layer commit output"));
+        layer
+            .commit_with_args(overlaybd::index_file::CommitArgs::new(output))
+            .await
+            .expect("commit raw layer");
+        commit_path
+    }
+
+    #[tokio::test]
+    async fn rewrite_shrinking_budget_compacts_runtime_suffix() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        // A 124-layer stable prefix shrinks the budget to max(32 - 124/4, 1) = 1,
+        // so a two-layer runtime-owned suffix already triggers compaction.
+        let mut lowers: Vec<LayerConfig> = (0..124)
+            .map(|index| LayerConfig {
+                file: String::new(),
+                digest: format!("sha256:base-{index}"),
+                size: 4096,
+                ..Default::default()
+            })
+            .collect();
+        let layer_a = seal_raw_test_layer(&runtime_root, "a", 4096, &[(0, 0xAA)]).await;
+        let layer_b = seal_raw_test_layer(&runtime_root, "b", 4096, &[(0, 0xBB)]).await;
+        lowers.push(local_layer_config(&layer_a));
+        lowers.push(local_layer_config(&layer_b));
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            lowers,
+            &output_dir,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+        )
+        .await
+        .expect("rewrite with shrinking budget");
+
+        assert_eq!(rewritten.len(), 125);
+        assert!(rewritten[..124].iter().all(|lower| lower.file.is_empty()));
+        let compacted = PathBuf::from(&rewritten[124].file);
+        assert_eq!(compacted, output_dir.join(MANAGED_BASE_LAYER_FILE));
+        assert!(compacted.exists());
+        assert!(!compacted.with_extension("commit.tmp").exists());
     }
 
     #[tokio::test]
