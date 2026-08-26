@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "../searchindex-6a10619c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5437f69c.js"></script>
+        <script src="../toc-0fdd41d5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,8 +182,9 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="sandboxes"><a class="header" href="#sandboxes">Sandboxes</a></h1>
-<p>A sandbox is an isolated Firecracker microVM with its own Linux kernel, filesystem, and network stack. Each sandbox runs independently and can be paused, resumed, or deleted.</p>
-<hr>
+<p>A sandbox is an isolated Firecracker microVM with its own Linux kernel,
+filesystem, processes, and network stack. It is the environment where you run
+code, use tools, modify files, and start services.</p>
 <h2 id="lifecycle"><a class="header" href="#lifecycle">Lifecycle</a></h2>
 <pre class="mermaid">stateDiagram-v2
     [*] --&gt; Creating
@@ -219,130 +220,351 @@
 </div>
 <hr>
 <h2 id="starting-a-sandbox"><a class="header" href="#starting-a-sandbox">Starting a Sandbox</a></h2>
-<p>There are two ways to start a sandbox:</p>
-<h3 id="warm-start-from-a-template"><a class="header" href="#warm-start-from-a-template">Warm Start (from a template)</a></h3>
-<p>Starting from a pre-built template restores a snapshot of a known filesystem state.</p>
-<pre><code class="language-bash">aenv start &lt;template-id&gt;
+<p>You can start a sandbox from a reusable template or snapshot, or cold start one
+directly from an OCI image.</p>
+<h3 id="from-a-template-or-snapshot"><a class="header" href="#from-a-template-or-snapshot">From a Template or Snapshot</a></h3>
+<p>Pass either a template/snapshot alias or its ID:</p>
+<p>Usage:</p>
+<pre><code class="language-bash">aenv start &lt;template-or-snapshot&gt; [options]
 </code></pre>
-<p>See <a href="./templates.html">Templates</a> for how templates are created.</p>
-<h3 id="cold-start-from-an-oci-image"><a class="header" href="#cold-start-from-an-oci-image">Cold Start (from an OCI image)</a></h3>
-<p>A cold start pulls an OCI image directly and converts it into a block device at runtime.</p>
-<pre><code class="language-bash">aenv start --cold ubuntu:24.04
-</code></pre>
-<p>The cold-start API accepts an optional <code>diskSizeMB</code> field to set the root filesystem’s virtual size in MiB. Explicit values must be at least 1024 MiB and divisible by 1024 because the current resize tool operates at 1 GiB granularity. Growth is allowed by default; shrinking below the source image size requires <code>ublk.overlaybd.allow_shrink = true</code>. If omitted, the image’s built-in virtual size is used. Resizing applies only when creating a fresh writable root filesystem, not to read-only images, images with an existing upper, or snapshot resume. Sandbox responses also report disk size as <code>diskSizeMB</code>.</p>
-<p>Use <code>aenv start --secure</code> with either warm or cold starts to require an envd access token for command and file operations. The CLI obtains and sends the token automatically. Secure mode protects the envd control port, while application proxy requests use the independent sandbox-scoped traffic token. Each fork derives distinct envd and traffic credentials from the child sandbox ID.</p>
-<hr>
-<h2 id="working-with-sandboxes"><a class="header" href="#working-with-sandboxes">Working with Sandboxes</a></h2>
-<h3 id="shell-and-command-execution"><a class="header" href="#shell-and-command-execution">Shell and command execution</a></h3>
-<pre><code class="language-bash"># Attach to a sandbox
-aenv connect &lt;sandbox-id&gt;
+<p>Example:</p>
+<pre><code class="language-bash"># Start by alias
+aenv start my-python-template
 
-# Run a one-shot command and stream its output
-aenv exec &lt;sandbox-id&gt; ls -la /
+# Start by ID
+aenv start 018f0d93-aaaa-bbbb-cccc-0123456789ab
 </code></pre>
+<p>Warm-start options:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;template-or-snapshot&gt;</code></td><td>Required</td><td>Template or snapshot ID or alias.</td></tr>
+<tr><td><code>--secure</code></td><td>Off</td><td>Require an envd access token for command and file operations. The CLI manages the token automatically; see <a href="./authentication.html#secure-sandbox-authentication">Authentication</a>.</td></tr>
+<tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
+<tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Without <code>--detach</code>, <code>aenv start</code> waits for the sandbox to become ready and then
+attaches an interactive shell. CPU, memory, and disk settings are inherited
+from the template or snapshot and cannot be overridden on a warm start.</p>
+<h3 id="cold-start-from-an-oci-image"><a class="header" href="#cold-start-from-an-oci-image">Cold Start from an OCI Image</a></h3>
+<p>A cold start resolves an OCI image directly and prepares a fresh writable root
+filesystem at runtime:</p>
+<p>Usage:</p>
+<pre><code class="language-bash">aenv start --cold &lt;image&gt; [options]
+</code></pre>
+<p>Example:</p>
+<pre><code class="language-bash">aenv start --cold ubuntu:24.04
+aenv start --cold ubuntu:24.04 --cpu 4 --memory 4096 --disk-size-mb 65536
+</code></pre>
+<p>Cold-start options:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;image&gt;</code></td><td>Required</td><td>External OCI image reference.</td></tr>
+<tr><td><code>--cold</code></td><td>Required for an OCI image</td><td>Cold start directly from <code>&lt;image&gt;</code>.</td></tr>
+<tr><td><code>--secure</code></td><td>Off</td><td>Require an envd access token for command and file operations. The CLI manages the token automatically; see <a href="./authentication.html#secure-sandbox-authentication">Authentication</a>.</td></tr>
+<tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your AgentENV config file</td><td>Set the sandbox’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set sandbox memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>--disk-size-mb &lt;MiB&gt;</code></td><td>Source image virtual size</td><td>Set root filesystem size. The value must be greater than zero and divisible by 1024 MiB. Alias: <code>--disk-mb</code>.</td></tr>
+<tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The AgentENV config file is <code>config/default.toml</code> by default, or the file
+specified by <code>AENV_CONFIG_PATH</code>.</p>
+<p>An OverlayBD-native image can start without downloading
+the complete image first; its filesystem data is loaded from the registry on
+demand. See <a href="../getting-started/on-demand-loading.html">On-Demand Loading</a>.</p>
+<p>Growth of the disk size is allowed by
+default. Shrinking below the source image size requires
+<code>ublk.overlaybd.allow_shrink = true</code> in your AgentENV config file. Resizing
+applies only when creating a fresh writable root filesystem, not to read-only
+images, images with an existing upper layer, or snapshot resume. Sandbox
+responses report the effective size as <code>diskSizeMB</code>.</p>
+<h2 id="working-with-sandboxes"><a class="header" href="#working-with-sandboxes">Working with Sandboxes</a></h2>
+<h3 id="connect-to-a-sandbox"><a class="header" href="#connect-to-a-sandbox">Connect to a Sandbox</a></h3>
+<p><code>aenv connect</code> opens an interactive shell inside the sandbox and attaches your
+terminal. <code>aenv cn</code> is its short alias:</p>
+<pre><code class="language-bash">aenv connect &lt;sandbox-id&gt;
+aenv cn &lt;sandbox-id&gt;
+</code></pre>
+<p>If a sandbox is paused, <code>aenv connect</code> will automatically resume it.</p>
+<h3 id="execute-a-command"><a class="header" href="#execute-a-command">Execute a Command</a></h3>
+<p><code>aenv exec</code> runs one non-interactive command, streams its output to your local
+terminal, and exits with the remote command’s exit code. It does not attach an
+interactive shell.
+Flags intended for the remote command
+that collide with aenv’s own flags can be escaped with a leading <code>--</code>.</p>
+<pre><code class="language-bash">aenv exec &lt;sandbox-id&gt; ls -la /
+aenv exec &lt;sandbox-id&gt; -- command-with-aenv-like-flags --timeout 10
+</code></pre>
+<h3 id="upload-files"><a class="header" href="#upload-files">Upload Files</a></h3>
+<p><code>aenv upload</code> copies a local file or directory into a running sandbox:</p>
+<p>Usage:</p>
+<pre><code class="language-bash">aenv upload &lt;sandbox-id&gt; &lt;local-path&gt; &lt;remote-path&gt; [options]
+</code></pre>
+<p>Example:</p>
+<pre><code class="language-bash">aenv upload 018f0d93-aaaa-bbbb-cccc-0123456789ab ./config.json /workspace/config.json
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;sandbox-id&gt;</code></td><td>Required</td><td>ID of the destination sandbox.</td></tr>
+<tr><td><code>&lt;local-path&gt;</code></td><td>Required</td><td>Local file or directory to upload.</td></tr>
+<tr><td><code>&lt;remote-path&gt;</code></td><td>Required</td><td>Destination inside the sandbox. Directory paths must be absolute.</td></tr>
+<tr><td><code>--user &lt;user&gt;</code></td><td>None</td><td>Resolves a relative remote file path from this user’s home directory and sets the uploaded file’s owner. It is not supported for directory uploads.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="download-files"><a class="header" href="#download-files">Download Files</a></h3>
+<p><code>aenv download</code> copies a file or directory from a running sandbox to your local
+machine:</p>
+<p>Usage:</p>
+<pre><code class="language-bash">aenv download &lt;sandbox-id&gt; &lt;remote-path&gt; [local-path] [options]
+</code></pre>
+<p>Example:</p>
+<pre><code class="language-bash">aenv download 018f0d93-aaaa-bbbb-cccc-0123456789ab /workspace/result.txt ./result.txt
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;sandbox-id&gt;</code></td><td>Required</td><td>ID of the sandbox to download from.</td></tr>
+<tr><td><code>&lt;remote-path&gt;</code></td><td>Required</td><td>File or directory inside the sandbox. Directory paths must be absolute.</td></tr>
+<tr><td><code>[local-path]</code></td><td>Current directory</td><td>Local destination file or directory.</td></tr>
+<tr><td><code>--user &lt;user&gt;</code></td><td>None</td><td>Resolves a relative remote file path from this user’s home directory. It is not supported for directory downloads.</td></tr>
+<tr><td><code>--force</code></td><td>Disabled</td><td>Replaces conflicting local files. Without it, the download stops instead of overwriting them.</td></tr>
+</tbody>
+</table>
+</div>
 <h3 id="pause-and-resume"><a class="header" href="#pause-and-resume">Pause and Resume</a></h3>
-<p>Pausing a sandbox captures:</p>
-<ul>
-<li><strong>Memory snapshot</strong> of the running VM state</li>
-<li><strong>Disk snapshot</strong> of the writable filesystem layer</li>
-</ul>
-<p>Resuming restores the VM from these snapshots in milliseconds. The sandbox picks up exactly where it left off, including running processes and open network connections.</p>
+<p>Pausing saves the sandbox’s current runtime state and stops its microVM. While
+it is paused, programs inside it do not run, services do not handle requests,
+and the sandbox releases its CPU and memory resources. Its saved state remains
+in storage so the same sandbox can be resumed later.</p>
+<p>After resume, the filesystem, running processes, environment variables, and
+in-memory data are restored to the state captured at pause time. Programs
+continue from that saved state instead of starting again from the beginning.</p>
 <pre><code class="language-bash">aenv pause &lt;sandbox-id&gt;
 aenv resume &lt;sandbox-id&gt;
+aenv resume &lt;sandbox-id&gt; --timeout 600
 </code></pre>
+<p><code>aenv resume</code> accepts <code>--timeout &lt;seconds&gt;</code>, which defaults to 300 seconds and
+sets the new TTL from resume time.</p>
+<p>By default, the sandbox automatically pauses when it reaches its TTL. See
+<a href="#auto-eviction">Auto-Eviction</a> for how the deadline is set and how to delete
+instead of pause.</p>
 <h3 id="persistent-snapshots"><a class="header" href="#persistent-snapshots">Persistent Snapshots</a></h3>
-<p>A snapshot captures the state of a <strong>running</strong> sandbox into a template that can be used to start new sandboxes.</p>
+<p>A snapshot is a durable, reusable checkpoint of a running sandbox. Creating one
+does not replace the sandbox: the source returns to Running after capture, and
+the snapshot can later launch one or more new sandboxes.</p>
 <pre><code class="language-bash">aenv snapshot create &lt;sandbox-id&gt;
 aenv snapshot create &lt;sandbox-id&gt; --name my-base
 </code></pre>
-<p>The resulting snapshot appears in <code>aenv snapshot list</code> and can be started with <code>aenv start &lt;name&gt;</code>. See <a href="./snapshots.html">Snapshots</a> for details.</p>
+<p>The resulting snapshot appears in <code>aenv snapshot list</code> and can be started with
+<code>aenv start &lt;snapshot-id-or-name&gt;</code>. See <a href="./snapshots.html">Snapshots</a> for its
+parameters and lifecycle.</p>
 <h3 id="fork"><a class="header" href="#fork">Fork</a></h3>
-<p>Forking clones a <strong>running</strong> sandbox into up to 16 child sandboxes on the same node. The source sandbox is briefly paused while the clone is captured, then resumes. All children inherit the source’s filesystem, memory, and resource configuration.</p>
+<p>Forking clones a running sandbox into independent child sandboxes on the same
+node. The source is briefly paused while its state is captured, then returns to
+Running. Children inherit the source filesystem, memory, network policy,
+security mode, and CPU/memory/disk configuration. All children use one captured
+state, but each child can succeed or fail independently.</p>
 <pre><code class="language-bash">curl -X POST \
   -H 'X-API-Key: test-key' \
   -H 'Content-Type: application/json' \
-  -d '{"count": 3}' \
+  -d '{"count": 3, "timeout": 600}' \
   http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/fork
 </code></pre>
-<h3 id="managing-sandboxes"><a class="header" href="#managing-sandboxes">Managing sandboxes</a></h3>
-<pre><code class="language-bash"># List all sandboxes
-aenv list
-
-# Delete a sandbox
-aenv delete &lt;sandbox-id&gt;
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>count</code></td><td><code>1</code></td><td>Number of children to create; minimum 1, maximum 100.</td></tr>
+<tr><td><code>timeout</code></td><td>Source sandbox’s TTL duration</td><td>TTL for each child, measured from the fork time.</td></tr>
+</tbody>
+</table>
+</div>
+<p>A successful request returns an array with one result for each requested child.
+Each entry contains either a <code>sandbox</code> object—including its <code>sandboxID</code>—or an
+<code>error</code> explaining why that individual child failed. It is not a plain list of
+IDs. A non-201 response means the request failed before any child was attempted.
+See the <a href="../api/index.html">API Reference</a> for the complete fork request and
+response schemas.</p>
+<h3 id="manage-sandboxes"><a class="header" href="#manage-sandboxes">Manage Sandboxes</a></h3>
+<p>List sandboxes:</p>
+<pre><code class="language-bash">aenv list
+aenv list --output json
 </code></pre>
-<hr>
+<p><code>--output</code> accepts <code>table</code> or <code>json</code>. It defaults to a table in an interactive
+terminal and JSON when output is piped or redirected.</p>
+<p>Delete a sandbox:</p>
+<pre><code class="language-bash">aenv delete &lt;sandbox-id&gt;
+</code></pre>
+<p>Deletion is permanent, but snapshots previously created from the sandbox are
+unaffected.</p>
 <h2 id="auto-eviction"><a class="header" href="#auto-eviction">Auto-Eviction</a></h2>
-<p>Every sandbox has a TTL (time-to-live). When it expires, one of two actions is taken:</p>
+<p>Every sandbox has a time-to-live (TTL), which controls how long it stays running
+when it is no longer being actively used or kept alive. TTL prevents idle
+sandboxes from occupying CPU and memory indefinitely. When the TTL is reached,
+AgentENV automatically pauses or deletes the sandbox so those resources can be
+reclaimed.</p>
+<p>When a sandbox reaches its TTL, AgentENV performs its configured timeout
+action:</p>
 <ul>
-<li><strong>pause</strong> (default) — the sandbox is paused and its state is preserved</li>
-<li><strong>kill</strong> — the sandbox is deleted permanently</li>
+<li><strong>Pause</strong> (<code>autoPause: true</code>, the default): preserve the sandbox so it can be
+resumed later.</li>
+<li><strong>Delete</strong> (<code>autoPause: false</code>): permanently remove the sandbox.</li>
 </ul>
-<p>Set TTL with <code>--timeout &lt;secs&gt;</code>:</p>
-<pre><code class="language-bash"># Start a sandbox with TTL of 600s
-aenv start &lt;template-id&gt; -d --timeout 600
-
-# Set the sandbox expiration for 600 seconds from now
-aenv timeout &lt;sandbox-id&gt; 600
+<p>Set the initial TTL with <code>aenv start --timeout &lt;seconds&gt;</code>, or set the TTL used
+after a resume with <code>aenv resume --timeout &lt;seconds&gt;</code>. Both commands default to
+300 seconds. Replace a running sandbox’s deadline at any time with:</p>
+<pre><code class="language-bash">aenv timeout &lt;sandbox-id&gt; 600
 </code></pre>
-<p>To delete instead of pause on expiry, use the API directly with <code>autoPause: false</code>:</p>
+<p>This gives the sandbox another 600 seconds from the time the command is sent.
+Calling it again replaces the previous TTL. An actively used <code>aenv connect</code>
+session keeps the sandbox alive.</p>
+<p>The current <code>aenv start</code> command does not expose <code>autoPause</code>. To delete on
+expiration, set it when creating a sandbox through the API.</p>
+<p>Warm start from a template or snapshot:</p>
 <pre><code class="language-bash">curl -X POST \
   -H 'X-API-Key: test-key' \
   -H 'Content-Type: application/json' \
-  -d '{"templateID": "&lt;template-id&gt;", "timeout": 600, "autoPause": false}' \
+  -d '{
+    "templateID": "my-template",
+    "timeout": 600,
+    "autoPause": false
+  }' \
   http://127.0.0.1:8000/sandboxes
 </code></pre>
-<p>The default timeout is configured in <code>config/default.toml</code> under <code>[orchestrator].default_sandbox_timeout_secs</code>.</p>
-<hr>
+<p>Cold start from an OCI image:</p>
+<pre><code class="language-bash">curl -X POST \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "image": "ubuntu:24.04",
+    "timeout": 600,
+    "autoPause": false
+  }' \
+  http://127.0.0.1:8000/sandboxes-cold
+</code></pre>
+<p>The timeout action cannot currently be changed after a sandbox has been
+created.</p>
 <h2 id="networking"><a class="header" href="#networking">Networking</a></h2>
-<p>Each sandbox runs in its own network namespace. By default, outbound internet access is enabled. To disable it at creation time:</p>
-<pre><code class="language-bash">curl -X POST \
-  -H 'X-API-Key: test-key' \
-  -H 'Content-Type: application/json' \
-  -d '{"templateID": "my-ubuntu", "allow_internet_access": false}' \
-  http://127.0.0.1:8000/sandboxes
-</code></pre>
-<p>For fine-grained egress control, pass a <code>network</code> object when creating the sandbox. Within user-configured egress rules, traffic is allow-by-default, and <code>allowOut</code> entries take precedence over matching <code>denyOut</code> entries. <code>allowOut</code> by itself does not create an allowlist: destinations that do not match a deny rule remain reachable.</p>
+<p>Each sandbox has an isolated network stack. Networking controls two separate
+boundaries:</p>
 <ul>
-<li><code>allowOut</code> — CIDR, IP, or domain pattern. Domain patterns apply to new TCP connections on ports 80 and 443 and require <code>denyOut: ["0.0.0.0/0"]</code>. Exact names, <code>*.example.com</code>, and <code>*</code> are supported; a wildcard does not match the apex domain.</li>
-<li><code>denyOut</code> — CIDR or IP</li>
+<li><strong>Egress:</strong> which IP addresses, CIDRs, and domains the sandbox can connect to.</li>
+<li><strong>Ingress:</strong> whether services exposed through the AgentENV proxy are public
+or require the sandbox traffic access token.</li>
 </ul>
-<p>The following diagram illustrates how the rules are evaluated:</p>
-<pre class="mermaid">flowchart TD
-    A[Destination packet] --&gt; B{Matches allowOut?}
+<h3 id="what-you-can-configure"><a class="header" href="#what-you-can-configure">What You Can Configure</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allow_internet_access</code> (warm) / <code>allowInternetAccess</code> (cold)</td><td><code>true</code></td><td>Base egress policy. <code>false</code> rejects destinations not explicitly allowed.</td></tr>
+<tr><td><code>network.allowOut</code></td><td>Empty</td><td>Egress exceptions expressed as IPv4 CIDRs, IPs, or domain patterns.</td></tr>
+<tr><td><code>network.denyOut</code></td><td>Empty</td><td>IPv4 CIDRs or IPs to reject. Domain names are not supported here.</td></tr>
+<tr><td><code>network.allowPublicTraffic</code></td><td><code>true</code></td><td>Per-sandbox creation setting controlling whether proxied services are public. When <code>false</code>, requests require the sandbox’s traffic access token.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Node-wide egress denials are configured separately with
+<code>[network.egress].always_denied_cidrs</code> in your AgentENV config file. This lists
+IP ranges that every sandbox is prohibited from reaching, such as private or
+host-local networks. These rules are applied before per-sandbox rules and
+cannot be overridden by <code>allowOut</code>.</p>
+<pre><code class="language-toml">[network.egress]
+always_denied_cidrs = [
+  "10.0.0.0/8",
+  "169.254.0.0/16",
+]
+</code></pre>
+<h3 id="matching-rules"><a class="header" href="#matching-rules">Matching Rules</a></h3>
+<p>Rules are evaluated in this order:</p>
+<pre class="mermaid">flowchart LR
+    A[Destination packet] --&gt; N{Node-level deny?}
+    N --&gt;|Yes| E[Reject traffic]
+    N --&gt;|No| B{Matches allowOut?}
     B --&gt;|Yes| C[Allow traffic]
     B --&gt;|No| D{Matches denyOut?}
-    D --&gt;|Yes| E[Reject traffic]
+    D --&gt;|Yes| E
     D --&gt;|No| F{"allow_internet_access?"}
     F --&gt;|Yes| C
     F --&gt;|No| E
 </pre>
 
-<p><code>allowOut</code> is evaluated before <code>denyOut</code> in the user egress chain, so an allowed destination can override an overlapping user-configured deny rule. <code>allow_internet_access: false</code> sets the base policy to <code>Deny</code>, which appends a catch-all reject after those rules and makes the remaining destinations fail closed. Static internal-network deny rules are evaluated before the user egress chain and cannot be overridden by <code>allowOut</code>.</p>
-<p>To create an allowlist, deny all traffic and then add the allowed exceptions with <code>allowOut</code>. You can deny all traffic explicitly with <code>denyOut: ["0.0.0.0/0"]</code>, or use <code>allow_internet_access: false</code> together with <code>allowOut</code>.</p>
+<p><code>allowOut</code> can override an overlapping user-configured <code>denyOut</code>, but it cannot
+override node-level internal/reserved-network deny rules. Setting
+<code>allow_internet_access: false</code> adds a deny-by-default base policy after the
+explicit rules.</p>
+<p>Domain names can be used only in <code>allowOut</code> for HTTP/HTTPS connections. Exact
+names and wildcard forms such as <code>*.example.com</code> are supported. If <code>allowOut</code>
+contains a domain, also set <code>denyOut</code> to <code>["0.0.0.0/0"]</code>; this blocks other
+destinations and leaves the listed domains as the allowed exceptions.</p>
+<h3 id="configure-at-creation"><a class="header" href="#configure-at-creation">Configure at Creation</a></h3>
+<p>Both warm and cold sandbox creation support network policy.</p>
+<p>Warm start from a template or snapshot:</p>
 <pre><code class="language-bash">curl -X POST \
   -H 'X-API-Key: test-key' \
   -H 'Content-Type: application/json' \
   -d '{
     "templateID": "my-ubuntu",
     "network": {
-      "allowOut": ["8.8.8.8/32", "1.1.1.1/32"],
-      "denyOut": ["0.0.0.0/0"]
+      "allowOut": ["*.example.com"],
+      "denyOut": ["0.0.0.0/0"],
+      "allowPublicTraffic": false
     }
   }' \
   http://127.0.0.1:8000/sandboxes
 </code></pre>
-<p>Egress rules can also be updated on a running sandbox:</p>
+<p>Cold start from an OCI image:</p>
+<pre><code class="language-bash">curl -X POST \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "image": "ubuntu:24.04",
+    "allowInternetAccess": false,
+    "network": {
+      "allowOut": ["8.8.8.8/32"]
+    }
+  }' \
+  http://127.0.0.1:8000/sandboxes-cold
+</code></pre>
+<h3 id="update-a-running-sandbox"><a class="header" href="#update-a-running-sandbox">Update a Running Sandbox</a></h3>
+<p>Replace the egress policy of a running sandbox:</p>
 <pre><code class="language-bash">curl -X PUT \
   -H 'X-API-Key: test-key' \
   -H 'Content-Type: application/json' \
   -d '{"allowOut": ["8.8.8.8/32"], "denyOut": ["0.0.0.0/0"]}' \
   http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/network
 </code></pre>
-<p>Omitting both fields clears all per-sandbox egress rules and restores the default allow behavior.</p>
-<p>Updating a policy primarily affects new connections; existing connections are not actively terminated. During replacement, the previous policy remains active until the new namespace rules are committed.</p>
-<p>For domain rules, the proxy matches the inspected Host/SNI and re-resolves the hostname using the host-side trusted resolver before connecting; the guest’s DNS answer and original destination IP are not authoritative for domain policy.</p>
-<hr>
+<p>The update replaces the current egress rules. Omitting both <code>allowOut</code> and
+<code>denyOut</code> clears the per-sandbox lists; omit <code>allow_internet_access</code> as well to
+restore the default base policy.</p>
+<p>In the current implementation, updates primarily affect new connections and do
+not actively terminate existing ones. For domain-policy replacement, the old
+policy remains active until the new namespace rules are installed and the new
+proxy policy is activated.</p>
 <h2 id="data-storage"><a class="header" href="#data-storage">Data Storage</a></h2>
 <div class="table-wrapper">
 <table>
@@ -350,9 +572,9 @@ aenv timeout &lt;sandbox-id&gt; 600
 <tr><th>Path</th><th>Contents</th><th>Config</th></tr>
 </thead>
 <tbody>
-<tr><td><code>$AENV_HOME/snapshot-store/</code></td><td>Committed snapshot and template artifacts (rootfs layers, memory snapshots, metadata)</td><td><code>[backend.posix_fs].snapshot_store</code></td></tr>
-<tr><td><code>$AENV_HOME/persisted-sandboxes/</code></td><td>Paused sandbox state persisted across server restarts</td><td><code>[orchestrator].persisted_sandbox_store_path</code></td></tr>
-<tr><td><code>$AENV_HOME/image-cache/</code></td><td>Converted OCI image layers (overlaybd format) cached after first cold start or template build</td><td><code>[image.cache].root_dir</code></td></tr>
+<tr><td><code>$AENV_HOME/snapshot-store/</code></td><td>Committed snapshot and template artifacts (rootfs layers, memory snapshots, metadata)</td><td><code>[backend.posix_fs]</code><br /><code>snapshot_store</code></td></tr>
+<tr><td><code>$AENV_HOME/persisted-sandboxes/</code></td><td>Paused sandbox state persisted across server restarts</td><td><code>[orchestrator]</code><br /><code>persisted_sandbox_store_path</code></td></tr>
+<tr><td><code>$AENV_HOME/image-cache/</code></td><td>Converted OCI image layers (overlaybd format) cached after first cold start or template build</td><td><code>[image.cache]</code><br /><code>root_dir</code></td></tr>
 </tbody>
 </table>
 </div>

@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "../searchindex-6a10619c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5437f69c.js"></script>
+        <script src="../toc-0fdd41d5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -206,6 +206,24 @@
     style node fill:transparent,stroke:gray
 </pre>
 
+<h2 id="key-components"><a class="header" href="#key-components">Key Components</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Component</th><th>Location</th><th>Responsibility</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>API Server</strong></td><td><code>src/api/</code></td><td>Exposes the E2B-compatible HTTP API and reverse proxy endpoints.</td></tr>
+<tr><td><strong>Orchestrator</strong></td><td><code>src/orchestrator/</code></td><td>Coordinates sandbox lifecycle transitions, persistence, and cleanup.</td></tr>
+<tr><td><strong>Firecracker Runtime</strong></td><td><code>src/sandbox/firecracker/</code></td><td>Creates and controls the microVM used by each sandbox.</td></tr>
+<tr><td><strong>Block Device Layer</strong></td><td><code>storage/overlaybd/</code>, <code>storage/ublk/</code></td><td>Provides layered root filesystems, attached drives, and snapshot-backed block devices.</td></tr>
+<tr><td><strong>envd Integration</strong></td><td><code>thirdparty/envd/</code>, <code>src/sandbox/</code></td><td>Handles in-guest command execution, file operations, process interaction, and health reporting.</td></tr>
+<tr><td><strong>Reverse Proxy</strong></td><td><code>src/api/proxy.rs</code></td><td>Routes HTTP, SSE, and WebSocket traffic to services inside sandboxes.</td></tr>
+<tr><td><strong>Snapshot Manager</strong></td><td><code>src/snapshot/</code></td><td>Commits, resolves, and deletes durable sandbox snapshots.</td></tr>
+<tr><td><strong>Template Builder</strong></td><td><code>src/template/</code></td><td>Builds user-facing templates and publishes their committed snapshots.</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="storage"><a class="header" href="#storage">Storage</a></h2>
 <p>The storage subsystem turns layered image files into block devices mountable by VMs, and provides ublk-backed memory snapshot restore for snapshot resume. Four crates compose the active subsystem:</p>
 <h3 id="overlaybd-storageoverlaybd"><a class="header" href="#overlaybd-storageoverlaybd">overlaybd (<code>storage/overlaybd/</code>)</a></h3>
@@ -438,7 +456,7 @@ services/                       # distributed control plane (Go)
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../troubleshooting/common-issues.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../configuration/env-vars.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -452,7 +470,7 @@ services/                       # distributed control plane (Go)
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../troubleshooting/common-issues.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../configuration/env-vars.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 

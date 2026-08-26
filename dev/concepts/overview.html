@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "../searchindex-6a10619c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5437f69c.js"></script>
+        <script src="../toc-0fdd41d5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,7 +182,52 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="how-agentenv-works"><a class="header" href="#how-agentenv-works">How AgentENV Works</a></h1>
-<p>AgentENV runs AI agents inside isolated Firecracker microVMs. Each sandbox is a lightweight Linux VM with its own kernel, filesystem, and network namespace.</p>
+<p>AgentENV runs AI agents and their tools inside isolated, snapshot-capable Linux
+environments. Each environment, called a <strong>sandbox</strong>, is backed by a Firecracker
+microVM with its own kernel, filesystem, processes, and network stack.</p>
+<h2 id="user-workflow"><a class="header" href="#user-workflow">User Workflow</a></h2>
+<pre class="mermaid">flowchart LR
+    image["OCI image"] --&gt;|"aenv pull"| template["Template"]
+    dockerfile["Dockerfile"] --&gt;|"aenv build"| template
+    image --&gt;|"aenv start --cold"| sandbox
+    template --&gt;|"aenv start"| sandbox["Running&lt;br/&gt;sandbox"]
+    sandbox --&gt;|"aenv connect / aenv exec"| work["Run code, tools, and services"]
+    work --&gt; sandbox
+    sandbox --&gt;|"aenv snapshot create"| snapshot["Snapshot"]
+    snapshot --&gt;|"aenv start"| newSandbox["New sandbox"]
+</pre>
+
+<p>A typical workflow is:</p>
+<ol>
+<li>Create a reusable template from an OCI image or Dockerfile.</li>
+<li>Start an isolated sandbox from the template, or cold start one directly
+from an OCI image.</li>
+<li>Run command in the sandbox.</li>
+<li>Pause the sandbox when you want to preserve the same sandbox for later, or
+create a snapshot when you want a reusable checkpoint that can launch new
+sandboxes.</li>
+<li>Delete sandboxes and snapshots when they are no longer needed.</li>
+</ol>
+<h2 id="templates-sandboxes-and-snapshots"><a class="header" href="#templates-sandboxes-and-snapshots">Templates, Sandboxes, and Snapshots</a></h2>
+<p>These three concepts describe the reusable and running forms of an environment:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Concept</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Template</strong></td><td>A named, reusable starting point used to launch sandboxes. A template build produces a committed snapshot underneath.</td></tr>
+<tr><td><strong>Sandbox</strong></td><td>A running, isolated Linux environment where you execute code, modify files, and start services.</td></tr>
+<tr><td><strong>Snapshot</strong></td><td>A durable checkpoint captured from a sandbox. It can be started repeatedly to create new sandboxes with the captured state.</td></tr>
+</tbody>
+</table>
+</div>
+<ul>
+<li>Building a template produces a snapshot-backed starting point.</li>
+<li>Starting a template or snapshot creates a sandbox.</li>
+<li>Capturing a running sandbox creates a snapshot without replacing the source
+sandbox.</li>
+</ul>
 <h2 id="system-overview"><a class="header" href="#system-overview">System Overview</a></h2>
 <pre class="mermaid">flowchart TD
     subgraph node[AgentENV Node]
@@ -195,52 +240,33 @@
 
 <h2 id="request-flow"><a class="header" href="#request-flow">Request Flow</a></h2>
 <ol>
-<li>A client sends an HTTP request to the AgentENV API (for example, <code>POST /sandboxes</code>).</li>
-<li>The <strong>API layer</strong> validates the request, checks authentication, and forwards it to the <strong>orchestrator</strong>.</li>
-<li>The <strong>orchestrator</strong> manages the sandbox lifecycle: it creates a Firecracker VM, sets up networking, and attaches block devices.</li>
-<li>The VM boots with a <strong>layered block device</strong> (overlaybd) that stacks read-only base image layers with a writable upper layer. Multiple sandboxes share the same base layers.</li>
-<li>Inside the VM, an <strong>envd</strong> daemon handles command execution, file operations, and health reporting.</li>
-<li>Clients interact with running sandboxes via the <strong>reverse proxy</strong> (<code>/proxy</code>, routing headers, or configured sandbox proxy domains), which forwards HTTP and WebSocket traffic to services inside the VM.</li>
+<li>A client sends an HTTP request to the AgentENV API (for example,
+<code>POST /sandboxes</code>).</li>
+<li>The <strong>API layer</strong> validates the request, checks authentication, and forwards
+it to the <strong>orchestrator</strong>.</li>
+<li>The <strong>orchestrator</strong> manages the sandbox lifecycle: it creates a Firecracker
+VM, sets up networking, and attaches block devices.</li>
+<li>The VM boots with a <strong>layered block device</strong> (overlaybd) that stacks read-only
+base image layers with a writable upper layer. Multiple sandboxes share the
+same base layers.</li>
+<li>Inside the VM, an <strong>envd</strong> daemon handles command execution, file operations,
+and health reporting.</li>
+<li>Clients interact with running sandboxes via the <strong>reverse proxy</strong> (<code>/proxy</code>,
+routing headers, or configured sandbox proxy domains), which forwards HTTP
+and WebSocket traffic to services inside the VM.</li>
 </ol>
-<h2 id="key-components"><a class="header" href="#key-components">Key Components</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Component</th><th>What It Does</th></tr>
-</thead>
-<tbody>
-<tr><td><strong>API Server</strong></td><td>HTTP server exposing E2B-compatible endpoints for sandbox and template management</td></tr>
-<tr><td><strong>Orchestrator</strong></td><td>State machine managing sandbox lifecycle transitions (create, pause, resume, delete)</td></tr>
-<tr><td><strong>Firecracker VM</strong></td><td>Lightweight microVM providing kernel-level isolation per sandbox</td></tr>
-<tr><td><strong>Block Device Layer</strong></td><td>overlaybd (layered images) + ublk (userspace block devices) for efficient storage</td></tr>
-<tr><td><strong>envd</strong></td><td>In-guest daemon for executing commands, streaming output, and managing processes</td></tr>
-<tr><td><strong>Reverse Proxy</strong></td><td>Routes HTTP/WebSocket traffic from clients to services running inside sandboxes</td></tr>
-<tr><td><strong>Snapshot Manager</strong></td><td>Manages committed snapshots for efficient sandbox creation and reuse</td></tr>
-<tr><td><strong>Template Builder</strong></td><td>User-facing build layer that declaratively produces committed snapshots with pre-installed software</td></tr>
-</tbody>
-</table>
-</div>
-<h2 id="multi-node-architecture"><a class="header" href="#multi-node-architecture">Multi-Node Architecture</a></h2>
-<p>For multi-node deployments, a <strong>gateway</strong> and <strong>scheduler</strong> sit in front of multiple AgentENV nodes:</p>
-<pre class="mermaid">flowchart LR
-    client["Client"] --&gt;|HTTP| gateway["Gateway&lt;br/&gt;(:8080)"]
-    gateway --&gt;|gRPC| scheduler["Scheduler&lt;br/&gt;(:9090)"]
-    gateway --&gt;|proxy HTTP| nodeA["Node A&lt;br/&gt;(:8000)"]
-    gateway --&gt;|proxy HTTP| nodeB["Node B&lt;br/&gt;(:8000)"]
-    scheduler -.-&gt;|node selection /&lt;br/&gt; lookup result| gateway
-</pre>
-
-<p>The gateway routes requests by sandbox ID. For new sandboxes, the scheduler picks a node. For existing sandboxes, the scheduler looks up the node that owns it. See <a href="../deployment/docker-compose.html">Deployment</a> for setup instructions.</p>
+<p>Continue with <a href="./templates.html">Templates</a>, <a href="./sandboxes.html">Sandboxes</a>, and
+<a href="./snapshots.html">Snapshots</a> for the commands and options for each workflow.</p>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../security/secure-sandboxes.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../deployment/pvm.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../concepts/templates.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../concepts/authentication.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -250,11 +276,11 @@
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../security/secure-sandboxes.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../deployment/pvm.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../concepts/templates.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../concepts/authentication.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>

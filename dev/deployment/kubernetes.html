@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "../searchindex-6a10619c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5437f69c.js"></script>
+        <script src="../toc-0fdd41d5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -224,7 +224,8 @@ cd AgentENV
 </code></pre>
 <p>This builds three images: <code>agentenv-runtime:latest</code>, <code>agentenv-gateway:latest</code>, and <code>agentenv-scheduler:latest</code>.</p>
 <h2 id="configure-the-access-token-seed-optional"><a class="header" href="#configure-the-access-token-seed-optional">Configure the Access-Token Seed (Optional)</a></h2>
-<p>See <a href="../security/secure-sandboxes.html">Secure Sandboxes</a> for the optional shared seed configuration and Kubernetes Secret example.</p>
+<p>See <a href="../concepts/authentication.html#sandbox-access-token-seed">Authentication</a>
+for the shared sandbox access-token seed configuration.</p>
 <h2 id="deploy"><a class="header" href="#deploy">Deploy</a></h2>
 <pre><code class="language-bash"># Run on each worker node before deploying
 sudo bash scripts/docker-setup.sh
@@ -245,7 +246,7 @@ configuring clients:</p>
 <code>make k8s-render</code> uses an invalid <code>REDACTED</code> placeholder so preview output never
 contains a deployable API key. The optional runtime seed keeps its existing
 <code>agentenv-runtime-secrets</code> contract described in
-<a href="../security/secure-sandboxes.html">Secure Sandboxes</a>.</p>
+<a href="../concepts/authentication.html#sandbox-access-token-seed">Authentication</a>.</p>
 <p>To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when rendering or applying manifests:</p>
 <pre><code class="language-bash">SANDBOX_PROXY_DOMAINS=sandbox.example.com make k8s-apply

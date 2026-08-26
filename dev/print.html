@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "searchindex-6a10619c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-5437f69c.js"></script>
+        <script src="toc-0fdd41d5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -412,12 +412,14 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--name &lt;name&gt;</code></td><td>Override the template name</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Override the template name. Defaults to the image’s repository segment.</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores for the template. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory for the template. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
 <tr><td><code>--start-cmd &lt;cmd&gt;</code></td><td>Shell command to run inside the sandbox before capturing the template snapshot</td></tr>
-<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td>Shell command used to wait until the sandbox is ready (polled until it exits 0)</td></tr>
-<tr><td><code>--probe &lt;PORT&gt;</code></td><td>Wait until <code>localhost:&lt;PORT&gt;</code> accepts TCP connections</td></tr>
+<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td>Shell command polled until it exits 0. Defaults to <code>sleep 20</code> when <code>--start-cmd</code> is set; otherwise unset.</td></tr>
+<tr><td><code>--probe &lt;PORT&gt;</code></td><td>Wait until <code>localhost:&lt;PORT&gt;</code> accepts TCP connections. Conflicts with <code>--ready-cmd</code>.</td></tr>
 <tr><td><code>-d, --detach</code></td><td>Submit the build and return immediately without waiting</td></tr>
-<tr><td><code>--timeout &lt;SECS&gt;</code></td><td>Maximum seconds to wait for the build to complete</td></tr>
+<tr><td><code>--timeout &lt;SECS&gt;</code></td><td>Maximum seconds to wait for the build to complete. No timeout by default. Conflicts with <code>--detach</code>.</td></tr>
 </tbody>
 </table>
 </div>
@@ -433,15 +435,29 @@ aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
 </thead>
 <tbody>
 <tr><td><code>--name &lt;name&gt;</code></td><td>Required template name</td></tr>
-<tr><td><code>--image &lt;image&gt;</code></td><td>Override the <code>FROM</code> image used as the rootfs base</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores for the template. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory for the template. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>--image &lt;image&gt;</code></td><td>Override the rootfs base. Defaults to the first concrete <code>FROM</code> image, then the server’s <code>[image.resolver].default_image</code> if none is usable. Alias: <code>--user-image</code>.</td></tr>
 </tbody>
 </table>
 </div>
+<p><code>aenv build</code> submits the build and returns immediately. Use
+<code>aenv template watch &lt;template&gt;</code> to wait for completion.</p>
 <h3 id="aenv-template-list"><a class="header" href="#aenv-template-list"><code>aenv template list</code></a></h3>
 <p>List all templates. Alias: <code>aenv template ls</code>, <code>aenv templates list</code>.</p>
 <pre><code class="language-bash">aenv template list
 aenv template list --output json
 </code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--output &lt;table|json&gt;</code></td><td>Output format. Defaults to table on a TTY and JSON when redirected.</td></tr>
+</tbody>
+</table>
+</div>
 <h3 id="aenv-template-watch-template"><a class="header" href="#aenv-template-watch-template"><code>aenv template watch &lt;template&gt;</code></a></h3>
 <p>Watch a template build until it succeeds or fails. Accepts either a template name/alias or a template UUID.</p>
 <pre><code class="language-bash">aenv template watch my-ubuntu
@@ -455,7 +471,8 @@ aenv template delete &lt;template-id&gt;
 <hr>
 <h2 id="sandboxes"><a class="header" href="#sandboxes">Sandboxes</a></h2>
 <h3 id="aenv-start-target"><a class="header" href="#aenv-start-target"><code>aenv start &lt;target&gt;</code></a></h3>
-<p>Start a sandbox and attach an interactive shell. <code>&lt;target&gt;</code> is a template name or template UUID.</p>
+<p>Start a sandbox and attach an interactive shell. <code>&lt;target&gt;</code> accepts a template
+or snapshot ID or alias, or an OCI image reference with <code>--cold</code>.</p>
 <pre><code class="language-bash">aenv start my-ubuntu
 aenv start --secure my-ubuntu               # require token-authenticated envd access
 aenv start --cold ubuntu:24.04              # start directly from an OCI image
@@ -469,13 +486,14 @@ aenv start --cold ubuntu:24.04              # start directly from an OCI image
 <tr><td><code>--cold</code></td><td>Start directly from an external OCI image instead of a template</td></tr>
 <tr><td><code>--secure</code></td><td>Require token authentication for envd control communication</td></tr>
 <tr><td><code>--timeout &lt;secs&gt;</code></td><td>Sandbox TTL in seconds (default: 300)</td></tr>
-<tr><td><code>--cpu-count &lt;n&gt;</code> / <code>--cpu</code></td><td>CPU cores — only valid with <code>--cold</code></td></tr>
-<tr><td><code>--memory-mb &lt;n&gt;</code> / <code>--mem</code></td><td>Memory in MiB — only valid with <code>--cold</code></td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores; only valid with <code>--cold</code>. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory in MiB; only valid with <code>--cold</code>. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>--disk-size-mb &lt;MiB&gt;</code></td><td>Root filesystem size; only valid with <code>--cold</code>. Defaults to the source image’s virtual size; an explicit value must be at least 1024 and divisible by 1024 MiB. Alias: <code>--disk-mb</code>.</td></tr>
 <tr><td><code>-d, --detach</code></td><td>Print the sandbox ID and exit without attaching a shell</td></tr>
 </tbody>
 </table>
 </div>
-<p><code>&lt;target&gt;</code> accepts a template UUID, template name, or (with <code>--cold</code>) an OCI image reference.</p>
+<p>CPU, memory, and disk overrides are supported only for cold starts.</p>
 <h3 id="aenv-pause-sandbox-id"><a class="header" href="#aenv-pause-sandbox-id"><code>aenv pause &lt;sandbox-id&gt;</code></a></h3>
 <p>Pause a running sandbox. The sandbox state is preserved and can be resumed later.</p>
 <pre><code class="language-bash">aenv pause &lt;sandbox-id&gt;
@@ -490,7 +508,7 @@ aenv start --cold ubuntu:24.04              # start directly from an OCI image
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--timeout &lt;secs&gt;</code></td><td>TTL in seconds from now (default: 300)</td></tr>
+<tr><td><code>--timeout &lt;secs&gt;</code></td><td>TTL in seconds from now (default: 300). Must be longer than the sandbox’s current remaining TTL.</td></tr>
 </tbody>
 </table>
 </div>
@@ -568,7 +586,16 @@ extended attributes, or hard-link relationships.</p>
 <p>List all sandboxes. Alias: <code>aenv ls</code>.</p>
 <pre><code class="language-bash">aenv list
 </code></pre>
-<p>Outputs a table on a TTY and JSON when piped. Override with <code>--output table|json</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--output &lt;table|json&gt;</code></td><td>Output format. Defaults to table on a TTY and JSON when redirected.</td></tr>
+</tbody>
+</table>
+</div>
 <h3 id="aenv-delete-sandbox-id"><a class="header" href="#aenv-delete-sandbox-id"><code>aenv delete &lt;sandbox-id&gt;</code></a></h3>
 <p>Kill and delete a sandbox. Alias: <code>aenv rm</code>.</p>
 <pre><code class="language-bash">aenv delete &lt;sandbox-id&gt;
@@ -587,7 +614,7 @@ aenv snapshot create &lt;sandbox-id&gt; --name my-base
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--name &lt;name&gt;</code></td><td>Snapshot name or alias</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Snapshot name or alias. If omitted, the generated snapshot ID identifies the snapshot.</td></tr>
 </tbody>
 </table>
 </div>
@@ -604,7 +631,7 @@ aenv snapshot list --sandbox-id &lt;sandbox-id&gt;
 </thead>
 <tbody>
 <tr><td><code>--sandbox-id &lt;id&gt;</code></td><td>Filter snapshots by source sandbox ID</td></tr>
-<tr><td><code>--output &lt;format&gt;</code></td><td>Output format: <code>table</code> (default on TTY) or <code>json</code></td></tr>
+<tr><td><code>--output &lt;table|json&gt;</code></td><td>Output format. Defaults to table on a TTY and JSON when redirected.</td></tr>
 </tbody>
 </table>
 </div>
@@ -766,6 +793,16 @@ AgentENV runtime nodes:</p>
 </tbody>
 </table>
 </div>
+<pre class="mermaid">flowchart LR
+    client["Client"] --&gt;|"HTTP / WebSocket"| gateway["Gateway&lt;br/&gt;10.0.0.10:8080"]
+    gateway --&gt;|"gRPC"| scheduler["Scheduler&lt;br/&gt;10.0.0.10:9090"]
+    gateway --&gt;|"HTTP proxy"| nodeA["Runtime node A&lt;br/&gt;10.0.0.21:8000"]
+    gateway --&gt;|"HTTP proxy"| nodeB["Runtime node B&lt;br/&gt;10.0.0.22:8000"]
+    nodeA -.-&gt;|"heartbeat"| scheduler
+    nodeB -.-&gt;|"heartbeat"| scheduler
+    scheduler -.-&gt;|"placement and lookup"| gateway
+</pre>
+
 <p>AgentENV authenticates HTTP requests but does not encrypt them. Use private
 addresses, a VPN, or TLS termination before traffic crosses an untrusted
 network.</p>
@@ -1042,7 +1079,8 @@ cd AgentENV
 </code></pre>
 <p>This builds three images: <code>agentenv-runtime:latest</code>, <code>agentenv-gateway:latest</code>, and <code>agentenv-scheduler:latest</code>.</p>
 <h2 id="configure-the-access-token-seed-optional"><a class="header" href="#configure-the-access-token-seed-optional">Configure the Access-Token Seed (Optional)</a></h2>
-<p>See <a href="#secure-sandboxes">Secure Sandboxes</a> for the optional shared seed configuration and Kubernetes Secret example.</p>
+<p>See <a href="#sandbox-access-token-seed">Authentication</a>
+for the shared sandbox access-token seed configuration.</p>
 <h2 id="deploy"><a class="header" href="#deploy">Deploy</a></h2>
 <pre><code class="language-bash"># Run on each worker node before deploying
 sudo bash scripts/docker-setup.sh
@@ -1063,7 +1101,7 @@ configuring clients:</p>
 <code>make k8s-render</code> uses an invalid <code>REDACTED</code> placeholder so preview output never
 contains a deployable API key. The optional runtime seed keeps its existing
 <code>agentenv-runtime-secrets</code> contract described in
-<a href="#secure-sandboxes">Secure Sandboxes</a>.</p>
+<a href="#sandbox-access-token-seed">Authentication</a>.</p>
 <p>To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when rendering or applying manifests:</p>
 <pre><code class="language-bash">SANDBOX_PROXY_DOMAINS=sandbox.example.com make k8s-apply
@@ -1390,6 +1428,1278 @@ id aenv
 </code></pre>
 <h3 id="snapshot-or-paused-sandbox-mode-mismatch"><a class="header" href="#snapshot-or-paused-sandbox-mode-mismatch">Snapshot or paused-sandbox mode mismatch</a></h3>
 <p>The persisted state was created in the other virtualization mode. Restore it on a node using its original mode, or rebuild the workload and capture a new snapshot in the target mode.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="how-agentenv-works"><a class="header" href="#how-agentenv-works">How AgentENV Works</a></h1>
+<p>AgentENV runs AI agents and their tools inside isolated, snapshot-capable Linux
+environments. Each environment, called a <strong>sandbox</strong>, is backed by a Firecracker
+microVM with its own kernel, filesystem, processes, and network stack.</p>
+<h2 id="user-workflow"><a class="header" href="#user-workflow">User Workflow</a></h2>
+<pre class="mermaid">flowchart LR
+    image["OCI image"] --&gt;|"aenv pull"| template["Template"]
+    dockerfile["Dockerfile"] --&gt;|"aenv build"| template
+    image --&gt;|"aenv start --cold"| sandbox
+    template --&gt;|"aenv start"| sandbox["Running&lt;br/&gt;sandbox"]
+    sandbox --&gt;|"aenv connect / aenv exec"| work["Run code, tools, and services"]
+    work --&gt; sandbox
+    sandbox --&gt;|"aenv snapshot create"| snapshot["Snapshot"]
+    snapshot --&gt;|"aenv start"| newSandbox["New sandbox"]
+</pre>
+
+<p>A typical workflow is:</p>
+<ol>
+<li>Create a reusable template from an OCI image or Dockerfile.</li>
+<li>Start an isolated sandbox from the template, or cold start one directly
+from an OCI image.</li>
+<li>Run command in the sandbox.</li>
+<li>Pause the sandbox when you want to preserve the same sandbox for later, or
+create a snapshot when you want a reusable checkpoint that can launch new
+sandboxes.</li>
+<li>Delete sandboxes and snapshots when they are no longer needed.</li>
+</ol>
+<h2 id="templates-sandboxes-and-snapshots"><a class="header" href="#templates-sandboxes-and-snapshots">Templates, Sandboxes, and Snapshots</a></h2>
+<p>These three concepts describe the reusable and running forms of an environment:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Concept</th><th>Purpose</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Template</strong></td><td>A named, reusable starting point used to launch sandboxes. A template build produces a committed snapshot underneath.</td></tr>
+<tr><td><strong>Sandbox</strong></td><td>A running, isolated Linux environment where you execute code, modify files, and start services.</td></tr>
+<tr><td><strong>Snapshot</strong></td><td>A durable checkpoint captured from a sandbox. It can be started repeatedly to create new sandboxes with the captured state.</td></tr>
+</tbody>
+</table>
+</div>
+<ul>
+<li>Building a template produces a snapshot-backed starting point.</li>
+<li>Starting a template or snapshot creates a sandbox.</li>
+<li>Capturing a running sandbox creates a snapshot without replacing the source
+sandbox.</li>
+</ul>
+<h2 id="system-overview"><a class="header" href="#system-overview">System Overview</a></h2>
+<pre class="mermaid">flowchart TD
+    subgraph node[AgentENV Node]
+        api["API&lt;br/&gt;(Axum)"] --&gt; orchestrator["Orchestrator&lt;br/&gt;(lifecycle)"]
+        orchestrator --&gt; vm["Firecracker VM&lt;br/&gt;/dev/vda (rootfs)&lt;br/&gt;/dev/vdb (extra)"]
+        vm --&gt; block["Block Device Layer&lt;br/&gt;(overlaybd + ublk)"]
+    end
+    style node fill:transparent,stroke:gray
+</pre>
+
+<h2 id="request-flow"><a class="header" href="#request-flow">Request Flow</a></h2>
+<ol>
+<li>A client sends an HTTP request to the AgentENV API (for example,
+<code>POST /sandboxes</code>).</li>
+<li>The <strong>API layer</strong> validates the request, checks authentication, and forwards
+it to the <strong>orchestrator</strong>.</li>
+<li>The <strong>orchestrator</strong> manages the sandbox lifecycle: it creates a Firecracker
+VM, sets up networking, and attaches block devices.</li>
+<li>The VM boots with a <strong>layered block device</strong> (overlaybd) that stacks read-only
+base image layers with a writable upper layer. Multiple sandboxes share the
+same base layers.</li>
+<li>Inside the VM, an <strong>envd</strong> daemon handles command execution, file operations,
+and health reporting.</li>
+<li>Clients interact with running sandboxes via the <strong>reverse proxy</strong> (<code>/proxy</code>,
+routing headers, or configured sandbox proxy domains), which forwards HTTP
+and WebSocket traffic to services inside the VM.</li>
+</ol>
+<p>Continue with <a href="#templates-1">Templates</a>, <a href="#sandboxes-1">Sandboxes</a>, and
+<a href="#snapshots-1">Snapshots</a> for the commands and options for each workflow.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="authentication-1"><a class="header" href="#authentication-1">Authentication</a></h1>
+<p>AgentENV uses three credentials for three separate kinds of access:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Credential</th><th>Protects</th><th>When required</th><th>Header</th></tr>
+</thead>
+<tbody>
+<tr><td>API key</td><td>AgentENV lifecycle and management APIs</td><td>All authenticated control-plane requests</td><td><code>X-API-Key</code></td></tr>
+<tr><td><code>trafficAccessToken</code></td><td>Services exposed by a sandbox</td><td><code>allowPublicTraffic: false</code></td><td><code>e2b-traffic-access-token</code></td></tr>
+<tr><td><code>envdAccessToken</code></td><td>envd operations such as command execution and file access</td><td><code>secure: true</code></td><td><code>X-Access-Token</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>These credentials are not interchangeable. The API key belongs to the AgentENV
+deployment; the other two tokens belong to an individual sandbox.</p>
+<h2 id="api-authentication"><a class="header" href="#api-authentication">API Authentication</a></h2>
+<p>The API key authenticates requests that create and manage AgentENV resources,
+including templates, sandboxes, and snapshots:</p>
+<pre><code class="language-bash">curl http://127.0.0.1:8000/sandboxes \
+  -H "X-API-Key: &lt;api-key&gt;"
+</code></pre>
+<h3 id="get-the-api-key"><a class="header" href="#get-the-api-key">Get the API Key</a></h3>
+<p>A runtime node checks these API-key sources in order:</p>
+<ol>
+<li><code>AENV_API_KEY</code></li>
+<li><code>/run/secrets/api-key</code></li>
+<li><code>$AENV_HOME/secrets/api-key</code></li>
+</ol>
+<p>The gateway checks only <code>AENV_API_KEY</code> and <code>/run/secrets/api-key</code>. The gateway
+and every runtime node in one deployment must use the same key.</p>
+<h4 id="provide-an-api-key"><a class="header" href="#provide-an-api-key">Provide an API Key</a></h4>
+<p>To provide your own key, generate a value containing 32 to 256 URL-safe
+characters and make it available through one of the locations above. For
+example, generate an E2B-compatible key and set it through the environment:</p>
+<pre><code class="language-bash">export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
+</code></pre>
+<p>Use the same explicitly generated key for the gateway and every runtime node in
+a multi-node deployment. Docker Compose can provide it through its shared
+managed-secret volume, while Kubernetes stores it in <code>Secret/agentenv-auth</code>.
+See the corresponding deployment guide for setup instructions.</p>
+<h4 id="use-an-automatically-generated-api-key"><a class="header" href="#use-an-automatically-generated-api-key">Use an Automatically Generated API Key</a></h4>
+<p>If a runtime node finds no key in any of the three locations, normal server
+startup generates an E2B-compatible key and atomically stores it at
+<code>$AENV_HOME/secrets/api-key</code>. Read that file after the server starts and use its
+value when configuring the CLI or another API client.</p>
+<p>Automatic generation is convenient for a normal single-node deployment. The
+gateway never generates a key, so a multi-node deployment must make one shared
+key available to the gateway and all runtime nodes.</p>
+<h3 id="configure-the-cli"><a class="header" href="#configure-the-cli">Configure the CLI</a></h3>
+<p>Run <code>aenv auth</code>, enter the AgentENV server URL, and paste the API key obtained
+above. Press Enter to accept the default local URL. The API key input is hidden:</p>
+<pre><code class="language-text">$ aenv auth
+AENV server URL [http://localhost:8000]: http://localhost:8000
+API key: &lt;paste-api-key-here&gt;
+Credentials saved.
+</code></pre>
+<p>E2B-compatible SDKs read the same AgentENV API key from <code>E2B_API_KEY</code>:</p>
+<pre><code class="language-bash">export E2B_API_KEY="&lt;paste-api-key-here&gt;"
+</code></pre>
+<h3 id="unauthenticated-endpoints"><a class="header" href="#unauthenticated-endpoints">Unauthenticated Endpoints</a></h3>
+<p><code>GET /health</code> and node <code>GET /metrics</code> are outside API-key authentication. The
+gateway exposes Prometheus metrics on a separate metrics listener. Protect
+these endpoints with the network and authentication controls used by your
+monitoring deployment.</p>
+<h3 id="rotate-the-api-key"><a class="header" href="#rotate-the-api-key">Rotate the API Key</a></h3>
+<p>Changing <code>AENV_API_KEY</code> invalidates existing API clients but does not change
+the credentials of existing sandboxes.</p>
+<h2 id="application-ingress-authentication"><a class="header" href="#application-ingress-authentication">Application Ingress Authentication</a></h2>
+<p>Application ingress is traffic sent through the AgentENV proxy to a service
+running inside a sandbox. It is independent from API and envd authentication.</p>
+<p>With <code>allowPublicTraffic: true</code>, which is the default, application ingress does
+not require an AgentENV credential.</p>
+<p>To create a private sandbox, set <code>allowPublicTraffic: false</code>. The creation
+response includes that sandbox’s <code>trafficAccessToken</code>; capture it for later
+proxy requests:</p>
+<pre><code class="language-bash">SANDBOX_RESPONSE=$(curl -sS -X POST http://127.0.0.1:8000/sandboxes \
+  -H "X-API-Key: &lt;api-key&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "templateID": "my-template",
+    "network": {
+      "allowPublicTraffic": false
+    }
+  }')
+
+SANDBOX_ID=$(printf '%s' "$SANDBOX_RESPONSE" | jq -r '.sandboxID')
+TRAFFIC_ACCESS_TOKEN=$(printf '%s' "$SANDBOX_RESPONSE" | jq -r '.trafficAccessToken')
+</code></pre>
+<p>Send that token in <code>e2b-traffic-access-token</code> when accessing an application in
+the sandbox:</p>
+<pre><code class="language-bash">curl http://127.0.0.1:8000/proxy/ \
+  -H "x-agentenv-sandbox-id: $SANDBOX_ID" \
+  -H "x-agentenv-target-port: 8080" \
+  -H "e2b-traffic-access-token: $TRAFFIC_ACCESS_TOKEN"
+</code></pre>
+<p>Each sandbox has its own token, and forked sandboxes receive independent
+credentials. AgentENV removes the traffic token before forwarding the request
+to the sandbox application. See <a href="#access-control">Proxy</a>
+for the complete proxy routing and access-control behavior.</p>
+<h2 id="secure-sandbox-authentication"><a class="header" href="#secure-sandbox-authentication">Secure Sandbox Authentication</a></h2>
+<p>A secure sandbox requires an <code>envdAccessToken</code> for envd control operations,
+including interactive connections, command execution, and file upload or
+download. This does not protect services exposed by the sandbox; application
+ingress uses <code>trafficAccessToken</code> as described above.</p>
+<h3 id="enable-secure-mode"><a class="header" href="#enable-secure-mode">Enable Secure Mode</a></h3>
+<p>Set <code>secure: true</code> in the sandbox
+creation request. For example, create a secure sandbox and capture
+the token returned in the response:</p>
+<pre><code class="language-bash">SANDBOX_RESPONSE=$(curl -sS -X POST http://127.0.0.1:8000/sandboxes \
+  -H "X-API-Key: &lt;api-key&gt;" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "templateID": "my-template",
+    "secure": true
+  }')
+
+SANDBOX_ID=$(printf '%s' "$SANDBOX_RESPONSE" | jq -r '.sandboxID')
+ENVD_ACCESS_TOKEN=$(printf '%s' "$SANDBOX_RESPONSE" | jq -r '.envdAccessToken')
+</code></pre>
+<p>Use the envd port <code>49983</code>, and send the token in <code>X-Access-Token</code>:</p>
+<pre><code class="language-bash">curl http://127.0.0.1:8000/proxy/health \
+  -H "x-agentenv-sandbox-id: $SANDBOX_ID" \
+  -H "x-agentenv-target-port: 49983" \
+  -H "X-Access-Token: $ENVD_ACCESS_TOKEN"
+</code></pre>
+<p>The <code>aenv</code> CLI handles this automatically. Use <code>--secure</code> when starting a sandbox:</p>
+<pre><code class="language-bash">aenv start --secure &lt;template-or-snapshot&gt;
+</code></pre>
+<p>For <code>connect</code>, <code>exec</code>, <code>upload</code>, and
+<code>download</code>, it obtains the token through the authenticated AgentENV API and
+adds <code>X-Access-Token</code> to the subsequent envd request.</p>
+<h3 id="secure-mode-lifecycle"><a class="header" href="#secure-mode-lifecycle">Secure-Mode Lifecycle</a></h3>
+<p>Secure mode and its credentials remain valid across pause, server restart, and
+resume. Forked sandboxes receive independent credentials.</p>
+<h2 id="sandbox-access-token-seed"><a class="header" href="#sandbox-access-token-seed">Sandbox Access-Token Seed</a></h2>
+<p>AgentENV derives both <code>trafficAccessToken</code> and <code>envdAccessToken</code> from the
+sandbox identity and a random access-token seed. This seed is independent of
+the AgentENV API key.</p>
+<p>For a standalone runtime, the seed is optional. When it is unset, AgentENV
+generates and persists one under <code>$AENV_HOME/secrets</code>, which is sufficient for
+normal single-node operation.</p>
+<p>In a multi-node deployment, generate one seed and configure the same value on
+every runtime node:</p>
+<pre><code class="language-bash">openssl rand -hex 32
+export AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED="&lt;generated-seed&gt;"
+</code></pre>
+<p>Alternatively, set it in your AgentENV config file (<code>config/default.toml</code>, or
+the file selected by <code>AENV_CONFIG_PATH</code>):</p>
+<pre><code class="language-toml">[sandbox]
+access_token_hash_seed = "&lt;generated-seed&gt;"
+</code></pre>
+<p>Kubernetes deployments store the shared value under the
+<code>sandbox-access-token-hash-seed</code> key in <code>Secret/agentenv-runtime-secrets</code>. See
+<a href="#kubernetes-multi-node">Kubernetes Deployment</a> for the setup commands.</p>
+<p>Preserve the seed across upgrades. Changing it rotates both sandbox token types
+and requires all runtime nodes to be updated together.</p>
+<h2 id="transport-security"><a class="header" href="#transport-security">Transport Security</a></h2>
+<p>Authentication does not encrypt traffic. Use HTTPS termination, a VPN,
+loopback, or a trusted private network to protect API keys and sandbox tokens
+in transit.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="templates-1"><a class="header" href="#templates-1">Templates</a></h1>
+<p>A template is a reusable starting point for launching sandboxes. Build or
+import it once, then use it to create sandboxes whenever you need the same
+software and configuration.</p>
+<h2 id="create-your-template"><a class="header" href="#create-your-template">Create Your Template</a></h2>
+<p>There are two ways to create a template: <code>aenv pull</code> imports an OCI image directly, and <code>aenv build</code> runs Dockerfile instructions inside a temporary build sandbox.</p>
+<p>Some defaults below come from your AgentENV config file. This is
+<code>config/default.toml</code> by default, or the file specified by
+<code>AENV_CONFIG_PATH</code>.</p>
+<h3 id="aenv-pull"><a class="header" href="#aenv-pull">aenv pull</a></h3>
+<p>Pull an existing OCI image as a template and optionally give it a memorable name:</p>
+<p>Usage:</p>
+<pre><code class="language-bash">aenv pull &lt;image&gt; [options]
+</code></pre>
+<p>Example:</p>
+<pre><code class="language-bash">aenv pull ubuntu:24.04
+aenv pull ubuntu:24.04 --name my-base
+</code></pre>
+<p><code>--name</code> is optional. Without it, AgentENV uses the image repository name. A template name can
+be used anywhere a template ID is accepted.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;image&gt;</code></td><td>Required</td><td>OCI image reference. Short names such as <code>ubuntu:24.04</code> and full references are supported.</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Image repository name</td><td>Assign a human-readable template name.</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your config file</td><td>Set the template’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set the template’s memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>--start-cmd &lt;cmd&gt;</code></td><td>None</td><td>Run a command before capturing the template snapshot.</td></tr>
+<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td><code>sleep 20</code> when <code>--start-cmd</code> is set; otherwise none</td><td>Poll a shell command every two seconds until it exits successfully.</td></tr>
+<tr><td><code>--probe &lt;port&gt;</code></td><td>None</td><td>Wait for TCP on <code>localhost:&lt;port&gt;</code>. Cannot be combined with <code>--ready-cmd</code>.</td></tr>
+<tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Submit the build and return immediately instead of waiting.</td></tr>
+<tr><td><code>--timeout &lt;seconds&gt;</code></td><td>No timeout</td><td>Limit how long the CLI waits for the build. Cannot be combined with <code>--detach</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>Env</code>, <code>WorkingDir</code>, and <code>User</code> are automatically inherited from the OCI image config. See <a href="#runtime-configuration">Runtime Configuration</a> for the full field list.</p>
+<h3 id="aenv-build"><a class="header" href="#aenv-build">aenv build</a></h3>
+<blockquote>
+<p>⚠️ <strong>Experimental</strong> — Not recommended for production use.</p>
+</blockquote>
+<p>Build a template by running Dockerfile instructions inside a temporary sandbox:</p>
+<pre><code class="language-bash">aenv build &lt;dockerfile&gt; --name &lt;name&gt; [options]
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;dockerfile&gt;</code></td><td>Required</td><td>Path to the Dockerfile.</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Required</td><td>Assign the template name.</td></tr>
+<tr><td><code>--image &lt;ref&gt;</code></td><td>First concrete <code>FROM</code> image</td><td>Override the base image. If the Dockerfile has no usable <code>FROM</code>, <code>[image.resolver].default_image</code> from your config file is used. Alias: <code>--user-image</code>.</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your config file</td><td>Set the template’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set the template’s memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>aenv build</code> and <code>aenv pull --detach</code> submit the build and return immediately. Watch it until it
+succeeds or fails by passing the template name or ID:</p>
+<pre><code class="language-bash">aenv template watch my-template
+</code></pre>
+<p><code>aenv template watch</code> has no timeout option. Stop the
+local watch with <code>Ctrl-C</code>; the remote build continues.</p>
+<p>Supported Dockerfile instructions:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Instruction</th><th>Behavior</th></tr>
+</thead>
+<tbody>
+<tr><td><code>FROM</code></td><td>Base image (overridable with <code>--image</code>)</td></tr>
+<tr><td><code>RUN</code></td><td>Shell command executed inside the build sandbox</td></tr>
+<tr><td><code>ENV</code></td><td>Set an environment variable</td></tr>
+<tr><td><code>ARG</code></td><td>Set a build-time variable</td></tr>
+<tr><td><code>WORKDIR</code></td><td>Create the directory if needed and set it as the working directory</td></tr>
+<tr><td><code>USER</code></td><td>Set the default user (a missing named account is created at the end of the build)</td></tr>
+<tr><td><code>ENTRYPOINT</code></td><td>Becomes the template <code>startCmd</code></td></tr>
+<tr><td><code>CMD</code></td><td>Becomes <code>startCmd</code> if no <code>ENTRYPOINT</code> is present</td></tr>
+<tr><td><code>EXPOSE</code> / <code>VOLUME</code> / <code>LABEL</code></td><td>Accepted but stored as metadata only</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="runtime-configuration"><a class="header" href="#runtime-configuration">Runtime Configuration</a></h3>
+<p>Both methods read the same set of OCI image config fields. For <code>aenv pull</code>, these come from the image config or flags; for <code>aenv build</code>, they are set by the
+corresponding Dockerfile instructions executed during the build. The following fields from the <a href="https://github.com/opencontainers/image-spec/blob/main/config.md">OCI image-spec config object</a> are recognised:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>OCI field</th><th>Dockerfile instruction</th><th>Runtime effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Env</code></td><td><code>ENV</code></td><td>Environment variables injected into every sandbox process</td></tr>
+<tr><td><code>WorkingDir</code></td><td><code>WORKDIR</code></td><td>Default working directory</td></tr>
+<tr><td><code>User</code></td><td><code>USER</code></td><td>Default user</td></tr>
+<tr><td><code>Entrypoint</code> / <code>Cmd</code></td><td><code>ENTRYPOINT</code> / <code>CMD</code></td><td>Mapped to <code>startCmd</code> for <code>aenv build</code>; use <code>--start-cmd</code> explicitly for <code>aenv pull</code></td></tr>
+<tr><td><code>ExposedPorts</code></td><td><code>EXPOSE</code></td><td>Stored as metadata only</td></tr>
+<tr><td><code>Volumes</code></td><td><code>VOLUME</code></td><td>Stored as metadata only</td></tr>
+<tr><td><code>Labels</code></td><td><code>LABEL</code></td><td>Stored as metadata only</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="manage-templates"><a class="header" href="#manage-templates">Manage Templates</a></h2>
+<h3 id="list-templates"><a class="header" href="#list-templates">List templates</a></h3>
+<pre><code class="language-bash">aenv template list        # alias: aenv template ls
+aenv template list --output json
+</code></pre>
+<p>Displays all templates with their ID, name, build status, CPU, memory, disk
+size, and last-updated timestamp. <code>--output</code> accepts <code>table</code> or <code>json</code>. It
+defaults to <code>table</code> in an interactive terminal and <code>json</code> when output is piped
+or redirected.</p>
+<h3 id="delete-a-template"><a class="header" href="#delete-a-template">Delete a template</a></h3>
+<pre><code class="language-bash">aenv template delete &lt;template-id-or-name&gt;   # alias: aenv template rm
+</code></pre>
+<h2 id="relationship-to-snapshots"><a class="header" href="#relationship-to-snapshots">Relationship to Snapshots</a></h2>
+<p>Templates are the API and UX layer. Snapshots are the durable runtime layer.</p>
+<ul>
+<li>A template build publishes one committed snapshot.</li>
+<li>A template ID or alias resolves to one committed snapshot.</li>
+<li>A sandbox created from a template resumes from that snapshot.</li>
+</ul>
+<p>If you want the storage and runtime model underneath templates, see
+<a href="#snapshots-1">Snapshots</a>.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="sandboxes-1"><a class="header" href="#sandboxes-1">Sandboxes</a></h1>
+<p>A sandbox is an isolated Firecracker microVM with its own Linux kernel,
+filesystem, processes, and network stack. It is the environment where you run
+code, use tools, modify files, and start services.</p>
+<h2 id="lifecycle"><a class="header" href="#lifecycle">Lifecycle</a></h2>
+<pre class="mermaid">stateDiagram-v2
+    [*] --&gt; Creating
+    Creating --&gt; Running
+    Running --&gt; Pausing
+    Pausing --&gt; Paused
+    Paused --&gt; Resuming
+    Resuming --&gt; Running
+    Running --&gt; Snapshotting
+    Snapshotting --&gt; Running
+    Running --&gt; Forking
+    Forking --&gt; Running
+    Running --&gt; Killing
+    Killing --&gt; [*]
+</pre>
+
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>State</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Creating</strong></td><td>VM is booting, block devices are being attached, networking is being configured</td></tr>
+<tr><td><strong>Running</strong></td><td>VM is ready. Commands can be executed, proxy traffic is routed, timeout is ticking</td></tr>
+<tr><td><strong>Pausing</strong></td><td>Memory and disk snapshots are being captured</td></tr>
+<tr><td><strong>Paused</strong></td><td>VM is stopped. Snapshot artifacts are stored. No resources consumed</td></tr>
+<tr><td><strong>Resuming</strong></td><td>Sandbox is being restored from its paused snapshot</td></tr>
+<tr><td><strong>Snapshotting</strong></td><td>A persistent snapshot is being captured; sandbox returns to Running after</td></tr>
+<tr><td><strong>Forking</strong></td><td>Sandbox is being cloned into child sandboxes; source returns to Running after</td></tr>
+<tr><td><strong>Killing</strong></td><td>VM is being torn down and resources released</td></tr>
+</tbody>
+</table>
+</div>
+<hr>
+<h2 id="starting-a-sandbox"><a class="header" href="#starting-a-sandbox">Starting a Sandbox</a></h2>
+<p>You can start a sandbox from a reusable template or snapshot, or cold start one
+directly from an OCI image.</p>
+<h3 id="from-a-template-or-snapshot"><a class="header" href="#from-a-template-or-snapshot">From a Template or Snapshot</a></h3>
+<p>Pass either a template/snapshot alias or its ID:</p>
+<p>Usage:</p>
+<pre><code class="language-bash">aenv start &lt;template-or-snapshot&gt; [options]
+</code></pre>
+<p>Example:</p>
+<pre><code class="language-bash"># Start by alias
+aenv start my-python-template
+
+# Start by ID
+aenv start 018f0d93-aaaa-bbbb-cccc-0123456789ab
+</code></pre>
+<p>Warm-start options:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;template-or-snapshot&gt;</code></td><td>Required</td><td>Template or snapshot ID or alias.</td></tr>
+<tr><td><code>--secure</code></td><td>Off</td><td>Require an envd access token for command and file operations. The CLI manages the token automatically; see <a href="#secure-sandbox-authentication">Authentication</a>.</td></tr>
+<tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
+<tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Without <code>--detach</code>, <code>aenv start</code> waits for the sandbox to become ready and then
+attaches an interactive shell. CPU, memory, and disk settings are inherited
+from the template or snapshot and cannot be overridden on a warm start.</p>
+<h3 id="cold-start-from-an-oci-image"><a class="header" href="#cold-start-from-an-oci-image">Cold Start from an OCI Image</a></h3>
+<p>A cold start resolves an OCI image directly and prepares a fresh writable root
+filesystem at runtime:</p>
+<p>Usage:</p>
+<pre><code class="language-bash">aenv start --cold &lt;image&gt; [options]
+</code></pre>
+<p>Example:</p>
+<pre><code class="language-bash">aenv start --cold ubuntu:24.04
+aenv start --cold ubuntu:24.04 --cpu 4 --memory 4096 --disk-size-mb 65536
+</code></pre>
+<p>Cold-start options:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;image&gt;</code></td><td>Required</td><td>External OCI image reference.</td></tr>
+<tr><td><code>--cold</code></td><td>Required for an OCI image</td><td>Cold start directly from <code>&lt;image&gt;</code>.</td></tr>
+<tr><td><code>--secure</code></td><td>Off</td><td>Require an envd access token for command and file operations. The CLI manages the token automatically; see <a href="#secure-sandbox-authentication">Authentication</a>.</td></tr>
+<tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your AgentENV config file</td><td>Set the sandbox’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set sandbox memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>--disk-size-mb &lt;MiB&gt;</code></td><td>Source image virtual size</td><td>Set root filesystem size. The value must be greater than zero and divisible by 1024 MiB. Alias: <code>--disk-mb</code>.</td></tr>
+<tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The AgentENV config file is <code>config/default.toml</code> by default, or the file
+specified by <code>AENV_CONFIG_PATH</code>.</p>
+<p>An OverlayBD-native image can start without downloading
+the complete image first; its filesystem data is loaded from the registry on
+demand. See <a href="#on-demand-loading-from-shared-storage">On-Demand Loading</a>.</p>
+<p>Growth of the disk size is allowed by
+default. Shrinking below the source image size requires
+<code>ublk.overlaybd.allow_shrink = true</code> in your AgentENV config file. Resizing
+applies only when creating a fresh writable root filesystem, not to read-only
+images, images with an existing upper layer, or snapshot resume. Sandbox
+responses report the effective size as <code>diskSizeMB</code>.</p>
+<h2 id="working-with-sandboxes"><a class="header" href="#working-with-sandboxes">Working with Sandboxes</a></h2>
+<h3 id="connect-to-a-sandbox"><a class="header" href="#connect-to-a-sandbox">Connect to a Sandbox</a></h3>
+<p><code>aenv connect</code> opens an interactive shell inside the sandbox and attaches your
+terminal. <code>aenv cn</code> is its short alias:</p>
+<pre><code class="language-bash">aenv connect &lt;sandbox-id&gt;
+aenv cn &lt;sandbox-id&gt;
+</code></pre>
+<p>If a sandbox is paused, <code>aenv connect</code> will automatically resume it.</p>
+<h3 id="execute-a-command"><a class="header" href="#execute-a-command">Execute a Command</a></h3>
+<p><code>aenv exec</code> runs one non-interactive command, streams its output to your local
+terminal, and exits with the remote command’s exit code. It does not attach an
+interactive shell.
+Flags intended for the remote command
+that collide with aenv’s own flags can be escaped with a leading <code>--</code>.</p>
+<pre><code class="language-bash">aenv exec &lt;sandbox-id&gt; ls -la /
+aenv exec &lt;sandbox-id&gt; -- command-with-aenv-like-flags --timeout 10
+</code></pre>
+<h3 id="upload-files"><a class="header" href="#upload-files">Upload Files</a></h3>
+<p><code>aenv upload</code> copies a local file or directory into a running sandbox:</p>
+<p>Usage:</p>
+<pre><code class="language-bash">aenv upload &lt;sandbox-id&gt; &lt;local-path&gt; &lt;remote-path&gt; [options]
+</code></pre>
+<p>Example:</p>
+<pre><code class="language-bash">aenv upload 018f0d93-aaaa-bbbb-cccc-0123456789ab ./config.json /workspace/config.json
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;sandbox-id&gt;</code></td><td>Required</td><td>ID of the destination sandbox.</td></tr>
+<tr><td><code>&lt;local-path&gt;</code></td><td>Required</td><td>Local file or directory to upload.</td></tr>
+<tr><td><code>&lt;remote-path&gt;</code></td><td>Required</td><td>Destination inside the sandbox. Directory paths must be absolute.</td></tr>
+<tr><td><code>--user &lt;user&gt;</code></td><td>None</td><td>Resolves a relative remote file path from this user’s home directory and sets the uploaded file’s owner. It is not supported for directory uploads.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="download-files"><a class="header" href="#download-files">Download Files</a></h3>
+<p><code>aenv download</code> copies a file or directory from a running sandbox to your local
+machine:</p>
+<p>Usage:</p>
+<pre><code class="language-bash">aenv download &lt;sandbox-id&gt; &lt;remote-path&gt; [local-path] [options]
+</code></pre>
+<p>Example:</p>
+<pre><code class="language-bash">aenv download 018f0d93-aaaa-bbbb-cccc-0123456789ab /workspace/result.txt ./result.txt
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;sandbox-id&gt;</code></td><td>Required</td><td>ID of the sandbox to download from.</td></tr>
+<tr><td><code>&lt;remote-path&gt;</code></td><td>Required</td><td>File or directory inside the sandbox. Directory paths must be absolute.</td></tr>
+<tr><td><code>[local-path]</code></td><td>Current directory</td><td>Local destination file or directory.</td></tr>
+<tr><td><code>--user &lt;user&gt;</code></td><td>None</td><td>Resolves a relative remote file path from this user’s home directory. It is not supported for directory downloads.</td></tr>
+<tr><td><code>--force</code></td><td>Disabled</td><td>Replaces conflicting local files. Without it, the download stops instead of overwriting them.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="pause-and-resume"><a class="header" href="#pause-and-resume">Pause and Resume</a></h3>
+<p>Pausing saves the sandbox’s current runtime state and stops its microVM. While
+it is paused, programs inside it do not run, services do not handle requests,
+and the sandbox releases its CPU and memory resources. Its saved state remains
+in storage so the same sandbox can be resumed later.</p>
+<p>After resume, the filesystem, running processes, environment variables, and
+in-memory data are restored to the state captured at pause time. Programs
+continue from that saved state instead of starting again from the beginning.</p>
+<pre><code class="language-bash">aenv pause &lt;sandbox-id&gt;
+aenv resume &lt;sandbox-id&gt;
+aenv resume &lt;sandbox-id&gt; --timeout 600
+</code></pre>
+<p><code>aenv resume</code> accepts <code>--timeout &lt;seconds&gt;</code>, which defaults to 300 seconds and
+sets the new TTL from resume time.</p>
+<p>By default, the sandbox automatically pauses when it reaches its TTL. See
+<a href="#auto-eviction">Auto-Eviction</a> for how the deadline is set and how to delete
+instead of pause.</p>
+<h3 id="persistent-snapshots"><a class="header" href="#persistent-snapshots">Persistent Snapshots</a></h3>
+<p>A snapshot is a durable, reusable checkpoint of a running sandbox. Creating one
+does not replace the sandbox: the source returns to Running after capture, and
+the snapshot can later launch one or more new sandboxes.</p>
+<pre><code class="language-bash">aenv snapshot create &lt;sandbox-id&gt;
+aenv snapshot create &lt;sandbox-id&gt; --name my-base
+</code></pre>
+<p>The resulting snapshot appears in <code>aenv snapshot list</code> and can be started with
+<code>aenv start &lt;snapshot-id-or-name&gt;</code>. See <a href="#snapshots-1">Snapshots</a> for its
+parameters and lifecycle.</p>
+<h3 id="fork"><a class="header" href="#fork">Fork</a></h3>
+<p>Forking clones a running sandbox into independent child sandboxes on the same
+node. The source is briefly paused while its state is captured, then returns to
+Running. Children inherit the source filesystem, memory, network policy,
+security mode, and CPU/memory/disk configuration. All children use one captured
+state, but each child can succeed or fail independently.</p>
+<pre><code class="language-bash">curl -X POST \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"count": 3, "timeout": 600}' \
+  http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/fork
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>count</code></td><td><code>1</code></td><td>Number of children to create; minimum 1, maximum 100.</td></tr>
+<tr><td><code>timeout</code></td><td>Source sandbox’s TTL duration</td><td>TTL for each child, measured from the fork time.</td></tr>
+</tbody>
+</table>
+</div>
+<p>A successful request returns an array with one result for each requested child.
+Each entry contains either a <code>sandbox</code> object—including its <code>sandboxID</code>—or an
+<code>error</code> explaining why that individual child failed. It is not a plain list of
+IDs. A non-201 response means the request failed before any child was attempted.
+See the <a href="#api-reference">API Reference</a> for the complete fork request and
+response schemas.</p>
+<h3 id="manage-sandboxes"><a class="header" href="#manage-sandboxes">Manage Sandboxes</a></h3>
+<p>List sandboxes:</p>
+<pre><code class="language-bash">aenv list
+aenv list --output json
+</code></pre>
+<p><code>--output</code> accepts <code>table</code> or <code>json</code>. It defaults to a table in an interactive
+terminal and JSON when output is piped or redirected.</p>
+<p>Delete a sandbox:</p>
+<pre><code class="language-bash">aenv delete &lt;sandbox-id&gt;
+</code></pre>
+<p>Deletion is permanent, but snapshots previously created from the sandbox are
+unaffected.</p>
+<h2 id="auto-eviction"><a class="header" href="#auto-eviction">Auto-Eviction</a></h2>
+<p>Every sandbox has a time-to-live (TTL), which controls how long it stays running
+when it is no longer being actively used or kept alive. TTL prevents idle
+sandboxes from occupying CPU and memory indefinitely. When the TTL is reached,
+AgentENV automatically pauses or deletes the sandbox so those resources can be
+reclaimed.</p>
+<p>When a sandbox reaches its TTL, AgentENV performs its configured timeout
+action:</p>
+<ul>
+<li><strong>Pause</strong> (<code>autoPause: true</code>, the default): preserve the sandbox so it can be
+resumed later.</li>
+<li><strong>Delete</strong> (<code>autoPause: false</code>): permanently remove the sandbox.</li>
+</ul>
+<p>Set the initial TTL with <code>aenv start --timeout &lt;seconds&gt;</code>, or set the TTL used
+after a resume with <code>aenv resume --timeout &lt;seconds&gt;</code>. Both commands default to
+300 seconds. Replace a running sandbox’s deadline at any time with:</p>
+<pre><code class="language-bash">aenv timeout &lt;sandbox-id&gt; 600
+</code></pre>
+<p>This gives the sandbox another 600 seconds from the time the command is sent.
+Calling it again replaces the previous TTL. An actively used <code>aenv connect</code>
+session keeps the sandbox alive.</p>
+<p>The current <code>aenv start</code> command does not expose <code>autoPause</code>. To delete on
+expiration, set it when creating a sandbox through the API.</p>
+<p>Warm start from a template or snapshot:</p>
+<pre><code class="language-bash">curl -X POST \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "templateID": "my-template",
+    "timeout": 600,
+    "autoPause": false
+  }' \
+  http://127.0.0.1:8000/sandboxes
+</code></pre>
+<p>Cold start from an OCI image:</p>
+<pre><code class="language-bash">curl -X POST \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "image": "ubuntu:24.04",
+    "timeout": 600,
+    "autoPause": false
+  }' \
+  http://127.0.0.1:8000/sandboxes-cold
+</code></pre>
+<p>The timeout action cannot currently be changed after a sandbox has been
+created.</p>
+<h2 id="networking"><a class="header" href="#networking">Networking</a></h2>
+<p>Each sandbox has an isolated network stack. Networking controls two separate
+boundaries:</p>
+<ul>
+<li><strong>Egress:</strong> which IP addresses, CIDRs, and domains the sandbox can connect to.</li>
+<li><strong>Ingress:</strong> whether services exposed through the AgentENV proxy are public
+or require the sandbox traffic access token.</li>
+</ul>
+<h3 id="what-you-can-configure"><a class="header" href="#what-you-can-configure">What You Can Configure</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>allow_internet_access</code> (warm) / <code>allowInternetAccess</code> (cold)</td><td><code>true</code></td><td>Base egress policy. <code>false</code> rejects destinations not explicitly allowed.</td></tr>
+<tr><td><code>network.allowOut</code></td><td>Empty</td><td>Egress exceptions expressed as IPv4 CIDRs, IPs, or domain patterns.</td></tr>
+<tr><td><code>network.denyOut</code></td><td>Empty</td><td>IPv4 CIDRs or IPs to reject. Domain names are not supported here.</td></tr>
+<tr><td><code>network.allowPublicTraffic</code></td><td><code>true</code></td><td>Per-sandbox creation setting controlling whether proxied services are public. When <code>false</code>, requests require the sandbox’s traffic access token.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Node-wide egress denials are configured separately with
+<code>[network.egress].always_denied_cidrs</code> in your AgentENV config file. This lists
+IP ranges that every sandbox is prohibited from reaching, such as private or
+host-local networks. These rules are applied before per-sandbox rules and
+cannot be overridden by <code>allowOut</code>.</p>
+<pre><code class="language-toml">[network.egress]
+always_denied_cidrs = [
+  "10.0.0.0/8",
+  "169.254.0.0/16",
+]
+</code></pre>
+<h3 id="matching-rules"><a class="header" href="#matching-rules">Matching Rules</a></h3>
+<p>Rules are evaluated in this order:</p>
+<pre class="mermaid">flowchart LR
+    A[Destination packet] --&gt; N{Node-level deny?}
+    N --&gt;|Yes| E[Reject traffic]
+    N --&gt;|No| B{Matches allowOut?}
+    B --&gt;|Yes| C[Allow traffic]
+    B --&gt;|No| D{Matches denyOut?}
+    D --&gt;|Yes| E
+    D --&gt;|No| F{"allow_internet_access?"}
+    F --&gt;|Yes| C
+    F --&gt;|No| E
+</pre>
+
+<p><code>allowOut</code> can override an overlapping user-configured <code>denyOut</code>, but it cannot
+override node-level internal/reserved-network deny rules. Setting
+<code>allow_internet_access: false</code> adds a deny-by-default base policy after the
+explicit rules.</p>
+<p>Domain names can be used only in <code>allowOut</code> for HTTP/HTTPS connections. Exact
+names and wildcard forms such as <code>*.example.com</code> are supported. If <code>allowOut</code>
+contains a domain, also set <code>denyOut</code> to <code>["0.0.0.0/0"]</code>; this blocks other
+destinations and leaves the listed domains as the allowed exceptions.</p>
+<h3 id="configure-at-creation"><a class="header" href="#configure-at-creation">Configure at Creation</a></h3>
+<p>Both warm and cold sandbox creation support network policy.</p>
+<p>Warm start from a template or snapshot:</p>
+<pre><code class="language-bash">curl -X POST \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "templateID": "my-ubuntu",
+    "network": {
+      "allowOut": ["*.example.com"],
+      "denyOut": ["0.0.0.0/0"],
+      "allowPublicTraffic": false
+    }
+  }' \
+  http://127.0.0.1:8000/sandboxes
+</code></pre>
+<p>Cold start from an OCI image:</p>
+<pre><code class="language-bash">curl -X POST \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "image": "ubuntu:24.04",
+    "allowInternetAccess": false,
+    "network": {
+      "allowOut": ["8.8.8.8/32"]
+    }
+  }' \
+  http://127.0.0.1:8000/sandboxes-cold
+</code></pre>
+<h3 id="update-a-running-sandbox"><a class="header" href="#update-a-running-sandbox">Update a Running Sandbox</a></h3>
+<p>Replace the egress policy of a running sandbox:</p>
+<pre><code class="language-bash">curl -X PUT \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"allowOut": ["8.8.8.8/32"], "denyOut": ["0.0.0.0/0"]}' \
+  http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/network
+</code></pre>
+<p>The update replaces the current egress rules. Omitting both <code>allowOut</code> and
+<code>denyOut</code> clears the per-sandbox lists; omit <code>allow_internet_access</code> as well to
+restore the default base policy.</p>
+<p>In the current implementation, updates primarily affect new connections and do
+not actively terminate existing ones. For domain-policy replacement, the old
+policy remains active until the new namespace rules are installed and the new
+proxy policy is activated.</p>
+<h2 id="data-storage"><a class="header" href="#data-storage">Data Storage</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Path</th><th>Contents</th><th>Config</th></tr>
+</thead>
+<tbody>
+<tr><td><code>$AENV_HOME/snapshot-store/</code></td><td>Committed snapshot and template artifacts (rootfs layers, memory snapshots, metadata)</td><td><code>[backend.posix_fs]</code><br /><code>snapshot_store</code></td></tr>
+<tr><td><code>$AENV_HOME/persisted-sandboxes/</code></td><td>Paused sandbox state persisted across server restarts</td><td><code>[orchestrator]</code><br /><code>persisted_sandbox_store_path</code></td></tr>
+<tr><td><code>$AENV_HOME/image-cache/</code></td><td>Converted OCI image layers (overlaybd format) cached after first cold start or template build</td><td><code>[image.cache]</code><br /><code>root_dir</code></td></tr>
+</tbody>
+</table>
+</div>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="snapshots-1"><a class="header" href="#snapshots-1">Snapshots</a></h1>
+<p>A snapshot is a reusable checkpoint of a sandbox. It preserves the sandbox’s
+filesystem and runtime state so that you can later start a new sandbox from the
+same point instead of rebuilding the environment and rerunning setup work.</p>
+<ul>
+<li><strong>Templates</strong> are stored as snapshots. A template build commits one snapshot;
+the template ID is an alias that resolves to it.</li>
+<li><strong>Sandboxes</strong> launch by resuming from a snapshot.</li>
+<li><strong>Running sandboxes</strong> can produce new snapshots, capturing their current
+state for later reuse or branching.</li>
+</ul>
+<h2 id="create-a-snapshot-from-a-running-sandbox"><a class="header" href="#create-a-snapshot-from-a-running-sandbox">Create a Snapshot from a Running Sandbox</a></h2>
+<p>Capture the current state of a running sandbox:</p>
+<pre><code class="language-bash">aenv snapshot create &lt;sandbox-id&gt;
+aenv snapshot create &lt;sandbox-id&gt; --name my-checkpoint
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;sandbox-id&gt;</code></td><td>Required</td><td>ID of the running sandbox to capture.</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>None</td><td>Assigns a human-readable alias. If omitted, use the generated snapshot ID returned by the command.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The source sandbox continues running after the snapshot is created. You can
+then pass either the snapshot ID or its alias to <code>aenv start</code>:</p>
+<pre><code class="language-bash">aenv start my-checkpoint
+# Or:
+aenv start &lt;snapshot-id&gt;
+</code></pre>
+<p>This creates a separate sandbox with a new sandbox ID. It inherits the captured
+filesystem, running processes, memory state, environment variables, runtime
+configuration, and resource settings.</p>
+<h2 id="use-a-snapshot-rootfs-as-an-oci-image"><a class="header" href="#use-a-snapshot-rootfs-as-an-oci-image">Use a Snapshot Rootfs as an OCI Image</a></h2>
+<p>Starting with <code>aenv start &lt;snapshot&gt;</code> restores the complete snapshot state. If
+you only need the captured root filesystem, you can instead publish it as an
+OCI image and cold-start sandboxes from that image.</p>
+<h3 id="publish-an-image-when-creating-a-snapshot"><a class="header" href="#publish-an-image-when-creating-a-snapshot">Publish an Image When Creating a Snapshot</a></h3>
+<p>AgentENV can automatically create and publish an OCI image of the snapshot
+rootfs whenever you create a snapshot. For snapshots backed by OSS and created
+from an OverlayBD-native OCI image, enable automatic publication in your
+AgentENV config file (<code>config/default.toml</code>, or the file selected by
+<code>AENV_CONFIG_PATH</code>):</p>
+<pre><code class="language-toml">[snapshot]
+repository_backend = "oss"
+
+[snapshot.image_publish]
+enabled = true
+</code></pre>
+<p>Create the snapshot:</p>
+<pre><code class="language-bash">aenv snapshot create &lt;sandbox-id&gt; --name my-checkpoint
+</code></pre>
+<p>The command prints the published image reference when publication succeeds.
+Use that reference to cold-start a sandbox:</p>
+<pre><code class="language-bash">aenv start --cold registry.example.com/team/app:agentenv-snapshot-&lt;snapshot-id&gt;
+</code></pre>
+<h3 id="export-an-existing-snapshot-rootfs"><a class="header" href="#export-an-existing-snapshot-rootfs">Export an Existing Snapshot Rootfs</a></h3>
+<p>You can manually export the rootfs of an existing snapshot as an OCI image.
+This is done with <code>aenv-snapshot-image</code>, which is not included in the regular
+AgentENV installation packages and must first be built and installed from the
+repository:</p>
+<pre><code class="language-bash">git clone https://github.com/kvcache-ai/AgentENV.git
+cd AgentENV
+make build-snapshot-image
+sudo install -m 0755 target/debug/aenv-snapshot-image /usr/local/bin/aenv-snapshot-image
+</code></pre>
+<p>Export the rootfs:</p>
+<pre><code class="language-bash">aenv-snapshot-image &lt;snapshot-id-or-alias&gt; \
+  --target-repository registry.example.com/team/app \
+  --tag release-1
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;snapshot-id-or-alias&gt;</code></td><td>Required</td><td>Snapshot whose rootfs is exported.</td></tr>
+<tr><td><code>--target-repository &lt;registry/repository&gt;</code></td><td>Inferred from the snapshot</td><td>Destination OCI repository. Specify it when a unique source repository cannot be inferred.</td></tr>
+<tr><td><code>--tag &lt;tag&gt;</code></td><td><code>latest</code> for an explicit destination; otherwise <code>snapshot-&lt;snapshot-id&gt;</code></td><td>Tag for the exported image.</td></tr>
+<tr><td><code>--config &lt;path&gt;</code></td><td><code>AENV_CONFIG_PATH</code>, then the default config path</td><td>AgentENV config used to locate the snapshot repository.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The exported image can be stored in an OCI registry, shared independently of
+the AgentENV snapshot repository, and used to cold-start new sandboxes. The new
+sandbox inherits the exported root filesystem and OCI runtime configuration,
+but not the snapshot’s memory or running-process state.</p>
+<p>You can capture it and start a sandbox from the resulting image:</p>
+<pre><code class="language-bash">aenv-snapshot-image &lt;snapshot-id-or-alias&gt; \
+  --target-repository registry.example.com/team/app \
+  --tag release-1
+
+aenv start --cold &lt;image_ref&gt;
+</code></pre>
+<h2 id="manage-snapshots"><a class="header" href="#manage-snapshots">Manage Snapshots</a></h2>
+<h3 id="list-snapshots"><a class="header" href="#list-snapshots">List Snapshots</a></h3>
+<pre><code class="language-bash">aenv snapshot list
+aenv snapshot list --sandbox-id &lt;sandbox-id&gt;
+</code></pre>
+<p><code>aenv snapshot ls</code> is an alias for <code>aenv snapshot list</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--sandbox-id &lt;sandbox-id&gt;</code></td><td>All snapshots</td><td>Shows only snapshots created from the specified sandbox, including after that sandbox is deleted.</td></tr>
+<tr><td><code>--output &lt;table|json&gt;</code></td><td>Table in an interactive terminal; JSON when redirected</td><td>Selects the output format.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="start-a-sandbox-from-a-snapshot"><a class="header" href="#start-a-sandbox-from-a-snapshot">Start a Sandbox from a Snapshot</a></h3>
+<pre><code class="language-bash">aenv start &lt;snapshot-id-or-name&gt;
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;snapshot-id-or-name&gt;</code></td><td>Required</td><td>Snapshot ID or alias to start from.</td></tr>
+<tr><td><code>--secure</code></td><td>Disabled</td><td>Requires an envd access token for sandbox control communication.</td></tr>
+<tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Sets the sandbox TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
+<tr><td><code>-d</code>, <code>--detach</code></td><td>Disabled</td><td>Prints the new sandbox ID without attaching an interactive shell.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="delete-a-snapshot"><a class="header" href="#delete-a-snapshot">Delete a Snapshot</a></h3>
+<p>Snapshots and templates share the same catalog. Delete a snapshot by passing
+its required ID or alias to the template delete command:</p>
+<pre><code class="language-bash">aenv template delete &lt;snapshot-id-or-name&gt;
+</code></pre>
+<h2 id="optional-p2p-visibility"><a class="header" href="#optional-p2p-visibility">Optional P2P Visibility</a></h2>
+<p>P2P visibility lets nodes discover and fetch committed snapshot artifacts from
+peers. The snapshot repository remains the durable source of truth, so P2P is
+an optional distribution path rather than a replacement for snapshot storage.</p>
+<p>Enable both the node-wide P2P transport and snapshot publication in your
+AgentENV config file (<code>config/default.toml</code>, or the file selected by
+<code>AENV_CONFIG_PATH</code>):</p>
+<pre><code class="language-toml">[p2p]
+enabled = true
+
+[snapshot]
+p2p_enabled = true
+</code></pre>
+<p>See the <a href="#p2p">Configuration Reference</a>
+for the optional transport, storage-directory, address, and timeout settings.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="custom-extension"><a class="header" href="#custom-extension">Custom Extension</a></h1>
+<p>The custom extension is an optional external HTTP service that AgentENV calls during the sandbox lifecycle. It lets you implement deployment-specific behavior — for example, connecting sandboxes into a VPN, custom firewall rules, or extra mounts — without changing AgentENV itself.</p>
+<p>The extension implements a small set of HTTP endpoints (“hooks”); AgentENV is the client. The interface is defined in <a href="https://github.com/kvcache-ai/AgentENV/blob/main/src/custom_extension_api/openapi.yml"><code>src/custom_extension_api/openapi.yml</code></a>.</p>
+<h2 id="lifecycle-hooks"><a class="header" href="#lifecycle-hooks">Lifecycle hooks</a></h2>
+<p>To support the complete sandbox lifecycle, your extension should implement the
+following four APIs. AgentENV sends a JSON request to
+<code>POST {url}/sandbox-hook/&lt;hook&gt;</code> when the corresponding event occurs. Any connection error, timeout, or non-2xx response fails the corresponding sandbox operation (except <code>stop</code>, which is best-effort).</p>
+<p>See <a href="#minimal-extension-example">Minimal Extension Example</a> for an example
+extension that implements all four hooks.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Hook</th><th>When</th><th>Request</th><th>Response</th></tr>
+</thead>
+<tbody>
+<tr><td><code>start-fresh</code></td><td>Before a fresh sandbox boots, after its network slot is allocated</td><td><code>sandboxId</code>, <code>sandboxInstanceId</code>, <code>networkNamespacePath</code>, <code>hostInteractionIp</code>, <code>customExtensionParams</code></td><td>optional <code>extraBootArgs</code> appended to the kernel cmdline</td></tr>
+<tr><td><code>start-resume</code></td><td>Before a sandbox resumes from a snapshot (template launch, resume after pause, fork child)</td><td>same as above</td><td>none</td></tr>
+<tr><td><code>patch-params</code></td><td>When a user PATCHes the sandbox’s params</td><td><code>sandboxId</code>, <code>patch</code> (verbatim user body)</td><td>updated <strong>full</strong> <code>customExtensionParams</code></td></tr>
+<tr><td><code>stop</code></td><td>When the sandbox runtime is torn down, before the network slot is released</td><td><code>sandboxId</code>, <code>sandboxInstanceId</code></td><td>none</td></tr>
+</tbody>
+</table>
+</div>
+<p>Notes:</p>
+<ul>
+<li><strong>Instance identity.</strong> A <code>sandboxId</code> is reused across pause/resume cycles. Every <code>start-fresh</code> / <code>start-resume</code> carries a fresh <code>sandboxInstanceId</code> identifying that runtime instance, and the subsequent <code>stop</code> carries the same value. Because <code>stop</code> is best-effort and may be reordered (e.g. a pause’s <code>stop</code> arriving after the resume’s <code>start-resume</code>), treat <code>(sandboxId, sandboxInstanceId)</code> as the identity of a running instance and ignore <code>stop</code> notifications whose <code>sandboxInstanceId</code> is not the latest started instance for that sandbox.</li>
+<li><strong><code>stop</code> also fires on pause.</strong> Pausing persists the sandbox state and then stops the VM process and releases the network namespace; the subsequent resume creates a fresh runtime and fires <code>start-resume</code>. In-place pause+resume during snapshot capture does not fire any hook (and keeps the same <code>sandboxInstanceId</code>).</li>
+<li><code>stop</code> is best-effort: delivery failures are only logged, and it is also fired fire-and-forget if a started sandbox is dropped without an explicit stop.</li>
+<li><code>networkNamespacePath</code> is the host path of the sandbox’s netns file (e.g. <code>/var/run/netns/agentenv-ns-*</code>), so the extension can enter the namespace (e.g. <code>nsenter --net=...</code>) to set up firewall rules or VPN interfaces.</li>
+<li><code>hostInteractionIp</code> is the per-runtime IPv4 address that AgentENV routes to this sandbox. It can change after pause/resume, so extensions must use the value from the current start hook rather than caching an older one.</li>
+<li>Concurrent <code>patch-params</code> calls to the same sandbox are not serialized; if your patch semantics are not commutative, handle concurrency in the extension.</li>
+</ul>
+<h2 id="connect-agentenv-to-an-extension"><a class="header" href="#connect-agentenv-to-an-extension">Connect AgentENV to an Extension</a></h2>
+<p>Connect AgentENV to your extension service by configuring its URL:</p>
+<pre><code class="language-toml"># config/default.toml (or your AENV_CONFIG_PATH)
+[custom_extension]
+url = "http://127.0.0.1:9090"
+# timeout_ms = 5000   # optional, per-call timeout in milliseconds
+</code></pre>
+<p><code>AENV_CUSTOM_EXTENSION_URL</code> works as well. When <code>url</code> is unset, the integration is fully disabled: no hooks are called and <code>customExtensionParams</code> must be empty.</p>
+<h2 id="use-the-extension"><a class="header" href="#use-the-extension">Use the Extension</a></h2>
+<p>Use <code>customExtensionParams</code> to pass extension-specific settings for a sandbox.
+It is an opaque JSON object interpreted only by your extension. An absent value
+and an empty object are equivalent.</p>
+<h3 id="set-at-creation"><a class="header" href="#set-at-creation">Set at Creation</a></h3>
+<p>Both <code>POST /sandboxes</code> and <code>POST /sandboxes-cold</code> accept
+<code>customExtensionParams</code>. For example, create a sandbox from a template with VPN
+settings for the extension:</p>
+<pre><code class="language-bash">curl -X POST http://127.0.0.1:8000/sandboxes \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "templateID": "my-template",
+    "customExtensionParams": {
+      "vpn": { "network": "team-a" }
+    }
+  }'
+</code></pre>
+<p>For a cold-start sandbox, include the same field in the cold-start request:</p>
+<pre><code class="language-bash">curl -X POST http://127.0.0.1:8000/sandboxes-cold \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "image": "docker.io/library/ubuntu:24.04",
+    "customExtensionParams": {
+      "vpn": { "network": "team-a" }
+    }
+  }'
+</code></pre>
+<h3 id="read"><a class="header" href="#read">Read</a></h3>
+<p>Get the current params. AgentENV returns <code>{}</code> when they are empty:</p>
+<pre><code class="language-bash">curl http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/custom-extension-params \
+  -H 'X-API-Key: test-key'
+</code></pre>
+<h3 id="patch"><a class="header" href="#patch">Patch</a></h3>
+<p>The request body is passed through verbatim to the extension’s <code>patch-params</code> hook; its semantics are defined entirely by the extension. The hook returns the updated full params, which AgentENV stores and returns:</p>
+<pre><code class="language-bash">curl -X PATCH http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/custom-extension-params \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"vpn": {"network": "team-a", "peers": ["10.8.0.2", "10.8.0.3"]}}'
+</code></pre>
+<h3 id="persistence"><a class="header" href="#persistence">Persistence</a></h3>
+<p>Params survive pause/resume and are stored into snapshots created from the sandbox. When starting from a template, a <code>customExtensionParams</code> provided at creation overrides the one stored in the snapshot; otherwise the snapshot’s value is inherited.</p>
+<hr>
+<h2 id="minimal-extension-example"><a class="header" href="#minimal-extension-example">Minimal extension example</a></h2>
+<pre><code class="language-python">from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+
+# Latest started runtime instance per sandbox: (sandboxId, sandboxInstanceId)
+# is the identity of a running instance; a stop for a superseded instance
+# (e.g. arriving after a newer start) is ignored.
+latest_instance: dict[str, str] = {}
+
+@app.post("/sandbox-hook/start-fresh")
+async def start_fresh(req: Request):
+    body = await req.json()
+    latest_instance[body["sandboxId"]] = body["sandboxInstanceId"]
+    # e.g. nsenter --net={body["networkNamespacePath"]} wg-quick up ...
+    return {"extraBootArgs": None}
+
+@app.post("/sandbox-hook/start-resume")
+async def start_resume(req: Request):
+    body = await req.json()
+    latest_instance[body["sandboxId"]] = body["sandboxInstanceId"]
+    return {}
+
+@app.post("/sandbox-hook/patch-params")
+async def patch_params(req: Request):
+    body = await req.json()
+    # apply body["patch"] however you like, then return the full new params
+    return {"customExtensionParams": body["patch"]}
+
+@app.post("/sandbox-hook/stop")
+async def stop(req: Request):
+    body = await req.json()
+    if latest_instance.get(body["sandboxId"]) == body["sandboxInstanceId"]:
+        latest_instance.pop(body["sandboxId"], None)
+        # tear down resources for this instance
+    return {}
+</code></pre>
+<p>Any non-2xx response (or timeout) fails the corresponding sandbox operation, except for <code>stop</code>, which is always tolerated.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="proxy"><a class="header" href="#proxy">Proxy</a></h1>
+<p>The reverse proxy lets you reach services running inside a sandbox from outside. It supports HTTP requests, SSE streams, and WebSocket connections.</p>
+<h2 id="endpoints"><a class="header" href="#endpoints">Endpoints</a></h2>
+<ul>
+<li><code>ANY /proxy</code> forwards to <code>/</code> inside the sandbox</li>
+<li><code>ANY /proxy/{path}</code> forwards to <code>/{path}</code> inside the sandbox</li>
+<li>Header-routed requests on otherwise unmatched paths forward the original path
+unchanged. This lets clients use the same base URL for API and sandbox data
+traffic when they send routing headers.</li>
+<li>When sandbox proxy domains are configured, host-based URLs shaped like
+<code>{port}-{sandboxID}.{domain}</code> forward the original path without routing
+headers.</li>
+</ul>
+<p>Query strings are forwarded unchanged.</p>
+<p>For example, start an HTTP server on port <code>8080</code> inside a running sandbox:</p>
+<pre><code class="language-bash">aenv exec &lt;sandbox-id&gt; sh -c 'echo "Hello from AgentENV" &gt; /tmp/index.html'
+aenv exec &lt;sandbox-id&gt; python3 -m http.server 8080 --directory /tmp
+</code></pre>
+<p>Access the service through the AgentENV proxy:</p>
+<pre><code class="language-bash">curl http://127.0.0.1:8000/proxy/index.html \
+  -H "x-agentenv-sandbox-id: &lt;sandbox-id&gt;" \
+  -H "x-agentenv-target-port: 8080"
+</code></pre>
+<h2 id="header-based-routing"><a class="header" href="#header-based-routing">Header-Based Routing</a></h2>
+<p>When using <code>/proxy</code> or routing an otherwise unmatched path with headers,
+identify the target sandbox and port with these headers:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Header</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>x-agentenv-sandbox-id</code></td><td>Sandbox UUID to route to</td></tr>
+<tr><td><code>x-agentenv-target-port</code></td><td>Port of the service inside the sandbox</td></tr>
+</tbody>
+</table>
+</div>
+<p>E2B-compatible aliases are also accepted:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Header</th><th>Alias for</th></tr>
+</thead>
+<tbody>
+<tr><td><code>e2b-sandbox-id</code></td><td><code>x-agentenv-sandbox-id</code></td></tr>
+<tr><td><code>e2b-sandbox-port</code></td><td><code>x-agentenv-target-port</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>These routing headers are stripped before the request is forwarded to the sandbox.</p>
+<h2 id="access-control"><a class="header" href="#access-control">Access Control</a></h2>
+<p>Proxy authentication is independent from AgentENV API authentication:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Traffic</th><th>When it applies</th><th>Required credential</th></tr>
+</thead>
+<tbody>
+<tr><td>Public application ingress</td><td>The sandbox uses <code>allowPublicTraffic: true</code>, which is the default.</td><td>None</td></tr>
+<tr><td>Private application ingress</td><td>The sandbox uses <code>allowPublicTraffic: false</code>.</td><td><code>e2b-traffic-access-token: &lt;trafficAccessToken&gt;</code></td></tr>
+<tr><td>Secure envd traffic</td><td>The sandbox was created with secure communication enabled.</td><td><code>X-Access-Token: &lt;envdAccessToken&gt;</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>X-API-Key</code> authenticates AgentENV control-plane APIs only. It does not grant
+access to private application ingress or secure envd. A matching platform key
+is stripped on proxy requests; other <code>X-API-Key</code> values remain available to
+sandbox applications. AgentENV also strips the traffic token, and forwards
+<code>X-Access-Token</code> only to the matching secure envd port.</p>
+<p>Host-based proxy requests derive both values from <code>Host</code>, for example
+<code>http://8080-&lt;sandbox-uuid&gt;.sandbox.example.com/health</code> targets port <code>8080</code>.
+The configured domain must route to the AgentENV server in single-node mode or
+to the gateway in multi-node mode. Host-based proxy traffic is always treated as
+data-plane traffic; lifecycle and other control-plane APIs should use the base
+API host.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="api-reference"><a href="#api-reference" class="header">API Reference</a></h1>
+<style>
+  main { padding: 0 !important; }
+</style>
+<iframe id="swagger-frame" src="../swagger-ui.html" scrolling="no" style="width:100%; border:none; display:block; min-height:600px;">
+</iframe>
+<script>
+document.getElementById('swagger-frame').addEventListener('load', function () {
+  var frame = this;
+  var resize = function () {
+    frame.style.height = frame.contentDocument.documentElement.scrollHeight + 'px';
+  };
+  resize();
+  new ResizeObserver(resize).observe(frame.contentDocument.body);
+});
+</script>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="e2b"><a class="header" href="#e2b">E2B</a></h1>
+<h2 id="e2b-sdk"><a class="header" href="#e2b-sdk">E2B SDK</a></h2>
+<p>AgentENV exposes an E2B-compatible API, so the official <a href="https://github.com/e2b-dev/e2b">E2B SDK</a> works out of the box.</p>
+<h3 id="general-settings"><a class="header" href="#general-settings">General Settings</a></h3>
+<p>Set environment variables to point at your AgentENV server. See <a href="#environment-variables">Environment Variables</a> for values per deployment mode.</p>
+<pre><code class="language-bash"># Single-node example
+export E2B_API_URL=http://127.0.0.1:8000
+export E2B_SANDBOX_URL=${E2B_API_URL}
+export E2B_API_KEY=${AENV_API_KEY}
+</code></pre>
+<p>AgentENV returns <code>trafficAccessToken</code> when <code>network.allowPublicTraffic</code> is false
+and (for secure sandboxes)
+<code>envdAccessToken</code> for envd control traffic. These credentials have different
+headers and trust boundaries: use <code>e2b-traffic-access-token</code> for private
+application routes and <code>X-Access-Token</code> only for envd. Public application
+routes require neither token.</p>
+<h3 id="typescript-sdk"><a class="header" href="#typescript-sdk">TypeScript SDK</a></h3>
+<h4 id="setup-1"><a class="header" href="#setup-1">Setup</a></h4>
+<p>Install the SDK:</p>
+<pre><code class="language-bash">npm install e2b
+</code></pre>
+<h4 id="usage"><a class="header" href="#usage">Usage</a></h4>
+<pre><code class="language-typescript">import { Sandbox } from "e2b";
+
+// Create a sandbox from a template
+const sandbox = await Sandbox.create("&lt;template-id&gt;", {
+  apiKey: process.env.E2B_API_KEY,
+});
+
+// List running sandboxes
+const running = Sandbox.list({
+  apiKey: process.env.E2B_API_KEY,
+  limit: 20,
+  query: { state: ["running"] },
+});
+console.log(await running.nextItems());
+
+// Run a command inside the sandbox
+sandbox.commands.run("echo hello world");
+
+// Pause the sandbox
+await Sandbox.Pause(sandbox.sandboxId, {
+  apiKey: process.env.E2B_API_KEY,
+});
+
+// Kill the sandbox
+await sandbox.kill();
+</code></pre>
+<p>Replace <code>&lt;template-id&gt;</code> with a template that exists in your local template store. Use <code>e2b template list</code> or <code>GET /v2/templates</code> to see available templates.</p>
+<h3 id="python-sdk"><a class="header" href="#python-sdk">Python SDK</a></h3>
+<h4 id="setup-1-1"><a class="header" href="#setup-1-1">Setup</a></h4>
+<p>Install the SDK:</p>
+<pre><code class="language-bash">pip install e2b
+</code></pre>
+<h4 id="usage-1"><a class="header" href="#usage-1">Usage</a></h4>
+<pre><code class="language-python">from e2b import Sandbox, SandboxQuery, SandboxState
+
+# Reuse the environment variables set in your shell:
+# E2B_API_URL / E2B_SANDBOX_URL / E2B_API_KEY
+
+# Create a sandbox from a template
+sandbox = Sandbox.create("&lt;template-id&gt;")
+
+# List running sandboxes
+running = Sandbox.list(
+    limit=20,
+    query=SandboxQuery(state=[SandboxState.RUNNING]),
+)
+print(running.next_items())
+
+# Run a command inside the sandbox
+result = sandbox.commands.run("echo hello world")
+print(result.stdout, end="")
+
+# Pause the sandbox
+sandbox.beta_pause()
+
+# Kill the sandbox
+sandbox.kill()
+</code></pre>
+<h2 id="e2b-cli"><a class="header" href="#e2b-cli">E2B CLI</a></h2>
+<p>AgentENV is compatible with the E2B CLI, but we recommend using the
+<a href="#aenv-cli-reference">aenv CLI</a> for AgentENV workflows.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="common-issues"><a class="header" href="#common-issues">Common Issues</a></h1>
+<h2 id="devkvm-is-missing-or-inaccessible"><a class="header" href="#devkvm-is-missing-or-inaccessible"><code>/dev/kvm</code> is missing or inaccessible</a></h2>
+<p><strong>Symptom</strong>: The server cannot find or open <code>/dev/kvm</code>.</p>
+<p><strong>Solution</strong>: First check whether standard KVM is available:</p>
+<pre><code class="language-bash">ls -l /dev/kvm
+</code></pre>
+<p>If the device exists, ensure it is readable and writable by the runtime user.
+On most systems:</p>
+<pre><code class="language-bash">sudo usermod -aG kvm $USER
+# Log out and back in for the group change to take effect
+</code></pre>
+<p>If the cloud server does not expose standard KVM, follow
+<a href="#pvm-deployment">PVM Deployment</a>. That guide covers the additional host
+setup needed before starting AgentENV.</p>
+<h2 id="the-configured-virtualization-mode-does-not-match-the-host"><a class="header" href="#the-configured-virtualization-mode-does-not-match-the-host">The configured virtualization mode does not match the host</a></h2>
+<p><strong>Symptom</strong>: Startup reports that KVM cannot run while the PVM module is
+loaded, or that PVM requires additional host setup.</p>
+<p><strong>Solution</strong>: Normal installations should use the default KVM mode. If the
+host was prepared for PVM, follow <a href="#pvm-deployment">PVM Deployment</a> and
+ensure the service environment contains:</p>
+<pre><code class="language-bash">AENV_VIRTUALIZATION_MODE=pvm
+</code></pre>
+<h2 id="permission-denied-for-network-operations"><a class="header" href="#permission-denied-for-network-operations">Permission denied for network operations</a></h2>
+<p><strong>Symptom</strong>: Sandbox creation fails with network namespace or iptables errors.</p>
+<p><strong>Solution</strong>: The server requires both <code>CAP_NET_ADMIN</code> and <code>CAP_SYS_ADMIN</code> in
+its effective, permitted, and inheritable sets. The installed systemd unit
+configures these automatically. For a source checkout, use <code>make start-server</code>
+or <code>scripts/run-with-capabilities.sh &lt;server-binary&gt;</code>; do not run the whole
+server as root. Also verify that the runtime account belongs to the <code>kvm</code>
+group, can open <code>/dev/kvm</code>, and can open <code>/dev/ublk-control</code>.</p>
+<h2 id="sandbox-namespaces-are-missing-from-ip-netns-list"><a class="header" href="#sandbox-namespaces-are-missing-from-ip-netns-list">Sandbox namespaces are missing from <code>ip netns list</code></a></h2>
+<p><strong>Symptom</strong>: Sandboxes are running, but <code>ip netns list</code> does not show their
+network namespaces and <code>ip netns exec &lt;name&gt;</code> cannot find them.</p>
+<p><strong>Solution</strong>: AgentENV stores namespace mount points under
+<code>$AENV_RUNTIME_PATH/netns</code> instead of <code>/var/run/netns</code>; the installed service
+uses <code>/run/aenv/netns</code>. Inspect that directory directly and enter a namespace
+by path when needed:</p>
+<pre><code class="language-bash">sudo nsenter --net=/run/aenv/netns/agentenv-ns-&lt;slot&gt; ip addr
+</code></pre>
+<h2 id="config-file-not-found"><a class="header" href="#config-file-not-found">Config file not found</a></h2>
+<p><strong>Symptom</strong>: <code>Error: config file not found</code></p>
+<p><strong>Solution</strong>: The server looks for <code>config/default.toml</code> by default. Either run from the repository root or set <code>AENV_CONFIG_PATH</code>:</p>
+<pre><code class="language-bash">export AENV_CONFIG_PATH=/path/to/your/config.toml
+</code></pre>
+<h2 id="port-already-in-use"><a class="header" href="#port-already-in-use">Port already in use</a></h2>
+<p><strong>Symptom</strong>: <code>Address already in use</code> when starting the server.</p>
+<p><strong>Solution</strong>: Another process is using port 8000. Either stop it or change the listen address:</p>
+<pre><code class="language-bash">API_ADDR=0.0.0.0:8001 make start-server
+</code></pre>
+<h2 id="sandbox-creation-timeout"><a class="header" href="#sandbox-creation-timeout">Sandbox creation timeout</a></h2>
+<p><strong>Symptom</strong>: <code>POST /sandboxes</code> returns a timeout error.</p>
+<p><strong>Solution</strong>: Check that runtime assets (Firecracker binary, kernel, rootfs) have been downloaded. The server auto-provisions them on first start, but network issues can cause failures. Run <code>cargo run --bin server -- --setup-only</code> to provision manually and see detailed errors.</p>
+<p>Also check <code>[envd].init_timeout_secs</code> in your config. The default is 60 seconds. If the rootfs image is large, the in-guest envd daemon may need more time to initialize.</p>
+<blockquote>
+<p>TODO: Expand with more common issues as they are reported.</p>
+</blockquote>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="configuration-reference"><a class="header" href="#configuration-reference">Configuration Reference</a></h1>
 <p>AgentENV reads configuration from a TOML file. The default path is <code>config/default.toml</code>. Override it with:</p>
@@ -2196,961 +3506,6 @@ export E2B_API_KEY=${AENV_API_KEY}
 </table>
 </div>
 <div style="break-before: page; page-break-before: always;"></div>
-<h1 id="authentication-1"><a class="header" href="#authentication-1">Authentication</a></h1>
-<p>AgentENV uses one shared API key for a single-tenant deployment. The gateway
-and every runtime node must use the same value.</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Credential</th><th>Scope</th><th>Header</th></tr>
-</thead>
-<tbody>
-<tr><td>API key</td><td>AgentENV lifecycle and management APIs</td><td><code>X-API-Key</code></td></tr>
-<tr><td><code>trafficAccessToken</code></td><td>Application ingress when <code>allowPublicTraffic</code> is <code>false</code></td><td><code>e2b-traffic-access-token</code></td></tr>
-<tr><td><code>envdAccessToken</code></td><td>Direct envd access for secure sandboxes</td><td><code>X-Access-Token</code></td></tr>
-</tbody>
-</table>
-</div>
-<p>The credentials are not interchangeable. Public application ingress and envd
-in insecure sandboxes need no AgentENV credential. <code>Authorization</code> remains an
-application header and does not authenticate AgentENV. On sandbox routes,
-<code>X-API-Key</code> is also treated as application data unless it exactly matches the
-AgentENV API key, in which case it is removed to avoid forwarding the platform
-credential.</p>
-<p><code>GET /health</code> and node <code>GET /metrics</code> are outside API-key authentication. The
-gateway exposes Prometheus metrics on its separate metrics listener. Protect
-these endpoints with the network and authentication controls used by your
-Prometheus deployment. They are distinct from E2B’s authenticated sandbox
-metrics API.</p>
-<p>E2B SDK users set <code>E2B_API_KEY</code> to the AgentENV API key. Sandbox credentials
-are derived from the sandbox ID and
-<code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code>, independently of the API key.</p>
-<h2 id="key-resolution"><a class="header" href="#key-resolution">Key Resolution</a></h2>
-<p>A runtime node checks these sources in order:</p>
-<ol>
-<li><code>AENV_API_KEY</code></li>
-<li><code>/run/secrets/api-key</code></li>
-<li><code>$AENV_HOME/secrets/api-key</code></li>
-</ol>
-<p>If none exists, normal server startup generates and atomically stores a key at
-the managed path. The gateway checks only the first two sources and never
-generates a key.</p>
-<p>Custom keys must contain 32 to 256 URL-safe characters. Generated keys use an
-E2B-compatible <code>e2b_</code> prefix. For example:</p>
-<pre><code class="language-bash">export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
-</code></pre>
-<p>Docker Compose shares one managed-secret volume between runtime nodes and
-mounts it read-only on the gateway. Kubernetes stores the key in
-<code>Secret/agentenv-auth</code>. See the corresponding deployment guide for commands to
-read or supply those values. Multi-node deployments must also share one
-<code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> across runtime nodes.</p>
-<h2 id="security-and-rotation"><a class="header" href="#security-and-rotation">Security and Rotation</a></h2>
-<p>API-key authentication does not encrypt traffic. Use HTTPS termination, a VPN,
-loopback, or a trusted private network.</p>
-<p>Changing <code>AENV_API_KEY</code> invalidates API clients without changing sandbox
-credentials. Changing <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> rotates both
-sandbox token types. Apply either change to all relevant processes together.</p>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="secure-sandboxes"><a class="header" href="#secure-sandboxes">Secure Sandboxes</a></h1>
-<p>Secure sandboxes use an envd access token for control-plane communication. This protects envd operations such as command execution and file access.</p>
-<blockquote class="blockquote-tag blockquote-tag-note">
-<p class="blockquote-tag-title"><svg viewbox="0 0 16 16" width="18" height="18"><path d="M0 8a8 8 0 1 1 16 0A8 8 0 0 1 0 8Zm8-6.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13ZM6.5 7.75A.75.75 0 0 1 7.25 7h1a.75.75 0 0 1 .75.75v2.75h.25a.75.75 0 0 1 0 1.5h-2a.75.75 0 0 1 0-1.5h.25v-2h-.25a.75.75 0 0 1-.75-.75ZM8 6a1 1 0 1 1 0-2 1 1 0 0 1 0 2Z"></path></svg>Note</p>
-<p>Secure mode protects envd control-plane operations. Application traffic uses
-the sandbox-scoped <code>trafficAccessToken</code> described in
-<a href="#authentication-1">Authentication</a>.</p>
-</blockquote>
-<p>Set <code>secure: true</code> when creating a sandbox through API or E2B-compatible SDKs to enable secure mode. Or use the CLI:</p>
-<pre><code class="language-bash">aenv start --secure &lt;template-id&gt;
-</code></pre>
-<p>The API and SDKs return the sandbox’s <code>envdAccessToken</code> where appropriate and attach it to envd requests automatically. Private application ingress has an independent <code>trafficAccessToken</code>, sent as <code>e2b-traffic-access-token</code>; public application ingress has no AgentENV credential. Forked sandboxes get independent credentials. Secure mode is preserved across pause, restart, and resume; legacy sandboxes remain non-secure unless created with <code>secure: true</code>.</p>
-<h2 id="access-token-seed"><a class="header" href="#access-token-seed">Access-Token Seed</a></h2>
-<p>A seed is a random value used to derive each sandbox’s envd and traffic access tokens. This seed is optional for a standalone runtime. When it is unset, the runtime automatically creates and persists a seed under <code>$AENV_HOME/secrets</code>.
-This is sufficient for normal single-node operation and does not require additional setup.</p>
-<p>Configure the same explicit seed on every runtime node in a clustered deployment. Generate it once and store it in the deployment’s secret manager:</p>
-<pre><code class="language-bash">openssl rand -hex 32
-</code></pre>
-<p>Set the value as <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> on every runtime node.
-For TOML configuration, use <code>[sandbox].access_token_hash_seed</code> instead.</p>
-<p>Preserve the seed across upgrades; changing it rotates both sandbox access tokens.</p>
-<h3 id="kubernetes"><a class="header" href="#kubernetes">Kubernetes</a></h3>
-<p>The runtime DaemonSet retains the existing optional <code>agentenv-runtime-secrets</code>
-contract. Create one shared seed before applying the runtime manifests:</p>
-<pre><code class="language-bash">kubectl apply -f deploy/k8s/base/namespace.yaml
-
-AENV_ACCESS_TOKEN_HASH_SEED="$(openssl rand -hex 32)"
-kubectl -n agentenv-system create secret generic agentenv-runtime-secrets \
-  --from-literal="sandbox-access-token-hash-seed=${AENV_ACCESS_TOKEN_HASH_SEED}" \
-  --dry-run=client -o yaml | kubectl apply -f -
-unset AENV_ACCESS_TOKEN_HASH_SEED
-</code></pre>
-<p>Preserve this Secret during upgrades. An external secret manager may provide
-the same name and key:</p>
-<pre><code class="language-yaml">apiVersion: v1
-kind: Secret
-metadata:
-  name: agentenv-runtime-secrets
-  namespace: agentenv-system
-stringData:
-  sandbox-access-token-hash-seed: &lt;shared-secret&gt;
-</code></pre>
-<p>If the Secret is absent, each runtime Pod uses its managed node-local seed.</p>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="how-agentenv-works"><a class="header" href="#how-agentenv-works">How AgentENV Works</a></h1>
-<p>AgentENV runs AI agents inside isolated Firecracker microVMs. Each sandbox is a lightweight Linux VM with its own kernel, filesystem, and network namespace.</p>
-<h2 id="system-overview"><a class="header" href="#system-overview">System Overview</a></h2>
-<pre class="mermaid">flowchart TD
-    subgraph node[AgentENV Node]
-        api["API&lt;br/&gt;(Axum)"] --&gt; orchestrator["Orchestrator&lt;br/&gt;(lifecycle)"]
-        orchestrator --&gt; vm["Firecracker VM&lt;br/&gt;/dev/vda (rootfs)&lt;br/&gt;/dev/vdb (extra)"]
-        vm --&gt; block["Block Device Layer&lt;br/&gt;(overlaybd + ublk)"]
-    end
-    style node fill:transparent,stroke:gray
-</pre>
-
-<h2 id="request-flow"><a class="header" href="#request-flow">Request Flow</a></h2>
-<ol>
-<li>A client sends an HTTP request to the AgentENV API (for example, <code>POST /sandboxes</code>).</li>
-<li>The <strong>API layer</strong> validates the request, checks authentication, and forwards it to the <strong>orchestrator</strong>.</li>
-<li>The <strong>orchestrator</strong> manages the sandbox lifecycle: it creates a Firecracker VM, sets up networking, and attaches block devices.</li>
-<li>The VM boots with a <strong>layered block device</strong> (overlaybd) that stacks read-only base image layers with a writable upper layer. Multiple sandboxes share the same base layers.</li>
-<li>Inside the VM, an <strong>envd</strong> daemon handles command execution, file operations, and health reporting.</li>
-<li>Clients interact with running sandboxes via the <strong>reverse proxy</strong> (<code>/proxy</code>, routing headers, or configured sandbox proxy domains), which forwards HTTP and WebSocket traffic to services inside the VM.</li>
-</ol>
-<h2 id="key-components"><a class="header" href="#key-components">Key Components</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Component</th><th>What It Does</th></tr>
-</thead>
-<tbody>
-<tr><td><strong>API Server</strong></td><td>HTTP server exposing E2B-compatible endpoints for sandbox and template management</td></tr>
-<tr><td><strong>Orchestrator</strong></td><td>State machine managing sandbox lifecycle transitions (create, pause, resume, delete)</td></tr>
-<tr><td><strong>Firecracker VM</strong></td><td>Lightweight microVM providing kernel-level isolation per sandbox</td></tr>
-<tr><td><strong>Block Device Layer</strong></td><td>overlaybd (layered images) + ublk (userspace block devices) for efficient storage</td></tr>
-<tr><td><strong>envd</strong></td><td>In-guest daemon for executing commands, streaming output, and managing processes</td></tr>
-<tr><td><strong>Reverse Proxy</strong></td><td>Routes HTTP/WebSocket traffic from clients to services running inside sandboxes</td></tr>
-<tr><td><strong>Snapshot Manager</strong></td><td>Manages committed snapshots for efficient sandbox creation and reuse</td></tr>
-<tr><td><strong>Template Builder</strong></td><td>User-facing build layer that declaratively produces committed snapshots with pre-installed software</td></tr>
-</tbody>
-</table>
-</div>
-<h2 id="multi-node-architecture"><a class="header" href="#multi-node-architecture">Multi-Node Architecture</a></h2>
-<p>For multi-node deployments, a <strong>gateway</strong> and <strong>scheduler</strong> sit in front of multiple AgentENV nodes:</p>
-<pre class="mermaid">flowchart LR
-    client["Client"] --&gt;|HTTP| gateway["Gateway&lt;br/&gt;(:8080)"]
-    gateway --&gt;|gRPC| scheduler["Scheduler&lt;br/&gt;(:9090)"]
-    gateway --&gt;|proxy HTTP| nodeA["Node A&lt;br/&gt;(:8000)"]
-    gateway --&gt;|proxy HTTP| nodeB["Node B&lt;br/&gt;(:8000)"]
-    scheduler -.-&gt;|node selection /&lt;br/&gt; lookup result| gateway
-</pre>
-
-<p>The gateway routes requests by sandbox ID. For new sandboxes, the scheduler picks a node. For existing sandboxes, the scheduler looks up the node that owns it. See <a href="#docker-compose-multi-node-simulation">Deployment</a> for setup instructions.</p>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="templates-1"><a class="header" href="#templates-1">Templates</a></h1>
-<p>A template is the user-facing wrapper around a committed snapshot. Instead of
-booting a fresh VM and installing software every time, you build a template
-once and later create sandboxes from it in milliseconds.</p>
-<h2 id="how-templates-work"><a class="header" href="#how-templates-work">How Templates Work</a></h2>
-<ol>
-<li><strong>Define</strong>: specify an overlaybd-backed base rootfs and ordered steps such as <code>run</code>, <code>env</code>, and <code>workdir</code>.</li>
-<li><strong>Build</strong>: AgentENV boots a temporary sandbox and executes those steps inside it.</li>
-<li><strong>Finalize</strong>: optional startup commands can be started and checked for readiness before the snapshot is captured.</li>
-<li><strong>Publish</strong>: the result is committed as a snapshot in the snapshot repository.</li>
-<li><strong>Launch</strong>: creating a sandbox from a template resolves the committed snapshot and resumes from it.</li>
-</ol>
-<h2 id="create-your-template"><a class="header" href="#create-your-template">Create Your Template</a></h2>
-<p>There are two ways to create a template: <code>aenv pull</code> imports an OCI image directly, and <code>aenv build</code> runs Dockerfile instructions inside a temporary build sandbox.</p>
-<h3 id="aenv-pull"><a class="header" href="#aenv-pull">aenv pull</a></h3>
-<p>Pulling an existing OCI image as a template:</p>
-<pre><code class="language-bash">aenv pull ubuntu:24.04
-</code></pre>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Flag</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>--name &lt;name&gt;</code></td><td>Template name. Defaults to the repository segment of the image</td></tr>
-<tr><td><code>--start-cmd &lt;cmd&gt;</code></td><td>Command to run before capturing the snapshot</td></tr>
-<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td>Shell command polled every 2 s until exit 0; gates snapshot capture</td></tr>
-<tr><td><code>--probe &lt;port&gt;</code></td><td>Readiness check: wait for TCP on <code>localhost:&lt;port&gt;</code></td></tr>
-<tr><td><code>-d</code>, <code>--detach</code></td><td>Submit the build and return without waiting</td></tr>
-<tr><td><code>--timeout &lt;secs&gt;</code></td><td>Maximum time to wait for the build to complete</td></tr>
-</tbody>
-</table>
-</div>
-<p><code>Env</code>, <code>WorkingDir</code>, and <code>User</code> are automatically inherited from the OCI image config. See <a href="#runtime-configuration">Runtime Configuration</a> for the full field list.</p>
-<h3 id="aenv-build"><a class="header" href="#aenv-build">aenv build</a></h3>
-<blockquote>
-<p>⚠️ <strong>Experimental</strong> — Not recommended for production use.</p>
-</blockquote>
-<p>Build a template by running Dockerfile instructions inside a temporary sandbox:</p>
-<pre><code class="language-bash">aenv build ./Dockerfile --name my-template
-</code></pre>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Flag</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>--name &lt;name&gt;</code></td><td>Required template name</td></tr>
-<tr><td><code>--image &lt;ref&gt;</code></td><td>Override the <code>FROM</code> image</td></tr>
-</tbody>
-</table>
-</div>
-<p>Supported Dockerfile instructions:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Instruction</th><th>Behavior</th></tr>
-</thead>
-<tbody>
-<tr><td><code>FROM</code></td><td>Base image (overridable with <code>--image</code>)</td></tr>
-<tr><td><code>RUN</code></td><td>Shell command executed inside the build sandbox</td></tr>
-<tr><td><code>ENV</code></td><td>Set an environment variable</td></tr>
-<tr><td><code>ARG</code></td><td>Set a build-time variable</td></tr>
-<tr><td><code>WORKDIR</code></td><td>Create the directory if needed and set it as the working directory</td></tr>
-<tr><td><code>USER</code></td><td>Set the default user (a missing named account is created at the end of the build)</td></tr>
-<tr><td><code>ENTRYPOINT</code></td><td>Becomes the template <code>startCmd</code></td></tr>
-<tr><td><code>CMD</code></td><td>Becomes <code>startCmd</code> if no <code>ENTRYPOINT</code> is present</td></tr>
-<tr><td><code>EXPOSE</code> / <code>VOLUME</code> / <code>LABEL</code></td><td>Accepted but stored as metadata only</td></tr>
-</tbody>
-</table>
-</div>
-<h3 id="runtime-configuration"><a class="header" href="#runtime-configuration">Runtime Configuration</a></h3>
-<p>Both methods read the same set of OCI image config fields. For <code>aenv pull</code>, these come from the image config or flags; for <code>aenv build</code>, they are set by the
-corresponding Dockerfile instructions executed during the build. The following fields from the <a href="https://github.com/opencontainers/image-spec/blob/main/config.md">OCI image-spec config object</a> are recognised:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>OCI field</th><th>Dockerfile instruction</th><th>Runtime effect</th></tr>
-</thead>
-<tbody>
-<tr><td><code>Env</code></td><td><code>ENV</code></td><td>Environment variables injected into every sandbox process</td></tr>
-<tr><td><code>WorkingDir</code></td><td><code>WORKDIR</code></td><td>Default working directory</td></tr>
-<tr><td><code>User</code></td><td><code>USER</code></td><td>Default user</td></tr>
-<tr><td><code>Entrypoint</code> / <code>Cmd</code></td><td><code>ENTRYPOINT</code> / <code>CMD</code></td><td>Mapped to <code>startCmd</code> for <code>aenv build</code>; use <code>--start-cmd</code> explicitly for <code>aenv pull</code></td></tr>
-<tr><td><code>ExposedPorts</code></td><td><code>EXPOSE</code></td><td>Stored as metadata only</td></tr>
-<tr><td><code>Volumes</code></td><td><code>VOLUME</code></td><td>Stored as metadata only</td></tr>
-<tr><td><code>Labels</code></td><td><code>LABEL</code></td><td>Stored as metadata only</td></tr>
-</tbody>
-</table>
-</div>
-<h3 id="aliases"><a class="header" href="#aliases">Aliases</a></h3>
-<p>Each template is identified by a UUID. Pass <code>--name</code> at creation time to assign
-a human-readable alias:</p>
-<pre><code class="language-bash">aenv pull ubuntu:24.04 --name my-base
-aenv build ./Dockerfile --name my-service
-</code></pre>
-<p>The alias can be used wherever a template ID is accepted:</p>
-<pre><code class="language-bash">aenv start my-base
-aenv template delete my-service
-</code></pre>
-<h2 id="manage-templates"><a class="header" href="#manage-templates">Manage Templates</a></h2>
-<h3 id="list-templates"><a class="header" href="#list-templates">List templates</a></h3>
-<pre><code class="language-bash">aenv template list        # alias: aenv template ls
-</code></pre>
-<p>Displays all templates with their ID, name, build status, CPU, memory, disk size, and last-updated timestamp.</p>
-<h3 id="delete-a-template"><a class="header" href="#delete-a-template">Delete a template</a></h3>
-<pre><code class="language-bash">aenv template delete &lt;template-id-or-name&gt;   # alias: aenv template rm
-</code></pre>
-<h3 id="watch-a-build"><a class="header" href="#watch-a-build">Watch a build</a></h3>
-<p><code>aenv build</code> always detaches immediately after submitting. Use <code>watch</code> to follow the build status until it succeeds or fails:</p>
-<pre><code class="language-bash">aenv template watch &lt;template-id-or-name&gt;
-</code></pre>
-<h3 id="start-a-sandbox-from-a-template"><a class="header" href="#start-a-sandbox-from-a-template">Start a sandbox from a template</a></h3>
-<pre><code class="language-bash">aenv start &lt;template-id-or-name&gt;      # start and attach an interactive shell
-aenv start -d &lt;template-id-or-name&gt;   # detach: print sandbox ID and exit
-</code></pre>
-<h2 id="relationship-to-snapshots"><a class="header" href="#relationship-to-snapshots">Relationship to Snapshots</a></h2>
-<p>Templates are the API and UX layer. Snapshots are the durable runtime layer.</p>
-<ul>
-<li>A template build publishes one committed snapshot.</li>
-<li>A template ID or alias resolves to one committed snapshot.</li>
-<li>A sandbox created from a template resumes from that snapshot.</li>
-</ul>
-<p>If you want the storage and runtime model underneath templates, see
-<a href="#snapshots-1">Snapshots</a>.</p>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="sandboxes-1"><a class="header" href="#sandboxes-1">Sandboxes</a></h1>
-<p>A sandbox is an isolated Firecracker microVM with its own Linux kernel, filesystem, and network stack. Each sandbox runs independently and can be paused, resumed, or deleted.</p>
-<hr>
-<h2 id="lifecycle"><a class="header" href="#lifecycle">Lifecycle</a></h2>
-<pre class="mermaid">stateDiagram-v2
-    [*] --&gt; Creating
-    Creating --&gt; Running
-    Running --&gt; Pausing
-    Pausing --&gt; Paused
-    Paused --&gt; Resuming
-    Resuming --&gt; Running
-    Running --&gt; Snapshotting
-    Snapshotting --&gt; Running
-    Running --&gt; Forking
-    Forking --&gt; Running
-    Running --&gt; Killing
-    Killing --&gt; [*]
-</pre>
-
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>State</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><strong>Creating</strong></td><td>VM is booting, block devices are being attached, networking is being configured</td></tr>
-<tr><td><strong>Running</strong></td><td>VM is ready. Commands can be executed, proxy traffic is routed, timeout is ticking</td></tr>
-<tr><td><strong>Pausing</strong></td><td>Memory and disk snapshots are being captured</td></tr>
-<tr><td><strong>Paused</strong></td><td>VM is stopped. Snapshot artifacts are stored. No resources consumed</td></tr>
-<tr><td><strong>Resuming</strong></td><td>Sandbox is being restored from its paused snapshot</td></tr>
-<tr><td><strong>Snapshotting</strong></td><td>A persistent snapshot is being captured; sandbox returns to Running after</td></tr>
-<tr><td><strong>Forking</strong></td><td>Sandbox is being cloned into child sandboxes; source returns to Running after</td></tr>
-<tr><td><strong>Killing</strong></td><td>VM is being torn down and resources released</td></tr>
-</tbody>
-</table>
-</div>
-<hr>
-<h2 id="starting-a-sandbox"><a class="header" href="#starting-a-sandbox">Starting a Sandbox</a></h2>
-<p>There are two ways to start a sandbox:</p>
-<h3 id="warm-start-from-a-template"><a class="header" href="#warm-start-from-a-template">Warm Start (from a template)</a></h3>
-<p>Starting from a pre-built template restores a snapshot of a known filesystem state.</p>
-<pre><code class="language-bash">aenv start &lt;template-id&gt;
-</code></pre>
-<p>See <a href="#templates-1">Templates</a> for how templates are created.</p>
-<h3 id="cold-start-from-an-oci-image"><a class="header" href="#cold-start-from-an-oci-image">Cold Start (from an OCI image)</a></h3>
-<p>A cold start pulls an OCI image directly and converts it into a block device at runtime.</p>
-<pre><code class="language-bash">aenv start --cold ubuntu:24.04
-</code></pre>
-<p>The cold-start API accepts an optional <code>diskSizeMB</code> field to set the root filesystem’s virtual size in MiB. Explicit values must be at least 1024 MiB and divisible by 1024 because the current resize tool operates at 1 GiB granularity. Growth is allowed by default; shrinking below the source image size requires <code>ublk.overlaybd.allow_shrink = true</code>. If omitted, the image’s built-in virtual size is used. Resizing applies only when creating a fresh writable root filesystem, not to read-only images, images with an existing upper, or snapshot resume. Sandbox responses also report disk size as <code>diskSizeMB</code>.</p>
-<p>Use <code>aenv start --secure</code> with either warm or cold starts to require an envd access token for command and file operations. The CLI obtains and sends the token automatically. Secure mode protects the envd control port, while application proxy requests use the independent sandbox-scoped traffic token. Each fork derives distinct envd and traffic credentials from the child sandbox ID.</p>
-<hr>
-<h2 id="working-with-sandboxes"><a class="header" href="#working-with-sandboxes">Working with Sandboxes</a></h2>
-<h3 id="shell-and-command-execution"><a class="header" href="#shell-and-command-execution">Shell and command execution</a></h3>
-<pre><code class="language-bash"># Attach to a sandbox
-aenv connect &lt;sandbox-id&gt;
-
-# Run a one-shot command and stream its output
-aenv exec &lt;sandbox-id&gt; ls -la /
-</code></pre>
-<h3 id="pause-and-resume"><a class="header" href="#pause-and-resume">Pause and Resume</a></h3>
-<p>Pausing a sandbox captures:</p>
-<ul>
-<li><strong>Memory snapshot</strong> of the running VM state</li>
-<li><strong>Disk snapshot</strong> of the writable filesystem layer</li>
-</ul>
-<p>Resuming restores the VM from these snapshots in milliseconds. The sandbox picks up exactly where it left off, including running processes and open network connections.</p>
-<pre><code class="language-bash">aenv pause &lt;sandbox-id&gt;
-aenv resume &lt;sandbox-id&gt;
-</code></pre>
-<h3 id="persistent-snapshots"><a class="header" href="#persistent-snapshots">Persistent Snapshots</a></h3>
-<p>A snapshot captures the state of a <strong>running</strong> sandbox into a template that can be used to start new sandboxes.</p>
-<pre><code class="language-bash">aenv snapshot create &lt;sandbox-id&gt;
-aenv snapshot create &lt;sandbox-id&gt; --name my-base
-</code></pre>
-<p>The resulting snapshot appears in <code>aenv snapshot list</code> and can be started with <code>aenv start &lt;name&gt;</code>. See <a href="#snapshots-1">Snapshots</a> for details.</p>
-<h3 id="fork"><a class="header" href="#fork">Fork</a></h3>
-<p>Forking clones a <strong>running</strong> sandbox into up to 16 child sandboxes on the same node. The source sandbox is briefly paused while the clone is captured, then resumes. All children inherit the source’s filesystem, memory, and resource configuration.</p>
-<pre><code class="language-bash">curl -X POST \
-  -H 'X-API-Key: test-key' \
-  -H 'Content-Type: application/json' \
-  -d '{"count": 3}' \
-  http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/fork
-</code></pre>
-<h3 id="managing-sandboxes"><a class="header" href="#managing-sandboxes">Managing sandboxes</a></h3>
-<pre><code class="language-bash"># List all sandboxes
-aenv list
-
-# Delete a sandbox
-aenv delete &lt;sandbox-id&gt;
-</code></pre>
-<hr>
-<h2 id="auto-eviction"><a class="header" href="#auto-eviction">Auto-Eviction</a></h2>
-<p>Every sandbox has a TTL (time-to-live). When it expires, one of two actions is taken:</p>
-<ul>
-<li><strong>pause</strong> (default) — the sandbox is paused and its state is preserved</li>
-<li><strong>kill</strong> — the sandbox is deleted permanently</li>
-</ul>
-<p>Set TTL with <code>--timeout &lt;secs&gt;</code>:</p>
-<pre><code class="language-bash"># Start a sandbox with TTL of 600s
-aenv start &lt;template-id&gt; -d --timeout 600
-
-# Set the sandbox expiration for 600 seconds from now
-aenv timeout &lt;sandbox-id&gt; 600
-</code></pre>
-<p>To delete instead of pause on expiry, use the API directly with <code>autoPause: false</code>:</p>
-<pre><code class="language-bash">curl -X POST \
-  -H 'X-API-Key: test-key' \
-  -H 'Content-Type: application/json' \
-  -d '{"templateID": "&lt;template-id&gt;", "timeout": 600, "autoPause": false}' \
-  http://127.0.0.1:8000/sandboxes
-</code></pre>
-<p>The default timeout is configured in <code>config/default.toml</code> under <code>[orchestrator].default_sandbox_timeout_secs</code>.</p>
-<hr>
-<h2 id="networking"><a class="header" href="#networking">Networking</a></h2>
-<p>Each sandbox runs in its own network namespace. By default, outbound internet access is enabled. To disable it at creation time:</p>
-<pre><code class="language-bash">curl -X POST \
-  -H 'X-API-Key: test-key' \
-  -H 'Content-Type: application/json' \
-  -d '{"templateID": "my-ubuntu", "allow_internet_access": false}' \
-  http://127.0.0.1:8000/sandboxes
-</code></pre>
-<p>For fine-grained egress control, pass a <code>network</code> object when creating the sandbox. Within user-configured egress rules, traffic is allow-by-default, and <code>allowOut</code> entries take precedence over matching <code>denyOut</code> entries. <code>allowOut</code> by itself does not create an allowlist: destinations that do not match a deny rule remain reachable.</p>
-<ul>
-<li><code>allowOut</code> — CIDR, IP, or domain pattern. Domain patterns apply to new TCP connections on ports 80 and 443 and require <code>denyOut: ["0.0.0.0/0"]</code>. Exact names, <code>*.example.com</code>, and <code>*</code> are supported; a wildcard does not match the apex domain.</li>
-<li><code>denyOut</code> — CIDR or IP</li>
-</ul>
-<p>The following diagram illustrates how the rules are evaluated:</p>
-<pre class="mermaid">flowchart TD
-    A[Destination packet] --&gt; B{Matches allowOut?}
-    B --&gt;|Yes| C[Allow traffic]
-    B --&gt;|No| D{Matches denyOut?}
-    D --&gt;|Yes| E[Reject traffic]
-    D --&gt;|No| F{"allow_internet_access?"}
-    F --&gt;|Yes| C
-    F --&gt;|No| E
-</pre>
-
-<p><code>allowOut</code> is evaluated before <code>denyOut</code> in the user egress chain, so an allowed destination can override an overlapping user-configured deny rule. <code>allow_internet_access: false</code> sets the base policy to <code>Deny</code>, which appends a catch-all reject after those rules and makes the remaining destinations fail closed. Static internal-network deny rules are evaluated before the user egress chain and cannot be overridden by <code>allowOut</code>.</p>
-<p>To create an allowlist, deny all traffic and then add the allowed exceptions with <code>allowOut</code>. You can deny all traffic explicitly with <code>denyOut: ["0.0.0.0/0"]</code>, or use <code>allow_internet_access: false</code> together with <code>allowOut</code>.</p>
-<pre><code class="language-bash">curl -X POST \
-  -H 'X-API-Key: test-key' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "templateID": "my-ubuntu",
-    "network": {
-      "allowOut": ["8.8.8.8/32", "1.1.1.1/32"],
-      "denyOut": ["0.0.0.0/0"]
-    }
-  }' \
-  http://127.0.0.1:8000/sandboxes
-</code></pre>
-<p>Egress rules can also be updated on a running sandbox:</p>
-<pre><code class="language-bash">curl -X PUT \
-  -H 'X-API-Key: test-key' \
-  -H 'Content-Type: application/json' \
-  -d '{"allowOut": ["8.8.8.8/32"], "denyOut": ["0.0.0.0/0"]}' \
-  http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/network
-</code></pre>
-<p>Omitting both fields clears all per-sandbox egress rules and restores the default allow behavior.</p>
-<p>Updating a policy primarily affects new connections; existing connections are not actively terminated. During replacement, the previous policy remains active until the new namespace rules are committed.</p>
-<p>For domain rules, the proxy matches the inspected Host/SNI and re-resolves the hostname using the host-side trusted resolver before connecting; the guest’s DNS answer and original destination IP are not authoritative for domain policy.</p>
-<hr>
-<h2 id="data-storage"><a class="header" href="#data-storage">Data Storage</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Path</th><th>Contents</th><th>Config</th></tr>
-</thead>
-<tbody>
-<tr><td><code>$AENV_HOME/snapshot-store/</code></td><td>Committed snapshot and template artifacts (rootfs layers, memory snapshots, metadata)</td><td><code>[backend.posix_fs].snapshot_store</code></td></tr>
-<tr><td><code>$AENV_HOME/persisted-sandboxes/</code></td><td>Paused sandbox state persisted across server restarts</td><td><code>[orchestrator].persisted_sandbox_store_path</code></td></tr>
-<tr><td><code>$AENV_HOME/image-cache/</code></td><td>Converted OCI image layers (overlaybd format) cached after first cold start or template build</td><td><code>[image.cache].root_dir</code></td></tr>
-</tbody>
-</table>
-</div>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="snapshots-1"><a class="header" href="#snapshots-1">Snapshots</a></h1>
-<p>Snapshots are the durable runtime primitive in AgentENV. Everything else is
-built on top of them:</p>
-<ul>
-<li><strong>Templates</strong> are stored as snapshots. A template build commits one snapshot;
-the template ID is an alias that resolves to it.</li>
-<li><strong>Sandboxes</strong> launch by resuming from a snapshot.</li>
-<li><strong>Running sandboxes</strong> can produce new snapshots, capturing their current
-state for later reuse or branching.</li>
-</ul>
-<h2 id="create-a-snapshot-from-a-running-sandbox"><a class="header" href="#create-a-snapshot-from-a-running-sandbox">Create a Snapshot from a Running Sandbox</a></h2>
-<p>Capture the current state of a live sandbox:</p>
-<pre><code class="language-bash">aenv snapshot create &lt;sandbox-id&gt;
-aenv snapshot create &lt;sandbox-id&gt; --name my-checkpoint
-</code></pre>
-<p>Pass <code>--name</code> to assign a human-readable alias. The alias can then be used with
-<code>aenv start</code> or any command that accepts a snapshot ID.</p>
-<p>The sandbox transitions through <code>Running → Snapshotting → Running</code> during
-capture; the sandbox continues running after the snapshot is committed.
-Recoverable failures leave the sandbox running and surface the error to the
-caller. Terminal failures — where the runtime was mutated past safe resume —
-tear down the sandbox.</p>
-<h2 id="overlaybd-image-publication"><a class="header" href="#overlaybd-image-publication">OverlayBD Image Publication</a></h2>
-<p>When the snapshot repository backend is <code>oss</code> and <code>[snapshot.image_publish]</code> is
-enabled, publishing a snapshot also writes its rootfs back to the original
-OverlayBD-native OCI registry as an image tag:</p>
-<pre><code class="language-text">Created snapshot 018f0d93-aaaa-bbbb-cccc-0123456789ab
-Image: registry.example.com/team/app:agentenv-snapshot-018f0d93-aaaa-bbbb-cccc-0123456789ab
-</code></pre>
-<p>The tag lives in the same registry and repository as the source image.
-Publication is incremental: layers already present in that repository (the
-base image and previously published snapshot deltas) are referenced by digest
-and never re-uploaded; only new runtime delta layers are pushed. The result is
-an OverlayBD-native OCI image that can be used directly as a <code>userImage</code> to
-cold boot new sandboxes.</p>
-<p>Notes:</p>
-<ul>
-<li>The image contains only the root filesystem. Memory state and <code>vm_state.bin</code>
-remain in the snapshot repository, so resuming with full memory state still
-requires starting from the snapshot itself.</li>
-<li>The published reference is returned as <code>imageRef</code> in snapshot create/GET/list
-API responses and shown by <code>aenv snapshot create</code> and <code>aenv snapshot list</code>.</li>
-<li>Snapshots created from non-OverlayBD-native source images, or created while
-publication is disabled, do not produce an <code>imageRef</code>.</li>
-<li>AgentENV never overwrites an existing generated snapshot tag. Registry
-administrators can still move or replace tags through external tooling.</li>
-<li>Deleting a snapshot also attempts to delete its published manifest from the
-registry.</li>
-</ul>
-<p>Published rootfs images preserve the snapshot’s effective OCI runtime fields
-(<code>Env</code>, <code>WorkingDir</code>, <code>User</code>, <code>Entrypoint</code>, <code>Cmd</code>, <code>ExposedPorts</code>, <code>Volumes</code>,
-and <code>Labels</code>) and retain unmodeled fields from the source rootfs config when
-available. AgentENV-specific startup commands remain snapshot metadata and are
-not converted into OCI <code>Entrypoint</code> or <code>Cmd</code>; use explicit OCI command metadata
-when that behavior must survive image export. Republishing a snapshot with this
-metadata changes its manifest digest, so an existing published tag still
-requires a new tag or deletion.</p>
-<h2 id="export-a-snapshot-rootfs-as-a-standalone-oci-image"><a class="header" href="#export-a-snapshot-rootfs-as-a-standalone-oci-image">Export a Snapshot Rootfs as a Standalone OCI Image</a></h2>
-<p><code>aenv-snapshot-image</code> (build with <code>make build-snapshot-image</code>; not part of the
-server binary, Docker image, or install packages) publishes a committed
-snapshot’s rootfs — never attached drives or memory — as an OverlayBD-native
-OCI image and prints the image reference on stdout (logs go to stderr):</p>
-<pre><code class="language-bash">aenv-snapshot-image &lt;snapshot-id-or-alias&gt; \
-  [--target-repository registry.example.com/team/app] [--tag release-1]
-</code></pre>
-<p>It reads the server config (<code>AENV_CONFIG_PATH</code> or <code>--config</code>) for the
-<code>posix_fs</code>/<code>oss</code> snapshot repository and does all registry I/O through
-<code>regctl</code> (<code>docker login</code> provides credentials). An explicit
-<code>--target-repository</code> defaults to the <code>latest</code> tag. When the target is omitted,
-the tool resolves the original repository from the snapshot’s rootfs
-publication metadata, or from its unique external source, and defaults to
-<code>snapshot-&lt;snapshot-id&gt;</code>. Persisted publication metadata is never treated as
-registry truth: every invocation checks the target manifest. Publishing is
-idempotent through the manifest digest, pre-existing conflicting references
-are refused, and blobs already present at the target are skipped. The conflict
-check is not atomic against concurrent tag writers. The tool records no new
-publication state. If the selected reference is already recorded as a
-snapshot-managed publication, the tool warns that it may be deleted with the
-snapshot; other exported references live independently of snapshot deletion.
-The standalone export preserves the same effective OCI runtime fields described
-under <a href="#overlaybd-image-publication">OverlayBD Image Publication</a>.</p>
-<h2 id="manage-snapshots"><a class="header" href="#manage-snapshots">Manage Snapshots</a></h2>
-<h3 id="list-snapshots"><a class="header" href="#list-snapshots">List Snapshots</a></h3>
-<p>List all snapshots, optionally filtered by source sandbox:</p>
-<pre><code class="language-bash">aenv snapshot list                           # alias: aenv snapshot ls
-aenv snapshot ls --sandbox-id &lt;sandbox-id&gt;
-</code></pre>
-<p>The <code>--sandbox-id</code> filter works even after the source sandbox has been deleted.</p>
-<h3 id="start-sandboxes-from-snapshots"><a class="header" href="#start-sandboxes-from-snapshots">Start Sandboxes from Snapshots</a></h3>
-<p>Start a new sandbox from a snapshot:</p>
-<pre><code class="language-bash">aenv start &lt;snapshot-id-or-name&gt;
-</code></pre>
-<h3 id="delete-snapshots"><a class="header" href="#delete-snapshots">Delete Snapshots</a></h3>
-<p>Snapshots share the same catalog as templates. To delete a snapshot, use the
-template delete command with the snapshot ID or alias:</p>
-<pre><code class="language-bash">aenv template delete &lt;snapshot-id-or-name&gt;
-</code></pre>
-<h2 id="optional-p2p-visibility"><a class="header" href="#optional-p2p-visibility">Optional P2P Visibility</a></h2>
-<p>When <code>[p2p].enabled = true</code>, published snapshot artifacts are advertised
-through the node-to-node P2P transport after the repository commit succeeds.
-This makes new artifacts discoverable to peer nodes before slow backend reads
-become the bottleneck:</p>
-<ul>
-<li><code>vm_state.bin</code> and <code>firecracker-manifest.json</code> are advertised under
-snapshot-scoped keys.</li>
-<li>Overlaybd commit layers are advertised under the shared overlaybd layer keys
-(<code>overlaybd-layer/v1/sha256:&lt;digest&gt;</code>), so overlaybd runtime reads can find
-them through the overlaybd P2P facade.</li>
-</ul>
-<p>P2P does not change the committed snapshot model. The snapshot repository
-remains the source of truth, and failed P2P publication does not roll back a
-successful snapshot publish.</p>
-<h2 id="storage"><a class="header" href="#storage">Storage</a></h2>
-<h3 id="three-layer-model"><a class="header" href="#three-layer-model">Three-layer model</a></h3>
-<p>It helps to treat these as three different layers rather than one combined store:</p>
-<p><strong>1. Builder staging</strong></p>
-<p>This is a manager-owned temporary workspace used while executing one build. It
-contains local snapshot artifacts captured from the build sandbox, for example:</p>
-<pre><code class="language-text">&lt;local_cache_path&gt;/
-  snapshots/&lt;id&gt;/
-    vm_state.bin
-    mem_image.json
-    rootfs/
-      image.json
-    drives/&lt;drive-id&gt;/
-      image.json
-</code></pre>
-<p>This directory is a <code>TemplateBuilder</code> implementation detail. It is not the
-durable committed record.</p>
-<p><strong>2. Committed snapshot repository</strong></p>
-<p>Once a build is published, the durable state lives in the snapshot repository:</p>
-<pre><code class="language-text">&lt;snapshot_store&gt;/
-  repository/
-    catalog/
-      aliases/
-    snapshots/&lt;id&gt;/
-      snapshot.json
-      firecracker-manifest.json
-      vm_state.bin
-    managed-layers/
-      &lt;digest&gt;.overlaybd.commit
-</code></pre>
-<p>This repository is the source of truth wrapped by the template API.</p>
-<p><strong>3. Node-local runtime cache</strong></p>
-<p>Before a sandbox is launched, AgentENV derives runnable overlaybd configs from
-the committed snapshot and materializes them in a node-local runtime cache:</p>
-<pre><code class="language-text">&lt;node_local_runtime_cache&gt;/
-  runtime/&lt;id&gt;/
-    memory/
-      image.json
-    rootfs/
-      image.json
-    drives/&lt;drive-id&gt;/
-      image.json
-</code></pre>
-<p>These are launch-time derived runtime inputs, not committed metadata.</p>
-<h3 id="what-a-committed-snapshot-contains"><a class="header" href="#what-a-committed-snapshot-contains">What a committed snapshot contains</a></h3>
-<p>Each committed snapshot is split across two durable files:</p>
-<p><strong><code>snapshot.json</code></strong> contains:</p>
-<ul>
-<li><strong><code>context</code></strong> — the runtime configuration baked in at build time: environment
-variables, working directory, user, exposed ports, volumes, and labels.
-Sandboxes launched from this snapshot inherit these values.</li>
-<li><strong><code>rootfs_layers</code></strong>, <strong><code>attached_drives[].layers</code></strong>, <strong><code>memory_layers</code></strong> —
-overlaybd layer references, either as managed local layers (deduplicated by content digest) or as external OCI registry references.</li>
-<li>Startup configuration.</li>
-</ul>
-<p><strong><code>firecracker-manifest.json</code></strong> contains launch-time metadata not expressed as
-overlay layer lists, including <code>memory.virtual_size</code>, <code>rootfs.virtual_size</code>,
-and per-drive metadata.</p>
-<p>The following files exist only as local build artifacts or node-local derived
-configs and are not committed:</p>
-<ul>
-<li><code>rootfs/image.json</code></li>
-<li><code>drives/&lt;id&gt;/image.json</code></li>
-<li><code>mem_image.json</code></li>
-<li><code>upper.data</code></li>
-<li><code>upper.index</code></li>
-</ul>
-<h3 id="runtime-resolution"><a class="header" href="#runtime-resolution">Runtime resolution</a></h3>
-<p>Before launch, the committed state is resolved into node-local paths:</p>
-<ul>
-<li><code>memory_layers</code> become runtime <code>memory/image.json</code></li>
-<li><code>rootfs.layers</code> become runtime <code>rootfs/image.json</code></li>
-<li><code>attached_drives[].layers</code> become runtime <code>drives/&lt;id&gt;/image.json</code></li>
-<li><code>firecracker-manifest.json</code> is loaded and hydrated with node-local absolute paths</li>
-<li>committed <code>vm_state.bin</code> becomes the runnable vm-state path</li>
-</ul>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="custom-extension"><a class="header" href="#custom-extension">Custom Extension</a></h1>
-<p>The custom extension is an optional external HTTP service that AgentENV calls during the sandbox lifecycle. It lets you implement deployment-specific behavior — for example, connecting sandboxes into a VPN, custom firewall rules, or extra mounts — without changing AgentENV itself.</p>
-<p>The extension implements a small set of HTTP endpoints (“hooks”); AgentENV is the client. The interface is defined in <a href="https://github.com/kvcache-ai/AgentENV/blob/main/src/custom_extension_api/openapi.yml"><code>src/custom_extension_api/openapi.yml</code></a>.</p>
-<hr>
-<h2 id="configuration-2"><a class="header" href="#configuration-2">Configuration</a></h2>
-<p>Enable the integration by pointing AgentENV at your extension service:</p>
-<pre><code class="language-toml"># config/default.toml (or your AENV_CONFIG_PATH)
-[custom_extension]
-url = "http://127.0.0.1:9090"
-# timeout_ms = 5000   # optional, per-call timeout in milliseconds
-</code></pre>
-<p><code>AENV_CUSTOM_EXTENSION_URL</code> works as well. When <code>url</code> is unset, the integration is fully disabled: no hooks are called and <code>customExtensionParams</code> must be empty.</p>
-<hr>
-<h2 id="lifecycle-hooks"><a class="header" href="#lifecycle-hooks">Lifecycle hooks</a></h2>
-<p>All hooks are <code>POST {url}/sandbox-hook/*</code> with a JSON body. Any connection error, timeout, or non-2xx response fails the corresponding sandbox operation (except <code>stop</code>, which is best-effort).</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Hook</th><th>When</th><th>Request</th><th>Response</th></tr>
-</thead>
-<tbody>
-<tr><td><code>start-fresh</code></td><td>Before a fresh sandbox boots, after its network slot is allocated</td><td><code>sandboxId</code>, <code>sandboxInstanceId</code>, <code>networkNamespacePath</code>, <code>hostInteractionIp</code>, <code>customExtensionParams</code></td><td>optional <code>extraBootArgs</code> appended to the kernel cmdline</td></tr>
-<tr><td><code>start-resume</code></td><td>Before a sandbox resumes from a snapshot (template launch, resume after pause, fork child)</td><td>same as above</td><td>none</td></tr>
-<tr><td><code>patch-params</code></td><td>When a user PATCHes the sandbox’s params</td><td><code>sandboxId</code>, <code>patch</code> (verbatim user body)</td><td>updated <strong>full</strong> <code>customExtensionParams</code></td></tr>
-<tr><td><code>stop</code></td><td>When the sandbox runtime is torn down, before the network slot is released</td><td><code>sandboxId</code>, <code>sandboxInstanceId</code></td><td>none</td></tr>
-</tbody>
-</table>
-</div>
-<p>Notes:</p>
-<ul>
-<li><strong>Instance identity.</strong> A <code>sandboxId</code> is reused across pause/resume cycles. Every <code>start-fresh</code> / <code>start-resume</code> carries a fresh <code>sandboxInstanceId</code> identifying that runtime instance, and the subsequent <code>stop</code> carries the same value. Because <code>stop</code> is best-effort and may be reordered (e.g. a pause’s <code>stop</code> arriving after the resume’s <code>start-resume</code>), treat <code>(sandboxId, sandboxInstanceId)</code> as the identity of a running instance and ignore <code>stop</code> notifications whose <code>sandboxInstanceId</code> is not the latest started instance for that sandbox.</li>
-<li><strong><code>stop</code> also fires on pause.</strong> Pausing persists the sandbox state and then stops the VM process and releases the network namespace; the subsequent resume creates a fresh runtime and fires <code>start-resume</code>. In-place pause+resume during snapshot capture does not fire any hook (and keeps the same <code>sandboxInstanceId</code>).</li>
-<li><code>stop</code> is best-effort: delivery failures are only logged, and it is also fired fire-and-forget if a started sandbox is dropped without an explicit stop.</li>
-<li><code>networkNamespacePath</code> is the host path of the sandbox’s netns file (e.g. <code>/var/run/netns/agentenv-ns-*</code>), so the extension can enter the namespace (e.g. <code>nsenter --net=...</code>) to set up firewall rules or VPN interfaces.</li>
-<li><code>hostInteractionIp</code> is the per-runtime IPv4 address that AgentENV routes to this sandbox. It can change after pause/resume, so extensions must use the value from the current start hook rather than caching an older one.</li>
-<li>Concurrent <code>patch-params</code> calls to the same sandbox are not serialized; if your patch semantics are not commutative, handle concurrency in the extension.</li>
-</ul>
-<hr>
-<h2 id="customextensionparams"><a class="header" href="#customextensionparams"><code>customExtensionParams</code></a></h2>
-<p>An opaque JSON object per sandbox, interpreted only by the extension. An absent value and an empty object are equivalent (empty params).</p>
-<p><strong>Set at creation</strong> — <code>POST /sandboxes</code> and <code>POST /sandboxes-cold</code> accept <code>customExtensionParams</code>:</p>
-<pre><code class="language-json">{
-  "templateID": "my-template",
-  "customExtensionParams": { "vpn": { "network": "team-a" } }
-}
-</code></pre>
-<p>Non-empty params are rejected with 400 when no extension is configured on the server.</p>
-<p><strong>Read</strong> — <code>GET /sandboxes/{sandboxID}/custom-extension-params</code> returns the current value (<code>{}</code> when empty).</p>
-<p><strong>Patch</strong> — <code>PATCH /sandboxes/{sandboxID}/custom-extension-params</code> (running sandboxes only). The request body is passed through verbatim to the extension’s <code>patch-params</code> hook; its semantics are defined entirely by the extension. The hook returns the updated full params, which AgentENV stores and returns:</p>
-<pre><code class="language-bash">curl -X PATCH .../sandboxes/{id}/custom-extension-params \
-  -d '{"vpn": {"network": "team-a", "peers": ["10.8.0.2", "10.8.0.3"]}}'
-</code></pre>
-<p><strong>Persistence</strong> — params survive pause/resume and are stored into snapshots created from the sandbox. When starting from a template, a <code>customExtensionParams</code> provided at creation overrides the one stored in the snapshot; otherwise the snapshot’s value is inherited.</p>
-<hr>
-<h2 id="minimal-extension-example"><a class="header" href="#minimal-extension-example">Minimal extension example</a></h2>
-<pre><code class="language-python">from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-
-app = FastAPI()
-
-# Latest started runtime instance per sandbox: (sandboxId, sandboxInstanceId)
-# is the identity of a running instance; a stop for a superseded instance
-# (e.g. arriving after a newer start) is ignored.
-latest_instance: dict[str, str] = {}
-
-@app.post("/sandbox-hook/start-fresh")
-async def start_fresh(req: Request):
-    body = await req.json()
-    latest_instance[body["sandboxId"]] = body["sandboxInstanceId"]
-    # e.g. nsenter --net={body["networkNamespacePath"]} wg-quick up ...
-    return {"extraBootArgs": None}
-
-@app.post("/sandbox-hook/start-resume")
-async def start_resume(req: Request):
-    body = await req.json()
-    latest_instance[body["sandboxId"]] = body["sandboxInstanceId"]
-    return {}
-
-@app.post("/sandbox-hook/patch-params")
-async def patch_params(req: Request):
-    body = await req.json()
-    # apply body["patch"] however you like, then return the full new params
-    return {"customExtensionParams": body["patch"]}
-
-@app.post("/sandbox-hook/stop")
-async def stop(req: Request):
-    body = await req.json()
-    if latest_instance.get(body["sandboxId"]) == body["sandboxInstanceId"]:
-        latest_instance.pop(body["sandboxId"], None)
-        # tear down resources for this instance
-    return {}
-</code></pre>
-<p>Any non-2xx response (or timeout) fails the corresponding sandbox operation, except for <code>stop</code>, which is always tolerated.</p>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="proxy"><a class="header" href="#proxy">Proxy</a></h1>
-<p>The reverse proxy lets you reach services running inside a sandbox from outside. It supports HTTP requests, SSE streams, and WebSocket connections.</p>
-<h2 id="endpoints"><a class="header" href="#endpoints">Endpoints</a></h2>
-<ul>
-<li><code>ANY /proxy</code> forwards to <code>/</code> inside the sandbox</li>
-<li><code>ANY /proxy/{path}</code> forwards to <code>/{path}</code> inside the sandbox</li>
-<li>Header-routed requests on otherwise unmatched paths forward the original path
-unchanged. This lets clients use the same base URL for API and sandbox data
-traffic when they send routing headers.</li>
-<li>When sandbox proxy domains are configured, host-based URLs shaped like
-<code>{port}-{sandboxID}.{domain}</code> forward the original path without routing
-headers.</li>
-</ul>
-<p>Query strings are forwarded unchanged.</p>
-<h2 id="required-headers"><a class="header" href="#required-headers">Required Headers</a></h2>
-<p>Each proxied request must identify the target sandbox and port:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Header</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>x-agentenv-sandbox-id</code></td><td>Sandbox UUID to route to</td></tr>
-<tr><td><code>x-agentenv-target-port</code></td><td>Port of the service inside the sandbox</td></tr>
-</tbody>
-</table>
-</div>
-<p>E2B-compatible aliases are also accepted:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Header</th><th>Alias for</th></tr>
-</thead>
-<tbody>
-<tr><td><code>e2b-sandbox-id</code></td><td><code>x-agentenv-sandbox-id</code></td></tr>
-<tr><td><code>e2b-sandbox-port</code></td><td><code>x-agentenv-target-port</code></td></tr>
-</tbody>
-</table>
-</div>
-<p>These routing headers are stripped before the request is forwarded to the sandbox.</p>
-<h2 id="access-control"><a class="header" href="#access-control">Access Control</a></h2>
-<p>Proxy authentication is independent from AgentENV API authentication:</p>
-<ul>
-<li>Public application ingress (<code>allowPublicTraffic: true</code>, the default) requires
-no AgentENV credential.</li>
-<li>Private application ingress (<code>allowPublicTraffic: false</code>) requires the
-sandbox’s <code>trafficAccessToken</code> in <code>e2b-traffic-access-token</code>.</li>
-<li>Secure envd traffic requires the sandbox’s <code>envdAccessToken</code> in
-<code>X-Access-Token</code>. Insecure envd traffic has no envd token.</li>
-</ul>
-<p><code>X-API-Key</code> authenticates AgentENV control-plane APIs only. It does not grant
-access to private application ingress or secure envd. A matching platform key
-is stripped on proxy requests; other <code>X-API-Key</code> values remain available to
-sandbox applications. AgentENV also strips the traffic token, and forwards
-<code>X-Access-Token</code> only to the matching secure envd port.</p>
-<p>Host-based proxy requests derive both values from <code>Host</code>, for example
-<code>http://8080-&lt;sandbox-uuid&gt;.sandbox.example.com/health</code> targets port <code>8080</code>.
-The configured domain must route to the AgentENV server in single-node mode or
-to the gateway in multi-node mode. Host-based proxy traffic is always treated as
-data-plane traffic; lifecycle and other control-plane APIs should use the base
-API host.</p>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="api-reference"><a href="#api-reference" class="header">API Reference</a></h1>
-<style>
-  main { padding: 0 !important; }
-</style>
-<iframe id="swagger-frame" src="../swagger-ui.html" scrolling="no" style="width:100%; border:none; display:block; min-height:600px;">
-</iframe>
-<script>
-document.getElementById('swagger-frame').addEventListener('load', function () {
-  var frame = this;
-  var resize = function () {
-    frame.style.height = frame.contentDocument.documentElement.scrollHeight + 'px';
-  };
-  resize();
-  new ResizeObserver(resize).observe(frame.contentDocument.body);
-});
-</script>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="e2b"><a class="header" href="#e2b">E2B</a></h1>
-<h2 id="e2b-sdk"><a class="header" href="#e2b-sdk">E2B SDK</a></h2>
-<p>AgentENV exposes an E2B-compatible API, so the official <a href="https://github.com/e2b-dev/e2b">E2B SDK</a> works out of the box.</p>
-<h3 id="general-settings"><a class="header" href="#general-settings">General Settings</a></h3>
-<p>Set environment variables to point at your AgentENV server. See <a href="#environment-variables">Environment Variables</a> for values per deployment mode.</p>
-<pre><code class="language-bash"># Single-node example
-export E2B_API_URL=http://127.0.0.1:8000
-export E2B_SANDBOX_URL=${E2B_API_URL}
-export E2B_API_KEY=${AENV_API_KEY}
-</code></pre>
-<p>AgentENV returns <code>trafficAccessToken</code> when <code>network.allowPublicTraffic</code> is false
-and (for secure sandboxes)
-<code>envdAccessToken</code> for envd control traffic. These credentials have different
-headers and trust boundaries: use <code>e2b-traffic-access-token</code> for private
-application routes and <code>X-Access-Token</code> only for envd. Public application
-routes require neither token.</p>
-<h3 id="typescript-sdk"><a class="header" href="#typescript-sdk">TypeScript SDK</a></h3>
-<h4 id="setup-1"><a class="header" href="#setup-1">Setup</a></h4>
-<p>Install the SDK:</p>
-<pre><code class="language-bash">npm install e2b
-</code></pre>
-<h4 id="usage"><a class="header" href="#usage">Usage</a></h4>
-<pre><code class="language-typescript">import { Sandbox } from "e2b";
-
-// Create a sandbox from a template
-const sandbox = await Sandbox.create("&lt;template-id&gt;", {
-  apiKey: process.env.E2B_API_KEY,
-});
-
-// List running sandboxes
-const running = Sandbox.list({
-  apiKey: process.env.E2B_API_KEY,
-  limit: 20,
-  query: { state: ["running"] },
-});
-console.log(await running.nextItems());
-
-// Run a command inside the sandbox
-sandbox.commands.run("echo hello world");
-
-// Pause the sandbox
-await Sandbox.Pause(sandbox.sandboxId, {
-  apiKey: process.env.E2B_API_KEY,
-});
-
-// Kill the sandbox
-await sandbox.kill();
-</code></pre>
-<p>Replace <code>&lt;template-id&gt;</code> with a template that exists in your local template store. Use <code>e2b template list</code> or <code>GET /v2/templates</code> to see available templates.</p>
-<h3 id="python-sdk"><a class="header" href="#python-sdk">Python SDK</a></h3>
-<h4 id="setup-1-1"><a class="header" href="#setup-1-1">Setup</a></h4>
-<p>Install the SDK:</p>
-<pre><code class="language-bash">pip install e2b
-</code></pre>
-<h4 id="usage-1"><a class="header" href="#usage-1">Usage</a></h4>
-<pre><code class="language-python">from e2b import Sandbox, SandboxQuery, SandboxState
-
-# Reuse the environment variables set in your shell:
-# E2B_API_URL / E2B_SANDBOX_URL / E2B_API_KEY
-
-# Create a sandbox from a template
-sandbox = Sandbox.create("&lt;template-id&gt;")
-
-# List running sandboxes
-running = Sandbox.list(
-    limit=20,
-    query=SandboxQuery(state=[SandboxState.RUNNING]),
-)
-print(running.next_items())
-
-# Run a command inside the sandbox
-result = sandbox.commands.run("echo hello world")
-print(result.stdout, end="")
-
-# Pause the sandbox
-sandbox.beta_pause()
-
-# Kill the sandbox
-sandbox.kill()
-</code></pre>
-<h2 id="e2b-cli"><a class="header" href="#e2b-cli">E2B CLI</a></h2>
-<p>AgentENV is compatible with the E2B CLI, but we recommend using the
-<a href="#aenv-cli-reference">aenv CLI</a> for AgentENV workflows.</p>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="common-issues"><a class="header" href="#common-issues">Common Issues</a></h1>
-<h2 id="devkvm-is-missing-or-inaccessible"><a class="header" href="#devkvm-is-missing-or-inaccessible"><code>/dev/kvm</code> is missing or inaccessible</a></h2>
-<p><strong>Symptom</strong>: The server cannot find or open <code>/dev/kvm</code>.</p>
-<p><strong>Solution</strong>: First check whether standard KVM is available:</p>
-<pre><code class="language-bash">ls -l /dev/kvm
-</code></pre>
-<p>If the device exists, ensure it is readable and writable by the runtime user.
-On most systems:</p>
-<pre><code class="language-bash">sudo usermod -aG kvm $USER
-# Log out and back in for the group change to take effect
-</code></pre>
-<p>If the cloud server does not expose standard KVM, follow
-<a href="#pvm-deployment">PVM Deployment</a>. That guide covers the additional host
-setup needed before starting AgentENV.</p>
-<h2 id="the-configured-virtualization-mode-does-not-match-the-host"><a class="header" href="#the-configured-virtualization-mode-does-not-match-the-host">The configured virtualization mode does not match the host</a></h2>
-<p><strong>Symptom</strong>: Startup reports that KVM cannot run while the PVM module is
-loaded, or that PVM requires additional host setup.</p>
-<p><strong>Solution</strong>: Normal installations should use the default KVM mode. If the
-host was prepared for PVM, follow <a href="#pvm-deployment">PVM Deployment</a> and
-ensure the service environment contains:</p>
-<pre><code class="language-bash">AENV_VIRTUALIZATION_MODE=pvm
-</code></pre>
-<h2 id="permission-denied-for-network-operations"><a class="header" href="#permission-denied-for-network-operations">Permission denied for network operations</a></h2>
-<p><strong>Symptom</strong>: Sandbox creation fails with network namespace or iptables errors.</p>
-<p><strong>Solution</strong>: The server requires both <code>CAP_NET_ADMIN</code> and <code>CAP_SYS_ADMIN</code> in
-its effective, permitted, and inheritable sets. The installed systemd unit
-configures these automatically. For a source checkout, use <code>make start-server</code>
-or <code>scripts/run-with-capabilities.sh &lt;server-binary&gt;</code>; do not run the whole
-server as root. Also verify that the runtime account belongs to the <code>kvm</code>
-group, can open <code>/dev/kvm</code>, and can open <code>/dev/ublk-control</code>.</p>
-<h2 id="sandbox-namespaces-are-missing-from-ip-netns-list"><a class="header" href="#sandbox-namespaces-are-missing-from-ip-netns-list">Sandbox namespaces are missing from <code>ip netns list</code></a></h2>
-<p><strong>Symptom</strong>: Sandboxes are running, but <code>ip netns list</code> does not show their
-network namespaces and <code>ip netns exec &lt;name&gt;</code> cannot find them.</p>
-<p><strong>Solution</strong>: AgentENV stores namespace mount points under
-<code>$AENV_RUNTIME_PATH/netns</code> instead of <code>/var/run/netns</code>; the installed service
-uses <code>/run/aenv/netns</code>. Inspect that directory directly and enter a namespace
-by path when needed:</p>
-<pre><code class="language-bash">sudo nsenter --net=/run/aenv/netns/agentenv-ns-&lt;slot&gt; ip addr
-</code></pre>
-<h2 id="config-file-not-found"><a class="header" href="#config-file-not-found">Config file not found</a></h2>
-<p><strong>Symptom</strong>: <code>Error: config file not found</code></p>
-<p><strong>Solution</strong>: The server looks for <code>config/default.toml</code> by default. Either run from the repository root or set <code>AENV_CONFIG_PATH</code>:</p>
-<pre><code class="language-bash">export AENV_CONFIG_PATH=/path/to/your/config.toml
-</code></pre>
-<h2 id="port-already-in-use"><a class="header" href="#port-already-in-use">Port already in use</a></h2>
-<p><strong>Symptom</strong>: <code>Address already in use</code> when starting the server.</p>
-<p><strong>Solution</strong>: Another process is using port 8000. Either stop it or change the listen address:</p>
-<pre><code class="language-bash">API_ADDR=0.0.0.0:8001 make start-server
-</code></pre>
-<h2 id="sandbox-creation-timeout"><a class="header" href="#sandbox-creation-timeout">Sandbox creation timeout</a></h2>
-<p><strong>Symptom</strong>: <code>POST /sandboxes</code> returns a timeout error.</p>
-<p><strong>Solution</strong>: Check that runtime assets (Firecracker binary, kernel, rootfs) have been downloaded. The server auto-provisions them on first start, but network issues can cause failures. Run <code>cargo run --bin server -- --setup-only</code> to provision manually and see detailed errors.</p>
-<p>Also check <code>[envd].init_timeout_secs</code> in your config. The default is 60 seconds. If the rootfs image is large, the in-guest envd daemon may need more time to initialize.</p>
-<blockquote>
-<p>TODO: Expand with more common issues as they are reported.</p>
-</blockquote>
-<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="agentenv-architecture"><a class="header" href="#agentenv-architecture">AgentENV Architecture</a></h1>
 <p>AgentENV runs AI agents inside isolated, snapshot-capable Firecracker microVMs. Its core is a <strong>storage subsystem</strong> that provides layered block devices mountable into VMs and ublk-backed memory snapshot restore. The system also includes a per-node <strong>orchestrator</strong> managing sandbox lifecycle, and a <strong>distributed control plane</strong> (gateway + scheduler) for multi-node routing.</p>
 <h2 id="system-overview-1"><a class="header" href="#system-overview-1">System Overview</a></h2>
@@ -3176,7 +3531,25 @@ by path when needed:</p>
     style node fill:transparent,stroke:gray
 </pre>
 
-<h2 id="storage-1"><a class="header" href="#storage-1">Storage</a></h2>
+<h2 id="key-components"><a class="header" href="#key-components">Key Components</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Component</th><th>Location</th><th>Responsibility</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>API Server</strong></td><td><code>src/api/</code></td><td>Exposes the E2B-compatible HTTP API and reverse proxy endpoints.</td></tr>
+<tr><td><strong>Orchestrator</strong></td><td><code>src/orchestrator/</code></td><td>Coordinates sandbox lifecycle transitions, persistence, and cleanup.</td></tr>
+<tr><td><strong>Firecracker Runtime</strong></td><td><code>src/sandbox/firecracker/</code></td><td>Creates and controls the microVM used by each sandbox.</td></tr>
+<tr><td><strong>Block Device Layer</strong></td><td><code>storage/overlaybd/</code>, <code>storage/ublk/</code></td><td>Provides layered root filesystems, attached drives, and snapshot-backed block devices.</td></tr>
+<tr><td><strong>envd Integration</strong></td><td><code>thirdparty/envd/</code>, <code>src/sandbox/</code></td><td>Handles in-guest command execution, file operations, process interaction, and health reporting.</td></tr>
+<tr><td><strong>Reverse Proxy</strong></td><td><code>src/api/proxy.rs</code></td><td>Routes HTTP, SSE, and WebSocket traffic to services inside sandboxes.</td></tr>
+<tr><td><strong>Snapshot Manager</strong></td><td><code>src/snapshot/</code></td><td>Commits, resolves, and deletes durable sandbox snapshots.</td></tr>
+<tr><td><strong>Template Builder</strong></td><td><code>src/template/</code></td><td>Builds user-facing templates and publishes their committed snapshots.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="storage"><a class="header" href="#storage">Storage</a></h2>
 <p>The storage subsystem turns layered image files into block devices mountable by VMs, and provides ublk-backed memory snapshot restore for snapshot resume. Four crates compose the active subsystem:</p>
 <h3 id="overlaybd-storageoverlaybd"><a class="header" href="#overlaybd-storageoverlaybd">overlaybd (<code>storage/overlaybd/</code>)</a></h3>
 <p>LSMT (Log Structured Merge Tree) based layered image format.</p>
@@ -3406,7 +3779,9 @@ services/                       # distributed control plane (Go)
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="sandbox-network-architecture"><a class="header" href="#sandbox-network-architecture">Sandbox Network Architecture</a></h1>
 <p>This document describes the network data plane for one AgentENV node. It covers the Linux network namespaces used by Firecracker sandboxes, host and namespace iptables, runtime egress policy updates, and the namespace-local egress proxy.</p>
-<p>The user-facing policy contract is documented in <a href="#network-access">Sandbox Network Access</a>. This page explains how that contract is implemented.</p>
+<p>The user-facing policy contract is documented in the public
+<a href="https://github.com/kvcache-ai/AgentENV/blob/main/docs/src/concepts/sandboxes.md#network-access">Sandboxes documentation</a>.
+This page explains how that contract is implemented.</p>
 <h2 id="topology"><a class="header" href="#topology">Topology</a></h2>
 <p>Each running sandbox has a dedicated network namespace. The Firecracker VM is connected to the namespace through a TAP device. The namespace is connected to the host through a veth pair; the namespace side is named <code>vpeer</code> and the host side is named <code>veth-{slot}</code>.</p>
 <pre class="mermaid">flowchart LR
@@ -4688,6 +5063,32 @@ network namespaces are missing</li>
 </tbody>
 </table>
 </div>
+<h2 id="snapshot-storage-model"><a class="header" href="#snapshot-storage-model">Snapshot Storage Model</a></h2>
+<p>Snapshot data passes through three storage layers with different ownership and
+lifetime rules:</p>
+<ol>
+<li><strong>Builder staging</strong> is a manager-owned temporary workspace under
+<code>&lt;snapshot.local_cache_path&gt;/snapshots/&lt;id&gt;/</code>. It holds local rootfs,
+memory, VM-state, and attached-drive artifacts while a build or capture is
+in progress. It is not the durable snapshot record.</li>
+<li><strong>The committed snapshot repository</strong> stores the snapshot catalog,
+aliases, <code>snapshot.json</code>, <code>firecracker-manifest.json</code>, <code>vm_state.bin</code>, and
+referenced managed layers. This is the durable source of truth exposed by
+the template and snapshot APIs.</li>
+<li><strong>The node-local runtime cache</strong> materializes runnable rootfs, memory, and
+drive <code>image.json</code> files under
+<code>&lt;snapshot.local_cache_path&gt;/runtime/&lt;id&gt;/</code> before launch. These files are
+derived runtime inputs and can be rebuilt from committed state.</li>
+</ol>
+<p>The committed <code>snapshot.json</code> records the captured runtime context, startup
+configuration, and rootfs, drive, and memory layer references. The Firecracker
+manifest records launch metadata such as virtual sizes and attached-drive
+configuration. Temporary upper files and generated <code>image.json</code> files are not
+committed snapshot truth.</p>
+<p>During runtime resolution, AgentENV converts the committed layer references
+into node-local rootfs, memory, and attached-drive configs, hydrates the
+Firecracker manifest with node-local paths, and resolves the committed
+<code>vm_state.bin</code> into a runnable path.</p>
 <h2 id="image-resolver"><a class="header" href="#image-resolver">Image Resolver</a></h2>
 <p>Owned by <code>src/image/*</code>.</p>
 <div class="table-wrapper">
@@ -5126,7 +5527,7 @@ make deploy-ps      # status
 make deploy-logs    # logs
 make deploy-down    # teardown
 </code></pre>
-<h3 id="kubernetes-1"><a class="header" href="#kubernetes-1">Kubernetes</a></h3>
+<h3 id="kubernetes"><a class="header" href="#kubernetes">Kubernetes</a></h3>
 <pre><code class="language-bash">make k8s-render     # render manifests
 make k8s-apply      # apply to cluster
 </code></pre>

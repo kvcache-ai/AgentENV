@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "../searchindex-6a10619c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5437f69c.js"></script>
+        <script src="../toc-0fdd41d5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -279,6 +279,32 @@
 </tbody>
 </table>
 </div>
+<h2 id="snapshot-storage-model"><a class="header" href="#snapshot-storage-model">Snapshot Storage Model</a></h2>
+<p>Snapshot data passes through three storage layers with different ownership and
+lifetime rules:</p>
+<ol>
+<li><strong>Builder staging</strong> is a manager-owned temporary workspace under
+<code>&lt;snapshot.local_cache_path&gt;/snapshots/&lt;id&gt;/</code>. It holds local rootfs,
+memory, VM-state, and attached-drive artifacts while a build or capture is
+in progress. It is not the durable snapshot record.</li>
+<li><strong>The committed snapshot repository</strong> stores the snapshot catalog,
+aliases, <code>snapshot.json</code>, <code>firecracker-manifest.json</code>, <code>vm_state.bin</code>, and
+referenced managed layers. This is the durable source of truth exposed by
+the template and snapshot APIs.</li>
+<li><strong>The node-local runtime cache</strong> materializes runnable rootfs, memory, and
+drive <code>image.json</code> files under
+<code>&lt;snapshot.local_cache_path&gt;/runtime/&lt;id&gt;/</code> before launch. These files are
+derived runtime inputs and can be rebuilt from committed state.</li>
+</ol>
+<p>The committed <code>snapshot.json</code> records the captured runtime context, startup
+configuration, and rootfs, drive, and memory layer references. The Firecracker
+manifest records launch metadata such as virtual sizes and attached-drive
+configuration. Temporary upper files and generated <code>image.json</code> files are not
+committed snapshot truth.</p>
+<p>During runtime resolution, AgentENV converts the committed layer references
+into node-local rootfs, memory, and attached-drive configs, hydrates the
+Firecracker manifest with node-local paths, and resolves the committed
+<code>vm_state.bin</code> into a runnable path.</p>
 <h2 id="image-resolver"><a class="header" href="#image-resolver">Image Resolver</a></h2>
 <p>Owned by <code>src/image/*</code>.</p>
 <div class="table-wrapper">

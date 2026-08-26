@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "../searchindex-6a10619c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5437f69c.js"></script>
+        <script src="../toc-0fdd41d5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -205,6 +205,16 @@ AgentENV runtime nodes:</p>
 </tbody>
 </table>
 </div>
+<pre class="mermaid">flowchart LR
+    client["Client"] --&gt;|"HTTP / WebSocket"| gateway["Gateway&lt;br/&gt;10.0.0.10:8080"]
+    gateway --&gt;|"gRPC"| scheduler["Scheduler&lt;br/&gt;10.0.0.10:9090"]
+    gateway --&gt;|"HTTP proxy"| nodeA["Runtime node A&lt;br/&gt;10.0.0.21:8000"]
+    gateway --&gt;|"HTTP proxy"| nodeB["Runtime node B&lt;br/&gt;10.0.0.22:8000"]
+    nodeA -.-&gt;|"heartbeat"| scheduler
+    nodeB -.-&gt;|"heartbeat"| scheduler
+    scheduler -.-&gt;|"placement and lookup"| gateway
+</pre>
+
 <p>AgentENV authenticates HTTP requests but does not encrypt them. Use private
 addresses, a VPN, or TLS termination before traffic crosses an untrusted
 network.</p>

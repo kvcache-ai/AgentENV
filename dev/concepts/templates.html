@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "../searchindex-6a10619c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5437f69c.js"></script>
+        <script src="../toc-0fdd41d5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,35 +182,40 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="templates"><a class="header" href="#templates">Templates</a></h1>
-<p>A template is the user-facing wrapper around a committed snapshot. Instead of
-booting a fresh VM and installing software every time, you build a template
-once and later create sandboxes from it in milliseconds.</p>
-<h2 id="how-templates-work"><a class="header" href="#how-templates-work">How Templates Work</a></h2>
-<ol>
-<li><strong>Define</strong>: specify an overlaybd-backed base rootfs and ordered steps such as <code>run</code>, <code>env</code>, and <code>workdir</code>.</li>
-<li><strong>Build</strong>: AgentENV boots a temporary sandbox and executes those steps inside it.</li>
-<li><strong>Finalize</strong>: optional startup commands can be started and checked for readiness before the snapshot is captured.</li>
-<li><strong>Publish</strong>: the result is committed as a snapshot in the snapshot repository.</li>
-<li><strong>Launch</strong>: creating a sandbox from a template resolves the committed snapshot and resumes from it.</li>
-</ol>
+<p>A template is a reusable starting point for launching sandboxes. Build or
+import it once, then use it to create sandboxes whenever you need the same
+software and configuration.</p>
 <h2 id="create-your-template"><a class="header" href="#create-your-template">Create Your Template</a></h2>
 <p>There are two ways to create a template: <code>aenv pull</code> imports an OCI image directly, and <code>aenv build</code> runs Dockerfile instructions inside a temporary build sandbox.</p>
+<p>Some defaults below come from your AgentENV config file. This is
+<code>config/default.toml</code> by default, or the file specified by
+<code>AENV_CONFIG_PATH</code>.</p>
 <h3 id="aenv-pull"><a class="header" href="#aenv-pull">aenv pull</a></h3>
-<p>Pulling an existing OCI image as a template:</p>
-<pre><code class="language-bash">aenv pull ubuntu:24.04
+<p>Pull an existing OCI image as a template and optionally give it a memorable name:</p>
+<p>Usage:</p>
+<pre><code class="language-bash">aenv pull &lt;image&gt; [options]
 </code></pre>
+<p>Example:</p>
+<pre><code class="language-bash">aenv pull ubuntu:24.04
+aenv pull ubuntu:24.04 --name my-base
+</code></pre>
+<p><code>--name</code> is optional. Without it, AgentENV uses the image repository name. A template name can
+be used anywhere a template ID is accepted.</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Flag</th><th>Description</th></tr>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--name &lt;name&gt;</code></td><td>Template name. Defaults to the repository segment of the image</td></tr>
-<tr><td><code>--start-cmd &lt;cmd&gt;</code></td><td>Command to run before capturing the snapshot</td></tr>
-<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td>Shell command polled every 2 s until exit 0; gates snapshot capture</td></tr>
-<tr><td><code>--probe &lt;port&gt;</code></td><td>Readiness check: wait for TCP on <code>localhost:&lt;port&gt;</code></td></tr>
-<tr><td><code>-d</code>, <code>--detach</code></td><td>Submit the build and return without waiting</td></tr>
-<tr><td><code>--timeout &lt;secs&gt;</code></td><td>Maximum time to wait for the build to complete</td></tr>
+<tr><td><code>&lt;image&gt;</code></td><td>Required</td><td>OCI image reference. Short names such as <code>ubuntu:24.04</code> and full references are supported.</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Image repository name</td><td>Assign a human-readable template name.</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your config file</td><td>Set the template’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set the template’s memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>--start-cmd &lt;cmd&gt;</code></td><td>None</td><td>Run a command before capturing the template snapshot.</td></tr>
+<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td><code>sleep 20</code> when <code>--start-cmd</code> is set; otherwise none</td><td>Poll a shell command every two seconds until it exits successfully.</td></tr>
+<tr><td><code>--probe &lt;port&gt;</code></td><td>None</td><td>Wait for TCP on <code>localhost:&lt;port&gt;</code>. Cannot be combined with <code>--ready-cmd</code>.</td></tr>
+<tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Submit the build and return immediately instead of waiting.</td></tr>
+<tr><td><code>--timeout &lt;seconds&gt;</code></td><td>No timeout</td><td>Limit how long the CLI waits for the build. Cannot be combined with <code>--detach</code>.</td></tr>
 </tbody>
 </table>
 </div>
@@ -220,19 +225,28 @@ once and later create sandboxes from it in milliseconds.</p>
 <p>⚠️ <strong>Experimental</strong> — Not recommended for production use.</p>
 </blockquote>
 <p>Build a template by running Dockerfile instructions inside a temporary sandbox:</p>
-<pre><code class="language-bash">aenv build ./Dockerfile --name my-template
+<pre><code class="language-bash">aenv build &lt;dockerfile&gt; --name &lt;name&gt; [options]
 </code></pre>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Flag</th><th>Description</th></tr>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--name &lt;name&gt;</code></td><td>Required template name</td></tr>
-<tr><td><code>--image &lt;ref&gt;</code></td><td>Override the <code>FROM</code> image</td></tr>
+<tr><td><code>&lt;dockerfile&gt;</code></td><td>Required</td><td>Path to the Dockerfile.</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Required</td><td>Assign the template name.</td></tr>
+<tr><td><code>--image &lt;ref&gt;</code></td><td>First concrete <code>FROM</code> image</td><td>Override the base image. If the Dockerfile has no usable <code>FROM</code>, <code>[image.resolver].default_image</code> from your config file is used. Alias: <code>--user-image</code>.</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your config file</td><td>Set the template’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set the template’s memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
 </tbody>
 </table>
 </div>
+<p><code>aenv build</code> and <code>aenv pull --detach</code> submit the build and return immediately. Watch it until it
+succeeds or fails by passing the template name or ID:</p>
+<pre><code class="language-bash">aenv template watch my-template
+</code></pre>
+<p><code>aenv template watch</code> has no timeout option. Stop the
+local watch with <code>Ctrl-C</code>; the remote build continues.</p>
 <p>Supported Dockerfile instructions:</p>
 <div class="table-wrapper">
 <table>
@@ -271,31 +285,17 @@ corresponding Dockerfile instructions executed during the build. The following f
 </tbody>
 </table>
 </div>
-<h3 id="aliases"><a class="header" href="#aliases">Aliases</a></h3>
-<p>Each template is identified by a UUID. Pass <code>--name</code> at creation time to assign
-a human-readable alias:</p>
-<pre><code class="language-bash">aenv pull ubuntu:24.04 --name my-base
-aenv build ./Dockerfile --name my-service
-</code></pre>
-<p>The alias can be used wherever a template ID is accepted:</p>
-<pre><code class="language-bash">aenv start my-base
-aenv template delete my-service
-</code></pre>
 <h2 id="manage-templates"><a class="header" href="#manage-templates">Manage Templates</a></h2>
 <h3 id="list-templates"><a class="header" href="#list-templates">List templates</a></h3>
 <pre><code class="language-bash">aenv template list        # alias: aenv template ls
+aenv template list --output json
 </code></pre>
-<p>Displays all templates with their ID, name, build status, CPU, memory, disk size, and last-updated timestamp.</p>
+<p>Displays all templates with their ID, name, build status, CPU, memory, disk
+size, and last-updated timestamp. <code>--output</code> accepts <code>table</code> or <code>json</code>. It
+defaults to <code>table</code> in an interactive terminal and <code>json</code> when output is piped
+or redirected.</p>
 <h3 id="delete-a-template"><a class="header" href="#delete-a-template">Delete a template</a></h3>
 <pre><code class="language-bash">aenv template delete &lt;template-id-or-name&gt;   # alias: aenv template rm
-</code></pre>
-<h3 id="watch-a-build"><a class="header" href="#watch-a-build">Watch a build</a></h3>
-<p><code>aenv build</code> always detaches immediately after submitting. Use <code>watch</code> to follow the build status until it succeeds or fails:</p>
-<pre><code class="language-bash">aenv template watch &lt;template-id-or-name&gt;
-</code></pre>
-<h3 id="start-a-sandbox-from-a-template"><a class="header" href="#start-a-sandbox-from-a-template">Start a sandbox from a template</a></h3>
-<pre><code class="language-bash">aenv start &lt;template-id-or-name&gt;      # start and attach an interactive shell
-aenv start -d &lt;template-id-or-name&gt;   # detach: print sandbox ID and exit
 </code></pre>
 <h2 id="relationship-to-snapshots"><a class="header" href="#relationship-to-snapshots">Relationship to Snapshots</a></h2>
 <p>Templates are the API and UX layer. Snapshots are the durable runtime layer.</p>
@@ -311,7 +311,7 @@ aenv start -d &lt;template-id-or-name&gt;   # detach: print sandbox ID and exit
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../concepts/overview.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../concepts/authentication.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
@@ -325,7 +325,7 @@ aenv start -d &lt;template-id-or-name&gt;   # detach: print sandbox ID and exit
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../concepts/overview.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../concepts/authentication.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 

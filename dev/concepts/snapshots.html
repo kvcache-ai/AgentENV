@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "../searchindex-6a10619c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5437f69c.js"></script>
+        <script src="../toc-0fdd41d5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,8 +182,9 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <h1 id="snapshots"><a class="header" href="#snapshots">Snapshots</a></h1>
-<p>Snapshots are the durable runtime primitive in AgentENV. Everything else is
-built on top of them:</p>
+<p>A snapshot is a reusable checkpoint of a sandbox. It preserves the sandbox’s
+filesystem and runtime state so that you can later start a new sandbox from the
+same point instead of rebuilding the environment and rerunning setup work.</p>
 <ul>
 <li><strong>Templates</strong> are stored as snapshots. A template build commits one snapshot;
 the template ID is an alias that resolves to it.</li>
@@ -192,183 +193,145 @@ the template ID is an alias that resolves to it.</li>
 state for later reuse or branching.</li>
 </ul>
 <h2 id="create-a-snapshot-from-a-running-sandbox"><a class="header" href="#create-a-snapshot-from-a-running-sandbox">Create a Snapshot from a Running Sandbox</a></h2>
-<p>Capture the current state of a live sandbox:</p>
+<p>Capture the current state of a running sandbox:</p>
 <pre><code class="language-bash">aenv snapshot create &lt;sandbox-id&gt;
 aenv snapshot create &lt;sandbox-id&gt; --name my-checkpoint
 </code></pre>
-<p>Pass <code>--name</code> to assign a human-readable alias. The alias can then be used with
-<code>aenv start</code> or any command that accepts a snapshot ID.</p>
-<p>The sandbox transitions through <code>Running → Snapshotting → Running</code> during
-capture; the sandbox continues running after the snapshot is committed.
-Recoverable failures leave the sandbox running and surface the error to the
-caller. Terminal failures — where the runtime was mutated past safe resume —
-tear down the sandbox.</p>
-<h2 id="overlaybd-image-publication"><a class="header" href="#overlaybd-image-publication">OverlayBD Image Publication</a></h2>
-<p>When the snapshot repository backend is <code>oss</code> and <code>[snapshot.image_publish]</code> is
-enabled, publishing a snapshot also writes its rootfs back to the original
-OverlayBD-native OCI registry as an image tag:</p>
-<pre><code class="language-text">Created snapshot 018f0d93-aaaa-bbbb-cccc-0123456789ab
-Image: registry.example.com/team/app:agentenv-snapshot-018f0d93-aaaa-bbbb-cccc-0123456789ab
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;sandbox-id&gt;</code></td><td>Required</td><td>ID of the running sandbox to capture.</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>None</td><td>Assigns a human-readable alias. If omitted, use the generated snapshot ID returned by the command.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The source sandbox continues running after the snapshot is created. You can
+then pass either the snapshot ID or its alias to <code>aenv start</code>:</p>
+<pre><code class="language-bash">aenv start my-checkpoint
+# Or:
+aenv start &lt;snapshot-id&gt;
 </code></pre>
-<p>The tag lives in the same registry and repository as the source image.
-Publication is incremental: layers already present in that repository (the
-base image and previously published snapshot deltas) are referenced by digest
-and never re-uploaded; only new runtime delta layers are pushed. The result is
-an OverlayBD-native OCI image that can be used directly as a <code>userImage</code> to
-cold boot new sandboxes.</p>
-<p>Notes:</p>
-<ul>
-<li>The image contains only the root filesystem. Memory state and <code>vm_state.bin</code>
-remain in the snapshot repository, so resuming with full memory state still
-requires starting from the snapshot itself.</li>
-<li>The published reference is returned as <code>imageRef</code> in snapshot create/GET/list
-API responses and shown by <code>aenv snapshot create</code> and <code>aenv snapshot list</code>.</li>
-<li>Snapshots created from non-OverlayBD-native source images, or created while
-publication is disabled, do not produce an <code>imageRef</code>.</li>
-<li>AgentENV never overwrites an existing generated snapshot tag. Registry
-administrators can still move or replace tags through external tooling.</li>
-<li>Deleting a snapshot also attempts to delete its published manifest from the
-registry.</li>
-</ul>
-<p>Published rootfs images preserve the snapshot’s effective OCI runtime fields
-(<code>Env</code>, <code>WorkingDir</code>, <code>User</code>, <code>Entrypoint</code>, <code>Cmd</code>, <code>ExposedPorts</code>, <code>Volumes</code>,
-and <code>Labels</code>) and retain unmodeled fields from the source rootfs config when
-available. AgentENV-specific startup commands remain snapshot metadata and are
-not converted into OCI <code>Entrypoint</code> or <code>Cmd</code>; use explicit OCI command metadata
-when that behavior must survive image export. Republishing a snapshot with this
-metadata changes its manifest digest, so an existing published tag still
-requires a new tag or deletion.</p>
-<h2 id="export-a-snapshot-rootfs-as-a-standalone-oci-image"><a class="header" href="#export-a-snapshot-rootfs-as-a-standalone-oci-image">Export a Snapshot Rootfs as a Standalone OCI Image</a></h2>
-<p><code>aenv-snapshot-image</code> (build with <code>make build-snapshot-image</code>; not part of the
-server binary, Docker image, or install packages) publishes a committed
-snapshot’s rootfs — never attached drives or memory — as an OverlayBD-native
-OCI image and prints the image reference on stdout (logs go to stderr):</p>
+<p>This creates a separate sandbox with a new sandbox ID. It inherits the captured
+filesystem, running processes, memory state, environment variables, runtime
+configuration, and resource settings.</p>
+<h2 id="use-a-snapshot-rootfs-as-an-oci-image"><a class="header" href="#use-a-snapshot-rootfs-as-an-oci-image">Use a Snapshot Rootfs as an OCI Image</a></h2>
+<p>Starting with <code>aenv start &lt;snapshot&gt;</code> restores the complete snapshot state. If
+you only need the captured root filesystem, you can instead publish it as an
+OCI image and cold-start sandboxes from that image.</p>
+<h3 id="publish-an-image-when-creating-a-snapshot"><a class="header" href="#publish-an-image-when-creating-a-snapshot">Publish an Image When Creating a Snapshot</a></h3>
+<p>AgentENV can automatically create and publish an OCI image of the snapshot
+rootfs whenever you create a snapshot. For snapshots backed by OSS and created
+from an OverlayBD-native OCI image, enable automatic publication in your
+AgentENV config file (<code>config/default.toml</code>, or the file selected by
+<code>AENV_CONFIG_PATH</code>):</p>
+<pre><code class="language-toml">[snapshot]
+repository_backend = "oss"
+
+[snapshot.image_publish]
+enabled = true
+</code></pre>
+<p>Create the snapshot:</p>
+<pre><code class="language-bash">aenv snapshot create &lt;sandbox-id&gt; --name my-checkpoint
+</code></pre>
+<p>The command prints the published image reference when publication succeeds.
+Use that reference to cold-start a sandbox:</p>
+<pre><code class="language-bash">aenv start --cold registry.example.com/team/app:agentenv-snapshot-&lt;snapshot-id&gt;
+</code></pre>
+<h3 id="export-an-existing-snapshot-rootfs"><a class="header" href="#export-an-existing-snapshot-rootfs">Export an Existing Snapshot Rootfs</a></h3>
+<p>You can manually export the rootfs of an existing snapshot as an OCI image.
+This is done with <code>aenv-snapshot-image</code>, which is not included in the regular
+AgentENV installation packages and must first be built and installed from the
+repository:</p>
+<pre><code class="language-bash">git clone https://github.com/kvcache-ai/AgentENV.git
+cd AgentENV
+make build-snapshot-image
+sudo install -m 0755 target/debug/aenv-snapshot-image /usr/local/bin/aenv-snapshot-image
+</code></pre>
+<p>Export the rootfs:</p>
 <pre><code class="language-bash">aenv-snapshot-image &lt;snapshot-id-or-alias&gt; \
-  [--target-repository registry.example.com/team/app] [--tag release-1]
+  --target-repository registry.example.com/team/app \
+  --tag release-1
 </code></pre>
-<p>It reads the server config (<code>AENV_CONFIG_PATH</code> or <code>--config</code>) for the
-<code>posix_fs</code>/<code>oss</code> snapshot repository and does all registry I/O through
-<code>regctl</code> (<code>docker login</code> provides credentials). An explicit
-<code>--target-repository</code> defaults to the <code>latest</code> tag. When the target is omitted,
-the tool resolves the original repository from the snapshot’s rootfs
-publication metadata, or from its unique external source, and defaults to
-<code>snapshot-&lt;snapshot-id&gt;</code>. Persisted publication metadata is never treated as
-registry truth: every invocation checks the target manifest. Publishing is
-idempotent through the manifest digest, pre-existing conflicting references
-are refused, and blobs already present at the target are skipped. The conflict
-check is not atomic against concurrent tag writers. The tool records no new
-publication state. If the selected reference is already recorded as a
-snapshot-managed publication, the tool warns that it may be deleted with the
-snapshot; other exported references live independently of snapshot deletion.
-The standalone export preserves the same effective OCI runtime fields described
-under <a href="#overlaybd-image-publication">OverlayBD Image Publication</a>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;snapshot-id-or-alias&gt;</code></td><td>Required</td><td>Snapshot whose rootfs is exported.</td></tr>
+<tr><td><code>--target-repository &lt;registry/repository&gt;</code></td><td>Inferred from the snapshot</td><td>Destination OCI repository. Specify it when a unique source repository cannot be inferred.</td></tr>
+<tr><td><code>--tag &lt;tag&gt;</code></td><td><code>latest</code> for an explicit destination; otherwise <code>snapshot-&lt;snapshot-id&gt;</code></td><td>Tag for the exported image.</td></tr>
+<tr><td><code>--config &lt;path&gt;</code></td><td><code>AENV_CONFIG_PATH</code>, then the default config path</td><td>AgentENV config used to locate the snapshot repository.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The exported image can be stored in an OCI registry, shared independently of
+the AgentENV snapshot repository, and used to cold-start new sandboxes. The new
+sandbox inherits the exported root filesystem and OCI runtime configuration,
+but not the snapshot’s memory or running-process state.</p>
+<p>You can capture it and start a sandbox from the resulting image:</p>
+<pre><code class="language-bash">aenv-snapshot-image &lt;snapshot-id-or-alias&gt; \
+  --target-repository registry.example.com/team/app \
+  --tag release-1
+
+aenv start --cold &lt;image_ref&gt;
+</code></pre>
 <h2 id="manage-snapshots"><a class="header" href="#manage-snapshots">Manage Snapshots</a></h2>
 <h3 id="list-snapshots"><a class="header" href="#list-snapshots">List Snapshots</a></h3>
-<p>List all snapshots, optionally filtered by source sandbox:</p>
-<pre><code class="language-bash">aenv snapshot list                           # alias: aenv snapshot ls
-aenv snapshot ls --sandbox-id &lt;sandbox-id&gt;
+<pre><code class="language-bash">aenv snapshot list
+aenv snapshot list --sandbox-id &lt;sandbox-id&gt;
 </code></pre>
-<p>The <code>--sandbox-id</code> filter works even after the source sandbox has been deleted.</p>
-<h3 id="start-sandboxes-from-snapshots"><a class="header" href="#start-sandboxes-from-snapshots">Start Sandboxes from Snapshots</a></h3>
-<p>Start a new sandbox from a snapshot:</p>
+<p><code>aenv snapshot ls</code> is an alias for <code>aenv snapshot list</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--sandbox-id &lt;sandbox-id&gt;</code></td><td>All snapshots</td><td>Shows only snapshots created from the specified sandbox, including after that sandbox is deleted.</td></tr>
+<tr><td><code>--output &lt;table|json&gt;</code></td><td>Table in an interactive terminal; JSON when redirected</td><td>Selects the output format.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="start-a-sandbox-from-a-snapshot"><a class="header" href="#start-a-sandbox-from-a-snapshot">Start a Sandbox from a Snapshot</a></h3>
 <pre><code class="language-bash">aenv start &lt;snapshot-id-or-name&gt;
 </code></pre>
-<h3 id="delete-snapshots"><a class="header" href="#delete-snapshots">Delete Snapshots</a></h3>
-<p>Snapshots share the same catalog as templates. To delete a snapshot, use the
-template delete command with the snapshot ID or alias:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;snapshot-id-or-name&gt;</code></td><td>Required</td><td>Snapshot ID or alias to start from.</td></tr>
+<tr><td><code>--secure</code></td><td>Disabled</td><td>Requires an envd access token for sandbox control communication.</td></tr>
+<tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Sets the sandbox TTL; see <a href="sandboxes.html#auto-eviction">Auto-Eviction</a>.</td></tr>
+<tr><td><code>-d</code>, <code>--detach</code></td><td>Disabled</td><td>Prints the new sandbox ID without attaching an interactive shell.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="delete-a-snapshot"><a class="header" href="#delete-a-snapshot">Delete a Snapshot</a></h3>
+<p>Snapshots and templates share the same catalog. Delete a snapshot by passing
+its required ID or alias to the template delete command:</p>
 <pre><code class="language-bash">aenv template delete &lt;snapshot-id-or-name&gt;
 </code></pre>
 <h2 id="optional-p2p-visibility"><a class="header" href="#optional-p2p-visibility">Optional P2P Visibility</a></h2>
-<p>When <code>[p2p].enabled = true</code>, published snapshot artifacts are advertised
-through the node-to-node P2P transport after the repository commit succeeds.
-This makes new artifacts discoverable to peer nodes before slow backend reads
-become the bottleneck:</p>
-<ul>
-<li><code>vm_state.bin</code> and <code>firecracker-manifest.json</code> are advertised under
-snapshot-scoped keys.</li>
-<li>Overlaybd commit layers are advertised under the shared overlaybd layer keys
-(<code>overlaybd-layer/v1/sha256:&lt;digest&gt;</code>), so overlaybd runtime reads can find
-them through the overlaybd P2P facade.</li>
-</ul>
-<p>P2P does not change the committed snapshot model. The snapshot repository
-remains the source of truth, and failed P2P publication does not roll back a
-successful snapshot publish.</p>
-<h2 id="storage"><a class="header" href="#storage">Storage</a></h2>
-<h3 id="three-layer-model"><a class="header" href="#three-layer-model">Three-layer model</a></h3>
-<p>It helps to treat these as three different layers rather than one combined store:</p>
-<p><strong>1. Builder staging</strong></p>
-<p>This is a manager-owned temporary workspace used while executing one build. It
-contains local snapshot artifacts captured from the build sandbox, for example:</p>
-<pre><code class="language-text">&lt;local_cache_path&gt;/
-  snapshots/&lt;id&gt;/
-    vm_state.bin
-    mem_image.json
-    rootfs/
-      image.json
-    drives/&lt;drive-id&gt;/
-      image.json
+<p>P2P visibility lets nodes discover and fetch committed snapshot artifacts from
+peers. The snapshot repository remains the durable source of truth, so P2P is
+an optional distribution path rather than a replacement for snapshot storage.</p>
+<p>Enable both the node-wide P2P transport and snapshot publication in your
+AgentENV config file (<code>config/default.toml</code>, or the file selected by
+<code>AENV_CONFIG_PATH</code>):</p>
+<pre><code class="language-toml">[p2p]
+enabled = true
+
+[snapshot]
+p2p_enabled = true
 </code></pre>
-<p>This directory is a <code>TemplateBuilder</code> implementation detail. It is not the
-durable committed record.</p>
-<p><strong>2. Committed snapshot repository</strong></p>
-<p>Once a build is published, the durable state lives in the snapshot repository:</p>
-<pre><code class="language-text">&lt;snapshot_store&gt;/
-  repository/
-    catalog/
-      aliases/
-    snapshots/&lt;id&gt;/
-      snapshot.json
-      firecracker-manifest.json
-      vm_state.bin
-    managed-layers/
-      &lt;digest&gt;.overlaybd.commit
-</code></pre>
-<p>This repository is the source of truth wrapped by the template API.</p>
-<p><strong>3. Node-local runtime cache</strong></p>
-<p>Before a sandbox is launched, AgentENV derives runnable overlaybd configs from
-the committed snapshot and materializes them in a node-local runtime cache:</p>
-<pre><code class="language-text">&lt;node_local_runtime_cache&gt;/
-  runtime/&lt;id&gt;/
-    memory/
-      image.json
-    rootfs/
-      image.json
-    drives/&lt;drive-id&gt;/
-      image.json
-</code></pre>
-<p>These are launch-time derived runtime inputs, not committed metadata.</p>
-<h3 id="what-a-committed-snapshot-contains"><a class="header" href="#what-a-committed-snapshot-contains">What a committed snapshot contains</a></h3>
-<p>Each committed snapshot is split across two durable files:</p>
-<p><strong><code>snapshot.json</code></strong> contains:</p>
-<ul>
-<li><strong><code>context</code></strong> — the runtime configuration baked in at build time: environment
-variables, working directory, user, exposed ports, volumes, and labels.
-Sandboxes launched from this snapshot inherit these values.</li>
-<li><strong><code>rootfs_layers</code></strong>, <strong><code>attached_drives[].layers</code></strong>, <strong><code>memory_layers</code></strong> —
-overlaybd layer references, either as managed local layers (deduplicated by content digest) or as external OCI registry references.</li>
-<li>Startup configuration.</li>
-</ul>
-<p><strong><code>firecracker-manifest.json</code></strong> contains launch-time metadata not expressed as
-overlay layer lists, including <code>memory.virtual_size</code>, <code>rootfs.virtual_size</code>,
-and per-drive metadata.</p>
-<p>The following files exist only as local build artifacts or node-local derived
-configs and are not committed:</p>
-<ul>
-<li><code>rootfs/image.json</code></li>
-<li><code>drives/&lt;id&gt;/image.json</code></li>
-<li><code>mem_image.json</code></li>
-<li><code>upper.data</code></li>
-<li><code>upper.index</code></li>
-</ul>
-<h3 id="runtime-resolution"><a class="header" href="#runtime-resolution">Runtime resolution</a></h3>
-<p>Before launch, the committed state is resolved into node-local paths:</p>
-<ul>
-<li><code>memory_layers</code> become runtime <code>memory/image.json</code></li>
-<li><code>rootfs.layers</code> become runtime <code>rootfs/image.json</code></li>
-<li><code>attached_drives[].layers</code> become runtime <code>drives/&lt;id&gt;/image.json</code></li>
-<li><code>firecracker-manifest.json</code> is loaded and hydrated with node-local absolute paths</li>
-<li>committed <code>vm_state.bin</code> becomes the runnable vm-state path</li>
-</ul>
+<p>See the <a href="../configuration/reference.html#p2p">Configuration Reference</a>
+for the optional transport, storage-directory, address, and timeout settings.</p>
 
                     </main>
 

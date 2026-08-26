@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "../searchindex-6a10619c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5437f69c.js"></script>
+        <script src="../toc-0fdd41d5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -183,7 +183,9 @@
                     <main>
                         <h1 id="sandbox-network-architecture"><a class="header" href="#sandbox-network-architecture">Sandbox Network Architecture</a></h1>
 <p>This document describes the network data plane for one AgentENV node. It covers the Linux network namespaces used by Firecracker sandboxes, host and namespace iptables, runtime egress policy updates, and the namespace-local egress proxy.</p>
-<p>The user-facing policy contract is documented in <a href="../concepts/sandboxes.html#network-access">Sandbox Network Access</a>. This page explains how that contract is implemented.</p>
+<p>The user-facing policy contract is documented in the public
+<a href="https://github.com/kvcache-ai/AgentENV/blob/main/docs/src/concepts/sandboxes.md#network-access">Sandboxes documentation</a>.
+This page explains how that contract is implemented.</p>
 <h2 id="topology"><a class="header" href="#topology">Topology</a></h2>
 <p>Each running sandbox has a dedicated network namespace. The Firecracker VM is connected to the namespace through a TAP device. The namespace is connected to the host through a veth pair; the namespace side is named <code>vpeer</code> and the host side is named <code>veth-{slot}</code>.</p>
 <pre class="mermaid">flowchart LR

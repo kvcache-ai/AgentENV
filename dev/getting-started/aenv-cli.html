@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "../searchindex-6a10619c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5437f69c.js"></script>
+        <script src="../toc-0fdd41d5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -212,12 +212,14 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--name &lt;name&gt;</code></td><td>Override the template name</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Override the template name. Defaults to the image’s repository segment.</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores for the template. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory for the template. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
 <tr><td><code>--start-cmd &lt;cmd&gt;</code></td><td>Shell command to run inside the sandbox before capturing the template snapshot</td></tr>
-<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td>Shell command used to wait until the sandbox is ready (polled until it exits 0)</td></tr>
-<tr><td><code>--probe &lt;PORT&gt;</code></td><td>Wait until <code>localhost:&lt;PORT&gt;</code> accepts TCP connections</td></tr>
+<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td>Shell command polled until it exits 0. Defaults to <code>sleep 20</code> when <code>--start-cmd</code> is set; otherwise unset.</td></tr>
+<tr><td><code>--probe &lt;PORT&gt;</code></td><td>Wait until <code>localhost:&lt;PORT&gt;</code> accepts TCP connections. Conflicts with <code>--ready-cmd</code>.</td></tr>
 <tr><td><code>-d, --detach</code></td><td>Submit the build and return immediately without waiting</td></tr>
-<tr><td><code>--timeout &lt;SECS&gt;</code></td><td>Maximum seconds to wait for the build to complete</td></tr>
+<tr><td><code>--timeout &lt;SECS&gt;</code></td><td>Maximum seconds to wait for the build to complete. No timeout by default. Conflicts with <code>--detach</code>.</td></tr>
 </tbody>
 </table>
 </div>
@@ -233,15 +235,29 @@ aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
 </thead>
 <tbody>
 <tr><td><code>--name &lt;name&gt;</code></td><td>Required template name</td></tr>
-<tr><td><code>--image &lt;image&gt;</code></td><td>Override the <code>FROM</code> image used as the rootfs base</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores for the template. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory for the template. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>--image &lt;image&gt;</code></td><td>Override the rootfs base. Defaults to the first concrete <code>FROM</code> image, then the server’s <code>[image.resolver].default_image</code> if none is usable. Alias: <code>--user-image</code>.</td></tr>
 </tbody>
 </table>
 </div>
+<p><code>aenv build</code> submits the build and returns immediately. Use
+<code>aenv template watch &lt;template&gt;</code> to wait for completion.</p>
 <h3 id="aenv-template-list"><a class="header" href="#aenv-template-list"><code>aenv template list</code></a></h3>
 <p>List all templates. Alias: <code>aenv template ls</code>, <code>aenv templates list</code>.</p>
 <pre><code class="language-bash">aenv template list
 aenv template list --output json
 </code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--output &lt;table|json&gt;</code></td><td>Output format. Defaults to table on a TTY and JSON when redirected.</td></tr>
+</tbody>
+</table>
+</div>
 <h3 id="aenv-template-watch-template"><a class="header" href="#aenv-template-watch-template"><code>aenv template watch &lt;template&gt;</code></a></h3>
 <p>Watch a template build until it succeeds or fails. Accepts either a template name/alias or a template UUID.</p>
 <pre><code class="language-bash">aenv template watch my-ubuntu
@@ -255,7 +271,8 @@ aenv template delete &lt;template-id&gt;
 <hr>
 <h2 id="sandboxes"><a class="header" href="#sandboxes">Sandboxes</a></h2>
 <h3 id="aenv-start-target"><a class="header" href="#aenv-start-target"><code>aenv start &lt;target&gt;</code></a></h3>
-<p>Start a sandbox and attach an interactive shell. <code>&lt;target&gt;</code> is a template name or template UUID.</p>
+<p>Start a sandbox and attach an interactive shell. <code>&lt;target&gt;</code> accepts a template
+or snapshot ID or alias, or an OCI image reference with <code>--cold</code>.</p>
 <pre><code class="language-bash">aenv start my-ubuntu
 aenv start --secure my-ubuntu               # require token-authenticated envd access
 aenv start --cold ubuntu:24.04              # start directly from an OCI image
@@ -269,13 +286,14 @@ aenv start --cold ubuntu:24.04              # start directly from an OCI image
 <tr><td><code>--cold</code></td><td>Start directly from an external OCI image instead of a template</td></tr>
 <tr><td><code>--secure</code></td><td>Require token authentication for envd control communication</td></tr>
 <tr><td><code>--timeout &lt;secs&gt;</code></td><td>Sandbox TTL in seconds (default: 300)</td></tr>
-<tr><td><code>--cpu-count &lt;n&gt;</code> / <code>--cpu</code></td><td>CPU cores — only valid with <code>--cold</code></td></tr>
-<tr><td><code>--memory-mb &lt;n&gt;</code> / <code>--mem</code></td><td>Memory in MiB — only valid with <code>--cold</code></td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores; only valid with <code>--cold</code>. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory in MiB; only valid with <code>--cold</code>. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>--disk-size-mb &lt;MiB&gt;</code></td><td>Root filesystem size; only valid with <code>--cold</code>. Defaults to the source image’s virtual size; an explicit value must be at least 1024 and divisible by 1024 MiB. Alias: <code>--disk-mb</code>.</td></tr>
 <tr><td><code>-d, --detach</code></td><td>Print the sandbox ID and exit without attaching a shell</td></tr>
 </tbody>
 </table>
 </div>
-<p><code>&lt;target&gt;</code> accepts a template UUID, template name, or (with <code>--cold</code>) an OCI image reference.</p>
+<p>CPU, memory, and disk overrides are supported only for cold starts.</p>
 <h3 id="aenv-pause-sandbox-id"><a class="header" href="#aenv-pause-sandbox-id"><code>aenv pause &lt;sandbox-id&gt;</code></a></h3>
 <p>Pause a running sandbox. The sandbox state is preserved and can be resumed later.</p>
 <pre><code class="language-bash">aenv pause &lt;sandbox-id&gt;
@@ -290,7 +308,7 @@ aenv start --cold ubuntu:24.04              # start directly from an OCI image
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--timeout &lt;secs&gt;</code></td><td>TTL in seconds from now (default: 300)</td></tr>
+<tr><td><code>--timeout &lt;secs&gt;</code></td><td>TTL in seconds from now (default: 300). Must be longer than the sandbox’s current remaining TTL.</td></tr>
 </tbody>
 </table>
 </div>
@@ -368,7 +386,16 @@ extended attributes, or hard-link relationships.</p>
 <p>List all sandboxes. Alias: <code>aenv ls</code>.</p>
 <pre><code class="language-bash">aenv list
 </code></pre>
-<p>Outputs a table on a TTY and JSON when piped. Override with <code>--output table|json</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--output &lt;table|json&gt;</code></td><td>Output format. Defaults to table on a TTY and JSON when redirected.</td></tr>
+</tbody>
+</table>
+</div>
 <h3 id="aenv-delete-sandbox-id"><a class="header" href="#aenv-delete-sandbox-id"><code>aenv delete &lt;sandbox-id&gt;</code></a></h3>
 <p>Kill and delete a sandbox. Alias: <code>aenv rm</code>.</p>
 <pre><code class="language-bash">aenv delete &lt;sandbox-id&gt;
@@ -387,7 +414,7 @@ aenv snapshot create &lt;sandbox-id&gt; --name my-base
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--name &lt;name&gt;</code></td><td>Snapshot name or alias</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Snapshot name or alias. If omitted, the generated snapshot ID identifies the snapshot.</td></tr>
 </tbody>
 </table>
 </div>
@@ -404,7 +431,7 @@ aenv snapshot list --sandbox-id &lt;sandbox-id&gt;
 </thead>
 <tbody>
 <tr><td><code>--sandbox-id &lt;id&gt;</code></td><td>Filter snapshots by source sandbox ID</td></tr>
-<tr><td><code>--output &lt;format&gt;</code></td><td>Output format: <code>table</code> (default on TTY) or <code>json</code></td></tr>
+<tr><td><code>--output &lt;table|json&gt;</code></td><td>Output format. Defaults to table on a TTY and JSON when redirected.</td></tr>
 </tbody>
 </table>
 </div>

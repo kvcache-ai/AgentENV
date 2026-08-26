@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "../searchindex-6a10619c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5437f69c.js"></script>
+        <script src="../toc-0fdd41d5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -195,8 +195,18 @@ traffic when they send routing headers.</li>
 headers.</li>
 </ul>
 <p>Query strings are forwarded unchanged.</p>
-<h2 id="required-headers"><a class="header" href="#required-headers">Required Headers</a></h2>
-<p>Each proxied request must identify the target sandbox and port:</p>
+<p>For example, start an HTTP server on port <code>8080</code> inside a running sandbox:</p>
+<pre><code class="language-bash">aenv exec &lt;sandbox-id&gt; sh -c 'echo "Hello from AgentENV" &gt; /tmp/index.html'
+aenv exec &lt;sandbox-id&gt; python3 -m http.server 8080 --directory /tmp
+</code></pre>
+<p>Access the service through the AgentENV proxy:</p>
+<pre><code class="language-bash">curl http://127.0.0.1:8000/proxy/index.html \
+  -H "x-agentenv-sandbox-id: &lt;sandbox-id&gt;" \
+  -H "x-agentenv-target-port: 8080"
+</code></pre>
+<h2 id="header-based-routing"><a class="header" href="#header-based-routing">Header-Based Routing</a></h2>
+<p>When using <code>/proxy</code> or routing an otherwise unmatched path with headers,
+identify the target sandbox and port with these headers:</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -223,14 +233,18 @@ headers.</li>
 <p>These routing headers are stripped before the request is forwarded to the sandbox.</p>
 <h2 id="access-control"><a class="header" href="#access-control">Access Control</a></h2>
 <p>Proxy authentication is independent from AgentENV API authentication:</p>
-<ul>
-<li>Public application ingress (<code>allowPublicTraffic: true</code>, the default) requires
-no AgentENV credential.</li>
-<li>Private application ingress (<code>allowPublicTraffic: false</code>) requires the
-sandbox’s <code>trafficAccessToken</code> in <code>e2b-traffic-access-token</code>.</li>
-<li>Secure envd traffic requires the sandbox’s <code>envdAccessToken</code> in
-<code>X-Access-Token</code>. Insecure envd traffic has no envd token.</li>
-</ul>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Traffic</th><th>When it applies</th><th>Required credential</th></tr>
+</thead>
+<tbody>
+<tr><td>Public application ingress</td><td>The sandbox uses <code>allowPublicTraffic: true</code>, which is the default.</td><td>None</td></tr>
+<tr><td>Private application ingress</td><td>The sandbox uses <code>allowPublicTraffic: false</code>.</td><td><code>e2b-traffic-access-token: &lt;trafficAccessToken&gt;</code></td></tr>
+<tr><td>Secure envd traffic</td><td>The sandbox was created with secure communication enabled.</td><td><code>X-Access-Token: &lt;envdAccessToken&gt;</code></td></tr>
+</tbody>
+</table>
+</div>
 <p><code>X-API-Key</code> authenticates AgentENV control-plane APIs only. It does not grant
 access to private application ingress or secure envd. A matching platform key
 is stripped on proxy requests; other <code>X-API-Key</code> values remain available to

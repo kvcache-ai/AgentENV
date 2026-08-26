@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
+            window.path_to_searchindex_js = "../searchindex-6a10619c.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-5437f69c.js"></script>
+        <script src="../toc-0fdd41d5.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -184,18 +184,12 @@
                         <h1 id="custom-extension"><a class="header" href="#custom-extension">Custom Extension</a></h1>
 <p>The custom extension is an optional external HTTP service that AgentENV calls during the sandbox lifecycle. It lets you implement deployment-specific behavior — for example, connecting sandboxes into a VPN, custom firewall rules, or extra mounts — without changing AgentENV itself.</p>
 <p>The extension implements a small set of HTTP endpoints (“hooks”); AgentENV is the client. The interface is defined in <a href="https://github.com/kvcache-ai/AgentENV/blob/main/src/custom_extension_api/openapi.yml"><code>src/custom_extension_api/openapi.yml</code></a>.</p>
-<hr>
-<h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
-<p>Enable the integration by pointing AgentENV at your extension service:</p>
-<pre><code class="language-toml"># config/default.toml (or your AENV_CONFIG_PATH)
-[custom_extension]
-url = "http://127.0.0.1:9090"
-# timeout_ms = 5000   # optional, per-call timeout in milliseconds
-</code></pre>
-<p><code>AENV_CUSTOM_EXTENSION_URL</code> works as well. When <code>url</code> is unset, the integration is fully disabled: no hooks are called and <code>customExtensionParams</code> must be empty.</p>
-<hr>
 <h2 id="lifecycle-hooks"><a class="header" href="#lifecycle-hooks">Lifecycle hooks</a></h2>
-<p>All hooks are <code>POST {url}/sandbox-hook/*</code> with a JSON body. Any connection error, timeout, or non-2xx response fails the corresponding sandbox operation (except <code>stop</code>, which is best-effort).</p>
+<p>To support the complete sandbox lifecycle, your extension should implement the
+following four APIs. AgentENV sends a JSON request to
+<code>POST {url}/sandbox-hook/&lt;hook&gt;</code> when the corresponding event occurs. Any connection error, timeout, or non-2xx response fails the corresponding sandbox operation (except <code>stop</code>, which is best-effort).</p>
+<p>See <a href="#minimal-extension-example">Minimal Extension Example</a> for an example
+extension that implements all four hooks.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -218,22 +212,57 @@ url = "http://127.0.0.1:9090"
 <li><code>hostInteractionIp</code> is the per-runtime IPv4 address that AgentENV routes to this sandbox. It can change after pause/resume, so extensions must use the value from the current start hook rather than caching an older one.</li>
 <li>Concurrent <code>patch-params</code> calls to the same sandbox are not serialized; if your patch semantics are not commutative, handle concurrency in the extension.</li>
 </ul>
-<hr>
-<h2 id="customextensionparams"><a class="header" href="#customextensionparams"><code>customExtensionParams</code></a></h2>
-<p>An opaque JSON object per sandbox, interpreted only by the extension. An absent value and an empty object are equivalent (empty params).</p>
-<p><strong>Set at creation</strong> — <code>POST /sandboxes</code> and <code>POST /sandboxes-cold</code> accept <code>customExtensionParams</code>:</p>
-<pre><code class="language-json">{
-  "templateID": "my-template",
-  "customExtensionParams": { "vpn": { "network": "team-a" } }
-}
+<h2 id="connect-agentenv-to-an-extension"><a class="header" href="#connect-agentenv-to-an-extension">Connect AgentENV to an Extension</a></h2>
+<p>Connect AgentENV to your extension service by configuring its URL:</p>
+<pre><code class="language-toml"># config/default.toml (or your AENV_CONFIG_PATH)
+[custom_extension]
+url = "http://127.0.0.1:9090"
+# timeout_ms = 5000   # optional, per-call timeout in milliseconds
 </code></pre>
-<p>Non-empty params are rejected with 400 when no extension is configured on the server.</p>
-<p><strong>Read</strong> — <code>GET /sandboxes/{sandboxID}/custom-extension-params</code> returns the current value (<code>{}</code> when empty).</p>
-<p><strong>Patch</strong> — <code>PATCH /sandboxes/{sandboxID}/custom-extension-params</code> (running sandboxes only). The request body is passed through verbatim to the extension’s <code>patch-params</code> hook; its semantics are defined entirely by the extension. The hook returns the updated full params, which AgentENV stores and returns:</p>
-<pre><code class="language-bash">curl -X PATCH .../sandboxes/{id}/custom-extension-params \
+<p><code>AENV_CUSTOM_EXTENSION_URL</code> works as well. When <code>url</code> is unset, the integration is fully disabled: no hooks are called and <code>customExtensionParams</code> must be empty.</p>
+<h2 id="use-the-extension"><a class="header" href="#use-the-extension">Use the Extension</a></h2>
+<p>Use <code>customExtensionParams</code> to pass extension-specific settings for a sandbox.
+It is an opaque JSON object interpreted only by your extension. An absent value
+and an empty object are equivalent.</p>
+<h3 id="set-at-creation"><a class="header" href="#set-at-creation">Set at Creation</a></h3>
+<p>Both <code>POST /sandboxes</code> and <code>POST /sandboxes-cold</code> accept
+<code>customExtensionParams</code>. For example, create a sandbox from a template with VPN
+settings for the extension:</p>
+<pre><code class="language-bash">curl -X POST http://127.0.0.1:8000/sandboxes \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "templateID": "my-template",
+    "customExtensionParams": {
+      "vpn": { "network": "team-a" }
+    }
+  }'
+</code></pre>
+<p>For a cold-start sandbox, include the same field in the cold-start request:</p>
+<pre><code class="language-bash">curl -X POST http://127.0.0.1:8000/sandboxes-cold \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "image": "docker.io/library/ubuntu:24.04",
+    "customExtensionParams": {
+      "vpn": { "network": "team-a" }
+    }
+  }'
+</code></pre>
+<h3 id="read"><a class="header" href="#read">Read</a></h3>
+<p>Get the current params. AgentENV returns <code>{}</code> when they are empty:</p>
+<pre><code class="language-bash">curl http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/custom-extension-params \
+  -H 'X-API-Key: test-key'
+</code></pre>
+<h3 id="patch"><a class="header" href="#patch">Patch</a></h3>
+<p>The request body is passed through verbatim to the extension’s <code>patch-params</code> hook; its semantics are defined entirely by the extension. The hook returns the updated full params, which AgentENV stores and returns:</p>
+<pre><code class="language-bash">curl -X PATCH http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/custom-extension-params \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
   -d '{"vpn": {"network": "team-a", "peers": ["10.8.0.2", "10.8.0.3"]}}'
 </code></pre>
-<p><strong>Persistence</strong> — params survive pause/resume and are stored into snapshots created from the sandbox. When starting from a template, a <code>customExtensionParams</code> provided at creation overrides the one stored in the snapshot; otherwise the snapshot’s value is inherited.</p>
+<h3 id="persistence"><a class="header" href="#persistence">Persistence</a></h3>
+<p>Params survive pause/resume and are stored into snapshots created from the sandbox. When starting from a template, a <code>customExtensionParams</code> provided at creation overrides the one stored in the snapshot; otherwise the snapshot’s value is inherited.</p>
 <hr>
 <h2 id="minimal-extension-example"><a class="header" href="#minimal-extension-example">Minimal extension example</a></h2>
 <pre><code class="language-python">from fastapi import FastAPI, Request
