@@ -199,6 +199,7 @@ pub struct PoolTomlConfig {
 pub struct PoolComponentConfig {
     #[config(default = true)]
     pub enabled: bool,
+    pub prewarm_high_watermark: Option<usize>,
     #[config(default = true)]
     pub maintenance_enabled: bool,
     #[config(default = true)]
@@ -1100,6 +1101,15 @@ impl AppConfig {
         }
         if let Some(block) = self.block_pool_config() {
             PoolTomlConfig::validate("block", &block)?;
+            if let Some(prewarm_high_watermark) = self.pool.block.prewarm_high_watermark {
+                if prewarm_high_watermark > block.high_watermark {
+                    bail!(
+                        "invalid block pool config: prewarm_high_watermark ({}) must be <= high_watermark ({})",
+                        prewarm_high_watermark,
+                        block.high_watermark
+                    );
+                }
+            }
         }
         if let Some(firecracker) = self.firecracker_pool_config() {
             PoolTomlConfig::validate("firecracker", &firecracker.pool)?;
@@ -1959,6 +1969,28 @@ mod tests {
             ..AppConfig::default()
         };
         assert!(config.validate_pool_config().is_ok());
+    }
+
+    #[test]
+    fn block_pool_prewarm_high_watermark_rejects_values_above_cache_capacity() {
+        let config = AppConfig {
+            pool: PoolTomlConfig {
+                high_watermark: 8,
+                block: PoolComponentConfig {
+                    enabled: true,
+                    prewarm_high_watermark: Some(9),
+                    ..PoolComponentConfig::default()
+                },
+                ..PoolTomlConfig::default()
+            },
+            ..AppConfig::default()
+        };
+
+        let err = config.validate_pool_config().unwrap_err();
+        assert!(
+            err.to_string().contains("prewarm_high_watermark"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

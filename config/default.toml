@@ -291,6 +291,10 @@ maintenance_enabled = true
 [pool.block]
 # Enable the reusable OverlayBD ublk-device pool.
 enabled = true
+# Limit proactive device creation independently from the total idle cache.
+# Returned devices may still fill pool.high_watermark. Omit this setting to
+# preserve the current behavior and use pool.high_watermark as the limit.
+# prewarm_high_watermark = 8
 # Omit to prewarm only when the kernel supports UBLK_F_UPDATE_SIZE. Set an
 # explicit boolean to override capability-based selection.
 # startup_prewarm = true

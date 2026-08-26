@@ -136,6 +136,9 @@ struct PoolState {
     /// requests do not all synchronously create replacement ublk devices.
     refill_inflight: AtomicBool,
     config: PoolConfig,
+    /// Maximum idle count that proactive refill may reach. Returned devices
+    /// remain bounded by `config.high_watermark` instead.
+    prewarm_high_watermark: usize,
     /// Ublk feature flags detected at startup.
     features: u64,
     /// Daemon-owned same-size sparse placeholder images, lazily built per device
@@ -152,6 +155,7 @@ struct PoolState {
 impl PoolState {
     fn new(
         config: PoolConfig,
+        prewarm_high_watermark: usize,
         features: u64,
         image_service: ImageService,
         placeholder_dir: PathBuf,
@@ -164,6 +168,7 @@ impl PoolState {
             image_locks: DashMap::new(),
             refill_inflight: AtomicBool::new(false),
             config,
+            prewarm_high_watermark,
             features,
             placeholders: Mutex::new(HashMap::new()),
             image_service,
@@ -227,6 +232,19 @@ impl PoolState {
 
     fn supports_update_size(&self) -> bool {
         self.features & ublk_caps::UBLK_F_UPDATE_SIZE != 0
+    }
+
+    fn prewarm_refill_count(&self) -> usize {
+        let idle_len = self.idle.len();
+        let remaining = self.prewarm_high_watermark.saturating_sub(idle_len);
+        if remaining == 0 {
+            return 0;
+        }
+
+        match self.idle.compute_maintenance_action(idle_len) {
+            PoolMaintenanceAction::Fill(to_create) => to_create.min(remaining),
+            PoolMaintenanceAction::Drain(_) | PoolMaintenanceAction::Idle => 0,
+        }
     }
 
     fn image_lock_key(image_config: &Path) -> ImageLockKey {
@@ -327,9 +345,22 @@ impl UblkDaemonServer {
 
     /// Enable warm pooling with the given configuration.
     /// Must be called before `run()`.
-    pub fn enable_pool(&mut self, config: PoolConfig, features: u64) {
+    pub fn enable_pool(
+        &mut self,
+        config: PoolConfig,
+        prewarm_high_watermark: usize,
+        features: u64,
+    ) {
+        tracing::info!(
+            low_watermark = config.low_watermark,
+            high_watermark = config.high_watermark,
+            prewarm_high_watermark,
+            startup_prewarm = config.startup_prewarm,
+            "enabling overlaybd warm pool"
+        );
         self.pool_state = Some(Arc::new(PoolState::new(
             config,
+            prewarm_high_watermark,
             features,
             self.default_image_service.clone(),
             self.pool_placeholder_dir(),
@@ -1446,10 +1477,7 @@ fn schedule_idle_pool_refill(
         refill_idle_pool_best_effort(&pool, ctrl_ring.clone(), virtual_size).await;
         pool.refill_inflight.store(false, Ordering::Release);
 
-        if matches!(
-            pool.idle.compute_maintenance_action(pool.idle.len()),
-            PoolMaintenanceAction::Fill(_)
-        ) {
+        if pool.prewarm_refill_count() > 0 {
             schedule_idle_pool_refill(pool, ctrl_ring, virtual_size);
         }
     });
@@ -1460,11 +1488,10 @@ async fn refill_idle_pool(
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     virtual_size: u64,
 ) -> Result<()> {
-    let PoolMaintenanceAction::Fill(to_create) =
-        pool.idle.compute_maintenance_action(pool.idle.len())
-    else {
+    let to_create = pool.prewarm_refill_count();
+    if to_create == 0 {
         return Ok(());
-    };
+    }
 
     let (placeholder_config, placeholder_image) = pool
         .placeholder_for(virtual_size)
@@ -1472,6 +1499,10 @@ async fn refill_idle_pool(
         .context("build pool placeholder for prewarm")?;
 
     for _ in 0..to_create {
+        if pool.idle.len() >= pool.prewarm_high_watermark {
+            break;
+        }
+
         let dev = create_new_device(ctrl_ring.clone(), &placeholder_config, &placeholder_image)
             .await
             .context("prewarm overlaybd pool device")?;
@@ -1480,6 +1511,11 @@ async fn refill_idle_pool(
             dev_sectors: placeholder_image.num_lbas(),
             _placeholder_image: Arc::clone(&placeholder_image),
         };
+        if pool.idle.len() >= pool.prewarm_high_watermark {
+            stop_excess_idle_device(pool, ctrl_ring.clone(), pooled).await;
+            break;
+        }
+
         if let Err(pooled) = pool.idle.try_push_bounded(pooled) {
             stop_excess_idle_device(pool, ctrl_ring.clone(), pooled).await;
             break;
@@ -1673,6 +1709,7 @@ mod tests {
         let placeholder_dir = dir.path().join("placeholders");
         let pool = PoolState::new(
             test_pool_config(),
+            1,
             0,
             image_service,
             placeholder_dir.clone(),
@@ -1713,5 +1750,57 @@ mod tests {
         assert_ne!(small_path, large_path);
         assert_eq!(small.num_lbas(), 8 * 1024 * 1024 / 512);
         assert_eq!(large.num_lbas(), 16 * 1024 * 1024 / 512);
+    }
+
+    #[tokio::test]
+    async fn prewarm_refill_count_is_capped_below_idle_cache_capacity() {
+        let dir = TempDir::new().unwrap();
+        let image_service = test_image_service(dir.path()).await;
+        let pool = PoolState::new(
+            PoolConfig {
+                low_watermark: 16,
+                high_watermark: 64,
+                maintenance_enabled: false,
+                startup_prewarm: true,
+            },
+            8,
+            0,
+            image_service,
+            dir.path().join("placeholders"),
+        );
+
+        assert_eq!(pool.prewarm_refill_count(), 8);
+        assert_eq!(pool.config.high_watermark, 64);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a host with ublk control access"]
+    async fn live_prewarm_refill_creates_only_the_block_specific_limit() {
+        let dir = TempDir::new().unwrap();
+        let image_service = test_image_service(dir.path()).await;
+        let pool = PoolState::new(
+            PoolConfig {
+                low_watermark: 16,
+                high_watermark: 64,
+                maintenance_enabled: false,
+                startup_prewarm: true,
+            },
+            8,
+            0,
+            image_service,
+            dir.path().join("placeholders"),
+        );
+        let (ctrl_ring, _ctrl_ring_worker) =
+            storage_util::io_ring::spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+
+        let refill_result = refill_idle_pool(&pool, ctrl_ring.clone(), 64 * 1024 * 1024).await;
+        let idle_len = pool.idle.len();
+        for pooled in pool.idle.drain_all() {
+            stop_overlaybd_device(ctrl_ring.clone(), pooled.dev).await;
+        }
+
+        refill_result.expect("refill live ublk devices");
+        assert_eq!(idle_len, 8);
+        assert_eq!(pool.config.high_watermark, 64);
     }
 }
