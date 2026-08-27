@@ -786,7 +786,7 @@ func extractSandboxIDFromResponse(body []byte) (string, bool) {
 }
 
 func extractSandboxIDsFromResponse(body []byte) []string {
-	var payload map[string]any
+	var payload any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil
 	}
@@ -796,15 +796,12 @@ func extractSandboxIDsFromResponse(body []byte) []string {
 			ids = append(ids, id)
 		}
 	}
-	for _, key := range []string{"sandboxID", "sandboxId", "sandbox_id"} {
-		appendSandboxID(payload[key])
-	}
-	if data, ok := payload["data"].(map[string]any); ok {
+	appendDirectSandboxID := func(object map[string]any) {
 		for _, key := range []string{"sandboxID", "sandboxId", "sandbox_id"} {
-			appendSandboxID(data[key])
+			appendSandboxID(object[key])
 		}
 	}
-	appendSandboxIDsFromArray := func(value any) {
+	appendSandboxIDsFromArray := func(value any, nested bool) {
 		items, ok := value.([]any)
 		if !ok {
 			return
@@ -814,14 +811,32 @@ func extractSandboxIDsFromResponse(body []byte) []string {
 			if !ok {
 				continue
 			}
-			for _, key := range []string{"sandboxID", "sandboxId", "sandbox_id"} {
-				appendSandboxID(object[key])
+			appendDirectSandboxID(object)
+			if nested {
+				if sandbox, ok := object["sandbox"].(map[string]any); ok {
+					appendDirectSandboxID(sandbox)
+				}
 			}
 		}
 	}
-	appendSandboxIDsFromArray(payload["sandboxes"])
-	if data, ok := payload["data"].(map[string]any); ok {
-		appendSandboxIDsFromArray(data["sandboxes"])
+	appendSandboxIDsFromObject := func(object map[string]any) {
+		appendDirectSandboxID(object)
+		if sandbox, ok := object["sandbox"].(map[string]any); ok {
+			appendDirectSandboxID(sandbox)
+		}
+		appendSandboxIDsFromArray(object["sandboxes"], false)
+	}
+
+	switch value := payload.(type) {
+	case map[string]any:
+		appendSandboxIDsFromObject(value)
+		if data, ok := value["data"].(map[string]any); ok {
+			appendSandboxIDsFromObject(data)
+		}
+	case []any:
+		// Fork responses are arrays of results whose successful entries contain
+		// a nested `sandbox` object.
+		appendSandboxIDsFromArray(value, true)
 	}
 	if len(ids) == 0 {
 		return nil

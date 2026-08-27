@@ -13,6 +13,7 @@ where
         + apis::sandboxes::Sandboxes<E, Claims = C>
         + apis::snapshots::Snapshots<E, Claims = C>
         + apis::templates::Templates<E, Claims = C>
+        + apis::volumes::Volumes<E, Claims = C>
         + apis::ApiKeyAuthHeader<Claims = C>
         + apis::ApiAuthBasic<Claims = C>
         + Send

@@ -245,6 +245,67 @@ components:
         type: string
         description: Environment variables for the sandbox
 
+    Volume:
+      type: object
+      required:
+        - volumeID
+        - name
+        - sizeMB
+        - status
+      properties:
+        volumeID:
+          type: string
+          description: Stable identifier of the volume.
+        name:
+          type: string
+          pattern: "^[a-zA-Z0-9_-]+$"
+          description: Unique human-readable volume name.
+        mode:
+          type: string
+          description: Access mode (`ro` or `exclusive`).
+        sizeMB:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Effective volume size in MiB.
+        status:
+          type: string
+          description: Availability state (`ready` or `uploading`).
+
+    NewVolume:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          pattern: "^[a-zA-Z0-9_-]+$"
+          description: Unique volume name.
+        sizeMB:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 65536
+          description: Volume size in MiB. Defaults to 65536 MiB (64 GiB).
+        mode:
+          type: string
+          description: Access mode (`ro` or `exclusive`).
+        fromVolume:
+          type: string
+          description: >-
+            Existing volume ID or name to use as a COW source. An exclusive
+            source must not be mounted by a sandbox; sandbox fork snapshots
+            and publishes its owned volumes internally before creating child
+            volumes.
+        image:
+          type: string
+          description: OCI or OverlayBD image reference for the initial content.
+    VolumeMounts:
+      type: object
+      description: Map of absolute guest mount paths to volume IDs or names.
+      additionalProperties:
+        type: string
+
     AttachedDriveSource:
       type: object
       description: >
@@ -483,6 +544,8 @@ components:
           $ref: "#/components/schemas/SandboxNetworkConfig"
         lifecycle:
           $ref: "#/components/schemas/SandboxLifecycle"
+        volumeMounts:
+          $ref: "#/components/schemas/VolumeMounts"
 
     ListedSandbox:
       required:
@@ -530,6 +593,8 @@ components:
           $ref: "#/components/schemas/SandboxState"
         envdVersion:
           $ref: "#/components/schemas/EnvdVersion"
+        volumeMounts:
+          $ref: "#/components/schemas/VolumeMounts"
 
     NewSandbox:
       required:
@@ -571,6 +636,8 @@ components:
           $ref: "#/components/schemas/CustomExtensionParams"
         mcp:
           $ref: "#/components/schemas/Mcp"
+        volumeMounts:
+          $ref: "#/components/schemas/VolumeMounts"
 
     ResumedSandbox:
       properties:
@@ -619,6 +686,8 @@ components:
           $ref: "#/components/schemas/EnvVars"
         customExtensionParams:
           $ref: "#/components/schemas/CustomExtensionParams"
+        volumeMounts:
+          $ref: "#/components/schemas/VolumeMounts"
         cpuCount:
           allOf:
             - $ref: "#/components/schemas/CPUCount"
@@ -1293,6 +1362,7 @@ tags:
   - name: templates
   - name: sandboxes
   - name: snapshots
+  - name: volumes
 
 paths:
   /health:
@@ -1305,6 +1375,113 @@ paths:
         "401":
           $ref: "#/components/responses/401"
 
+  /volumes:
+    get:
+      summary: List volumes
+      description: List independently managed persistent volumes.
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      responses:
+        "200":
+          description: Volumes returned successfully
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Volume"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+    post:
+      summary: Create a volume
+      description: Create an empty, image-backed, or copy-on-write volume.
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewVolume"
+      responses:
+        "201":
+          description: Volume created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Volume"
+        "400":
+          $ref: "#/components/responses/400"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /volumes/{volumeID}:
+    get:
+      summary: Get a volume
+      description: Get a volume by ID or unique name.
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - name: volumeID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Volume returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Volume"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+    delete:
+      summary: Delete a volume
+      description: Delete a volume catalog entry when it is not reserved.
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - name: volumeID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Volume deleted successfully
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
   /sandboxes:
     get:
       summary: List running sandboxes
@@ -1374,6 +1551,8 @@ paths:
           $ref: "#/components/responses/401"
         "400":
           $ref: "#/components/responses/400"
+        "409":
+          $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1413,6 +1592,8 @@ paths:
           $ref: "#/components/responses/401"
         "400":
           $ref: "#/components/responses/400"
+        "409":
+          $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1603,13 +1784,13 @@ paths:
     post:
       summary: Fork sandbox
       description: >-
-        Fork the sandbox: checkpoint the running sandbox in place (it is
-        briefly paused, snapshotted with its full memory state, and resumed on
-        its node, keeping its ID and expiration untouched) and create count
-        new sandboxes from that snapshot. Returns one result per requested
-        fork, each carrying either the created sandbox or the error that
-        prevented it from starting. A non-201 status means the request failed
-        before any fork was attempted.
+        Fork the sandbox: snapshot the running sandbox in place (it is briefly
+        paused with its full memory state captured, then resumed on its node,
+        keeping its ID and expiration untouched) and create count new
+        sandboxes from that snapshot. Returns one result per requested fork,
+        each carrying either the created sandbox or the error that prevented
+        it from starting. A non-201 status means the request failed before any
+        fork was attempted.
       tags: [sandboxes]
       security:
         - ApiKeyAuth: []

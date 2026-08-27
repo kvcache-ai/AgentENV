@@ -3,6 +3,7 @@ pub mod default;
 pub mod sandboxes;
 pub mod snapshots;
 pub mod templates;
+pub mod volumes;
 
 /// API Key Authentication - Header.
 #[async_trait::async_trait]

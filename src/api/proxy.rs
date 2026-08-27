@@ -1632,11 +1632,13 @@ mod tests {
         let snapshot_manager = Arc::new(mock_snapshot_manager());
         let template_builder = Arc::new(TemplateBuilder::new());
         let image_resolver = Arc::new(ImageResolver::new(&AppConfig::default()));
+        let volume_manager = Arc::new(crate::volume::VolumeManager::new());
         Arc::new(ApiImpl::new(
             orchestrator,
             snapshot_manager,
             template_builder,
             image_resolver,
+            volume_manager,
             None,
             domains,
             ApiKey::new(api_key).unwrap(),
@@ -1735,6 +1737,27 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    async fn control_plane_request(
+        app: &axum::Router,
+        method: Method,
+        uri: impl AsRef<str>,
+        body: impl Into<Body>,
+    ) -> Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri.as_ref())
+                    .header(header::HOST, "localhost")
+                    .header(API_KEY_HEADER, TEST_API_KEY)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body.into())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -1896,6 +1919,86 @@ mod tests {
             get_status(&app, "/proxy/health", &route).await,
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn volume_crud_is_authenticated_and_persistent() {
+        let app = server::new(build_api().await);
+        assert_eq!(
+            get_status(&app, "/volumes", &[]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let body = serde_json::to_vec(&json!({"name": "my-data"})).unwrap();
+        let response = control_plane_request(&app, Method::POST, "/volumes", body).await;
+        let status = response.status();
+        let response_body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "unexpected volume create response: {}",
+            String::from_utf8_lossy(&response_body)
+        );
+        let created: Value = serde_json::from_slice(&response_body).unwrap();
+        let volume_id = created["volumeID"].as_str().unwrap().to_owned();
+        assert_eq!(created["name"], "my-data");
+        assert_eq!(created["sizeMB"], 64 * 1024);
+        assert_eq!(created["status"], "ready");
+
+        let response = control_plane_request(&app, Method::GET, "/volumes", Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed: Vec<Value> =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["volumeID"], volume_id);
+        assert_eq!(listed[0]["status"], "ready");
+
+        let response = control_plane_request(
+            &app,
+            Method::DELETE,
+            format!("/volumes/{volume_id}"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn volume_child_lifecycle_routes_are_omitted() {
+        let app = server::new(build_api().await);
+        for operation in ["fork", "snapshot", "restore"] {
+            let response = control_plane_request(
+                &app,
+                Method::POST,
+                format!("/volumes/vol_missing/{operation}"),
+                serde_json::to_vec(&json!({"name": "child"})).unwrap(),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{operation} route exists"
+            );
+        }
+    }
+
+    #[test]
+    fn e2b_volume_mounts_use_a_path_to_volume_map() {
+        let request: agentenv_http_server::models::NewSandbox = serde_json::from_value(json!({
+            "templateID": "template",
+            "volumeMounts": {"/mnt/data": "vol_123"}
+        }))
+        .expect("E2B volumeMounts map should deserialize");
+        assert_eq!(
+            request.volume_mounts.unwrap().get("/mnt/data"),
+            Some(&"vol_123".to_string())
+        );
+
+        serde_json::from_value::<agentenv_http_server::models::NewSandbox>(json!({
+            "templateID": "template",
+            "volumeMounts": [{"name": "vol_123", "path": "/mnt/data"}]
+        }))
+        .expect_err("array form is not the issue 211 API");
     }
 
     #[tokio::test]

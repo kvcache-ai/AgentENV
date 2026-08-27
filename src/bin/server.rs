@@ -10,6 +10,7 @@ use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
+use agentenv::volume::VolumeManager;
 use axum::serve::ListenerExt;
 use clap::Parser;
 use tokio::sync::oneshot;
@@ -143,11 +144,54 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let volume_repository = snapshot_manager.repository();
+    let volume_manager = Arc::new(
+        VolumeManager::open_with_repository(
+            config.home_path.join("volumes/catalog"),
+            Some(volume_repository),
+        )
+        .await?,
+    );
+    let mut volume_events = orchestrator.subscribe_sandbox_events();
+    let volume_manager_for_events = Arc::clone(&volume_manager);
+    let volume_release_task = tokio::spawn(async move {
+        loop {
+            match volume_events.recv().await {
+                Ok(event) => match event.event_type {
+                    agentenv::orchestrator::SandboxLifecycleEventType::Delete => {
+                        let owner = event.sandbox_id.to_string();
+                        if let Err(error) = volume_manager_for_events
+                            .publish_owner_backings(&owner)
+                            .await
+                        {
+                            warn!(error = %error, sandbox_id = %event.sandbox_id, "failed to publish volume backing after sandbox deletion event");
+                            continue;
+                        }
+                        if let Err(error) = volume_manager_for_events.release_owner(&owner).await {
+                            warn!(error = %error, sandbox_id = %event.sandbox_id, "failed to release volume reservation after sandbox deletion event");
+                        }
+                    }
+                    agentenv::orchestrator::SandboxLifecycleEventType::Pause => {
+                        if let Err(error) = volume_manager_for_events
+                            .publish_owner_backings(&event.sandbox_id.to_string())
+                            .await
+                        {
+                            warn!(error = %error, sandbox_id = %event.sandbox_id, "failed to publish volume backing after sandbox pause event");
+                        }
+                    }
+                    _ => {}
+                },
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
     let api_impl = Arc::new(ApiImpl::new(
         Arc::clone(&orchestrator),
         snapshot_manager,
         template_builder,
         image_resolver,
+        volume_manager,
         observability,
         config.sandbox_proxy.domains.clone(),
         api_key,
@@ -168,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown_cleanup = tokio::spawn(async move {
         if let Ok(()) = shutdown_rx.await {
+            volume_release_task.abort();
             if let Some(mut handle) = reporter.take() {
                 info!(target: "agentenv", "stopping observability reporter before process exit");
                 if let Err(err) = handle.shutdown().await {

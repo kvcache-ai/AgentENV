@@ -21,6 +21,8 @@ pub enum SandboxesColdPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Bad request
     Status400_BadRequest(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -52,6 +54,8 @@ pub enum SandboxesPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Bad request
     Status400_BadRequest(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }

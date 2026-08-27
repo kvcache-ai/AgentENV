@@ -6,6 +6,7 @@ mod sandbox;
 mod snapshots;
 mod template;
 mod template_helpers;
+mod volumes;
 
 use std::sync::Arc;
 
@@ -20,6 +21,7 @@ use crate::orchestrator::Orchestrator;
 use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
+use crate::volume::VolumeManager;
 use agentenv_http_server::{apis, models};
 
 #[derive(Clone, Debug)]
@@ -31,6 +33,7 @@ pub struct ApiImpl {
     snapshot_manager: Arc<SnapshotManager>,
     template_builder: Arc<TemplateBuilder>,
     image_resolver: Arc<ImageResolver>,
+    volume_manager: Arc<VolumeManager>,
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
@@ -38,11 +41,13 @@ pub struct ApiImpl {
 }
 
 impl ApiImpl {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         orchestrator: Arc<Orchestrator>,
         snapshot_manager: Arc<SnapshotManager>,
         template_builder: Arc<TemplateBuilder>,
         image_resolver: Arc<ImageResolver>,
+        volume_manager: Arc<VolumeManager>,
         observability: Option<Arc<ObservabilityService>>,
         sandbox_proxy_domains: Vec<String>,
         api_key: ApiKey,
@@ -52,6 +57,7 @@ impl ApiImpl {
             snapshot_manager,
             template_builder,
             image_resolver,
+            volume_manager,
             observability,
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
