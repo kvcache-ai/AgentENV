@@ -35,6 +35,9 @@ pub enum ExtraDrive {
         /// sub-path. Stored as a relative path.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sub_path: Option<PathBuf>,
+        /// Optional persistent destination for a volume snapshot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot_output_dir: Option<PathBuf>,
     },
 }
 
@@ -73,6 +76,7 @@ impl ExtraDrive {
             mount_path,
             virtual_size: None,
             sub_path,
+            snapshot_output_dir: None,
         })
     }
 
@@ -126,6 +130,37 @@ impl ExtraDrive {
         format!("extra-drive-{}", self.drive_id())
     }
 
+    pub(crate) fn snapshot_output_dir(&self) -> Option<&Path> {
+        match self {
+            Self::Overlaybd {
+                snapshot_output_dir,
+                ..
+            } => snapshot_output_dir.as_deref(),
+        }
+    }
+
+    pub(crate) fn with_snapshot_output_dir(&self, output_dir: Option<PathBuf>) -> Self {
+        match self {
+            Self::Overlaybd {
+                drive_id,
+                image_config_path,
+                read_only,
+                mount_path,
+                virtual_size,
+                sub_path,
+                ..
+            } => Self::Overlaybd {
+                drive_id: drive_id.clone(),
+                image_config_path: image_config_path.clone(),
+                read_only: *read_only,
+                mount_path: mount_path.clone(),
+                virtual_size: *virtual_size,
+                sub_path: sub_path.clone(),
+                snapshot_output_dir: output_dir,
+            },
+        }
+    }
+
     pub(crate) fn with_image_config_path(&self, image_config_path: PathBuf) -> Self {
         match self {
             Self::Overlaybd {
@@ -134,6 +169,7 @@ impl ExtraDrive {
                 mount_path,
                 virtual_size,
                 sub_path,
+                snapshot_output_dir,
                 ..
             } => Self::Overlaybd {
                 drive_id: drive_id.clone(),
@@ -142,6 +178,7 @@ impl ExtraDrive {
                 mount_path: mount_path.clone(),
                 virtual_size: *virtual_size,
                 sub_path: sub_path.clone(),
+                snapshot_output_dir: snapshot_output_dir.clone(),
             },
         }
     }
@@ -157,6 +194,7 @@ impl ExtraDrive {
                 image_config_path,
                 read_only,
                 mount_path,
+                snapshot_output_dir,
                 sub_path,
                 ..
             } => Ok(Self::Overlaybd {
@@ -166,6 +204,7 @@ impl ExtraDrive {
                 mount_path: mount_path.clone(),
                 virtual_size: Some(virtual_size),
                 sub_path: sub_path.clone(),
+                snapshot_output_dir: snapshot_output_dir.clone(),
             }),
         }
     }
@@ -175,11 +214,16 @@ pub fn validate_drive_id(drive_id: &str) -> Result<()> {
     if drive_id.trim().is_empty() {
         anyhow::bail!("attached drive driveID must not be empty");
     }
+    if !drive_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        anyhow::bail!(
+            "attached drive driveID must contain only ASCII letters, numbers, and underscores: {drive_id}"
+        );
+    }
     if matches!(drive_id, ROOTFS_DRIVE_ID | USER_ROOTFS_DRIVE_ID) {
         anyhow::bail!("attached drive driveID is reserved: {drive_id}");
-    }
-    if drive_id.contains('/') {
-        anyhow::bail!("attached drive driveID must not contain '/' : {}", drive_id);
     }
     Ok(())
 }
@@ -474,6 +518,16 @@ mod tests {
             .expect_err("internal drive id should fail");
 
         assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn overlaybd_drive_rejects_firecracker_incompatible_drive_id() {
+        for drive_id in ["resume-data", "resume/data", "resume data", "résumé"] {
+            let err = ExtraDrive::try_new_overlaybd(drive_id, "/tmp/image.json", true)
+                .expect_err("Firecracker-incompatible drive id should fail");
+
+            assert!(err.to_string().contains("ASCII letters"));
+        }
     }
 
     #[test]

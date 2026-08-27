@@ -26,6 +26,7 @@ static ENVD_BOOTSTRAP_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
         .expect("build envd bootstrap HTTP client")
 });
 
+#[derive(Clone)]
 pub(crate) struct EnvdInstance {
     config: Configuration,
     grpc_address: String,

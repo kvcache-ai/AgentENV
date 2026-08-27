@@ -88,6 +88,8 @@ pub type SandboxForkResult = anyhow::Result<Box<dyn SandboxBackend>>;
 pub struct SandboxForkSpec {
     pub sandbox_id: SandboxId,
     pub envd_access_token: Option<EnvdAccessToken>,
+    pub extra_drives: Vec<super::ExtraDrive>,
+    pub replace_drive_ids: Vec<String>,
 }
 
 /// Opaque set of local runtime artifacts a sandbox needs while it is alive.
@@ -224,6 +226,14 @@ pub trait SandboxBackend: Send + 'static {
     /// as safely runnable.
     async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot>;
 
+    /// Flush and seal writable persistent-volume upper layers while keeping
+    /// the sandbox running.
+    ///
+    /// The sealed layers are node-local until the volume catalog publishes
+    /// them. This operation provides the runtime half of that publication
+    /// barrier without capturing rootfs, memory, or VM state.
+    async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()>;
+
     /// Fork this running sandbox into ready child backends.
     ///
     /// The outer error is reserved for failures before child startup begins.
@@ -317,7 +327,7 @@ pub trait SandboxExecutor: Send {
     /// Obtain a process executor backed by this sandbox's envd connection.
     ///
     /// Returns an error if the sandbox is not running.
-    fn executor(&self) -> Result<Executor<'_>>;
+    fn executor(&self) -> Result<Executor>;
 
     /// Run a command inside the sandbox and wait for it to complete.
     ///

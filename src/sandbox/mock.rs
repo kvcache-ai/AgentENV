@@ -51,6 +51,7 @@ pub enum MockOperation {
     Pause,
     Resume,
     Snapshot,
+    SnapshotVolumes,
     Fork,
     ForkChild,
     Stop,
@@ -304,6 +305,12 @@ impl SandboxBackend for MockSandboxBackend {
             .apply_capture_result(MockOperation::Snapshot)
             .await?;
         Ok(CapturedSandboxSnapshot::new(MockCapturedSnapshot))
+    }
+
+    async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
+        self.behavior
+            .apply_capture_result(MockOperation::SnapshotVolumes)
+            .await
     }
 
     async fn fork(

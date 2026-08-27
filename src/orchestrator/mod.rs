@@ -21,8 +21,8 @@ pub use store::{
     SandboxTimeoutAction,
 };
 pub use types::{
-    CreateSandboxRequest, SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType,
-    SandboxState, SnapshotCaptureResult,
+    CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource, SandboxLifecycleEvent,
+    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
 };
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;
@@ -36,6 +36,7 @@ pub enum SandboxOperation {
     Pause,
     Resume,
     Snapshot,
+    SnapshotVolumes,
     Fork,
     UpdateNetwork,
     PatchCustomExtensionParams,

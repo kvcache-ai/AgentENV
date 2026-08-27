@@ -352,6 +352,17 @@ impl FirecrackerInstance {
             .with_context(|| format!("Failed to patch rate limiter on drive {}", drive_id))
     }
 
+    /// Updates the host backing path for a drive on a loaded snapshot.
+    pub async fn patch_drive_path(&self, drive_id: &str, path_on_host: &Path) -> Result<()> {
+        let mut partial = PartialDrive::new(drive_id.to_string());
+        partial.path_on_host = Some(path_on_host.to_string_lossy().into_owned());
+        let path = format!("/drives/{}", drive_id);
+        self.client
+            .request_no_content(Method::PATCH, &path, Some(&partial))
+            .await
+            .with_context(|| format!("Failed to patch host path on drive {}", drive_id))
+    }
+
     /// Adds a network interface.
     /// Pre-boot only.
     pub async fn add_network_interface(

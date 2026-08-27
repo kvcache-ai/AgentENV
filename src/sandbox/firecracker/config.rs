@@ -147,6 +147,13 @@ pub struct FirecrackerCommonConfig {
     #[serde(default)]
     pub rootfs_allow_shrink: bool,
     pub extra_drives: Vec<ExtraDrive>,
+    /// Extra drives physically present in the Firecracker snapshot before its
+    /// reserved launch-time volume slots.
+    #[serde(default)]
+    pub physical_extra_drive_count: usize,
+    /// Existing placeholder drives that can be rebound to launch-time volumes.
+    #[serde(default)]
+    pub volume_drive_slots: usize,
     pub ublk_config: Option<UblkConfig>,
     /// Cluster-wide CPU intersection received from the scheduler.
     /// When set, applied via `PUT /cpu-config` before the VM boots.
@@ -194,6 +201,8 @@ impl FirecrackerCommonConfig {
             rootfs_virtual_size: None,
             rootfs_allow_shrink: false,
             extra_drives: Vec::new(),
+            physical_extra_drive_count: 0,
+            volume_drive_slots: 0,
             ublk_config: None,
             cpu_config_json: None,
             network_policy: None,
@@ -516,6 +525,8 @@ impl FirecrackerSnapshotConfig {
             rootfs_image_config: Some(rootfs_image_config),
             rootfs_virtual_size: Some(manifest.rootfs.virtual_size),
             extra_drives: manifest.extra_drives(),
+            physical_extra_drive_count: manifest.physical_extra_drive_count,
+            volume_drive_slots: manifest.volume_drive_slots,
             ..base_common
         };
 
@@ -774,6 +785,7 @@ mod tests {
                 mount_path: ExtraDrive::default_mount_path("data"),
                 virtual_size: None,
                 sub_path: None,
+                snapshot_output_dir: None,
             },
             ExtraDrive::Overlaybd {
                 drive_id: "data".to_string(),
@@ -782,6 +794,7 @@ mod tests {
                 mount_path: ExtraDrive::default_mount_path("data"),
                 virtual_size: None,
                 sub_path: None,
+                snapshot_output_dir: None,
             },
         ];
 
@@ -803,7 +816,7 @@ mod tests {
         );
         config.extra_drives = (0..=MAX_EXTRA_DRIVES)
             .map(|i| {
-                let drive_id = format!("data-{i}");
+                let drive_id = format!("data_{i}");
                 ExtraDrive::Overlaybd {
                     mount_path: ExtraDrive::default_mount_path(&drive_id),
                     drive_id,
@@ -814,6 +827,7 @@ mod tests {
                     read_only: true,
                     virtual_size: None,
                     sub_path: None,
+                    snapshot_output_dir: None,
                 }
             })
             .collect();

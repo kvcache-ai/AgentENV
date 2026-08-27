@@ -69,6 +69,8 @@ pub struct SandboxLaunchConfig {
     /// The sandbox layer does not interpret these; they are passed through
     /// as-is to the VM via the Firecracker MMDS interface.
     pub extra_mmds: serde_json::Map<String, serde_json::Value>,
+    /// Additional drives supplied for this launch, such as persistent volume mounts.
+    pub extra_drives: Vec<ExtraDrive>,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Takes precedence over any value persisted in the source snapshot.
     pub custom_extension_params: Option<CustomExtensionParams>,
@@ -85,6 +87,7 @@ impl SandboxLaunchConfig {
             env_vars: None,
             network: None,
             extra_mmds: serde_json::Map::new(),
+            extra_drives: Vec::new(),
             custom_extension_params: None,
             envd_access_token: None,
         }

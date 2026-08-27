@@ -476,6 +476,7 @@ async fn capture_live_overlaybd_snapshot(
     read_only: bool,
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
+    snapshot_layer_file_name: &str,
     kind: &'static str,
 ) -> Result<LiveOverlaybdSnapshotState> {
     if read_only {
@@ -488,7 +489,7 @@ async fn capture_live_overlaybd_snapshot(
 
     let live_upper_data_path = restack_target_upper_data_path(live_runtime_image_config_path)
         .context("resolve restack source upper path")?;
-    let snapshot_layer_path = output_dir.join("snapshot.commit");
+    let snapshot_layer_path = output_dir.join(snapshot_layer_file_name);
     prepare_specific_snapshot_layer_path(&snapshot_layer_path).await?;
     let live_snapshot_layer_path = if on_same_filesystem(&live_upper_data_path, output_dir)
         .context("validate restack snapshot filesystem precondition")?
@@ -498,7 +499,7 @@ async fn capture_live_overlaybd_snapshot(
         let live_snapshot_layer_path = live_upper_data_path
             .parent()
             .context("restack source upper path has no parent directory")?
-            .join("snapshot.commit");
+            .join(snapshot_layer_file_name);
         prepare_specific_snapshot_layer_path(&live_snapshot_layer_path)
             .await
             .with_context(|| {
@@ -598,6 +599,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     read_only: bool,
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
+    snapshot_layer_file_name: &str,
     kind: &'static str,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
@@ -609,6 +611,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         read_only,
         live_runtime_image_config_path,
         output_dir,
+        snapshot_layer_file_name,
         kind,
     )
     .await?;
@@ -634,6 +637,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
         read_only,
         live_runtime_image_config_path,
         &snapshot_root.join("rootfs"),
+        "snapshot.commit",
         "rootfs",
     )
     .await
