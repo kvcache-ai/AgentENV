@@ -2,6 +2,7 @@ pub mod files;
 pub mod sandboxes;
 pub mod snapshots;
 pub mod templates;
+pub mod volumes;
 
 use crate::auth::Credentials;
 use crate::grpc::Transport;

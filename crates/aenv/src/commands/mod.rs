@@ -14,6 +14,7 @@ pub mod start;
 pub mod template;
 pub mod timeout;
 pub mod upload;
+pub mod volume;
 
 use crate::client::Client;
 use anyhow::Result;

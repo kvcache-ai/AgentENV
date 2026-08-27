@@ -58,6 +58,8 @@ enum Cmd {
     /// Template operations
     #[command(visible_alias = "templates")]
     Template(commands::template::Args),
+    /// Persistent volume operations
+    Volume(commands::volume::Args),
 }
 
 fn main() -> Result<()> {
@@ -80,5 +82,6 @@ fn main() -> Result<()> {
         Cmd::Timeout(a) => commands::timeout::run(a),
         Cmd::Snapshot(a) => commands::snapshot::run(a),
         Cmd::Template(a) => commands::template::run(a),
+        Cmd::Volume(a) => commands::volume::run(a),
     }
 }

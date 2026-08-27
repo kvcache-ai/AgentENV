@@ -1,6 +1,7 @@
-use crate::client::Client;
+use crate::client::{sandboxes::SandboxLaunchOptions, Client};
 use anyhow::Result;
 use clap::Args as ClapArgs;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 const ENVD_READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -35,6 +36,9 @@ pub struct Args {
     /// Start the sandbox and print its ID without attaching an interactive shell
     #[arg(short = 'd', long)]
     detach: bool,
+    /// Mount a persistent volume using MOUNT_PATH=VOLUME_ID_OR_NAME (repeatable)
+    #[arg(long = "volume", value_name = "MOUNT_PATH=VOLUME", action = clap::ArgAction::Append)]
+    volumes: Vec<String>,
 }
 
 fn parse_disk_size_mb(value: &str) -> std::result::Result<u32, String> {
@@ -49,20 +53,31 @@ fn parse_disk_size_mb(value: &str) -> std::result::Result<u32, String> {
 
 pub fn run(args: Args) -> Result<()> {
     let client = Client::from_env()?;
+    let volume_mounts = parse_volume_mounts(&args.volumes)?;
     let sandbox = if args.cold {
         client.create_cold_sandbox(
             &args.target,
-            Some(args.timeout),
             args.resources.cpu_count,
             args.resources.memory_mb,
             args.disk_size_mb,
-            args.secure,
+            SandboxLaunchOptions {
+                timeout: Some(args.timeout),
+                secure: args.secure,
+                volume_mounts,
+            },
         )?
     } else {
         if args.resources.is_set() || args.disk_size_mb.is_some() {
             anyhow::bail!("--cpu-count, --memory-mb, and --disk-size-mb require --cold");
         }
-        client.create_sandbox(&args.target, Some(args.timeout), args.secure)?
+        client.create_sandbox(
+            &args.target,
+            SandboxLaunchOptions {
+                timeout: Some(args.timeout),
+                secure: args.secure,
+                volume_mounts,
+            },
+        )?
     };
     let sandbox_id = sandbox.sandbox_id;
 
@@ -80,6 +95,33 @@ pub fn run(args: Args) -> Result<()> {
     ))?;
     let code = rt.block_on(super::connect::attach(&client, &sandbox_id))?;
     std::process::exit(code);
+}
+
+fn parse_volume_mounts(values: &[String]) -> Result<Option<HashMap<String, String>>> {
+    if values.is_empty() {
+        return Ok(None);
+    }
+    let mut mounts = HashMap::with_capacity(values.len());
+    for value in values {
+        let Some((mount_path, volume)) = value.split_once('=') else {
+            anyhow::bail!("volume mount must use MOUNT_PATH=VOLUME syntax: {value}");
+        };
+        if !mount_path.starts_with('/') || mount_path == "/" {
+            anyhow::bail!(
+                "volume mount path must be an absolute guest path other than /: {mount_path}"
+            );
+        }
+        if volume.is_empty() {
+            anyhow::bail!("volume reference cannot be empty: {value}");
+        }
+        if mounts
+            .insert(mount_path.to_owned(), volume.to_owned())
+            .is_some()
+        {
+            anyhow::bail!("volume mount path is specified more than once: {mount_path}");
+        }
+    }
+    Ok(Some(mounts))
 }
 
 async fn wait_for_envd(
@@ -103,4 +145,30 @@ async fn wait_for_envd(
         tokio::time::sleep(ENVD_READY_PROBE_INTERVAL).await;
     }
     anyhow::bail!("sandbox {} envd not healthy within 30s", sandbox_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_volume_mounts;
+
+    #[test]
+    fn parses_volume_mounts() {
+        let values = vec![
+            "/mnt/data=cache".to_owned(),
+            "/opt/assets=assets".to_owned(),
+        ];
+        let mounts = parse_volume_mounts(&values).unwrap().unwrap();
+        assert_eq!(mounts.get("/mnt/data"), Some(&"cache".to_owned()));
+        assert_eq!(mounts.get("/opt/assets"), Some(&"assets".to_owned()));
+    }
+
+    #[test]
+    fn rejects_invalid_or_duplicate_mounts() {
+        assert!(parse_volume_mounts(&["data=cache".to_owned()]).is_err());
+        assert!(parse_volume_mounts(&["/mnt/data".to_owned()]).is_err());
+        assert!(
+            parse_volume_mounts(&["/mnt/data=cache".to_owned(), "/mnt/data=other".to_owned()])
+                .is_err()
+        );
+    }
 }

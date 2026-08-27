@@ -2,6 +2,7 @@ use super::{handle_status, Client};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashMap;
 use std::time::Duration;
 
 #[derive(Debug, Serialize)]
@@ -12,6 +13,15 @@ pub struct NewSandbox<'a> {
     pub timeout: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secure: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "volumeMounts")]
+    pub volume_mounts: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Default)]
+pub struct SandboxLaunchOptions {
+    pub timeout: Option<u32>,
+    pub secure: bool,
+    pub volume_mounts: Option<HashMap<String, String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -27,6 +37,8 @@ pub struct NewColdSandbox<'a> {
     pub disk_size_mb: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secure: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "volumeMounts")]
+    pub volume_mounts: Option<HashMap<String, String>>,
 }
 
 #[derive(Deserialize)]
@@ -76,13 +88,13 @@ impl Client {
     pub fn create_sandbox(
         &self,
         template_id: &str,
-        timeout: Option<u32>,
-        secure: bool,
+        options: SandboxLaunchOptions,
     ) -> Result<Sandbox> {
         let body = NewSandbox {
             template_id,
-            timeout,
-            secure: secure.then_some(true),
+            timeout: options.timeout,
+            secure: options.secure.then_some(true),
+            volume_mounts: options.volume_mounts,
         };
         let resp = handle_status(self.post("/sandboxes").send_json(&body))?;
         let sandbox: Sandbox = resp.into_json()?;
@@ -92,19 +104,19 @@ impl Client {
     pub fn create_cold_sandbox(
         &self,
         image: &str,
-        timeout: Option<u32>,
         cpu_count: Option<u32>,
         memory_mb: Option<u32>,
         disk_size_mb: Option<u32>,
-        secure: bool,
+        options: SandboxLaunchOptions,
     ) -> Result<Sandbox> {
         let body = NewColdSandbox {
             image,
-            timeout,
+            timeout: options.timeout,
             cpu_count,
             memory_mb,
             disk_size_mb,
-            secure: secure.then_some(true),
+            secure: options.secure.then_some(true),
+            volume_mounts: options.volume_mounts,
         };
         let resp = handle_status(self.post("/sandboxes-cold").send_json(&body))?;
         let sandbox: Sandbox = resp.into_json()?;
@@ -186,6 +198,7 @@ mod tests {
             template_id: "base-template",
             timeout: Some(300),
             secure: Some(true),
+            volume_mounts: None,
         };
 
         let value = serde_json::to_value(body).unwrap();
@@ -205,6 +218,7 @@ mod tests {
             memory_mb: Some(1024),
             disk_size_mb: Some(8192),
             secure: Some(true),
+            volume_mounts: None,
         };
 
         let value = serde_json::to_value(body).unwrap();
