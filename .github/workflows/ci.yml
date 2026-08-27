@@ -14,6 +14,9 @@ on:
       - "scripts/tests/setup-ublk-access.sh"
       - "scripts/tests/verify-capability-runner.sh"
       - "scripts/tests/verify-install-service.sh"
+      - "scripts/tests/verify-tools-init.sh"
+      - "tools-image/init"
+      - "tools-image/pivot-init"
       - ".github/actions/**"
       - ".github/workflows/ci.yml"
   push:
@@ -28,6 +31,9 @@ on:
       - "scripts/tests/setup-ublk-access.sh"
       - "scripts/tests/verify-capability-runner.sh"
       - "scripts/tests/verify-install-service.sh"
+      - "scripts/tests/verify-tools-init.sh"
+      - "tools-image/init"
+      - "tools-image/pivot-init"
       - ".github/actions/**"
       - ".github/workflows/ci.yml"
 
