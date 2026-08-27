@@ -37,6 +37,13 @@ async fn resolve_volume_mounts_inner(
     owner: &str,
 ) -> Result<(Vec<ExtraDrive>, HashMap<String, String>), models::Error> {
     let mut drives = Vec::with_capacity(mounts.len());
+    let limits = manager.limits();
+    if mounts.len() > limits.max_mounts {
+        return Err(error_response(VolumeError::TooManyMountedVolumes {
+            max_count: limits.max_mounts,
+        })
+        .1);
+    }
     let mut volume_ids = HashSet::with_capacity(mounts.len());
     let mut normalized_mounts = HashMap::with_capacity(mounts.len());
 
@@ -47,6 +54,12 @@ async fn resolve_volume_mounts_inner(
             .get(reference)
             .await
             .map_err(|error| error_response(error).1)?;
+        if volume.size_mb > limits.max_size_mb {
+            return Err(error_response(VolumeError::SizeLimitExceeded {
+                max_size_mb: limits.max_size_mb,
+            })
+            .1);
+        }
         if !volume_ids.insert(volume.id.clone()) {
             return Err(ApiImpl::error(
                 400,
@@ -141,7 +154,9 @@ pub(super) fn error_response(error: VolumeError) -> (i32, models::Error) {
         | VolumeError::MultipleSources
         | VolumeError::SourceNotFound(_)
         | VolumeError::InvalidSize
+        | VolumeError::SizeLimitExceeded { .. }
         | VolumeError::SizeMismatch => 400,
+        VolumeError::TooManyMountedVolumes { .. } => 400,
         VolumeError::NotFound(_) => 404,
         VolumeError::NameConflict(_) | VolumeError::Reserved(_) | VolumeError::Uploading(_) => 409,
         VolumeError::Storage(_) => 500,
@@ -189,6 +204,26 @@ impl Volumes<()> for ApiImpl {
                 )))
             }
         };
+        let resolved_image = match (body.from_volume.is_none(), body.image.as_deref()) {
+            (true, Some(image)) => match self.image_resolver.resolve(image).await {
+                Ok(resolved) => Some(resolved.overlaybd_config_path),
+                Err(error) => {
+                    let code = if error.is_user_error() { 400 } else { 500 };
+                    return Ok(match code {
+                        400 => VolumesPostResponse::Status400_BadRequest(ApiImpl::error(
+                            code,
+                            format!("resolve volume image: {error:#}"),
+                        )),
+                        _ => VolumesPostResponse::Status500_ServerError(ApiImpl::error(
+                            code,
+                            format!("resolve volume image: {error:#}"),
+                        )),
+                    });
+                }
+            },
+            _ => None,
+        };
+
         match self
             .volume_manager
             .create(
@@ -200,9 +235,26 @@ impl Volumes<()> for ApiImpl {
             )
             .await
         {
-            Ok(record) => Ok(VolumesPostResponse::Status201_VolumeCreatedSuccessfully(
-                to_model(record),
-            )),
+            Ok(record) => {
+                if let Some(config) = resolved_image {
+                    if let Err(error) = self
+                        .volume_manager
+                        .ensure_backing_config(&record.id, &config)
+                        .await
+                    {
+                        let _ = self.volume_manager.delete(&record.id).await;
+                        let (code, error) = error_response(error);
+                        return Ok(match code {
+                            400 => VolumesPostResponse::Status400_BadRequest(error),
+                            409 => VolumesPostResponse::Status409_Conflict(error),
+                            _ => VolumesPostResponse::Status500_ServerError(error),
+                        });
+                    }
+                }
+                Ok(VolumesPostResponse::Status201_VolumeCreatedSuccessfully(
+                    to_model(record),
+                ))
+            }
             Err(error) => {
                 let (code, error) = error_response(error);
                 match code {

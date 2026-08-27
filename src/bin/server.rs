@@ -10,7 +10,7 @@ use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
-use agentenv::volume::VolumeManager;
+use agentenv::volume::{VolumeLimits, VolumeManager};
 use axum::serve::ListenerExt;
 use clap::Parser;
 use tokio::sync::oneshot;
@@ -146,9 +146,13 @@ async fn main() -> anyhow::Result<()> {
 
     let volume_repository = snapshot_manager.repository();
     let volume_manager = Arc::new(
-        VolumeManager::open_with_repository(
+        VolumeManager::open_with_repository_and_limits(
             config.home_path.join("volumes/catalog"),
             Some(volume_repository),
+            VolumeLimits {
+                max_size_mb: config.volume.max_size_mb,
+                max_mounts: config.volume.max_volume_count,
+            },
         )
         .await?,
     );

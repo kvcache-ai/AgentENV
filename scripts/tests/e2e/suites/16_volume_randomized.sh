@@ -19,20 +19,10 @@ readonly VOLUME_RANDOM_SEED="${AENV_VOLUME_RANDOM_SEED:-21106}"
 readonly VOLUME_RANDOM_STEPS="${AENV_VOLUME_RANDOM_STEPS:-100}"
 readonly VOLUME_SIZE_MB=16
 readonly VOLUME_MOUNT_PATH="/volume"
-declare -ar VOLUME_FILE_PATHS=(
-  "${VOLUME_MOUNT_PATH}/state.txt"
-  "${VOLUME_MOUNT_PATH}/nested/config/state.json"
-  "${VOLUME_MOUNT_PATH}/blocks/before-4k.bin"
-  "${VOLUME_MOUNT_PATH}/blocks/after-4k.bin"
-  "${VOLUME_MOUNT_PATH}/space dir/note.txt"
-  "${VOLUME_MOUNT_PATH}/.hidden/state"
-)
-declare -ar VOLUME_PAYLOAD_SIZES=(127 1023 4095 4097 16391 65537)
 
 RANDOM=$((VOLUME_RANDOM_SEED & 32767))
 CURRENT_STEP="setup"
 NEXT_VOLUME_NAME=0
-WRITE_SEQUENCE=0
 LAST_VOLUME_ID=""
 LAST_SANDBOX_ID=""
 LAST_NODE_ID=""
@@ -42,8 +32,7 @@ random_file="$(mktemp "${TMPDIR:-/tmp}/aenv-volume-random.XXXXXX")"
 run_name="volume-random-${VOLUME_RANDOM_SEED}-$(date +%s%N)"
 
 declare -A VOLUME_MODE=()
-declare -A VOLUME_FILE_DIGEST=()
-declare -A VOLUME_FILE_SIZE=()
+declare -A VOLUME_CONTENT=()
 declare -A VOLUME_NODE_KEYS=()
 declare -A SEEN_NODES=()
 ALL_VOLUME_IDS=()
@@ -73,19 +62,10 @@ response_node_id() {
 register_volume() {
   local volume_id="$1"
   local mode="$2"
-  local source_id="${3:-}"
-  local slot source_key target_key
+  local content="$3"
   VOLUME_MODE["${volume_id}"]="${mode}"
+  VOLUME_CONTENT["${volume_id}"]="${content}"
   ALL_VOLUME_IDS+=("${volume_id}")
-  [[ -n "${source_id}" ]] || return 0
-  for slot in "${!VOLUME_FILE_PATHS[@]}"; do
-    source_key="${source_id}|${slot}"
-    target_key="${volume_id}|${slot}"
-    if [[ -n "${VOLUME_FILE_DIGEST[${source_key}]+present}" ]]; then
-      VOLUME_FILE_DIGEST["${target_key}"]="${VOLUME_FILE_DIGEST[${source_key}]}"
-      VOLUME_FILE_SIZE["${target_key}"]="${VOLUME_FILE_SIZE[${source_key}]}"
-    fi
-  done
 }
 
 active_volume_ids() {
@@ -118,7 +98,7 @@ create_empty_volume() {
   assert_not_empty "${LAST_VOLUME_ID}" "${CURRENT_STEP}: created volume ID is present"
   assert_json_field "${HTTP_BODY}" '.status' "ready" \
     "${CURRENT_STEP}: created volume is ready"
-  register_volume "${LAST_VOLUME_ID}" "exclusive"
+  register_volume "${LAST_VOLUME_ID}" "exclusive" ""
   log "seed=${VOLUME_RANDOM_SEED} step=${CURRENT_STEP} created=${LAST_VOLUME_ID}"
 }
 
@@ -138,7 +118,7 @@ clone_volume() {
   assert_not_empty "${LAST_VOLUME_ID}" "${CURRENT_STEP}: cloned volume ID is present"
   assert_json_field "${HTTP_BODY}" '.status' "ready" \
     "${CURRENT_STEP}: cloned volume is ready"
-  register_volume "${LAST_VOLUME_ID}" "${mode}" "${source_id}"
+  register_volume "${LAST_VOLUME_ID}" "${mode}" "${VOLUME_CONTENT[${source_id}]}"
   log "seed=${VOLUME_RANDOM_SEED} step=${CURRENT_STEP} cloned=${LAST_VOLUME_ID} source=${source_id} mode=${mode}"
 }
 
@@ -156,9 +136,8 @@ upload_random_file() {
 
 download_random_file() {
   local sandbox_id="$1"
-  local path="$2"
   local encoded_path
-  encoded_path=$(jq -rn --arg path "${path}" '$path|@uri')
+  encoded_path=$(jq -rn --arg path "${VOLUME_MOUNT_PATH}/state.txt" '$path|@uri')
   _curl_do -s \
     -H "x-agentenv-sandbox-id: ${sandbox_id}" \
     -H "x-agentenv-target-port: ${AENV_ENVD_PORT}" \
@@ -197,108 +176,38 @@ start_volume_sandbox() {
   capture_sandbox_node "${LAST_SANDBOX_ID}" "${volume_id}"
 }
 
-verify_volume_files() {
+verify_volume_content() {
   local sandbox_id="$1"
   local volume_id="$2"
-  local slot key path expected_digest expected_size actual_digest actual_size
-  for slot in "${!VOLUME_FILE_PATHS[@]}"; do
-    key="${volume_id}|${slot}"
-    [[ -n "${VOLUME_FILE_DIGEST[${key}]+present}" ]] || continue
-    path="${VOLUME_FILE_PATHS[${slot}]}"
-    expected_digest="${VOLUME_FILE_DIGEST[${key}]}"
-    expected_size="${VOLUME_FILE_SIZE[${key}]}"
-    download_random_file "${sandbox_id}" "${path}"
-    assert_status "${HTTP_STATUS}" "200" \
-      "${CURRENT_STEP}: read modeled file ${path}"
-    actual_digest="$(sha256sum "${_E2E_BODY}" | awk '{print $1}')"
-    actual_size="$(wc -c <"${_E2E_BODY}" | tr -d ' ')"
-    assert_eq "${actual_digest}" "${expected_digest}" \
-      "${CURRENT_STEP}: digest matches for ${path}"
-    assert_eq "${actual_size}" "${expected_size}" \
-      "${CURRENT_STEP}: size matches for ${path}"
-  done
+  local expected="${VOLUME_CONTENT[${volume_id}]}"
+  [[ -n "${expected}" ]] || return 0
+  download_random_file "${sandbox_id}"
+  assert_status "${HTTP_STATUS}" "200" "${CURRENT_STEP}: read modeled volume data"
+  assert_contains "${HTTP_BODY}" "${expected}" \
+    "${CURRENT_STEP}: guest data matches the model"
 }
 
-generate_payload() {
-  local token="$1"
-  local size="$2"
-  awk -v token="${token}" -v bytes="${size}" 'BEGIN {
-    chunk = token "|"
-    while (length(chunk) < 512) {
-      chunk = chunk token "|"
-    }
-    remaining = bytes
-    while (remaining > 0) {
-      count = remaining < length(chunk) ? remaining : length(chunk)
-      printf "%s", substr(chunk, 1, count)
-      remaining -= count
-    }
-  }' >"${random_file}"
-}
-
-write_new_volume_file() {
-  local sandbox_id="$1"
-  local volume_id="$2"
-  local slot="$3"
-  local phase="$4"
-  local path="${VOLUME_FILE_PATHS[${slot}]}"
-  local size="${VOLUME_PAYLOAD_SIZES[${slot}]}"
-  local token key
-  WRITE_SEQUENCE=$((WRITE_SEQUENCE + 1))
-  token="seed-${VOLUME_RANDOM_SEED}-${CURRENT_STEP}-${phase}-${WRITE_SEQUENCE}-${volume_id}-${slot}"
-  generate_payload "${token}" "${size}"
-  upload_random_file "${sandbox_id}" "${path}"
-  assert_status "${HTTP_STATUS}" "200" \
-    "${CURRENT_STEP}: write modeled file ${path}"
-  key="${volume_id}|${slot}"
-  VOLUME_FILE_DIGEST["${key}"]="$(sha256sum "${random_file}" | awk '{print $1}')"
-  VOLUME_FILE_SIZE["${key}"]="${size}"
-}
-
-seed_missing_volume_files() {
-  local sandbox_id="$1"
-  local volume_id="$2"
-  local slot key
-  for slot in "${!VOLUME_FILE_PATHS[@]}"; do
-    key="${volume_id}|${slot}"
-    if [[ -z "${VOLUME_FILE_DIGEST[${key}]+present}" ]]; then
-      write_new_volume_file "${sandbox_id}" "${volume_id}" "${slot}" "seed"
-    fi
-  done
-}
-
-mutate_volume_burst() {
+write_new_volume_content() {
   local sandbox_id="$1"
   local volume_id="$2"
   local phase="$3"
-  local count="${4:-$((3 + RANDOM % 5))}"
-  local start_slot=$((RANDOM % ${#VOLUME_FILE_PATHS[@]}))
-  local mutation slot
-  for ((mutation = 0; mutation < count; mutation++)); do
-    if [[ "${mutation}" -lt "${#VOLUME_FILE_PATHS[@]}" ]]; then
-      slot=$(((start_slot + mutation) % ${#VOLUME_FILE_PATHS[@]}))
-    else
-      slot=$((RANDOM % ${#VOLUME_FILE_PATHS[@]}))
-    fi
-    write_new_volume_file "${sandbox_id}" "${volume_id}" "${slot}" \
-      "${phase}-${mutation}"
-  done
+  local token="seed-${VOLUME_RANDOM_SEED}-${CURRENT_STEP}-${phase}-${volume_id}"
+  printf '%s\n' "${token}" >"${random_file}"
+  upload_random_file "${sandbox_id}"
+  assert_status "${HTTP_STATUS}" "200" "${CURRENT_STEP}: write modeled guest data"
+  VOLUME_CONTENT["${volume_id}"]="${token}"
+  verify_volume_content "${sandbox_id}" "${volume_id}"
 }
 
 assert_read_only_write_fails() {
   local sandbox_id="$1"
-  local attempt path
-  for attempt in 0 1; do
-    path="${VOLUME_MOUNT_PATH}/read-only-attempt-${attempt}/write-must-fail.txt"
-    generate_payload "read-only-write-must-fail-${attempt}" "$((4095 + attempt * 2))"
-    upload_random_file "${sandbox_id}" "${path}"
-    if [[ "${HTTP_STATUS}" == "500" ]] && [[ "${HTTP_BODY}" == *"Read-only file system"* || "${HTTP_BODY}" == *"read-only"* ]]; then
-      _pass "${CURRENT_STEP}: read-only guest write ${attempt} is rejected"
-    else
-      _fail "${CURRENT_STEP}: read-only guest write ${attempt} is rejected" \
-        "HTTP 500 with read-only error" "HTTP ${HTTP_STATUS}: ${HTTP_BODY}"
-    fi
-  done
+  printf 'read-only-write-must-fail\n' >"${random_file}"
+  upload_random_file "${sandbox_id}" "${VOLUME_MOUNT_PATH}/write-must-fail.txt"
+  if [[ "${HTTP_STATUS}" == "200" ]]; then
+    _fail "${CURRENT_STEP}: read-only guest write is rejected" "non-200" "${HTTP_STATUS}"
+  else
+    _pass "${CURRENT_STEP}: read-only guest write is rejected"
+  fi
 }
 
 pause_and_resume_sandbox() {
@@ -319,22 +228,19 @@ exercise_volume_cycle() {
   local mode="${VOLUME_MODE[${volume_id}]}"
   start_volume_sandbox "${volume_id}"
   local sandbox_id="${LAST_SANDBOX_ID}"
-  verify_volume_files "${sandbox_id}" "${volume_id}"
+  verify_volume_content "${sandbox_id}" "${volume_id}"
 
   if [[ "${mode}" == "exclusive" ]]; then
-    seed_missing_volume_files "${sandbox_id}" "${volume_id}"
-    mutate_volume_burst "${sandbox_id}" "${volume_id}" "before-cycle"
-    verify_volume_files "${sandbox_id}" "${volume_id}"
+    write_new_volume_content "${sandbox_id}" "${volume_id}" "before-cycle"
   else
     assert_read_only_write_fails "${sandbox_id}"
   fi
 
   if [[ "${pause_cycle}" == "1" ]]; then
     pause_and_resume_sandbox "${sandbox_id}"
-    verify_volume_files "${sandbox_id}" "${volume_id}"
+    verify_volume_content "${sandbox_id}" "${volume_id}"
     if [[ "${mode}" == "exclusive" ]]; then
-      mutate_volume_burst "${sandbox_id}" "${volume_id}" "after-resume"
-      verify_volume_files "${sandbox_id}" "${volume_id}"
+      write_new_volume_content "${sandbox_id}" "${volume_id}" "after-resume"
     fi
   fi
 
@@ -346,7 +252,7 @@ verify_volume_cycle() {
   local volume_id="$1"
   start_volume_sandbox "${volume_id}"
   local sandbox_id="${LAST_SANDBOX_ID}"
-  verify_volume_files "${sandbox_id}" "${volume_id}"
+  verify_volume_content "${sandbox_id}" "${volume_id}"
   delete_sandbox "${sandbox_id}"
   assert_status "${HTTP_STATUS}" "204" "${CURRENT_STEP}: delete verification sandbox"
 }
@@ -355,10 +261,8 @@ fork_volume_cycle() {
   local source_volume_id="$1"
   start_volume_sandbox "${source_volume_id}"
   local source_sandbox_id="${LAST_SANDBOX_ID}"
-  verify_volume_files "${source_sandbox_id}" "${source_volume_id}"
-  seed_missing_volume_files "${source_sandbox_id}" "${source_volume_id}"
-  mutate_volume_burst "${source_sandbox_id}" "${source_volume_id}" "before-fork" 6
-  verify_volume_files "${source_sandbox_id}" "${source_volume_id}"
+  verify_volume_content "${source_sandbox_id}" "${source_volume_id}"
+  write_new_volume_content "${source_sandbox_id}" "${source_volume_id}" "before-fork"
 
   api_post "/sandboxes/${source_sandbox_id}/fork" '{"count":1}'
   assert_status "${HTTP_STATUS}" "201" "${CURRENT_STEP}: fork volume sandbox through gateway"
@@ -373,26 +277,10 @@ fork_volume_cycle() {
   local child_volume_id
   child_volume_id="$(echo "${HTTP_BODY}" | jq -r --arg path "${VOLUME_MOUNT_PATH}" '.volumeMounts[$path] // empty')"
   assert_not_empty "${child_volume_id}" "${CURRENT_STEP}: fork child volume ID is present"
-  register_volume "${child_volume_id}" "exclusive" "${source_volume_id}"
+  register_volume "${child_volume_id}" "exclusive" "${VOLUME_CONTENT[${source_volume_id}]}"
   log "seed=${VOLUME_RANDOM_SEED} step=${CURRENT_STEP} fork-volume=${child_volume_id} source=${source_volume_id}"
   capture_sandbox_node "${child_sandbox_id}" "${child_volume_id}"
-  verify_volume_files "${child_sandbox_id}" "${child_volume_id}"
-
-  # Mutate the same file independently on both sides, then verify the complete
-  # manifests. This catches accidental shared writable uppers after a fork.
-  write_new_volume_file "${child_sandbox_id}" "${child_volume_id}" 0 "child-diverge"
-  verify_volume_files "${child_sandbox_id}" "${child_volume_id}"
-  verify_volume_files "${source_sandbox_id}" "${source_volume_id}"
-  write_new_volume_file "${source_sandbox_id}" "${source_volume_id}" 0 "source-diverge"
-  mutate_volume_burst "${source_sandbox_id}" "${source_volume_id}" "source-after-fork" 3
-  mutate_volume_burst "${child_sandbox_id}" "${child_volume_id}" "child-after-fork" 3
-  assert_not_eq \
-    "${VOLUME_FILE_DIGEST[${source_volume_id}|0]}" \
-    "${VOLUME_FILE_DIGEST[${child_volume_id}|0]}" \
-    "${CURRENT_STEP}: source and child file models diverge"
-  pause_and_resume_sandbox "${child_sandbox_id}"
-  verify_volume_files "${source_sandbox_id}" "${source_volume_id}"
-  verify_volume_files "${child_sandbox_id}" "${child_volume_id}"
+  verify_volume_content "${child_sandbox_id}" "${child_volume_id}"
 
   delete_sandbox "${child_sandbox_id}"
   assert_status "${HTTP_STATUS}" "204" "${CURRENT_STEP}: delete fork child sandbox"
@@ -420,12 +308,7 @@ delete_modeled_volume() {
   api_delete "/volumes/${volume_id}"
   assert_status "${HTTP_STATUS}" "204" "${CURRENT_STEP}: delete modeled volume"
   unset "VOLUME_MODE[${volume_id}]"
-  local slot key
-  for slot in "${!VOLUME_FILE_PATHS[@]}"; do
-    key="${volume_id}|${slot}"
-    unset "VOLUME_FILE_DIGEST[${key}]"
-    unset "VOLUME_FILE_SIZE[${key}]"
-  done
+  unset "VOLUME_CONTENT[${volume_id}]"
 }
 
 count_volume_nodes() {

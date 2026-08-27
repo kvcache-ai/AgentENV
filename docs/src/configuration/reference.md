@@ -263,6 +263,13 @@ The managed seed is node-local persistent state and must be included in backups 
 
 Configure `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` with the same value on every runtime node in a clustered deployment. Standalone runtime nodes use their managed seed when it is unset.
 
+## `[volume]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_size_mb` | integer | `262144` | Maximum persistent volume size in MiB (256 GiB). |
+| `max_volume_count` | integer | `4` | Maximum number of persistent volumes that one sandbox may mount. Must be between 1 and the Firecracker extra-drive limit. |
+
 ## `[orchestrator]`
 
 Sandbox lifecycle management.

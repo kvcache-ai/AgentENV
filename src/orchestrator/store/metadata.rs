@@ -13,7 +13,7 @@ use crate::snapshot::{CommandContext, SnapshotRuntimeVersions, StartupCommand};
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use crate::virtualization::VirtualizationMode;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum SandboxTimeoutAction {
     Pause,
     Delete,

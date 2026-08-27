@@ -10,6 +10,7 @@ use overlaybd::index_file::CommitArgs;
 use overlaybd::virtual_file::VirtualFile;
 
 use crate::snapshot::{ManagedLayer, OverlaybdLayerRef, RepositoryError, RepositoryResult};
+use uuid::Uuid;
 
 pub(crate) async fn materialize_volume_image_config(
     layers: &[OverlaybdLayerRef],
@@ -50,14 +51,24 @@ pub(crate) async fn materialize_volume_image_config(
     })?;
     let bytes = serde_json::to_vec_pretty(&image_config)
         .map_err(|error| RepositoryError::backend("serialize volume image config", error))?;
-    tokio::fs::write(destination, bytes)
-        .await
-        .map_err(|error| {
-            RepositoryError::backend(
-                format!("write volume image config '{}'", destination.display()),
-                error,
-            )
-        })?;
+    let temporary = destination.with_extension(format!("tmp-{}", Uuid::now_v7().simple()));
+    if let Err(error) = tokio::fs::write(&temporary, bytes).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(RepositoryError::backend(
+            format!(
+                "write temporary volume image config '{}'",
+                temporary.display()
+            ),
+            error,
+        ));
+    }
+    if let Err(error) = tokio::fs::rename(&temporary, destination).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(RepositoryError::backend(
+            format!("install volume image config '{}'", destination.display()),
+            error,
+        ));
+    }
     Ok(destination.to_path_buf())
 }
 

@@ -12,6 +12,8 @@ use crate::snapshot::repository::{RepositoryError, SnapshotRepository};
 use crate::snapshot::OverlaybdLayerRef;
 
 pub const DEFAULT_VOLUME_SIZE_MB: u64 = 64 * 1024;
+/// Firecracker exposes /dev/vdc through /dev/vdz for extra drives.
+pub const MAX_VOLUME_MOUNTS: usize = 24;
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
 fn default_volume_size_mb() -> u64 {
@@ -33,6 +35,7 @@ pub enum VolumeStatus {
     #[default]
     Ready,
     Uploading,
+    Failed,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -56,6 +59,8 @@ pub struct VolumeRecord {
     /// another node to reopen the volume.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backing_layers: Vec<OverlaybdLayerRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_only_mounts: Vec<String>,
 }
 
 fn current_local_backing(remote: &VolumeRecord, local: &[VolumeRecord]) -> Option<PathBuf> {
@@ -78,33 +83,65 @@ pub enum VolumeError {
     Reserved(String),
     #[error("volume is uploading and not usable: {0}")]
     Uploading(String),
+    #[error("volume publication failed and is not usable: {0}")]
+    Failed(String),
     #[error("fromVolume and image cannot be used together")]
     MultipleSources,
     #[error("volume size must be greater than zero")]
     InvalidSize,
+    #[error("volume size exceeds the configured maximum of {max_size_mb} MiB")]
+    SizeLimitExceeded { max_size_mb: u64 },
     #[error("volume child size must match its source size")]
     SizeMismatch,
+    #[error("sandbox cannot mount more than {max_count} volumes")]
+    TooManyMountedVolumes { max_count: usize },
     #[error("source volume not found: {0}")]
     SourceNotFound(String),
     #[error("volume catalog storage failed: {0}")]
     Storage(String),
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct VolumeManager {
     records: Arc<RwLock<Vec<VolumeRecord>>>,
     root: Option<PathBuf>,
     repository: Option<Arc<dyn SnapshotRepository>>,
     publication_lock: Arc<Mutex<()>>,
+    limits: VolumeLimits,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct VolumeLimits {
+    pub max_size_mb: u64,
+    pub max_mounts: usize,
+}
+
+impl Default for VolumeLimits {
+    fn default() -> Self {
+        let config = crate::cfg::VolumeConfig::default();
+        Self {
+            max_size_mb: config.max_size_mb,
+            max_mounts: config.max_volume_count,
+        }
+    }
 }
 
 impl VolumeManager {
     pub fn new() -> Self {
+        Self::with_limits(VolumeLimits::default())
+    }
+
+    pub fn with_limits(limits: VolumeLimits) -> Self {
+        let limits = VolumeLimits {
+            max_mounts: limits.max_mounts.min(MAX_VOLUME_MOUNTS),
+            ..limits
+        };
         Self {
             records: Arc::new(RwLock::new(Vec::new())),
             root: None,
             repository: None,
             publication_lock: Arc::new(Mutex::new(())),
+            limits,
         }
     }
 
@@ -116,6 +153,14 @@ impl VolumeManager {
         path: impl Into<std::path::PathBuf>,
         repository: Option<Arc<dyn SnapshotRepository>>,
     ) -> anyhow::Result<Self> {
+        Self::open_with_repository_and_limits(path, repository, VolumeLimits::default()).await
+    }
+
+    pub async fn open_with_repository_and_limits(
+        path: impl Into<std::path::PathBuf>,
+        repository: Option<Arc<dyn SnapshotRepository>>,
+        limits: VolumeLimits,
+    ) -> anyhow::Result<Self> {
         let path = path.into();
         let root = path.parent().map(Path::to_path_buf);
         let manager = Self {
@@ -123,9 +168,17 @@ impl VolumeManager {
             root,
             repository,
             publication_lock: Arc::new(Mutex::new(())),
+            limits: VolumeLimits {
+                max_mounts: limits.max_mounts.min(MAX_VOLUME_MOUNTS),
+                ..limits
+            },
         };
         manager.refresh_repository().await?;
         Ok(manager)
+    }
+
+    pub fn limits(&self) -> VolumeLimits {
+        self.limits
     }
 
     async fn refresh_repository(&self) -> Result<(), VolumeError> {
@@ -147,6 +200,7 @@ impl VolumeManager {
         let mut records = self.records.write().await;
         let local_records = records.clone();
         for remote in &mut remote_records {
+            validate_volume_id(&remote.id)?;
             remote.backing_image_config = current_local_backing(remote, &local_records);
             if remote.backing_image_config.is_none() && !remote.backing_layers.is_empty() {
                 let Some(root) = self.root.as_ref() else {
@@ -249,6 +303,11 @@ impl VolumeManager {
         if size_mb == 0 {
             return Err(VolumeError::InvalidSize);
         }
+        if size_mb > self.limits.max_size_mb {
+            return Err(VolumeError::SizeLimitExceeded {
+                max_size_mb: self.limits.max_size_mb,
+            });
+        }
         if from_volume.is_some() && image.is_some() {
             return Err(VolumeError::MultipleSources);
         }
@@ -267,6 +326,9 @@ impl VolumeManager {
                     .ok_or_else(|| VolumeError::SourceNotFound(reference.clone()))?;
                 if parent.status == VolumeStatus::Uploading {
                     return Err(VolumeError::Uploading(parent.id.clone()));
+                }
+                if parent.status == VolumeStatus::Failed {
+                    return Err(VolumeError::Failed(parent.id.clone()));
                 }
                 if let Some(owner) = parent.reserved_by_sandbox_id.as_deref() {
                     if source_owner != Some(owner) {
@@ -304,6 +366,7 @@ impl VolumeManager {
             reserved_by_sandbox_id: None,
             backing_image_config,
             backing_layers: Vec::new(),
+            read_only_mounts: Vec::new(),
         };
         if let Err(error) = self.persist(&mut record).await {
             if let Some(config) = record.backing_image_config.as_ref() {
@@ -328,6 +391,9 @@ impl VolumeManager {
         };
         if let Some(owner) = records[index].reserved_by_sandbox_id.as_deref() {
             return Err(VolumeError::Reserved(owner.to_owned()));
+        }
+        if let Some(owner) = records[index].read_only_mounts.first() {
+            return Err(VolumeError::Reserved(owner.clone()));
         }
         if let Some(repository) = &self.repository {
             match repository.delete_volume(&records[index].id).await {
@@ -421,10 +487,36 @@ impl VolumeManager {
             .iter()
             .position(|record| record.id == reference || record.name == reference)
             .ok_or_else(|| VolumeError::NotFound(reference.to_owned()))?;
-        if records[index].status == VolumeStatus::Uploading {
-            return Err(VolumeError::Uploading(records[index].id.clone()));
+        match records[index].status {
+            VolumeStatus::Uploading => {
+                return Err(VolumeError::Uploading(records[index].id.clone()))
+            }
+            VolumeStatus::Failed => return Err(VolumeError::Failed(records[index].id.clone())),
+            VolumeStatus::Ready => {}
         }
         if records[index].mode == VolumeMode::ReadOnly {
+            let repository_updated = if let Some(repository) = &self.repository {
+                match repository
+                    .reserve_read_only_volume(&records[index].id, owner)
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(RepositoryError::Unsupported { .. }) => false,
+                    Err(error) => return Err(repository_error(error)),
+                }
+            } else {
+                false
+            };
+            if !records[index]
+                .read_only_mounts
+                .iter()
+                .any(|entry| entry == owner)
+            {
+                records[index].read_only_mounts.push(owner.to_owned());
+            }
+            if !repository_updated {
+                self.persist_catalog(&records[index]).await?;
+            }
             return Ok(());
         }
         if let Some(existing) = records[index].reserved_by_sandbox_id.as_deref() {
@@ -474,6 +566,12 @@ impl VolumeManager {
                     self.persist_catalog(record).await?;
                 }
             }
+            if record.read_only_mounts.iter().any(|entry| entry == owner) {
+                record.read_only_mounts.retain(|entry| entry != owner);
+                if !repository_updated {
+                    self.persist_catalog(record).await?;
+                }
+            }
         }
         Ok(())
     }
@@ -489,14 +587,26 @@ impl VolumeManager {
                 // Publish the state transition before uploading any writable
                 // upper layer so other nodes cannot mount stale content.
                 record.status = VolumeStatus::Uploading;
-                self.persist_catalog(record).await?;
+                if let Err(error) = self.persist_catalog(record).await {
+                    record.status = VolumeStatus::Failed;
+                    let _ = self.persist_catalog(record).await;
+                    return Err(error);
+                }
                 let previous_layers = record.backing_layers.clone();
-                self.publish_backing(record).await?;
+                if let Err(error) = self.publish_backing(record).await {
+                    record.status = VolumeStatus::Failed;
+                    let _ = self.persist_catalog(record).await;
+                    return Err(error);
+                }
                 if record.backing_layers != previous_layers {
                     record.revision = record.revision.saturating_add(1);
                 }
                 record.status = VolumeStatus::Ready;
-                self.persist_catalog(record).await?;
+                if let Err(error) = self.persist_catalog(record).await {
+                    record.status = VolumeStatus::Failed;
+                    let _ = self.persist_catalog(record).await;
+                    return Err(error);
+                }
             }
         }
         Ok(())
@@ -674,6 +784,12 @@ impl VolumeManager {
     }
 }
 
+impl Default for VolumeManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn repository_error(error: RepositoryError) -> VolumeError {
     VolumeError::Storage(error.to_string())
 }
@@ -687,6 +803,19 @@ fn validate_name(name: &str) -> Result<(), VolumeError> {
         Ok(())
     } else {
         Err(VolumeError::InvalidName)
+    }
+}
+
+fn validate_volume_id(id: &str) -> Result<(), VolumeError> {
+    if !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        Ok(())
+    } else {
+        Err(VolumeError::Storage(format!("invalid volume id '{id}'")))
     }
 }
 
@@ -761,6 +890,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_volume_larger_than_configured_limit() {
+        let manager = VolumeManager::with_limits(VolumeLimits {
+            max_size_mb: 16,
+            max_mounts: 4,
+        });
+        assert_eq!(
+            manager
+                .create(
+                    "too-large".to_owned(),
+                    VolumeMode::Exclusive,
+                    None,
+                    None,
+                    17,
+                )
+                .await,
+            Err(VolumeError::SizeLimitExceeded { max_size_mb: 16 })
+        );
+    }
+
+    #[tokio::test]
     async fn deleting_unknown_or_reserved_volume_fails() {
         let manager = VolumeManager::new();
         assert_eq!(
@@ -825,6 +974,45 @@ mod tests {
         assert_eq!(
             manager.get(&record.id).await.unwrap().status,
             VolumeStatus::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_leases_prevent_delete_until_all_owners_release() {
+        let manager = VolumeManager::new();
+        let record = manager
+            .create(
+                "shared".to_owned(),
+                VolumeMode::ReadOnly,
+                None,
+                Some("image:latest".to_owned()),
+                DEFAULT_VOLUME_SIZE_MB,
+            )
+            .await
+            .unwrap();
+        manager.reserve(&record.id, "sandbox-a").await.unwrap();
+        manager.reserve(&record.id, "sandbox-b").await.unwrap();
+        assert!(matches!(
+            manager.delete(&record.id).await,
+            Err(VolumeError::Reserved(_))
+        ));
+        manager.release_owner("sandbox-a").await.unwrap();
+        assert!(matches!(
+            manager.delete(&record.id).await,
+            Err(VolumeError::Reserved(_))
+        ));
+        manager.release_owner("sandbox-b").await.unwrap();
+        manager.delete(&record.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_volume_is_not_mountable() {
+        let manager = VolumeManager::new();
+        let record = create_empty(&manager, "failed").await;
+        manager.records.write().await[0].status = VolumeStatus::Failed;
+        assert_eq!(
+            manager.reserve(&record.id, "sandbox").await,
+            Err(VolumeError::Failed(record.id))
         );
     }
 

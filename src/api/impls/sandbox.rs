@@ -1091,11 +1091,6 @@ impl Sandboxes<()> for ApiImpl {
                     ),
                 ));
             }
-            Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
-                return Ok(SandboxesSandboxIdConnectPostResponse::Status409_Conflict(
-                    Self::error(409, err.to_string()),
-                ));
-            }
             Err(err) => {
                 return Ok(
                     SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()),
@@ -1706,22 +1701,12 @@ impl Sandboxes<()> for ApiImpl {
                     sandbox_not_found(id),
                 ));
             }
-            Err(OrchestratorError::InvalidTimeout { timeout, .. }) => {
-                return Ok(SandboxesSandboxIdResumePostResponse::Status400_BadRequest(
-                    Self::error(400, format!("invalid timeout: {timeout}")),
-                ));
-            }
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
                 return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
                     Self::error(
                         409,
                         format!("sandbox cannot be resumed from {} state", state),
                     ),
-                ));
-            }
-            Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
-                return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
-                    Self::error(409, err.to_string()),
                 ));
             }
             Err(err) => {
@@ -1784,28 +1769,18 @@ impl Sandboxes<()> for ApiImpl {
             // treat it as no state filter (i.e. return all sandboxes regardless of state)
             None
         };
-        let include_running = states
-            .as_ref()
-            .is_none_or(|states| states.contains(&SandboxState::Running));
-        let descending = !matches!(query_params.order, Some(models::OrderDirection::Asc));
 
         let filter = SandboxListFilter {
             states,
             excluded_states: None,
             user_metadata: parse_metadata_filter(&query_params.metadata),
-            started_after: query_params.started_after.map(SystemTime::from),
-            template: query_params.template.clone(),
+            started_after: None,
+            template: None,
         };
 
         let cursor = match query_params.next_token.as_deref() {
             Some(token) => match PaginationCursor::parse(token) {
-                Ok(cursor) if cursor.is_descending() == descending => cursor,
-                Ok(_) => {
-                    return Ok(V2SandboxesGetResponse::Status400_BadRequest(Self::error(
-                        400,
-                        "next token was issued for a different sort order".to_string(),
-                    )));
-                }
+                Ok(cursor) => cursor,
                 Err(err) => {
                     return Ok(V2SandboxesGetResponse::Status400_BadRequest(Self::error(
                         400,
@@ -1813,10 +1788,7 @@ impl Sandboxes<()> for ApiImpl {
                     )));
                 }
             },
-            None if descending => {
-                PaginationCursor::new_descending(SystemTime::now(), SandboxId::max())
-            }
-            None => PaginationCursor::new_ascending(SystemTime::UNIX_EPOCH, SandboxId::max()),
+            None => PaginationCursor::new(SystemTime::now(), SandboxId::max(), true),
         };
 
         let list = match self.orchestrator.list_sandboxes_filtered(filter).await {
@@ -1826,28 +1798,19 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
-        let x_total_running = include_running.then(|| {
-            list.iter()
-                .filter(|sandbox| sandbox.state == SandboxState::Running)
-                .count()
-                .try_into()
-                .unwrap_or(i32::MAX)
-        });
-
         let page = cursor.paginate(
             list,
             query_params.limit,
-            |a, b| PaginationCursor::compare(descending, a.created_at, &a.id, b.created_at, &b.id),
+            |a, b| PaginationCursor::compare_desc(a.created_at, &a.id, b.created_at, &b.id),
             |sandbox, cursor| {
-                PaginationCursor::compare(
-                    descending,
+                PaginationCursor::compare_desc(
                     sandbox.created_at,
                     &sandbox.id,
                     cursor.time(),
                     cursor.value(),
                 )
             },
-            |sandbox| PaginationCursor::new(sandbox.created_at, sandbox.id, descending),
+            |sandbox| PaginationCursor::new(sandbox.created_at, sandbox.id, true),
         );
 
         let out = page
@@ -1860,7 +1823,7 @@ impl Sandboxes<()> for ApiImpl {
             V2SandboxesGetResponse::Status200_SuccessfullyReturnedAllRunningSandboxes {
                 body: out,
                 x_next_token: page.next_token,
-                x_total_running,
+                x_total_running: None,
             },
         )
     }

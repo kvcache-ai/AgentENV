@@ -43,6 +43,7 @@ impl PosixFsArtifactStore {
                 error,
             )
         })?;
+        let config_parent = image_config_path.parent().unwrap_or_else(|| Path::new("."));
         image_config
             .lowers
             .into_iter()
@@ -50,23 +51,62 @@ impl PosixFsArtifactStore {
             .map(|(index, layer)| {
                 if !layer.file.is_empty() {
                     let layer_path = Path::new(&layer.file);
-                    if !layer.digest.is_empty() && layer.size > 0 {
+                    let layer_path = if layer_path.is_absolute() {
+                        layer_path.to_path_buf()
+                    } else {
+                        config_parent.join(layer_path)
+                    };
+                    if !layer.digest.is_empty() || layer.size != 0 {
+                        if layer.digest.is_empty() || layer.size == 0 {
+                            return Err(RepositoryError::InvalidRequest {
+                                reason: format!(
+                                    "volume layer {index} has an incomplete digest/size descriptor"
+                                ),
+                            });
+                        }
+                        let actual = FileDigest::describe_blocking(&layer_path).map_err(|error| {
+                            RepositoryError::backend(
+                                format!("describe volume layer '{}'", layer_path.display()),
+                                error,
+                            )
+                        })?;
+                        if actual.sha256 != layer.digest || actual.size != layer.size {
+                            return Err(RepositoryError::InvalidRequest {
+                                reason: format!(
+                                    "volume layer {index} digest/size does not match its content"
+                                ),
+                            });
+                        }
                         return self
                             .import_managed_layer_with_descriptor(
-                                layer_path,
+                                &layer_path,
                                 &layer.digest,
                                 layer.size,
                             )
                             .map(OverlaybdLayerRef::Managed);
                     }
                     return self
-                        .import_descriptorless_rootfs_layer(layer_path)
+                        .import_descriptorless_rootfs_layer(&layer_path)
                         .map(OverlaybdLayerRef::Managed);
                 }
                 let repo_blob_url = layer
                     .effective_repo_blob_url(&image_config.repo_blob_url)
                     .to_string();
                 if !repo_blob_url.is_empty() {
+                    let parsed = url::Url::parse(&repo_blob_url).map_err(|error| {
+                        RepositoryError::InvalidRequest {
+                            reason: format!("volume layer {index} has invalid repoBlobUrl: {error}"),
+                        }
+                    })?;
+                    if !matches!(parsed.scheme(), "http" | "https" | "s3")
+                        || parsed.host_str().is_none()
+                    {
+                        return Err(RepositoryError::InvalidRequest {
+                            reason: format!(
+                                "volume layer {index} repoBlobUrl must use http, https, or s3 with a host"
+                            ),
+                        });
+                    }
                     return Ok(OverlaybdLayerRef::External(
                         crate::snapshot::ExternalLayer {
                             digest: if !layer.digest.is_empty() {

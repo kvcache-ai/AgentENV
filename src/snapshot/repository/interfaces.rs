@@ -35,6 +35,14 @@ pub struct SnapshotListFilter {
     pub template_statuses: Option<Vec<TemplateBuildStatus>>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VolumeRecordPage {
+    pub records: Vec<crate::volume::VolumeRecord>,
+    /// The last returned volume ID. Supplying it to the next request resumes
+    /// after that record in the repository's stable shard-and-ID order.
+    pub next_volume_id: Option<String>,
+}
+
 fn unsupported<T>(feature: &str) -> RepositoryResult<T> {
     Err(RepositoryError::Unsupported {
         feature: feature.to_owned(),
@@ -181,15 +189,44 @@ pub trait SnapshotRepository: Send + Sync {
         reason: TemplateBuildErrorReason,
     ) -> RepositoryResult<()>;
 
-    /// Lists independently managed volume records stored with this repository.
-    ///
-    /// Repositories that do not provide a volume catalog may retain the default
-    /// unsupported response; this keeps snapshot-only test doubles lightweight.
-    async fn list_volumes(&self) -> RepositoryResult<Vec<crate::volume::VolumeRecord>> {
+    /// Resolves a volume by ID first, then by its unique name.
+    async fn get_volume(
+        &self,
+        _reference: &str,
+    ) -> RepositoryResult<Option<crate::volume::VolumeRecord>> {
         unsupported("volume catalog")
     }
 
-    /// Creates or replaces one durable volume record.
+    /// Lists one bounded page ordered by the repository's stable volume cursor.
+    async fn list_volumes_page(
+        &self,
+        _after_volume_id: Option<&str>,
+        _limit: usize,
+    ) -> RepositoryResult<VolumeRecordPage> {
+        unsupported("volume catalog")
+    }
+
+    async fn list_volumes(&self) -> RepositoryResult<Vec<crate::volume::VolumeRecord>> {
+        let mut records = Vec::new();
+        let mut after_volume_id = None;
+        loop {
+            let page = self
+                .list_volumes_page(after_volume_id.as_deref(), 100)
+                .await?;
+            records.extend(page.records);
+            let Some(next_volume_id) = page.next_volume_id else {
+                return Ok(records);
+            };
+            after_volume_id = Some(next_volume_id);
+        }
+    }
+
+    /// Creates one durable volume record and atomically claims its unique name.
+    async fn create_volume(&self, _record: crate::volume::VolumeRecord) -> RepositoryResult<()> {
+        unsupported("volume catalog")
+    }
+
+    /// Updates one existing durable volume record.
     async fn put_volume(&self, _record: crate::volume::VolumeRecord) -> RepositoryResult<()> {
         unsupported("volume catalog")
     }
@@ -229,12 +266,25 @@ pub trait SnapshotRepository: Send + Sync {
         unsupported("volume reservations")
     }
 
-    /// Releases reservations held by `from`, or rebinds them when `to` is set.
-    async fn replace_volume_owner(
+    /// Adds a shared lease for a read-only volume.
+    async fn reserve_read_only_volume(
         &self,
-        _from: &str,
-        _to: Option<&str>,
-    ) -> RepositoryResult<Option<String>> {
+        _volume_id: &str,
+        _owner: &str,
+    ) -> RepositoryResult<()> {
+        unsupported("read-only volume reservations")
+    }
+
+    /// Returns only volumes currently reserved or leased by one owner.
+    async fn list_volumes_by_owner(
+        &self,
+        _owner: &str,
+    ) -> RepositoryResult<Vec<crate::volume::VolumeRecord>> {
+        unsupported("volume reservations")
+    }
+
+    /// Releases reservations held by `from`, or rebinds them when `to` is set.
+    async fn replace_volume_owner(&self, _from: &str, _to: Option<&str>) -> RepositoryResult<()> {
         unsupported("volume reservations")
     }
 }

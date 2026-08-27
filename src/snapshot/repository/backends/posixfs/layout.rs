@@ -5,6 +5,8 @@ use crate::snapshot::{SnapshotAlias, SnapshotId};
 pub(super) const POSIXFS_SNAPSHOT_COMMIT_MARKER: &str = "commit";
 const LOCK_SUFFIX: &str = ".lock";
 const VOLUME_CATALOG_DIR: &str = "volumes";
+const VOLUME_NAMES_DIR: &str = "volume-names";
+const VOLUME_OWNERS_DIR: &str = "volume-owners";
 
 pub(super) fn managed_layer_file_name(digest: &str) -> String {
     format!("{}.overlaybd.commit", digest.replace([':', '/'], "_"))
@@ -41,7 +43,37 @@ impl PosixFsSnapshotArtifactLayout {
     }
 
     pub(super) fn volume_record_path(root: &Path, volume_id: &str) -> PathBuf {
-        Self::volumes_dir(root).join(format!("{volume_id}.json"))
+        Self::volumes_dir(root)
+            .join(crate::snapshot::repository::volume_catalog_shard(volume_id))
+            .join(format!("{volume_id}.json"))
+    }
+
+    pub(super) fn volume_shard_dir(root: &Path, shard: &str) -> PathBuf {
+        Self::volumes_dir(root).join(shard)
+    }
+
+    pub(super) fn volume_names_dir(root: &Path) -> PathBuf {
+        Self::catalog_dir(root).join(VOLUME_NAMES_DIR)
+    }
+
+    pub(super) fn volume_name_path(root: &Path, name: &str) -> PathBuf {
+        Self::volume_names_dir(root)
+            .join(crate::snapshot::repository::volume_catalog_shard(name))
+            .join(format!("{name}.json"))
+    }
+
+    pub(super) fn volume_owners_dir(root: &Path) -> PathBuf {
+        Self::catalog_dir(root).join(VOLUME_OWNERS_DIR)
+    }
+
+    pub(super) fn volume_owner_dir(root: &Path, owner: &str) -> PathBuf {
+        Self::volume_owners_dir(root)
+            .join(crate::snapshot::repository::volume_catalog_shard(owner))
+            .join(owner)
+    }
+
+    pub(super) fn volume_owner_path(root: &Path, owner: &str, volume_id: &str) -> PathBuf {
+        Self::volume_owner_dir(root, owner).join(format!("{volume_id}.json"))
     }
 
     pub(super) fn volume_catalog_lock_path(root: &Path) -> PathBuf {

@@ -202,6 +202,53 @@ impl OssClient {
             .collect())
     }
 
+    /// Lists at most `limit` files after a repository-relative key.
+    pub(crate) async fn list_keys_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let full_prefix = self.full_key(prefix);
+        let full_start_after = start_after.map(|key| self.full_key(key));
+        let keys = self
+            .run_with_operator(|operator| {
+                let full_prefix = full_prefix.clone();
+                let full_start_after = full_start_after.clone();
+                async move {
+                    let builder = operator
+                        .lister_with(&full_prefix)
+                        .recursive(true)
+                        .limit(limit);
+                    let mut lister = match full_start_after.as_deref() {
+                        Some(key) => builder.start_after(key).await?,
+                        None => builder.await?,
+                    };
+                    let mut keys = Vec::with_capacity(limit);
+                    while keys.len() < limit {
+                        let Some(entry) = lister.try_next().await? else {
+                            break;
+                        };
+                        if !entry.metadata().mode().is_dir() {
+                            keys.push(entry.path().to_string());
+                        }
+                    }
+                    Ok(keys)
+                }
+            })
+            .await
+            .with_context(|| format!("oss list page '{prefix}'"))?;
+
+        if self.prefix.is_empty() {
+            return Ok(keys);
+        }
+        let strip = format!("{}/", self.prefix);
+        Ok(keys
+            .into_iter()
+            .map(|key| key.strip_prefix(&strip).unwrap_or(&key).to_string())
+            .collect())
+    }
+
     /// Write small data (catalog JSON, alias JSON, etc.).
     pub(crate) async fn put_bytes(
         &self,

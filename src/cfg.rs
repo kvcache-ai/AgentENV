@@ -112,6 +112,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub sandbox: SandboxConfig,
     #[config(nested)]
+    pub volume: VolumeConfig,
+    #[config(nested)]
     pub orchestrator: OrchestratorConfig,
     #[config(nested)]
     pub snapshot: SnapshotConfig,
@@ -288,6 +290,16 @@ impl std::fmt::Debug for SandboxConfig {
             )
             .finish()
     }
+}
+
+#[derive(Debug, Config, Clone)]
+pub struct VolumeConfig {
+    /// Operator-configured maximum persistent volume size in MiB.
+    #[config(default = 262144u64)]
+    pub max_size_mb: u64,
+    /// Maximum number of persistent volumes a sandbox may mount.
+    #[config(default = 4usize)]
+    pub max_volume_count: usize,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -624,6 +636,7 @@ impl_config_default!(
     SandboxProxyConfig,
     EnvdConfig,
     SandboxConfig,
+    VolumeConfig,
     MachineConfig,
     SnapshotConfig,
     SnapshotImagePublishConfig,
@@ -930,6 +943,22 @@ impl AppConfig {
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
+        self.validate_volume_limits()?;
+        Ok(())
+    }
+
+    fn validate_volume_limits(&self) -> Result<()> {
+        if self.volume.max_size_mb == 0 {
+            bail!("volume.max_size_mb must be greater than 0");
+        }
+        if self.volume.max_volume_count == 0
+            || self.volume.max_volume_count > crate::volume::MAX_VOLUME_MOUNTS
+        {
+            bail!(
+                "volume.max_volume_count must be between 1 and {}",
+                crate::volume::MAX_VOLUME_MOUNTS
+            );
+        }
         Ok(())
     }
 
@@ -1478,6 +1507,24 @@ mod tests {
         config
             .validate()
             .expect("consistent disk rate limit config passes");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_volume_limits() {
+        let mut config = AppConfig::default();
+        config.volume.max_size_mb = 0;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_size_mb"));
+
+        let mut config = AppConfig::default();
+        config.volume.max_volume_count = 0;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_volume_count"));
+
+        let mut config = AppConfig::default();
+        config.volume.max_volume_count = crate::volume::MAX_VOLUME_MOUNTS + 1;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_volume_count"));
     }
 
     #[test]

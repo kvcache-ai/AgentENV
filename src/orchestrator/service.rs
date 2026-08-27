@@ -748,10 +748,6 @@ where
     /// - If `states` is provided, only sandboxes in those states will be included.
     /// - If `user_metadata` is provided, only sandboxes whose user metadata contains
     ///   all the specified key-value pairs will be included.
-    /// - If `started_after` is provided, only sandboxes created at or after that instant
-    ///   will be included.
-    /// - If `template` is provided, only sandboxes using the matching snapshot ID or alias
-    ///   will be included.
     #[tracing::instrument(skip(self, filter))]
     pub async fn list_sandboxes_filtered(
         &self,
@@ -908,10 +904,11 @@ where
     /// the in-progress operation to finish before proceeding with deletion, preventing
     /// races where an ongoing operation might overwrite the `Killing` state.
     pub async fn delete_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        self.snapshot_volume_mounts_before_delete(sandbox_id)
+            .await?;
+
         let this = Arc::clone(self);
         self.run_cancellation_safe("delete", sandbox_id, async move {
-            this.snapshot_volume_mounts_before_delete(sandbox_id)
-                .await?;
             this.delete_sandbox_inner(sandbox_id).await
         })
         .await
@@ -1012,53 +1009,6 @@ where
             }
         };
 
-        self.delete_sandbox_impl(sandbox_id, previous_state).await
-    }
-
-    async fn claim_expired_running_sandbox(
-        &self,
-        sandbox_id: SandboxId,
-        cutoff: SystemTime,
-        claimed_state: SandboxState,
-    ) -> Result<bool> {
-        match self
-            .store
-            .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
-                if metadata.is_expired(cutoff) {
-                    metadata.state = claimed_state;
-                }
-            })
-            .await
-        {
-            Ok(update) if update.current.state == claimed_state => Ok(true),
-            Ok(update) => {
-                debug!(
-                    expires_at = ?update.current.expires_at,
-                    ?cutoff,
-                    "skipping auto-eviction because sandbox expiry was updated"
-                );
-                Ok(false)
-            }
-            Err(StoreError::StateConflict { actual_state, .. }) => {
-                debug!(
-                    state = ?actual_state,
-                    "skipping auto-eviction because sandbox state changed"
-                );
-                Ok(false)
-            }
-            Err(StoreError::SandboxNotFound { .. }) => {
-                debug!("skipping auto-eviction because sandbox no longer exists");
-                Ok(false)
-            }
-            Err(err) => Err(OrchestratorError::from(err)),
-        }
-    }
-
-    async fn delete_sandbox_impl(
-        self: &Arc<Self>,
-        sandbox_id: SandboxId,
-        previous_state: SandboxState,
-    ) -> Result<()> {
         let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
 
         // If the sandbox is still in memory, attempt to stop it.
@@ -1183,10 +1133,6 @@ where
             Err(err) => return Err(OrchestratorError::from(err)),
         }
 
-        self.pause_sandbox_impl(sandbox_id).await
-    }
-
-    async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         // Pin paused runtime artifacts before detaching from the running set.
         let runtime_artifacts = {
             let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
@@ -2003,54 +1949,30 @@ where
             return Ok(Vec::new());
         }
 
-        let eviction_cutoff = SystemTime::now();
-        let expired = self.store.list_expired(eviction_cutoff).await?;
+        let expired = self.store.list_expired(SystemTime::now()).await?;
         let mut evicted_ids = Vec::new();
 
         for metadata in expired {
             if metadata.state != SandboxState::Running {
                 continue;
             }
-            let flush_volumes_before_delete = metadata.timeout_action
-                == SandboxTimeoutAction::Delete
-                && !metadata.volume_mounts.is_empty();
-            let claimed_state = match (metadata.timeout_action, flush_volumes_before_delete) {
-                (SandboxTimeoutAction::Pause, _) => SandboxState::Pausing,
-                (SandboxTimeoutAction::Delete, true) => SandboxState::Pausing,
-                (SandboxTimeoutAction::Delete, false) => SandboxState::Killing,
-            };
-            let result = match self
-                .claim_expired_running_sandbox(metadata.id, eviction_cutoff, claimed_state)
-                .await
-            {
-                Ok(true) => match metadata.timeout_action {
-                    SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
-                    SandboxTimeoutAction::Delete if flush_volumes_before_delete => {
-                        async {
-                            self.pause_sandbox_impl(metadata.id).await?;
-                            self.delete_sandbox_inner(metadata.id).await
-                        }
-                        .await
-                    }
-                    SandboxTimeoutAction::Delete => {
-                        self.delete_sandbox_impl(metadata.id, SandboxState::Running)
-                            .await
-                    }
+            if let Err(err) = match metadata.timeout_action {
+                SandboxTimeoutAction::Pause => self.pause_sandbox_inner(metadata.id).await,
+                SandboxTimeoutAction::Delete => {
+                    self.snapshot_volume_mounts_before_delete(metadata.id)
+                        .await?;
+                    self.delete_sandbox_inner(metadata.id).await
                 }
-                .map(|_| true),
-                Ok(false) => Ok(false),
-                Err(err) => Err(err),
-            };
-            match result {
-                Ok(true) => evicted_ids.push(metadata.id),
-                Ok(false) => continue,
-                Err(err) => warn!(
+            } {
+                warn!(
                     sandbox_id = %metadata.id,
                     action = ?metadata.timeout_action,
                     error = ?err,
                     "failed to auto-evict expired sandbox"
-                ),
+                );
+                continue;
             }
+            evicted_ids.push(metadata.id);
         }
 
         Ok(evicted_ids)
@@ -2536,8 +2458,11 @@ where
             let sandboxes = self
                 .store
                 .list_filtered(SandboxListFilter {
+                    states: None,
                     excluded_states: Some(vec![SandboxState::Paused]),
-                    ..SandboxListFilter::matches_all()
+                    user_metadata: None,
+                    started_after: None,
+                    template: None,
                 })
                 .await?;
             if sandboxes.is_empty() {

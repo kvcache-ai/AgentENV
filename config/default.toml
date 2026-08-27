@@ -192,6 +192,11 @@ poll_ms = 3
 # AgentENV creates a node-local seed under $AENV_HOME/secrets. Configure the
 # same explicit value on every node when cross-node sandbox recovery is required.
 # access_token_hash_seed = "replace-with-a-secret"
+[volume]
+# Maximum persistent volume size in MiB (256 GiB by default).
+max_size_mb = 262144
+# Maximum number of persistent volumes a sandbox may mount.
+max_volume_count = 4
 
 [orchestrator]
 # Expired-sandbox eviction interval in milliseconds (1000 = 1 second).

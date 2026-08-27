@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::layout::PosixFsSnapshotArtifactLayout;
-use crate::snapshot::repository::SnapshotListFilter;
+use crate::snapshot::repository::{volume_catalog_shard, SnapshotListFilter, VolumeRecordPage};
 use crate::snapshot::{
     CommittedSnapshot, RepositoryError, RepositoryResult, SnapshotAlias, SnapshotId,
     SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
@@ -319,12 +319,16 @@ impl PosixFsCatalogStore {
         let aliases_dir = self.aliases_dir();
         let records_dir = self.records_dir();
         let volumes_dir = PosixFsSnapshotArtifactLayout::volumes_dir(&self.root);
+        let volume_names_dir = PosixFsSnapshotArtifactLayout::volume_names_dir(&self.root);
+        let volume_owners_dir = PosixFsSnapshotArtifactLayout::volume_owners_dir(&self.root);
         let snapshots_dir = self.snapshots_dir();
         for dir in [
             &catalog_dir,
             &aliases_dir,
             &records_dir,
             &volumes_dir,
+            &volume_names_dir,
+            &volume_owners_dir,
             &snapshots_dir,
         ] {
             fs::create_dir_all(dir).map_err(|error| {
@@ -334,52 +338,207 @@ impl PosixFsCatalogStore {
         Ok(())
     }
 
-    pub(crate) fn list_volumes(&self) -> RepositoryResult<Vec<VolumeRecord>> {
-        self.ensure_layout()?;
-        let mut records = Vec::new();
-        for entry in fs::read_dir(PosixFsSnapshotArtifactLayout::volumes_dir(&self.root))
-            .map_err(|error| RepositoryError::backend("read volume catalog directory", error))?
-        {
-            let entry = entry
-                .map_err(|error| RepositoryError::backend("read volume catalog entry", error))?;
-            if !entry
-                .file_type()
-                .map_err(|error| RepositoryError::backend("inspect volume catalog entry", error))?
-                .is_file()
-                || entry
-                    .path()
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    != Some("json")
-            {
-                continue;
-            }
-            records.push(self.read_json(&entry.path())?);
+    pub(crate) fn get_volume(&self, reference: &str) -> RepositoryResult<Option<VolumeRecord>> {
+        self.ensure_volume_component(reference, "reference")?;
+        if let Some(record) = self.load_volume_by_id_unlocked(reference)? {
+            return Ok(Some(record));
         }
-        Ok(records)
+
+        let name_path = PosixFsSnapshotArtifactLayout::volume_name_path(&self.root, reference);
+        if !name_path.exists() {
+            return Ok(None);
+        }
+        let volume_id: String = self.read_json(&name_path)?;
+        self.ensure_volume_id(&volume_id)?;
+        self.load_volume_by_id_unlocked(&volume_id)
+    }
+
+    pub(crate) fn list_volumes_page(
+        &self,
+        after_volume_id: Option<&str>,
+        limit: usize,
+    ) -> RepositoryResult<VolumeRecordPage> {
+        if limit == 0 {
+            return Err(RepositoryError::InvalidRequest {
+                reason: "volume page limit must be greater than zero".to_string(),
+            });
+        }
+        if let Some(volume_id) = after_volume_id {
+            self.ensure_volume_id(volume_id)?;
+        }
+        self.ensure_layout()?;
+
+        let start_shard = after_volume_id
+            .map(volume_catalog_shard)
+            .unwrap_or_else(|| "00".to_string());
+        let start_shard = u8::from_str_radix(&start_shard, 16)
+            .map_err(|error| RepositoryError::backend("parse volume catalog shard", error))?;
+        let mut selected = Vec::with_capacity(limit.saturating_add(1));
+
+        'shards: for shard_index in start_shard..=u8::MAX {
+            let shard = format!("{shard_index:02x}");
+            let directory = PosixFsSnapshotArtifactLayout::volume_shard_dir(&self.root, &shard);
+            let entries = match fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(RepositoryError::backend(
+                        format!("read volume shard '{}'", directory.display()),
+                        error,
+                    ))
+                }
+            };
+            let mut volume_ids = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    RepositoryError::backend("read volume catalog entry", error)
+                })?;
+                if !entry
+                    .file_type()
+                    .map_err(|error| {
+                        RepositoryError::backend("inspect volume catalog entry", error)
+                    })?
+                    .is_file()
+                    || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+                {
+                    continue;
+                }
+                let path = entry.path();
+                let Some(volume_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                    return Err(RepositoryError::InvalidRequest {
+                        reason: format!("invalid volume record path '{}'", path.display()),
+                    });
+                };
+                self.ensure_volume_id(volume_id)?;
+                if volume_catalog_shard(volume_id) != shard {
+                    return Err(RepositoryError::InvalidRequest {
+                        reason: format!(
+                            "volume record '{}' is stored in the wrong shard '{shard}'",
+                            entry.path().display()
+                        ),
+                    });
+                }
+                volume_ids.push(volume_id.to_string());
+            }
+            volume_ids.sort_unstable();
+            for volume_id in volume_ids {
+                if shard_index == start_shard
+                    && after_volume_id.is_some_and(|after| volume_id.as_str() <= after)
+                {
+                    continue;
+                }
+                selected.push(volume_id);
+                if selected.len() > limit {
+                    break 'shards;
+                }
+            }
+        }
+
+        let has_more = selected.len() > limit;
+        selected.truncate(limit);
+        let mut records = Vec::with_capacity(selected.len());
+        for volume_id in selected {
+            let record = self
+                .load_volume_by_id_unlocked(&volume_id)?
+                .ok_or_else(|| RepositoryError::VolumeNotFound {
+                    lookup: volume_id.clone(),
+                })?;
+            records.push(record);
+        }
+        let next_volume_id = has_more
+            .then(|| records.last().map(|record| record.id.clone()))
+            .flatten();
+        Ok(VolumeRecordPage {
+            records,
+            next_volume_id,
+        })
+    }
+
+    pub(crate) fn create_volume(&self, record: &VolumeRecord) -> RepositoryResult<()> {
+        self.ensure_volume_id(&record.id)?;
+        self.ensure_volume_component(&record.name, "name")?;
+        let _guard = self.acquire_volume_catalog_lock()?;
+        let record_path = PosixFsSnapshotArtifactLayout::volume_record_path(&self.root, &record.id);
+        if record_path.exists() {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("volume '{}' already exists", record.id),
+            });
+        }
+        let name_path = PosixFsSnapshotArtifactLayout::volume_name_path(&self.root, &record.name);
+        if name_path.exists() {
+            return Err(RepositoryError::VolumeNameConflict {
+                name: record.name.clone(),
+            });
+        }
+
+        let mut durable_record = record.clone();
+        durable_record.backing_image_config = None;
+        self.write_json(&record_path, &durable_record)?;
+        if let Err(error) = self.write_json(&name_path, &record.id) {
+            let _ = self.remove_file_if_exists(&record_path);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn put_volume(&self, record: &VolumeRecord) -> RepositoryResult<()> {
         self.ensure_volume_id(&record.id)?;
+        self.ensure_volume_component(&record.name, "name")?;
         let _guard = self.acquire_volume_catalog_lock()?;
         let path = PosixFsSnapshotArtifactLayout::volume_record_path(&self.root, &record.id);
-        let mut record = record.clone();
-        if let Ok(existing) = self.read_json::<VolumeRecord>(&path) {
-            if existing.reserved_by_sandbox_id.is_some()
-                && existing.reserved_by_sandbox_id != record.reserved_by_sandbox_id
-            {
-                record.reserved_by_sandbox_id = existing.reserved_by_sandbox_id;
-            }
+        if !path.exists() {
+            return Err(RepositoryError::VolumeNotFound {
+                lookup: record.id.clone(),
+            });
         }
-        self.write_json(&path, &record)
+        let existing = self.read_json::<VolumeRecord>(&path)?;
+        self.ensure_volume_id(&existing.id)?;
+        if existing.name != record.name {
+            return Err(RepositoryError::InvalidRequest {
+                reason: "volume names cannot be changed".to_string(),
+            });
+        }
+        if existing.revision > record.revision {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!(
+                    "volume '{}' revision {} supersedes attempted revision {}",
+                    record.id, existing.revision, record.revision
+                ),
+            });
+        }
+        let mut durable_record = record.clone();
+        durable_record.backing_image_config = None;
+        // Reservation state is owned exclusively by the reservation APIs. A
+        // concurrent backing/status update must not restore a released owner.
+        durable_record.reserved_by_sandbox_id = existing.reserved_by_sandbox_id;
+        durable_record.read_only_mounts = existing.read_only_mounts;
+        self.write_json(&path, &durable_record)
     }
 
     pub(crate) fn delete_volume(&self, volume_id: &str) -> RepositoryResult<()> {
         self.ensure_volume_id(volume_id)?;
         let _guard = self.acquire_volume_catalog_lock()?;
+        let Some(record) = self.load_volume_by_id_unlocked(volume_id)? else {
+            return Ok(());
+        };
+        if let Some(owner) = record.reserved_by_sandbox_id {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("volume '{volume_id}' is reserved by sandbox '{owner}'"),
+            });
+        }
+        if let Some(owner) = record.read_only_mounts.first() {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("volume '{volume_id}' is mounted read-only by sandbox '{owner}'"),
+            });
+        }
         self.remove_file_if_exists(&PosixFsSnapshotArtifactLayout::volume_record_path(
             &self.root, volume_id,
-        ))
+        ))?;
+        let name_path = PosixFsSnapshotArtifactLayout::volume_name_path(&self.root, &record.name);
+        if name_path.exists() && self.read_json::<String>(&name_path)? == volume_id {
+            self.remove_file_if_exists(&name_path)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn reserve_volume(
@@ -388,9 +547,14 @@ impl PosixFsCatalogStore {
         owner: &str,
     ) -> RepositoryResult<Option<String>> {
         self.ensure_volume_id(volume_id)?;
+        self.ensure_volume_component(owner, "owner")?;
         let _guard = self.acquire_volume_catalog_lock()?;
         let path = PosixFsSnapshotArtifactLayout::volume_record_path(&self.root, volume_id);
-        let mut record: VolumeRecord = self.read_json(&path)?;
+        let mut record = self.load_volume_by_id_unlocked(volume_id)?.ok_or_else(|| {
+            RepositoryError::VolumeNotFound {
+                lookup: volume_id.to_string(),
+            }
+        })?;
         if record.mode == VolumeMode::ReadOnly {
             return Ok(None);
         }
@@ -402,49 +566,187 @@ impl PosixFsCatalogStore {
         }
         record.reserved_by_sandbox_id = Some(owner.to_owned());
         self.write_json(&path, &record)?;
+        if let Err(error) = self.write_volume_owner_entry(owner, volume_id) {
+            record.reserved_by_sandbox_id = None;
+            let _ = self.write_json(&path, &record);
+            return Err(error);
+        }
         Ok(None)
+    }
+
+    pub(crate) fn reserve_read_only_volume(
+        &self,
+        volume_id: &str,
+        owner: &str,
+    ) -> RepositoryResult<()> {
+        self.ensure_volume_id(volume_id)?;
+        self.ensure_volume_component(owner, "owner")?;
+        let _guard = self.acquire_volume_catalog_lock()?;
+        let path = PosixFsSnapshotArtifactLayout::volume_record_path(&self.root, volume_id);
+        let mut record = self.load_volume_by_id_unlocked(volume_id)?.ok_or_else(|| {
+            RepositoryError::VolumeNotFound {
+                lookup: volume_id.to_string(),
+            }
+        })?;
+        if record.mode != VolumeMode::ReadOnly {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("volume '{volume_id}' is not read-only"),
+            });
+        }
+        if record.read_only_mounts.iter().any(|entry| entry == owner) {
+            return Ok(());
+        }
+        record.read_only_mounts.push(owner.to_owned());
+        self.write_json(&path, &record)?;
+        if let Err(error) = self.write_volume_owner_entry(owner, volume_id) {
+            record.read_only_mounts.retain(|entry| entry != owner);
+            let _ = self.write_json(&path, &record);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn list_volumes_by_owner(&self, owner: &str) -> RepositoryResult<Vec<VolumeRecord>> {
+        self.ensure_volume_component(owner, "owner")?;
+        self.load_volumes_by_owner_unlocked(owner)
     }
 
     pub(crate) fn replace_volume_owner(
         &self,
         from: &str,
         to: Option<&str>,
-    ) -> RepositoryResult<Option<String>> {
-        let _guard = self.acquire_volume_catalog_lock()?;
-        let records = self.list_volumes()?;
+    ) -> RepositoryResult<()> {
+        self.ensure_volume_component(from, "owner")?;
         if let Some(to) = to {
-            if from != to
-                && records
-                    .iter()
-                    .any(|record| record.reserved_by_sandbox_id.as_deref() == Some(to))
-            {
-                return Ok(Some(to.to_owned()));
+            self.ensure_volume_component(to, "owner")?;
+            if to == from {
+                return Ok(());
             }
         }
+        let _guard = self.acquire_volume_catalog_lock()?;
+        let records = self.load_volumes_by_owner_unlocked(from)?;
         for mut record in records {
             if record.reserved_by_sandbox_id.as_deref() == Some(from) {
                 record.reserved_by_sandbox_id = to.map(str::to_owned);
-                self.write_json(
-                    &PosixFsSnapshotArtifactLayout::volume_record_path(&self.root, &record.id),
-                    &record,
-                )?;
+            }
+            if record.read_only_mounts.iter().any(|owner| owner == from) {
+                record.read_only_mounts.retain(|owner| owner != from);
+                if let Some(to) = to {
+                    if !record.read_only_mounts.iter().any(|owner| owner == to) {
+                        record.read_only_mounts.push(to.to_owned());
+                    }
+                }
+            }
+            if let Some(to) = to {
+                self.write_volume_owner_entry(to, &record.id)?;
+            }
+            if let Err(error) = self.write_json(
+                &PosixFsSnapshotArtifactLayout::volume_record_path(&self.root, &record.id),
+                &record,
+            ) {
+                if let Some(to) = to {
+                    let _ = self.remove_file_if_exists(
+                        &PosixFsSnapshotArtifactLayout::volume_owner_path(
+                            &self.root, to, &record.id,
+                        ),
+                    );
+                }
+                return Err(error);
+            }
+            self.remove_file_if_exists(&PosixFsSnapshotArtifactLayout::volume_owner_path(
+                &self.root, from, &record.id,
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn load_volume_by_id_unlocked(
+        &self,
+        volume_id: &str,
+    ) -> RepositoryResult<Option<VolumeRecord>> {
+        self.ensure_volume_id(volume_id)?;
+        let path = PosixFsSnapshotArtifactLayout::volume_record_path(&self.root, volume_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let record: VolumeRecord = self.read_json(&path)?;
+        self.ensure_volume_id(&record.id)?;
+        if record.id != volume_id {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!(
+                    "volume record id '{}' does not match path '{}'",
+                    record.id,
+                    path.display()
+                ),
+            });
+        }
+        Ok(Some(record))
+    }
+
+    fn load_volumes_by_owner_unlocked(&self, owner: &str) -> RepositoryResult<Vec<VolumeRecord>> {
+        let directory = PosixFsSnapshotArtifactLayout::volume_owner_dir(&self.root, owner);
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(RepositoryError::backend(
+                    format!("read volume owner index '{}'", directory.display()),
+                    error,
+                ))
+            }
+        };
+        let mut records = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| RepositoryError::backend("read volume owner entry", error))?;
+            if !entry
+                .file_type()
+                .map_err(|error| RepositoryError::backend("inspect volume owner entry", error))?
+                .is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let path = entry.path();
+            let Some(volume_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            let Some(record) = self.load_volume_by_id_unlocked(volume_id)? else {
+                continue;
+            };
+            if record.reserved_by_sandbox_id.as_deref() == Some(owner)
+                || record.read_only_mounts.iter().any(|entry| entry == owner)
+            {
+                records.push(record);
             }
         }
-        Ok(None)
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(records)
+    }
+
+    fn write_volume_owner_entry(&self, owner: &str, volume_id: &str) -> RepositoryResult<()> {
+        self.write_json(
+            &PosixFsSnapshotArtifactLayout::volume_owner_path(&self.root, owner, volume_id),
+            &volume_id,
+        )
     }
 
     fn ensure_volume_id(&self, volume_id: &str) -> RepositoryResult<()> {
-        if !volume_id.is_empty()
-            && volume_id
+        self.ensure_volume_component(volume_id, "id")
+    }
+
+    fn ensure_volume_component(&self, value: &str, kind: &str) -> RepositoryResult<()> {
+        if value.is_empty()
+            || value.len() > 128
+            || !value
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
         {
-            Ok(())
-        } else {
-            Err(RepositoryError::InvalidRequest {
-                reason: format!("invalid volume id '{volume_id}'"),
-            })
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("invalid volume {kind} '{value}'"),
+            });
         }
+        Ok(())
     }
 
     fn acquire_volume_catalog_lock(&self) -> RepositoryResult<PosixFileLockGuard> {
@@ -907,6 +1209,8 @@ mod tests {
 
     use super::super::layout::PosixFsSnapshotArtifactLayout;
     use super::PosixFsCatalogStore;
+    use crate::snapshot::repository::volume_catalog_shard;
+    use crate::snapshot::RepositoryError;
     use crate::snapshot::{
         CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotPublishMetadata,
         SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind, TemplateBuildStatus,
@@ -1152,36 +1456,137 @@ mod tests {
             reserved_by_sandbox_id: None,
             backing_image_config: None,
             backing_layers: Vec::new(),
+            read_only_mounts: Vec::new(),
         };
 
-        store.put_volume(&record).expect("put volume should work");
-        assert_eq!(store.list_volumes().unwrap(), vec![record.clone()]);
+        store
+            .create_volume(&record)
+            .expect("create volume should work");
+        assert_eq!(
+            store.list_volumes_page(None, 10).unwrap().records,
+            vec![record.clone()]
+        );
         assert_eq!(store.reserve_volume("vol_test", "sandbox-a").unwrap(), None);
         assert_eq!(
             store.reserve_volume("vol_test", "sandbox-b").unwrap(),
             Some("sandbox-a".to_string())
         );
+        store
+            .replace_volume_owner("sandbox-a", Some("sandbox-b"))
+            .unwrap();
         assert_eq!(
             store
-                .replace_volume_owner("sandbox-a", Some("sandbox-b"))
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            store.list_volumes().unwrap()[0]
+                .get_volume("vol_test")
+                .unwrap()
+                .unwrap()
                 .reserved_by_sandbox_id
                 .as_deref(),
             Some("sandbox-b")
         );
+        let mut stale_catalog_update = store.get_volume("vol_test").unwrap().unwrap();
         store
             .replace_volume_owner("sandbox-b", None)
             .expect("release should work");
-        assert!(store.list_volumes().unwrap()[0]
+        stale_catalog_update.revision += 1;
+        store
+            .put_volume(&stale_catalog_update)
+            .expect("catalog update should preserve the concurrent release");
+        assert!(store
+            .get_volume("data")
+            .unwrap()
+            .unwrap()
             .reserved_by_sandbox_id
             .is_none());
         store
             .delete_volume("vol_test")
             .expect("delete volume should work");
-        assert!(store.list_volumes().unwrap().is_empty());
+        assert!(store
+            .list_volumes_page(None, 10)
+            .unwrap()
+            .records
+            .is_empty());
+    }
+
+    #[test]
+    fn volume_catalog_uses_keyed_indexes_and_bounded_pages() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
+        let mut expected_ids = Vec::new();
+        for index in 0..300 {
+            let record = VolumeRecord {
+                id: format!("vol_{index:06}"),
+                name: format!("data-{index:06}"),
+                mode: VolumeMode::Exclusive,
+                source: "empty".to_string(),
+                parent_volume_id: None,
+                revision: 0,
+                size_mb: crate::volume::DEFAULT_VOLUME_SIZE_MB,
+                status: crate::volume::VolumeStatus::Ready,
+                reserved_by_sandbox_id: None,
+                backing_image_config: None,
+                backing_layers: Vec::new(),
+                read_only_mounts: Vec::new(),
+            };
+            expected_ids.push(record.id.clone());
+            store.create_volume(&record).unwrap();
+        }
+
+        assert_eq!(
+            store.get_volume("data-000123").unwrap().unwrap().id,
+            "vol_000123"
+        );
+        assert_eq!(
+            store.get_volume("vol_000123").unwrap().unwrap().name,
+            "data-000123"
+        );
+        let conflict = VolumeRecord {
+            id: "vol_conflict".to_string(),
+            name: "data-000123".to_string(),
+            mode: VolumeMode::Exclusive,
+            source: "empty".to_string(),
+            parent_volume_id: None,
+            revision: 0,
+            size_mb: crate::volume::DEFAULT_VOLUME_SIZE_MB,
+            status: crate::volume::VolumeStatus::Ready,
+            reserved_by_sandbox_id: None,
+            backing_image_config: None,
+            backing_layers: Vec::new(),
+            read_only_mounts: Vec::new(),
+        };
+        assert!(matches!(
+            store.create_volume(&conflict),
+            Err(RepositoryError::VolumeNameConflict { .. })
+        ));
+
+        expected_ids.sort_by(|left, right| {
+            volume_catalog_shard(left)
+                .cmp(&volume_catalog_shard(right))
+                .then_with(|| left.cmp(right))
+        });
+        let mut actual_ids = Vec::new();
+        let mut after = None;
+        loop {
+            let page = store.list_volumes_page(after.as_deref(), 13).unwrap();
+            assert!(page.records.len() <= 13);
+            actual_ids.extend(page.records.into_iter().map(|record| record.id));
+            let Some(next) = page.next_volume_id else {
+                break;
+            };
+            after = Some(next);
+        }
+        assert_eq!(actual_ids, expected_ids);
+
+        for volume_id in expected_ids.iter().take(4) {
+            store.reserve_volume(volume_id, "sandbox-owner").unwrap();
+        }
+        assert_eq!(
+            store.list_volumes_by_owner("sandbox-owner").unwrap().len(),
+            4
+        );
+        store.replace_volume_owner("sandbox-owner", None).unwrap();
+        assert!(store
+            .list_volumes_by_owner("sandbox-owner")
+            .unwrap()
+            .is_empty());
     }
 }

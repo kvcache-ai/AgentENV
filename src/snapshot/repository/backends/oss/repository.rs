@@ -21,7 +21,9 @@ use crate::snapshot::repository::backends::common::{
     materialize_volume_image_config, write_dense_overlaybd_layer_to_file,
 };
 use crate::snapshot::repository::interfaces::SnapshotRepository;
-use crate::snapshot::repository::{RepositoryError, RepositoryResult};
+use crate::snapshot::repository::{
+    volume_catalog_shard, RepositoryError, RepositoryResult, VolumeRecordPage,
+};
 use crate::snapshot::{
     CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
     PersistedDiskImagePublication, SnapshotAlias, SnapshotId, SnapshotListFilter,
@@ -82,17 +84,53 @@ fn validated_alias_key(alias: &str) -> RepositoryResult<String> {
 }
 
 fn validate_volume_id(volume_id: &str) -> RepositoryResult<()> {
-    if !volume_id.is_empty()
-        && volume_id
+    validate_volume_component(volume_id, "id")
+}
+
+fn validate_volume_component(value: &str, kind: &str) -> RepositoryResult<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
     {
-        Ok(())
-    } else {
-        Err(RepositoryError::InvalidRequest {
-            reason: format!("invalid volume id '{volume_id}'"),
-        })
+        return Err(RepositoryError::InvalidRequest {
+            reason: format!("invalid volume {kind} '{value}'"),
+        });
     }
+    Ok(())
+}
+
+fn volume_id_from_record_key(key: &str) -> RepositoryResult<String> {
+    let relative = key
+        .strip_prefix(OssSnapshotArtifactLayout::volume_records_prefix())
+        .ok_or_else(|| RepositoryError::InvalidRequest {
+            reason: format!("invalid volume record key '{key}'"),
+        })?;
+    let (shard, file_name) =
+        relative
+            .split_once('/')
+            .ok_or_else(|| RepositoryError::InvalidRequest {
+                reason: format!("invalid volume record key '{key}'"),
+            })?;
+    if file_name.contains('/') {
+        return Err(RepositoryError::InvalidRequest {
+            reason: format!("invalid volume record key '{key}'"),
+        });
+    }
+    let volume_id =
+        file_name
+            .strip_suffix(".json")
+            .ok_or_else(|| RepositoryError::InvalidRequest {
+                reason: format!("invalid volume record key '{key}'"),
+            })?;
+    validate_volume_id(volume_id)?;
+    if volume_catalog_shard(volume_id) != shard {
+        return Err(RepositoryError::InvalidRequest {
+            reason: format!("volume record key '{key}' uses the wrong shard"),
+        });
+    }
+    Ok(volume_id.to_string())
 }
 
 fn now_unix_ms() -> i64 {
@@ -535,22 +573,104 @@ impl SnapshotRepository for OssSnapshotRepository {
         self.write_record(&record).await
     }
 
-    async fn list_volumes(&self) -> RepositoryResult<Vec<VolumeRecord>> {
-        let keys = self
+    async fn get_volume(&self, reference: &str) -> RepositoryResult<Option<VolumeRecord>> {
+        validate_volume_component(reference, "reference")?;
+        if let Some(record) = self.read_volume_record(reference).await? {
+            return Ok(Some(record));
+        }
+        let name_key = OssSnapshotArtifactLayout::volume_name_key(reference);
+        let volume_id = match self.client.get_bytes(&name_key).await {
+            Ok(bytes) => serde_json::from_slice::<String>(&bytes).map_err(|error| {
+                RepositoryError::backend(format!("parse volume name index '{name_key}'"), error)
+            })?,
+            Err(error) if OssClient::is_not_found_error(&error) => return Ok(None),
+            Err(error) => {
+                return Err(RepositoryError::backend(
+                    format!("read volume name index '{name_key}'"),
+                    error,
+                ))
+            }
+        };
+        self.read_volume_record(&volume_id).await
+    }
+
+    async fn list_volumes_page(
+        &self,
+        after_volume_id: Option<&str>,
+        limit: usize,
+    ) -> RepositoryResult<VolumeRecordPage> {
+        if limit == 0 {
+            return Err(RepositoryError::InvalidRequest {
+                reason: "volume page limit must be greater than zero".to_string(),
+            });
+        }
+        if let Some(volume_id) = after_volume_id {
+            validate_volume_id(volume_id)?;
+        }
+        let start_after = after_volume_id.map(OssSnapshotArtifactLayout::volume_record_key);
+        let mut keys = self
             .client
-            .list_keys_recursive(OssSnapshotArtifactLayout::volume_records_prefix())
+            .list_keys_page(
+                OssSnapshotArtifactLayout::volume_records_prefix(),
+                start_after.as_deref(),
+                limit.saturating_add(1),
+            )
             .await
             .map_err(|error| RepositoryError::backend("list volume records", error))?;
+        let has_more = keys.len() > limit;
+        keys.truncate(limit);
         let mut records = Vec::with_capacity(keys.len());
         for key in keys {
-            let bytes = self.client.get_bytes(&key).await.map_err(|error| {
-                RepositoryError::backend(format!("read volume record '{key}'"), error)
+            let volume_id = volume_id_from_record_key(&key)?;
+            let record = self.read_volume_record(&volume_id).await?.ok_or_else(|| {
+                RepositoryError::VolumeNotFound {
+                    lookup: volume_id.clone(),
+                }
             })?;
-            records.push(serde_json::from_slice(&bytes).map_err(|error| {
-                RepositoryError::backend(format!("parse volume record '{key}'"), error)
-            })?);
+            records.push(record);
         }
-        Ok(records)
+        let next_volume_id = if has_more {
+            records.last().map(|record| record.id.clone())
+        } else {
+            None
+        };
+        Ok(VolumeRecordPage {
+            records,
+            next_volume_id,
+        })
+    }
+
+    async fn create_volume(&self, record: VolumeRecord) -> RepositoryResult<()> {
+        validate_volume_id(&record.id)?;
+        validate_volume_component(&record.name, "name")?;
+        let mut record = record;
+        record.backing_image_config = None;
+        let name_key = OssSnapshotArtifactLayout::volume_name_key(&record.name);
+        let name_bytes = serde_json::to_vec(&record.id)
+            .map_err(|error| RepositoryError::backend("serialize volume name index", error))?;
+        let claimed = self
+            .client
+            .put_bytes_conditionally(&name_key, name_bytes, None)
+            .await
+            .map_err(|error| RepositoryError::backend("claim volume name", error))?;
+        if !claimed {
+            return Err(RepositoryError::VolumeNameConflict {
+                name: record.name.clone(),
+            });
+        }
+        match self.write_volume_record_conditionally(&record, None).await {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                let _ = self.client.delete(&name_key).await;
+                Err(RepositoryError::InvalidRequest {
+                    reason: format!("volume '{}' already exists", record.id),
+                })
+            }
+            Err(error) => {
+                let _ = self.client.delete(&name_key).await;
+                Err(error)
+            }
+        }
     }
 
     async fn put_volume(&self, record: VolumeRecord) -> RepositoryResult<()> {
@@ -560,15 +680,32 @@ impl SnapshotRepository for OssSnapshotRepository {
         for _attempt in 0..MAX_VOLUME_CAS_ATTEMPTS {
             let (next, etag) = match self.read_volume_record_versioned(&record.id).await? {
                 Some((existing, etag)) => {
-                    let mut next = record.clone();
-                    if existing.reserved_by_sandbox_id.is_some()
-                        && existing.reserved_by_sandbox_id != next.reserved_by_sandbox_id
-                    {
-                        next.reserved_by_sandbox_id = existing.reserved_by_sandbox_id;
+                    if existing.name != record.name {
+                        return Err(RepositoryError::InvalidRequest {
+                            reason: "volume names cannot be changed".to_string(),
+                        });
                     }
+                    if existing.revision > record.revision {
+                        return Err(RepositoryError::InvalidRequest {
+                            reason: format!(
+                                "volume '{}' revision {} is newer than revision {}",
+                                record.id, existing.revision, record.revision
+                            ),
+                        });
+                    }
+                    let mut next = record.clone();
+                    // Reservation state is owned exclusively by the
+                    // reservation APIs. A concurrent backing/status update
+                    // must not restore a released owner.
+                    next.reserved_by_sandbox_id = existing.reserved_by_sandbox_id;
+                    next.read_only_mounts = existing.read_only_mounts;
                     (next, etag)
                 }
-                None => (record.clone(), None),
+                None => {
+                    return Err(RepositoryError::VolumeNotFound {
+                        lookup: record.id.clone(),
+                    })
+                }
             };
             if self
                 .write_volume_record_conditionally(&next, etag.as_deref())
@@ -614,10 +751,32 @@ impl SnapshotRepository for OssSnapshotRepository {
 
     async fn delete_volume(&self, volume_id: &str) -> RepositoryResult<()> {
         validate_volume_id(volume_id)?;
+        let record = self.read_volume_record(volume_id).await?;
+        if let Some(record) = record.as_ref() {
+            if let Some(owner) = record.reserved_by_sandbox_id.as_deref() {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!("volume '{volume_id}' is reserved by sandbox '{owner}'"),
+                });
+            }
+            if let Some(owner) = record.read_only_mounts.first() {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!(
+                        "volume '{volume_id}' is mounted read-only by sandbox '{owner}'"
+                    ),
+                });
+            }
+        }
         self.client
             .delete(&OssSnapshotArtifactLayout::volume_record_key(volume_id))
             .await
-            .map_err(|error| RepositoryError::backend("delete volume record", error))
+            .map_err(|error| RepositoryError::backend("delete volume record", error))?;
+        if let Some(record) = record {
+            self.client
+                .delete(&OssSnapshotArtifactLayout::volume_name_key(&record.name))
+                .await
+                .map_err(|error| RepositoryError::backend("delete volume name index", error))?;
+        }
+        Ok(())
     }
 
     async fn reserve_volume(
@@ -626,6 +785,7 @@ impl SnapshotRepository for OssSnapshotRepository {
         owner: &str,
     ) -> RepositoryResult<Option<String>> {
         validate_volume_id(volume_id)?;
+        validate_volume_component(owner, "owner")?;
         for _attempt in 0..MAX_VOLUME_CAS_ATTEMPTS {
             let Some((mut record, etag)) = self.read_volume_record_versioned(volume_id).await?
             else {
@@ -640,6 +800,7 @@ impl SnapshotRepository for OssSnapshotRepository {
                 if existing != owner {
                     return Ok(Some(existing.to_owned()));
                 }
+                self.write_volume_owner_entry(owner, volume_id).await?;
                 return Ok(None);
             }
             record.reserved_by_sandbox_id = Some(owner.to_owned());
@@ -647,6 +808,12 @@ impl SnapshotRepository for OssSnapshotRepository {
                 .write_volume_record_conditionally(&record, etag.as_deref())
                 .await?
             {
+                if let Err(error) = self.write_volume_owner_entry(owner, volume_id).await {
+                    let _ = self
+                        .replace_volume_record_owner(volume_id, owner, None)
+                        .await;
+                    return Err(error);
+                }
                 return Ok(None);
             }
         }
@@ -656,34 +823,153 @@ impl SnapshotRepository for OssSnapshotRepository {
         })
     }
 
-    async fn replace_volume_owner(
-        &self,
-        from: &str,
-        to: Option<&str>,
-    ) -> RepositoryResult<Option<String>> {
-        let records = self.list_volumes().await?;
-        if let Some(to) = to {
-            if from != to
-                && records
-                    .iter()
-                    .any(|record| record.reserved_by_sandbox_id.as_deref() == Some(to))
+    async fn reserve_read_only_volume(&self, volume_id: &str, owner: &str) -> RepositoryResult<()> {
+        validate_volume_id(volume_id)?;
+        validate_volume_component(owner, "owner")?;
+        for _attempt in 0..MAX_VOLUME_CAS_ATTEMPTS {
+            let Some((mut record, etag)) = self.read_volume_record_versioned(volume_id).await?
+            else {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!("volume '{volume_id}' does not exist in the repository"),
+                });
+            };
+            if record.mode != VolumeMode::ReadOnly {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!("volume '{volume_id}' is not read-only"),
+                });
+            }
+            if record.read_only_mounts.iter().any(|entry| entry == owner) {
+                self.write_volume_owner_entry(owner, volume_id).await?;
+                return Ok(());
+            }
+            record.read_only_mounts.push(owner.to_owned());
+            if self
+                .write_volume_record_conditionally(&record, etag.as_deref())
+                .await?
             {
-                return Ok(Some(to.to_owned()));
+                if let Err(error) = self.write_volume_owner_entry(owner, volume_id).await {
+                    let _ = self
+                        .replace_volume_record_owner(volume_id, owner, None)
+                        .await;
+                    return Err(error);
+                }
+                return Ok(());
             }
         }
+        Err(RepositoryError::Backend {
+            message: format!("volume '{volume_id}' changed too often while reserving read-only"),
+            source: None,
+        })
+    }
+
+    async fn list_volumes_by_owner(&self, owner: &str) -> RepositoryResult<Vec<VolumeRecord>> {
+        validate_volume_component(owner, "owner")?;
+        self.read_volumes_by_owner(owner).await
+    }
+
+    async fn replace_volume_owner(&self, from: &str, to: Option<&str>) -> RepositoryResult<()> {
+        validate_volume_component(from, "owner")?;
+        if let Some(to) = to {
+            validate_volume_component(to, "owner")?;
+            if to == from {
+                return Ok(());
+            }
+        }
+        let records = self.read_volumes_by_owner(from).await?;
         for record in records {
-            if record.reserved_by_sandbox_id.as_deref() == Some(from) {
-                self.replace_volume_record_owner(&record.id, from, to)
-                    .await?;
+            if let Some(to) = to {
+                self.write_volume_owner_entry(to, &record.id).await?;
             }
+            if let Err(error) = self.replace_volume_record_owner(&record.id, from, to).await {
+                if let Some(to) = to {
+                    let _ = self
+                        .client
+                        .delete(&OssSnapshotArtifactLayout::volume_owner_key(to, &record.id))
+                        .await;
+                }
+                return Err(error);
+            }
+            self.client
+                .delete(&OssSnapshotArtifactLayout::volume_owner_key(
+                    from, &record.id,
+                ))
+                .await
+                .map_err(|error| RepositoryError::backend("delete volume owner index", error))?;
         }
-        Ok(None)
+        Ok(())
     }
 }
 
 // ── private helpers ────────────────────────────────────────────────────
 
 impl OssSnapshotRepository {
+    async fn read_volume_record(&self, volume_id: &str) -> RepositoryResult<Option<VolumeRecord>> {
+        validate_volume_id(volume_id)?;
+        let key = OssSnapshotArtifactLayout::volume_record_key(volume_id);
+        match self.client.get_bytes(&key).await {
+            Ok(bytes) => {
+                let record: VolumeRecord = serde_json::from_slice(&bytes)
+                    .map_err(|error| RepositoryError::backend("parse volume record", error))?;
+                validate_volume_id(&record.id)?;
+                if record.id != volume_id {
+                    return Err(RepositoryError::InvalidRequest {
+                        reason: format!(
+                            "volume record id '{}' does not match key '{volume_id}'",
+                            record.id
+                        ),
+                    });
+                }
+                Ok(Some(record))
+            }
+            Err(error) if OssClient::is_not_found_error(&error) => Ok(None),
+            Err(error) => Err(RepositoryError::backend("read volume record", error)),
+        }
+    }
+
+    async fn read_volumes_by_owner(&self, owner: &str) -> RepositoryResult<Vec<VolumeRecord>> {
+        let prefix = OssSnapshotArtifactLayout::volume_owner_prefix(owner);
+        let keys = self
+            .client
+            .list_keys_recursive(&prefix)
+            .await
+            .map_err(|error| RepositoryError::backend("list volume owner index", error))?;
+        let mut records = Vec::with_capacity(keys.len());
+        for key in keys {
+            let Some(volume_id) = key
+                .strip_prefix(&prefix)
+                .and_then(|value| value.strip_suffix(".json"))
+                .filter(|value| !value.contains('/'))
+            else {
+                continue;
+            };
+            validate_volume_id(volume_id)?;
+            let record = self.read_volume_record(volume_id).await?;
+            if let Some(record) = record.filter(|record| {
+                record.reserved_by_sandbox_id.as_deref() == Some(owner)
+                    || record.read_only_mounts.iter().any(|entry| entry == owner)
+            }) {
+                records.push(record);
+            } else {
+                let _ = self.client.delete(&key).await;
+            }
+        }
+        records.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(records)
+    }
+
+    async fn write_volume_owner_entry(&self, owner: &str, volume_id: &str) -> RepositoryResult<()> {
+        let bytes = serde_json::to_vec(volume_id)
+            .map_err(|error| RepositoryError::backend("serialize volume owner index", error))?;
+        self.client
+            .put_bytes(
+                &OssSnapshotArtifactLayout::volume_owner_key(owner, volume_id),
+                bytes,
+                OssUploadArtifact::CatalogRecord,
+            )
+            .await
+            .map_err(|error| RepositoryError::backend("write volume owner index", error))
+    }
+
     async fn replace_volume_record_owner(
         &self,
         volume_id: &str,
@@ -695,10 +981,22 @@ impl OssSnapshotRepository {
             else {
                 return Ok(());
             };
-            if record.reserved_by_sandbox_id.as_deref() != Some(from) {
+            if record.reserved_by_sandbox_id.as_deref() != Some(from)
+                && !record.read_only_mounts.iter().any(|owner| owner == from)
+            {
                 return Ok(());
             }
-            record.reserved_by_sandbox_id = to.map(str::to_owned);
+            if record.reserved_by_sandbox_id.as_deref() == Some(from) {
+                record.reserved_by_sandbox_id = to.map(str::to_owned);
+            }
+            if record.read_only_mounts.iter().any(|owner| owner == from) {
+                record.read_only_mounts.retain(|owner| owner != from);
+                if let Some(to) = to {
+                    if !record.read_only_mounts.iter().any(|owner| owner == to) {
+                        record.read_only_mounts.push(to.to_owned());
+                    }
+                }
+            }
             if self
                 .write_volume_record_conditionally(&record, etag.as_deref())
                 .await?
@@ -718,9 +1016,23 @@ impl OssSnapshotRepository {
     ) -> RepositoryResult<Option<(VolumeRecord, Option<String>)>> {
         let key = OssSnapshotArtifactLayout::volume_record_key(volume_id);
         match self.client.get_bytes_with_etag(&key).await {
-            Ok((bytes, etag)) => serde_json::from_slice(&bytes)
-                .map(|record| Some((record, etag)))
-                .map_err(|error| RepositoryError::backend("parse volume record", error)),
+            Ok((bytes, etag)) => {
+                let record: VolumeRecord = serde_json::from_slice(&bytes)
+                    .map_err(|error| RepositoryError::backend("parse volume record", error))?;
+                validate_volume_id(&record.id)?;
+                if record.id != volume_id {
+                    return Err(RepositoryError::InvalidRequest {
+                        reason: format!(
+                            "volume record id '{}' does not match key '{volume_id}'",
+                            record.id
+                        ),
+                    });
+                }
+                let etag = etag.ok_or_else(|| RepositoryError::Unsupported {
+                    feature: "OSS volume CAS requires ETags".to_string(),
+                })?;
+                Ok(Some((record, Some(etag))))
+            }
             Err(error) if OssClient::is_not_found_error(&error) => Ok(None),
             Err(error) => Err(RepositoryError::backend("read volume record", error)),
         }
@@ -1489,6 +1801,28 @@ mod tests {
         )
         .expect("oss client");
         OssSnapshotRepository::new(Arc::new(client), SnapshotImageStoragePolicy::ObjectStorage)
+    }
+
+    #[test]
+    fn volume_record_keys_round_trip_through_sharded_layout() {
+        let volume_id = "vol_019c0000000070008000000000000000";
+        let key = OssSnapshotArtifactLayout::volume_record_key(volume_id);
+        assert_eq!(volume_id_from_record_key(&key).unwrap(), volume_id);
+        let wrong_shard = if volume_catalog_shard(volume_id) == "00" {
+            "01"
+        } else {
+            "00"
+        };
+        assert!(volume_id_from_record_key(&format!(
+            "catalog/volumes/{wrong_shard}/{volume_id}.json"
+        ))
+        .is_err());
+        assert!(OssSnapshotArtifactLayout::volume_name_key("my-data")
+            .starts_with("catalog/volume-names/"));
+        assert!(
+            OssSnapshotArtifactLayout::volume_owner_key("sandbox", volume_id)
+                .starts_with("catalog/volume-owners/")
+        );
     }
 
     #[test]

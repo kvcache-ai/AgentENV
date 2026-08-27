@@ -13,7 +13,9 @@ use crate::image::cache::{local_image_services_from_global_config, OverlaybdLaye
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
-use crate::snapshot::repository::{RepositoryError, RepositoryResult, SnapshotListFilter};
+use crate::snapshot::repository::{
+    RepositoryError, RepositoryResult, SnapshotListFilter, VolumeRecordPage,
+};
 use crate::snapshot::types::{
     CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
 };
@@ -312,8 +314,26 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         .await
     }
 
-    async fn list_volumes(&self) -> RepositoryResult<Vec<VolumeRecord>> {
-        self.run_catalog("list volumes", PosixFsCatalogStore::list_volumes)
+    async fn get_volume(&self, reference: &str) -> RepositoryResult<Option<VolumeRecord>> {
+        let reference = reference.to_owned();
+        self.run_catalog("get volume", move |store| store.get_volume(&reference))
+            .await
+    }
+
+    async fn list_volumes_page(
+        &self,
+        after_volume_id: Option<&str>,
+        limit: usize,
+    ) -> RepositoryResult<VolumeRecordPage> {
+        let after_volume_id = after_volume_id.map(str::to_owned);
+        self.run_catalog("list volumes", move |store| {
+            store.list_volumes_page(after_volume_id.as_deref(), limit)
+        })
+        .await
+    }
+
+    async fn create_volume(&self, record: VolumeRecord) -> RepositoryResult<()> {
+        self.run_catalog("create volume", move |store| store.create_volume(&record))
             .await
     }
 
@@ -382,11 +402,24 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         .await
     }
 
-    async fn replace_volume_owner(
-        &self,
-        from: &str,
-        to: Option<&str>,
-    ) -> RepositoryResult<Option<String>> {
+    async fn reserve_read_only_volume(&self, volume_id: &str, owner: &str) -> RepositoryResult<()> {
+        let volume_id = volume_id.to_owned();
+        let owner = owner.to_owned();
+        self.run_catalog("reserve read-only volume", move |store| {
+            store.reserve_read_only_volume(&volume_id, &owner)
+        })
+        .await
+    }
+
+    async fn list_volumes_by_owner(&self, owner: &str) -> RepositoryResult<Vec<VolumeRecord>> {
+        let owner = owner.to_owned();
+        self.run_catalog("list volumes by owner", move |store| {
+            store.list_volumes_by_owner(&owner)
+        })
+        .await
+    }
+
+    async fn replace_volume_owner(&self, from: &str, to: Option<&str>) -> RepositoryResult<()> {
         let from = from.to_owned();
         let to = to.map(str::to_owned);
         self.run_catalog("replace volume reservations", move |store| {

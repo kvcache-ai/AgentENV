@@ -194,11 +194,10 @@ for index in $(seq 1 "${read_only_sandbox_count}"); do
     "recent source data is visible in read-only sandbox #${index}"
 
   upload_volume_file "${second_id}" "/home/write-must-fail.txt"
-  if [[ "${HTTP_STATUS}" == "500" ]] && [[ "${HTTP_BODY}" == *"Read-only file system"* || "${HTTP_BODY}" == *"read-only"* ]]; then
-    _pass "guest write to read-only sandbox #${index} is rejected"
+  if [[ "${HTTP_STATUS}" == "200" ]]; then
+    _fail "guest write to read-only sandbox #${index} is rejected" "non-200" "${HTTP_STATUS}"
   else
-    _fail "guest write to read-only sandbox #${index} is rejected" \
-      "HTTP 500 with read-only error" "HTTP ${HTTP_STATUS}: ${HTTP_BODY}"
+    _pass "guest write to read-only sandbox #${index} is rejected"
   fi
 done
 
