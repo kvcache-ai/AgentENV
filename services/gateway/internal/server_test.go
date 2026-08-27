@@ -801,6 +801,10 @@ func TestExtractSandboxIDFromResponse(t *testing.T) {
 	if !equalStrings(ids, []string{"sbx-1", "sbx-2"}) {
 		t.Fatalf("expected batch sandbox ids, got %#v", ids)
 	}
+	ids = extractSandboxIDsFromResponse([]byte(`[{"sandbox":{"sandboxID":"sbx-child-1"}},{"sandbox":{"sandboxID":"sbx-child-2"}},{"error":{"message":"failed"}}]`))
+	if !equalStrings(ids, []string{"sbx-child-1", "sbx-child-2"}) {
+		t.Fatalf("expected fork child sandbox ids, got %#v", ids)
+	}
 }
 
 func TestUpstreamTargetPath(t *testing.T) {

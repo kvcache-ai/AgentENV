@@ -1162,12 +1162,14 @@ fn create_request(
 
     CreateSandboxRequest {
         source: SandboxLaunchSource::Snapshot(Box::new(RunnableSnapshot::mock())),
+        extra_drives: Vec::new(),
         timeout: timeout_secs.map(Duration::from_secs),
         timeout_action: SandboxTimeoutAction::Pause,
         user_metadata,
         env_vars: None,
         network_policy: SandboxNetworkPolicy::default(),
         custom_extension_params: None,
+        volume_mounts: HashMap::new(),
         auto_resume: false,
         secure: false,
     }
@@ -1202,8 +1204,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
         ..Default::default()
     });
     let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
-            .await;
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
     let resources = SandboxResources {
         cpu_count: 2,
         memory_mib: 512,
@@ -1224,12 +1225,14 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
                 extra_boot_args: None,
                 image_configs: Box::new(ImageConfigs::new()),
             },
+            extra_drives: Vec::new(),
             timeout: Some(Duration::from_secs(60)),
             timeout_action: SandboxTimeoutAction::Pause,
             user_metadata: None,
             env_vars: None,
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
+            volume_mounts: HashMap::new(),
             auto_resume: false,
             secure: false,
         })
@@ -1612,6 +1615,41 @@ async fn pause_resume_transitions_and_is_idempotent() -> Result<()> {
 }
 
 #[tokio::test]
+async fn delete_snapshots_volume_mounts_before_teardown() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let operations = Arc::new(StdMutex::new(Vec::new()));
+    for operation in [MockOperation::Pause, MockOperation::Stop] {
+        let operations = Arc::clone(&operations);
+        behavior.set_on_operation(
+            operation,
+            Arc::new(move || {
+                operations
+                    .lock()
+                    .expect("operation log mutex poisoned")
+                    .push(operation);
+            }),
+        );
+    }
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let mut request = create_request(Some(60), &[]);
+    request
+        .volume_mounts
+        .insert("/mnt/data".to_owned(), "vol_test".to_owned());
+    let created = orchestrator.create_sandbox(request).await?;
+
+    orchestrator.delete_sandbox(created.id).await?;
+
+    assert_eq!(
+        *operations.lock().expect("operation log mutex poisoned"),
+        vec![MockOperation::Pause, MockOperation::Stop]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn pause_succeeds_and_releases_metrics_even_when_stop_fails_after_snapshot() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
@@ -1942,6 +1980,95 @@ async fn capture_snapshot_returns_snapshot_and_preserves_running_sandbox() -> Re
     .await;
 
     orchestrator.delete_sandbox(sandbox_id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_volume_mounts_preserves_running_sandbox_and_allows_retry() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::SnapshotVolumes,
+        MockAction::Fail {
+            message: "volume snapshot staging failed".to_string(),
+        },
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let mut request = create_request(Some(60), &[]);
+    request
+        .volume_mounts
+        .insert("/mnt/data".to_owned(), "vol_test".to_owned());
+    let created = orchestrator.create_sandbox(request).await?;
+
+    let error = orchestrator
+        .snapshot_volume_mounts(created.id)
+        .await
+        .expect_err("recoverable volume snapshot failure should be returned");
+    assert!(matches!(
+        error,
+        OrchestratorError::SandboxOperationFailed {
+            operation: SandboxOperation::SnapshotVolumes,
+            ..
+        }
+    ));
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&created.id)
+            .await?
+            .expect("sandbox remains after recoverable failure")
+            .state,
+        SandboxState::Running
+    );
+
+    orchestrator.snapshot_volume_mounts(created.id).await?;
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&created.id)
+            .await?
+            .expect("sandbox remains after volume snapshot")
+            .state,
+        SandboxState::Running
+    );
+    assert_proxy_ready(&orchestrator, &created.id).await?;
+
+    orchestrator.delete_sandbox(created.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_volume_mounts_terminal_failure_removes_sandbox() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::SnapshotVolumes,
+        MockAction::FailTerminal {
+            message: "volume upper was sealed but publication failed".to_string(),
+        },
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let mut request = create_request(Some(60), &[]);
+    request
+        .volume_mounts
+        .insert("/mnt/data".to_owned(), "vol_test".to_owned());
+    let created = orchestrator.create_sandbox(request).await?;
+
+    let error = orchestrator
+        .snapshot_volume_mounts(created.id)
+        .await
+        .expect_err("terminal volume snapshot failure should be returned");
+    assert!(matches!(
+        error,
+        OrchestratorError::SandboxOperationFailed {
+            operation: SandboxOperation::SnapshotVolumes,
+            ..
+        }
+    ));
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    assert_proxy_not_found(&orchestrator, &created.id).await?;
+    assert_eq!(behavior.stop_calls(), 1);
     Ok(())
 }
 
@@ -4860,6 +4987,38 @@ async fn fork_sandbox_creates_running_children_from_one_source() -> Result<()> {
     for child in children {
         orchestrator.delete_sandbox(child.id).await?;
     }
+    orchestrator.delete_sandbox(source.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn fork_sandbox_with_specs_persists_child_volume_mounts() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let source = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "fork-volume-spec")]))
+        .await?;
+    let child_id = SandboxId::new();
+    let child_mounts = HashMap::from([(String::from("/mnt/data"), String::from("vol_child"))]);
+
+    let outcomes = orchestrator
+        .fork_sandbox_with_specs(
+            source.id,
+            vec![SandboxForkChildSpec {
+                sandbox_id: child_id,
+                volume_mounts: child_mounts.clone(),
+                ..Default::default()
+            }],
+            NewTimeout::UseExisting,
+        )
+        .await?;
+    let child = outcomes.into_iter().next().expect("one child outcome")?;
+    assert_eq!(child.id, child_id);
+    assert_eq!(child.volume_mounts, child_mounts);
+
+    orchestrator.delete_sandbox(child.id).await?;
     orchestrator.delete_sandbox(source.id).await?;
     Ok(())
 }

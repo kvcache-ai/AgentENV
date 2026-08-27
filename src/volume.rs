@@ -5,6 +5,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock};
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::snapshot::repository::{RepositoryError, SnapshotRepository};
@@ -334,16 +335,25 @@ impl VolumeManager {
                 Err(error) => return Err(repository_error(error)),
             }
         }
-        if let Some(config) = records[index].backing_image_config.as_ref() {
-            if let Some(directory) = config.parent() {
-                if let Err(error) = tokio::fs::remove_dir_all(directory).await {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        return Err(VolumeError::Storage(error.to_string()));
-                    }
+        let backing_directory = records[index]
+            .backing_image_config
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let record = records.remove(index);
+        drop(records);
+        if let Some(directory) = backing_directory {
+            if let Err(error) = tokio::fs::remove_dir_all(&directory).await {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!(
+                        volume_id = %record.id,
+                        path = %directory.display(),
+                        %error,
+                        "failed to clean deleted volume's node-local backing"
+                    );
                 }
             }
         }
-        records.remove(index);
         Ok(())
     }
 
@@ -954,6 +964,17 @@ mod tests {
         let backing_directory = config_path.parent().unwrap().to_path_buf();
         manager.delete(&record.id).await.unwrap();
         assert!(!backing_directory.exists());
+
+        let record = create_empty(&manager, "cleanup-failure").await;
+        let non_directory = directory.path().join("not-a-directory");
+        tokio::fs::write(&non_directory, b"test").await.unwrap();
+        manager.records.write().await[0].backing_image_config =
+            Some(non_directory.join("image.json"));
+        manager.delete(&record.id).await.unwrap();
+        assert_eq!(
+            manager.get(&record.id).await,
+            Err(VolumeError::NotFound(record.id))
+        );
     }
 
     #[tokio::test]

@@ -1,4 +1,8 @@
 services:
+  gateway:
+    environment:
+      GATEWAY_DEBUG_MODE: "true"
+
   agentenv-a:
     ports:
       - "8001:8000"

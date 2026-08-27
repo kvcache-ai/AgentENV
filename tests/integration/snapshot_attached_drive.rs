@@ -185,6 +185,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
         },
         virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
         image_configs: agentenv::types::ImageConfigs::new(),
+        volume_snapshots: Vec::new(),
         custom_extension_params: None,
     };
 
@@ -325,6 +326,48 @@ async fn writable_attached_overlaybd_drive_preserves_metadata_and_mount_mode() -
     assert_snapshot_attached_drive_is_visible(&sandbox, "data", false).await?;
     sandbox.stop().await?;
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn resumed_attached_drive_is_remounted_through_envd() -> Result<()> {
+    common::setup().await;
+    let (_, image_config) = common::default_rootfs_template_build_spec_with_image_config();
+    let user_image = OverlaybdConfig {
+        image_config_path: image_config.to_path_buf(),
+        read_only: false,
+        runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+    };
+    let mut config = FirecrackerSandboxConfig::from_global_config_with_user_image(user_image)?;
+    config.vcpu_count = 1;
+    config.mem_size_mib = 128;
+    config.common.extra_drives = vec![ExtraDrive::try_new_overlaybd(
+        "resume_data",
+        image_config.to_path_buf(),
+        false,
+    )?];
+
+    let mut sandbox = FirecrackerSandbox::new(config)?;
+    sandbox.start().await?;
+    let initial = sandbox
+        .run_command(
+            "sh",
+            &["-c", "echo before-resume > /mnt/resume_data/state.txt"],
+        )
+        .await?;
+    assert_eq!(initial.exit_code, 0);
+    assert_snapshot_attached_drive_is_visible(&sandbox, "resume_data", false).await?;
+
+    let paused = sandbox.pause().await?;
+    let _ = sandbox.stop().await;
+    let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&paused).await?;
+    assert_snapshot_attached_drive_is_visible(&resumed, "resume_data", false).await?;
+    let output = resumed
+        .run_command("cat", &["/mnt/resume_data/state.txt"])
+        .await?;
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout.trim(), "before-resume");
+    resumed.stop().await?;
     Ok(())
 }
 
