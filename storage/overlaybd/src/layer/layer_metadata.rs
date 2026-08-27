@@ -10,8 +10,15 @@ use zerocopy::FromBytes;
 use crate::config::LayerConfig;
 use crate::lsmt::format::HeaderTrailer;
 
-pub(crate) const COMMIT_FILE_NAME: &str = "overlaybd.commit";
-pub(crate) const SEALED_FILE_NAME: &str = "overlaybd.sealed";
+/// The names [`resolve_local_layer_path`] probes inside a layer's `dir`, in this
+/// order.
+///
+/// Public because they are a naming convention, not an implementation detail: anything
+/// that *writes* a layer has to use one of these for the result to be findable from a
+/// `LayerConfig` that carries only a directory. `COMMIT_FILE_NAME` is what to write;
+/// `SEALED_FILE_NAME` is only read, for layers produced before that name settled.
+pub const COMMIT_FILE_NAME: &str = "overlaybd.commit";
+pub const SEALED_FILE_NAME: &str = "overlaybd.sealed";
 
 pub fn resolve_local_layer_path(layer: &LayerConfig) -> Option<PathBuf> {
     if !layer.file.is_empty() {
