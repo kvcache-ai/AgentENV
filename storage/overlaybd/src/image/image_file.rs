@@ -99,6 +99,23 @@ impl fmt::Debug for ImageFileBase {
     }
 }
 
+/// Refuse an upper that cannot be sealed, naming the `operation` the user asked for.
+///
+/// Which files have to be present is decided by the mode: a log-structured or hybrid
+/// upper keeps its mappings in a separate index, and sealing one without that index
+/// would produce a layer that owns nothing. Sparse carries its index inside the data
+/// file, so the data path is all it needs.
+fn ensure_sealable_upper(upper: &UpperConfig, operation: &str) -> Result<()> {
+    let needs_index = matches!(
+        upper.writable_mode(),
+        UpperMode::LogStructured | UpperMode::HybridLogStructured
+    );
+    if upper.data.is_empty() || (needs_index && upper.index.is_empty()) {
+        bail!("{operation} requires a writable upper layer");
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct ImageFile {
     state: RwLock<LiveImageState>,
@@ -190,6 +207,64 @@ impl ImageFile {
             .await
     }
 
+    /// Seal the writable upper and move the finished layer to `output_layer_path`.
+    ///
+    /// Named after [`LSMTFile::close_seal`] and terminal in the same way: **the image
+    /// must not be used after this returns.** Its upper is sealed, so every write
+    /// answers "File is sealed.", and the data file no longer exists at the path the
+    /// config still names. Nothing here tries to leave a recoverable state behind,
+    /// because there is no state worth recovering to — the caller asked for this
+    /// upper to become a layer.
+    ///
+    /// [`Self::create_snapshot_and_restack`] is the same seal followed by stacking a
+    /// fresh upper on the result, for a caller that has to keep serving.
+    ///
+    /// The move is a plain rename, so **an existing file at `output_layer_path` is
+    /// replaced**. Whoever chooses that path decides whether something being there
+    /// already means a previous attempt left a layer worth keeping.
+    pub async fn close_seal(&self, output_layer_path: &Path) -> Result<Option<LayerDescriptor>> {
+        // Exclusive rather than shared, unlike `export_upper_as_sealed`: this one
+        // modifies the upper it is reading, so no I/O may be in flight beside it.
+        let state = self.state.write().await;
+        ensure_sealable_upper(&state.config.upper, "close_seal")?;
+        let upper_data_path = Path::new(&state.config.upper.data);
+        let current = state
+            .base
+            .writable()
+            .context("close_seal requires a writable upper layer")?;
+
+        // Before the seal, so that an output path that cannot exist is refused while
+        // the upper is still intact.
+        if let Some(output_dir) = output_layer_path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            tokio::fs::create_dir_all(output_dir)
+                .await
+                .with_context(|| {
+                    format!("create the layer's directory {}", output_dir.display())
+                })?;
+        }
+
+        // The seal writes the compact index and trailer through the upper's open
+        // handle — `LSMTFile::close_seal` takes no path — so the rename comes last,
+        // which is what leaves a failed seal's data file where it was.
+        let descriptor = current
+            .close_seal()
+            .await
+            .with_context(|| format!("seal the upper {}", upper_data_path.display()))?;
+        tokio::fs::rename(upper_data_path, output_layer_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "move the sealed layer from {} to {}",
+                    upper_data_path.display(),
+                    output_layer_path.display()
+                )
+            })?;
+        Ok(descriptor)
+    }
+
     pub async fn create_snapshot_and_restack(
         &self,
         output_layer_path: &Path,
@@ -199,14 +274,7 @@ impl ImageFile {
         let upper_data_path = PathBuf::from(&state.config.upper.data);
         let upper_index_path = (!state.config.upper.index.is_empty())
             .then(|| PathBuf::from(&state.config.upper.index));
-        if upper_data_path.as_os_str().is_empty()
-            || (matches!(
-                upper_mode,
-                UpperMode::LogStructured | UpperMode::HybridLogStructured
-            ) && upper_index_path.is_none())
-        {
-            bail!("create_snapshot_and_restack requires a writable upper layer");
-        }
+        ensure_sealable_upper(&state.config.upper, "create_snapshot_and_restack")?;
         let Some(output_dir) = output_layer_path.parent() else {
             bail!(
                 "snapshot output path has no parent directory: {}",
@@ -913,7 +981,8 @@ impl VirtualFile for ImageFile {
 mod tests {
     use super::*;
     use crate::config::DownloadConfig;
-    use crate::lsmt::file::{create_file_rw, LayerInfo, RwLayout};
+    use crate::layer::layer_metadata::read_overlaybd_layer_virtual_size;
+    use crate::lsmt::file::{create_file_rw, open_file_ro, LayerInfo, RwLayout};
     use crate::prefetch::new_prefetcher;
     use axum::body::Body;
     use axum::extract::{Request, State};
@@ -1860,6 +1929,134 @@ mod tests {
         assert!(
             write_err.to_string().contains("File is sealed"),
             "expected sealed write failure, got: {write_err:#}"
+        );
+    }
+
+    /// An image with a hybrid upper and nothing under it, so a layer sealed out of it
+    /// has to own everything that reads back.
+    async fn hybrid_image_without_lowers(tmp: &TempDir, virtual_size: u64) -> (ImageFile, PathBuf) {
+        let upper_data = tmp.path().join("upper.data");
+        let upper_index = tmp.path().join("upper.index");
+        create_initialized_upper_with_mode(
+            &upper_data,
+            Some(&upper_index),
+            virtual_size,
+            UpperMode::HybridLogStructured,
+        )
+        .await
+        .expect("build initialized hybrid upper");
+
+        let image_cfg = ImageConfig {
+            repo_blob_url: String::new(),
+            lowers: Vec::new(),
+            upper: UpperConfig {
+                mode: Some(UpperMode::HybridLogStructured),
+                index: upper_index.to_string_lossy().into_owned(),
+                data: upper_data.to_string_lossy().into_owned(),
+                target: String::new(),
+                gzip_index: String::new(),
+            },
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+
+        let image = ImageFile::open(image_cfg, build_service(tmp).await, None)
+            .await
+            .expect("open image");
+        (image, upper_data)
+    }
+
+    /// The property that makes sealing affordable: the upper *becomes* the layer.
+    /// `close_seal` appends a compact index and a trailer to the data file that is
+    /// already on disk and renames it, so an upper the guest filled with 58 GiB costs
+    /// a rename rather than a 58 GiB copy — which is what `export_upper_as_sealed`
+    /// costs, since it compacts into a fresh file.
+    ///
+    /// This test arrived with the implementation, from the NBD server that used to
+    /// seal by reopening the files itself; it was the only thing pinning this.
+    #[tokio::test]
+    async fn test_close_seal_turns_the_upper_into_a_layer_without_copying() {
+        let tmp = TempDir::new().expect("tempdir");
+        let virtual_size = 1 << 20;
+        let (image, upper_data) = hybrid_image_without_lowers(&tmp, virtual_size).await;
+
+        let payload = vec![0xAB; 4096];
+        image.write_at(0, &payload).await.expect("write payload");
+        image.sync().await.expect("sync payload");
+
+        let before = std::fs::metadata(&upper_data)
+            .expect("stat the upper")
+            .len();
+        let output = tmp.path().join("layers/delta.commit");
+        image.close_seal(&output).await.expect("seal the upper");
+
+        // Moved rather than copied. The runtime path being empty afterwards is also
+        // what stops the next `prepare_runtime_upper` from truncating the layer.
+        assert!(
+            !upper_data.exists(),
+            "the upper was left at its runtime path"
+        );
+        let after = std::fs::metadata(&output).expect("stat the layer").len();
+        assert!(
+            after >= before && after < before + (1 << 20),
+            "sealing appended an index and a trailer, not a second copy: {before} -> {after}",
+        );
+
+        // Read the layer back through fresh handles, which is the first time anything
+        // reads the index and trailer that sealing wrote out of memory.
+        assert_eq!(
+            read_overlaybd_layer_virtual_size(&output).expect("read the trailer"),
+            virtual_size
+        );
+        let layer_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_ro(&output).expect("open the layer"));
+        let layer = open_file_ro(layer_file)
+            .await
+            .expect("open it as a sealed layer");
+        let mut read = vec![0u8; payload.len()];
+        layer
+            .read_at_into(0, &mut read)
+            .await
+            .expect("read it back");
+        assert_eq!(read, payload);
+
+        // A block the upper never owned still reads as zeros, so sealing did not
+        // invent mappings for the rest of the virtual size.
+        let mut hole = vec![0xFF; 4096];
+        layer
+            .read_at_into(8192, &mut hole)
+            .await
+            .expect("read a hole");
+        assert!(hole.iter().all(|byte| *byte == 0));
+    }
+
+    /// Sealing twice must be refused rather than append a second trailer. The refusal
+    /// comes from `LSMTFile::close_seal`'s own flag, so it does not depend on the data
+    /// file still being where the config says it is — after the first call it is not.
+    #[tokio::test]
+    async fn test_close_seal_twice_is_refused() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (image, _upper_data) = hybrid_image_without_lowers(&tmp, 1 << 20).await;
+        image
+            .write_at(0, &[0xCD; 4096])
+            .await
+            .expect("write payload");
+
+        image
+            .close_seal(&tmp.path().join("first.commit"))
+            .await
+            .expect("seal the upper");
+        let error = image
+            .close_seal(&tmp.path().join("second.commit"))
+            .await
+            .expect_err("a sealed upper must not be sealed again");
+        // The whole chain rather than `to_string()`: the outermost context names the
+        // file, and the refusal itself comes from the layer underneath it.
+        assert!(
+            format!("{error:#}").contains("already been sealed"),
+            "{error:#}"
         );
     }
 
