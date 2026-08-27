@@ -16,6 +16,11 @@
 - [Manual Compile (Single Node)](./deployment/manual-compile.md)
 - [PVM Deployment (When KVM Is Unavailable)](./deployment/pvm.md)
 
+# Use Cases
+
+- [Run Python Code](./use-cases/python.md)
+- [Train Terminal-Bench-2 with Miles](./use-cases/miles.md)
+
 # Core Concepts
 
 - [How AgentENV Works](./concepts/overview.md)

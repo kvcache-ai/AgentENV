@@ -186,20 +186,27 @@ AgentENV derives both `trafficAccessToken` and `envdAccessToken` from the
 sandbox identity and a random access-token seed. This seed is independent of
 the AgentENV API key.
 
-For a standalone runtime, the seed is optional. When it is unset, AgentENV
-generates and persists one under `$AENV_HOME/secrets`, which is sufficient for
-normal single-node operation.
+By default, no manual configuration is required. When a seed is not configured,
+AgentENV generates one on first startup and persists it at
+`$AENV_HOME/secrets/sandbox-access-token-hash-seed`. Later startups reuse the
+same value.
 
-In a multi-node deployment, generate one seed and configure the same value on
-every runtime node:
+To provide your own seed, generate one value:
 
 ```bash
-openssl rand -hex 32
-export AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED="<generated-seed>"
+ACCESS_TOKEN_SEED="$(openssl rand -hex 32)"
 ```
 
-Alternatively, set it in your AgentENV config file (`config/default.toml`, or
-the file selected by `AENV_CONFIG_PATH`):
+Then configure it using one of the following methods.
+
+Set the environment variable before starting AgentENV:
+
+```bash
+export AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED="$ACCESS_TOKEN_SEED"
+```
+
+Or set it in `config/default.toml`, or in the configuration file selected by
+`AENV_CONFIG_PATH`:
 
 ```toml
 [sandbox]
@@ -207,8 +214,7 @@ access_token_hash_seed = "<generated-seed>"
 ```
 
 Kubernetes deployments store the shared value under the
-`sandbox-access-token-hash-seed` key in `Secret/agentenv-runtime-secrets`. See
-[Kubernetes Deployment](../deployment/kubernetes.md) for the setup commands.
+`sandbox-access-token-hash-seed` key in `Secret/agentenv-runtime-secrets`.
 
 Preserve the seed across upgrades. Changing it rotates both sandbox token types
 and requires all runtime nodes to be updated together.

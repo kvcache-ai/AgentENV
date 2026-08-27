@@ -37,6 +37,13 @@ This creates a separate sandbox with a new sandbox ID. It inherits the captured
 filesystem, running processes, memory state, environment variables, runtime
 configuration, and resource settings.
 
+To retrieve information about one snapshot by ID or alias, use the HTTP API:
+
+```bash
+curl -H 'X-API-Key: test-key' \
+  http://127.0.0.1:8000/snapshots/<snapshot-id-or-alias>
+```
+
 ## Use a Snapshot Rootfs as an OCI Image
 
 Starting with `aenv start <snapshot>` restores the complete snapshot state. If
