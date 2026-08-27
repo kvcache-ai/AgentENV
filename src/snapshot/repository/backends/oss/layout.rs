@@ -18,6 +18,14 @@ impl<'a> OssSnapshotArtifactLayout<'a> {
         format!("catalog/records/{id}.json")
     }
 
+    pub(super) fn volume_record_key(volume_id: &str) -> String {
+        format!("catalog/volumes/{volume_id}.json")
+    }
+
+    pub(super) fn volume_records_prefix() -> &'static str {
+        "catalog/volumes/"
+    }
+
     pub(crate) fn managed_layer_key(digest: &str) -> String {
         format!("managed-layers/{digest}")
     }

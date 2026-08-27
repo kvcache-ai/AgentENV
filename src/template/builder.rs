@@ -137,6 +137,7 @@ impl TemplateBuilder {
                     runtime_versions: build_execution.runtime_versions,
                     virtualization_mode: context.virtualization_mode,
                     image_configs: build_execution.image_configs,
+                    volume_snapshots: Vec::new(),
                     // Template builds intentionally do not propagate the base
                     // snapshot's extension custom config: it is a per-sandbox
                     // user setting, not part of the built image content.

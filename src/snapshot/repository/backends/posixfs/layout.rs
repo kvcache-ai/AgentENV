@@ -4,6 +4,7 @@ use crate::snapshot::{SnapshotAlias, SnapshotId};
 
 pub(super) const POSIXFS_SNAPSHOT_COMMIT_MARKER: &str = "commit";
 const LOCK_SUFFIX: &str = ".lock";
+const VOLUME_CATALOG_DIR: &str = "volumes";
 
 pub(super) fn managed_layer_file_name(digest: &str) -> String {
     format!("{}.overlaybd.commit", digest.replace([':', '/'], "_"))
@@ -33,6 +34,18 @@ impl PosixFsSnapshotArtifactLayout {
 
     pub(super) fn records_dir(root: &Path) -> PathBuf {
         Self::catalog_dir(root).join("records")
+    }
+
+    pub(super) fn volumes_dir(root: &Path) -> PathBuf {
+        Self::catalog_dir(root).join(VOLUME_CATALOG_DIR)
+    }
+
+    pub(super) fn volume_record_path(root: &Path, volume_id: &str) -> PathBuf {
+        Self::volumes_dir(root).join(format!("{volume_id}.json"))
+    }
+
+    pub(super) fn volume_catalog_lock_path(root: &Path) -> PathBuf {
+        Self::volumes_dir(root).join(format!("catalog{LOCK_SUFFIX}"))
     }
 
     pub(super) fn alias_path(root: &Path, alias: &SnapshotAlias) -> PathBuf {

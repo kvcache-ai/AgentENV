@@ -1,8 +1,9 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::errors::RepositoryResult;
+use super::errors::{RepositoryError, RepositoryResult};
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::types::{
     RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSourceKind,
@@ -32,6 +33,12 @@ pub struct SnapshotListFilter {
     ///
     /// Sandbox records never match this field.
     pub template_statuses: Option<Vec<TemplateBuildStatus>>,
+}
+
+fn unsupported<T>(feature: &str) -> RepositoryResult<T> {
+    Err(RepositoryError::Unsupported {
+        feature: feature.to_owned(),
+    })
 }
 
 impl SnapshotListFilter {
@@ -173,6 +180,63 @@ pub trait SnapshotRepository: Send + Sync {
         id: &SnapshotId,
         reason: TemplateBuildErrorReason,
     ) -> RepositoryResult<()>;
+
+    /// Lists independently managed volume records stored with this repository.
+    ///
+    /// Repositories that do not provide a volume catalog may retain the default
+    /// unsupported response; this keeps snapshot-only test doubles lightweight.
+    async fn list_volumes(&self) -> RepositoryResult<Vec<crate::volume::VolumeRecord>> {
+        unsupported("volume catalog")
+    }
+
+    /// Creates or replaces one durable volume record.
+    async fn put_volume(&self, _record: crate::volume::VolumeRecord) -> RepositoryResult<()> {
+        unsupported("volume catalog")
+    }
+
+    /// Publishes the current node-local OverlayBD backing and returns logical
+    /// layer references suitable for the shared volume catalog.
+    async fn publish_volume_backing(
+        &self,
+        _volume_id: &str,
+        _image_config_path: &Path,
+    ) -> RepositoryResult<Vec<crate::snapshot::OverlaybdLayerRef>> {
+        unsupported("volume backing publication")
+    }
+
+    /// Materializes a node-local runtime image config from shared logical layers.
+    async fn materialize_volume_backing(
+        &self,
+        _volume_id: &str,
+        _layers: &[crate::snapshot::OverlaybdLayerRef],
+        _destination: &Path,
+    ) -> RepositoryResult<PathBuf> {
+        unsupported("volume backing materialization")
+    }
+
+    /// Removes one durable volume record. Missing records are considered success.
+    async fn delete_volume(&self, _volume_id: &str) -> RepositoryResult<()> {
+        unsupported("volume catalog")
+    }
+
+    /// Acquires an exclusive volume reservation atomically where the backend
+    /// supports it. `Ok(Some(owner))` reports an existing conflicting owner.
+    async fn reserve_volume(
+        &self,
+        _volume_id: &str,
+        _owner: &str,
+    ) -> RepositoryResult<Option<String>> {
+        unsupported("volume reservations")
+    }
+
+    /// Releases reservations held by `from`, or rebinds them when `to` is set.
+    async fn replace_volume_owner(
+        &self,
+        _from: &str,
+        _to: Option<&str>,
+    ) -> RepositoryResult<Option<String>> {
+        unsupported("volume reservations")
+    }
 }
 
 #[async_trait]

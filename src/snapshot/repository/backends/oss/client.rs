@@ -128,6 +128,18 @@ impl OssClient {
         result
     }
 
+    /// Reads a small object together with its backend version token for a
+    /// conditional update.
+    pub(crate) async fn get_bytes_with_etag(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+        self.run_with_key(key, |operator, key| async move {
+            let metadata = operator.stat(&key).await?;
+            let bytes = operator.read(&key).await?.to_bytes();
+            Ok((bytes, metadata.etag().map(str::to_owned)))
+        })
+        .await
+        .with_context(|| format!("oss get versioned object '{key}'"))
+    }
+
     /// Download an object directly to a local file (atomic: temp + rename).
     pub(crate) async fn get_to_file(&self, key: &str, dest: &Path) -> Result<u64> {
         let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "get_to_file");
@@ -221,6 +233,37 @@ impl OssClient {
         }
         result?;
         Ok(())
+    }
+
+    /// Conditionally writes a small object. `etag = None` means the object
+    /// must not already exist. A failed condition returns `Ok(false)`.
+    pub(crate) async fn put_bytes_conditionally(
+        &self,
+        key: &str,
+        data: impl Into<Bytes>,
+        etag: Option<&str>,
+    ) -> Result<bool> {
+        let data = data.into();
+        let oss_key = self.full_key(key);
+        self.run_with_operator(|operator| {
+            let data = data.clone();
+            let oss_key = oss_key.clone();
+            let etag = etag.map(str::to_owned);
+            async move {
+                let write = operator.write_with(&oss_key, data);
+                let result = match etag.as_deref() {
+                    Some(etag) => write.if_match(etag).await,
+                    None => write.if_none_match("*").await,
+                };
+                match result {
+                    Ok(_) => Ok(true),
+                    Err(error) if error.kind() == OpenDalErrorKind::ConditionNotMatch => Ok(false),
+                    Err(error) => Err(error),
+                }
+            }
+        })
+        .await
+        .with_context(|| format!("oss conditional put '{key}'"))
     }
 
     /// Upload a local file to OSS.

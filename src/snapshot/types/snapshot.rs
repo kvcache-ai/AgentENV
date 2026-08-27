@@ -18,6 +18,14 @@ use super::version::SnapshotRuntimeVersions;
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::types::{ImageConfigs, SandboxResources};
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotVolume {
+    pub mount_path: String,
+    pub volume_id: String,
+    pub revision: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct SnapshotPublishMetadata {
     pub id: SnapshotId,
@@ -29,6 +37,7 @@ pub struct SnapshotPublishMetadata {
     pub runtime_versions: SnapshotRuntimeVersions,
     pub virtualization_mode: VirtualizationMode,
     pub image_configs: ImageConfigs,
+    pub volume_snapshots: Vec<SnapshotVolume>,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Template launches inherit it unless overridden at create time.
     pub custom_extension_params: Option<CustomExtensionParams>,
@@ -52,6 +61,7 @@ impl SnapshotPublishMetadata {
             },
             virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
             image_configs: ImageConfigs::new(),
+            volume_snapshots: Vec::new(),
             custom_extension_params: None,
         }
     }
@@ -293,6 +303,10 @@ pub struct CommittedSnapshot {
     pub image_configs: ImageConfigs,
     pub rootfs_layers: Vec<OverlaybdLayerRef>,
     pub attached_drives: Vec<CommittedAttachedDrive>,
+    /// Logical volume snapshots captured with the sandbox, without local
+    /// snapshot artifact paths.
+    #[serde(default)]
+    pub volume_snapshots: Vec<SnapshotVolume>,
     /// Managed overlaybd layers for the memory snapshot image, ordered bottom-up.
     pub memory_layers: Vec<ManagedLayer>,
     #[serde(default)]
@@ -318,6 +332,7 @@ impl CommittedSnapshot {
             image_configs: ImageConfigs::new(),
             rootfs_layers: Vec::new(),
             attached_drives: Vec::new(),
+            volume_snapshots: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,
@@ -575,7 +590,7 @@ impl fmt::Debug for RunnableSnapshot {
 mod tests {
     use super::{
         rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ManagedLayer,
-        PersistedDiskImagePublication, SnapshotRecord, TemplateBuildErrorReason,
+        PersistedDiskImagePublication, SnapshotRecord, SnapshotVolume, TemplateBuildErrorReason,
     };
     use std::collections::HashMap;
 
@@ -609,6 +624,33 @@ mod tests {
             .runtime_versions
             .tools_drive_version
             .is_empty());
+    }
+
+    #[test]
+    fn snapshot_volume_is_logical() {
+        let mut record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        record
+            .committed
+            .as_mut()
+            .unwrap()
+            .volume_snapshots
+            .push(SnapshotVolume {
+                mount_path: "/mnt/data".to_string(),
+                volume_id: "vol_snapshot".to_string(),
+                revision: 3,
+            });
+
+        let value = serde_json::to_value(&record).expect("serialize snapshot record");
+        assert_eq!(
+            value["committed"]["volume_snapshots"][0]["volumeId"],
+            "vol_snapshot"
+        );
+        assert!(!value.to_string().contains("snapshot_dir"));
+        let decoded: SnapshotRecord = serde_json::from_value(value).expect("deserialize record");
+        assert_eq!(
+            decoded.committed.unwrap().volume_snapshots[0].mount_path,
+            "/mnt/data"
+        );
     }
 
     #[test]

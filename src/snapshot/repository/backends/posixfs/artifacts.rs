@@ -25,8 +25,67 @@ impl PosixFsArtifactStore {
         Self { root }
     }
 
+    pub(crate) fn managed_layer_path(&self, digest: &str) -> PathBuf {
+        PosixFsSnapshotArtifactLayout::managed_layer_path(&self.root, digest)
+    }
+
     fn committed_layout(&self, snapshot_id: &SnapshotId) -> PosixFsSnapshotArtifactLayout {
         PosixFsSnapshotArtifactLayout::new(&self.root, snapshot_id)
+    }
+
+    pub(crate) fn publish_volume_backing(
+        &self,
+        image_config_path: &Path,
+    ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
+        let image_config = load_overlaybd_image_config(image_config_path).map_err(|error| {
+            RepositoryError::backend(
+                format!("load volume image config '{}'", image_config_path.display()),
+                error,
+            )
+        })?;
+        image_config
+            .lowers
+            .into_iter()
+            .enumerate()
+            .map(|(index, layer)| {
+                if !layer.file.is_empty() {
+                    let layer_path = Path::new(&layer.file);
+                    if !layer.digest.is_empty() && layer.size > 0 {
+                        return self
+                            .import_managed_layer_with_descriptor(
+                                layer_path,
+                                &layer.digest,
+                                layer.size,
+                            )
+                            .map(OverlaybdLayerRef::Managed);
+                    }
+                    return self
+                        .import_descriptorless_rootfs_layer(layer_path)
+                        .map(OverlaybdLayerRef::Managed);
+                }
+                let repo_blob_url = layer
+                    .effective_repo_blob_url(&image_config.repo_blob_url)
+                    .to_string();
+                if !repo_blob_url.is_empty() {
+                    return Ok(OverlaybdLayerRef::External(
+                        crate::snapshot::ExternalLayer {
+                            digest: if !layer.digest.is_empty() {
+                                layer.digest
+                            } else if !layer.target_digest.is_empty() {
+                                layer.target_digest
+                            } else {
+                                format!("external:{index}")
+                            },
+                            repo_blob_url,
+                            size: layer.size,
+                        },
+                    ));
+                }
+                Err(RepositoryError::Unsupported {
+                    feature: format!("volume layer {index} without local file or repoBlobUrl"),
+                })
+            })
+            .collect()
     }
 
     /// Imports manager-owned local build artifacts into committed repository storage.
@@ -829,6 +888,7 @@ mod tests {
                 mount_path: crate::sandbox::ExtraDrive::default_mount_path("data"),
                 virtual_size: Some(4096),
                 sub_path: None,
+                snapshot_output_dir: None,
             }])
             .expect("attached drive manifest should include virtual size");
 

@@ -5,7 +5,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::task;
 
-use super::super::shared_runtime_cache_root;
+use super::super::{common::materialize_volume_image_config, shared_runtime_cache_root};
 use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
 use super::catalog::PosixFsCatalogStore;
 use super::runtime::PosixFsRuntimeResolver;
@@ -17,6 +17,7 @@ use crate::snapshot::repository::{RepositoryError, RepositoryResult, SnapshotLis
 use crate::snapshot::types::{
     CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
 };
+use crate::volume::VolumeRecord;
 
 #[derive(Clone, Debug)]
 pub struct PosixFsBackendConfig {
@@ -137,6 +138,7 @@ impl PosixFsSnapshotRepository {
             custom_extension_params: metadata.custom_extension_params.clone(),
             rootfs_layers: built.rootfs_layers,
             attached_drives: built.attached_drives,
+            volume_snapshots: metadata.volume_snapshots.clone(),
             memory_layers: built.memory_layers,
             disk_publications: Vec::new(),
         }
@@ -144,6 +146,15 @@ impl PosixFsSnapshotRepository {
 
     fn create_sync(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         self.catalog_store.create(record)
+    }
+
+    async fn run_catalog<T, F>(&self, operation: &'static str, work: F) -> RepositoryResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&PosixFsCatalogStore) -> RepositoryResult<T> + Send + 'static,
+    {
+        let store = Arc::clone(&self.catalog_store);
+        run_repository_blocking(operation, move || work(&store)).await
     }
 
     fn publish_sync(
@@ -297,6 +308,89 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         let id = id.clone();
         run_repository_blocking("mark template build error", move || {
             repository.mark_error_sync(&id, reason)
+        })
+        .await
+    }
+
+    async fn list_volumes(&self) -> RepositoryResult<Vec<VolumeRecord>> {
+        self.run_catalog("list volumes", PosixFsCatalogStore::list_volumes)
+            .await
+    }
+
+    async fn put_volume(&self, record: VolumeRecord) -> RepositoryResult<()> {
+        let mut record = record;
+        record.backing_image_config = None;
+        self.run_catalog("put volume", move |store| store.put_volume(&record))
+            .await
+    }
+
+    async fn publish_volume_backing(
+        &self,
+        _volume_id: &str,
+        image_config_path: &std::path::Path,
+    ) -> RepositoryResult<Vec<crate::snapshot::OverlaybdLayerRef>> {
+        let repository = self.clone();
+        let image_config_path = image_config_path.to_path_buf();
+        run_repository_blocking("publish volume backing", move || {
+            repository
+                .artifact_store
+                .publish_volume_backing(&image_config_path)
+        })
+        .await
+    }
+
+    async fn materialize_volume_backing(
+        &self,
+        _volume_id: &str,
+        layers: &[crate::snapshot::OverlaybdLayerRef],
+        destination: &std::path::Path,
+    ) -> RepositoryResult<std::path::PathBuf> {
+        materialize_volume_image_config(layers, destination, |layer| {
+            overlaybd::config::LayerConfig {
+                file: self
+                    .artifact_store
+                    .managed_layer_path(&layer.digest)
+                    .to_string_lossy()
+                    .into_owned(),
+                digest: layer.digest.clone(),
+                size: layer.size,
+                uuid: layer.uuid.clone().unwrap_or_default(),
+                ..Default::default()
+            }
+        })
+        .await
+    }
+
+    async fn delete_volume(&self, volume_id: &str) -> RepositoryResult<()> {
+        let volume_id = volume_id.to_owned();
+        self.run_catalog("delete volume", move |store| {
+            store.delete_volume(&volume_id)
+        })
+        .await
+    }
+
+    async fn reserve_volume(
+        &self,
+        volume_id: &str,
+        owner: &str,
+    ) -> RepositoryResult<Option<String>> {
+        let volume_id = volume_id.to_owned();
+        let owner = owner.to_owned();
+        self.run_catalog("reserve volume", move |store| {
+            store.reserve_volume(&volume_id, &owner)
+        })
+        .await
+    }
+
+    async fn replace_volume_owner(
+        &self,
+        from: &str,
+        to: Option<&str>,
+    ) -> RepositoryResult<Option<String>> {
+        let from = from.to_owned();
+        let to = to.map(str::to_owned);
+        self.run_catalog("replace volume reservations", move |store| {
+            store.replace_volume_owner(&from, to.as_deref())
         })
         .await
     }
@@ -604,6 +698,7 @@ mod tests {
                     mount_path: ExtraDrive::default_mount_path("data"),
                     virtual_size: Some(32768),
                     sub_path: None,
+                    snapshot_output_dir: None,
                 },
                 ExtraDrive::Overlaybd {
                     drive_id: "data".to_string(),
@@ -612,6 +707,7 @@ mod tests {
                     mount_path: ExtraDrive::default_mount_path("data"),
                     virtual_size: Some(32768),
                     sub_path: None,
+                    snapshot_output_dir: None,
                 },
             ],
         );
@@ -648,6 +744,7 @@ mod tests {
                 uuid: None,
             })],
             attached_drives: Vec::new(),
+            volume_snapshots: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,
@@ -705,6 +802,7 @@ mod tests {
                 uuid: Some("11111111-2222-3333-4444-555555555555".to_string()),
             })],
             attached_drives: Vec::new(),
+            volume_snapshots: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,

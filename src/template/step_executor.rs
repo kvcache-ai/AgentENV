@@ -163,7 +163,7 @@ mod tests {
 
     #[async_trait(?Send)]
     impl SandboxExecutor for NoopSandbox {
-        fn executor(&self) -> Result<Executor<'_>> {
+        fn executor(&self) -> Result<Executor> {
             Err(anyhow!("not used"))
         }
         async fn run_command_with_opts(
@@ -218,7 +218,7 @@ mod tests {
 
     #[async_trait(?Send)]
     impl SandboxExecutor for RecordingSandbox {
-        fn executor(&self) -> Result<Executor<'_>> {
+        fn executor(&self) -> Result<Executor> {
             Err(anyhow!("not used"))
         }
         async fn run_command_with_opts(
