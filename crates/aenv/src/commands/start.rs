@@ -1,5 +1,5 @@
-use crate::client::{sandboxes::SandboxLaunchOptions, Client};
-use anyhow::Result;
+use crate::client::{volumes::validate_volume_reference, Client};
+use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -57,27 +57,18 @@ pub fn run(args: Args) -> Result<()> {
     let sandbox = if args.cold {
         client.create_cold_sandbox(
             &args.target,
+            Some(args.timeout),
             args.resources.cpu_count,
             args.resources.memory_mb,
             args.disk_size_mb,
-            SandboxLaunchOptions {
-                timeout: Some(args.timeout),
-                secure: args.secure,
-                volume_mounts,
-            },
+            args.secure,
+            volume_mounts,
         )?
     } else {
         if args.resources.is_set() || args.disk_size_mb.is_some() {
             anyhow::bail!("--cpu-count, --memory-mb, and --disk-size-mb require --cold");
         }
-        client.create_sandbox(
-            &args.target,
-            SandboxLaunchOptions {
-                timeout: Some(args.timeout),
-                secure: args.secure,
-                volume_mounts,
-            },
-        )?
+        client.create_sandbox(&args.target, Some(args.timeout), args.secure, volume_mounts)?
     };
     let sandbox_id = sandbox.sandbox_id;
 
@@ -101,27 +92,78 @@ fn parse_volume_mounts(values: &[String]) -> Result<Option<HashMap<String, Strin
     if values.is_empty() {
         return Ok(None);
     }
-    let mut mounts = HashMap::with_capacity(values.len());
+    let mut mounts: HashMap<String, String> = HashMap::with_capacity(values.len());
     for value in values {
         let Some((mount_path, volume)) = value.split_once('=') else {
             anyhow::bail!("volume mount must use MOUNT_PATH=VOLUME syntax: {value}");
         };
-        if !mount_path.starts_with('/') || mount_path == "/" {
-            anyhow::bail!(
-                "volume mount path must be an absolute guest path other than /: {mount_path}"
-            );
-        }
-        if volume.is_empty() {
-            anyhow::bail!("volume reference cannot be empty: {value}");
+        let mount_path = normalize_mount_path(mount_path)?;
+        validate_volume_reference(volume)
+            .with_context(|| format!("invalid volume reference in mount: {value}"))?;
+        if mounts
+            .keys()
+            .any(|existing| mount_paths_overlap(existing, &mount_path))
+        {
+            anyhow::bail!("volume mount paths overlap: {mount_path}");
         }
         if mounts
-            .insert(mount_path.to_owned(), volume.to_owned())
+            .insert(mount_path.clone(), volume.to_owned())
             .is_some()
         {
             anyhow::bail!("volume mount path is specified more than once: {mount_path}");
         }
     }
     Ok(Some(mounts))
+}
+
+fn normalize_mount_path(value: &str) -> Result<String> {
+    if !value.starts_with('/') || value == "/" {
+        anyhow::bail!("volume mount path must be an absolute guest path other than /: {value}");
+    }
+    if value.contains('\\')
+        || value.chars().any(char::is_whitespace)
+        || value.contains(',')
+        || value.contains(':')
+    {
+        anyhow::bail!("volume mount path contains invalid characters or '..': {value}");
+    }
+    let mut normalized = String::new();
+    for component in value.split('/') {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if component == ".." {
+            anyhow::bail!("volume mount path contains invalid characters or '..': {value}");
+        }
+        normalized.push('/');
+        normalized.push_str(component);
+    }
+    if normalized.is_empty() {
+        anyhow::bail!("volume mount path must be an absolute guest path other than /: {value}");
+    }
+    for reserved in [
+        "/proc",
+        "/sys",
+        "/dev",
+        "/run",
+        "/agentenv",
+        "/opt/agentenv",
+    ] {
+        if mount_paths_overlap(&normalized, reserved) {
+            anyhow::bail!("volume mount path conflicts with reserved path: {value}");
+        }
+    }
+    Ok(normalized)
+}
+
+fn mount_paths_overlap(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 async fn wait_for_envd(

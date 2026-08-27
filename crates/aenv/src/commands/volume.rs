@@ -18,7 +18,11 @@ enum Sub {
     /// Create an empty, image-backed, or copy-on-write volume.
     Create {
         name: String,
-        #[arg(long = "size-mb", default_value_t = DEFAULT_VOLUME_SIZE_MB)]
+        #[arg(
+            long = "size-mb",
+            default_value_t = DEFAULT_VOLUME_SIZE_MB,
+            value_parser = parse_volume_size_mb
+        )]
         size_mb: u64,
         #[arg(long, value_enum, default_value = "exclusive")]
         mode: Mode,
@@ -37,6 +41,15 @@ enum Sub {
     Inspect { volume: String },
     /// Delete a volume by ID or name.
     Delete { volume: String },
+}
+
+fn parse_volume_size_mb(value: &str) -> std::result::Result<u64, String> {
+    let size = value
+        .parse::<u64>()
+        .map_err(|_| "volume size must be a positive integer in MiB".to_string())?;
+    (size > 0)
+        .then_some(size)
+        .ok_or_else(|| "volume size must be greater than zero".to_string())
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]

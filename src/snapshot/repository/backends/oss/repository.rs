@@ -31,7 +31,7 @@ use crate::snapshot::{
     SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
     SNAPSHOT_ARTIFACT_LAYOUT,
 };
-use crate::volume::{VolumeMode, VolumeRecord};
+use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord};
 
 /// Manages the committed‐state layer of the OSS snapshot repository.
 ///
@@ -88,12 +88,7 @@ fn validate_volume_id(volume_id: &str) -> RepositoryResult<()> {
 }
 
 fn validate_volume_component(value: &str, kind: &str) -> RepositoryResult<()> {
-    if value.is_empty()
-        || value.len() > 128
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
+    if !is_valid_volume_component(value) {
         return Err(RepositoryError::InvalidRequest {
             reason: format!("invalid volume {kind} '{value}'"),
         });
@@ -944,10 +939,7 @@ impl OssSnapshotRepository {
             };
             validate_volume_id(volume_id)?;
             let record = self.read_volume_record(volume_id).await?;
-            if let Some(record) = record.filter(|record| {
-                record.reserved_by_sandbox_id.as_deref() == Some(owner)
-                    || record.read_only_mounts.iter().any(|entry| entry == owner)
-            }) {
+            if let Some(record) = record.filter(|record| record.mounted_by(owner)) {
                 records.push(record);
             } else {
                 let _ = self.client.delete(&key).await;
@@ -981,21 +973,8 @@ impl OssSnapshotRepository {
             else {
                 return Ok(());
             };
-            if record.reserved_by_sandbox_id.as_deref() != Some(from)
-                && !record.read_only_mounts.iter().any(|owner| owner == from)
-            {
+            if !record.replace_owner(from, to) {
                 return Ok(());
-            }
-            if record.reserved_by_sandbox_id.as_deref() == Some(from) {
-                record.reserved_by_sandbox_id = to.map(str::to_owned);
-            }
-            if record.read_only_mounts.iter().any(|owner| owner == from) {
-                record.read_only_mounts.retain(|owner| owner != from);
-                if let Some(to) = to {
-                    if !record.read_only_mounts.iter().any(|owner| owner == to) {
-                        record.read_only_mounts.push(to.to_owned());
-                    }
-                }
             }
             if self
                 .write_volume_record_conditionally(&record, etag.as_deref())

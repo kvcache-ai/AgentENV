@@ -20,12 +20,20 @@ readonly VOLUME_RANDOM_STEPS="${AENV_VOLUME_RANDOM_STEPS:-100}"
 readonly VOLUME_SIZE_MB=16
 readonly VOLUME_MOUNT_PATH="/volume"
 
+if ! [[ "${VOLUME_RANDOM_SEED}" =~ ^[0-9]+$ ]] || (( VOLUME_RANDOM_SEED > 2147483647 )); then
+  echo "AENV_VOLUME_RANDOM_SEED must be a non-negative integer <= 2147483647" >&2
+  exit 1
+fi
+if ! [[ "${VOLUME_RANDOM_STEPS}" =~ ^[0-9]+$ ]] || (( VOLUME_RANDOM_STEPS < 1 || VOLUME_RANDOM_STEPS > 1000 )); then
+  echo "AENV_VOLUME_RANDOM_STEPS must be an integer from 1 through 1000" >&2
+  exit 1
+fi
+
 RANDOM=$((VOLUME_RANDOM_SEED & 32767))
 CURRENT_STEP="setup"
 NEXT_VOLUME_NAME=0
 LAST_VOLUME_ID=""
 LAST_SANDBOX_ID=""
-LAST_NODE_ID=""
 SELECTED_VOLUME_ID=""
 
 random_file="$(mktemp "${TMPDIR:-/tmp}/aenv-volume-random.XXXXXX")"
@@ -33,8 +41,7 @@ run_name="volume-random-${VOLUME_RANDOM_SEED}-$(date +%s%N)"
 
 declare -A VOLUME_MODE=()
 declare -A VOLUME_CONTENT=()
-declare -A VOLUME_NODE_KEYS=()
-declare -A SEEN_NODES=()
+declare -A BASELINE_VOLUME_IDS=()
 ALL_VOLUME_IDS=()
 
 cleanup_randomized_volume_e2e() {
@@ -46,18 +53,17 @@ cleanup_randomized_volume_e2e() {
   done
   for volume_id in "${ALL_VOLUME_IDS[@]}"; do
     [[ -n "${volume_id}" ]] || continue
-    api_delete "/volumes/${volume_id}" 2>/dev/null || true
+    for _attempt in 1 2 3 4 5; do
+      api_delete "/volumes/${volume_id}" 2>/dev/null || true
+      [[ "${HTTP_STATUS}" == "204" || "${HTTP_STATUS}" == "404" ]] && break
+      sleep 1
+    done
   done
-  rm -f "${random_file}"
   _cleanup_e2e || true
+  rm -f "${random_file}"
   return "${status}"
 }
 trap cleanup_randomized_volume_e2e EXIT
-
-response_node_id() {
-  printf '%s\n' "${HTTP_HEADERS:-}" | awk -F': *' \
-    'tolower($1) == "x-agentenv-node-id" {gsub("\\r", "", $2); print $2; exit}'
-}
 
 register_volume() {
   local volume_id="$1"
@@ -136,23 +142,13 @@ upload_random_file() {
 
 download_random_file() {
   local sandbox_id="$1"
+  local path="${2:-${VOLUME_MOUNT_PATH}/state.txt}"
   local encoded_path
-  encoded_path=$(jq -rn --arg path "${VOLUME_MOUNT_PATH}/state.txt" '$path|@uri')
+  encoded_path=$(jq -rn --arg path "${path}" '$path|@uri')
   _curl_do -s \
     -H "x-agentenv-sandbox-id: ${sandbox_id}" \
     -H "x-agentenv-target-port: ${AENV_ENVD_PORT}" \
     "${AENV_PROXY_URL}/files?path=${encoded_path}"
-}
-
-capture_sandbox_node() {
-  local sandbox_id="$1"
-  local volume_id="$2"
-  api_get_with_headers "/sandboxes/${sandbox_id}"
-  assert_status "${HTTP_STATUS}" "200" "${CURRENT_STEP}: gateway routes sandbox details"
-  LAST_NODE_ID="$(response_node_id)"
-  assert_not_empty "${LAST_NODE_ID}" "${CURRENT_STEP}: gateway identifies sandbox backend"
-  SEEN_NODES["${LAST_NODE_ID}"]=1
-  VOLUME_NODE_KEYS["${volume_id}|${LAST_NODE_ID}"]=1
 }
 
 start_volume_sandbox() {
@@ -173,7 +169,6 @@ start_volume_sandbox() {
   fi
   assert_not_empty "${LAST_SANDBOX_ID}" "${CURRENT_STEP}: sandbox ID is present"
   track_sandbox "${LAST_SANDBOX_ID}"
-  capture_sandbox_node "${LAST_SANDBOX_ID}" "${volume_id}"
 }
 
 verify_volume_content() {
@@ -201,13 +196,15 @@ write_new_volume_content() {
 
 assert_read_only_write_fails() {
   local sandbox_id="$1"
+  local volume_id="$2"
+  local path="${VOLUME_MOUNT_PATH}/write-must-fail-${CURRENT_STEP}-${volume_id}.txt"
   printf 'read-only-write-must-fail\n' >"${random_file}"
-  upload_random_file "${sandbox_id}" "${VOLUME_MOUNT_PATH}/write-must-fail.txt"
-  if [[ "${HTTP_STATUS}" == "200" ]]; then
-    _fail "${CURRENT_STEP}: read-only guest write is rejected" "non-200" "${HTTP_STATUS}"
-  else
-    _pass "${CURRENT_STEP}: read-only guest write is rejected"
-  fi
+  upload_random_file "${sandbox_id}" "${path}"
+  assert_status "${HTTP_STATUS}" "500" \
+    "${CURRENT_STEP}: read-only guest write returns the documented filesystem error"
+  download_random_file "${sandbox_id}" "${path}"
+  assert_status "${HTTP_STATUS}" "404" \
+    "${CURRENT_STEP}: rejected read-only write does not create a guest file"
 }
 
 pause_and_resume_sandbox() {
@@ -233,7 +230,7 @@ exercise_volume_cycle() {
   if [[ "${mode}" == "exclusive" ]]; then
     write_new_volume_content "${sandbox_id}" "${volume_id}" "before-cycle"
   else
-    assert_read_only_write_fails "${sandbox_id}"
+    assert_read_only_write_fails "${sandbox_id}" "${volume_id}"
   fi
 
   if [[ "${pause_cycle}" == "1" ]]; then
@@ -246,6 +243,8 @@ exercise_volume_cycle() {
 
   delete_sandbox "${sandbox_id}"
   assert_status "${HTTP_STATUS}" "204" "${CURRENT_STEP}: delete sandbox and publish volume data"
+  wait_for_volume_status "${volume_id}" "ready" 30 ||
+    _fail "${CURRENT_STEP}: volume publication completes after sandbox deletion" "ready" "timeout"
 }
 
 verify_volume_cycle() {
@@ -255,6 +254,8 @@ verify_volume_cycle() {
   verify_volume_content "${sandbox_id}" "${volume_id}"
   delete_sandbox "${sandbox_id}"
   assert_status "${HTTP_STATUS}" "204" "${CURRENT_STEP}: delete verification sandbox"
+  wait_for_volume_status "${volume_id}" "ready" 30 ||
+    _fail "${CURRENT_STEP}: verification volume publication completes" "ready" "timeout"
 }
 
 fork_volume_cycle() {
@@ -279,13 +280,16 @@ fork_volume_cycle() {
   assert_not_empty "${child_volume_id}" "${CURRENT_STEP}: fork child volume ID is present"
   register_volume "${child_volume_id}" "exclusive" "${VOLUME_CONTENT[${source_volume_id}]}"
   log "seed=${VOLUME_RANDOM_SEED} step=${CURRENT_STEP} fork-volume=${child_volume_id} source=${source_volume_id}"
-  capture_sandbox_node "${child_sandbox_id}" "${child_volume_id}"
   verify_volume_content "${child_sandbox_id}" "${child_volume_id}"
 
   delete_sandbox "${child_sandbox_id}"
   assert_status "${HTTP_STATUS}" "204" "${CURRENT_STEP}: delete fork child sandbox"
+  wait_for_volume_status "${child_volume_id}" "ready" 30 ||
+    _fail "${CURRENT_STEP}: fork child volume publication completes" "ready" "timeout"
   delete_sandbox "${source_sandbox_id}"
   assert_status "${HTTP_STATUS}" "204" "${CURRENT_STEP}: delete fork source sandbox"
+  wait_for_volume_status "${source_volume_id}" "ready" 30 ||
+    _fail "${CURRENT_STEP}: fork source volume publication completes" "ready" "timeout"
 }
 
 assert_catalog_matches_model() {
@@ -300,6 +304,14 @@ assert_catalog_matches_model() {
     status="$(echo "${HTTP_BODY}" | jq -r --arg id "${volume_id}" '.[] | select(.volumeID == $id) | .status')"
     assert_eq "${status}" "ready" "${CURRENT_STEP}: modeled volume ${volume_id} is ready"
   done < <(active_volume_ids)
+  local catalog_id
+  while IFS= read -r catalog_id; do
+    [[ -n "${catalog_id}" ]] || continue
+    if [[ -z "${VOLUME_MODE[${catalog_id}]+present}" \
+      && -z "${BASELINE_VOLUME_IDS[${catalog_id}]+present}" ]]; then
+      _fail "${CURRENT_STEP}: catalog contains no unmodeled volume" "modeled volume" "${catalog_id}"
+    fi
+  done < <(echo "${HTTP_BODY}" | jq -r '.[].volumeID')
 }
 
 delete_modeled_volume() {
@@ -311,31 +323,38 @@ delete_modeled_volume() {
   unset "VOLUME_CONTENT[${volume_id}]"
 }
 
-count_volume_nodes() {
-  local volume_id="$1"
-  local count=0 key
-  for key in "${!VOLUME_NODE_KEYS[@]}"; do
-    if [[ "${key}" == "${volume_id}|"* ]]; then
-      count=$((count + 1))
-    fi
-  done
-  printf '%s\n' "${count}"
+assert_volume_visible_on_node() {
+  local node_url="$1"
+  local node_label="$2"
+  local volume_id="$3"
+  api_get_at "${node_url}" "/volumes/${volume_id}"
+  assert_status "${HTTP_STATUS}" "200" \
+    "${CURRENT_STEP}: ${node_label} lists the shared volume"
+  assert_json_field "${HTTP_BODY}" '.volumeID' "${volume_id}" \
+    "${CURRENT_STEP}: ${node_label} returns the shared volume ID"
+  assert_json_field "${HTTP_BODY}" '.status' "ready" \
+    "${CURRENT_STEP}: ${node_label} reports the shared volume ready"
 }
 
 log "Random seed: ${VOLUME_RANDOM_SEED}; steps: ${VOLUME_RANDOM_STEPS}"
 
-# Establish the cross-node invariant up front. These sandbox creates are
-# consecutive gateway scheduling operations, so round-robin places them on
-# different runtime nodes while both mount the same published volume.
+api_get "/volumes"
+assert_status "${HTTP_STATUS}" "200" "capture pre-existing volume catalog"
+while IFS= read -r baseline_id; do
+  [[ -n "${baseline_id}" ]] || continue
+  BASELINE_VOLUME_IDS["${baseline_id}"]=1
+done < <(echo "${HTTP_BODY}" | jq -r '.[].volumeID')
+
+# Establish the cross-node catalog invariant up front. The volume is created
+# through the gateway, then queried directly on both runtime nodes so this
+# check does not depend on the scheduler's current round-robin phase.
 CURRENT_STEP="cross-node-initial"
 create_empty_volume
 base_volume_id="${LAST_VOLUME_ID}"
-exercise_volume_cycle "${base_volume_id}" 1
+assert_volume_visible_on_node "${AENV_NODE_A_URL}" "agentenv-a" "${base_volume_id}"
+assert_volume_visible_on_node "${AENV_NODE_B_URL}" "agentenv-b" "${base_volume_id}"
 CURRENT_STEP="cross-node-remount"
 exercise_volume_cycle "${base_volume_id}" 1
-assert_eq "$(count_volume_nodes "${base_volume_id}")" "2" \
-  "the same volume is written and remounted through gateway on both nodes"
-assert_eq "${#SEEN_NODES[@]}" "2" "randomized test has exercised both runtime nodes"
 assert_catalog_matches_model
 
 for ((step = 0; step < VOLUME_RANDOM_STEPS; step++)); do
@@ -401,7 +420,6 @@ for volume_id in "${final_volume_ids[@]}"; do
   verify_volume_cycle "${volume_id}"
 done
 assert_catalog_matches_model
-assert_eq "${#SEEN_NODES[@]}" "2" "final randomized coverage includes both runtime nodes"
 
 CURRENT_STEP="final-delete"
 for volume_id in "${final_volume_ids[@]}"; do

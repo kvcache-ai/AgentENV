@@ -160,7 +160,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
     assert_eq!(setup.exit_code, 0);
 
     let captured = SandboxBackend::snapshot(&mut sandbox).await?;
-    let _ = sandbox.stop().await;
+    sandbox.stop().await?;
 
     let metadata = SnapshotPublishMetadata {
         id: SnapshotId::generate(),
@@ -330,7 +330,7 @@ async fn writable_attached_overlaybd_drive_preserves_metadata_and_mount_mode() -
 }
 
 #[tokio::test]
-async fn resumed_attached_drive_is_remounted_through_envd() -> Result<()> {
+async fn resumed_attached_drive_preserves_guest_mount_state() -> Result<()> {
     common::setup().await;
     let (_, image_config) = common::default_rootfs_template_build_spec_with_image_config();
     let user_image = OverlaybdConfig {
@@ -367,7 +367,51 @@ async fn resumed_attached_drive_is_remounted_through_envd() -> Result<()> {
         .await?;
     assert_eq!(output.exit_code, 0);
     assert_eq!(output.stdout.trim(), "before-resume");
+
+    let unmount = resumed
+        .run_command("/agentenv/bin/busybox", &["umount", "/mnt/resume_data"])
+        .await?;
+    assert_eq!(unmount.exit_code, 0, "unmount failed: {}", unmount.stderr);
+    let paused_unmounted = resumed.pause().await?;
     resumed.stop().await?;
+
+    let mut resumed_unmounted =
+        FirecrackerSandbox::resume_from_snapshot_config(&paused_unmounted).await?;
+    let mount_probe = resumed_unmounted
+        .run_command(
+            "sh",
+            &[
+                "-c",
+                "awk '$2==\"/mnt/resume_data\" { found=1 } END { exit found ? 1 : 0 }' /proc/mounts",
+            ],
+        )
+        .await?;
+    assert_eq!(
+        mount_probe.exit_code, 0,
+        "unmounted drive was mounted again after resume: {}",
+        mount_probe.stderr
+    );
+    let hidden = resumed_unmounted
+        .run_command("cat", &["/mnt/resume_data/state.txt"])
+        .await?;
+    assert_ne!(
+        hidden.exit_code, 0,
+        "volume contents should remain hidden while the drive is unmounted"
+    );
+
+    let remount = resumed_unmounted
+        .run_command(
+            "/agentenv/bin/busybox",
+            &["mount", "-n", "/dev/vdc", "/mnt/resume_data"],
+        )
+        .await?;
+    assert_eq!(remount.exit_code, 0, "remount failed: {}", remount.stderr);
+    let restored = resumed_unmounted
+        .run_command("cat", &["/mnt/resume_data/state.txt"])
+        .await?;
+    assert_eq!(restored.exit_code, 0);
+    assert_eq!(restored.stdout.trim(), "before-resume");
+    resumed_unmounted.stop().await?;
     Ok(())
 }
 

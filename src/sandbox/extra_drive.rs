@@ -318,8 +318,18 @@ pub fn normalize_mount_path_for_drive(drive_id: &str, mount_path: PathBuf) -> Re
     } else {
         mount_path
     };
+    normalize_mount_path(mount_path)
+}
+
+pub fn normalize_mount_path(mount_path: PathBuf) -> Result<PathBuf> {
     validate_mount_path(&mount_path)?;
-    Ok(mount_path)
+    let mut normalized = PathBuf::from("/");
+    for component in mount_path.components() {
+        if let std::path::Component::Normal(value) = component {
+            normalized.push(value);
+        }
+    }
+    Ok(normalized)
 }
 
 #[derive(Clone, Debug)]
@@ -556,6 +566,15 @@ mod tests {
         .expect_err("mounting over /opt should fail");
 
         assert!(err.to_string().contains("reserved path /opt/agentenv"));
+    }
+
+    #[test]
+    fn mount_paths_are_normalized_for_overlap_checks() {
+        assert_eq!(
+            normalize_mount_path(PathBuf::from("/workspace//data")).expect("path should normalize"),
+            PathBuf::from("/workspace/data")
+        );
+        assert!(normalize_mount_path(PathBuf::from("/workspace/data/../logs")).is_err());
     }
 
     #[test]

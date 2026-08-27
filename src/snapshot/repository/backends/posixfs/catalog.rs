@@ -14,7 +14,7 @@ use crate::snapshot::{
     SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
     SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };
-use crate::volume::{VolumeMode, VolumeRecord};
+use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord};
 const FILE_LOCK_TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
 const ALIAS_LOCK_STALE_AGE: Duration = Duration::from_secs(60);
 const RECORD_LOCK_STALE_AGE: Duration = Duration::from_secs(60);
@@ -626,17 +626,7 @@ impl PosixFsCatalogStore {
         let _guard = self.acquire_volume_catalog_lock()?;
         let records = self.load_volumes_by_owner_unlocked(from)?;
         for mut record in records {
-            if record.reserved_by_sandbox_id.as_deref() == Some(from) {
-                record.reserved_by_sandbox_id = to.map(str::to_owned);
-            }
-            if record.read_only_mounts.iter().any(|owner| owner == from) {
-                record.read_only_mounts.retain(|owner| owner != from);
-                if let Some(to) = to {
-                    if !record.read_only_mounts.iter().any(|owner| owner == to) {
-                        record.read_only_mounts.push(to.to_owned());
-                    }
-                }
-            }
+            record.replace_owner(from, to);
             if let Some(to) = to {
                 self.write_volume_owner_entry(to, &record.id)?;
             }
@@ -714,9 +704,7 @@ impl PosixFsCatalogStore {
             let Some(record) = self.load_volume_by_id_unlocked(volume_id)? else {
                 continue;
             };
-            if record.reserved_by_sandbox_id.as_deref() == Some(owner)
-                || record.read_only_mounts.iter().any(|entry| entry == owner)
-            {
+            if record.mounted_by(owner) {
                 records.push(record);
             }
         }
@@ -736,12 +724,7 @@ impl PosixFsCatalogStore {
     }
 
     fn ensure_volume_component(&self, value: &str, kind: &str) -> RepositoryResult<()> {
-        if value.is_empty()
-            || value.len() > 128
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        {
+        if !is_valid_volume_component(value) {
             return Err(RepositoryError::InvalidRequest {
                 reason: format!("invalid volume {kind} '{value}'"),
             });

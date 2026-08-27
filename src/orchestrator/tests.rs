@@ -1087,6 +1087,7 @@ fn create_request(
     CreateSandboxRequest {
         source: SandboxLaunchSource::Snapshot(Box::new(RunnableSnapshot::mock())),
         extra_drives: Vec::new(),
+        extra_drives_in_snapshot: false,
         timeout: timeout_secs.map(Duration::from_secs),
         timeout_action: SandboxTimeoutAction::Pause,
         user_metadata,
@@ -1150,6 +1151,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
                 image_configs: Box::new(ImageConfigs::new()),
             },
             extra_drives: Vec::new(),
+            extra_drives_in_snapshot: false,
             timeout: Some(Duration::from_secs(60)),
             timeout_action: SandboxTimeoutAction::Pause,
             user_metadata: None,

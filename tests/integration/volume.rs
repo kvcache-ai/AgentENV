@@ -43,7 +43,12 @@ async fn published_volume_upper_is_mountable_with_latest_data_on_another_node() 
 
     node_a.publish_owner_backings("sandbox-a").await.unwrap();
     assert_eq!(
-        repository.list_volumes().await.unwrap()[0].status,
+        repository
+            .get_volume(&record.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         VolumeStatus::Ready
     );
 
@@ -56,13 +61,15 @@ async fn published_volume_upper_is_mountable_with_latest_data_on_another_node() 
     )
     .await
     .unwrap();
-    let reopened = node_b.get(&record.id).await.unwrap();
+    let mut reopened = node_b.get(&record.id).await.unwrap();
     assert_eq!(reopened.status, VolumeStatus::Ready);
     assert_eq!(reopened.reserved_by_sandbox_id, None);
     assert_eq!(reopened.backing_layers.len(), 2);
+    assert!(reopened.backing_image_config.is_none());
 
-    // The materialized config points at repository-owned layer files, which
-    // is the backing the second node will mount.
+    // Backing materialization is lazy and happens only when the second node
+    // prepares the volume for a mount.
+    reopened = node_b.materialize_backing(&record.id).await.unwrap();
     let reopened_config = reopened.backing_image_config.unwrap();
     let reopened_image: ImageConfig =
         serde_json::from_slice(&tokio::fs::read(reopened_config).await.unwrap()).unwrap();

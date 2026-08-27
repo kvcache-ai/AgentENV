@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -366,6 +366,7 @@ where
             secure,
             volume_mounts,
             extra_drives: launch_extra_drives,
+            extra_drives_in_snapshot,
         } = request;
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
         info!(timeout = ?timeout, "creating sandbox");
@@ -404,6 +405,7 @@ where
                     custom_extension_params: effective_custom_extension_params.clone(),
                     envd_access_token: envd_access_token.clone(),
                     extra_drives: launch_extra_drives.clone(),
+                    extra_drives_in_snapshot,
                 };
 
                 let transitional_metadata = SandboxMetadata {
@@ -461,6 +463,7 @@ where
                     custom_extension_params: custom_extension_params.clone(),
                     envd_access_token,
                     extra_drives: Vec::new(),
+                    extra_drives_in_snapshot: false,
                 };
                 let build_spec = FreshSandboxBuildSpec {
                     image_config_path: overlaybd_config_path,
@@ -524,6 +527,16 @@ where
         count: u32,
         new_timeout: NewTimeout,
     ) -> Result<Vec<SandboxForkOutcome>> {
+        if self
+            .store
+            .get(&source_sandbox_id)
+            .await?
+            .is_some_and(|metadata| !metadata.volume_mounts.is_empty())
+        {
+            return Err(OrchestratorError::InternalError(
+                "fork with volume mounts requires volume-aware child specs".to_string(),
+            ));
+        }
         let child_specs = (0..count)
             .map(|_| SandboxForkChildSpec {
                 sandbox_id: SandboxId::new(),
@@ -561,7 +574,22 @@ where
     ) -> Result<Vec<SandboxForkOutcome>> {
         self.ensure_accepting_lifecycle_operations()?;
 
-        let count = child_specs.len() as u32;
+        let count = u32::try_from(child_specs.len())
+            .map_err(|_| OrchestratorError::InternalError("too many fork children".to_string()))?;
+        let mut child_ids = HashSet::with_capacity(child_specs.len());
+        for child in &child_specs {
+            if child.sandbox_id == source_sandbox_id || !child_ids.insert(child.sandbox_id) {
+                return Err(OrchestratorError::InternalError(
+                    "fork child sandbox IDs must be unique and differ from the source".to_string(),
+                ));
+            }
+            if self.store.get(&child.sandbox_id).await?.is_some() {
+                return Err(OrchestratorError::InternalError(format!(
+                    "fork child sandbox {} already exists",
+                    child.sandbox_id
+                )));
+            }
+        }
         info!("forking sandboxes");
 
         let source_handle = {

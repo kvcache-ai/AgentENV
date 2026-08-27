@@ -169,7 +169,6 @@ async fn main() -> anyhow::Result<()> {
                             .await
                         {
                             warn!(error = %error, sandbox_id = %event.sandbox_id, "failed to publish volume backing after sandbox deletion event");
-                            continue;
                         }
                         if let Err(error) = volume_manager_for_events.release_owner(&owner).await {
                             warn!(error = %error, sandbox_id = %event.sandbox_id, "failed to release volume reservation after sandbox deletion event");

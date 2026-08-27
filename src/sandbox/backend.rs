@@ -89,7 +89,8 @@ pub struct SandboxForkSpec {
     pub sandbox_id: SandboxId,
     pub envd_access_token: Option<EnvdAccessToken>,
     pub extra_drives: Vec<super::ExtraDrive>,
-    pub replace_drive_ids: Vec<String>,
+    /// Pairs of `(source_drive_id, replacement_drive_id)`.
+    pub replace_drive_ids: Vec<(String, String)>,
 }
 
 /// Opaque set of local runtime artifacts a sandbox needs while it is alive.

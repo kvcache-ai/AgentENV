@@ -110,12 +110,13 @@ impl ApiImpl {
         match err {
             RepositoryError::InvalidRequest { .. } => Self::error(400, err.to_string()),
             RepositoryError::SnapshotNotFound { .. }
+            | RepositoryError::VolumeNotFound { .. }
             | RepositoryError::AliasNotFound { .. }
             | RepositoryError::ArtifactNotFound { .. }
             | RepositoryError::ManagedLayerNotFound { .. } => Self::error(404, err.to_string()),
-            RepositoryError::AliasConflict { .. } | RepositoryError::IntegrityMismatch { .. } => {
-                Self::error(409, err.to_string())
-            }
+            RepositoryError::AliasConflict { .. }
+            | RepositoryError::VolumeNameConflict { .. }
+            | RepositoryError::IntegrityMismatch { .. } => Self::error(409, err.to_string()),
             RepositoryError::Unsupported { .. } => Self::error(500, err.to_string()),
             RepositoryError::Backend { .. } => Self::internal_error(err),
         }

@@ -13,9 +13,14 @@ use crate::{models, types::*};
 #[allow(clippy::large_enum_variant)]
 pub enum VolumesGetResponse {
     /// Volumes returned successfully
-    Status200_VolumesReturnedSuccessfully(Vec<models::Volume>),
+    Status200_VolumesReturnedSuccessfully {
+        body: Vec<models::Volume>,
+        x_next_token: Option<String>,
+    },
     /// Authentication error
     Status401_AuthenticationError(models::Error),
+    /// Bad request
+    Status400_BadRequest(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -76,6 +81,7 @@ pub trait Volumes<E: std::fmt::Debug + Send + Sync + 'static = ()>: super::Error
         host: &Host,
         cookies: &CookieJar,
         claims: &Self::Claims,
+        query_params: &models::VolumesGetQueryParams,
     ) -> Result<VolumesGetResponse, E>;
 
     /// Create a volume.

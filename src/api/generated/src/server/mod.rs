@@ -4973,8 +4973,12 @@ where
 }
 
 #[tracing::instrument(skip_all)]
-fn volumes_get_validation() -> std::result::Result<(), ValidationErrors> {
-    Ok(())
+fn volumes_get_validation(
+    query_params: models::VolumesGetQueryParams,
+) -> std::result::Result<(models::VolumesGetQueryParams,), ValidationErrors> {
+    query_params.validate()?;
+
+    Ok((query_params,))
 }
 /// VolumesGet - GET /volumes
 #[tracing::instrument(skip_all)]
@@ -4983,6 +4987,7 @@ async fn volumes_get<I, A, E, C>(
     TypedHeader(host): TypedHeader<Host>,
     cookies: CookieJar,
     headers: HeaderMap,
+    QueryExtra(query_params): QueryExtra<models::VolumesGetQueryParams>,
     State(api_impl): State<I>,
 ) -> Result<Response, StatusCode>
 where
@@ -5009,11 +5014,11 @@ where
     };
 
     #[allow(clippy::redundant_closure)]
-    let validation = tokio::task::spawn_blocking(move || volumes_get_validation())
+    let validation = tokio::task::spawn_blocking(move || volumes_get_validation(query_params))
         .await
         .unwrap();
 
-    let Ok(()) = validation else {
+    let Ok((query_params,)) = validation else {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Body::from(validation.unwrap_err().to_string()))
@@ -5022,14 +5027,33 @@ where
 
     let result = api_impl
         .as_ref()
-        .volumes_get(&method, &host, &cookies, &claims)
+        .volumes_get(&method, &host, &cookies, &claims, &query_params)
         .await;
 
     let mut response = Response::builder();
 
     let resp = match result {
         Ok(rsp) => match rsp {
-            apis::volumes::VolumesGetResponse::Status200_VolumesReturnedSuccessfully(body) => {
+            apis::volumes::VolumesGetResponse::Status200_VolumesReturnedSuccessfully {
+                body,
+                x_next_token,
+            } => {
+                if let Some(x_next_token) = x_next_token {
+                    let x_next_token = match header::IntoHeaderValue(x_next_token).try_into() {
+                        Ok(val) => val,
+                        Err(e) => {
+                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_next_token header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                        }
+                    };
+
+                    {
+                        let mut response_headers = response.headers_mut().unwrap();
+                        response_headers
+                            .insert(HeaderName::from_static("x-next-token"), x_next_token);
+                    }
+                }
                 let mut response = response.status(200);
                 {
                     let mut response_headers = response.headers_mut().unwrap();
@@ -5049,6 +5073,24 @@ where
             }
             apis::volumes::VolumesGetResponse::Status401_AuthenticationError(body) => {
                 let mut response = response.status(401);
+                {
+                    let mut response_headers = response.headers_mut().unwrap();
+                    response_headers
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                }
+
+                let body_content = tokio::task::spawn_blocking(move || {
+                    serde_json::to_vec(&body).map_err(|e| {
+                        error!(error = ?e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })
+                })
+                .await
+                .unwrap()?;
+                response.body(Body::from(body_content))
+            }
+            apis::volumes::VolumesGetResponse::Status400_BadRequest(body) => {
+                let mut response = response.status(400);
                 {
                     let mut response_headers = response.headers_mut().unwrap();
                     response_headers

@@ -1,25 +1,36 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use overlaybd::config::{ImageConfig, LayerConfig};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::process::Command;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::snapshot::repository::{RepositoryError, SnapshotRepository};
+use crate::snapshot::repository::{volume_catalog_shard, RepositoryError, SnapshotRepository};
 use crate::snapshot::OverlaybdLayerRef;
 
 pub const DEFAULT_VOLUME_SIZE_MB: u64 = 64 * 1024;
 /// Firecracker exposes /dev/vdc through /dev/vdz for extra drives.
 pub const MAX_VOLUME_MOUNTS: usize = 24;
+pub const DEFAULT_VOLUME_PAGE_SIZE: usize = 100;
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
-fn default_volume_size_mb() -> u64 {
-    // Keep catalogs written before sizeMB was introduced at their original
-    // 1 GiB runtime size. New volumes use DEFAULT_VOLUME_SIZE_MB instead.
-    1024
+pub(crate) fn is_valid_volume_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VolumePage {
+    pub records: Vec<VolumeRecord>,
+    pub next_token: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -47,26 +58,52 @@ pub struct VolumeRecord {
     pub source: String,
     pub parent_volume_id: Option<String>,
     pub revision: u64,
-    #[serde(default = "default_volume_size_mb")]
     pub size_mb: u64,
-    #[serde(default)]
     pub status: VolumeStatus,
     pub reserved_by_sandbox_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub backing_image_config: Option<PathBuf>,
     /// Repository-owned logical layers for the volume backing. The image config
     /// path above is only a node-local runtime cache and is never required for
     /// another node to reopen the volume.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backing_layers: Vec<OverlaybdLayerRef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_only_mounts: Vec<String>,
 }
 
-fn current_local_backing(remote: &VolumeRecord, local: &[VolumeRecord]) -> Option<PathBuf> {
+impl VolumeRecord {
+    pub(crate) fn mounted_by(&self, owner: &str) -> bool {
+        self.reserved_by_sandbox_id.as_deref() == Some(owner)
+            || self.read_only_mounts.iter().any(|entry| entry == owner)
+    }
+
+    pub(crate) fn replace_owner(&mut self, from: &str, to: Option<&str>) -> bool {
+        let mut changed = false;
+        if self.reserved_by_sandbox_id.as_deref() == Some(from) {
+            self.reserved_by_sandbox_id = to.map(str::to_owned);
+            changed = true;
+        }
+        if self.read_only_mounts.iter().any(|owner| owner == from) {
+            self.read_only_mounts.retain(|owner| owner != from);
+            if let Some(to) = to {
+                if !self.read_only_mounts.iter().any(|owner| owner == to) {
+                    self.read_only_mounts.push(to.to_owned());
+                }
+            }
+            changed = true;
+        }
+        changed
+    }
+}
+
+fn current_local_backing(
+    remote: &VolumeRecord,
+    local: &HashMap<String, VolumeRecord>,
+) -> Option<PathBuf> {
     local
-        .iter()
-        .find(|record| record.id == remote.id && record.backing_layers == remote.backing_layers)
+        .get(&remote.id)
+        .filter(|record| {
+            record.revision == remote.revision && record.backing_layers == remote.backing_layers
+        })
         .and_then(|record| record.backing_image_config.clone())
         .filter(|path| path.exists())
 }
@@ -97,16 +134,19 @@ pub enum VolumeError {
     TooManyMountedVolumes { max_count: usize },
     #[error("source volume not found: {0}")]
     SourceNotFound(String),
+    #[error("invalid volume next token")]
+    InvalidNextToken,
+    #[error("volume page limit must be greater than zero")]
+    InvalidPageLimit,
     #[error("volume catalog storage failed: {0}")]
     Storage(String),
 }
 
 #[derive(Clone)]
 pub struct VolumeManager {
-    records: Arc<RwLock<Vec<VolumeRecord>>>,
+    records: Arc<RwLock<HashMap<String, VolumeRecord>>>,
     root: Option<PathBuf>,
     repository: Option<Arc<dyn SnapshotRepository>>,
-    publication_lock: Arc<Mutex<()>>,
     limits: VolumeLimits,
 }
 
@@ -132,15 +172,19 @@ impl VolumeManager {
     }
 
     pub fn with_limits(limits: VolumeLimits) -> Self {
-        let limits = VolumeLimits {
-            max_mounts: limits.max_mounts.min(MAX_VOLUME_MOUNTS),
-            ..limits
-        };
+        Self::with_storage(None, None, limits)
+    }
+
+    fn with_storage(
+        root: Option<PathBuf>,
+        repository: Option<Arc<dyn SnapshotRepository>>,
+        mut limits: VolumeLimits,
+    ) -> Self {
+        limits.max_mounts = limits.max_mounts.min(MAX_VOLUME_MOUNTS);
         Self {
-            records: Arc::new(RwLock::new(Vec::new())),
-            root: None,
-            repository: None,
-            publication_lock: Arc::new(Mutex::new(())),
+            records: Arc::new(RwLock::new(HashMap::new())),
+            root,
+            repository,
             limits,
         }
     }
@@ -162,84 +206,84 @@ impl VolumeManager {
         limits: VolumeLimits,
     ) -> anyhow::Result<Self> {
         let path = path.into();
-        let root = path.parent().map(Path::to_path_buf);
-        let manager = Self {
-            records: Arc::new(RwLock::new(Vec::new())),
-            root,
+        Ok(Self::with_storage(
+            path.parent().map(Path::to_path_buf),
             repository,
-            publication_lock: Arc::new(Mutex::new(())),
-            limits: VolumeLimits {
-                max_mounts: limits.max_mounts.min(MAX_VOLUME_MOUNTS),
-                ..limits
-            },
-        };
-        manager.refresh_repository().await?;
-        Ok(manager)
+            limits,
+        ))
     }
 
     pub fn limits(&self) -> VolumeLimits {
         self.limits
     }
 
-    async fn refresh_repository(&self) -> Result<(), VolumeError> {
-        let Some(repository) = self.repository.as_ref() else {
-            return Ok(());
-        };
-        let remote_records = match repository.list_volumes().await {
-            Ok(records) => records,
-            Err(RepositoryError::Unsupported { .. }) => return Ok(()),
-            Err(error) => return Err(repository_error(error)),
-        };
-        self.replace_with_remote(remote_records).await
-    }
-
-    async fn replace_with_remote(
-        &self,
-        mut remote_records: Vec<VolumeRecord>,
-    ) -> Result<(), VolumeError> {
-        let mut records = self.records.write().await;
-        let local_records = records.clone();
-        for remote in &mut remote_records {
-            validate_volume_id(&remote.id)?;
-            remote.backing_image_config = current_local_backing(remote, &local_records);
-            if remote.backing_image_config.is_none() && !remote.backing_layers.is_empty() {
-                let Some(root) = self.root.as_ref() else {
-                    continue;
-                };
-                let destination = root.join("data").join(&remote.id).join("image.json");
-                match self
-                    .repository
-                    .as_ref()
-                    .expect("remote records require a repository")
-                    .materialize_volume_backing(&remote.id, &remote.backing_layers, &destination)
-                    .await
-                {
-                    Ok(path) => remote.backing_image_config = Some(path),
-                    Err(RepositoryError::Unsupported { .. }) => {}
-                    Err(error) => return Err(repository_error(error)),
-                }
-            }
-        }
-        *records = remote_records;
-        Ok(())
-    }
-
-    pub async fn list(&self) -> Result<Vec<VolumeRecord>, VolumeError> {
-        self.refresh_repository().await?;
-        let mut records = self.records.read().await.clone();
-        records.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(records)
-    }
-
     pub async fn get(&self, reference: &str) -> Result<VolumeRecord, VolumeError> {
-        self.refresh_repository().await?;
-        self.records
-            .read()
-            .await
-            .iter()
-            .find(|record| record.id == reference || record.name == reference)
-            .cloned()
-            .ok_or_else(|| VolumeError::NotFound(reference.to_owned()))
+        if let Some(repository) = self.repository.as_ref() {
+            let mut record = repository
+                .get_volume(reference)
+                .await
+                .map_err(repository_error)?
+                .ok_or_else(|| VolumeError::NotFound(reference.to_owned()))?;
+            validate_volume_id(&record.id)?;
+            let local = self.records.read().await;
+            record.backing_image_config = current_local_backing(&record, &local);
+            return Ok(record);
+        }
+        self.local_get(reference).await
+    }
+
+    pub async fn list_page(
+        &self,
+        next_token: Option<&str>,
+        limit: usize,
+    ) -> Result<VolumePage, VolumeError> {
+        if limit == 0 {
+            return Err(VolumeError::InvalidPageLimit);
+        }
+        let after_volume_id = next_token.map(decode_volume_cursor).transpose()?;
+        if let Some(repository) = self.repository.as_ref() {
+            let mut page = repository
+                .list_volumes_page(after_volume_id.as_deref(), limit)
+                .await
+                .map_err(repository_error)?;
+            let local = self.records.read().await;
+            for record in &mut page.records {
+                validate_volume_id(&record.id)?;
+                record.backing_image_config = current_local_backing(record, &local);
+            }
+            return Ok(VolumePage {
+                records: page.records,
+                next_token: page.next_volume_id.map(encode_volume_cursor),
+            });
+        }
+
+        let mut records: Vec<_> = self.records.read().await.values().cloned().collect();
+        records.sort_by(|left, right| {
+            volume_catalog_shard(&left.id)
+                .cmp(&volume_catalog_shard(&right.id))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        if let Some(after) = after_volume_id.as_deref() {
+            let shard = volume_catalog_shard(after);
+            records.retain(|record| {
+                let record_shard = volume_catalog_shard(&record.id);
+                record_shard.as_str() > shard.as_str()
+                    || (record_shard == shard && record.id.as_str() > after)
+            });
+        }
+        let has_more = records.len() > limit;
+        records.truncate(limit);
+        let next_token = if has_more {
+            records
+                .last()
+                .map(|record| encode_volume_cursor(record.id.clone()))
+        } else {
+            None
+        };
+        Ok(VolumePage {
+            records,
+            next_token,
+        })
     }
 
     pub fn data_dir(&self, volume_id: &str) -> Option<PathBuf> {
@@ -253,16 +297,15 @@ impl VolumeManager {
         reference: &str,
         source_config: &Path,
     ) -> Result<PathBuf, VolumeError> {
-        self.refresh_repository().await?;
-        let mut records = self.records.write().await;
-        let index = records
-            .iter()
-            .position(|record| record.id == reference || record.name == reference)
-            .ok_or_else(|| VolumeError::NotFound(reference.to_owned()))?;
-        if let Some(path) = records[index].backing_image_config.clone() {
+        let mut record = self.get(reference).await?;
+        if let Some(path) = record
+            .backing_image_config
+            .clone()
+            .filter(|path| path.exists())
+        {
             return Ok(path);
         }
-        let Some(directory) = self.data_dir(&records[index].id) else {
+        let Some(directory) = self.data_dir(&record.id) else {
             return Ok(source_config.to_path_buf());
         };
         let target = directory.join("image.json");
@@ -272,9 +315,33 @@ impl VolumeManager {
         tokio::fs::copy(source_config, &target)
             .await
             .map_err(|error| VolumeError::Storage(error.to_string()))?;
-        records[index].backing_image_config = Some(target.clone());
-        self.persist(&mut records[index]).await?;
+        record.backing_image_config = Some(target.clone());
+        self.persist(&mut record).await?;
+        self.cache_record(record).await;
         Ok(target)
+    }
+
+    pub async fn materialize_backing(&self, reference: &str) -> Result<VolumeRecord, VolumeError> {
+        let mut record = self.get(reference).await?;
+        if record
+            .backing_image_config
+            .as_ref()
+            .is_some_and(|path| path.exists())
+            || record.backing_layers.is_empty()
+        {
+            return Ok(record);
+        }
+        let (Some(repository), Some(root)) = (self.repository.as_ref(), self.root.as_ref()) else {
+            return Ok(record);
+        };
+        let destination = root.join("data").join(&record.id).join("image.json");
+        let path = repository
+            .materialize_volume_backing(&record.id, &record.backing_layers, &destination)
+            .await
+            .map_err(repository_error)?;
+        record.backing_image_config = Some(path);
+        self.cache_record(record.clone()).await;
+        Ok(record)
     }
 
     pub async fn create(
@@ -298,7 +365,6 @@ impl VolumeManager {
         size_mb: u64,
         source_owner: Option<&str>,
     ) -> Result<VolumeRecord, VolumeError> {
-        self.refresh_repository().await?;
         validate_name(&name)?;
         if size_mb == 0 {
             return Err(VolumeError::InvalidSize);
@@ -311,19 +377,22 @@ impl VolumeManager {
         if from_volume.is_some() && image.is_some() {
             return Err(VolumeError::MultipleSources);
         }
-
-        let mut records = self.records.write().await;
-        if records.iter().any(|record| record.name == name) {
-            return Err(VolumeError::NameConflict(name));
+        match self.get(&name).await {
+            Ok(_) => return Err(VolumeError::NameConflict(name)),
+            Err(VolumeError::NotFound(_)) => {}
+            Err(error) => return Err(error),
         }
 
         let id = format!("vol_{}", Uuid::now_v7().simple());
         let (source, parent_volume_id, revision, backing_image_config) =
             if let Some(reference) = from_volume {
-                let parent = records
-                    .iter()
-                    .find(|record| record.id == reference || record.name == reference)
-                    .ok_or_else(|| VolumeError::SourceNotFound(reference.clone()))?;
+                let mut parent = match self.get(&reference).await {
+                    Ok(parent) => parent,
+                    Err(VolumeError::NotFound(_)) => {
+                        return Err(VolumeError::SourceNotFound(reference))
+                    }
+                    Err(error) => return Err(error),
+                };
                 if parent.status == VolumeStatus::Uploading {
                     return Err(VolumeError::Uploading(parent.id.clone()));
                 }
@@ -337,6 +406,9 @@ impl VolumeManager {
                 }
                 if parent.size_mb != size_mb {
                     return Err(VolumeError::SizeMismatch);
+                }
+                if parent.backing_image_config.is_none() && !parent.backing_layers.is_empty() {
+                    parent = self.materialize_backing(&parent.id).await?;
                 }
                 (
                     "volume".to_owned(),
@@ -368,7 +440,25 @@ impl VolumeManager {
             backing_layers: Vec::new(),
             read_only_mounts: Vec::new(),
         };
-        if let Err(error) = self.persist(&mut record).await {
+        let create_result = async {
+            self.publish_backing(&mut record).await?;
+            if let Some(repository) = self.repository.as_ref() {
+                repository
+                    .create_volume(record.clone())
+                    .await
+                    .map_err(repository_error)?;
+                self.cache_record(record.clone()).await;
+            } else {
+                let mut records = self.records.write().await;
+                if records.values().any(|entry| entry.name == record.name) {
+                    return Err(VolumeError::NameConflict(record.name.clone()));
+                }
+                records.insert(record.id.clone(), record.clone());
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(error) = create_result {
             if let Some(config) = record.backing_image_config.as_ref() {
                 if let Some(directory) = config.parent() {
                     let _ = tokio::fs::remove_dir_all(directory).await;
@@ -376,38 +466,29 @@ impl VolumeManager {
             }
             return Err(error);
         }
-        records.push(record.clone());
         Ok(record)
     }
 
     pub async fn delete(&self, reference: &str) -> Result<(), VolumeError> {
-        self.refresh_repository().await?;
-        let mut records = self.records.write().await;
-        let Some(index) = records
-            .iter()
-            .position(|record| record.id == reference || record.name == reference)
-        else {
-            return Err(VolumeError::NotFound(reference.to_owned()));
-        };
-        if let Some(owner) = records[index].reserved_by_sandbox_id.as_deref() {
+        let record = self.get(reference).await?;
+        if let Some(owner) = record.reserved_by_sandbox_id.as_deref() {
             return Err(VolumeError::Reserved(owner.to_owned()));
         }
-        if let Some(owner) = records[index].read_only_mounts.first() {
+        if let Some(owner) = record.read_only_mounts.first() {
             return Err(VolumeError::Reserved(owner.clone()));
         }
         if let Some(repository) = &self.repository {
-            match repository.delete_volume(&records[index].id).await {
-                Ok(()) | Err(RepositoryError::Unsupported { .. }) => {}
-                Err(error) => return Err(repository_error(error)),
-            }
+            repository
+                .delete_volume(&record.id)
+                .await
+                .map_err(repository_error)?;
         }
-        let backing_directory = records[index]
+        let backing_directory = record
             .backing_image_config
             .as_deref()
             .and_then(Path::parent)
             .map(Path::to_path_buf);
-        let record = records.remove(index);
-        drop(records);
+        self.records.write().await.remove(&record.id);
         if let Some(directory) = backing_directory {
             if let Err(error) = tokio::fs::remove_dir_all(&directory).await {
                 if error.kind() != std::io::ErrorKind::NotFound {
@@ -481,97 +562,69 @@ impl VolumeManager {
     }
 
     pub async fn reserve(&self, reference: &str, owner: &str) -> Result<(), VolumeError> {
-        self.refresh_repository().await?;
-        let mut records = self.records.write().await;
-        let index = records
-            .iter()
-            .position(|record| record.id == reference || record.name == reference)
-            .ok_or_else(|| VolumeError::NotFound(reference.to_owned()))?;
-        match records[index].status {
-            VolumeStatus::Uploading => {
-                return Err(VolumeError::Uploading(records[index].id.clone()))
-            }
-            VolumeStatus::Failed => return Err(VolumeError::Failed(records[index].id.clone())),
+        let mut record = self.get(reference).await?;
+        match record.status {
+            VolumeStatus::Uploading => return Err(VolumeError::Uploading(record.id.clone())),
+            VolumeStatus::Failed => return Err(VolumeError::Failed(record.id.clone())),
             VolumeStatus::Ready => {}
         }
-        if records[index].mode == VolumeMode::ReadOnly {
-            let repository_updated = if let Some(repository) = &self.repository {
-                match repository
-                    .reserve_read_only_volume(&records[index].id, owner)
+        if record.mode == VolumeMode::ReadOnly {
+            if let Some(repository) = &self.repository {
+                repository
+                    .reserve_read_only_volume(&record.id, owner)
                     .await
-                {
-                    Ok(()) => true,
-                    Err(RepositoryError::Unsupported { .. }) => false,
-                    Err(error) => return Err(repository_error(error)),
+                    .map_err(repository_error)?;
+                if !record.read_only_mounts.iter().any(|entry| entry == owner) {
+                    record.read_only_mounts.push(owner.to_owned());
                 }
-            } else {
-                false
-            };
-            if !records[index]
-                .read_only_mounts
-                .iter()
-                .any(|entry| entry == owner)
-            {
-                records[index].read_only_mounts.push(owner.to_owned());
-            }
-            if !repository_updated {
-                self.persist_catalog(&records[index]).await?;
-            }
-            return Ok(());
-        }
-        if let Some(existing) = records[index].reserved_by_sandbox_id.as_deref() {
-            if existing != owner {
-                return Err(VolumeError::Reserved(existing.to_owned()));
-            }
-            return Ok(());
-        }
-        let repository_updated = if let Some(repository) = &self.repository {
-            match repository.reserve_volume(&records[index].id, owner).await {
-                Ok(Some(existing)) => return Err(VolumeError::Reserved(existing)),
-                Ok(None) => true,
-                Err(RepositoryError::Unsupported { .. }) => false,
-                Err(error) => return Err(repository_error(error)),
-            }
-        } else {
-            false
-        };
-        records[index].reserved_by_sandbox_id = Some(owner.to_owned());
-        if !repository_updated {
-            let result = self.persist_catalog(&records[index]).await;
-            if result.is_ok() {
+                self.cache_record(record).await;
                 return Ok(());
             }
-            records[index].reserved_by_sandbox_id = None;
-            return result;
+            let mut records = self.records.write().await;
+            let current = records
+                .get_mut(&record.id)
+                .ok_or_else(|| VolumeError::NotFound(reference.to_owned()))?;
+            if !current.read_only_mounts.iter().any(|entry| entry == owner) {
+                current.read_only_mounts.push(owner.to_owned());
+            }
+            return Ok(());
         }
+        if let Some(repository) = &self.repository {
+            if let Some(existing) = repository
+                .reserve_volume(&record.id, owner)
+                .await
+                .map_err(repository_error)?
+            {
+                return Err(VolumeError::Reserved(existing));
+            }
+            record.reserved_by_sandbox_id = Some(owner.to_owned());
+            self.cache_record(record).await;
+            return Ok(());
+        }
+        let mut records = self.records.write().await;
+        let current = records
+            .get_mut(&record.id)
+            .ok_or_else(|| VolumeError::NotFound(reference.to_owned()))?;
+        if let Some(existing) = current.reserved_by_sandbox_id.as_deref() {
+            if existing == owner {
+                return Ok(());
+            }
+            return Err(VolumeError::Reserved(existing.to_owned()));
+        }
+        current.reserved_by_sandbox_id = Some(owner.to_owned());
         Ok(())
     }
 
     pub async fn release_owner(&self, owner: &str) -> Result<(), VolumeError> {
-        self.refresh_repository().await?;
-        let repository_updated = if let Some(repository) = &self.repository {
-            match repository.replace_volume_owner(owner, None).await {
-                Ok(_) => true,
-                Err(RepositoryError::Unsupported { .. }) => false,
-                Err(error) => return Err(repository_error(error)),
-            }
-        } else {
-            false
-        };
+        if let Some(repository) = &self.repository {
+            repository
+                .replace_volume_owner(owner, None)
+                .await
+                .map_err(repository_error)?;
+        }
         let mut records = self.records.write().await;
-        for record in records.iter_mut() {
-            if record.reserved_by_sandbox_id.as_deref() == Some(owner) {
-                record.reserved_by_sandbox_id = None;
-                if !repository_updated {
-                    self.persist_catalog(record).await?;
-                }
-            }
-            if record.read_only_mounts.iter().any(|entry| entry == owner) {
-                record.read_only_mounts.retain(|entry| entry != owner);
-                if !repository_updated {
-                    self.persist_catalog(record).await?;
-                }
-            }
+        for record in records.values_mut() {
+            record.replace_owner(owner, None);
         }
         Ok(())
     }
@@ -579,61 +632,89 @@ impl VolumeManager {
     /// Publishes the latest local backing for volumes still held by a paused
     /// sandbox without releasing its exclusive reservations.
     pub async fn publish_owner_backings(&self, owner: &str) -> Result<(), VolumeError> {
-        let _publication_guard = self.publication_lock.lock().await;
-        self.refresh_repository().await?;
-        let mut records = self.records.write().await;
-        for record in records.iter_mut() {
-            if record.reserved_by_sandbox_id.as_deref() == Some(owner) {
-                // Publish the state transition before uploading any writable
-                // upper layer so other nodes cannot mount stale content.
-                record.status = VolumeStatus::Uploading;
-                if let Err(error) = self.persist_catalog(record).await {
-                    record.status = VolumeStatus::Failed;
-                    let _ = self.persist_catalog(record).await;
-                    return Err(error);
-                }
-                let previous_layers = record.backing_layers.clone();
-                if let Err(error) = self.publish_backing(record).await {
-                    record.status = VolumeStatus::Failed;
-                    let _ = self.persist_catalog(record).await;
-                    return Err(error);
-                }
-                if record.backing_layers != previous_layers {
-                    record.revision = record.revision.saturating_add(1);
-                }
-                record.status = VolumeStatus::Ready;
-                if let Err(error) = self.persist_catalog(record).await {
-                    record.status = VolumeStatus::Failed;
-                    let _ = self.persist_catalog(record).await;
-                    return Err(error);
-                }
+        for mut record in self.records_for_owner(owner).await? {
+            if record.reserved_by_sandbox_id.as_deref() != Some(owner) {
+                continue;
             }
+            // Publish the state transition before uploading any writable
+            // upper layer so other nodes cannot mount stale content.
+            record.status = VolumeStatus::Uploading;
+            if let Err(error) = self.persist_catalog(&record).await {
+                record.status = VolumeStatus::Failed;
+                let _ = self.persist_catalog(&record).await;
+                self.cache_record(record).await;
+                return Err(error);
+            }
+            self.cache_record(record.clone()).await;
+            let previous_layers = record.backing_layers.clone();
+            if let Err(error) = self.publish_backing(&mut record).await {
+                record.status = VolumeStatus::Failed;
+                let _ = self.persist_catalog(&record).await;
+                self.cache_record(record).await;
+                return Err(error);
+            }
+            if record.backing_layers != previous_layers {
+                record.revision = record.revision.saturating_add(1);
+            }
+            record.status = VolumeStatus::Ready;
+            if let Err(error) = self.persist_catalog(&record).await {
+                record.status = VolumeStatus::Failed;
+                let _ = self.persist_catalog(&record).await;
+                self.cache_record(record).await;
+                return Err(error);
+            }
+            self.cache_record(record).await;
         }
         Ok(())
     }
 
     pub async fn rebind_owner(&self, from: &str, to: &str) -> Result<(), VolumeError> {
-        self.refresh_repository().await?;
-        let repository_updated = if let Some(repository) = &self.repository {
-            match repository.replace_volume_owner(from, Some(to)).await {
-                Ok(Some(existing)) => return Err(VolumeError::Reserved(existing)),
-                Ok(None) => true,
-                Err(RepositoryError::Unsupported { .. }) => false,
-                Err(error) => return Err(repository_error(error)),
-            }
-        } else {
-            false
-        };
+        if let Some(repository) = &self.repository {
+            repository
+                .replace_volume_owner(from, Some(to))
+                .await
+                .map_err(repository_error)?;
+        }
         let mut records = self.records.write().await;
-        for record in records.iter_mut() {
-            if record.reserved_by_sandbox_id.as_deref() == Some(from) {
-                record.reserved_by_sandbox_id = Some(to.to_owned());
-                if !repository_updated {
-                    self.persist_catalog(record).await?;
-                }
-            }
+        for record in records.values_mut() {
+            record.replace_owner(from, Some(to));
         }
         Ok(())
+    }
+
+    async fn local_get(&self, reference: &str) -> Result<VolumeRecord, VolumeError> {
+        let records = self.records.read().await;
+        records
+            .get(reference)
+            .or_else(|| records.values().find(|record| record.name == reference))
+            .cloned()
+            .ok_or_else(|| VolumeError::NotFound(reference.to_owned()))
+    }
+
+    async fn cache_record(&self, record: VolumeRecord) {
+        self.records.write().await.insert(record.id.clone(), record);
+    }
+
+    async fn records_for_owner(&self, owner: &str) -> Result<Vec<VolumeRecord>, VolumeError> {
+        if let Some(repository) = self.repository.as_ref() {
+            let mut records = repository
+                .list_volumes_by_owner(owner)
+                .await
+                .map_err(repository_error)?;
+            let local = self.records.read().await;
+            for record in &mut records {
+                record.backing_image_config = current_local_backing(record, &local);
+            }
+            return Ok(records);
+        }
+        Ok(self
+            .records
+            .read()
+            .await
+            .values()
+            .filter(|record| record.mounted_by(owner))
+            .cloned()
+            .collect())
     }
 
     async fn persist(&self, record: &mut VolumeRecord) -> Result<(), VolumeError> {
@@ -644,11 +725,10 @@ impl VolumeManager {
     async fn publish_backing(&self, record: &mut VolumeRecord) -> Result<(), VolumeError> {
         if let Some(repository) = &self.repository {
             if let Some(path) = record.backing_image_config.as_deref() {
-                match repository.publish_volume_backing(&record.id, path).await {
-                    Ok(layers) => record.backing_layers = layers,
-                    Err(RepositoryError::Unsupported { .. }) => {}
-                    Err(error) => return Err(repository_error(error)),
-                }
+                record.backing_layers = repository
+                    .publish_volume_backing(&record.id, path)
+                    .await
+                    .map_err(repository_error)?;
             }
         }
         Ok(())
@@ -656,10 +736,10 @@ impl VolumeManager {
 
     async fn persist_catalog(&self, record: &VolumeRecord) -> Result<(), VolumeError> {
         if let Some(repository) = &self.repository {
-            match repository.put_volume(record.clone()).await {
-                Ok(()) | Err(RepositoryError::Unsupported { .. }) => {}
-                Err(error) => return Err(repository_error(error)),
-            }
+            repository
+                .put_volume(record.clone())
+                .await
+                .map_err(repository_error)?;
         }
         Ok(())
     }
@@ -791,15 +871,28 @@ impl Default for VolumeManager {
 }
 
 fn repository_error(error: RepositoryError) -> VolumeError {
-    VolumeError::Storage(error.to_string())
+    match error {
+        RepositoryError::VolumeNotFound { lookup } => VolumeError::NotFound(lookup),
+        RepositoryError::VolumeNameConflict { name } => VolumeError::NameConflict(name),
+        error => VolumeError::Storage(error.to_string()),
+    }
+}
+
+fn encode_volume_cursor(volume_id: String) -> String {
+    URL_SAFE_NO_PAD.encode(volume_id)
+}
+
+fn decode_volume_cursor(token: &str) -> Result<String, VolumeError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| VolumeError::InvalidNextToken)?;
+    let volume_id = String::from_utf8(bytes).map_err(|_| VolumeError::InvalidNextToken)?;
+    validate_volume_id(&volume_id).map_err(|_| VolumeError::InvalidNextToken)?;
+    Ok(volume_id)
 }
 
 fn validate_name(name: &str) -> Result<(), VolumeError> {
-    if !name.is_empty()
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
+    if is_valid_volume_component(name) {
         Ok(())
     } else {
         Err(VolumeError::InvalidName)
@@ -807,12 +900,7 @@ fn validate_name(name: &str) -> Result<(), VolumeError> {
 }
 
 fn validate_volume_id(id: &str) -> Result<(), VolumeError> {
-    if !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
+    if is_valid_volume_component(id) {
         Ok(())
     } else {
         Err(VolumeError::Storage(format!("invalid volume id '{id}'")))
@@ -825,6 +913,9 @@ mod tests {
     use crate::snapshot::repository::backends::posixfs::{
         PosixFsArtifactStore, PosixFsCatalogStore, PosixFsSnapshotRepository,
     };
+    use crate::snapshot::repository::VolumeRecordPage;
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const DEFAULT_VOLUME_SIZE_MB: u64 = 16;
 
@@ -848,6 +939,182 @@ mod tests {
             .unwrap()
     }
 
+    #[derive(Default)]
+    struct CountingVolumeRepository {
+        get_calls: AtomicUsize,
+        page_calls: AtomicUsize,
+        materialize_calls: AtomicUsize,
+    }
+
+    impl CountingVolumeRepository {
+        fn unsupported<T>() -> crate::snapshot::RepositoryResult<T> {
+            Err(RepositoryError::Unsupported {
+                feature: "snapshot operation is not used by the volume test".to_string(),
+            })
+        }
+
+        fn record(index: usize) -> VolumeRecord {
+            VolumeRecord {
+                id: format!("vol_{index:010}"),
+                name: if index == 42 {
+                    "target".to_string()
+                } else {
+                    format!("volume-{index:010}")
+                },
+                mode: VolumeMode::Exclusive,
+                source: "empty".to_string(),
+                parent_volume_id: None,
+                revision: 1,
+                size_mb: DEFAULT_VOLUME_SIZE_MB,
+                status: VolumeStatus::Ready,
+                reserved_by_sandbox_id: None,
+                backing_image_config: None,
+                backing_layers: vec![OverlaybdLayerRef::Managed(crate::snapshot::ManagedLayer {
+                    digest: format!("sha256:{index:064x}"),
+                    size: 4096,
+                    uuid: None,
+                })],
+                read_only_mounts: Vec::new(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SnapshotRepository for CountingVolumeRepository {
+        async fn create(
+            &self,
+            _record: crate::snapshot::SnapshotRecord,
+        ) -> crate::snapshot::RepositoryResult<crate::snapshot::SnapshotRecord> {
+            Self::unsupported()
+        }
+
+        async fn publish(
+            &self,
+            _metadata: crate::snapshot::SnapshotPublishMetadata,
+            _manifest: crate::sandbox::FirecrackerSnapshotManifest,
+        ) -> crate::snapshot::RepositoryResult<crate::snapshot::SnapshotRecord> {
+            Self::unsupported()
+        }
+
+        async fn get(
+            &self,
+            _id_or_alias: &str,
+        ) -> crate::snapshot::RepositoryResult<Option<crate::snapshot::SnapshotRecord>> {
+            Self::unsupported()
+        }
+
+        async fn list(
+            &self,
+            _filter: crate::snapshot::SnapshotListFilter,
+        ) -> crate::snapshot::RepositoryResult<Vec<crate::snapshot::SnapshotRecord>> {
+            Self::unsupported()
+        }
+
+        async fn delete(&self, _id_or_alias: &str) -> crate::snapshot::RepositoryResult<()> {
+            Self::unsupported()
+        }
+
+        async fn resolve_alias(
+            &self,
+            _alias: &str,
+        ) -> crate::snapshot::RepositoryResult<Option<crate::snapshot::SnapshotId>> {
+            Self::unsupported()
+        }
+
+        async fn try_start_build(
+            &self,
+            _id: &crate::snapshot::SnapshotId,
+        ) -> crate::snapshot::RepositoryResult<crate::snapshot::SnapshotRecord> {
+            Self::unsupported()
+        }
+
+        async fn mark_build_error(
+            &self,
+            _id: &crate::snapshot::SnapshotId,
+            _reason: crate::snapshot::TemplateBuildErrorReason,
+        ) -> crate::snapshot::RepositoryResult<()> {
+            Self::unsupported()
+        }
+
+        async fn get_volume(
+            &self,
+            reference: &str,
+        ) -> crate::snapshot::RepositoryResult<Option<VolumeRecord>> {
+            self.get_calls.fetch_add(1, Ordering::Relaxed);
+            Ok((reference == "target" || reference == "vol_0000000042").then(|| Self::record(42)))
+        }
+
+        async fn list_volumes_page(
+            &self,
+            after_volume_id: Option<&str>,
+            limit: usize,
+        ) -> crate::snapshot::RepositoryResult<VolumeRecordPage> {
+            self.page_calls.fetch_add(1, Ordering::Relaxed);
+            let start = after_volume_id
+                .and_then(|value| value.strip_prefix("vol_"))
+                .and_then(|value| value.parse::<usize>().ok())
+                .map_or(0, |index| index + 1);
+            let end = start.saturating_add(limit).min(1_000_000);
+            let records: Vec<_> = (start..end).map(Self::record).collect();
+            let next_volume_id = (end < 1_000_000)
+                .then(|| records.last().map(|record| record.id.clone()))
+                .flatten();
+            Ok(VolumeRecordPage {
+                records,
+                next_volume_id,
+            })
+        }
+
+        async fn materialize_volume_backing(
+            &self,
+            _volume_id: &str,
+            _layers: &[OverlaybdLayerRef],
+            destination: &Path,
+        ) -> crate::snapshot::RepositoryResult<PathBuf> {
+            self.materialize_calls.fetch_add(1, Ordering::Relaxed);
+            tokio::fs::create_dir_all(destination.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(destination, b"{}").await.unwrap();
+            Ok(destination.to_path_buf())
+        }
+    }
+
+    #[tokio::test]
+    async fn repository_access_is_keyed_bounded_and_lazy() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Arc::new(CountingVolumeRepository::default());
+        let manager = VolumeManager::open_with_repository(
+            directory.path().join("node/catalog"),
+            Some(repository.clone()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(repository.get_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(repository.page_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(repository.materialize_calls.load(Ordering::Relaxed), 0);
+        assert!(manager.records.read().await.is_empty());
+
+        let target = manager.get("target").await.unwrap();
+        assert_eq!(target.id, "vol_0000000042");
+        assert_eq!(repository.get_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(repository.materialize_calls.load(Ordering::Relaxed), 0);
+        assert!(manager.records.read().await.is_empty());
+
+        let page = manager.list_page(None, 37).await.unwrap();
+        assert_eq!(page.records.len(), 37);
+        assert!(page.next_token.is_some());
+        assert_eq!(repository.page_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(repository.materialize_calls.load(Ordering::Relaxed), 0);
+        assert!(manager.records.read().await.is_empty());
+
+        let materialized = manager.materialize_backing("target").await.unwrap();
+        assert!(materialized.backing_image_config.unwrap().is_file());
+        assert_eq!(repository.materialize_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(manager.records.read().await.len(), 1);
+    }
+
     #[tokio::test]
     async fn creates_and_resolves_by_id_or_name() {
         let manager = VolumeManager::new();
@@ -856,6 +1123,43 @@ mod tests {
         assert_eq!(manager.get("my-data").await.unwrap(), record);
         assert_eq!(manager.get(&record.id).await.unwrap(), record);
         assert_eq!(record.source, "empty");
+    }
+
+    #[tokio::test]
+    async fn local_volume_pages_have_stable_opaque_cursors() {
+        let manager = VolumeManager::new();
+        for index in 0..205 {
+            manager
+                .create(
+                    format!("volume-{index:03}"),
+                    VolumeMode::ReadOnly,
+                    None,
+                    Some("image:latest".to_string()),
+                    DEFAULT_VOLUME_SIZE_MB,
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut token = None;
+        let mut ids = Vec::new();
+        loop {
+            let page = manager.list_page(token.as_deref(), 37).await.unwrap();
+            assert!(page.records.len() <= 37);
+            ids.extend(page.records.into_iter().map(|record| record.id));
+            let Some(next) = page.next_token else {
+                break;
+            };
+            token = Some(next);
+        }
+        assert_eq!(ids.len(), 205);
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 205);
+        assert_eq!(
+            manager.list_page(Some("not-a-token"), 10).await,
+            Err(VolumeError::InvalidNextToken)
+        );
     }
 
     #[tokio::test]
@@ -919,7 +1223,11 @@ mod tests {
 
         let mut record = create_empty(&manager, "my-data").await;
         record.reserved_by_sandbox_id = Some("sbx".to_owned());
-        *manager.records.write().await = vec![record];
+        manager
+            .records
+            .write()
+            .await
+            .insert(record.id.clone(), record);
         assert_eq!(
             manager.delete("my-data").await,
             Err(VolumeError::Reserved("sbx".to_owned()))
@@ -963,7 +1271,7 @@ mod tests {
         manager.reserve(&record.id, "sandbox").await.unwrap();
         {
             let mut records = manager.records.write().await;
-            records[0].status = VolumeStatus::Uploading;
+            records.get_mut(&record.id).unwrap().status = VolumeStatus::Uploading;
         }
 
         assert_eq!(
@@ -1006,10 +1314,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rebind_transfers_read_only_lease() {
+        let manager = VolumeManager::new();
+        let record = manager
+            .create(
+                "shared".to_owned(),
+                VolumeMode::ReadOnly,
+                None,
+                Some("image:latest".to_owned()),
+                DEFAULT_VOLUME_SIZE_MB,
+            )
+            .await
+            .unwrap();
+
+        manager.reserve(&record.id, "pending").await.unwrap();
+        manager.rebind_owner("pending", "sandbox").await.unwrap();
+
+        let record = manager.get(&record.id).await.unwrap();
+        assert_eq!(record.read_only_mounts, vec!["sandbox"]);
+        manager.release_owner("sandbox").await.unwrap();
+        assert!(manager
+            .get(&record.id)
+            .await
+            .unwrap()
+            .read_only_mounts
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn failed_volume_is_not_mountable() {
         let manager = VolumeManager::new();
         let record = create_empty(&manager, "failed").await;
-        manager.records.write().await[0].status = VolumeStatus::Failed;
+        manager
+            .records
+            .write()
+            .await
+            .get_mut(&record.id)
+            .unwrap()
+            .status = VolumeStatus::Failed;
         assert_eq!(
             manager.reserve(&record.id, "sandbox").await,
             Err(VolumeError::Failed(record.id))
@@ -1117,7 +1459,15 @@ mod tests {
             .await
             .unwrap();
         drop(first);
-        assert_eq!(second.list().await.unwrap()[0].id, record.id);
+        assert_eq!(
+            second
+                .list_page(None, DEFAULT_VOLUME_PAGE_SIZE)
+                .await
+                .unwrap()
+                .records[0]
+                .id,
+            record.id
+        );
         second.reserve(&record.id, "sandbox-b").await.unwrap();
 
         let first_again = VolumeManager::open_with_repository(
@@ -1156,8 +1506,13 @@ mod tests {
         let record = create_empty(&manager, "cleanup-failure").await;
         let non_directory = directory.path().join("not-a-directory");
         tokio::fs::write(&non_directory, b"test").await.unwrap();
-        manager.records.write().await[0].backing_image_config =
-            Some(non_directory.join("image.json"));
+        manager
+            .records
+            .write()
+            .await
+            .get_mut(&record.id)
+            .unwrap()
+            .backing_image_config = Some(non_directory.join("image.json"));
         manager.delete(&record.id).await.unwrap();
         assert_eq!(
             manager.get(&record.id).await,

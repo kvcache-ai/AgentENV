@@ -951,6 +951,12 @@ impl AppConfig {
         if self.volume.max_size_mb == 0 {
             bail!("volume.max_size_mb must be greater than 0");
         }
+        if self.volume.max_size_mb > u64::MAX / (1024 * 1024) {
+            bail!(
+                "volume.max_size_mb must be at most {}",
+                u64::MAX / (1024 * 1024)
+            );
+        }
         if self.volume.max_volume_count == 0
             || self.volume.max_volume_count > crate::volume::MAX_VOLUME_MOUNTS
         {
@@ -1520,6 +1526,11 @@ mod tests {
         config.volume.max_volume_count = 0;
         let error = config.validate().unwrap_err();
         assert!(error.to_string().contains("volume.max_volume_count"));
+
+        let mut config = AppConfig::default();
+        config.volume.max_size_mb = u64::MAX;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_size_mb"));
 
         let mut config = AppConfig::default();
         config.volume.max_volume_count = crate::volume::MAX_VOLUME_MOUNTS + 1;

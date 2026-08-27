@@ -206,21 +206,6 @@ pub trait SnapshotRepository: Send + Sync {
         unsupported("volume catalog")
     }
 
-    async fn list_volumes(&self) -> RepositoryResult<Vec<crate::volume::VolumeRecord>> {
-        let mut records = Vec::new();
-        let mut after_volume_id = None;
-        loop {
-            let page = self
-                .list_volumes_page(after_volume_id.as_deref(), 100)
-                .await?;
-            records.extend(page.records);
-            let Some(next_volume_id) = page.next_volume_id else {
-                return Ok(records);
-            };
-            after_volume_id = Some(next_volume_id);
-        }
-    }
-
     /// Creates one durable volume record and atomically claims its unique name.
     async fn create_volume(&self, _record: crate::volume::VolumeRecord) -> RepositoryResult<()> {
         unsupported("volume catalog")

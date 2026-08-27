@@ -627,13 +627,17 @@ fn validate_overlaybd_extra_drive(
     if !drive_ids.insert(drive_id.to_string()) {
         anyhow::bail!("duplicate extra drive id: {}", drive_id);
     }
-    crate::sandbox::validate_mount_path(drive.mount_path())?;
-    if !mount_paths.insert(drive.mount_path().to_path_buf()) {
+    let mount_path = crate::sandbox::normalize_mount_path(drive.mount_path().to_path_buf())?;
+    if mount_paths
+        .iter()
+        .any(|existing| existing.starts_with(&mount_path) || mount_path.starts_with(existing))
+    {
         anyhow::bail!(
-            "duplicate extra drive mount path: {}",
+            "overlapping extra drive mount path: {}",
             drive.mount_path().display()
         );
     }
+    mount_paths.insert(mount_path);
     if matches!(drive.virtual_size(), Some(0)) {
         anyhow::bail!("extra drive virtual size must be non-zero: {}", drive_id);
     }

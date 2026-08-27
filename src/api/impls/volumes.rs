@@ -10,9 +10,10 @@ use agentenv_http_server::apis::volumes::*;
 use agentenv_http_server::models;
 
 use crate::image::ImageResolver;
-use crate::sandbox::{validate_mount_path, ExtraDrive};
+use crate::sandbox::{normalize_mount_path, ExtraDrive};
 use crate::volume::{
-    VolumeError, VolumeManager, VolumeMode, VolumeRecord, VolumeStatus, DEFAULT_VOLUME_SIZE_MB,
+    VolumeError, VolumeManager, VolumeMode, VolumeRecord, VolumeStatus, DEFAULT_VOLUME_PAGE_SIZE,
+    DEFAULT_VOLUME_SIZE_MB,
 };
 
 use super::ApiImpl;
@@ -25,7 +26,9 @@ pub(super) async fn resolve_volume_mounts(
 ) -> Result<(Vec<ExtraDrive>, HashMap<String, String>), models::Error> {
     let result = resolve_volume_mounts_inner(manager, image_resolver, mounts, owner).await;
     if result.is_err() {
-        let _ = manager.release_owner(owner).await;
+        if let Err(error) = manager.release_owner(owner).await {
+            tracing::warn!(%owner, %error, "failed to clean up volume reservations after mount resolution failed");
+        }
     }
     result
 }
@@ -47,9 +50,23 @@ async fn resolve_volume_mounts_inner(
     let mut volume_ids = HashSet::with_capacity(mounts.len());
     let mut normalized_mounts = HashMap::with_capacity(mounts.len());
 
+    let mut mounts = mounts.iter().collect::<Vec<_>>();
+    mounts.sort_unstable_by_key(|(mount_path, _)| *mount_path);
     for (mount_path, reference) in mounts {
-        let mount_path = PathBuf::from(mount_path);
-        validate_mount_path(&mount_path).map_err(|error| ApiImpl::error(400, error.to_string()))?;
+        let mount_path = normalize_mount_path(PathBuf::from(mount_path))
+            .map_err(|error| ApiImpl::error(400, error.to_string()))?;
+        if normalized_mounts.keys().any(|existing| {
+            let existing = PathBuf::from(existing);
+            existing.starts_with(&mount_path) || mount_path.starts_with(existing)
+        }) {
+            return Err(ApiImpl::error(
+                400,
+                format!(
+                    "volume mount path overlaps another mount: {}",
+                    mount_path.display()
+                ),
+            ));
+        }
         let volume = manager
             .get(reference)
             .await
@@ -71,14 +88,18 @@ async fn resolve_volume_mounts_inner(
             .await
             .map_err(|error| error_response(error).1)?;
 
-        let mut source_record = volume.clone();
+        let mut source_record = manager
+            .materialize_backing(&volume.id)
+            .await
+            .map_err(|error| error_response(error).1)?;
         while source_record.source == "volume" && source_record.backing_image_config.is_none() {
             let Some(parent_id) = source_record.parent_volume_id.as_deref() else {
                 break;
             };
-            let Ok(parent) = manager.get(parent_id).await else {
-                break;
-            };
+            let parent = manager
+                .materialize_backing(parent_id)
+                .await
+                .map_err(|error| error_response(error).1)?;
             source_record = parent;
         }
         let image_config_path = match source_record.backing_image_config.clone() {
@@ -139,6 +160,7 @@ fn to_model(record: VolumeRecord) -> models::Volume {
     let status = match record.status {
         VolumeStatus::Ready => "ready",
         VolumeStatus::Uploading => "uploading",
+        VolumeStatus::Failed => "failed",
     };
     let mut model = models::Volume::new(record.id, record.name, record.size_mb, status.to_owned());
     model.mode = Some(match record.mode {
@@ -154,11 +176,16 @@ pub(super) fn error_response(error: VolumeError) -> (i32, models::Error) {
         | VolumeError::MultipleSources
         | VolumeError::SourceNotFound(_)
         | VolumeError::InvalidSize
+        | VolumeError::InvalidNextToken
+        | VolumeError::InvalidPageLimit
         | VolumeError::SizeLimitExceeded { .. }
         | VolumeError::SizeMismatch => 400,
         VolumeError::TooManyMountedVolumes { .. } => 400,
         VolumeError::NotFound(_) => 404,
-        VolumeError::NameConflict(_) | VolumeError::Reserved(_) | VolumeError::Uploading(_) => 409,
+        VolumeError::NameConflict(_)
+        | VolumeError::Reserved(_)
+        | VolumeError::Uploading(_)
+        | VolumeError::Failed(_) => 409,
         VolumeError::Storage(_) => 500,
     };
     (code, ApiImpl::error(code, error.to_string()))
@@ -174,11 +201,26 @@ impl Volumes<()> for ApiImpl {
         _host: &Host,
         _cookies: &CookieJar,
         _claims: &Self::Claims,
+        query_params: &models::VolumesGetQueryParams,
     ) -> Result<VolumesGetResponse, ()> {
-        match self.volume_manager.list().await {
-            Ok(records) => Ok(VolumesGetResponse::Status200_VolumesReturnedSuccessfully(
-                records.into_iter().map(to_model).collect(),
-            )),
+        match self
+            .volume_manager
+            .list_page(
+                query_params.next_token.as_deref(),
+                query_params
+                    .limit
+                    .map(|limit| limit as usize)
+                    .unwrap_or(DEFAULT_VOLUME_PAGE_SIZE),
+            )
+            .await
+        {
+            Ok(page) => Ok(VolumesGetResponse::Status200_VolumesReturnedSuccessfully {
+                body: page.records.into_iter().map(to_model).collect(),
+                x_next_token: page.next_token,
+            }),
+            Err(error @ (VolumeError::InvalidNextToken | VolumeError::InvalidPageLimit)) => Ok(
+                VolumesGetResponse::Status400_BadRequest(error_response(error).1),
+            ),
             Err(error) => Ok(VolumesGetResponse::Status500_ServerError(ApiImpl::error(
                 500,
                 error.to_string(),
@@ -349,5 +391,36 @@ mod tests {
                 .reserved_by_sandbox_id,
             Some("pending".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn resolves_volume_drives_in_mount_path_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let manager = VolumeManager::open(directory.path().join("catalog"))
+            .await
+            .unwrap();
+        let first = manager
+            .create("first".to_owned(), VolumeMode::Exclusive, None, None, 16)
+            .await
+            .unwrap();
+        let second = manager
+            .create("second".to_owned(), VolumeMode::Exclusive, None, None, 16)
+            .await
+            .unwrap();
+        let resolver = ImageResolver::new(&AppConfig {
+            deps_path: directory.path().join("deps"),
+            ..AppConfig::default()
+        });
+        let mounts = HashMap::from([
+            (String::from("/mnt/z-last"), first.id),
+            (String::from("/mnt/a-first"), second.id),
+        ]);
+
+        let (drives, _) = resolve_volume_mounts(&manager, &resolver, &mounts, "pending")
+            .await
+            .expect("volume mounts should resolve");
+
+        assert_eq!(drives[0].mount_path(), Path::new("/mnt/a-first"));
+        assert_eq!(drives[1].mount_path(), Path::new("/mnt/z-last"));
     }
 }

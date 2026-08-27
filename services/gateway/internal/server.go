@@ -352,7 +352,7 @@ func (s *Server) proxyRequest(
 			if !options.recordAssignment || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				return nil
 			}
-			return s.recordAssignmentFromResponse(originalCtx, resp, node)
+			return s.recordAssignmentFromResponse(originalCtx, resp, node, proxyReq.URL.Path)
 		},
 		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
 			if errors.Is(err, context.Canceled) {
@@ -419,7 +419,7 @@ func (e *proxyResponseError) Error() string {
 	return e.message
 }
 
-func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node) error {
+func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestPath string) error {
 	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
 	defer cancelRecord()
 
@@ -456,7 +456,11 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 	}
 	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 
-	for _, sandboxID := range extractSandboxIDsFromResponse(body) {
+	ids := extractSandboxIDsFromResponse(body)
+	if isForkPath(requestPath) {
+		ids = extractForkSandboxIDsFromResponse(body)
+	}
+	for _, sandboxID := range ids {
 		s.recordAssignment(recordCtx, sandboxID, node, "response_body")
 	}
 	return nil
@@ -523,7 +527,11 @@ func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox
 	}
 
 	// Fork is routed by the source sandbox but creates child sandbox assignments.
-	parts := strings.Split(strings.Trim(path, "/"), "/")
+	return isForkPath(path)
+}
+
+func isForkPath(path string) bool {
+	parts := strings.Split(strings.Trim(strings.TrimRight(path, "/"), "/"), "/")
 	return len(parts) == 3 && parts[0] == "sandboxes" && strings.TrimSpace(parts[1]) != "" && parts[2] == "fork"
 }
 
@@ -786,7 +794,7 @@ func extractSandboxIDFromResponse(body []byte) (string, bool) {
 }
 
 func extractSandboxIDsFromResponse(body []byte) []string {
-	var payload any
+	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil
 	}
@@ -796,12 +804,15 @@ func extractSandboxIDsFromResponse(body []byte) []string {
 			ids = append(ids, id)
 		}
 	}
-	appendDirectSandboxID := func(object map[string]any) {
+	for _, key := range []string{"sandboxID", "sandboxId", "sandbox_id"} {
+		appendSandboxID(payload[key])
+	}
+	if data, ok := payload["data"].(map[string]any); ok {
 		for _, key := range []string{"sandboxID", "sandboxId", "sandbox_id"} {
-			appendSandboxID(object[key])
+			appendSandboxID(data[key])
 		}
 	}
-	appendSandboxIDsFromArray := func(value any, nested bool) {
+	appendSandboxIDsFromArray := func(value any) {
 		items, ok := value.([]any)
 		if !ok {
 			return
@@ -811,32 +822,14 @@ func extractSandboxIDsFromResponse(body []byte) []string {
 			if !ok {
 				continue
 			}
-			appendDirectSandboxID(object)
-			if nested {
-				if sandbox, ok := object["sandbox"].(map[string]any); ok {
-					appendDirectSandboxID(sandbox)
-				}
+			for _, key := range []string{"sandboxID", "sandboxId", "sandbox_id"} {
+				appendSandboxID(object[key])
 			}
 		}
 	}
-	appendSandboxIDsFromObject := func(object map[string]any) {
-		appendDirectSandboxID(object)
-		if sandbox, ok := object["sandbox"].(map[string]any); ok {
-			appendDirectSandboxID(sandbox)
-		}
-		appendSandboxIDsFromArray(object["sandboxes"], false)
-	}
-
-	switch value := payload.(type) {
-	case map[string]any:
-		appendSandboxIDsFromObject(value)
-		if data, ok := value["data"].(map[string]any); ok {
-			appendSandboxIDsFromObject(data)
-		}
-	case []any:
-		// Fork responses are arrays of results whose successful entries contain
-		// a nested `sandbox` object.
-		appendSandboxIDsFromArray(value, true)
+	appendSandboxIDsFromArray(payload["sandboxes"])
+	if data, ok := payload["data"].(map[string]any); ok {
+		appendSandboxIDsFromArray(data["sandboxes"])
 	}
 	if len(ids) == 0 {
 		return nil
@@ -851,6 +844,36 @@ func extractSandboxIDsFromResponse(body []byte) []string {
 		unique = append(unique, id)
 	}
 	return unique
+}
+
+type forkAssignmentResult struct {
+	Sandbox *struct {
+		SandboxID string `json:"sandboxID"`
+	} `json:"sandbox"`
+}
+
+func extractForkSandboxIDsFromResponse(body []byte) []string {
+	var results []forkAssignmentResult
+	if err := json.Unmarshal(body, &results); err != nil {
+		return nil
+	}
+	ids := make([]string, 0, len(results))
+	seen := make(map[string]struct{}, len(results))
+	for _, result := range results {
+		if result.Sandbox == nil {
+			continue
+		}
+		id := strings.TrimSpace(result.Sandbox.SandboxID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 func singleHeaderMatches(headers http.Header, name string, expected []byte) bool {

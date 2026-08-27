@@ -17,13 +17,6 @@ pub struct NewSandbox<'a> {
     pub volume_mounts: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Default)]
-pub struct SandboxLaunchOptions {
-    pub timeout: Option<u32>,
-    pub secure: bool,
-    pub volume_mounts: Option<HashMap<String, String>>,
-}
-
 #[derive(Debug, Serialize)]
 pub struct NewColdSandbox<'a> {
     pub image: &'a str,
@@ -88,35 +81,40 @@ impl Client {
     pub fn create_sandbox(
         &self,
         template_id: &str,
-        options: SandboxLaunchOptions,
+        timeout: Option<u32>,
+        secure: bool,
+        volume_mounts: Option<HashMap<String, String>>,
     ) -> Result<Sandbox> {
         let body = NewSandbox {
             template_id,
-            timeout: options.timeout,
-            secure: options.secure.then_some(true),
-            volume_mounts: options.volume_mounts,
+            timeout,
+            secure: secure.then_some(true),
+            volume_mounts,
         };
         let resp = handle_status(self.post("/sandboxes").send_json(&body))?;
         let sandbox: Sandbox = resp.into_json()?;
         Ok(sandbox)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_cold_sandbox(
         &self,
         image: &str,
+        timeout: Option<u32>,
         cpu_count: Option<u32>,
         memory_mb: Option<u32>,
         disk_size_mb: Option<u32>,
-        options: SandboxLaunchOptions,
+        secure: bool,
+        volume_mounts: Option<HashMap<String, String>>,
     ) -> Result<Sandbox> {
         let body = NewColdSandbox {
             image,
-            timeout: options.timeout,
+            timeout,
             cpu_count,
             memory_mb,
             disk_size_mb,
-            secure: options.secure.then_some(true),
-            volume_mounts: options.volume_mounts,
+            secure: secure.then_some(true),
+            volume_mounts,
         };
         let resp = handle_status(self.post("/sandboxes-cold").send_json(&body))?;
         let sandbox: Sandbox = resp.into_json()?;

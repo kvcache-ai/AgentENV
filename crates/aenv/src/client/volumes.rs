@@ -58,19 +58,42 @@ impl Client {
         }
     }
 
-    pub fn get_volume(&self, reference: &str) -> Result<Volume> {
-        Ok(handle_status(self.get(&format!("/volumes/{reference}")).call())?.into_json()?)
+    pub fn get_volume(&self, volume: &str) -> Result<Volume> {
+        validate_volume_reference(volume)?;
+        Ok(handle_status(self.get(&format!("/volumes/{volume}")).call())?.into_json()?)
     }
 
-    pub fn delete_volume(&self, reference: &str) -> Result<()> {
-        handle_status(self.delete(&format!("/volumes/{reference}")).call())?;
+    pub fn delete_volume(&self, volume: &str) -> Result<()> {
+        validate_volume_reference(volume)?;
+        handle_status(self.delete(&format!("/volumes/{volume}")).call())?;
         Ok(())
+    }
+}
+
+pub(crate) fn validate_volume_reference(volume: &str) -> Result<()> {
+    if !volume.is_empty()
+        && volume
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "volume reference must contain only letters, numbers, underscores, or hyphens"
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::CreateVolume;
+    use super::{validate_volume_reference, CreateVolume};
+
+    #[test]
+    fn rejects_unsafe_volume_references() {
+        assert!(validate_volume_reference("../volume").is_err());
+        assert!(validate_volume_reference("volume/name").is_err());
+        assert!(validate_volume_reference("volume_name-1").is_ok());
+    }
 
     #[test]
     fn create_volume_serializes_issue_fields() {

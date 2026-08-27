@@ -351,6 +351,20 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
     return 1
   }
 
+  wait_for_volume_status() {
+    local id="$1" target_status="$2" timeout="${3:-30}"
+    for ((i = 0; i < timeout * 2; i++)); do
+      api_get "/volumes/${id}"
+      if [[ "$HTTP_STATUS" == "200" ]] \
+        && [[ "$(echo "$HTTP_BODY" | jq -r '.status // empty')" == "$target_status" ]]; then
+        return 0
+      fi
+      sleep 0.5
+    done
+    warn "Timed out waiting for volume $id to reach status '$target_status'"
+    return 1
+  }
+
   # Poll until a template build reaches "ready" or "error".
   _template_build_status_field() {
     local body="$1"

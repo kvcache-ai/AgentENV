@@ -307,6 +307,20 @@ pub struct V2TemplatesTemplateIdBuildsBuildIdPostPathParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct VolumesGetQueryParams {
+    /// Cursor to start the list from
+    #[serde(rename = "nextToken")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_token: Option<String>,
+    /// Maximum number of items to return per page
+    #[serde(rename = "limit")]
+    #[validate(range(min = 1u32, max = 100u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct VolumesVolumeIdDeletePathParams {
     pub volume_id: String,
 }
@@ -9360,7 +9374,7 @@ pub struct Volume {
     #[validate(range(min = 1u64))]
     pub size_mb: u64,
 
-    /// Availability state (`ready` or `uploading`).
+    /// Availability state (`ready`, `uploading`, or `failed`).
     #[serde(rename = "status")]
     #[validate(custom(function = "check_xss_string"))]
     pub status: String,

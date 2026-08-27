@@ -801,8 +801,11 @@ func TestExtractSandboxIDFromResponse(t *testing.T) {
 	if !equalStrings(ids, []string{"sbx-1", "sbx-2"}) {
 		t.Fatalf("expected batch sandbox ids, got %#v", ids)
 	}
-	ids = extractSandboxIDsFromResponse([]byte(`[{"sandbox":{"sandboxID":"sbx-child-1"}},{"sandbox":{"sandboxID":"sbx-child-2"}},{"error":{"message":"failed"}}]`))
-	if !equalStrings(ids, []string{"sbx-child-1", "sbx-child-2"}) {
+	forkBody := []byte(`[{"sandbox":{"sandboxID":"sbx-child-1"}},{"sandbox":{"sandboxID":"sbx-child-2"}},{"error":{"message":"failed"}}]`)
+	if ids := extractSandboxIDsFromResponse(forkBody); len(ids) != 0 {
+		t.Fatalf("generic response parser should not infer fork ids, got %#v", ids)
+	}
+	if ids := extractForkSandboxIDsFromResponse(forkBody); !equalStrings(ids, []string{"sbx-child-1", "sbx-child-2"}) {
 		t.Fatalf("expected fork child sandbox ids, got %#v", ids)
 	}
 }
@@ -1078,7 +1081,7 @@ func TestHandleProxyAggregatesV2SandboxesWithGlobalPagination(t *testing.T) {
 	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
-	req, err := http.NewRequest(http.MethodGet, gatewayServer.URL+"/v2/sandboxes?metadata=team%3Dalpha&state=running%2Cpaused&limit=2", nil)
+	req, err := http.NewRequest(http.MethodGet, gatewayServer.URL+"/v2/sandboxes?metadata=team%3Dalpha&state=running%2Cpaused&order=desc&startedAfter=2026-01-01T00%3A00%3A00Z&template=tmpl&limit=2", nil)
 	if err != nil {
 		t.Fatalf("build first page request failed: %v", err)
 	}
@@ -1106,8 +1109,11 @@ func TestHandleProxyAggregatesV2SandboxesWithGlobalPagination(t *testing.T) {
 	if nextToken == "" {
 		t.Fatal("expected x-next-token on first page")
 	}
+	if got := resp.Header.Get("x-total-running"); got != "2" {
+		t.Fatalf("first page x-total-running = %q, want 2", got)
+	}
 
-	req, err = http.NewRequest(http.MethodGet, gatewayServer.URL+"/v2/sandboxes?metadata=team%3Dalpha&state=running%2Cpaused&limit=2&nextToken="+url.QueryEscape(nextToken), nil)
+	req, err = http.NewRequest(http.MethodGet, gatewayServer.URL+"/v2/sandboxes?metadata=team%3Dalpha&state=running%2Cpaused&order=desc&startedAfter=2026-01-01T00%3A00%3A00Z&template=tmpl&limit=2&nextToken="+url.QueryEscape(nextToken), nil)
 	if err != nil {
 		t.Fatalf("build second page request failed: %v", err)
 	}
@@ -1132,6 +1138,9 @@ func TestHandleProxyAggregatesV2SandboxesWithGlobalPagination(t *testing.T) {
 	if got := respTwo.Header.Get("x-next-token"); got != "" {
 		t.Fatalf("second page x-next-token = %q, want empty", got)
 	}
+	if got := respTwo.Header.Get("x-total-running"); got != "2" {
+		t.Fatalf("second page x-total-running = %q, want 2", got)
+	}
 
 	for i := 0; i < 4; i++ {
 		query := <-requests
@@ -1141,12 +1150,114 @@ func TestHandleProxyAggregatesV2SandboxesWithGlobalPagination(t *testing.T) {
 		if query.Get("state") != "running,paused" {
 			t.Fatalf("state query = %q, want %q", query.Get("state"), "running,paused")
 		}
+		if query.Get("order") != "desc" {
+			t.Fatalf("order query = %q, want %q", query.Get("order"), "desc")
+		}
+		if query.Get("startedAfter") != "2026-01-01T00:00:00Z" {
+			t.Fatalf("startedAfter query = %q, want %q", query.Get("startedAfter"), "2026-01-01T00:00:00Z")
+		}
+		if query.Get("template") != "tmpl" {
+			t.Fatalf("template query = %q, want %q", query.Get("template"), "tmpl")
+		}
 		if query.Get("limit") != "" {
 			t.Fatalf("limit query = %q, want empty", query.Get("limit"))
 		}
 		if query.Get("nextToken") != "" {
 			t.Fatalf("nextToken query = %q, want empty", query.Get("nextToken"))
 		}
+	}
+}
+
+func TestHandleProxyAggregatesV2SandboxesAscendingPagination(t *testing.T) {
+	newNode := func(items []listedSandbox) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if got := r.URL.Query().Get("order"); got != "asc" {
+				t.Errorf("order query = %q, want asc", got)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(items)
+		}))
+	}
+
+	nodeA := newNode([]listedSandbox{
+		mustListedSandbox("00000000-0000-0000-0000-000000000003", "2026-01-01T00:00:02Z", "running", "envd-a"),
+	})
+	defer nodeA.Close()
+	nodeB := newNode([]listedSandbox{
+		mustListedSandbox("00000000-0000-0000-0000-000000000001", "2026-01-01T00:00:01Z", "running", "envd-b"),
+		mustListedSandbox("00000000-0000-0000-0000-000000000002", "2026-01-01T00:00:02Z", "paused", "envd-c"),
+	})
+	defer nodeB.Close()
+
+	server := newTestServer(t, stubSchedulerClient{
+		listNodesFunc: func(_ context.Context, _ *schedulerv1.ListNodesRequest, _ ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
+			return &schedulerv1.ListNodesResponse{
+				Nodes: []*schedulerv1.Node{
+					{NodeId: "node-a", Endpoint: nodeA.URL},
+					{NodeId: "node-b", Endpoint: nodeB.URL},
+				},
+			}, nil
+		},
+	}, time.Second, 1024)
+
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
+	defer gatewayServer.Close()
+
+	request := func(nextToken string) (*http.Response, error) {
+		query := "order=asc&limit=2"
+		if nextToken != "" {
+			query += "&nextToken=" + url.QueryEscape(nextToken)
+		}
+		req, err := http.NewRequest(http.MethodGet, gatewayServer.URL+"/v2/sandboxes?"+query, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Host = "gateway.test"
+		return http.DefaultClient.Do(req)
+	}
+
+	resp, err := request("")
+	if err != nil {
+		t.Fatalf("first page request failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first page status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	nextToken := resp.Header.Get("x-next-token")
+	if nextToken == "" {
+		t.Fatal("expected x-next-token on first page")
+	}
+	if got := resp.Header.Get("x-total-running"); got != "2" {
+		t.Fatalf("first page x-total-running = %q, want 2", got)
+	}
+	pageOne := decodeListedSandboxResponse(t, resp.Body)
+	_ = resp.Body.Close()
+	if got := sandboxIDs(pageOne); !equalStrings(got, []string{
+		"00000000-0000-0000-0000-000000000001",
+		"00000000-0000-0000-0000-000000000003",
+	}) {
+		t.Fatalf("first page ids = %v", got)
+	}
+
+	resp, err = request(nextToken)
+	if err != nil {
+		t.Fatalf("second page request failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("second page status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+	pageTwo := decodeListedSandboxResponse(t, resp.Body)
+	_ = resp.Body.Close()
+	if got := sandboxIDs(pageTwo); !equalStrings(got, []string{
+		"00000000-0000-0000-0000-000000000002",
+	}) {
+		t.Fatalf("second page ids = %v", got)
+	}
+	if got := resp.Header.Get("x-next-token"); got != "" {
+		t.Fatalf("second page x-next-token = %q, want empty", got)
+	}
+	if got := resp.Header.Get("x-total-running"); got != "2" {
+		t.Fatalf("second page x-total-running = %q, want 2", got)
 	}
 }
 
@@ -1466,7 +1577,7 @@ func TestRecordAssignmentFromResponseUsesHeaderWithoutReadingBody(t *testing.T) 
 	resp.Header.Set(headerSandboxID, "sbx-from-header")
 
 	node := &schedulerv1.Node{NodeId: "node-1", Endpoint: "http://node"}
-	if err := server.recordAssignmentFromResponse(context.Background(), resp, node); err != nil {
+	if err := server.recordAssignmentFromResponse(context.Background(), resp, node, "/sandboxes/sbx-from-header"); err != nil {
 		t.Fatalf("recordAssignmentFromResponse returned error: %v", err)
 	}
 

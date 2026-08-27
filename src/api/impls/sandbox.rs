@@ -17,8 +17,8 @@ use crate::orchestrator::{
     CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxForkChildSpec, SandboxLaunchSource,
     SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
 };
+use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
-use crate::sandbox::{CustomExtensionParams, ExtraDrive};
 use crate::snapshot::{
     CommandContext, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
     SnapshotVolume,
@@ -139,14 +139,11 @@ async fn finish_volume_reservation(
     manager: &VolumeManager,
     owner: Option<&str>,
     sandbox_id: Option<SandboxId>,
-) {
-    let Some(owner) = owner else { return };
-    let result = match sandbox_id {
+) -> Result<(), crate::volume::VolumeError> {
+    let Some(owner) = owner else { return Ok(()) };
+    match sandbox_id {
         Some(id) => manager.rebind_owner(owner, &id.to_string()).await,
         None => manager.release_owner(owner).await,
-    };
-    if let Err(error) = result {
-        warn!(%error, ?sandbox_id, "failed to finalize volume reservation");
     }
 }
 
@@ -189,6 +186,7 @@ async fn prepare_volume_fork_specs(
     for _ in 0..count {
         let child_id = SandboxId::new();
         let owner = child_id.to_string();
+        children.entry(child_id).or_default();
         let mut volume_mounts = HashMap::with_capacity(source.volume_mounts.len());
         let mut child_mounts = HashMap::new();
         let mut replace_drive_ids = Vec::new();
@@ -218,10 +216,11 @@ async fn prepare_volume_fork_specs(
                 };
                 children.entry(child_id).or_default().push(child.id.clone());
                 child_mounts.insert(mount_path.clone(), child.id.clone());
-                replace_drive_ids.push(volume.id.clone());
+                replace_drive_ids.push((volume.id.clone(), child.id.clone()));
                 volume_mounts.insert(mount_path.clone(), child.id);
             } else {
                 volume_mounts.insert(mount_path.clone(), volume.id.clone());
+                child_mounts.insert(mount_path.clone(), volume.id.clone());
             }
         }
 
@@ -289,6 +288,23 @@ async fn restore_snapshot_volume_mounts(
                 return Err(volume_error_response(error).1);
             }
         };
+        if parent.revision != volume_snapshot.revision {
+            cleanup_volume_ids(&api.volume_manager, &volume_ids).await;
+            return Err(ApiImpl::error(
+                409,
+                format!(
+                    "volume snapshot {} revision {} is unavailable (current revision {})",
+                    volume_snapshot.volume_id, volume_snapshot.revision, parent.revision
+                ),
+            ));
+        }
+        let mount_path = match normalize_mount_path(volume_snapshot.mount_path.clone().into()) {
+            Ok(path) => path,
+            Err(error) => {
+                cleanup_volume_ids(&api.volume_manager, &volume_ids).await;
+                return Err(ApiImpl::error(400, error.to_string()));
+            }
+        };
         let name = format!("{}-restore-{}", parent.name, Uuid::now_v7().simple());
         let child = match api
             .volume_manager
@@ -302,7 +318,7 @@ async fn restore_snapshot_volume_mounts(
             }
         };
         volume_ids.push(child.id.clone());
-        mounts.insert(volume_snapshot.mount_path.clone(), child.id);
+        mounts.insert(mount_path.to_string_lossy().into_owned(), child.id);
     }
     Ok((mounts, volume_ids))
 }
@@ -762,6 +778,7 @@ impl Sandboxes<()> for ApiImpl {
                 image_configs: Box::new(image_configs),
             },
             extra_drives: Vec::new(),
+            extra_drives_in_snapshot: false,
             timeout: duration_from_secs(body.timeout),
             timeout_action: match body.auto_pause {
                 Some(false) => SandboxTimeoutAction::Delete,
@@ -784,12 +801,24 @@ impl Sandboxes<()> for ApiImpl {
             .await
         {
             Ok(metadata) => {
-                finish_volume_reservation(
+                if let Err(error) = finish_volume_reservation(
                     &self.volume_manager,
                     pending_volume_owner.as_deref(),
                     Some(metadata.id),
                 )
-                .await;
+                .await
+                {
+                    if let Some(owner) = pending_volume_owner.as_deref() {
+                        let _ = self.volume_manager.release_owner(owner).await;
+                    }
+                    let _ = self.orchestrator.delete_sandbox(metadata.id).await;
+                    return Ok(SandboxesColdPostResponse::Status500_ServerError(
+                        Self::error(
+                            500,
+                            format!("failed to finalize volume reservation: {error}"),
+                        ),
+                    ));
+                }
                 let sandbox_id = metadata.id.to_string();
                 Ok(
                     SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
@@ -799,7 +828,7 @@ impl Sandboxes<()> for ApiImpl {
                 )
             }
             Err(err) => {
-                finish_volume_reservation(
+                let _ = finish_volume_reservation(
                     &self.volume_manager,
                     pending_volume_owner.as_deref(),
                     None,
@@ -908,6 +937,8 @@ impl Sandboxes<()> for ApiImpl {
             )));
         }
 
+        let extra_drives_in_snapshot =
+            body.volume_mounts.is_none() && !snapshot.committed().volume_snapshots.is_empty();
         let (requested_volume_mounts, restored_volume_ids) = if body.volume_mounts.is_some() {
             (body.volume_mounts.clone(), Vec::new())
         } else {
@@ -940,6 +971,7 @@ impl Sandboxes<()> for ApiImpl {
         let request = CreateSandboxRequest {
             source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
             extra_drives: volume_drives,
+            extra_drives_in_snapshot,
             timeout: duration_from_secs(body.timeout),
             timeout_action: match body.auto_pause {
                 Some(false) => SandboxTimeoutAction::Delete,
@@ -962,12 +994,23 @@ impl Sandboxes<()> for ApiImpl {
             .await
         {
             Ok(metadata) => {
-                finish_volume_reservation(
+                if let Err(error) = finish_volume_reservation(
                     &self.volume_manager,
                     pending_volume_owner.as_deref(),
                     Some(metadata.id),
                 )
-                .await;
+                .await
+                {
+                    if let Some(owner) = pending_volume_owner.as_deref() {
+                        let _ = self.volume_manager.release_owner(owner).await;
+                    }
+                    cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                    let _ = self.orchestrator.delete_sandbox(metadata.id).await;
+                    return Ok(SandboxesPostResponse::Status500_ServerError(Self::error(
+                        500,
+                        format!("failed to finalize volume reservation: {error}"),
+                    )));
+                }
                 let sandbox_id = metadata.id.to_string();
                 Ok(
                     SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
@@ -977,7 +1020,7 @@ impl Sandboxes<()> for ApiImpl {
                 )
             }
             Err(err) => {
-                finish_volume_reservation(
+                let _ = finish_volume_reservation(
                     &self.volume_manager,
                     pending_volume_owner.as_deref(),
                     None,
@@ -1115,22 +1158,6 @@ impl Sandboxes<()> for ApiImpl {
         };
         match self.orchestrator.delete_sandbox(sandbox_id).await {
             Ok(_) => {
-                let owner = sandbox_id.to_string();
-                if let Err(error) = self.volume_manager.publish_owner_backings(&owner).await {
-                    warn!(error = %error, %sandbox_id, "failed to publish volume backing after sandbox deletion");
-                    return Ok(SandboxesSandboxIdDeleteResponse::Status500_ServerError(
-                        Self::error(500, format!("failed to publish volume backing: {error}")),
-                    ));
-                }
-                if let Err(error) = self.volume_manager.release_owner(&owner).await {
-                    warn!(error = %error, %sandbox_id, "failed to release volume reservations after sandbox deletion");
-                    return Ok(SandboxesSandboxIdDeleteResponse::Status500_ServerError(
-                        Self::error(
-                            500,
-                            format!("failed to release volume reservation: {error}"),
-                        ),
-                    ));
-                }
                 Ok(SandboxesSandboxIdDeleteResponse::Status204_TheSandboxWasKilledSuccessfully)
             }
             Err(OrchestratorError::SandboxNotFound(id)) => Ok(
@@ -1173,6 +1200,11 @@ impl Sandboxes<()> for ApiImpl {
         };
 
         let count = body.as_ref().and_then(|b| b.count).unwrap_or(1);
+        if !(1..=100).contains(&count) {
+            return Ok(SandboxesSandboxIdForkPostResponse::Status400_BadRequest(
+                Self::error(400, "count must be between 1 and 100"),
+            ));
+        }
         if !source_metadata.volume_mounts.is_empty() {
             if let Err(error) = self.orchestrator.snapshot_volume_mounts(sandbox_id).await {
                 return Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
@@ -1475,23 +1507,9 @@ impl Sandboxes<()> for ApiImpl {
             .time("pause", self.orchestrator.pause_sandbox(sandbox_id))
             .await
         {
-            Ok(_) => {
-                if let Err(error) = self
-                    .volume_manager
-                    .publish_owner_backings(&sandbox_id.to_string())
-                    .await
-                {
-                    return Ok(SandboxesSandboxIdPausePostResponse::Status500_ServerError(
-                        Self::error(
-                            500,
-                            format!("failed to publish volume backing after pause: {error}"),
-                        ),
-                    ));
-                }
-                Ok(
-                    SandboxesSandboxIdPausePostResponse::Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
-                )
-            }
+            Ok(_) => Ok(
+                SandboxesSandboxIdPausePostResponse::Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
+            ),
             Err(OrchestratorError::SandboxNotFound(id)) => Ok(
                 SandboxesSandboxIdPausePostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
