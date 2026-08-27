@@ -218,6 +218,12 @@ pub struct SnapshotsGetQueryParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SnapshotsSnapshotIdDeletePathParams {
+    pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SnapshotsSnapshotIdGetPathParams {
     pub snapshot_id: String,
 }

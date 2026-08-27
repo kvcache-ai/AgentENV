@@ -148,6 +148,47 @@ impl Snapshots<()> for ApiImpl {
             )),
         }
     }
+
+    async fn snapshots_snapshot_id_delete(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SnapshotsSnapshotIdDeletePathParams,
+    ) -> Result<SnapshotsSnapshotIdDeleteResponse, ()> {
+        let snapshot_id = match self.snapshot_manager.get(&path_params.snapshot_id).await {
+            Ok(Some(record)) if matches!(record.source, SnapshotSource::Sandbox { .. }) => {
+                record.id.to_string()
+            }
+            Ok(None) => {
+                return Ok(
+                    SnapshotsSnapshotIdDeleteResponse::Status204_TheSnapshotWasDeletedOrWasAlreadyAbsent,
+                );
+            }
+            Ok(Some(_)) => {
+                return Ok(SnapshotsSnapshotIdDeleteResponse::Status404_NotFound(
+                    Self::error(
+                        404,
+                        format!("snapshot '{}' not found", path_params.snapshot_id),
+                    ),
+                ));
+            }
+            Err(err) => {
+                return Ok(SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(
+                    Self::snapshot_manager_error(&err),
+                ));
+            }
+        };
+        match self.snapshot_manager.delete(&snapshot_id).await {
+            Ok(()) => Ok(
+                SnapshotsSnapshotIdDeleteResponse::Status204_TheSnapshotWasDeletedOrWasAlreadyAbsent,
+            ),
+            Err(err) => Ok(SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(
+                Self::snapshot_manager_error(&err),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1927,6 +1927,28 @@ paths:
           $ref: "#/components/responses/404"
         "500":
           $ref: "#/components/responses/500"
+    delete:
+      summary: Delete snapshot
+      description: Idempotently delete one sandbox-created snapshot by ID or alias
+      tags: [snapshots]
+      security:
+        - ApiKeyAuth: []
+        - AccessTokenAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/snapshotID"
+      responses:
+        "204":
+          description: The snapshot was deleted or was already absent
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
 
   /v3/templates:
     post:
