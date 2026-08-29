@@ -659,17 +659,14 @@ fn write_generated_overlaybd_global_config(
 ) -> Result<()> {
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let log_path = config_dir.join("overlaybd.log");
-    let credential_config = match detect_docker_credential_config() {
-        Some(credential_path) => {
-            info!("found docker credential file; wiring overlaybd runtime to reuse it for registry auth");
-            serde_json::json!({
-                "mode": "file",
-                "path": credential_path.to_string_lossy(),
-                "timeout": 5
-            })
-        }
-        None => serde_json::json!({"mode": "", "path": "", "timeout": 1}),
-    };
+    let credential_path = detect_docker_credential_config();
+    if credential_path.is_some() {
+        info!(
+            "found docker credential file; wiring overlaybd runtime to reuse it for registry auth"
+        );
+    }
+    let (credential_file_path, credential_config) =
+        overlaybd_credential_fields(credential_path.as_deref());
     let p2p_config = match p2p_facade_address {
         Some(address) => serde_json::json!({
             "enable": true,
@@ -693,6 +690,7 @@ fn write_generated_overlaybd_global_config(
             "refillSize": 262144,
             "blockSize": 65536
         },
+        "credentialFilePath": credential_file_path,
         "credentialConfig": credential_config,
         "ioEngine": 0,
         "download": download,
@@ -720,6 +718,26 @@ fn write_generated_overlaybd_global_config(
         .with_context(|| format!("write overlaybd global config {}", path.display()))?;
     set_file_mode(path, 0o600)?;
     Ok(())
+}
+
+fn overlaybd_credential_fields(credential_path: Option<&Path>) -> (String, serde_json::Value) {
+    match credential_path {
+        Some(credential_path) => {
+            let credential_path = credential_path.to_string_lossy().into_owned();
+            (
+                credential_path.clone(),
+                serde_json::json!({
+                    "mode": "file",
+                    "path": credential_path,
+                    "timeout": 5
+                }),
+            )
+        }
+        None => (
+            String::new(),
+            serde_json::json!({"mode": "", "path": "", "timeout": 1}),
+        ),
+    }
 }
 
 fn overlaybd_runtime_oss_config(oss: &OssBackendConfig) -> Result<serde_json::Value> {
@@ -799,10 +817,10 @@ fn detect_docker_credential_config() -> Option<PathBuf> {
 mod tests {
     use super::{
         bundled_manifest, ensure_firecracker, ensure_kernel, ensure_tools, file_exists_nonempty,
-        overlaybd_runtime_oss_config, validate_explicit_file, version_output_mentions_exact_token,
-        write_generated_overlaybd_global_configs,
+        overlaybd_credential_fields, overlaybd_runtime_oss_config, validate_explicit_file,
+        version_output_mentions_exact_token, write_generated_overlaybd_global_configs,
     };
-    use overlaybd::config::DownloadConfig;
+    use overlaybd::config::{load_global_config, DownloadConfig};
 
     use crate::cfg::{
         AppConfig, MemorySnapshotConfig, OssBackendConfig, UblkOverlaybdTomlConfig, UblkTomlConfig,
@@ -1054,6 +1072,61 @@ mod tests {
     fn read_global_config_value(path: &std::path::Path) -> serde_json::Value {
         serde_json::from_slice(&std::fs::read(path).expect("read generated global config"))
             .expect("parse generated global config")
+    }
+
+    #[test]
+    fn overlaybd_credential_fields_keep_legacy_and_modern_modes_aligned() {
+        let (legacy_path, modern) = overlaybd_credential_fields(None);
+        assert!(legacy_path.is_empty());
+        assert_eq!(modern["mode"], "");
+        assert_eq!(modern["path"], legacy_path);
+        assert_eq!(modern["timeout"], 1);
+
+        let path = std::path::Path::new("/tmp/docker-config.json");
+        let (legacy_path, modern) = overlaybd_credential_fields(Some(path));
+        assert_eq!(legacy_path, path.to_string_lossy());
+        assert_eq!(modern["mode"], "file");
+        assert_eq!(modern["path"], legacy_path);
+        assert_eq!(modern["timeout"], 5);
+    }
+
+    #[test]
+    fn generated_overlaybd_global_configs_preserve_effective_credentials() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp.path().join("overlaybd-global.json");
+        let memory = temp.path().join("mem-overlaybd-global.json");
+        let config =
+            app_config_with_overlaybd_global_configs(temp.path(), rootfs.clone(), memory.clone());
+        let convert = config.resolved_overlaybd_convert_global_config_path();
+        let resize = config.resolved_overlaybd_resize_global_config_path();
+
+        write_generated_overlaybd_global_configs(&config, None).expect("write global configs");
+
+        for path in [&rootfs, &memory, &convert, &resize] {
+            let value = read_global_config_value(path);
+            assert_eq!(
+                value["credentialFilePath"],
+                value["credentialConfig"]["path"],
+                "legacy and modern credential paths differ in {}",
+                path.display()
+            );
+
+            let loaded = load_global_config(path).expect("reload generated global config");
+            assert_eq!(
+                loaded.credential_config.mode,
+                value["credentialConfig"]["mode"]
+                    .as_str()
+                    .expect("credential mode is a string"),
+                "effective credential mode changed while loading {}",
+                path.display()
+            );
+            assert_eq!(
+                loaded.credential_config.path,
+                loaded.credential_file_path,
+                "effective credential paths differ after loading {}",
+                path.display()
+            );
+        }
     }
 
     fn assert_download_json(value: &serde_json::Value, expected: &DownloadConfig) {
