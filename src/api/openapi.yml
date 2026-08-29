@@ -927,6 +927,11 @@ components:
 
     TemplateBuildRequestV3:
       properties:
+        alias:
+          description: Alias of the template. Deprecated, use name instead.
+          type: string
+          maxLength: 128
+          deprecated: true
         name:
           description: Name of the template. Can include a tag with colon separator (e.g. "my-template" or "my-template:v1"). If tag is included, it will be treated as if the tag was provided in the tags array.
           type: string

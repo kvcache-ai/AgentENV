@@ -7947,6 +7947,12 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<TemplateBuil
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct TemplateBuildRequestV3 {
+    /// Alias of the template. Deprecated, use name instead.
+    #[serde(rename = "alias")]
+    #[validate(length(max = 128), custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+
     /// Name of the template. Can include a tag with colon separator (e.g. \"my-template\" or \"my-template:v1\"). If tag is included, it will be treated as if the tag was provided in the tags array.
     #[serde(rename = "name")]
     #[validate(length(max = 128), custom(function = "check_xss_string"))]
@@ -7976,6 +7982,7 @@ impl TemplateBuildRequestV3 {
     #[allow(clippy::new_without_default, clippy::too_many_arguments)]
     pub fn new() -> TemplateBuildRequestV3 {
         TemplateBuildRequestV3 {
+            alias: None,
             name: None,
             tags: None,
             cpu_count: None,
@@ -7990,6 +7997,9 @@ impl TemplateBuildRequestV3 {
 impl std::fmt::Display for TemplateBuildRequestV3 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let params: Vec<Option<String>> = vec![
+            self.alias
+                .as_ref()
+                .map(|alias| ["alias".to_string(), alias.to_string()].join(",")),
             self.name
                 .as_ref()
                 .map(|name| ["name".to_string(), name.to_string()].join(",")),
@@ -8030,6 +8040,7 @@ impl std::str::FromStr for TemplateBuildRequestV3 {
         #[derive(Default)]
         #[allow(dead_code)]
         struct IntermediateRep {
+            pub alias: Vec<String>,
             pub name: Vec<String>,
             pub tags: Vec<Vec<String>>,
             pub cpu_count: Vec<u32>,
@@ -8056,6 +8067,8 @@ impl std::str::FromStr for TemplateBuildRequestV3 {
                 #[allow(clippy::match_single_binding)]
                 match key {
                     #[allow(clippy::redundant_clone)]
+                    #[allow(clippy::redundant_clone)]
+                    "alias" => intermediate_rep.alias.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     "name" => intermediate_rep.name.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     "tags" => return std::result::Result::Err("Parsing a container in this style is not supported in TemplateBuildRequestV3".to_string()),
                     #[allow(clippy::redundant_clone)]
@@ -8072,6 +8085,7 @@ impl std::str::FromStr for TemplateBuildRequestV3 {
 
         // Use the intermediate representation to return the struct
         std::result::Result::Ok(TemplateBuildRequestV3 {
+            alias: intermediate_rep.alias.into_iter().next(),
             name: intermediate_rep.name.into_iter().next(),
             tags: intermediate_rep.tags.into_iter().next(),
             cpu_count: intermediate_rep.cpu_count.into_iter().next(),

@@ -534,7 +534,7 @@ impl Templates<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::TemplateBuildRequestV3,
     ) -> Result<V3TemplatesPostResponse, ()> {
-        let Some(name) = body.name.clone() else {
+        let Some(name) = template_name_from_v3_request(body) else {
             return Ok(V3TemplatesPostResponse::Status400_BadRequest(Self::error(
                 400,
                 "template name must be provided",
@@ -797,9 +797,19 @@ impl Templates<()> for ApiImpl {
     }
 }
 
+/// The template name of a v3 build request: `name`, or the deprecated `alias`
+/// that E2B's schema still carries and the E2B Python SDK (2.10 and earlier)
+/// sends. Accepting it lets SDK clients build templates.
+fn template_name_from_v3_request(body: &models::TemplateBuildRequestV3) -> Option<String> {
+    body.name
+        .clone()
+        .or_else(|| body.alias.clone())
+        .filter(|name| !name.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::pipeline_build_error;
+    use super::{models, pipeline_build_error, template_name_from_v3_request};
 
     #[test]
     fn pipeline_build_error_maps_invalid_input_to_bad_request() {
@@ -823,5 +833,24 @@ mod tests {
 
         assert_eq!(error.code, 400);
         assert!(error.message.contains("dup"));
+    }
+
+    #[test]
+    fn v3_template_name_accepts_name_and_sdk_alias() {
+        let mut body = models::TemplateBuildRequestV3::new();
+        assert_eq!(template_name_from_v3_request(&body), None);
+        body.alias = Some("from-sdk".to_string());
+        assert_eq!(
+            template_name_from_v3_request(&body).as_deref(),
+            Some("from-sdk")
+        );
+        body.name = Some("explicit".to_string());
+        assert_eq!(
+            template_name_from_v3_request(&body).as_deref(),
+            Some("explicit")
+        );
+        body.name = Some(String::new());
+        body.alias = None;
+        assert_eq!(template_name_from_v3_request(&body), None);
     }
 }
