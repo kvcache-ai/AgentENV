@@ -232,6 +232,31 @@ func TestScheduleReturnsUnavailableWhenRegistryIsEmpty(t *testing.T) {
 	}
 }
 
+func TestScheduleRequiresFreshReadyHeartbeatWhenConfigured(t *testing.T) {
+	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL)
+	service := NewService(
+		zap.NewNop(),
+		registry,
+		NewStrategy("round_robin"),
+		NewInMemoryBindingStore(defaultObservedReportTTL),
+		WithRequireFreshHeartbeat(),
+	)
+
+	_, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected no placement before a fresh heartbeat, got %v", err)
+	}
+
+	registerObservedNodeForTest(t, service, "node-a", "svc-a")
+	response, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{})
+	if err != nil {
+		t.Fatalf("schedule after ready heartbeat failed: %v", err)
+	}
+	if response.GetNode().GetNodeId() != "node-a" {
+		t.Fatalf("unexpected scheduled node: %q", response.GetNode().GetNodeId())
+	}
+}
+
 func TestScheduleOnlyConsidersReadyNodes(t *testing.T) {
 	registry := NewAtomicNodeRegistry(nil, defaultObservedReportTTL)
 	// node-a: active, node-b: lingering

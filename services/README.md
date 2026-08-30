@@ -101,10 +101,12 @@ General config notes:
 - `scheduler.binding_ttl` controls how long sandbox-to-node bindings survive without a fresh `RecordAssignment` or heartbeat roster refresh.
 - `scheduler.redis_addr` selects Redis-backed sandbox binding storage when set; when empty, the scheduler uses the in-memory binding store. It accepts either `host:port` or a Redis URL such as `redis://[:password@]host:6379/db`.
 - `--query-only` starts a read-only scheduler that supports only `LookupNode`; it requires `scheduler.redis_addr` and does not need node discovery config.
+- `scheduler.leader_election.enabled` runs full Scheduler replicas as a single-active Kubernetes Lease group. It requires Redis-backed bindings, Kubernetes discovery, `lease_name`, `lease_namespace`, a unique per-Pod `identity`, and duration strings satisfying `lease_duration > renew_deadline > retry_period > 0`. Followers report gRPC health as not serving and reject every non-health RPC.
 - `scheduler.artifact_store_capacity` controls how many distinct P2P artifact keys the in-memory artifact index keeps before LRU eviction; defaults to `1000000`.
 - `scheduler.artifact_lookup_node_limit` controls how many node IDs a P2P artifact lookup returns; values `<= 0` return all matching nodes.
 - `SCHEDULER_BINDING_TTL=<duration>` overrides `scheduler.binding_ttl` from the environment.
 - `SCHEDULER_REDIS_ADDR=<addr>` overrides `scheduler.redis_addr` from the environment.
+- `SCHEDULER_LEADER_ELECTION_IDENTITY=<identity>` supplies the unique replica identity, normally from the Kubernetes Pod name through the Downward API.
 - `SCHEDULER_ARTIFACT_STORE_CAPACITY=<count>` overrides `scheduler.artifact_store_capacity` from the environment.
 - `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT=<count>` overrides `scheduler.artifact_lookup_node_limit` from the environment.
 
@@ -290,7 +292,7 @@ Operational notes:
 - The scheduler uses in-cluster Kubernetes config and watches EndpointSlices plus Pods for service discovery.
 - Only serving, non-terminating DaemonSet Pods are schedulable. Use `no_schedule_pod_selector` for drain/no-new-work labels and `ignore_pod_selector` for Pods that should be completely hidden from discovery.
 - For the default `memory` binding store, `scheduler` should stay single-replica because sandbox bindings are process-local.
-- For high availability, run one primary scheduler with `scheduler.redis_addr` set and multiple query-only scheduler replicas started with `--query-only` against the same Redis. Point gateways at the primary with `gateway.scheduler_addr` and at the query-only service with `gateway.query_only_scheduler_addr`. The primary writes sandbox bindings to Redis while query-only replicas continue to serve data-plane `LookupNode` during primary restarts or upgrades. This HA mode is intentionally data-plane only: requests that proxy to existing sandboxes can keep routing, but control-plane operations that need the primary scheduler, such as creating new sandboxes, scheduling, assignment writes, node listing, node detail resolution, and P2P scheduler APIs, still fail while the primary scheduler is unavailable. Artifact store state is still in-memory and is not covered by this HA mode.
+- For high availability, run at least two full Scheduler replicas with Kubernetes leader election and Redis-backed bindings, plus multiple query-only replicas started with `--query-only` against the same Redis. Point runtime nodes and gateway control-plane calls at a Service that publishes only the healthy leader, and point `gateway.query_only_scheduler_addr` at the query-only Service. Existing-sandbox `LookupNode` remains available during leader replacement; new scheduling resumes after a follower acquires the Lease and receives fresh READY node heartbeats. Observed-node state and the P2P artifact index are intentionally ephemeral, so followers do not serve control RPCs and a new leader does not place work from a stale resource view.
 - The gateway is intentionally left as ClusterIP by default; attach an Ingress or LoadBalancer based on your environment.
 
 ## gRPC API

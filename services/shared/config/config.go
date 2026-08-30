@@ -32,6 +32,16 @@ type SchedulerDiscoveryConfig struct {
 	Kubernetes SchedulerDiscoveryKubernetesConfig `json:"kubernetes"`
 }
 
+type SchedulerLeaderElectionConfig struct {
+	Enabled        bool          `json:"enabled"`
+	LeaseName      string        `json:"lease_name"`
+	LeaseNamespace string        `json:"lease_namespace"`
+	Identity       string        `json:"identity"`
+	LeaseDuration  time.Duration `json:"lease_duration"`
+	RenewDeadline  time.Duration `json:"renew_deadline"`
+	RetryPeriod    time.Duration `json:"retry_period"`
+}
+
 // NodeResourceLimit defines per-node resource thresholds for scheduling
 // eligibility. A node exceeding any configured limit is excluded from
 // scheduling candidates. Nil (absent) fields impose no limit.
@@ -58,17 +68,18 @@ type NodeResourceLimit struct {
 }
 
 type SchedulerConfig struct {
-	GRPCListenAddr          string                   `json:"grpc_listen_addr"`
-	MetricsListenAddr       string                   `json:"metrics_listen_addr"`
-	Strategy                string                   `json:"strategy"`
-	ReportTTL               time.Duration            `json:"report_ttl"`
-	BindingTTL              time.Duration            `json:"binding_ttl"`
-	RedisAddr               string                   `json:"redis_addr"`
-	ArtifactStoreCapacity   int                      `json:"artifact_store_capacity"`
-	ArtifactLookupNodeLimit int                      `json:"artifact_lookup_node_limit"`
-	Nodes                   []Node                   `json:"nodes"`
-	Discovery               SchedulerDiscoveryConfig `json:"discovery"`
-	NodeResourceLimit       *NodeResourceLimit       `json:"node_resource_limit"`
+	GRPCListenAddr          string                        `json:"grpc_listen_addr"`
+	MetricsListenAddr       string                        `json:"metrics_listen_addr"`
+	Strategy                string                        `json:"strategy"`
+	ReportTTL               time.Duration                 `json:"report_ttl"`
+	BindingTTL              time.Duration                 `json:"binding_ttl"`
+	RedisAddr               string                        `json:"redis_addr"`
+	ArtifactStoreCapacity   int                           `json:"artifact_store_capacity"`
+	ArtifactLookupNodeLimit int                           `json:"artifact_lookup_node_limit"`
+	Nodes                   []Node                        `json:"nodes"`
+	Discovery               SchedulerDiscoveryConfig      `json:"discovery"`
+	LeaderElection          SchedulerLeaderElectionConfig `json:"leader_election"`
+	NodeResourceLimit       *NodeResourceLimit            `json:"node_resource_limit"`
 }
 
 func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
@@ -83,7 +94,16 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		ArtifactLookupNodeLimit *int                      `json:"artifact_lookup_node_limit"`
 		Nodes                   *[]Node                   `json:"nodes"`
 		Discovery               *SchedulerDiscoveryConfig `json:"discovery"`
-		NodeResourceLimit       *NodeResourceLimit        `json:"node_resource_limit"`
+		LeaderElection          *struct {
+			Enabled        *bool           `json:"enabled"`
+			LeaseName      *string         `json:"lease_name"`
+			LeaseNamespace *string         `json:"lease_namespace"`
+			Identity       *string         `json:"identity"`
+			LeaseDuration  json.RawMessage `json:"lease_duration"`
+			RenewDeadline  json.RawMessage `json:"renew_deadline"`
+			RetryPeriod    json.RawMessage `json:"retry_period"`
+		} `json:"leader_election"`
+		NodeResourceLimit *NodeResourceLimit `json:"node_resource_limit"`
 	}
 
 	parsed := wire{}
@@ -105,6 +125,41 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.Discovery != nil {
 		s.Discovery = *parsed.Discovery
+	}
+	if parsed.LeaderElection != nil {
+		leader := parsed.LeaderElection
+		if leader.Enabled != nil {
+			s.LeaderElection.Enabled = *leader.Enabled
+		}
+		if leader.LeaseName != nil {
+			s.LeaderElection.LeaseName = *leader.LeaseName
+		}
+		if leader.LeaseNamespace != nil {
+			s.LeaderElection.LeaseNamespace = *leader.LeaseNamespace
+		}
+		if leader.Identity != nil {
+			s.LeaderElection.Identity = *leader.Identity
+		}
+		parseDuration := func(raw json.RawMessage, field string, target *time.Duration) error {
+			if len(bytes.TrimSpace(raw)) == 0 {
+				return nil
+			}
+			duration, err := parseSchedulerDuration(raw, field)
+			if err != nil {
+				return err
+			}
+			*target = duration
+			return nil
+		}
+		if err := parseDuration(leader.LeaseDuration, "scheduler.leader_election.lease_duration", &s.LeaderElection.LeaseDuration); err != nil {
+			return err
+		}
+		if err := parseDuration(leader.RenewDeadline, "scheduler.leader_election.renew_deadline", &s.LeaderElection.RenewDeadline); err != nil {
+			return err
+		}
+		if err := parseDuration(leader.RetryPeriod, "scheduler.leader_election.retry_period", &s.LeaderElection.RetryPeriod); err != nil {
+			return err
+		}
 	}
 	if parsed.NodeResourceLimit != nil {
 		s.NodeResourceLimit = parsed.NodeResourceLimit
@@ -287,6 +342,11 @@ func defaultConfig(service string) Config {
 			BindingTTL:              30 * time.Second,
 			ArtifactStoreCapacity:   defaultSchedulerArtifactStoreCapacity,
 			ArtifactLookupNodeLimit: 0,
+			LeaderElection: SchedulerLeaderElectionConfig{
+				LeaseDuration: 15 * time.Second,
+				RenewDeadline: 10 * time.Second,
+				RetryPeriod:   2 * time.Second,
+			},
 			Nodes: []Node{
 				{ID: "local-node", Endpoint: "http://127.0.0.1:8000"},
 			},
@@ -320,6 +380,7 @@ func overrideWithEnv(cfg *Config) error {
 	set("SCHEDULER_METRICS_LISTEN_ADDR", &cfg.Scheduler.MetricsListenAddr)
 	set("SCHEDULER_STRATEGY", &cfg.Scheduler.Strategy)
 	set("SCHEDULER_REDIS_ADDR", &cfg.Scheduler.RedisAddr)
+	set("SCHEDULER_LEADER_ELECTION_IDENTITY", &cfg.Scheduler.LeaderElection.Identity)
 	set("GATEWAY_HTTP_LISTEN_ADDR", &cfg.Gateway.HTTPListenAddr)
 	set("GATEWAY_METRICS_LISTEN_ADDR", &cfg.Gateway.MetricsListenAddr)
 	set("GATEWAY_SCHEDULER_ADDR", &cfg.Gateway.SchedulerAddr)
@@ -442,6 +503,24 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 				return errors.New("scheduler --query-only requires scheduler.redis_addr")
 			}
 			return nil
+		}
+		if c.Scheduler.LeaderElection.Enabled {
+			leader := c.Scheduler.LeaderElection
+			if strings.TrimSpace(c.Scheduler.RedisAddr) == "" {
+				return errors.New("scheduler leader election requires scheduler.redis_addr")
+			}
+			if strings.ToLower(strings.TrimSpace(c.Scheduler.Discovery.Mode)) != "kubernetes" {
+				return errors.New("scheduler leader election requires kubernetes discovery")
+			}
+			if strings.TrimSpace(leader.LeaseName) == "" || strings.TrimSpace(leader.LeaseNamespace) == "" {
+				return errors.New("scheduler leader election requires lease_name and lease_namespace")
+			}
+			if strings.TrimSpace(leader.Identity) == "" {
+				return errors.New("scheduler leader election requires a unique identity")
+			}
+			if leader.LeaseDuration <= leader.RenewDeadline || leader.RenewDeadline <= leader.RetryPeriod || leader.RetryPeriod <= 0 {
+				return errors.New("scheduler leader election requires lease_duration > renew_deadline > retry_period > 0")
+			}
 		}
 		if c.Scheduler.ArtifactStoreCapacity <= 0 {
 			return errors.New("scheduler.artifact_store_capacity must be greater than zero")

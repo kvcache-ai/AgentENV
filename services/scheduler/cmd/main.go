@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
 
@@ -48,43 +49,78 @@ func main() {
 	store, closeStore := createBindingStore(logger, cfg)
 	defer closeStore()
 
-	g := grpc.NewServer(grpc.UnaryInterceptor(scheduler.MetricsUnaryInterceptor()))
+	leaderElectionEnabled := !*queryOnly && cfg.Scheduler.LeaderElection.Enabled
+	gate := newLeadershipGate(!leaderElectionEnabled)
+	g := grpc.NewServer(grpc.ChainUnaryInterceptor(
+		scheduler.MetricsUnaryInterceptor(),
+		gate.unaryServerInterceptor(),
+	))
+	hs := health.NewServer()
+	setServingStatus := func(serving bool) {
+		status := grpc_health_v1.HealthCheckResponse_NOT_SERVING
+		if serving {
+			status = grpc_health_v1.HealthCheckResponse_SERVING
+		}
+		hs.SetServingStatus("", status)
+		hs.SetServingStatus(schedulerv1.Scheduler_ServiceDesc.ServiceName, status)
+	}
+	setServingStatus(!leaderElectionEnabled)
+
+	var runLeaderWork func(context.Context)
 	if *queryOnly {
 		svc := scheduler.NewQueryOnlyService(logger, store)
 		schedulerv1.RegisterSchedulerServer(g, svc)
 		logger.Info("scheduler query-only service enabled", zap.String("redis_addr", cfg.Scheduler.RedisAddr))
 	} else {
 		registry := scheduler.NewAtomicNodeRegistry(nil, cfg.Scheduler.ReportTTL)
-		switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode)) {
-		case "kubernetes":
-			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry)
-		default:
-			nodes := make([]scheduler.Node, 0, len(cfg.Scheduler.Nodes))
-			for _, n := range cfg.Scheduler.Nodes {
-				nodes = append(nodes, scheduler.Node{ID: n.ID, Endpoint: n.Endpoint})
-			}
-			registry.Set(nodes, nil)
-		}
-
-		svc := scheduler.NewService(
-			logger,
-			registry,
-			scheduler.NewStrategy(cfg.Scheduler.Strategy),
-			store,
+		serviceOptions := []scheduler.ServiceOption{
 			scheduler.WithArtifactStore(scheduler.NewInMemoryArtifactStore(
 				cfg.Scheduler.ArtifactStoreCapacity,
 				cfg.Scheduler.ArtifactLookupNodeLimit,
 			)),
 			scheduler.WithNodeResourceLimit(cfg.Scheduler.NodeResourceLimit),
+		}
+		if leaderElectionEnabled {
+			serviceOptions = append(serviceOptions, scheduler.WithRequireFreshHeartbeat())
+		}
+		svc := scheduler.NewService(
+			logger,
+			registry,
+			scheduler.NewStrategy(cfg.Scheduler.Strategy),
+			store,
+			serviceOptions...,
 		)
-		go svc.RunObservedNodesMetrics(sigCtx, 15*time.Second)
 		schedulerv1.RegisterSchedulerServer(g, svc)
+
+		runLeaderWork = func(ctx context.Context) {
+			switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode)) {
+			case "kubernetes":
+				go runKubernetesDiscoveryWithRetry(ctx, logger, cfg.Scheduler.Discovery.Kubernetes, registry)
+			default:
+				nodes := make([]scheduler.Node, 0, len(cfg.Scheduler.Nodes))
+				for _, n := range cfg.Scheduler.Nodes {
+					nodes = append(nodes, scheduler.Node{ID: n.ID, Endpoint: n.Endpoint})
+				}
+				registry.Set(nodes, nil)
+			}
+			go svc.RunObservedNodesMetrics(ctx, 15*time.Second)
+			<-ctx.Done()
+		}
 	}
 
-	hs := health.NewServer()
-	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
-	hs.SetServingStatus(schedulerv1.Scheduler_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
 	grpc_health_v1.RegisterHealthServer(g, hs)
+
+	var leaderClient kubernetes.Interface
+	if leaderElectionEnabled {
+		restConfig, err := rest.InClusterConfig()
+		if err != nil {
+			logger.Fatal("load in-cluster config for scheduler leader election failed", zap.Error(err))
+		}
+		leaderClient, err = kubernetes.NewForConfig(restConfig)
+		if err != nil {
+			logger.Fatal("create Kubernetes client for scheduler leader election failed", zap.Error(err))
+		}
+	}
 
 	lis, err := net.Listen("tcp", cfg.Scheduler.GRPCListenAddr)
 	if err != nil {
@@ -118,18 +154,47 @@ func main() {
 		serveErrCh <- nil
 	}()
 
+	leadershipLostCh := make(chan struct{}, 1)
+	if leaderElectionEnabled {
+		go runLeaderElection(
+			sigCtx,
+			logger,
+			leaderClient,
+			cfg.Scheduler.LeaderElection,
+			func(leaderCtx context.Context) {
+				gate.setLeader(true)
+				setServingStatus(true)
+				runLeaderWork(leaderCtx)
+			},
+			func() {
+				gate.setLeader(false)
+				setServingStatus(false)
+				if sigCtx.Err() == nil {
+					select {
+					case leadershipLostCh <- struct{}{}:
+					default:
+					}
+				}
+			},
+		)
+	} else if !*queryOnly {
+		go runLeaderWork(sigCtx)
+	}
+
 	select {
 	case err := <-serveErrCh:
 		if err != nil {
 			logger.Fatal("serve failed", zap.Error(err))
 		}
 		return
+	case <-leadershipLostCh:
+		logger.Error("scheduler leadership lost; shutting down to discard stale observed state")
+		stop()
 	case <-sigCtx.Done():
 	}
 
 	logger.Info("scheduler shutdown signal received")
-	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
-	hs.SetServingStatus(schedulerv1.Scheduler_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+	setServingStatus(false)
 
 	gracefulStopDone := make(chan struct{})
 	go func() {

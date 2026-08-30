@@ -17,12 +17,13 @@ import (
 
 type Service struct {
 	schedulerv1.UnimplementedSchedulerServer
-	logger        *zap.Logger
-	nodes         NodeRegistry
-	strategy      Strategy
-	store         BindingStore
-	artifacts     ArtifactStore
-	resourceLimit *config.NodeResourceLimit
+	logger                *zap.Logger
+	nodes                 NodeRegistry
+	strategy              Strategy
+	store                 BindingStore
+	artifacts             ArtifactStore
+	resourceLimit         *config.NodeResourceLimit
+	requireFreshHeartbeat bool
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -61,6 +62,15 @@ func WithArtifactStore(store ArtifactStore) ServiceOption {
 	}
 }
 
+// WithRequireFreshHeartbeat prevents a newly elected scheduler from placing
+// sandboxes until a node has rebuilt its in-memory resource view through a
+// fresh READY heartbeat.
+func WithRequireFreshHeartbeat() ServiceOption {
+	return func(s *Service) {
+		s.requireFreshHeartbeat = true
+	}
+}
+
 type QueryOnlyService struct {
 	schedulerv1.UnimplementedSchedulerServer
 	logger *zap.Logger
@@ -86,10 +96,19 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 
 	discovered := s.nodes.Snapshot( /* allowLingering */ false)
 	rich := make([]RichNode, 0, len(discovered))
+	now := time.Now()
 	for _, n := range discovered {
+		snapshot := s.nodes.PeekObserved(n.ID)
+		if s.requireFreshHeartbeat {
+			observed, ok := s.nodes.GetObserved(n.ID, "", now)
+			if !ok || observed.GetSnapshot().GetStatus() != schedulerv1.NodeStatus_NODE_STATUS_READY {
+				continue
+			}
+			snapshot = observed.GetSnapshot()
+		}
 		rich = append(rich, RichNode{
 			Node:     n,
-			Snapshot: s.nodes.PeekObserved(n.ID),
+			Snapshot: snapshot,
 		})
 	}
 

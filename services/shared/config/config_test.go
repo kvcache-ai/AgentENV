@@ -79,6 +79,110 @@ func TestLoadSchedulerRejectsQueryOnlyWithoutRedis(t *testing.T) {
 	}
 }
 
+func TestLoadSchedulerAcceptsLeaderElectionWithRedisAndKubernetesDiscovery(t *testing.T) {
+	t.Setenv("SCHEDULER_LEADER_ELECTION_IDENTITY", "scheduler-0")
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"scheduler": {
+			"redis_addr": "redis.agentenv-system.svc:6379",
+			"leader_election": {
+				"enabled": true,
+				"lease_name": "agentenv-scheduler",
+				"lease_namespace": "agentenv-system",
+				"lease_duration": "20s",
+				"renew_deadline": "12s",
+				"retry_period": "3s"
+			},
+			"discovery": {
+				"mode": "kubernetes",
+				"kubernetes": {
+					"namespace": "agentenv-system",
+					"service_name": "agentenv-nodes",
+					"port": 8000
+				}
+			}
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	cfg, err := LoadScheduler(path, false)
+	if err != nil {
+		t.Fatalf("load leader-election scheduler config failed: %v", err)
+	}
+	if cfg.Scheduler.LeaderElection.Identity != "scheduler-0" {
+		t.Fatalf("unexpected leader identity: %q", cfg.Scheduler.LeaderElection.Identity)
+	}
+	if cfg.Scheduler.LeaderElection.LeaseDuration != 20*time.Second || cfg.Scheduler.LeaderElection.RenewDeadline != 12*time.Second || cfg.Scheduler.LeaderElection.RetryPeriod != 3*time.Second {
+		t.Fatalf("unexpected leader election timings: %#v", cfg.Scheduler.LeaderElection)
+	}
+}
+
+func TestLoadSchedulerRejectsLeaderElectionWithoutRedis(t *testing.T) {
+	t.Setenv("SCHEDULER_LEADER_ELECTION_IDENTITY", "scheduler-0")
+	path := writeLeaderElectionConfig(t, "", "kubernetes", "15s", "10s", "2s")
+	if _, err := LoadScheduler(path, false); err == nil {
+		t.Fatal("expected leader election without redis_addr to fail")
+	}
+}
+
+func TestLoadSchedulerRejectsLeaderElectionWithoutKubernetesDiscovery(t *testing.T) {
+	t.Setenv("SCHEDULER_LEADER_ELECTION_IDENTITY", "scheduler-0")
+	path := writeLeaderElectionConfig(t, "redis:6379", "static", "15s", "10s", "2s")
+	if _, err := LoadScheduler(path, false); err == nil {
+		t.Fatal("expected leader election with static discovery to fail")
+	}
+}
+
+func TestLoadSchedulerRejectsInvalidLeaderElectionTiming(t *testing.T) {
+	t.Setenv("SCHEDULER_LEADER_ELECTION_IDENTITY", "scheduler-0")
+	path := writeLeaderElectionConfig(t, "redis:6379", "kubernetes", "10s", "10s", "2s")
+	if _, err := LoadScheduler(path, false); err == nil {
+		t.Fatal("expected invalid leader election timing to fail")
+	}
+}
+
+func TestLoadQueryOnlySchedulerIgnoresLeaderIdentity(t *testing.T) {
+	path := writeLeaderElectionConfig(t, "redis:6379", "kubernetes", "15s", "10s", "2s")
+	if _, err := LoadScheduler(path, true); err != nil {
+		t.Fatalf("query-only scheduler should not participate in leader election: %v", err)
+	}
+}
+
+func writeLeaderElectionConfig(t *testing.T, redisAddr string, discoveryMode string, leaseDuration string, renewDeadline string, retryPeriod string) string {
+	t.Helper()
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := fmt.Sprintf(`{
+		"scheduler": {
+			"redis_addr": %q,
+			"nodes": [{"id": "node-a", "endpoint": "http://node-a:8000"}],
+			"leader_election": {
+				"enabled": true,
+				"lease_name": "agentenv-scheduler",
+				"lease_namespace": "agentenv-system",
+				"lease_duration": %q,
+				"renew_deadline": %q,
+				"retry_period": %q
+			},
+			"discovery": {
+				"mode": %q,
+				"kubernetes": {
+					"namespace": "agentenv-system",
+					"service_name": "agentenv-nodes",
+					"port": 8000
+				}
+			}
+		}
+	}`, redisAddr, leaseDuration, renewDeadline, retryPeriod, discoveryMode)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+	return path
+}
+
 func TestValidateRejectsUnsupportedLogFormat(t *testing.T) {
 	cfg := defaultConfig("gateway")
 	cfg.LogFormat = "pretty"
