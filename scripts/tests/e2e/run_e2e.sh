@@ -11,6 +11,7 @@
 #   AENV_TEMPLATE_ID  - Pre-existing template to use (skips template creation)
 #   E2E_DEFAULT_USER_IMAGE - Default fromImage for template builds
 #   E2E_TEMPLATE_USER_IMAGE - Optional fromImage override for the base template build
+#   E2E_TEMPLATE_BUILD_TIMEOUT - Base template build timeout in seconds (default: 120)
 #   SKIP_BUILD            - Set to 1 to skip the build step
 #   SUITE_FILTER          - Run only suites matching this glob (e.g. "02*")
 #   E2E_MODE              - Runtime mode: single-node, compose, or k8s
@@ -38,6 +39,7 @@ source "${SCRIPT_DIR}/lib/helpers.sh"
 LOG_TAG="E2E"
 export E2E_DEFAULT_USER_IMAGE="${E2E_DEFAULT_USER_IMAGE:-ghcr.io/linuxserver/baseimage-ubuntu:noble}"
 export E2E_TEMPLATE_USER_IMAGE="${E2E_TEMPLATE_USER_IMAGE:-$E2E_DEFAULT_USER_IMAGE}"
+: "${E2E_TEMPLATE_BUILD_TIMEOUT:=120}"
 
 _E2E_PHASE="initialization"
 report_unexpected_error() {
@@ -122,7 +124,7 @@ if [[ "${_E2E_TEMPLATE_FROM_USER:-0}" != "1" ]]; then
   track_template "$E2E_TEMPLATE_ID"
 
   log "Waiting for template build to complete (id: ${E2E_TEMPLATE_ID}) ..."
-  wait_for_template_build "$E2E_TEMPLATE_ID" 120 "$E2E_TEMPLATE_BUILD_ID" || die "Template build failed or timed out"
+  wait_for_template_build "$E2E_TEMPLATE_ID" "$E2E_TEMPLATE_BUILD_TIMEOUT" "$E2E_TEMPLATE_BUILD_ID" || die "Template build failed or timed out"
   log "Template build ready."
 
   export AENV_TEMPLATE_ID="$E2E_TEMPLATE_NAME"

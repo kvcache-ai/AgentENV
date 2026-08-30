@@ -128,5 +128,8 @@ jobs:
           else
             SKIP_BUILD=1 make ${{ matrix.make_target }} PROFILE=debug
           fi
+      - name: P2P multi-node regression test
+        if: ${{ matrix.e2e_name == 'docker-compose' }}
+        run: SKIP_BUILD=1 make test-e2e-p2p PROFILE=debug
       - uses: ./.github/actions/sandbox-artifacts-cleanup
         if: always()
