@@ -12,9 +12,8 @@ pub struct Volume {
     pub name: String,
     #[serde(default)]
     pub mode: Option<String>,
-    #[serde(default, rename = "sizeMB")]
+    #[serde(rename = "sizeMB")]
     pub size_mb: u64,
-    #[serde(default)]
     pub status: String,
 }
 

@@ -118,6 +118,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         shutdown_outcome: tokio::sync::OnceCell::new(),
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
+        volume_manager: None,
     })
 }
 
@@ -129,11 +130,43 @@ enum StoreAction {
 type StoreHook = Arc<dyn Fn(&SandboxMetadata) + Send + Sync>;
 type StoreHookSlot = StdMutex<Option<StoreHook>>;
 
+#[derive(Clone)]
+struct StoreClaimGate {
+    claimed: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
+}
+
+impl StoreClaimGate {
+    fn new() -> Self {
+        Self {
+            claimed: Arc::new(tokio::sync::Barrier::new(2)),
+            release: Arc::new(tokio::sync::Barrier::new(2)),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct StoreListGate {
+    listed: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
+}
+
+impl StoreListGate {
+    fn new() -> Self {
+        Self {
+            listed: Arc::new(tokio::sync::Barrier::new(2)),
+            release: Arc::new(tokio::sync::Barrier::new(2)),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ScriptedStoreControl {
     add_actions: StdMutex<VecDeque<StoreAction>>,
     update_if_state_actions: StdMutex<VecDeque<StoreAction>>,
     on_add: StoreHookSlot,
+    claim_gate: StdMutex<Option<StoreClaimGate>>,
+    list_gate: StdMutex<Option<StoreListGate>>,
 }
 
 impl ScriptedStoreControl {
@@ -153,6 +186,28 @@ impl ScriptedStoreControl {
 
     fn set_on_add(&self, hook: StoreHook) {
         *self.on_add.lock().expect("on_add mutex poisoned") = Some(hook);
+    }
+
+    fn set_claim_gate(&self, gate: StoreClaimGate) {
+        *self.claim_gate.lock().expect("claim gate mutex poisoned") = Some(gate);
+    }
+
+    fn take_claim_gate(&self) -> Option<StoreClaimGate> {
+        self.claim_gate
+            .lock()
+            .expect("claim gate mutex poisoned")
+            .take()
+    }
+
+    fn set_list_gate(&self, gate: StoreListGate) {
+        *self.list_gate.lock().expect("list gate mutex poisoned") = Some(gate);
+    }
+
+    fn list_gate(&self) -> Option<StoreListGate> {
+        self.list_gate
+            .lock()
+            .expect("list gate mutex poisoned")
+            .clone()
     }
 
     fn take_action(queue: &StdMutex<VecDeque<StoreAction>>) -> StoreAction {
@@ -223,14 +278,29 @@ impl MetadataStore for ScriptedStore {
     where
         F: FnOnce(&mut SandboxMetadata) + Send,
     {
-        match ScriptedStoreControl::take_action(&self.control.update_if_state_actions) {
+        let result = match ScriptedStoreControl::take_action(&self.control.update_if_state_actions)
+        {
             StoreAction::Delegate => {
                 self.inner
                     .update_if_state(sandbox_id, expected_states, update)
                     .await
             }
             StoreAction::Fail(err) => Err(err),
+        };
+
+        if result.as_ref().is_ok_and(|update| {
+            matches!(
+                update.current.state,
+                SandboxState::Pausing | SandboxState::Killing
+            )
+        }) {
+            if let Some(gate) = self.control.take_claim_gate() {
+                gate.claimed.wait().await;
+                gate.release.wait().await;
+            }
         }
+
+        result
     }
 
     async fn get(&self, sandbox_id: &SandboxId) -> StdResult<Option<SandboxMetadata>, StoreError> {
@@ -266,7 +336,14 @@ impl MetadataStore for ScriptedStore {
         &self,
         now: std::time::SystemTime,
     ) -> StdResult<Vec<SandboxMetadata>, StoreError> {
-        self.inner.list_expired(now).await
+        let expired = self.inner.list_expired(now).await?;
+        if !expired.is_empty() {
+            if let Some(gate) = self.control.list_gate() {
+                gate.listed.wait().await;
+                gate.release.wait().await;
+            }
+        }
+        Ok(expired)
     }
 
     async fn list_ids(&self) -> StdResult<Vec<SandboxId>, StoreError> {
@@ -1541,41 +1618,6 @@ async fn pause_resume_transitions_and_is_idempotent() -> Result<()> {
 }
 
 #[tokio::test]
-async fn delete_snapshots_volume_mounts_before_teardown() -> Result<()> {
-    setup();
-    let behavior = Arc::new(MockBehavior::new());
-    let operations = Arc::new(StdMutex::new(Vec::new()));
-    for operation in [MockOperation::Pause, MockOperation::Stop] {
-        let operations = Arc::clone(&operations);
-        behavior.set_on_operation(
-            operation,
-            Arc::new(move || {
-                operations
-                    .lock()
-                    .expect("operation log mutex poisoned")
-                    .push(operation);
-            }),
-        );
-    }
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
-            .await;
-    let mut request = create_request(Some(60), &[]);
-    request
-        .volume_mounts
-        .insert("/mnt/data".to_owned(), "vol_test".to_owned());
-    let created = orchestrator.create_sandbox(request).await?;
-
-    orchestrator.delete_sandbox(created.id).await?;
-
-    assert_eq!(
-        *operations.lock().expect("operation log mutex poisoned"),
-        vec![MockOperation::Pause, MockOperation::Stop]
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn pause_succeeds_and_releases_metrics_even_when_stop_fails_after_snapshot() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
@@ -1906,95 +1948,6 @@ async fn capture_snapshot_returns_snapshot_and_preserves_running_sandbox() -> Re
     .await;
 
     orchestrator.delete_sandbox(sandbox_id).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn snapshot_volume_mounts_preserves_running_sandbox_and_allows_retry() -> Result<()> {
-    setup();
-    let behavior = Arc::new(MockBehavior::new());
-    behavior.push_action(
-        MockOperation::SnapshotVolumes,
-        MockAction::Fail {
-            message: "volume snapshot staging failed".to_string(),
-        },
-    );
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
-    let mut request = create_request(Some(60), &[]);
-    request
-        .volume_mounts
-        .insert("/mnt/data".to_owned(), "vol_test".to_owned());
-    let created = orchestrator.create_sandbox(request).await?;
-
-    let error = orchestrator
-        .snapshot_volume_mounts(created.id)
-        .await
-        .expect_err("recoverable volume snapshot failure should be returned");
-    assert!(matches!(
-        error,
-        OrchestratorError::SandboxOperationFailed {
-            operation: SandboxOperation::SnapshotVolumes,
-            ..
-        }
-    ));
-    assert_eq!(
-        orchestrator
-            .get_sandbox(&created.id)
-            .await?
-            .expect("sandbox remains after recoverable failure")
-            .state,
-        SandboxState::Running
-    );
-
-    orchestrator.snapshot_volume_mounts(created.id).await?;
-    assert_eq!(
-        orchestrator
-            .get_sandbox(&created.id)
-            .await?
-            .expect("sandbox remains after volume snapshot")
-            .state,
-        SandboxState::Running
-    );
-    assert_proxy_ready(&orchestrator, &created.id).await?;
-
-    orchestrator.delete_sandbox(created.id).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn snapshot_volume_mounts_terminal_failure_removes_sandbox() -> Result<()> {
-    setup();
-    let behavior = Arc::new(MockBehavior::new());
-    behavior.push_action(
-        MockOperation::SnapshotVolumes,
-        MockAction::FailTerminal {
-            message: "volume upper was sealed but publication failed".to_string(),
-        },
-    );
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
-            .await;
-    let mut request = create_request(Some(60), &[]);
-    request
-        .volume_mounts
-        .insert("/mnt/data".to_owned(), "vol_test".to_owned());
-    let created = orchestrator.create_sandbox(request).await?;
-
-    let error = orchestrator
-        .snapshot_volume_mounts(created.id)
-        .await
-        .expect_err("terminal volume snapshot failure should be returned");
-    assert!(matches!(
-        error,
-        OrchestratorError::SandboxOperationFailed {
-            operation: SandboxOperation::SnapshotVolumes,
-            ..
-        }
-    ));
-    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
-    assert_proxy_not_found(&orchestrator, &created.id).await?;
-    assert_eq!(behavior.stop_calls(), 1);
     Ok(())
 }
 
@@ -2751,10 +2704,7 @@ async fn orchestrator_list_empty_returns_empty() -> Result<()> {
     let filtered = orchestrator
         .list_sandboxes_filtered(SandboxListFilter {
             states: Some(vec![SandboxState::Running]),
-            excluded_states: None,
-            user_metadata: None,
-            started_after: None,
-            template: None,
+            ..SandboxListFilter::matches_all()
         })
         .await?;
     assert!(
@@ -2985,6 +2935,277 @@ async fn auto_evict_sandboxes_skips_non_running_and_non_expired_and_continues_on
 }
 
 #[tokio::test]
+async fn auto_evict_revalidates_expiry_after_listing() -> Result<()> {
+    setup();
+
+    for timeout_action in [SandboxTimeoutAction::Pause, SandboxTimeoutAction::Delete] {
+        let cutoff = std::time::SystemTime::now();
+        let sandbox_id = SandboxId::new();
+        // Inject a renewal immediately before auto-eviction's first metadata
+        // CAS, after list_expired has returned its stale candidate.
+        let store = RaceBeforeUpdateStore::new(Duration::from_secs(60));
+        store
+            .add(SandboxMetadata {
+                id: sandbox_id,
+                state: SandboxState::Running,
+                created_at: cutoff,
+                timeout: Some(Duration::from_secs(1)),
+                expires_at: cutoff.checked_sub(Duration::from_secs(1)),
+                timeout_action,
+                ..Default::default()
+            })
+            .await?;
+
+        let orchestrator = make_orchestrator_without_background(store);
+        let evicted = orchestrator.evict_expired_sandboxes().await?;
+        assert!(
+            evicted.is_empty(),
+            "renewed sandbox must not be reported as evicted for {timeout_action:?}"
+        );
+
+        let metadata = orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("renewed sandbox metadata should remain");
+        assert_eq!(metadata.state, SandboxState::Running);
+        assert_eq!(metadata.timeout, Some(Duration::from_secs(60)));
+        assert!(!metadata.is_expired(std::time::SystemTime::now()));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn keep_alive_success_wins_against_inflight_auto_evict() -> Result<()> {
+    setup();
+
+    let control = Arc::new(ScriptedStoreControl::default());
+    let orchestrator = make_orchestrator_without_background(ScriptedStore::new(control.clone()));
+    let mut sandbox_ids = Vec::new();
+
+    for timeout_action in [SandboxTimeoutAction::Pause, SandboxTimeoutAction::Delete] {
+        let mut request = create_request(Some(60), &[]);
+        request.timeout_action = timeout_action;
+        let created = orchestrator.create_sandbox(request).await?;
+        orchestrator
+            .store
+            .update_if_state(&created.id, &[SandboxState::Running], |metadata| {
+                metadata.timeout = Some(Duration::from_secs(1));
+                metadata.expires_at =
+                    std::time::SystemTime::now().checked_sub(Duration::from_secs(1));
+            })
+            .await?;
+        sandbox_ids.push(created.id);
+    }
+
+    let gate = StoreListGate::new();
+    control.set_list_gate(gate.clone());
+    let eviction = tokio::spawn({
+        let orchestrator = orchestrator.clone();
+        async move { orchestrator.evict_expired_sandboxes().await }
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), gate.listed.wait())
+        .await
+        .expect("auto-eviction should capture the expired metadata snapshot");
+
+    for sandbox_id in &sandbox_ids {
+        let renewed = orchestrator
+            .keep_alive_for(*sandbox_id, Some(Duration::from_secs(60)), true)
+            .await?
+            .expect("keep-alive should acknowledge the running sandbox renewal");
+        assert_eq!(renewed.state, SandboxState::Running);
+        assert!(!renewed.is_expired(std::time::SystemTime::now()));
+    }
+
+    tokio::time::timeout(Duration::from_secs(5), gate.release.wait())
+        .await
+        .expect("auto-eviction release barrier should complete");
+    let evicted = tokio::time::timeout(Duration::from_secs(5), eviction)
+        .await
+        .expect("auto-eviction should finish after release")
+        .expect("auto-eviction task should not panic")?;
+    assert!(
+        evicted.is_empty(),
+        "sandboxes renewed after listing must not be evicted"
+    );
+
+    for sandbox_id in sandbox_ids {
+        let metadata = orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("renewed sandbox metadata should remain");
+        assert_eq!(metadata.state, SandboxState::Running);
+        assert_eq!(metadata.timeout, Some(Duration::from_secs(60)));
+        assert!(!metadata.is_expired(std::time::SystemTime::now()));
+        assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+        orchestrator.delete_sandbox(sandbox_id).await?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn auto_evict_revalidates_later_candidate_after_prior_claim() -> Result<()> {
+    setup();
+
+    for renewed_action in [SandboxTimeoutAction::Pause, SandboxTimeoutAction::Delete] {
+        let control = Arc::new(ScriptedStoreControl::default());
+        let orchestrator =
+            make_orchestrator_without_background(ScriptedStore::new(control.clone()));
+
+        let mut first_request = create_request(Some(60), &[]);
+        first_request.timeout_action = SandboxTimeoutAction::Delete;
+        let first = orchestrator.create_sandbox(first_request).await?;
+
+        let mut renewed_request = create_request(Some(60), &[]);
+        renewed_request.timeout_action = renewed_action;
+        let renewed = orchestrator.create_sandbox(renewed_request).await?;
+
+        let cutoff = std::time::SystemTime::now();
+        for (sandbox_id, age) in [(first.id, 2), (renewed.id, 1)] {
+            orchestrator
+                .store
+                .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
+                    metadata.timeout = Some(Duration::from_secs(1));
+                    metadata.expires_at = cutoff.checked_sub(Duration::from_secs(age));
+                })
+                .await?;
+        }
+
+        let gate = StoreClaimGate::new();
+        control.set_claim_gate(gate.clone());
+        let eviction = tokio::spawn({
+            let orchestrator = orchestrator.clone();
+            async move { orchestrator.evict_expired_sandboxes().await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), gate.claimed.wait())
+            .await
+            .expect("auto-eviction should claim the first expired sandbox");
+        let first_metadata = orchestrator
+            .get_sandbox(&first.id)
+            .await?
+            .expect("first sandbox should still exist while delete is blocked");
+        assert_eq!(first_metadata.state, SandboxState::Killing);
+
+        orchestrator
+            .keep_alive_for(renewed.id, Some(Duration::from_secs(60)), true)
+            .await?
+            .expect("later stale candidate should be renewed while the first delete is blocked");
+
+        tokio::time::timeout(Duration::from_secs(5), gate.release.wait())
+            .await
+            .expect("first auto-eviction release barrier should complete");
+        let evicted = tokio::time::timeout(Duration::from_secs(5), eviction)
+            .await
+            .expect("auto-eviction batch should finish after release")
+            .expect("auto-eviction task should not panic")?;
+        assert_eq!(evicted, vec![first.id]);
+
+        let renewed_metadata = orchestrator
+            .get_sandbox(&renewed.id)
+            .await?
+            .expect("renewed later candidate should remain");
+        assert_eq!(renewed_metadata.state, SandboxState::Running);
+        assert_eq!(renewed_metadata.timeout, Some(Duration::from_secs(60)));
+        assert!(!renewed_metadata.is_expired(std::time::SystemTime::now()));
+        assert_proxy_ready(&orchestrator, &renewed.id).await?;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            orchestrator.delete_sandbox(renewed.id),
+        )
+        .await
+        .expect("renewed sandbox cleanup should not block on the consumed claim gate")?;
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn auto_evict_claim_prevents_late_keep_alive_success() -> Result<()> {
+    setup();
+
+    for (timeout_action, claimed_state, with_volume) in [
+        (SandboxTimeoutAction::Pause, SandboxState::Pausing, false),
+        (SandboxTimeoutAction::Delete, SandboxState::Killing, false),
+        (SandboxTimeoutAction::Delete, SandboxState::Pausing, true),
+    ] {
+        let control = Arc::new(ScriptedStoreControl::default());
+        let orchestrator =
+            make_orchestrator_without_background(ScriptedStore::new(control.clone()));
+        let mut request = create_request(Some(60), &[]);
+        request.timeout_action = timeout_action;
+        if with_volume {
+            request
+                .volume_mounts
+                .insert("/mnt/data".to_owned(), "vol_test".to_owned());
+        }
+        let created = orchestrator.create_sandbox(request).await?;
+        let sandbox_id = created.id;
+
+        orchestrator
+            .store
+            .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
+                metadata.timeout = Some(Duration::from_secs(1));
+                metadata.expires_at =
+                    std::time::SystemTime::now().checked_sub(Duration::from_secs(1));
+            })
+            .await?;
+
+        let gate = StoreClaimGate::new();
+        control.set_claim_gate(gate.clone());
+        let eviction = tokio::spawn({
+            let orchestrator = orchestrator.clone();
+            async move { orchestrator.evict_expired_sandboxes().await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), gate.claimed.wait())
+            .await
+            .expect("auto-eviction should atomically claim the expired sandbox");
+
+        let error = orchestrator
+            .keep_alive_for(sandbox_id, Some(Duration::from_secs(60)), true)
+            .await
+            .expect_err("keep-alive must not succeed after auto-eviction has claimed the sandbox");
+        assert!(matches!(
+            error,
+            OrchestratorError::InvalidSandboxState { state, .. } if state == claimed_state
+        ));
+
+        tokio::time::timeout(Duration::from_secs(5), gate.release.wait())
+            .await
+            .expect("auto-eviction release barrier should complete");
+        let evicted = tokio::time::timeout(Duration::from_secs(5), eviction)
+            .await
+            .expect("auto-eviction should finish after release")
+            .expect("auto-eviction task should not panic")?;
+        assert_eq!(evicted, vec![sandbox_id]);
+
+        match timeout_action {
+            SandboxTimeoutAction::Pause => {
+                let metadata = orchestrator
+                    .get_sandbox(&sandbox_id)
+                    .await?
+                    .expect("auto-paused sandbox metadata should remain");
+                assert_eq!(metadata.state, SandboxState::Paused);
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    orchestrator.delete_sandbox(sandbox_id),
+                )
+                .await
+                .expect("paused sandbox cleanup should not block on the consumed claim gate")?;
+            }
+            SandboxTimeoutAction::Delete => {
+                assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn orchestrator_list_filtered_returns_empty_on_non_matching_metadata() -> Result<()> {
     setup();
     let orchestrator = make_orchestrator().await;
@@ -3006,10 +3227,8 @@ async fn orchestrator_list_filtered_returns_empty_on_non_matching_metadata() -> 
     let filtered = orchestrator
         .list_sandboxes_filtered(SandboxListFilter {
             states: Some(vec![SandboxState::Running]),
-            excluded_states: None,
             user_metadata: Some(required_metadata),
-            started_after: None,
-            template: None,
+            ..SandboxListFilter::matches_all()
         })
         .await?;
     assert!(
@@ -4652,38 +4871,6 @@ async fn fork_sandbox_creates_running_children_from_one_source() -> Result<()> {
     for child in children {
         orchestrator.delete_sandbox(child.id).await?;
     }
-    orchestrator.delete_sandbox(source.id).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn fork_sandbox_with_specs_persists_child_volume_mounts() -> Result<()> {
-    setup();
-    let behavior = Arc::new(MockBehavior::new());
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
-    let source = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "fork-volume-spec")]))
-        .await?;
-    let child_id = SandboxId::new();
-    let child_mounts = HashMap::from([(String::from("/mnt/data"), String::from("vol_child"))]);
-
-    let outcomes = orchestrator
-        .fork_sandbox_with_specs(
-            source.id,
-            vec![SandboxForkChildSpec {
-                sandbox_id: child_id,
-                volume_mounts: child_mounts.clone(),
-                ..Default::default()
-            }],
-            NewTimeout::UseExisting,
-        )
-        .await?;
-    let child = outcomes.into_iter().next().expect("one child outcome")?;
-    assert_eq!(child.id, child_id);
-    assert_eq!(child.volume_mounts, child_mounts);
-
-    orchestrator.delete_sandbox(child.id).await?;
     orchestrator.delete_sandbox(source.id).await?;
     Ok(())
 }

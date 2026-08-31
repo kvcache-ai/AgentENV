@@ -17,6 +17,3 @@ mod snapshot_attached_drive;
 
 #[path = "integration/ublk.rs"]
 mod ublk;
-
-#[path = "integration/volume.rs"]
-mod volume;

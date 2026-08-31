@@ -45,7 +45,6 @@ impl<T> PaginationCursor<T> {
         Self::new(time, value, true)
     }
 
-    #[allow(dead_code)]
     pub fn new_ascending(time: SystemTime, value: T) -> Self {
         Self::new(time, value, false)
     }

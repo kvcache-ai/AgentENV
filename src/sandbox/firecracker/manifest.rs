@@ -113,6 +113,7 @@ impl FirecrackerSnapshotManifest {
                 .unwrap_or_else(|_| ExtraDrive::default_mount_path(&drive.drive_id)),
                 sub_path: drive.sub_path.clone(),
                 snapshot_output_dir: None,
+                volume: false,
             })
             .collect()
     }
@@ -238,6 +239,7 @@ mod tests {
             virtual_size: None,
             sub_path: None,
             snapshot_output_dir: None,
+            volume: false,
         };
 
         let err = FirecrackerSnapshotManifest::new(
@@ -272,6 +274,7 @@ mod tests {
             virtual_size: Some(0),
             sub_path: None,
             snapshot_output_dir: None,
+            volume: false,
         };
 
         let err = manifest

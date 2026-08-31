@@ -256,6 +256,52 @@ aenv rm <sandbox-id>
 
 ---
 
+## Volumes
+
+### `aenv volume create <name>`
+
+Create an independent persistent volume. Volumes default to 65536 MiB (64 GiB)
+and `exclusive` mode.
+
+```bash
+aenv volume create workspace
+aenv volume create models --mode ro --image ghcr.io/example/models:latest
+aenv volume create job-workspace --from-volume workspace
+```
+
+| Flag | Description |
+|------|-------------|
+| `--size-mb <MiB>` | Volume size. A copy-on-write fork must use the same size as its source. |
+| `--mode <exclusive\|ro>` | Access mode. Exclusive volumes are writable by one sandbox; read-only volumes can be shared. |
+| `--from-volume <volume>` | Create a copy-on-write fork from an existing volume ID or name. |
+| `--image <image>` | Initialize the volume from an OCI image. |
+
+We recommend creating an exclusive fork for each sandbox instead of mounting a
+shared writable volume directly:
+
+```bash
+aenv volume create job-data --mode exclusive --from-volume dataset-base
+aenv start ubuntu --volume /workspace/data=job-data
+```
+
+See [Volumes](../concepts/volumes.md) for access-mode semantics, lifecycle
+behavior, automatic sandbox fork and snapshot handling, and complete CLI and
+HTTP API examples.
+
+### Inspect and delete volumes
+
+```bash
+aenv volume list
+aenv volume list --output json
+aenv volume inspect job-data
+aenv volume delete job-data
+```
+
+A mounted volume cannot be deleted. `aenv volume ls` is an alias for
+`aenv volume list`.
+
+---
+
 ## Snapshots
 
 ### `aenv snapshot create <sandbox-id>`

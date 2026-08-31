@@ -12,6 +12,7 @@ use crate::sandbox::ublk::{OverlaybdRuntimeHandle, UblkDeviceManager};
 pub const DEFAULT_EXTRA_DRIVE_MOUNT_ROOT: &str = "/mnt";
 pub(crate) const ROOTFS_DRIVE_ID: &str = "rootfs";
 pub(crate) const USER_ROOTFS_DRIVE_ID: &str = "user_rootfs";
+pub(crate) const VOLUME_DRIVE_SLOT_PREFIX: &str = "agentenv_volume_slot_";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExtraDrive {
@@ -38,6 +39,10 @@ pub enum ExtraDrive {
         /// Optional persistent destination for a volume snapshot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         snapshot_output_dir: Option<PathBuf>,
+        /// Persistent volumes are omitted from committed attached-drive
+        /// manifests and rebound through reserved Firecracker slots.
+        #[serde(default)]
+        volume: bool,
     },
 }
 
@@ -77,6 +82,7 @@ impl ExtraDrive {
             virtual_size: None,
             sub_path,
             snapshot_output_dir: None,
+            volume: false,
         })
     }
 
@@ -139,7 +145,13 @@ impl ExtraDrive {
         }
     }
 
-    pub(crate) fn with_snapshot_output_dir(&self, output_dir: Option<PathBuf>) -> Self {
+    pub(crate) fn is_volume(&self) -> bool {
+        match self {
+            Self::Overlaybd { volume, .. } => *volume,
+        }
+    }
+
+    pub(crate) fn with_volume_snapshot_output_dir(&self, output_dir: Option<PathBuf>) -> Self {
         match self {
             Self::Overlaybd {
                 drive_id,
@@ -157,6 +169,7 @@ impl ExtraDrive {
                 virtual_size: *virtual_size,
                 sub_path: sub_path.clone(),
                 snapshot_output_dir: output_dir,
+                volume: true,
             },
         }
     }
@@ -170,6 +183,7 @@ impl ExtraDrive {
                 virtual_size,
                 sub_path,
                 snapshot_output_dir,
+                volume,
                 ..
             } => Self::Overlaybd {
                 drive_id: drive_id.clone(),
@@ -179,6 +193,7 @@ impl ExtraDrive {
                 virtual_size: *virtual_size,
                 sub_path: sub_path.clone(),
                 snapshot_output_dir: snapshot_output_dir.clone(),
+                volume: *volume,
             },
         }
     }
@@ -195,6 +210,7 @@ impl ExtraDrive {
                 read_only,
                 mount_path,
                 snapshot_output_dir,
+                volume,
                 sub_path,
                 ..
             } => Ok(Self::Overlaybd {
@@ -205,6 +221,7 @@ impl ExtraDrive {
                 virtual_size: Some(virtual_size),
                 sub_path: sub_path.clone(),
                 snapshot_output_dir: snapshot_output_dir.clone(),
+                volume: *volume,
             }),
         }
     }
@@ -222,7 +239,9 @@ pub fn validate_drive_id(drive_id: &str) -> Result<()> {
             "attached drive driveID must contain only ASCII letters, numbers, and underscores: {drive_id}"
         );
     }
-    if matches!(drive_id, ROOTFS_DRIVE_ID | USER_ROOTFS_DRIVE_ID) {
+    if matches!(drive_id, ROOTFS_DRIVE_ID | USER_ROOTFS_DRIVE_ID)
+        || drive_id.starts_with(VOLUME_DRIVE_SLOT_PREFIX)
+    {
         anyhow::bail!("attached drive driveID is reserved: {drive_id}");
     }
     Ok(())
@@ -528,6 +547,24 @@ mod tests {
             .expect_err("internal drive id should fail");
 
         assert!(err.to_string().contains("reserved"));
+
+        let err = ExtraDrive::try_new_overlaybd(
+            format!("{VOLUME_DRIVE_SLOT_PREFIX}0"),
+            "/tmp/image.json",
+            true,
+        )
+        .expect_err("reserved volume slot id should fail");
+        assert!(err.to_string().contains("reserved"));
+    }
+
+    #[test]
+    fn read_only_volume_is_explicitly_marked() {
+        let drive = ExtraDrive::try_new_overlaybd("data", "/tmp/image.json", true)
+            .expect("drive should parse")
+            .with_volume_snapshot_output_dir(None);
+
+        assert!(drive.is_volume());
+        assert!(drive.snapshot_output_dir().is_none());
     }
 
     #[test]

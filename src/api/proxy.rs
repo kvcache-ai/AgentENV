@@ -1632,7 +1632,14 @@ mod tests {
         let snapshot_manager = Arc::new(mock_snapshot_manager());
         let template_builder = Arc::new(TemplateBuilder::new());
         let image_resolver = Arc::new(ImageResolver::new(&AppConfig::default()));
-        let volume_manager = Arc::new(crate::volume::VolumeManager::new());
+        let volume_manager = Arc::new(
+            crate::volume::VolumeManager::open_with_repository(
+                root.path().join("volumes/catalog.json"),
+                snapshot_manager.repository(),
+            )
+            .await
+            .unwrap(),
+        );
         Arc::new(ApiImpl::new(
             orchestrator,
             snapshot_manager,
@@ -1919,48 +1926,6 @@ mod tests {
             get_status(&app, "/proxy/health", &route).await,
             StatusCode::NOT_FOUND
         );
-    }
-
-    #[tokio::test]
-    async fn volume_crud_is_authenticated_and_persistent() {
-        let app = server::new(build_api().await);
-        assert_eq!(
-            get_status(&app, "/volumes", &[]).await,
-            StatusCode::UNAUTHORIZED
-        );
-        let body = serde_json::to_vec(&json!({"name": "my-data"})).unwrap();
-        let response = control_plane_request(&app, Method::POST, "/volumes", body).await;
-        let status = response.status();
-        let response_body = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(
-            status,
-            StatusCode::CREATED,
-            "unexpected volume create response: {}",
-            String::from_utf8_lossy(&response_body)
-        );
-        let created: Value = serde_json::from_slice(&response_body).unwrap();
-        let volume_id = created["volumeID"].as_str().unwrap().to_owned();
-        assert_eq!(created["name"], "my-data");
-        assert_eq!(created["sizeMB"], 64 * 1024);
-        assert_eq!(created["status"], "ready");
-
-        let response = control_plane_request(&app, Method::GET, "/volumes", Body::empty()).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let listed: Vec<Value> =
-            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0]["volumeID"], volume_id);
-        assert_eq!(listed[0]["status"], "ready");
-
-        let response = control_plane_request(
-            &app,
-            Method::DELETE,
-            format!("/volumes/{volume_id}"),
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
 
     #[tokio::test]

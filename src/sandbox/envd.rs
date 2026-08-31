@@ -1,5 +1,8 @@
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, LazyLock,
+};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::time::{sleep, Duration};
@@ -31,6 +34,7 @@ pub(crate) struct EnvdInstance {
     config: Configuration,
     grpc_address: String,
     access_token: Option<EnvdAccessToken>,
+    live: Arc<AtomicBool>,
 }
 
 impl EnvdInstance {
@@ -53,12 +57,26 @@ impl EnvdInstance {
             },
             grpc_address,
             access_token,
+            live: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    fn ensure_live(&self) -> Result<()> {
+        if self.live.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(anyhow!("sandbox runtime is no longer active"))
+        }
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.live.store(false, Ordering::Release);
     }
 
     /// Create a new gRPC `ProcessClient` connected to the envd daemon.
     #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
     pub(crate) async fn process_client(&self) -> Result<ProcessClient> {
+        self.ensure_live()?;
         trace!(grpc_address = %self.grpc_address, "connecting envd process client");
         let client = ProcessClient::connect(
             &self.grpc_address,
@@ -73,6 +91,7 @@ impl EnvdInstance {
     /// Create a new gRPC `FilesystemClient` connected to the envd daemon.
     #[tracing::instrument(skip(self), fields(grpc_address = %self.grpc_address))]
     pub(crate) async fn filesystem_client(&self) -> Result<FilesystemClient> {
+        self.ensure_live()?;
         trace!(grpc_address = %self.grpc_address, "connecting envd filesystem client");
         let client = FilesystemClient::connect(
             &self.grpc_address,
@@ -224,5 +243,15 @@ mod tests {
         assert!(error.to_string().contains("timed out waiting for envd"));
         assert!(started.elapsed() < Duration::from_millis(500));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn invalidated_runtime_rejects_new_envd_clients() {
+        let envd = EnvdInstance::new("http://127.0.0.1:1".to_owned(), None);
+        let stale = envd.clone();
+        envd.invalidate();
+
+        assert!(stale.process_client().await.is_err());
+        assert!(stale.filesystem_client().await.is_err());
     }
 }

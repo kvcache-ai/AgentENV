@@ -15,16 +15,26 @@ if ! e2e_mode_is compose; then
   exit 0
 fi
 
-readonly VOLUME_RANDOM_SEED="${AENV_VOLUME_RANDOM_SEED:-21106}"
-readonly VOLUME_RANDOM_STEPS="${AENV_VOLUME_RANDOM_STEPS:-100}"
+raw_random_seed="${AENV_VOLUME_RANDOM_SEED:-21106}"
+raw_random_steps="${AENV_VOLUME_RANDOM_STEPS:-100}"
 readonly VOLUME_SIZE_MB=16
 readonly VOLUME_MOUNT_PATH="/volume"
 
-if ! [[ "${VOLUME_RANDOM_SEED}" =~ ^[0-9]+$ ]] || (( VOLUME_RANDOM_SEED > 2147483647 )); then
+if ! [[ "${raw_random_seed}" =~ ^[0-9]+$ ]] || [[ "${#raw_random_seed}" -gt 10 ]]; then
   echo "AENV_VOLUME_RANDOM_SEED must be a non-negative integer <= 2147483647" >&2
   exit 1
 fi
-if ! [[ "${VOLUME_RANDOM_STEPS}" =~ ^[0-9]+$ ]] || (( VOLUME_RANDOM_STEPS < 1 || VOLUME_RANDOM_STEPS > 1000 )); then
+readonly VOLUME_RANDOM_SEED=$((10#${raw_random_seed}))
+if (( VOLUME_RANDOM_SEED > 2147483647 )); then
+  echo "AENV_VOLUME_RANDOM_SEED must be a non-negative integer <= 2147483647" >&2
+  exit 1
+fi
+if ! [[ "${raw_random_steps}" =~ ^[0-9]+$ ]] || [[ "${#raw_random_steps}" -gt 4 ]]; then
+  echo "AENV_VOLUME_RANDOM_STEPS must be an integer from 1 through 1000" >&2
+  exit 1
+fi
+readonly VOLUME_RANDOM_STEPS=$((10#${raw_random_steps}))
+if (( VOLUME_RANDOM_STEPS < 1 || VOLUME_RANDOM_STEPS > 1000 )); then
   echo "AENV_VOLUME_RANDOM_STEPS must be an integer from 1 through 1000" >&2
   exit 1
 fi
@@ -53,7 +63,7 @@ cleanup_randomized_volume_e2e() {
   done
   for volume_id in "${ALL_VOLUME_IDS[@]}"; do
     [[ -n "${volume_id}" ]] || continue
-    for _attempt in 1 2 3 4 5; do
+    for _attempt in $(seq 1 30); do
       api_delete "/volumes/${volume_id}" 2>/dev/null || true
       [[ "${HTTP_STATUS}" == "204" || "${HTTP_STATUS}" == "404" ]] && break
       sleep 1
@@ -176,10 +186,13 @@ verify_volume_content() {
   local volume_id="$2"
   local expected="${VOLUME_CONTENT[${volume_id}]}"
   [[ -n "${expected}" ]] || return 0
-  download_random_file "${sandbox_id}"
-  assert_status "${HTTP_STATUS}" "200" "${CURRENT_STEP}: read modeled volume data"
-  assert_contains "${HTTP_BODY}" "${expected}" \
-    "${CURRENT_STEP}: guest data matches the model"
+  local file_index
+  for file_index in 0 1 2 3; do
+    download_random_file "${sandbox_id}" "${VOLUME_MOUNT_PATH}/state-${file_index}.txt"
+    assert_status "${HTTP_STATUS}" "200" "${CURRENT_STEP}: read modeled volume file ${file_index}"
+    assert_contains "${HTTP_BODY}" "${expected}-file-${file_index}" \
+      "${CURRENT_STEP}: guest file ${file_index} matches the model"
+  done
 }
 
 write_new_volume_content() {
@@ -187,9 +200,13 @@ write_new_volume_content() {
   local volume_id="$2"
   local phase="$3"
   local token="seed-${VOLUME_RANDOM_SEED}-${CURRENT_STEP}-${phase}-${volume_id}"
-  printf '%s\n' "${token}" >"${random_file}"
-  upload_random_file "${sandbox_id}"
-  assert_status "${HTTP_STATUS}" "200" "${CURRENT_STEP}: write modeled guest data"
+  local file_index
+  for file_index in 0 1 2 3; do
+    printf '%s\n' "${token}-file-${file_index}" >"${random_file}"
+    upload_random_file "${sandbox_id}" "${VOLUME_MOUNT_PATH}/state-${file_index}.txt"
+    assert_status "${HTTP_STATUS}" "200" \
+      "${CURRENT_STEP}: write modeled guest file ${file_index}"
+  done
   VOLUME_CONTENT["${volume_id}"]="${token}"
   verify_volume_content "${sandbox_id}" "${volume_id}"
 }
@@ -292,8 +309,32 @@ fork_volume_cycle() {
     _fail "${CURRENT_STEP}: fork source volume publication completes" "ready" "timeout"
 }
 
+list_all_volumes() {
+  local all_volumes='[]'
+  local next_token=""
+  while :; do
+    local path="/volumes?limit=100"
+    if [[ -n "${next_token}" ]]; then
+      local encoded_token
+      encoded_token=$(jq -rn --arg token "${next_token}" '$token|@uri')
+      path+="&nextToken=${encoded_token}"
+    fi
+    api_get_with_headers "${path}"
+    [[ "${HTTP_STATUS}" == "200" ]] || return 1
+    all_volumes=$(jq -nc \
+      --argjson previous "${all_volumes}" \
+      --argjson page "${HTTP_BODY}" \
+      '$previous + $page')
+    next_token=$(printf '%s\n' "${HTTP_HEADERS}" | awk -F': *' \
+      'tolower($1) == "x-next-token" {gsub("\\r", "", $2); print $2; exit}')
+    [[ -n "${next_token}" ]] || break
+  done
+  HTTP_BODY="${all_volumes}"
+  HTTP_STATUS=200
+}
+
 assert_catalog_matches_model() {
-  api_get "/volumes"
+  list_all_volumes
   assert_status "${HTTP_STATUS}" "200" "${CURRENT_STEP}: list volumes through gateway"
   local volume_id
   while IFS= read -r volume_id; do
@@ -338,7 +379,7 @@ assert_volume_visible_on_node() {
 
 log "Random seed: ${VOLUME_RANDOM_SEED}; steps: ${VOLUME_RANDOM_STEPS}"
 
-api_get "/volumes"
+list_all_volumes
 assert_status "${HTTP_STATUS}" "200" "capture pre-existing volume catalog"
 while IFS= read -r baseline_id; do
   [[ -n "${baseline_id}" ]] || continue
@@ -425,7 +466,7 @@ CURRENT_STEP="final-delete"
 for volume_id in "${final_volume_ids[@]}"; do
   delete_modeled_volume "${volume_id}"
 done
-api_get "/volumes"
+list_all_volumes
 assert_status "${HTTP_STATUS}" "200" "final volume list through gateway"
 for volume_id in "${final_volume_ids[@]}"; do
   remaining="$(echo "${HTTP_BODY}" | jq --arg id "${volume_id}" '[.[] | select(.volumeID == $id)] | length')"

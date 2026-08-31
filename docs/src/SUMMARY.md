@@ -23,6 +23,7 @@
 - [Templates](./concepts/templates.md)
 - [Sandboxes](./concepts/sandboxes.md)
 - [Snapshots](./concepts/snapshots.md)
+- [Volumes](./concepts/volumes.md)
 - [Custom Extension](./concepts/custom-extension.md)
 - [Proxy](./concepts/proxy.md)
 

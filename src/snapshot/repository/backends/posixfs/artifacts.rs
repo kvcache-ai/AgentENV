@@ -37,95 +37,7 @@ impl PosixFsArtifactStore {
         &self,
         image_config_path: &Path,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
-        let image_config = load_overlaybd_image_config(image_config_path).map_err(|error| {
-            RepositoryError::backend(
-                format!("load volume image config '{}'", image_config_path.display()),
-                error,
-            )
-        })?;
-        let config_parent = image_config_path.parent().unwrap_or_else(|| Path::new("."));
-        image_config
-            .lowers
-            .into_iter()
-            .enumerate()
-            .map(|(index, layer)| {
-                if !layer.file.is_empty() {
-                    let layer_path = Path::new(&layer.file);
-                    let layer_path = if layer_path.is_absolute() {
-                        layer_path.to_path_buf()
-                    } else {
-                        config_parent.join(layer_path)
-                    };
-                    if !layer.digest.is_empty() || layer.size != 0 {
-                        if layer.digest.is_empty() || layer.size == 0 {
-                            return Err(RepositoryError::InvalidRequest {
-                                reason: format!(
-                                    "volume layer {index} has an incomplete digest/size descriptor"
-                                ),
-                            });
-                        }
-                        let actual = FileDigest::describe_blocking(&layer_path).map_err(|error| {
-                            RepositoryError::backend(
-                                format!("describe volume layer '{}'", layer_path.display()),
-                                error,
-                            )
-                        })?;
-                        if actual.sha256 != layer.digest || actual.size != layer.size {
-                            return Err(RepositoryError::InvalidRequest {
-                                reason: format!(
-                                    "volume layer {index} digest/size does not match its content"
-                                ),
-                            });
-                        }
-                        return self
-                            .import_managed_layer_with_descriptor(
-                                &layer_path,
-                                &layer.digest,
-                                layer.size,
-                            )
-                            .map(OverlaybdLayerRef::Managed);
-                    }
-                    return self
-                        .import_descriptorless_rootfs_layer(&layer_path)
-                        .map(OverlaybdLayerRef::Managed);
-                }
-                let repo_blob_url = layer
-                    .effective_repo_blob_url(&image_config.repo_blob_url)
-                    .to_string();
-                if !repo_blob_url.is_empty() {
-                    let parsed = url::Url::parse(&repo_blob_url).map_err(|error| {
-                        RepositoryError::InvalidRequest {
-                            reason: format!("volume layer {index} has invalid repoBlobUrl: {error}"),
-                        }
-                    })?;
-                    if !matches!(parsed.scheme(), "http" | "https" | "s3")
-                        || parsed.host_str().is_none()
-                    {
-                        return Err(RepositoryError::InvalidRequest {
-                            reason: format!(
-                                "volume layer {index} repoBlobUrl must use http, https, or s3 with a host"
-                            ),
-                        });
-                    }
-                    return Ok(OverlaybdLayerRef::External(
-                        crate::snapshot::ExternalLayer {
-                            digest: if !layer.digest.is_empty() {
-                                layer.digest
-                            } else if !layer.target_digest.is_empty() {
-                                layer.target_digest
-                            } else {
-                                format!("external:{index}")
-                            },
-                            repo_blob_url,
-                            size: layer.size,
-                        },
-                    ));
-                }
-                Err(RepositoryError::Unsupported {
-                    feature: format!("volume layer {index} without local file or repoBlobUrl"),
-                })
-            })
-            .collect()
+        self.derive_rootfs_layers(image_config_path, true)
     }
 
     /// Imports manager-owned local build artifacts into committed repository storage.
@@ -164,7 +76,7 @@ impl PosixFsArtifactStore {
                 // The committed attached-drive manifest stores logical layers only.
                 // The build-time image config is used here as an input for deriving
                 // those layers, but is not copied into the committed repository.
-                let rootfs_layers = self.derive_rootfs_layers(&drive.image_config_path)?;
+                let rootfs_layers = self.derive_rootfs_layers(&drive.image_config_path, false)?;
                 Ok(CommittedAttachedDrive::Overlaybd {
                     drive_id: drive.drive_id.clone(),
                     layers: rootfs_layers,
@@ -182,7 +94,7 @@ impl PosixFsArtifactStore {
             })
             .collect::<RepositoryResult<Vec<_>>>()?;
 
-        let rootfs_layers = self.derive_rootfs_layers(&manifest.rootfs.image_config_path)?;
+        let rootfs_layers = self.derive_rootfs_layers(&manifest.rootfs.image_config_path, false)?;
 
         Ok(CollectedBuiltArtifacts {
             rootfs_layers,
@@ -495,6 +407,7 @@ impl PosixFsArtifactStore {
     fn derive_rootfs_layers(
         &self,
         image_config_path: &Path,
+        allow_descriptorless: bool,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
         let image_config = load_overlaybd_image_config(image_config_path).map_err(|error| {
             RepositoryError::backend(
@@ -522,9 +435,11 @@ impl PosixFsArtifactStore {
                             )
                             .map(OverlaybdLayerRef::Managed);
                     }
-                    if crate::image::local_layer::rootfs_layer_is_runtime_generated_delta(
-                        layer_path,
-                    ) {
+                    if allow_descriptorless
+                        || crate::image::local_layer::rootfs_layer_is_runtime_generated_delta(
+                            layer_path,
+                        )
+                    {
                         return self
                             .import_descriptorless_rootfs_layer(layer_path)
                             .map(OverlaybdLayerRef::Managed);
@@ -862,7 +777,9 @@ mod tests {
         )
         .expect("write image config");
 
-        let layers = store.derive_rootfs_layers(&image).expect("derive layers");
+        let layers = store
+            .derive_rootfs_layers(&image, false)
+            .expect("derive layers");
 
         assert_eq!(
             layers,
@@ -929,6 +846,7 @@ mod tests {
                 virtual_size: Some(4096),
                 sub_path: None,
                 snapshot_output_dir: None,
+                volume: false,
             }])
             .expect("attached drive manifest should include virtual size");
 

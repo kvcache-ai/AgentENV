@@ -100,18 +100,16 @@ fn parse_volume_mounts(values: &[String]) -> Result<Option<HashMap<String, Strin
         let mount_path = normalize_mount_path(mount_path)?;
         validate_volume_reference(volume)
             .with_context(|| format!("invalid volume reference in mount: {value}"))?;
+        if mounts.contains_key(&mount_path) {
+            anyhow::bail!("volume mount path is specified more than once: {mount_path}");
+        }
         if mounts
             .keys()
             .any(|existing| mount_paths_overlap(existing, &mount_path))
         {
             anyhow::bail!("volume mount paths overlap: {mount_path}");
         }
-        if mounts
-            .insert(mount_path.clone(), volume.to_owned())
-            .is_some()
-        {
-            anyhow::bail!("volume mount path is specified more than once: {mount_path}");
-        }
+        mounts.insert(mount_path, volume.to_owned());
     }
     Ok(Some(mounts))
 }

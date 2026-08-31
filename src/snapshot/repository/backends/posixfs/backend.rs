@@ -411,19 +411,17 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         .await
     }
 
-    async fn list_volumes_by_owner(&self, owner: &str) -> RepositoryResult<Vec<VolumeRecord>> {
-        let owner = owner.to_owned();
-        self.run_catalog("list volumes by owner", move |store| {
-            store.list_volumes_by_owner(&owner)
-        })
-        .await
-    }
-
-    async fn replace_volume_owner(&self, from: &str, to: Option<&str>) -> RepositoryResult<()> {
+    async fn replace_volume_owner_for(
+        &self,
+        volume_id: &str,
+        from: &str,
+        to: Option<&str>,
+    ) -> RepositoryResult<()> {
+        let volume_id = volume_id.to_owned();
         let from = from.to_owned();
         let to = to.map(str::to_owned);
-        self.run_catalog("replace volume reservations", move |store| {
-            store.replace_volume_owner(&from, to.as_deref())
+        self.run_catalog("replace volume owner", move |store| {
+            store.replace_volume_owner_for(&volume_id, &from, to.as_deref())
         })
         .await
     }
@@ -732,6 +730,7 @@ mod tests {
                     virtual_size: Some(32768),
                     sub_path: None,
                     snapshot_output_dir: None,
+                    volume: false,
                 },
                 ExtraDrive::Overlaybd {
                     drive_id: "data".to_string(),
@@ -741,6 +740,7 @@ mod tests {
                     virtual_size: Some(32768),
                     sub_path: None,
                     snapshot_output_dir: None,
+                    volume: false,
                 },
             ],
         );

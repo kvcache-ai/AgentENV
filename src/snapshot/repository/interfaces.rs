@@ -260,16 +260,14 @@ pub trait SnapshotRepository: Send + Sync {
         unsupported("read-only volume reservations")
     }
 
-    /// Returns only volumes currently reserved or leased by one owner.
-    async fn list_volumes_by_owner(
+    /// Conditionally releases or rebinds one known volume. Implementations
+    /// must change the record only when it is currently mounted by `from`.
+    async fn replace_volume_owner_for(
         &self,
-        _owner: &str,
-    ) -> RepositoryResult<Vec<crate::volume::VolumeRecord>> {
-        unsupported("volume reservations")
-    }
-
-    /// Releases reservations held by `from`, or rebinds them when `to` is set.
-    async fn replace_volume_owner(&self, _from: &str, _to: Option<&str>) -> RepositoryResult<()> {
+        _volume_id: &str,
+        _from: &str,
+        _to: Option<&str>,
+    ) -> RepositoryResult<()> {
         unsupported("volume reservations")
     }
 }

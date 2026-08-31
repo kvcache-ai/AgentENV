@@ -19,32 +19,15 @@ impl<'a> OssSnapshotArtifactLayout<'a> {
     }
 
     pub(super) fn volume_record_key(volume_id: &str) -> String {
-        format!(
-            "catalog/volumes/{}/{volume_id}.json",
-            crate::snapshot::repository::volume_catalog_shard(volume_id)
-        )
+        format!("volumes/records/{volume_id}.json")
     }
 
     pub(super) fn volume_records_prefix() -> &'static str {
-        "catalog/volumes/"
+        "volumes/records/"
     }
 
-    pub(super) fn volume_name_key(name: &str) -> String {
-        format!(
-            "catalog/volume-names/{}/{name}.json",
-            crate::snapshot::repository::volume_catalog_shard(name)
-        )
-    }
-
-    pub(super) fn volume_owner_prefix(owner: &str) -> String {
-        format!(
-            "catalog/volume-owners/{}/{owner}/",
-            crate::snapshot::repository::volume_catalog_shard(owner)
-        )
-    }
-
-    pub(super) fn volume_owner_key(owner: &str, volume_id: &str) -> String {
-        format!("{}{volume_id}.json", Self::volume_owner_prefix(owner))
+    pub(super) fn volume_alias_key(alias: &str) -> String {
+        format!("volumes/aliases/{alias}.json")
     }
 
     pub(crate) fn managed_layer_key(digest: &str) -> String {

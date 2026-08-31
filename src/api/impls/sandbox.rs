@@ -111,6 +111,7 @@ struct PreparedVolumeMounts {
     owner: Option<String>,
     drives: Vec<ExtraDrive>,
     mounts: HashMap<String, String>,
+    volume_ids: Vec<String>,
 }
 
 async fn prepare_volume_mounts(
@@ -121,16 +122,11 @@ async fn prepare_volume_mounts(
         return Ok(PreparedVolumeMounts::default());
     };
     let owner = format!("pending-{}", Uuid::now_v7().simple());
-    let (drives, mounts) = resolve_volume_mounts(
-        &api.volume_manager,
-        api.image_resolver.as_ref(),
-        mounts,
-        &owner,
-    )
-    .await?;
+    let (drives, mounts) = resolve_volume_mounts(&api.volume_manager, mounts, &owner).await?;
     Ok(PreparedVolumeMounts {
         owner: Some(owner),
         drives,
+        volume_ids: mounts.values().cloned().collect(),
         mounts,
     })
 }
@@ -139,12 +135,13 @@ async fn finish_volume_reservation(
     manager: &VolumeManager,
     owner: Option<&str>,
     sandbox_id: Option<SandboxId>,
+    volume_ids: &[String],
 ) -> Result<(), crate::volume::VolumeError> {
     let Some(owner) = owner else { return Ok(()) };
-    match sandbox_id {
-        Some(id) => manager.rebind_owner(owner, &id.to_string()).await,
-        None => manager.release_owner(owner).await,
-    }
+    let sandbox_id = sandbox_id.map(|id| id.to_string());
+    manager
+        .replace_owner_for(owner, sandbox_id.as_deref(), volume_ids)
+        .await
 }
 
 async fn cleanup_fork_volume_children(
@@ -152,7 +149,9 @@ async fn cleanup_fork_volume_children(
     children: &HashMap<SandboxId, Vec<String>>,
 ) {
     for (owner, volume_ids) in children {
-        let _ = manager.release_owner(&owner.to_string()).await;
+        let _ = manager
+            .replace_owner_for(&owner.to_string(), None, volume_ids)
+            .await;
         for volume_id in volume_ids {
             let _ = manager.delete(volume_id).await;
         }
@@ -196,7 +195,7 @@ async fn prepare_volume_fork_specs(
                 .get(reference)
                 .expect("source volume was resolved above");
             if volume.mode == VolumeMode::Exclusive {
-                let child_name = format!("{}-fork-{}", volume.name, child_id);
+                let child_name = format!("volume-fork-{}", Uuid::now_v7().simple());
                 let child = match api
                     .volume_manager
                     .create_child_for_owner(
@@ -205,6 +204,7 @@ async fn prepare_volume_fork_specs(
                         VolumeMode::Exclusive,
                         volume.size_mb,
                         &source_owner,
+                        &owner,
                     )
                     .await
                 {
@@ -224,20 +224,14 @@ async fn prepare_volume_fork_specs(
             }
         }
 
-        let (extra_drives, _) = match resolve_volume_mounts(
-            &api.volume_manager,
-            api.image_resolver.as_ref(),
-            &child_mounts,
-            &owner,
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                cleanup_fork_volume_children(&api.volume_manager, &children).await;
-                return Err(error);
-            }
-        };
+        let (extra_drives, _) =
+            match resolve_volume_mounts(&api.volume_manager, &child_mounts, &owner).await {
+                Ok(result) => result,
+                Err(error) => {
+                    cleanup_fork_volume_children(&api.volume_manager, &children).await;
+                    return Err(error);
+                }
+            };
 
         specs.push(SandboxForkChildSpec {
             sandbox_id: child_id,
@@ -253,25 +247,22 @@ async fn prepare_volume_fork_specs(
 async fn snapshot_sandbox_volumes(
     api: &ApiImpl,
     metadata: &SandboxMetadata,
-) -> Result<(Vec<SnapshotVolume>, Vec<String>), models::Error> {
+) -> Result<Vec<SnapshotVolume>, models::Error> {
     let mut snapshots = Vec::with_capacity(metadata.volume_mounts.len());
-    let mut snapshot_ids: Vec<String> = Vec::with_capacity(metadata.volume_mounts.len());
     for (mount_path, reference) in &metadata.volume_mounts {
-        let snapshot = match api.volume_manager.snapshot_volume(reference).await {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                cleanup_volume_ids(&api.volume_manager, &snapshot_ids).await;
-                return Err(volume_error_response(error).1);
-            }
-        };
-        snapshot_ids.push(snapshot.id.clone());
+        let snapshot = api
+            .volume_manager
+            .snapshot_volume_state(reference)
+            .await
+            .map_err(|error| volume_error_response(error).1)?;
         snapshots.push(SnapshotVolume {
             mount_path: mount_path.clone(),
-            volume_id: snapshot.id,
-            revision: snapshot.revision,
+            mode: snapshot.mode,
+            size_mb: snapshot.size_mb,
+            layers: snapshot.backing_layers,
         });
     }
-    Ok((snapshots, snapshot_ids))
+    Ok(snapshots)
 }
 
 async fn restore_snapshot_volume_mounts(
@@ -281,23 +272,6 @@ async fn restore_snapshot_volume_mounts(
     let mut mounts = HashMap::new();
     let mut volume_ids = Vec::with_capacity(snapshot.committed().volume_snapshots.len());
     for volume_snapshot in &snapshot.committed().volume_snapshots {
-        let parent = match api.volume_manager.get(&volume_snapshot.volume_id).await {
-            Ok(parent) => parent,
-            Err(error) => {
-                cleanup_volume_ids(&api.volume_manager, &volume_ids).await;
-                return Err(volume_error_response(error).1);
-            }
-        };
-        if parent.revision != volume_snapshot.revision {
-            cleanup_volume_ids(&api.volume_manager, &volume_ids).await;
-            return Err(ApiImpl::error(
-                409,
-                format!(
-                    "volume snapshot {} revision {} is unavailable (current revision {})",
-                    volume_snapshot.volume_id, volume_snapshot.revision, parent.revision
-                ),
-            ));
-        }
         let mount_path = match normalize_mount_path(volume_snapshot.mount_path.clone().into()) {
             Ok(path) => path,
             Err(error) => {
@@ -305,10 +279,15 @@ async fn restore_snapshot_volume_mounts(
                 return Err(ApiImpl::error(400, error.to_string()));
             }
         };
-        let name = format!("{}-restore-{}", parent.name, Uuid::now_v7().simple());
+        let name = format!("volume-restore-{}", Uuid::now_v7().simple());
         let child = match api
             .volume_manager
-            .create_child(&parent.id, name, VolumeMode::Exclusive, parent.size_mb)
+            .create_from_snapshot(
+                name,
+                volume_snapshot.mode,
+                volume_snapshot.size_mb,
+                volume_snapshot.layers.clone(),
+            )
             .await
         {
             Ok(child) => child,
@@ -743,6 +722,7 @@ impl Sandboxes<()> for ApiImpl {
             owner: pending_volume_owner,
             drives: volume_drives,
             mounts: volume_mounts,
+            volume_ids: reserved_volume_ids,
         } = match prepare_volume_mounts(self, body.volume_mounts.as_ref()).await {
             Ok(prepared) => prepared,
             Err(error) if error.code >= 500 => {
@@ -805,13 +785,17 @@ impl Sandboxes<()> for ApiImpl {
                     &self.volume_manager,
                     pending_volume_owner.as_deref(),
                     Some(metadata.id),
+                    &reserved_volume_ids,
                 )
                 .await
                 {
-                    if let Some(owner) = pending_volume_owner.as_deref() {
-                        let _ = self.volume_manager.release_owner(owner).await;
-                    }
                     let _ = self.orchestrator.delete_sandbox(metadata.id).await;
+                    if let Some(owner) = pending_volume_owner.as_deref() {
+                        let _ = self
+                            .volume_manager
+                            .replace_owner_for(owner, None, &reserved_volume_ids)
+                            .await;
+                    }
                     return Ok(SandboxesColdPostResponse::Status500_ServerError(
                         Self::error(
                             500,
@@ -832,6 +816,7 @@ impl Sandboxes<()> for ApiImpl {
                     &self.volume_manager,
                     pending_volume_owner.as_deref(),
                     None,
+                    &reserved_volume_ids,
                 )
                 .await;
                 let invalid_request = match &err {
@@ -866,10 +851,8 @@ impl Sandboxes<()> for ApiImpl {
     ) -> Result<SandboxesGetResponse, ()> {
         let filter = SandboxListFilter {
             states: Some(vec![SandboxState::Running]),
-            excluded_states: None,
             user_metadata: parse_metadata_filter(&query_params.metadata),
-            started_after: None,
-            template: None,
+            ..SandboxListFilter::matches_all()
         };
 
         let list = match self.orchestrator.list_sandboxes_filtered(filter).await {
@@ -956,6 +939,7 @@ impl Sandboxes<()> for ApiImpl {
             owner: pending_volume_owner,
             drives: volume_drives,
             mounts: volume_mounts,
+            volume_ids: reserved_volume_ids,
         } = match prepare_volume_mounts(self, requested_volume_mounts.as_ref()).await {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -998,14 +982,18 @@ impl Sandboxes<()> for ApiImpl {
                     &self.volume_manager,
                     pending_volume_owner.as_deref(),
                     Some(metadata.id),
+                    &reserved_volume_ids,
                 )
                 .await
                 {
+                    let _ = self.orchestrator.delete_sandbox(metadata.id).await;
                     if let Some(owner) = pending_volume_owner.as_deref() {
-                        let _ = self.volume_manager.release_owner(owner).await;
+                        let _ = self
+                            .volume_manager
+                            .replace_owner_for(owner, None, &reserved_volume_ids)
+                            .await;
                     }
                     cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                    let _ = self.orchestrator.delete_sandbox(metadata.id).await;
                     return Ok(SandboxesPostResponse::Status500_ServerError(Self::error(
                         500,
                         format!("failed to finalize volume reservation: {error}"),
@@ -1024,6 +1012,7 @@ impl Sandboxes<()> for ApiImpl {
                     &self.volume_manager,
                     pending_volume_owner.as_deref(),
                     None,
+                    &reserved_volume_ids,
                 )
                 .await;
                 cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
@@ -1134,6 +1123,11 @@ impl Sandboxes<()> for ApiImpl {
                     ),
                 ));
             }
+            Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
+                return Ok(SandboxesSandboxIdConnectPostResponse::Status409_Conflict(
+                    Self::error(409, err.to_string()),
+                ));
+            }
             Err(err) => {
                 return Ok(
                     SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()),
@@ -1213,13 +1207,20 @@ impl Sandboxes<()> for ApiImpl {
             }
             if let Err(error) = self
                 .volume_manager
-                .publish_owner_backings(&sandbox_id.to_string())
+                .recover_backings(
+                    &sandbox_id.to_string(),
+                    &source_metadata
+                        .volume_mounts
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
                 .await
             {
                 return Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
                     Self::error(
                         500,
-                        format!("failed to publish volume backing before fork: {error}"),
+                        format!("failed to recover local volume backing before fork: {error}"),
                     ),
                 ));
             }
@@ -1584,18 +1585,15 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
-        let (volume_snapshots, volume_snapshot_ids) =
-            match snapshot_sandbox_volumes(self, &capture.metadata).await {
-                Ok(snapshots) => snapshots,
-                Err(error) => {
-                    return Ok(match error.code {
-                        500 => {
-                            SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(error)
-                        }
-                        _ => SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(error),
-                    });
-                }
-            };
+        let volume_snapshots = match snapshot_sandbox_volumes(self, &capture.metadata).await {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                return Ok(match error.code {
+                    500 => SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(error),
+                    _ => SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(error),
+                });
+            }
+        };
 
         let published = match timer
             .time(
@@ -1623,9 +1621,6 @@ impl Sandboxes<()> for ApiImpl {
         {
             Ok(snapshot) => snapshot,
             Err(err) => {
-                for id in volume_snapshot_ids {
-                    let _ = self.volume_manager.delete(&id).await;
-                }
                 let error =
                     Self::bad_request_for_repository_build_error(&err).unwrap_or_else(|| {
                         warn!(error = ?err, %sandbox_id, "failed to publish captured snapshot");
@@ -1719,12 +1714,22 @@ impl Sandboxes<()> for ApiImpl {
                     sandbox_not_found(id),
                 ));
             }
+            Err(OrchestratorError::InvalidTimeout { timeout, .. }) => {
+                return Ok(SandboxesSandboxIdResumePostResponse::Status400_BadRequest(
+                    Self::error(400, format!("invalid timeout: {timeout}")),
+                ));
+            }
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
                 return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
                     Self::error(
                         409,
                         format!("sandbox cannot be resumed from {} state", state),
                     ),
+                ));
+            }
+            Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
+                return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
+                    Self::error(409, err.to_string()),
                 ));
             }
             Err(err) => {
@@ -1787,18 +1792,28 @@ impl Sandboxes<()> for ApiImpl {
             // treat it as no state filter (i.e. return all sandboxes regardless of state)
             None
         };
+        let include_running = states
+            .as_ref()
+            .is_none_or(|states| states.contains(&SandboxState::Running));
+        let descending = !matches!(query_params.order, Some(models::OrderDirection::Asc));
 
         let filter = SandboxListFilter {
             states,
             excluded_states: None,
             user_metadata: parse_metadata_filter(&query_params.metadata),
-            started_after: None,
-            template: None,
+            started_after: query_params.started_after.map(SystemTime::from),
+            template: query_params.template.clone(),
         };
 
         let cursor = match query_params.next_token.as_deref() {
             Some(token) => match PaginationCursor::parse(token) {
-                Ok(cursor) => cursor,
+                Ok(cursor) if cursor.is_descending() == descending => cursor,
+                Ok(_) => {
+                    return Ok(V2SandboxesGetResponse::Status400_BadRequest(Self::error(
+                        400,
+                        "next token was issued for a different sort order".to_string(),
+                    )));
+                }
                 Err(err) => {
                     return Ok(V2SandboxesGetResponse::Status400_BadRequest(Self::error(
                         400,
@@ -1806,7 +1821,10 @@ impl Sandboxes<()> for ApiImpl {
                     )));
                 }
             },
-            None => PaginationCursor::new(SystemTime::now(), SandboxId::max(), true),
+            None if descending => {
+                PaginationCursor::new_descending(SystemTime::now(), SandboxId::max())
+            }
+            None => PaginationCursor::new_ascending(SystemTime::UNIX_EPOCH, SandboxId::max()),
         };
 
         let list = match self.orchestrator.list_sandboxes_filtered(filter).await {
@@ -1816,19 +1834,28 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
+        let x_total_running = include_running.then(|| {
+            list.iter()
+                .filter(|sandbox| sandbox.state == SandboxState::Running)
+                .count()
+                .try_into()
+                .unwrap_or(i32::MAX)
+        });
+
         let page = cursor.paginate(
             list,
             query_params.limit,
-            |a, b| PaginationCursor::compare_desc(a.created_at, &a.id, b.created_at, &b.id),
+            |a, b| PaginationCursor::compare(descending, a.created_at, &a.id, b.created_at, &b.id),
             |sandbox, cursor| {
-                PaginationCursor::compare_desc(
+                PaginationCursor::compare(
+                    descending,
                     sandbox.created_at,
                     &sandbox.id,
                     cursor.time(),
                     cursor.value(),
                 )
             },
-            |sandbox| PaginationCursor::new(sandbox.created_at, sandbox.id, true),
+            |sandbox| PaginationCursor::new(sandbox.created_at, sandbox.id, descending),
         );
 
         let out = page
@@ -1841,7 +1868,7 @@ impl Sandboxes<()> for ApiImpl {
             V2SandboxesGetResponse::Status200_SuccessfullyReturnedAllRunningSandboxes {
                 body: out,
                 x_next_token: page.next_token,
-                x_total_running: None,
+                x_total_running,
             },
         )
     }

@@ -132,9 +132,23 @@ impl OssClient {
     /// conditional update.
     pub(crate) async fn get_bytes_with_etag(&self, key: &str) -> Result<(Bytes, Option<String>)> {
         self.run_with_key(key, |operator, key| async move {
-            let metadata = operator.stat(&key).await?;
-            let bytes = operator.read(&key).await?.to_bytes();
-            Ok((bytes, metadata.etag().map(str::to_owned)))
+            for _attempt in 0..5 {
+                let metadata = operator.stat(&key).await?;
+                let etag = metadata.etag().map(str::to_owned);
+                let read = match etag.as_deref() {
+                    Some(etag) => operator.read_with(&key).if_match(etag).await,
+                    None => operator.read(&key).await,
+                };
+                match read {
+                    Ok(bytes) => return Ok((bytes.to_bytes(), etag)),
+                    Err(error) if error.kind() == OpenDalErrorKind::ConditionNotMatch => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(OpenDalError::new(
+                OpenDalErrorKind::Unexpected,
+                "object changed too often while reading its version",
+            ))
         })
         .await
         .with_context(|| format!("oss get versioned object '{key}'"))

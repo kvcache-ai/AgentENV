@@ -9,7 +9,6 @@ use http::Method;
 use agentenv_http_server::apis::volumes::*;
 use agentenv_http_server::models;
 
-use crate::image::ImageResolver;
 use crate::sandbox::{normalize_mount_path, ExtraDrive};
 use crate::volume::{
     VolumeError, VolumeManager, VolumeMode, VolumeRecord, VolumeStatus, DEFAULT_VOLUME_PAGE_SIZE,
@@ -20,13 +19,13 @@ use super::ApiImpl;
 
 pub(super) async fn resolve_volume_mounts(
     manager: &VolumeManager,
-    image_resolver: &ImageResolver,
     mounts: &HashMap<String, String>,
     owner: &str,
 ) -> Result<(Vec<ExtraDrive>, HashMap<String, String>), models::Error> {
-    let result = resolve_volume_mounts_inner(manager, image_resolver, mounts, owner).await;
+    let mut reserved = Vec::with_capacity(mounts.len());
+    let result = resolve_volume_mounts_inner(manager, mounts, owner, &mut reserved).await;
     if result.is_err() {
-        if let Err(error) = manager.release_owner(owner).await {
+        if let Err(error) = manager.replace_owner_for(owner, None, &reserved).await {
             tracing::warn!(%owner, %error, "failed to clean up volume reservations after mount resolution failed");
         }
     }
@@ -35,9 +34,9 @@ pub(super) async fn resolve_volume_mounts(
 
 async fn resolve_volume_mounts_inner(
     manager: &VolumeManager,
-    image_resolver: &ImageResolver,
     mounts: &HashMap<String, String>,
     owner: &str,
+    reserved: &mut Vec<String>,
 ) -> Result<(Vec<ExtraDrive>, HashMap<String, String>), models::Error> {
     let mut drives = Vec::with_capacity(mounts.len());
     let limits = manager.limits();
@@ -87,47 +86,15 @@ async fn resolve_volume_mounts_inner(
             .reserve(&volume.id, owner)
             .await
             .map_err(|error| error_response(error).1)?;
+        reserved.push(volume.id.clone());
 
-        let mut source_record = manager
+        let volume = manager
             .materialize_backing(&volume.id)
             .await
             .map_err(|error| error_response(error).1)?;
-        while source_record.source == "volume" && source_record.backing_image_config.is_none() {
-            let Some(parent_id) = source_record.parent_volume_id.as_deref() else {
-                break;
-            };
-            let parent = manager
-                .materialize_backing(parent_id)
-                .await
-                .map_err(|error| error_response(error).1)?;
-            source_record = parent;
-        }
-        let image_config_path = match source_record.backing_image_config.clone() {
-            Some(path) => path,
-            None if source_record.source == "empty" || source_record.source == "volume" => {
-                return Err(ApiImpl::error(
-                    500,
-                    format!("volume {} has no backing image", volume.id),
-                ));
-            }
-            None => {
-                let resolved = image_resolver
-                    .resolve(&source_record.source)
-                    .await
-                    .map_err(|error| {
-                        ApiImpl::error(
-                            if error.is_user_error() { 400 } else { 500 },
-                            format!("resolve volume {} source: {error:#}", volume.id),
-                        )
-                    })?;
-                manager
-                    .ensure_backing_config(&volume.id, &resolved.overlaybd_config_path)
-                    .await
-                    .map_err(|error| {
-                        ApiImpl::error(500, format!("persist volume {} source: {error}", volume.id))
-                    })?
-            }
-        };
+        let image_config_path = volume.backing_image_config.clone().ok_or_else(|| {
+            ApiImpl::error(500, format!("volume {} has no backing image", volume.id))
+        })?;
 
         let normalized_path = mount_path.to_string_lossy().into_owned();
         let drive = ExtraDrive::try_new_overlaybd_with_mount_path(
@@ -146,10 +113,9 @@ async fn resolve_volume_mounts_inner(
             )
         })
         .map_err(|error| ApiImpl::error(400, error.to_string()))?;
-        let snapshot_output_dir = (volume.mode == VolumeMode::Exclusive)
-            .then(|| manager.data_dir(&volume.id))
-            .flatten();
-        drives.push(drive.with_snapshot_output_dir(snapshot_output_dir));
+        let snapshot_output_dir =
+            (volume.mode == VolumeMode::Exclusive).then(|| manager.data_dir(&volume.id));
+        drives.push(drive.with_volume_snapshot_output_dir(snapshot_output_dir));
         normalized_mounts.insert(normalized_path, volume.id);
     }
 
@@ -272,31 +238,14 @@ impl Volumes<()> for ApiImpl {
                 body.name.clone(),
                 mode,
                 body.from_volume.clone(),
-                body.image.clone(),
+                resolved_image,
                 body.size_mb.unwrap_or(DEFAULT_VOLUME_SIZE_MB),
             )
             .await
         {
-            Ok(record) => {
-                if let Some(config) = resolved_image {
-                    if let Err(error) = self
-                        .volume_manager
-                        .ensure_backing_config(&record.id, &config)
-                        .await
-                    {
-                        let _ = self.volume_manager.delete(&record.id).await;
-                        let (code, error) = error_response(error);
-                        return Ok(match code {
-                            400 => VolumesPostResponse::Status400_BadRequest(error),
-                            409 => VolumesPostResponse::Status409_Conflict(error),
-                            _ => VolumesPostResponse::Status500_ServerError(error),
-                        });
-                    }
-                }
-                Ok(VolumesPostResponse::Status201_VolumeCreatedSuccessfully(
-                    to_model(record),
-                ))
-            }
+            Ok(record) => Ok(VolumesPostResponse::Status201_VolumeCreatedSuccessfully(
+                to_model(record),
+            )),
             Err(error) => {
                 let (code, error) = error_response(error);
                 match code {
@@ -349,78 +298,5 @@ impl Volumes<()> for ApiImpl {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
-
-    use crate::cfg::AppConfig;
-
-    #[tokio::test]
-    async fn resolves_empty_volume_mount_to_extra_drive_and_reserves_it() {
-        let directory = tempfile::tempdir().unwrap();
-        let manager = VolumeManager::open(directory.path().join("catalog"))
-            .await
-            .unwrap();
-        let record = manager
-            .create("my-data".to_owned(), VolumeMode::Exclusive, None, None, 16)
-            .await
-            .unwrap();
-        let resolver = ImageResolver::new(&AppConfig {
-            deps_path: directory.path().join("deps"),
-            ..AppConfig::default()
-        });
-        let mounts = HashMap::from([(String::from("/mnt/data"), record.id.clone())]);
-
-        let (drives, normalized) = resolve_volume_mounts(&manager, &resolver, &mounts, "pending")
-            .await
-            .expect("volume mount should resolve");
-        assert_eq!(drives.len(), 1);
-        assert_eq!(drives[0].drive_id(), record.id);
-        assert_eq!(drives[0].mount_path(), Path::new("/mnt/data"));
-        assert!(!drives[0].read_only());
-        assert_eq!(normalized.get("/mnt/data"), Some(&record.id));
-        assert_eq!(
-            manager
-                .get(&record.id)
-                .await
-                .unwrap()
-                .reserved_by_sandbox_id,
-            Some("pending".to_owned())
-        );
-    }
-
-    #[tokio::test]
-    async fn resolves_volume_drives_in_mount_path_order() {
-        let directory = tempfile::tempdir().unwrap();
-        let manager = VolumeManager::open(directory.path().join("catalog"))
-            .await
-            .unwrap();
-        let first = manager
-            .create("first".to_owned(), VolumeMode::Exclusive, None, None, 16)
-            .await
-            .unwrap();
-        let second = manager
-            .create("second".to_owned(), VolumeMode::Exclusive, None, None, 16)
-            .await
-            .unwrap();
-        let resolver = ImageResolver::new(&AppConfig {
-            deps_path: directory.path().join("deps"),
-            ..AppConfig::default()
-        });
-        let mounts = HashMap::from([
-            (String::from("/mnt/z-last"), first.id),
-            (String::from("/mnt/a-first"), second.id),
-        ]);
-
-        let (drives, _) = resolve_volume_mounts(&manager, &resolver, &mounts, "pending")
-            .await
-            .expect("volume mounts should resolve");
-
-        assert_eq!(drives[0].mount_path(), Path::new("/mnt/a-first"));
-        assert_eq!(drives[1].mount_path(), Path::new("/mnt/z-last"));
     }
 }

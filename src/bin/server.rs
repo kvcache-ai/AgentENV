@@ -113,8 +113,23 @@ async fn main() -> anyhow::Result<()> {
         &cluster_cpu_arc,
     )));
     let image_resolver = Arc::new(ImageResolver::new(config));
+    let volume_manager = Arc::new(
+        VolumeManager::open_with_repository_and_limits(
+            config.home_path.join("volumes/catalog"),
+            snapshot_manager.repository(),
+            VolumeLimits {
+                max_size_mb: config.volume.max_size_mb,
+                max_mounts: config.volume.max_volume_count,
+            },
+        )
+        .await?,
+    );
     let factory = FirecrackerSandboxFactory::with_cpu_config(Arc::clone(&cluster_cpu_arc));
-    let orchestrator = Orchestrator::with_file_backed_store_and_factory(factory).await?;
+    let orchestrator = Orchestrator::with_file_backed_store_factory_and_volumes(
+        factory,
+        Arc::clone(&volume_manager),
+    )
+    .await?;
     let observability_config = &config.observability;
     let observability = if observability_config.enabled {
         Some(Arc::new(
@@ -144,51 +159,6 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let volume_repository = snapshot_manager.repository();
-    let volume_manager = Arc::new(
-        VolumeManager::open_with_repository_and_limits(
-            config.home_path.join("volumes/catalog"),
-            Some(volume_repository),
-            VolumeLimits {
-                max_size_mb: config.volume.max_size_mb,
-                max_mounts: config.volume.max_volume_count,
-            },
-        )
-        .await?,
-    );
-    let mut volume_events = orchestrator.subscribe_sandbox_events();
-    let volume_manager_for_events = Arc::clone(&volume_manager);
-    let volume_release_task = tokio::spawn(async move {
-        loop {
-            match volume_events.recv().await {
-                Ok(event) => match event.event_type {
-                    agentenv::orchestrator::SandboxLifecycleEventType::Delete => {
-                        let owner = event.sandbox_id.to_string();
-                        if let Err(error) = volume_manager_for_events
-                            .publish_owner_backings(&owner)
-                            .await
-                        {
-                            warn!(error = %error, sandbox_id = %event.sandbox_id, "failed to publish volume backing after sandbox deletion event");
-                        }
-                        if let Err(error) = volume_manager_for_events.release_owner(&owner).await {
-                            warn!(error = %error, sandbox_id = %event.sandbox_id, "failed to release volume reservation after sandbox deletion event");
-                        }
-                    }
-                    agentenv::orchestrator::SandboxLifecycleEventType::Pause => {
-                        if let Err(error) = volume_manager_for_events
-                            .publish_owner_backings(&event.sandbox_id.to_string())
-                            .await
-                        {
-                            warn!(error = %error, sandbox_id = %event.sandbox_id, "failed to publish volume backing after sandbox pause event");
-                        }
-                    }
-                    _ => {}
-                },
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
     let api_impl = Arc::new(ApiImpl::new(
         Arc::clone(&orchestrator),
         snapshot_manager,
@@ -215,7 +185,6 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown_cleanup = tokio::spawn(async move {
         if let Ok(()) = shutdown_rx.await {
-            volume_release_task.abort();
             if let Some(mut handle) = reporter.take() {
                 info!(target: "agentenv", "stopping observability reporter before process exit");
                 if let Err(err) = handle.shutdown().await {

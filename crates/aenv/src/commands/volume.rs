@@ -124,10 +124,6 @@ fn list(client: &Client, format: Format) -> Result<()> {
             .clone()
             .unwrap_or_else(|| "exclusive".to_owned()),
         size_mb: volume.size_mb.to_string(),
-        status: if volume.status.is_empty() {
-            "ready".to_owned()
-        } else {
-            volume.status.clone()
-        },
+        status: volume.status.clone(),
     })
 }
