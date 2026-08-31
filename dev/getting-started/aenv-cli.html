@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-6a10619c.js";
+            window.path_to_searchindex_js = "../searchindex-e3ea46aa.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-0fdd41d5.js"></script>
@@ -437,6 +437,77 @@ aenv snapshot list --sandbox-id &lt;sandbox-id&gt;
 </div>
 <p>The table output includes an <code>IMAGE REF</code> column (<code>-</code> when no image was published); JSON output includes the optional <code>imageRef</code> field.</p>
 <p>To delete a snapshot, use <code>aenv template delete &lt;snapshot-id&gt;</code> or <code>aenv template delete &lt;name&gt;</code> — snapshots share the same underlying store as templates and are deleted through the same command.</p>
+<hr>
+<h2 id="shell-completion"><a class="header" href="#shell-completion">Shell completion</a></h2>
+<p><code>aenv completion &lt;shell&gt;</code> prints a shell-completion registration script for the
+<code>aenv</code> CLI to stdout. Supported shells: <code>bash</code>, <code>zsh</code>, and <code>fish</code>.</p>
+<p>The script registers a completion function that calls back into the <code>aenv</code>
+binary at completion time (<code>COMPLETE=&lt;shell&gt; aenv ...</code>), so completion logic
+always matches the installed CLI version — upgrading <code>aenv</code> does not require
+regenerating the script. The script invokes <code>aenv</code> by name, so the binary must
+be on your <code>PATH</code>.</p>
+<h3 id="generate-and-install-a-script"><a class="header" href="#generate-and-install-a-script">Generate and install a script</a></h3>
+<h4 id="bash"><a class="header" href="#bash">Bash</a></h4>
+<pre><code class="language-bash">mkdir -p ~/.local/share/bash-completion/completions
+aenv completion bash &gt; ~/.local/share/bash-completion/completions/aenv
+</code></pre>
+<p>The Bash completion file is loaded on demand by
+<a href="https://github.com/scop/bash-completion"><code>bash-completion</code></a>.
+This requires <code>bash-completion</code> to be installed and initialized in the current
+shell.</p>
+<h4 id="zsh"><a class="header" href="#zsh">Zsh</a></h4>
+<pre><code class="language-zsh">mkdir -p ~/.local/share/zsh/site-functions
+aenv completion zsh &gt; ~/.local/share/zsh/site-functions/_aenv
+</code></pre>
+<p>Zsh loads completion functions from directories listed in <code>fpath</code>.
+<code>~/.local/share/zsh/site-functions</code> is not included in <code>fpath</code> by default on
+all systems. Add the following lines to <code>~/.zshrc</code> before any existing
+<code>compinit</code> invocation:</p>
+<pre><code class="language-zsh">fpath=(~/.local/share/zsh/site-functions $fpath)
+autoload -Uz compinit
+compinit
+</code></pre>
+<h4 id="fish"><a class="header" href="#fish">Fish</a></h4>
+<pre><code class="language-shell">mkdir -p ~/.config/fish/completions
+aenv completion fish &gt; ~/.config/fish/completions/aenv.fish
+</code></pre>
+<h3 id="activate-without-installing"><a class="header" href="#activate-without-installing">Activate without installing</a></h3>
+<p>To test completion for the current shell session without saving a generated
+file:</p>
+<pre><code class="language-bash">source &lt;(aenv completion bash)         # Bash
+eval "$(aenv completion zsh)"         # Zsh
+aenv completion fish | source          # Fish
+</code></pre>
+<h3 id="what-completion-covers"><a class="header" href="#what-completion-covers">What completion covers</a></h3>
+<p>Static completion covers the full CLI surface:</p>
+<pre><code class="language-bash">aenv &lt;TAB&gt;                       # top-level commands
+aenv snapshot &lt;TAB&gt;              # nested subcommands (create, list, ...)
+aenv list --output &lt;TAB&gt;         # enum values: table, json
+aenv build ./&lt;TAB&gt;               # local path arguments
+</code></pre>
+<p>Commands that take a sandbox ID also complete live sandbox IDs dynamically,
+filtered to the states each command accepts:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Command</th><th>Completed sandboxes</th></tr>
+</thead>
+<tbody>
+<tr><td><code>pause</code>, <code>exec</code>, <code>timeout</code>, <code>upload</code>, <code>download</code>, <code>snapshot create</code></td><td>running</td></tr>
+<tr><td><code>resume</code></td><td>paused</td></tr>
+<tr><td><code>connect</code>, <code>delete</code></td><td>running and paused</td></tr>
+</tbody>
+</table>
+</div>
+<pre><code class="language-bash">aenv resume &lt;TAB&gt;                # paused sandbox IDs
+aenv exec &lt;TAB&gt;                  # running sandbox IDs
+</code></pre>
+<p>Where the shell supports it, candidates carry a description with the sandbox’s
+template and state.</p>
+<p>Dynamic lookup is best-effort: it uses short timeouts (500 ms connect, 1 s
+request) and silently returns no candidates when credentials, the server, or
+the network are unavailable. Static command and flag completion keeps working
+in that case, and no diagnostic output is written to your command line.</p>
 
                     </main>
 
