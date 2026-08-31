@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-f2fd1696.js";
+            window.path_to_searchindex_js = "../searchindex-95cfd7e3.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-0fdd41d5.js"></script>
+        <script src="../toc-d21ca9d8.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -294,6 +294,16 @@ aenv template list --output json
 size, and last-updated timestamp. <code>--output</code> accepts <code>table</code> or <code>json</code>. It
 defaults to <code>table</code> in an interactive terminal and <code>json</code> when output is piped
 or redirected.</p>
+<h3 id="list-template-builds"><a class="header" href="#list-template-builds">List template builds</a></h3>
+<p>List the complete build history for one template:</p>
+<pre><code class="language-bash">curl -H 'X-API-Key: test-key' \
+  http://127.0.0.1:8000/templates/&lt;template-id&gt;
+</code></pre>
+<h3 id="check-a-template-alias"><a class="header" href="#check-a-template-alias">Check a template alias</a></h3>
+<p>Check whether an alias exists and resolve it to a template ID:</p>
+<pre><code class="language-bash">curl -H 'X-API-Key: test-key' \
+  http://127.0.0.1:8000/templates/aliases/&lt;alias&gt;
+</code></pre>
 <h3 id="delete-a-template"><a class="header" href="#delete-a-template">Delete a template</a></h3>
 <pre><code class="language-bash">aenv template delete &lt;template-id-or-name&gt;   # alias: aenv template rm
 </code></pre>

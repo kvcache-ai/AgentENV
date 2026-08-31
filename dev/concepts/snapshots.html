@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-f2fd1696.js";
+            window.path_to_searchindex_js = "../searchindex-95cfd7e3.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-0fdd41d5.js"></script>
+        <script src="../toc-d21ca9d8.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -217,6 +217,10 @@ aenv start &lt;snapshot-id&gt;
 <p>This creates a separate sandbox with a new sandbox ID. It inherits the captured
 filesystem, running processes, memory state, environment variables, runtime
 configuration, and resource settings.</p>
+<p>To retrieve information about one snapshot by ID or alias, use the HTTP API:</p>
+<pre><code class="language-bash">curl -H 'X-API-Key: test-key' \
+  http://127.0.0.1:8000/snapshots/&lt;snapshot-id-or-alias&gt;
+</code></pre>
 <h2 id="use-a-snapshot-rootfs-as-an-oci-image"><a class="header" href="#use-a-snapshot-rootfs-as-an-oci-image">Use a Snapshot Rootfs as an OCI Image</a></h2>
 <p>Starting with <code>aenv start &lt;snapshot&gt;</code> restores the complete snapshot state. If
 you only need the captured root filesystem, you can instead publish it as an

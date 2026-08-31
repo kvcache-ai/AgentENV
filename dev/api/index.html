@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-f2fd1696.js";
+            window.path_to_searchindex_js = "../searchindex-95cfd7e3.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-0fdd41d5.js"></script>
+        <script src="../toc-d21ca9d8.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -182,20 +182,34 @@
                 <div id="mdbook-content" class="content">
                     <main>
                         <style>
-  main { padding: 0 !important; }
+  /* Stoplight uses its own multi-column navigation, so let it use the full
+     mdBook content area instead of the default narrow reading column. */
+  html,
+  body,
+  .page-wrapper,
+  .page {
+    height: 100% !important;
+    overflow: hidden !important;
+  }
+  .content {
+    height: calc(100vh - 50px) !important;
+    overflow: hidden !important;
+    padding: 0 !important;
+  }
+  .content main {
+    width: 100% !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+  /* This page has navigation inside Stoplight; mdBook chapter arrows overlap it. */
+  .nav-chapters,
+  .mobile-nav-chapters {
+    display: none !important;
+  }
 </style>
-<iframe id="swagger-frame" src="../swagger-ui.html" scrolling="no" style="width:100%; border:none; display:block; min-height:600px;">
+<iframe id="stoplight-elements-frame" src="../stoplight-elements.html#/paths/health/get" title="AgentENV API Reference rendered with Stoplight Elements" style="width: 100%; height: calc(100vh - 50px); border: none; display: block;">
 </iframe>
-<script>
-document.getElementById('swagger-frame').addEventListener('load', function () {
-  var frame = this;
-  var resize = function () {
-    frame.style.height = frame.contentDocument.documentElement.scrollHeight + 'px';
-  };
-  resize();
-  new ResizeObserver(resize).observe(frame.contentDocument.body);
-});
-</script>
 
                     </main>
 

@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-f2fd1696.js";
+            window.path_to_searchindex_js = "../searchindex-95cfd7e3.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-0fdd41d5.js"></script>
+        <script src="../toc-d21ca9d8.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -251,6 +251,11 @@ aenv start 018f0d93-aaaa-bbbb-cccc-0123456789ab
 <p>Without <code>--detach</code>, <code>aenv start</code> waits for the sandbox to become ready and then
 attaches an interactive shell. CPU, memory, and disk settings are inherited
 from the template or snapshot and cannot be overridden on a warm start.</p>
+<p>To retrieve the current state and configuration of one sandbox, use the HTTP
+API:</p>
+<pre><code class="language-bash">curl -H 'X-API-Key: test-key' \
+  http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;
+</code></pre>
 <h3 id="cold-start-from-an-oci-image"><a class="header" href="#cold-start-from-an-oci-image">Cold Start from an OCI Image</a></h3>
 <p>A cold start resolves an OCI image directly and prepares a fresh writable root
 filesystem at runtime:</p>
@@ -420,11 +425,12 @@ terminal and JSON when output is piped or redirected.</p>
 <p>Deletion is permanent, but snapshots previously created from the sandbox are
 unaffected.</p>
 <h2 id="auto-eviction"><a class="header" href="#auto-eviction">Auto-Eviction</a></h2>
-<p>Every sandbox has a time-to-live (TTL), which controls how long it stays running
-when it is no longer being actively used or kept alive. TTL prevents idle
-sandboxes from occupying CPU and memory indefinitely. When the TTL is reached,
+<p>Every running sandbox has a time-to-live (TTL). The TTL establishes an
+expiration deadline so a sandbox cannot occupy CPU and memory indefinitely.
+When the TTL is reached,
 AgentENV automatically pauses or deletes the sandbox so those resources can be
 reclaimed.</p>
+<h3 id="behavior-at-expiration"><a class="header" href="#behavior-at-expiration">Behavior at Expiration</a></h3>
 <p>When a sandbox reaches its TTL, AgentENV performs its configured timeout
 action:</p>
 <ul>
@@ -432,16 +438,9 @@ action:</p>
 resumed later.</li>
 <li><strong>Delete</strong> (<code>autoPause: false</code>): permanently remove the sandbox.</li>
 </ul>
-<p>Set the initial TTL with <code>aenv start --timeout &lt;seconds&gt;</code>, or set the TTL used
-after a resume with <code>aenv resume --timeout &lt;seconds&gt;</code>. Both commands default to
-300 seconds. Replace a running sandbox’s deadline at any time with:</p>
-<pre><code class="language-bash">aenv timeout &lt;sandbox-id&gt; 600
-</code></pre>
-<p>This gives the sandbox another 600 seconds from the time the command is sent.
-Calling it again replaces the previous TTL. An actively used <code>aenv connect</code>
-session keeps the sandbox alive.</p>
-<p>The current <code>aenv start</code> command does not expose <code>autoPause</code>. To delete on
-expiration, set it when creating a sandbox through the API.</p>
+<p>The timeout action is selected when the sandbox is created. The <code>aenv start</code> command uses the default action,
+<code>autoPause: true</code>. To delete on expiration instead, create the sandbox through
+the API with <code>autoPause: false</code>.</p>
 <p>Warm start from a template or snapshot:</p>
 <pre><code class="language-bash">curl -X POST \
   -H 'X-API-Key: test-key' \
@@ -464,8 +463,30 @@ expiration, set it when creating a sandbox through the API.</p>
   }' \
   http://127.0.0.1:8000/sandboxes-cold
 </code></pre>
-<p>The timeout action cannot currently be changed after a sandbox has been
-created.</p>
+<h3 id="set-or-extend-the-deadline"><a class="header" href="#set-or-extend-the-deadline">Set or Extend the Deadline</a></h3>
+<p><code>aenv start --timeout &lt;seconds&gt;</code> sets the initial TTL. If an automatically
+paused sandbox is needed again, <code>aenv resume --timeout &lt;seconds&gt;</code> resumes it and
+sets a new TTL from the resume time. Both commands default to 300 seconds.</p>
+<p>For a running sandbox, replace its deadline with an exact number of seconds
+from now:</p>
+<pre><code class="language-bash">aenv timeout &lt;sandbox-id&gt; 600
+</code></pre>
+<p>This sets the deadline to 600 seconds from the time the command is sent.
+Calling it again replaces the previous deadline, so it can either extend or
+shorten the remaining time.</p>
+<p>To keep a running sandbox alive without shortening a later existing deadline,
+use the refresh API:</p>
+<pre><code class="language-bash">curl -X POST \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"duration": 600}' \
+  http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/refreshes
+</code></pre>
+<p>Refresh does not shorten the remaining TTL if the current deadline is
+later. Refresh applies only to a running sandbox; resume a paused sandbox
+first. If <code>duration</code> is omitted, the server’s default sandbox timeout is used.</p>
+<p><code>aenv connect</code> resumes a paused sandbox when it connects and ensures that its
+TTL is at least the default 300 seconds.</p>
 <h2 id="networking"><a class="header" href="#networking">Networking</a></h2>
 <p>Each sandbox has an isolated network stack. Networking controls two separate
 boundaries:</p>
@@ -502,11 +523,11 @@ always_denied_cidrs = [
 <h3 id="matching-rules"><a class="header" href="#matching-rules">Matching Rules</a></h3>
 <p>Rules are evaluated in this order:</p>
 <pre class="mermaid">flowchart LR
-    A[Destination packet] --&gt; N{Node-level deny?}
-    N --&gt;|Yes| E[Reject traffic]
-    N --&gt;|No| B{Matches allowOut?}
-    B --&gt;|Yes| C[Allow traffic]
-    B --&gt;|No| D{Matches denyOut?}
+    A[Destination&lt;br/&gt;packet] --&gt; N{Node-level&lt;br/&gt;deny?}
+    N --&gt;|Yes| E[Reject&lt;br/&gt;traffic]
+    N --&gt;|No| B{Matches&lt;br/&gt;allowOut?}
+    B --&gt;|Yes| C[Allow&lt;br/&gt;traffic]
+    B --&gt;|No| D{Matches&lt;br/&gt;denyOut?}
     D --&gt;|Yes| E
     D --&gt;|No| F{"allow_internet_access?"}
     F --&gt;|Yes| C
@@ -565,19 +586,6 @@ restore the default base policy.</p>
 not actively terminate existing ones. For domain-policy replacement, the old
 policy remains active until the new namespace rules are installed and the new
 proxy policy is activated.</p>
-<h2 id="data-storage"><a class="header" href="#data-storage">Data Storage</a></h2>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Path</th><th>Contents</th><th>Config</th></tr>
-</thead>
-<tbody>
-<tr><td><code>$AENV_HOME/snapshot-store/</code></td><td>Committed snapshot and template artifacts (rootfs layers, memory snapshots, metadata)</td><td><code>[backend.posix_fs]</code><br /><code>snapshot_store</code></td></tr>
-<tr><td><code>$AENV_HOME/persisted-sandboxes/</code></td><td>Paused sandbox state persisted across server restarts</td><td><code>[orchestrator]</code><br /><code>persisted_sandbox_store_path</code></td></tr>
-<tr><td><code>$AENV_HOME/image-cache/</code></td><td>Converted OCI image layers (overlaybd format) cached after first cold start or template build</td><td><code>[image.cache]</code><br /><code>root_dir</code></td></tr>
-</tbody>
-</table>
-</div>
 
                     </main>
 

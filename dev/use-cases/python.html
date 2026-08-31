@@ -3,7 +3,7 @@
     <head>
         <!-- Book generated using mdBook -->
         <meta charset="UTF-8">
-        <title>Template Builder and Testing - AgentENV Documentation</title>
+        <title>Run Python Code - AgentENV Documentation</title>
 
 
         <!-- Custom HTML head -->
@@ -147,7 +147,7 @@
                         <a href="https://github.com/kvcache-ai/AgentENV" title="Git repository" aria-label="Git repository">
                             <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
                         </a>
-                        <a href="https://github.com/kvcache-ai/AgentENV/edit/main/docs/src/internals/template-builder-testing.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                        <a href="https://github.com/kvcache-ai/AgentENV/edit/main/docs/src/use-cases/python.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
                             <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
                         </a>
 
@@ -181,263 +181,47 @@
 
                 <div id="mdbook-content" class="content">
                     <main>
-                        <h1 id="template-builder-and-testing"><a class="header" href="#template-builder-and-testing">Template Builder and Testing</a></h1>
-<p>This document explains how the current template-facing build API maps onto the
-snapshot-first internals, how committed snapshots move through the
-repository/runtime boundary, and what the relevant tests validate.</p>
-<h2 id="1-public-surface-vs-internal-model"><a class="header" href="#1-public-surface-vs-internal-model">1) Public Surface vs Internal Model</a></h2>
-<h3 id="user-facing-builder-api"><a class="header" href="#user-facing-builder-api">User-facing builder API</a></h3>
-<ul>
-<li>
-<p><code>TemplateBuildSpec</code> (<code>src/template/build_spec.rs</code>)</p>
-<ul>
-<li>Describes a declarative build request.</li>
-<li>Builder helpers include:
-<ul>
-<li><code>from_existing_rootfs(path)</code></li>
-<li><code>from_overlaybd_configs(global_config_path, image_config_path)</code></li>
-<li><code>run(cmd)</code></li>
-<li><code>env(key, value)</code></li>
-<li><code>workdir(path)</code></li>
-<li><code>apt(packages)</code></li>
-<li><code>alias(alias)</code></li>
-<li><code>resources(cpu_count, memory_mib)</code></li>
-</ul>
-</li>
-<li>The current builder implementation accepts overlaybd-backed fresh builds and
-rebuilds from committed snapshots. Fresh ext4-rootfs builds are not wired
-through <code>TemplateBuilder</code>.</li>
-</ul>
-</li>
-<li>
-<p><code>TemplateBuilder</code> (<code>src/template/builder.rs</code>)</p>
-<ul>
-<li>Preserves the external template semantics for build / rebuild flows, while
-committed snapshot lifecycle operations live in <code>SnapshotManager</code>.</li>
-<li>Main methods:
-<ul>
-<li><code>new()</code></li>
-<li><code>with_local_store_root(path)</code></li>
-<li><code>build_and_publish(snapshot_manager, config).await</code></li>
-<li><code>rebuild_and_publish(snapshot_manager, config, snapshot_id, base_snapshot).await</code></li>
-</ul>
-</li>
-</ul>
-</li>
-</ul>
-<h3 id="snapshot-first-internals"><a class="header" href="#snapshot-first-internals">Snapshot-first internals</a></h3>
-<ul>
-<li>
-<p><code>StoredSnapshot</code> / <code>RunnableSnapshot</code> (<code>src/snapshot/types/</code>)</p>
-<ul>
-<li><code>StoredSnapshot</code> is the durable committed manifest state.</li>
-<li>It stores snapshot metadata plus logical rootfs / attached-drive layer
-descriptions and memory layers.</li>
-<li>Snapshot publication also persists <code>firecracker-manifest.json</code> for
-launch-time metadata such as rootfs/memory virtual size and attached-drive
-<code>read_only</code> flags.</li>
-<li>It does not store fixed local artifact locations such as <code>mem_image.json</code>
-or runtime-derived <code>rootfs/image.json</code>.</li>
-<li><code>RunnableSnapshot</code> is a node-local resolved view with concrete artifact
-paths and runtime-ready overlaybd image configs.</li>
-</ul>
-</li>
-<li>
-<p><code>SnapshotRepository</code> / <code>SnapshotRuntimeResolver</code>
-(<code>src/snapshot/repository/interfaces.rs</code>)</p>
-<ul>
-<li><code>SnapshotRepository</code> owns committed durable state.</li>
-<li><code>SnapshotRuntimeResolver</code> turns committed state into node-local runnable
-paths.</li>
-</ul>
-</li>
-</ul>
-<h2 id="2-build-and-publish-flow"><a class="header" href="#2-build-and-publish-flow">2) Build and Publish Flow</a></h2>
-<p><code>TemplateBuilder::build_and_publish(...)</code> does the following:</p>
-<ol>
-<li>Prepare the build base from either:
-<ul>
-<li>a committed snapshot (<code>rebuild_and_publish</code>)</li>
-<li>overlaybd configs (<code>from_overlaybd_configs</code>)</li>
-</ul>
-</li>
-<li>Start a temporary Firecracker sandbox with the requested CPU/memory.</li>
-<li>Execute template steps in order.</li>
-<li>Probe <code>envd</code>, kernel, and firecracker versions from the running guest and executable.</li>
-<li>Pause the sandbox and export a <code>FirecrackerSnapshotManifest</code> carrying metadata for repository publication</li>
-<li>Publish those local artifacts into the configured snapshot repository.</li>
-</ol>
-<p>The important boundary is:</p>
-<ul>
-<li>the builder API describes what to build</li>
-<li>local build artifacts are manager-owned temporary outputs</li>
-<li>committed snapshot records store logical durable state</li>
-<li>backend layout conventions determine where committed files and shared layers live</li>
-<li>runtime resolution turns committed snapshot state into node-local runnable paths</li>
-</ul>
-<h2 id="3-repository-layout"><a class="header" href="#3-repository-layout">3) Repository Layout</a></h2>
-<p>The default backend is the POSIX filesystem backend. Given a backend root like
-<code>/path/to/store/repository</code>:</p>
-<ul>
-<li>committed snapshot manifest:
-<ul>
-<li><code>/path/to/store/repository/snapshots/&lt;id&gt;/snapshot.json</code></li>
-</ul>
-</li>
-<li>committed fixed-layout files:
-<ul>
-<li><code>/path/to/store/repository/snapshots/&lt;id&gt;/vm_state.bin</code></li>
-<li><code>/path/to/store/repository/snapshots/&lt;id&gt;/firecracker-manifest.json</code></li>
-</ul>
-</li>
-<li>shared managed layers:
-<ul>
-<li><code>/path/to/store/repository/managed-layers/&lt;digest&gt;.overlaybd.commit</code></li>
-</ul>
-</li>
-<li>alias bindings:
-<ul>
-<li><code>/path/to/store/repository/catalog/aliases/&lt;alias&gt;</code></li>
-<li><code>/path/to/store/repository/catalog/aliases/&lt;alias&gt;.lock</code></li>
-</ul>
-</li>
-</ul>
-<p>Alias locking is per-alias, not a single global <code>aliases.lock</code> file.</p>
-<p><code>snapshot.json</code> intentionally does not repeat local build-artifact paths such
-as <code>mem_image.json</code> or <code>rootfs/image.json</code>. Runtime code derives node-local
-image configs from:</p>
-<ul>
-<li>repository root</li>
-<li>snapshot id</li>
-<li>attached drive id</li>
-<li>managed layer digest</li>
-</ul>
-<p><code>firecracker-manifest.json</code> complements this by persisting launch-time virtual
-size and attached-drive mode metadata without embedding node-local runtime
-paths.</p>
-<h2 id="4-load-and-launch-flow"><a class="header" href="#4-load-and-launch-flow">4) Load and Launch Flow</a></h2>
-<p>Typical runtime usage is:</p>
-<ol>
-<li><code>SnapshotManager::load_committed(id_or_alias).await</code></li>
-<li><code>SnapshotManager::resolve_runnable(stored).await</code></li>
-<li><code>FirecrackerSandbox::from_snapshot(&amp;runnable, &amp;SandboxLaunchConfig::default())</code></li>
-<li><code>sandbox.start().await</code></li>
-</ol>
-<p>If you want the two snapshot-manager calls combined, use
-<code>SnapshotManager::load_runnable(id_or_alias).await</code>.</p>
-<p><code>resolve_runnable(...)</code> is where backend-neutral committed state becomes
-node-local launch inputs:</p>
-<ul>
-<li><code>memory_layers</code> -&gt; runtime <code>memory/image.json</code></li>
-<li><code>rootfs.layers</code> -&gt; runtime <code>rootfs/image.json</code></li>
-<li><code>attached_drives[].layers</code> -&gt; runtime <code>drives/&lt;id&gt;/image.json</code></li>
-<li><code>attached_drives[].read_only</code> -&gt; runtime mount mode for <code>drives/&lt;id&gt;</code></li>
-<li><code>firecracker-manifest.json</code> -&gt; runtime manifest hydrated with node-local
-artifact paths</li>
-<li>committed <code>vm_state.bin</code> -&gt; runnable vm-state path</li>
-</ul>
-<h2 id="5-minimal-example"><a class="header" href="#5-minimal-example">5) Minimal Example</a></h2>
-<pre class="playground"><code class="language-rust"><span class="boring">#![allow(unused)]
-</span><span class="boring">fn main() {
-</span>use agentenv::cfg::ConfigManager;
-use agentenv::image::ImageResolver;
-use agentenv::sandbox::{FirecrackerSandbox, SandboxExecutor, SandboxLaunchConfig};
-use agentenv::snapshot::SnapshotManager;
-use agentenv::template::{TemplateBuildSpec, TemplateBuilder};
+                        <h1 id="run-python-code"><a class="header" href="#run-python-code">Run Python Code</a></h1>
+<p>This quickstart imports the official Python image as an AgentENV template,
+starts a sandbox, and executes Python code inside it. The Python program is
+included directly in the command; no sample project or source file is needed.</p>
+<p>Before starting, deploy AgentENV and configure the <code>aenv</code> CLI as described in
+<a href="../getting-started/quickstart.html">Quick Start</a>.</p>
+<h2 id="1-create-a-python-template"><a class="header" href="#1-create-a-python-template">1. Create a Python Template</a></h2>
+<p>Import the official Python 3.12 image and wait for the template to become
+ready:</p>
+<pre><code class="language-bash">aenv pull python:3.12-slim --name python
+</code></pre>
+<h2 id="2-start-a-sandbox"><a class="header" href="#2-start-a-sandbox">2. Start a Sandbox</a></h2>
+<p>Start the template in detached mode and capture the generated sandbox ID:</p>
+<pre><code class="language-bash">SANDBOX_ID="$(aenv start python -d)"
+</code></pre>
+<h2 id="3-execute-python"><a class="header" href="#3-execute-python">3. Execute Python</a></h2>
+<p>Run this program inside the sandbox:</p>
+<pre><code class="language-bash">aenv exec "$SANDBOX_ID" python -c '
+from statistics import mean
 
-let builder = TemplateBuilder::new();
-let snapshot_manager = SnapshotManager::new()?;
-let config = ConfigManager::global()?.config();
-let image_resolver = ImageResolver::new(config);
-let image_config = image_resolver
-  .resolve(image_resolver.default_image())
-  .await?
-  .overlaybd_config_path;
-
-let alias = "my-template-v1";
-
-builder
-    .build_and_publish(
-        &amp;snapshot_manager,
-        TemplateBuildSpec::new()
-            .from_overlaybd_config(image_config)
-            .alias(alias)
-            .resources(1, 128)
-            .run("mkdir -p /workspace")
-            .workdir("/workspace")
-            .env("MARK", "ready")
-            .run("printf '%s' \"$MARK\" &gt; mark.txt"),
-    )
-    .await?;
-
-let runnable = snapshot_manager
-    .load_runnable(alias)
-    .await?
-    .expect("template should exist");
-
-let mut sandbox =
-    FirecrackerSandbox::from_snapshot(&amp;runnable, &amp;SandboxLaunchConfig::default())?;
-sandbox.start().await?;
-
-let out = sandbox.run_command("cat", &amp;["/workspace/mark.txt"]).await?;
-assert_eq!(out.exit_code, 0);
-assert_eq!(out.stdout.trim(), "ready");
-
-sandbox.stop().await?;
-<span class="boring">}</span></code></pre>
-<h2 id="6-state-transition"><a class="header" href="#6-state-transition">6) State Transition</a></h2>
-<p>The template-facing state transition is:</p>
-<ol>
-<li>local build artifacts</li>
-<li>committed <code>snapshot.json</code> + <code>firecracker-manifest.json</code> + fixed files + managed layers</li>
-<li>node-local runtime-derived image configs</li>
-<li>Firecracker resume inputs</li>
-</ol>
-<h2 id="7-what-the-tests-validate"><a class="header" href="#7-what-the-tests-validate">7) What the Tests Validate</a></h2>
-<p><code>tests/integration/snapshot.rs</code> covers:</p>
-<ul>
-<li>building and publishing from overlaybd configs</li>
-<li>loading committed snapshots by alias / id through the snapshot manager</li>
-<li>resolving committed snapshots into runnable snapshots</li>
-<li>launching Firecracker sandboxes from resolved snapshots</li>
-<li>rebuilding from committed snapshots while preserving base state</li>
-<li>listing and deleting committed snapshots through the template API surface</li>
-</ul>
-<p><code>tests/integration/snapshot_attached_drive.rs</code> covers overlaybd attached-drive handling
-across sandbox capture, publish, resolve, launch, and rebuild flows, including:</p>
-<ul>
-<li>committed metadata preserving <code>readOnly</code></li>
-<li>runtime mount mode for readonly and writable drives</li>
-<li>rebuild keeping attached-drive metadata stable</li>
-</ul>
-<p><code>crates/e2e-tests/tests/snapshot_oss_e2e_test.rs</code> covers OSS-backed snapshot publication,
-resolution, alias cleanup, missing managed-layer failure modes, and deletion.</p>
-<p>Repository/backend unit tests under <code>src/snapshot/repository/backends/</code> cover:</p>
-<ul>
-<li>artifact import</li>
-<li>alias handling</li>
-<li>committed snapshot deletion</li>
-<li>runtime cache behavior</li>
-</ul>
-<h2 id="8-common-failure-areas"><a class="header" href="#8-common-failure-areas">8) Common Failure Areas</a></h2>
-<ul>
-<li>overlaybd base config paths are missing or invalid</li>
-<li><code>ublk</code> is disabled while using overlaybd build bases</li>
-<li>Linux host prerequisites for Firecracker, the selected KVM/PVM mode, or
-network namespaces are missing</li>
-<li>repository alias conflicts during publish</li>
-<li>runtime resolver cannot materialize local paths from committed artifacts</li>
-</ul>
+temperatures = [21.5, 23.0, 22.4, 24.1]
+print(f"average temperature: {mean(temperatures):.2f} C")
+'
+</code></pre>
+<p>Expected output:</p>
+<pre><code class="language-text">average temperature: 22.75 C
+</code></pre>
+<h2 id="4-delete-the-sandbox-and-the-template"><a class="header" href="#4-delete-the-sandbox-and-the-template">4. Delete the Sandbox and the Template</a></h2>
+<pre><code class="language-bash">aenv delete "$SANDBOX_ID"
+aenv template delete python
+</code></pre>
 
                     </main>
 
                     <nav class="nav-wrapper" aria-label="Page navigation">
                         <!-- Mobile navigation buttons -->
-                            <a rel="prev" href="../internals/sandbox-testing.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                            <a rel="prev" href="../deployment/pvm.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                             </a>
 
-                            <a rel="next prefetch" href="../internals/persistence-artifact-inventory.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                            <a rel="next prefetch" href="../use-cases/miles.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                                 <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                             </a>
 
@@ -447,11 +231,11 @@ network namespaces are missing</li>
             </div>
 
             <nav class="nav-wide-wrapper" aria-label="Page navigation">
-                    <a rel="prev" href="../internals/sandbox-testing.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                    <a rel="prev" href="../deployment/pvm.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
                     </a>
 
-                    <a rel="next prefetch" href="../internals/persistence-artifact-inventory.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                    <a rel="next prefetch" href="../use-cases/miles.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
                         <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
                     </a>
             </nav>
