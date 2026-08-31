@@ -114,7 +114,11 @@ RUN set -eux; \
     /tools-rootfs/agentenv/bin/busybox --list | grep -qx 'runsv' || \
       { echo "BusyBox runsv applet missing; rebuild with CONFIG_RUNSV=y" >&2; exit 1; }; \
     /tools-rootfs/agentenv/bin/busybox --list | grep -qx 'svlogd' || \
-      { echo "BusyBox svlogd applet missing; rebuild with CONFIG_SVLOGD=y" >&2; exit 1; }
+      { echo "BusyBox svlogd applet missing; rebuild with CONFIG_SVLOGD=y" >&2; exit 1; }; \
+    /tools-rootfs/agentenv/bin/busybox --list | grep -qx 'nice' || \
+      { echo "BusyBox nice applet missing; rebuild with CONFIG_NICE=y" >&2; exit 1; }; \
+    /tools-rootfs/agentenv/bin/busybox --list | grep -qx 'ionice' || \
+      { echo "BusyBox ionice applet missing; rebuild with CONFIG_IONICE=y" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Stage 3: materialize the rootfs as an ext4 disk image.
