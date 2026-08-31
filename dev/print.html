@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e3ea46aa.js";
+            window.path_to_searchindex_js = "searchindex-f2fd1696.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-0fdd41d5.js"></script>
@@ -5172,6 +5172,7 @@ Firecracker manifest with node-local paths, and resolves the committed
 <tr><td>Image metadata sidecar</td><td><code>&lt;image.cache.root_dir&gt;/configs/*.metadata.json</code></td><td>Base env/workdir metadata from OCI image config</td><td>Preserves image launch context beside cached image config</td><td>Written after image config. Rebuilt if missing while image config is usable.</td></tr>
 <tr><td>Overlaybd commit cache</td><td><code>&lt;image.cache.root_dir&gt;/commits/{digest-slug}/overlaybd.commit</code></td><td>Content-addressed overlaybd commit layers from standard OCI conversion, and target dirs for remote overlaybd-native layers</td><td>Node-local reusable layer store for user image layers</td><td>Standard OCI conversion writes commits. Remote overlaybd-native configs point <code>dir</code> here for runtime population. No unified GC today.</td></tr>
 <tr><td>OCI conversion index</td><td><code>&lt;image.cache.root_dir&gt;/indexes/{source-digest}/...json</code></td><td>Mapping from OCI source layer/context to overlaybd commit digest and size</td><td>Skips repeated layer conversion when converted commits exist</td><td>Written after successful standard OCI conversion. No unified GC today.</td></tr>
+<tr><td>Converted OCI layer P2P artifact</td><td>P2P catalog key <code>oci-layer/v1/{context-hash}</code></td><td>A completed OverlayBD commit plus its conversion context and output digest/size</td><td>Lets another node reuse a compatible standard-OCI conversion</td><td>Published as a Reference after the local commit is durable; ownership is persisted on the hard-commit record and removed by image-cache GC.</td></tr>
 <tr><td>Temporary OCI pull/conversion work</td><td>process temp dir</td><td>OCI layout and per-layer conversion workspace</td><td>Intermediate input for standard OCI conversion</td><td>Owned by <code>TempDir</code>; removed after conversion scope exits.</td></tr>
 </tbody>
 </table>
@@ -5761,6 +5762,8 @@ pub trait P2pTransport: Send + Sync {
 <li>Deciding whether and when to publish local artifacts.</li>
 </ul>
 <p>This boundary keeps the transport reusable and avoids baking module-specific cache semantics into <code>src/p2p</code>.</p>
+<p>The image resolver uses the same boundary for standard OCI conversion artifacts. After a converted OverlayBD commit is durable in the node-local image cache, the image module publishes it under <code>oci-layer/v1/{context-hash}</code>. The hash is serialized from <code>LayerConversionKey</code>; descriptor metadata contains only the protocol version, output commit digest, and size. A consumer still resolves the source OCI manifest/config from the registry, then looks up each conversion context in P2P before falling back to local OCI download and conversion.
+Fetched bytes are verified as a sealed OverlayBD layer before being indexed locally. P2P publication and lookup failures are acceleration misses, while successful publications are recorded on the owning image-cache hard commit so GC can unpublish them before deleting the file.</p>
 
                     </main>
 
