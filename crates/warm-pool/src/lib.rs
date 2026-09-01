@@ -247,9 +247,19 @@ impl<T: Send> WarmPool<T> {
     /// This is intended for maintenance refill paths that have just created a
     /// resource and need a final bounded insert before publishing it as idle.
     pub fn try_push_bounded(&self, resource: T) -> Result<(), T> {
+        self.try_push_bounded_to(resource, self.config.high_watermark)
+    }
+
+    /// Try to enqueue an idle resource below a caller-specific limit.
+    ///
+    /// The effective limit is capped at `high_watermark`. Checking the current
+    /// length and inserting the resource happen under the same lock, so callers
+    /// can enforce a stricter refill limit without racing concurrent releases.
+    pub fn try_push_bounded_to(&self, resource: T, limit: usize) -> Result<(), T> {
+        let limit = limit.min(self.config.high_watermark);
         if !self.is_shutting_down() {
             let mut pool = self.pool.lock().unwrap();
-            if !self.is_shutting_down() && pool.len() < self.config.high_watermark {
+            if !self.is_shutting_down() && pool.len() < limit {
                 pool.push_back(resource);
                 return Ok(());
             }
@@ -549,6 +559,25 @@ mod tests {
         assert!(pool.release(1).is_ok());
         assert!(pool.release(2).is_ok());
         assert_eq!(pool.release(3), Err(3));
+    }
+
+    #[test]
+    fn try_push_bounded_to_atomically_respects_stricter_limit() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 0,
+            high_watermark: 64,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+        });
+
+        for value in 0..8 {
+            pool.release(value).unwrap();
+        }
+
+        assert_eq!(pool.try_push_bounded_to(8, 8), Err(8));
+        assert_eq!(pool.len(), 8);
+        assert!(pool.try_push_bounded_to(8, 9).is_ok());
+        assert_eq!(pool.len(), 9);
     }
 
     #[test]

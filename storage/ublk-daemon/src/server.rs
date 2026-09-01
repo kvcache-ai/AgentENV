@@ -1454,7 +1454,14 @@ async fn return_or_stop_idle_device(
     };
 
     if let Err(pooled) = pool.idle.try_push_bounded(pooled) {
-        stop_excess_idle_device(pool, ctrl_ring, pooled).await;
+        stop_excess_idle_device(
+            pool,
+            ctrl_ring,
+            pooled,
+            pool.config.high_watermark,
+            "idle cache capacity reached",
+        )
+        .await;
         return false;
     }
     true
@@ -1511,13 +1518,18 @@ async fn refill_idle_pool(
             dev_sectors: placeholder_image.num_lbas(),
             _placeholder_image: Arc::clone(&placeholder_image),
         };
-        if pool.idle.len() >= pool.prewarm_high_watermark {
-            stop_excess_idle_device(pool, ctrl_ring.clone(), pooled).await;
-            break;
-        }
-
-        if let Err(pooled) = pool.idle.try_push_bounded(pooled) {
-            stop_excess_idle_device(pool, ctrl_ring.clone(), pooled).await;
+        if let Err(pooled) = pool
+            .idle
+            .try_push_bounded_to(pooled, pool.prewarm_high_watermark)
+        {
+            stop_excess_idle_device(
+                pool,
+                ctrl_ring.clone(),
+                pooled,
+                pool.prewarm_high_watermark,
+                "proactive refill limit reached",
+            )
+            .await;
             break;
         }
     }
@@ -1543,12 +1555,16 @@ async fn stop_excess_idle_device(
     pool: &PoolState,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     pooled: PooledDevice,
+    idle_limit: usize,
+    reason: &'static str,
 ) {
     let dev_id = pooled.dev.dev_id();
     tracing::info!(
         dev_id,
-        high_watermark = pool.idle.config().high_watermark,
-        "idle overlaybd pool is full; stopping returned device"
+        idle_limit,
+        cache_high_watermark = pool.idle.config().high_watermark,
+        reason,
+        "stopping excess idle overlaybd device"
     );
     stop_overlaybd_device(ctrl_ring, pooled.dev).await;
 }
