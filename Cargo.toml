@@ -41,7 +41,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dependencies]
-firecracker_client = { version = "1.15.1", path = "thirdparty/firecracker-client" }
+firecracker_client = { version = "=1.15.1-patch-v2", path = "thirdparty/firecracker-client" }
 envd = { version = "0.1.0", path = "thirdparty/envd" }
 custom_extension_client = { version = "0.1.0", path = "src/custom_extension_api/generated" }
 tokio = { version = "1", features = ["full"] }

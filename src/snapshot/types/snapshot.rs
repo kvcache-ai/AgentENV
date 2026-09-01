@@ -560,6 +560,16 @@ impl RunnableSnapshot {
             _lease: default_runtime_artifact_lease(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_manifest_with_working_set(
+        record: SnapshotRecord,
+        working_set: crate::sandbox::GuestMemoryWorkingSet,
+    ) -> Self {
+        let mut snapshot = Self::from_test_manifest(record, Vec::new());
+        snapshot.manifest.memory.working_set = Some(working_set);
+        snapshot
+    }
 }
 
 impl fmt::Debug for RunnableSnapshot {

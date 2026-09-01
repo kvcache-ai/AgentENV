@@ -11,8 +11,9 @@ use firecracker_client::models::vm::State as VmState;
 use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig, PartialDrive};
 use firecracker_client::models::{
     Balloon, BootSource, DirtyMemoryRanges, Drive, InstanceActionInfo, Logger,
-    MachineConfiguration, MemoryBackend, NetworkInterface, NetworkOverride, RateLimiter,
-    SnapshotCreateParams, SnapshotLoadParams, Vm,
+    MachineConfiguration, MemoryBackend, NetworkInterface, NetworkOverride, PreFaultMemoryRange,
+    PreFaultMemoryRequest, PreFaultMemoryStats, RateLimiter, SnapshotCreateParams,
+    SnapshotLoadParams, Vm,
 };
 use hyper::Method;
 use nix::sys::signal::{kill, Signal};
@@ -24,6 +25,10 @@ use tracing::{debug, trace, warn};
 
 use super::mmds::MmdsMetadata;
 use super::socket::UnixSocketClient;
+use super::{
+    manifest::GuestMemoryRegion,
+    mincore_tracking::{GuestMemoryImageRegion, ResidentMemoryRange},
+};
 
 /// Maximum size (in bytes) of the MMDS data store. The Firecracker default is
 /// 51200 (50 KiB); we raise it to 1 MiB to accommodate raw image configs
@@ -49,6 +54,12 @@ impl FirecrackerInstance {
             stderr_path: None,
             process: None,
         }
+    }
+
+    #[cfg(test)]
+    /// Path of the Firecracker API socket for crate-internal lifecycle tests.
+    pub(crate) fn api_socket_path(&self) -> &Path {
+        &self.socket_path
     }
 
     pub fn pid(&self) -> Result<Pid> {
@@ -473,6 +484,112 @@ impl FirecrackerInstance {
             .context("Failed to get dirty memory ranges")
     }
 
+    /// Returns the guest-RAM layout for restore-time metadata validation.
+    #[tracing::instrument(skip(self))]
+    pub async fn get_guest_memory_regions(&self) -> Result<Vec<GuestMemoryRegion>> {
+        let regions = self
+            .client
+            .request::<(), Vec<firecracker_client::models::GuestRegionUffdMapping>>(
+                Method::GET,
+                "/vm/guest-memory-regions",
+                None,
+            )
+            .await
+            .context("Failed to get guest-memory regions")?;
+        regions
+            .into_iter()
+            .map(|region| {
+                Ok(GuestMemoryRegion {
+                    base_host_virt_addr: u64::try_from(region.base_host_virt_addr)
+                        .context("Firecracker returned a negative guest-memory host address")?,
+                    guest_phys_addr: u64::try_from(region.guest_phys_addr)
+                        .context("Firecracker returned a negative guest physical address")?,
+                    size: u64::try_from(region.size)
+                        .context("Firecracker returned a negative guest-memory region size")?,
+                    page_size: u64::try_from(region.page_size)
+                        .context("Firecracker returned a negative guest-memory page size")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns Firecracker's snapshot-image-to-GPA map for mincore harvesting.
+    #[tracing::instrument(skip(self))]
+    pub async fn get_guest_memory_image_regions(&self) -> Result<Vec<GuestMemoryImageRegion>> {
+        let regions = self
+            .client
+            .request::<(), Vec<firecracker_client::models::GuestRegionUffdMapping>>(
+                Method::GET,
+                "/vm/guest-memory-regions",
+                None,
+            )
+            .await
+            .context("Failed to get guest-memory regions")?;
+        regions
+            .into_iter()
+            .map(|region| {
+                Ok(GuestMemoryImageRegion {
+                    image_offset: u64::try_from(region.offset)
+                        .context("Firecracker returned a negative guest-memory image offset")?,
+                    guest_phys_addr: u64::try_from(region.guest_phys_addr)
+                        .context("Firecracker returned a negative guest physical address")?,
+                    size: u64::try_from(region.size)
+                        .context("Firecracker returned a negative guest-memory region size")?,
+                    page_size: u64::try_from(region.page_size)
+                        .context("Firecracker returned a negative guest-memory page size")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns mincore-resident memory in Firecracker's contiguous image layout.
+    #[tracing::instrument(skip(self))]
+    pub async fn get_resident_memory_ranges(&self) -> Result<Vec<ResidentMemoryRange>> {
+        let ranges = self.get_dirty_memory_ranges().await?;
+        ranges
+            .ranges
+            .into_iter()
+            .map(|range| {
+                Ok(ResidentMemoryRange {
+                    image_offset: u64::try_from(range.image_offset)
+                        .context("Firecracker returned a negative resident image offset")?,
+                    length: u64::try_from(range.length)
+                        .context("Firecracker returned a negative resident memory length")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Requests KVM pre-fault for validated non-empty GPA ranges while paused.
+    #[tracing::instrument(skip(self, ranges))]
+    pub async fn pre_fault_memory(
+        &self,
+        ranges: &[super::manifest::GuestMemoryRange],
+    ) -> Result<Option<PreFaultMemoryStats>> {
+        if ranges.is_empty() {
+            bail!("refusing to send an empty pre-fault request to Firecracker");
+        }
+        let ranges = ranges
+            .iter()
+            .map(|range| {
+                Ok(PreFaultMemoryRange::new(
+                    i64::try_from(range.gpa).context("pre-fault GPA exceeds i64")?,
+                    i64::try_from(range.size).context("pre-fault size exceeds i64")?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let stats: Option<PreFaultMemoryStats> = self
+            .client
+            .request(
+                Method::PUT,
+                "/vm/pre-fault-memory",
+                Some(&PreFaultMemoryRequest::new(ranges)),
+            )
+            .await
+            .context("Failed to pre-fault guest memory")?;
+        Ok(stats)
+    }
+
     /// Loads a snapshot with uffd memory backend.
     /// Pre-boot only.
     #[allow(dead_code)]
@@ -611,8 +728,18 @@ fn parse_log_level(level: &str) -> Result<firecracker_client::models::logger::Le
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::convert::Infallible;
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command as StdCommand;
+
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::{Bytes, Incoming};
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response, StatusCode};
+    use hyper_util::rt::TokioIo;
     use tempfile::tempdir;
+    use tokio::net::UnixListener;
 
     #[tokio::test]
     async fn wait_for_ready_times_out_when_socket_never_appears() {
@@ -645,6 +772,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_memory_apis_use_v2_gpa_and_prefault_schema() -> Result<()> {
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        let listener = UnixListener::bind(&instance.socket_path)?;
+
+        let server = tokio::spawn(async move {
+            for expected_path in [
+                "/vm/guest-memory-regions",
+                "/vm/guest-memory-regions",
+                "/vm/dirty-memory-ranges",
+                "/vm/pre-fault-memory",
+            ] {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("accept fake Firecracker request");
+                http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(move |request: Request<Incoming>| async move {
+                            assert_eq!(request.uri().path(), expected_path);
+                            let (status, body) = match expected_path {
+                                "/vm/guest-memory-regions" => {
+                                    assert_eq!(request.method(), Method::GET);
+                                    (
+                                        StatusCode::OK,
+                                        r#"[{"base_host_virt_addr":8192,"guest_phys_addr":4294967296,"size":4096,"offset":4096,"page_size":4096}]"#,
+                                    )
+                                }
+                                "/vm/dirty-memory-ranges" => {
+                                    assert_eq!(request.method(), Method::GET);
+                                    (
+                                        StatusCode::OK,
+                                        r#"{"page_size":4096,"memory_size":4096,"ranges":[{"base_host_virt_addr":0,"image_offset":4096,"length":4096}]}"#,
+                                    )
+                                }
+                                "/vm/pre-fault-memory" => {
+                                    assert_eq!(request.method(), Method::PUT);
+                                    let body = request
+                                        .collect()
+                                        .await
+                                        .expect("collect pre-fault request")
+                                        .to_bytes();
+                                    let request: serde_json::Value =
+                                        serde_json::from_slice(&body).expect("decode pre-fault request");
+                                    assert_eq!(
+                                        request,
+                                        serde_json::json!({"ranges": [{"gpa": 4294967296_i64, "size": 4096_i64}]}),
+                                    );
+                                    (StatusCode::NO_CONTENT, "")
+                                }
+                                _ => unreachable!(),
+                            };
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(status)
+                                    .body(Full::new(Bytes::from(body)))
+                                    .expect("build fake Firecracker response"),
+                            )
+                        }),
+                    )
+                    .await
+                    .expect("serve fake Firecracker request");
+            }
+        });
+
+        let restore_regions = instance.get_guest_memory_regions().await?;
+        assert_eq!(restore_regions[0].base_host_virt_addr, 8192);
+
+        let regions = instance.get_guest_memory_image_regions().await?;
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].image_offset, 4096);
+        assert_eq!(regions[0].guest_phys_addr, 4 * 1024 * 1024 * 1024);
+
+        let resident = instance.get_resident_memory_ranges().await?;
+        assert_eq!(
+            resident,
+            vec![ResidentMemoryRange {
+                image_offset: 4096,
+                length: 4096,
+            }]
+        );
+
+        instance
+            .pre_fault_memory(&[super::super::manifest::GuestMemoryRange {
+                gpa: 4 * 1024 * 1024 * 1024,
+                size: 4096,
+            }])
+            .await?;
+        let empty_error = instance
+            .pre_fault_memory(&[])
+            .await
+            .expect_err("empty ranges must not reach Firecracker");
+        assert!(empty_error.to_string().contains("empty pre-fault request"));
+
+        server.await.expect("join fake Firecracker server");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn stop_without_process_removes_stale_socket_file() -> Result<()> {
         let temp = tempdir()?;
         let mut instance = FirecrackerInstance::new(temp.path().to_path_buf());
@@ -671,6 +899,53 @@ mod tests {
             .expect_err("second spawn should fail");
 
         assert!(err.to_string().contains("already started"));
+        instance.stop(Duration::from_millis(10)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn firecracker_child_does_not_inherit_server_capabilities() -> Result<()> {
+        let temp = tempdir()?;
+        let status_path = temp.path().join("firecracker-cap-status");
+        let fake_firecracker = temp.path().join("fake-firecracker.sh");
+        fs::write(
+            &fake_firecracker,
+            "#!/bin/sh\ngrep -E '^Cap(Eff|Amb):' /proc/thread-self/status > firecracker-cap-status\n",
+        )?;
+        fs::set_permissions(&fake_firecracker, fs::Permissions::from_mode(0o755))?;
+
+        let mut instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        instance
+            .spawn_with_netns(&fake_firecracker, None, None, None)
+            .await?;
+
+        let mut status = None;
+        for _ in 0..20 {
+            match fs::read_to_string(&status_path) {
+                Ok(candidate) if !candidate.trim().is_empty() => {
+                    status = Some(candidate);
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let status = status.context("wait for fake Firecracker capability status")?;
+        assert!(
+            status
+                .lines()
+                .any(|line| line == "CapEff:\t0000000000000000"),
+            "firecracker child retained effective capabilities:\n{status}"
+        );
+        assert!(
+            status
+                .lines()
+                .any(|line| line == "CapAmb:\t0000000000000000"),
+            "firecracker child retained ambient capabilities:\n{status}"
+        );
+
         instance.stop(Duration::from_millis(10)).await?;
         Ok(())
     }

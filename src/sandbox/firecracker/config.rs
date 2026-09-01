@@ -9,6 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::manifest::GuestMemoryWorkingSet;
 use super::mmds::MmdsMetadata;
 use crate::cfg::{AppConfig, ConfigManager, EnvdConfig, ToolsConfig};
 use crate::sandbox::ublk::UblkConfig;
@@ -460,6 +461,9 @@ pub struct FirecrackerSnapshotConfig {
     pub mem_overlaybd_config: OverlaybdConfig,
     /// Virtual size of the memory image in bytes.
     pub mem_virtual_size: u64,
+    /// Optional immutable working-set metadata consumed before a restored VM resumes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_working_set: Option<GuestMemoryWorkingSet>,
     /// If `None`, the caller is responsible for managing the snapshot directory lifecycle.
     /// `Some` is used for keeping the snapshot directory alive across multiple pause/resume cycles.
     #[serde(skip)]
@@ -530,6 +534,7 @@ impl FirecrackerSnapshotConfig {
             vm_state_path: manifest.vm_state.path.clone(),
             mem_overlaybd_config,
             mem_virtual_size: manifest.memory.virtual_size,
+            restore_working_set: manifest.memory.working_set.clone(),
             managed_snapshot_root: None,
         })
     }
@@ -847,6 +852,7 @@ mod tests {
                 runtime_upper_mode: UpperMode::LogStructured,
             },
             mem_virtual_size: 4096,
+            restore_working_set: None,
             managed_snapshot_root: None,
         };
 

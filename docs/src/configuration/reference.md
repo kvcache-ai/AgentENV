@@ -508,6 +508,27 @@ these TOML settings always take effect automatically — any manual edits to the
 generated file are overwritten on the next startup. To keep customizations,
 make them through the TOML settings, not by editing the generated JSON.
 
+## `[template_profiling]`
+
+Optional mincore working-set collection during template publication. See
+[Working-set Profiling and Pre-fault](../concepts/working-set-prefault.md) for
+the lifecycle and operational constraints.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Starts a disposable profiling resume for new template snapshots and stores its validated GPA working-set metadata. |
+| `max_prefault_bytes` | integer | `268435456` | Maximum accepted working-set size in bytes. Oversized sets are rejected, not truncated. |
+| `max_range_count` | integer | `4096` | Maximum accepted GPA range count. |
+| `max_guest_memory_ratio_percent` | integer | `50` | Maximum accepted working-set size as a percentage of configured guest RAM. |
+
+## `[restore_prefault]`
+
+Optional KVM pre-fault before a snapshot restore resumes.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Applies valid working-set metadata before resume. Missing, invalid, or unavailable pre-fault metadata/API is skipped and the sandbox resumes normally. |
+
 ## `[memory_snapshot]`
 
 Memory snapshot overlaybd configuration. The server auto-generates the file at

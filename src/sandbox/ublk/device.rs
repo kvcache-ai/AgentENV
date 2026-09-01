@@ -570,6 +570,47 @@ impl UblkDeviceManager {
 
         Ok(SharedMemDevice { inner })
     }
+
+    /// Create a memory device owned exclusively by a short-lived profiler.
+    ///
+    /// Unlike `get_or_create_shared_mem`, this deliberately requests daemon
+    /// `Exclusive` access so it cannot reuse a normal sandbox's device or its
+    /// page cache. The caller must release the returned device after stopping
+    /// Firecracker; no pool key is recorded for it.
+    pub(crate) async fn create_unshared_mem(
+        &self,
+        spec: &UblkCreateSpec,
+        virtual_size: u64,
+    ) -> Result<UblkDevice> {
+        let UblkCreateSpec::Overlaybd {
+            image_config,
+            global_config,
+        } = spec;
+        if !self.pool_enabled {
+            return self
+                .create_raw_overlaybd_device(spec)
+                .await
+                .context("create unshared profiler memory ublk device");
+        }
+        let client = self.require_client()?;
+        let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "acquire_unshared_memory");
+        let acquired = client
+            .acquire_overlaybd(
+                image_config,
+                global_config,
+                virtual_size,
+                uvm_ublk_daemon::AccessMode::Exclusive,
+            )
+            .await
+            .context("acquire exclusive profiler memory ublk device");
+        metric.finish(&acquired);
+        let (dev_id, device_path) = acquired?;
+        info!(dev_id, path = %device_path.display(), "created exclusive profiler memory ublk device");
+        Ok(UblkDevice {
+            dev_id,
+            device_path,
+        })
+    }
 }
 
 // ── Shared memory device ────────────────────────────────────────────────────

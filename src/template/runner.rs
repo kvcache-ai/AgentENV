@@ -12,9 +12,11 @@ use tracing::{debug, warn, Span};
 use super::build_spec::TemplateBuildStep;
 use super::errors::{command_output_suffix, TemplateBuildFailure};
 use super::step_executor::TemplateStepExecutor;
+use crate::cfg::ConfigManager;
 use crate::sandbox::{
-    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotManifest, ProcessHandle,
-    ProcessOpts, SandboxExecutor, SandboxLaunchConfig, UblkConfig,
+    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotConfig,
+    FirecrackerSnapshotManifest, ProcessHandle, ProcessOpts, SandboxExecutor, SandboxLaunchConfig,
+    UblkConfig,
 };
 use crate::snapshot::{
     CommandContext, RunnableSnapshot, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions,
@@ -90,6 +92,7 @@ pub(crate) struct TemplateBuildExecution {
     pub build_context: CommandContext,
     pub startup: Option<StartupCommand>,
     pub image_configs: ImageConfigs,
+    snapshot_config: FirecrackerSnapshotConfig,
 }
 
 impl TemplateBuildRunner {
@@ -205,8 +208,9 @@ impl TemplateBuildRunner {
         let startup = context.startup.clone();
         let override_startup = context.override_startup;
 
-        let handle =
-            spawn_with_trace_context(worker_span, move || -> Result<TemplateBuildExecution> {
+        let handle = spawn_with_trace_context(
+            worker_span,
+            move || -> Result<TemplateBuildExecution> {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -231,7 +235,7 @@ impl TemplateBuildRunner {
                         let runtime_versions = SnapshotRuntimeVersions::probe(&sandbox).await?;
 
                         debug!("capturing template snapshot");
-                        let (_, manifest) = sandbox.pause_to_dir(&output_dir).await?;
+                        let (snapshot_config, manifest) = sandbox.pause_to_dir(&output_dir).await?;
                         debug!("template snapshot captured");
 
                         Ok(TemplateBuildExecution {
@@ -240,13 +244,38 @@ impl TemplateBuildRunner {
                             build_context,
                             startup,
                             image_configs,
+                            snapshot_config,
                         })
                     }
                     .await;
 
                     let stop_result = sandbox.stop().await;
                     match (run_result, stop_result) {
-                        (Ok(result), Ok(())) => Ok(result),
+                        (Ok(mut result), Ok(())) => {
+                            let config = ConfigManager::global_config();
+                            if config.template_profiling.enabled {
+                                let limits = crate::sandbox::GuestMemoryWorkingSetLimits {
+                                    max_bytes: config.template_profiling.max_prefault_bytes,
+                                    max_ranges: config.template_profiling.max_range_count,
+                                    max_guest_memory_ratio_percent: config.template_profiling.max_guest_memory_ratio_percent,
+                                };
+                                match FirecrackerSandbox::profile_snapshot_working_set(
+                                    &result.snapshot_config,
+                                    limits,
+                                )
+                                .await
+                                {
+                                    Ok(working_set) => {
+                                        result.manifest = result
+                                            .manifest
+                                            .with_working_set(working_set)
+                                            .context("attach mincore working-set metadata before publish")?;
+                                    }
+                                    Err(error) => warn!(error = ?error, "template profiling failed; publishing snapshot without working-set metadata"),
+                                }
+                            }
+                            Ok(result)
+                        }
                         (Err(run_err), Ok(())) => Err(run_err),
                         (Ok(_), Err(stop_err)) => Err(stop_err),
                         (Err(run_err), Err(stop_err)) => Err(anyhow!(
@@ -256,7 +285,8 @@ impl TemplateBuildRunner {
                         )),
                     }
                 })
-            });
+            },
+        );
         match handle.join() {
             Ok(result) => result,
             Err(_) => bail!("snapshot build worker thread panicked"),

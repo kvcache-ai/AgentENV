@@ -183,6 +183,7 @@ dependencies = [
  "libc",
  "libublk-rs-sys",
  "overlaybd",
+ "reqwest 0.13.3",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2519,7 +2520,7 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "firecracker_client"
-version = "1.15.1"
+version = "1.15.1-patch-v2"
 dependencies = [
  "reqwest 0.13.3",
  "serde",

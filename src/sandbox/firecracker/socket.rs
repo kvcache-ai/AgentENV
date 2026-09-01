@@ -1,6 +1,7 @@
+use std::fmt;
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::Uri;
@@ -10,6 +11,24 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::connector::UnixConnector;
+
+#[derive(Debug)]
+pub(super) struct HttpStatusError {
+    status: hyper::StatusCode,
+    body: String,
+}
+
+impl fmt::Display for HttpStatusError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Request failed: {} - {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for HttpStatusError {}
+
+pub(super) fn is_http_status_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<HttpStatusError>().is_some()
+}
 
 #[derive(Clone)]
 pub(super) struct UnixSocketClient {
@@ -61,7 +80,11 @@ impl UnixSocketClient {
                 .context("Failed to read error body")?
                 .to_bytes();
             let error_msg = String::from_utf8_lossy(&bytes);
-            return Err(anyhow!("Request failed: {} - {}", status, error_msg));
+            return Err(HttpStatusError {
+                status,
+                body: error_msg.into_owned(),
+            }
+            .into());
         }
 
         let bytes = res

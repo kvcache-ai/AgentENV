@@ -1,6 +1,6 @@
 [firecracker.kvm]
-version = "1.15.1-patch-v1"
-url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/firecracker-{version}-{arch}.tgz"
+version = "1.15.1-patch-v2"
+url = "https://github.com/kvcache-ai/firecracker/releases/download/v1.15.1-patch-v2/firecracker-{version}-{arch}.tgz"
 
 [firecracker.pvm]
 version = "v1.17.0-next.1"

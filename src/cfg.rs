@@ -137,6 +137,10 @@ pub struct AppConfig {
     pub network: NetworkConfig,
     #[config(nested)]
     pub custom_extension: CustomExtensionConfig,
+    #[config(nested)]
+    pub template_profiling: TemplateProfilingConfig,
+    #[config(nested)]
+    pub restore_prefault: RestorePrefaultConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Config)]
@@ -344,6 +348,26 @@ pub struct SnapshotConfig {
 
 #[derive(Debug, Config, Clone)]
 pub struct SnapshotImagePublishConfig {
+    #[config(default = false)]
+    pub enabled: bool,
+}
+
+/// Configuration for the optional pre-publication mincore profiling pass.
+#[derive(Debug, Config, Clone)]
+pub struct TemplateProfilingConfig {
+    #[config(default = false)]
+    pub enabled: bool,
+    #[config(default = 268_435_456u64)]
+    pub max_prefault_bytes: u64,
+    #[config(default = 4096usize)]
+    pub max_range_count: usize,
+    #[config(default = 50u8)]
+    pub max_guest_memory_ratio_percent: u8,
+}
+
+/// Configuration for optional restore-time KVM pre-fault.
+#[derive(Debug, Config, Clone)]
+pub struct RestorePrefaultConfig {
     #[config(default = false)]
     pub enabled: bool,
 }
@@ -1341,6 +1365,18 @@ mod tests {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
         Ok(())
+    }
+
+    #[test]
+    fn template_profiling_and_restore_prefault_default_to_disabled() {
+        let mut config = AppConfig::default();
+        assert!(!config.template_profiling.enabled);
+        assert!(!config.restore_prefault.enabled);
+
+        config.template_profiling.enabled = true;
+        config.restore_prefault.enabled = true;
+        assert!(config.template_profiling.enabled);
+        assert!(config.restore_prefault.enabled);
     }
 
     #[test]

@@ -14,6 +14,8 @@ docs/CpuConfig.md
 docs/CpuTemplate.md
 docs/CpuidLeafModifier.md
 docs/CpuidRegisterModifier.md
+docs/DirtyMemoryRange.md
+docs/DirtyMemoryRanges.md
 docs/Drive.md
 docs/EntropyDevice.md
 docs/Error.md
@@ -36,6 +38,8 @@ docs/NetworkOverride.md
 docs/PartialDrive.md
 docs/PartialNetworkInterface.md
 docs/Pmem.md
+docs/PreFaultMemoryRange.md
+docs/PreFaultMemoryRequest.md
 docs/RateLimiter.md
 docs/SerialDevice.md
 docs/SnapshotCreateParams.md
@@ -60,6 +64,8 @@ src/models/cpu_config.rs
 src/models/cpu_template.rs
 src/models/cpuid_leaf_modifier.rs
 src/models/cpuid_register_modifier.rs
+src/models/dirty_memory_range.rs
+src/models/dirty_memory_ranges.rs
 src/models/drive.rs
 src/models/entropy_device.rs
 src/models/error.rs
@@ -83,6 +89,8 @@ src/models/network_override.rs
 src/models/partial_drive.rs
 src/models/partial_network_interface.rs
 src/models/pmem.rs
+src/models/pre_fault_memory_range.rs
+src/models/pre_fault_memory_request.rs
 src/models/rate_limiter.rs
 src/models/serial_device.rs
 src/models/snapshot_create_params.rs

@@ -1,0 +1,270 @@
+SAMPLE vcpu=1 index=1
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=1 total_wall_time_us=330833 api_wall_time_us=243312 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=1 firecracker_wall_time_us=241669
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 ioctl_count=1 wall_time_us=241477
+SAMPLE vcpu=1 index=2
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=1 total_wall_time_us=417585 api_wall_time_us=296718 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=2 firecracker_wall_time_us=294925
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 ioctl_count=2 wall_time_us=294756
+SAMPLE vcpu=1 index=3
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=1 total_wall_time_us=367972 api_wall_time_us=281436 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=1 firecracker_wall_time_us=279326
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 ioctl_count=1 wall_time_us=279060
+SAMPLE vcpu=1 index=4
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=1 total_wall_time_us=354846 api_wall_time_us=262469 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=1 firecracker_wall_time_us=261031
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 ioctl_count=1 wall_time_us=260794
+SAMPLE vcpu=1 index=5
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=1 total_wall_time_us=344583 api_wall_time_us=238012 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=1 firecracker_wall_time_us=236672
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 ioctl_count=1 wall_time_us=236424
+SAMPLE vcpu=1 index=6
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=1 total_wall_time_us=294910 api_wall_time_us=212973 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=1 firecracker_wall_time_us=211798
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 ioctl_count=1 wall_time_us=211566
+SAMPLE vcpu=1 index=7
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=1 total_wall_time_us=303330 api_wall_time_us=205484 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=1 firecracker_wall_time_us=204260
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 ioctl_count=1 wall_time_us=204044
+SAMPLE vcpu=1 index=8
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=1 total_wall_time_us=403004 api_wall_time_us=305759 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=1 firecracker_wall_time_us=304543
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 ioctl_count=1 wall_time_us=304358
+SAMPLE vcpu=1 index=9
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=1 total_wall_time_us=357004 api_wall_time_us=255289 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=1 firecracker_wall_time_us=253884
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 ioctl_count=1 wall_time_us=253747
+SAMPLE vcpu=1 index=10
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=1 total_wall_time_us=388317 api_wall_time_us=286888 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=1 firecracker_wall_time_us=285183
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 ioctl_count=1 wall_time_us=284995
+SAMPLE vcpu=2 index=1
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=2 total_wall_time_us=421923 api_wall_time_us=332176 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=2 firecracker_wall_time_us=330328
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=323982
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=330120
+SAMPLE vcpu=2 index=2
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=2 total_wall_time_us=382128 api_wall_time_us=306195 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=2 firecracker_wall_time_us=305350
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=305183
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=302444
+SAMPLE vcpu=2 index=3
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=2 total_wall_time_us=374203 api_wall_time_us=297527 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=2 firecracker_wall_time_us=295372
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=293113
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=295176
+SAMPLE vcpu=2 index=4
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=2 total_wall_time_us=345702 api_wall_time_us=260037 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=2 firecracker_wall_time_us=258217
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=258081
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=256623
+SAMPLE vcpu=2 index=5
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=2 total_wall_time_us=418693 api_wall_time_us=326730 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=2 firecracker_wall_time_us=324593
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=324386
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=319738
+SAMPLE vcpu=2 index=6
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=2 total_wall_time_us=381948 api_wall_time_us=277235 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=3 firecracker_wall_time_us=276296
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=2 wall_time_us=271613
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=276185
+SAMPLE vcpu=2 index=7
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=2 total_wall_time_us=363211 api_wall_time_us=254882 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=2 firecracker_wall_time_us=253324
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=253059
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=252347
+SAMPLE vcpu=2 index=8
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=2 total_wall_time_us=397187 api_wall_time_us=283152 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=2 firecracker_wall_time_us=281389
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=270519
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=281187
+SAMPLE vcpu=2 index=9
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=2 total_wall_time_us=394599 api_wall_time_us=294734 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=2 firecracker_wall_time_us=292894
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=281359
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=292697
+SAMPLE vcpu=2 index=10
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=2 total_wall_time_us=388230 api_wall_time_us=306386 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=2 firecracker_wall_time_us=304810
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=301600
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=268435456 completed_bytes=268435456 remaining_bytes=0 ioctl_count=1 wall_time_us=304509
+SAMPLE vcpu=4 index=1
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=4 total_wall_time_us=298589 api_wall_time_us=196324 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=5 firecracker_wall_time_us=195396
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=2 wall_time_us=195251
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=186394
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=194977
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=176607
+SAMPLE vcpu=4 index=2
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=4 total_wall_time_us=314497 api_wall_time_us=225952 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=4 firecracker_wall_time_us=224903
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=224622
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=215596
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=213487
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=204868
+SAMPLE vcpu=4 index=3
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=4 total_wall_time_us=376199 api_wall_time_us=265000 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=5 firecracker_wall_time_us=262621
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=2 wall_time_us=259402
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=253384
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=262324
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=242226
+SAMPLE vcpu=4 index=4
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=4 total_wall_time_us=371274 api_wall_time_us=255836 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=5 firecracker_wall_time_us=254924
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=2 wall_time_us=246532
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=225523
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=254689
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=225717
+SAMPLE vcpu=4 index=5
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=4 total_wall_time_us=410050 api_wall_time_us=285175 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=5 firecracker_wall_time_us=283063
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=2 wall_time_us=282979
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=277442
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=281299
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=281488
+SAMPLE vcpu=4 index=6
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=4 total_wall_time_us=360669 api_wall_time_us=261532 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=5 firecracker_wall_time_us=259544
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=2 wall_time_us=259388
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=241269
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=254866
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=244237
+SAMPLE vcpu=4 index=7
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=4 total_wall_time_us=341057 api_wall_time_us=238879 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=4 firecracker_wall_time_us=237289
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=234049
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=217806
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=237077
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=214489
+SAMPLE vcpu=4 index=8
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=4 total_wall_time_us=335743 api_wall_time_us=227989 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=4 firecracker_wall_time_us=226324
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=226125
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=207440
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=222108
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=202468
+SAMPLE vcpu=4 index=9
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=4 total_wall_time_us=293337 api_wall_time_us=197237 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=4 firecracker_wall_time_us=195906
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=195721
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=191563
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=192773
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=183113
+SAMPLE vcpu=4 index=10
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=4 total_wall_time_us=313312 api_wall_time_us=201365 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=5 firecracker_wall_time_us=200260
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=2 wall_time_us=198339
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=196048
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=200047
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=134217728 completed_bytes=134217728 remaining_bytes=0 ioctl_count=1 wall_time_us=189282
+SAMPLE vcpu=8 index=1
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=8 total_wall_time_us=298423 api_wall_time_us=192093 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=9 firecracker_wall_time_us=190456
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=2 wall_time_us=190118
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=186824
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=190120
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=177555
+fixed512_prefault_scaling_worker vcpu=4 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=186386
+fixed512_prefault_scaling_worker vcpu=5 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=188920
+fixed512_prefault_scaling_worker vcpu=6 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=180917
+fixed512_prefault_scaling_worker vcpu=7 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=164742
+SAMPLE vcpu=8 index=2
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=8 total_wall_time_us=328186 api_wall_time_us=214682 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=8 firecracker_wall_time_us=212578
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=210978
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=206416
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=208915
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=177370
+fixed512_prefault_scaling_worker vcpu=4 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=208683
+fixed512_prefault_scaling_worker vcpu=5 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=212287
+fixed512_prefault_scaling_worker vcpu=6 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=211964
+fixed512_prefault_scaling_worker vcpu=7 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=171979
+SAMPLE vcpu=8 index=3
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=8 total_wall_time_us=377735 api_wall_time_us=256551 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=8 firecracker_wall_time_us=255471
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=246307
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=252817
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=255177
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=203487
+fixed512_prefault_scaling_worker vcpu=4 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=250748
+fixed512_prefault_scaling_worker vcpu=5 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=252036
+fixed512_prefault_scaling_worker vcpu=6 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=235001
+fixed512_prefault_scaling_worker vcpu=7 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=217140
+SAMPLE vcpu=8 index=4
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=8 total_wall_time_us=256909 api_wall_time_us=175173 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=9 firecracker_wall_time_us=174269
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=2 wall_time_us=170774
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=173700
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=172918
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=152152
+fixed512_prefault_scaling_worker vcpu=4 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=174021
+fixed512_prefault_scaling_worker vcpu=5 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=173759
+fixed512_prefault_scaling_worker vcpu=6 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=171609
+fixed512_prefault_scaling_worker vcpu=7 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=142911
+SAMPLE vcpu=8 index=5
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=8 total_wall_time_us=299669 api_wall_time_us=196909 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=8 firecracker_wall_time_us=195978
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=194744
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=189751
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=192652
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=166542
+fixed512_prefault_scaling_worker vcpu=4 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=194725
+fixed512_prefault_scaling_worker vcpu=5 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=195715
+fixed512_prefault_scaling_worker vcpu=6 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=186804
+fixed512_prefault_scaling_worker vcpu=7 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=162224
+SAMPLE vcpu=8 index=6
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=8 total_wall_time_us=271763 api_wall_time_us=196462 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=8 firecracker_wall_time_us=195434
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=191175
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=180237
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=195230
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=165355
+fixed512_prefault_scaling_worker vcpu=4 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=194304
+fixed512_prefault_scaling_worker vcpu=5 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=190768
+fixed512_prefault_scaling_worker vcpu=6 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=188719
+fixed512_prefault_scaling_worker vcpu=7 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=149733
+SAMPLE vcpu=8 index=7
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=8 total_wall_time_us=285055 api_wall_time_us=189193 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=8 firecracker_wall_time_us=188369
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=183509
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=177998
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=188127
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=173425
+fixed512_prefault_scaling_worker vcpu=4 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=187810
+fixed512_prefault_scaling_worker vcpu=5 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=187555
+fixed512_prefault_scaling_worker vcpu=6 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=178895
+fixed512_prefault_scaling_worker vcpu=7 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=154948
+SAMPLE vcpu=8 index=8
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=8 total_wall_time_us=252302 api_wall_time_us=174808 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=8 firecracker_wall_time_us=173532
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=173448
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=170746
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=171843
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=146625
+fixed512_prefault_scaling_worker vcpu=4 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=167149
+fixed512_prefault_scaling_worker vcpu=5 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=171783
+fixed512_prefault_scaling_worker vcpu=6 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=157314
+fixed512_prefault_scaling_worker vcpu=7 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=134450
+SAMPLE vcpu=8 index=9
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=8 total_wall_time_us=315815 api_wall_time_us=204035 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=8 firecracker_wall_time_us=202429
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=199143
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=201305
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=202192
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=179175
+fixed512_prefault_scaling_worker vcpu=4 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=201916
+fixed512_prefault_scaling_worker vcpu=5 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=199345
+fixed512_prefault_scaling_worker vcpu=6 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=197979
+fixed512_prefault_scaling_worker vcpu=7 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=167601
+SAMPLE vcpu=8 index=10
+Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)
+fixed512_prefault_scaling vcpu=8 total_wall_time_us=264234 api_wall_time_us=166838 requested_bytes=536870912 completed_bytes=536870912 remaining_bytes=0 range_count=1 ioctl_count=9 firecracker_wall_time_us=166067
+fixed512_prefault_scaling_worker vcpu=0 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=2 wall_time_us=165373
+fixed512_prefault_scaling_worker vcpu=1 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=165898
+fixed512_prefault_scaling_worker vcpu=2 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=164276
+fixed512_prefault_scaling_worker vcpu=3 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=142084
+fixed512_prefault_scaling_worker vcpu=4 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=158901
+fixed512_prefault_scaling_worker vcpu=5 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=157457
+fixed512_prefault_scaling_worker vcpu=6 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=161831
+fixed512_prefault_scaling_worker vcpu=7 assigned_range_count=1 assigned_bytes=67108864 completed_bytes=67108864 remaining_bytes=0 ioctl_count=1 wall_time_us=135830

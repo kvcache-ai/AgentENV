@@ -28,6 +28,7 @@
 - [Templates](./concepts/templates.md)
 - [Sandboxes](./concepts/sandboxes.md)
 - [Snapshots](./concepts/snapshots.md)
+- [Working-set Profiling and Pre-fault](./concepts/working-set-prefault.md)
 - [Custom Extension](./concepts/custom-extension.md)
 - [Proxy](./concepts/proxy.md)
 

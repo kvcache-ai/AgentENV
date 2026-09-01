@@ -5,7 +5,7 @@ info:
     The API is accessible through HTTP calls on specific URLs
     carrying JSON modeled data.
     The transport medium is a Unix Domain Socket.
-  version: 1.15.1
+  version: 1.15.1-patch-v2
   termsOfService: ""
   contact:
     email: "firecracker-maintainers@amazon.com"
@@ -873,6 +873,36 @@ paths:
           description: VM is not in a valid state for this operation
           schema:
             $ref: "#/definitions/Error"
+
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+  /vm/pre-fault-memory:
+    put:
+      summary: Pre-fault selected guest memory.
+      description:
+        Pre-faults the requested guest-physical ranges while the microVM is
+        paused. Ranges must be non-empty, non-zero, 4096-byte aligned, and
+        fully covered by plugged guest RAM. The request does not sort, merge,
+        or deduplicate ranges. This operation is available on x86_64 hosts
+        whose KVM exposes KVM_CAP_PRE_FAULT_MEMORY.
+      operationId: putPreFaultMemory
+      parameters:
+        - name: body
+          in: body
+          required: true
+          schema:
+            $ref: "#/definitions/PreFaultMemoryRequest"
+      responses:
+        200:
+          description: Pre-fault completed successfully.
+          schema:
+            $ref: "#/definitions/PreFaultMemoryStats"
+        400:
+          description: Invalid request, unsupported host capability, or VM state.
+          schema:
+            $ref: "#/definitions/Error"
         default:
           description: Internal server error
           schema:
@@ -1329,11 +1359,12 @@ definitions:
     type: object
     description:
       Describes a guest memory region mapping, providing the host virtual address,
-      region size, offset within a contiguous snapshot layout, and page size. Used
+      guest physical address, region size, offset within a contiguous snapshot layout, and page size. Used
       by external processes to read guest memory directly from the Firecracker
       process address space via process_vm_readv().
     required:
       - base_host_virt_addr
+      - guest_phys_addr
       - size
       - offset
       - page_size
@@ -1342,6 +1373,10 @@ definitions:
         type: integer
         format: int64
         description: Base host virtual address of the guest memory region.
+      guest_phys_addr:
+        type: integer
+        format: int64
+        description: Guest physical address at which this region begins. Unlike offset, this preserves GPA holes.
       size:
         type: integer
         format: int64
@@ -1362,6 +1397,107 @@ definitions:
       page_size_kib:
         type: integer
         description: Deprecated. Same value as page_size. Will be removed in 2.0.
+
+  PreFaultMemoryRange:
+    type: object
+    description: Guest-physical memory range to pre-fault.
+    additionalProperties: false
+    required:
+      - gpa
+      - size
+    properties:
+      gpa:
+        type: integer
+        format: int64
+        minimum: 0
+      size:
+        type: integer
+        format: int64
+        minimum: 4096
+
+  PreFaultMemoryRequest:
+    type: object
+    description: Non-empty guest-physical ranges to pre-fault on a paused microVM.
+    additionalProperties: false
+    required:
+      - ranges
+    properties:
+      ranges:
+        type: array
+        minItems: 1
+        items:
+          $ref: "#/definitions/PreFaultMemoryRange"
+
+  PreFaultMemoryWorkerStats:
+    type: object
+    description: Completion statistics for work assigned to one vCPU worker.
+    additionalProperties: false
+    required:
+      - vcpu_id
+      - range_count
+      - requested_bytes
+      - completed_bytes
+      - remaining_bytes
+      - ioctl_count
+      - wall_time_us
+    properties:
+      vcpu_id:
+        type: integer
+        format: int32
+      range_count:
+        type: integer
+        format: int64
+      requested_bytes:
+        type: integer
+        format: int64
+      completed_bytes:
+        type: integer
+        format: int64
+      remaining_bytes:
+        type: integer
+        format: int64
+      ioctl_count:
+        type: integer
+        format: int64
+      wall_time_us:
+        type: integer
+        format: int64
+
+  PreFaultMemoryStats:
+    type: object
+    additionalProperties: false
+    description: Completion statistics for a paused guest-memory pre-fault request.
+    required:
+      - range_count
+      - requested_bytes
+      - completed_bytes
+      - remaining_bytes
+      - ioctl_count
+      - wall_time_us
+      - workers
+    properties:
+      range_count:
+        type: integer
+        format: int64
+      requested_bytes:
+        type: integer
+        format: int64
+      completed_bytes:
+        type: integer
+        format: int64
+      remaining_bytes:
+        type: integer
+        format: int64
+      ioctl_count:
+        type: integer
+        format: int64
+      wall_time_us:
+        type: integer
+        format: int64
+      workers:
+        type: array
+        items:
+          $ref: "#/definitions/PreFaultMemoryWorkerStats"
 
   DirtyMemoryRange:
     type: object

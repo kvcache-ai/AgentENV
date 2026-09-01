@@ -180,10 +180,17 @@ fn raise_ambient_capability(capability: i32) -> io::Result<()> {
 /// use it from a `pre_exec` closure.
 pub fn configure_current_process_capabilities(capabilities: &[i32]) -> io::Result<()> {
     capability_masks(capabilities)?;
-    clear_ambient_capabilities()?;
-    set_capability_sets(capabilities)?;
+    clear_ambient_capabilities()
+        .map_err(|err| io::Error::new(err.kind(), format!("clear ambient capabilities: {err}")))?;
+    set_capability_sets(capabilities)
+        .map_err(|err| io::Error::new(err.kind(), format!("set capability sets: {err}")))?;
     for capability in capabilities {
-        raise_ambient_capability(*capability)?;
+        raise_ambient_capability(*capability).map_err(|err| {
+            io::Error::new(
+                err.kind(),
+                format!("raise ambient capability {capability}: {err}"),
+            )
+        })?;
     }
     Ok(())
 }
