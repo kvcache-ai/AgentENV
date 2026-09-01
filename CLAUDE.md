@@ -59,6 +59,8 @@ sudo -E cargo test -p agentenv --test orchestrator_integration orchestrator::tes
 
 Integration tests require root (network namespaces), `/dev/kvm`, host modules matching `AENV_VIRTUALIZATION_MODE`, and `AENV_CONFIG_PATH` pointing to a valid config.
 
+`make test-unit` is expected to run as a non-root user (CI parity). Capability assertions in `src/privileges.rs` tests are root-aware: under root, `execve` regrants an euid-0 child the full bounding set in `CapPrm`/`CapEff`, so only `CapInh`/`CapAmb` are asserted (they stay zero, or exactly the delegated capability, regardless of uid). Some unit tests (for example the image resolver tests) also need network access to their test registries.
+
 ## Architecture
 
 See `docs/src/internals/architecture.md` for detailed design with data flow diagrams.
