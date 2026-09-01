@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-95cfd7e3.js";
+            window.path_to_searchindex_js = "searchindex-a333b07f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-d21ca9d8.js"></script>
+        <script src="toc-a02e686b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -601,6 +601,44 @@ extended attributes, or hard-link relationships.</p>
 <pre><code class="language-bash">aenv delete &lt;sandbox-id&gt;
 aenv rm &lt;sandbox-id&gt;
 </code></pre>
+<hr>
+<h2 id="volumes"><a class="header" href="#volumes">Volumes</a></h2>
+<h3 id="aenv-volume-create-name"><a class="header" href="#aenv-volume-create-name"><code>aenv volume create &lt;name&gt;</code></a></h3>
+<p>Create an independent persistent volume. Volumes default to 65536 MiB (64 GiB)
+and <code>exclusive</code> mode.</p>
+<pre><code class="language-bash">aenv volume create workspace
+aenv volume create models --mode ro --image ghcr.io/example/models:latest
+aenv volume create job-workspace --from-volume workspace
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--size-mb &lt;MiB&gt;</code></td><td>Volume size. A copy-on-write fork must use the same size as its source.</td></tr>
+<tr><td><code>--mode &lt;exclusive|ro&gt;</code></td><td>Access mode. Exclusive volumes are writable by one sandbox; read-only volumes can be shared.</td></tr>
+<tr><td><code>--from-volume &lt;volume&gt;</code></td><td>Create a copy-on-write fork from an existing volume ID or name.</td></tr>
+<tr><td><code>--image &lt;image&gt;</code></td><td>Initialize the volume from an OCI image.</td></tr>
+</tbody>
+</table>
+</div>
+<p>We recommend creating an exclusive fork for each sandbox instead of mounting a
+shared writable volume directly:</p>
+<pre><code class="language-bash">aenv volume create job-data --mode exclusive --from-volume dataset-base
+aenv start ubuntu --volume /workspace/data=job-data
+</code></pre>
+<p>See <a href="#volumes-1">Volumes</a> for access-mode semantics, lifecycle
+behavior, automatic sandbox fork and snapshot handling, and complete CLI and
+HTTP API examples.</p>
+<h3 id="inspect-and-delete-volumes"><a class="header" href="#inspect-and-delete-volumes">Inspect and delete volumes</a></h3>
+<pre><code class="language-bash">aenv volume list
+aenv volume list --output json
+aenv volume inspect job-data
+aenv volume delete job-data
+</code></pre>
+<p>A mounted volume cannot be deleted. <code>aenv volume ls</code> is an alias for
+<code>aenv volume list</code>.</p>
 <hr>
 <h2 id="snapshots"><a class="header" href="#snapshots">Snapshots</a></h2>
 <h3 id="aenv-snapshot-create-sandbox-id"><a class="header" href="#aenv-snapshot-create-sandbox-id"><code>aenv snapshot create &lt;sandbox-id&gt;</code></a></h3>
@@ -2538,6 +2576,178 @@ p2p_enabled = true
 <p>See the <a href="#p2p">Configuration Reference</a>
 for the optional transport, storage-directory, address, and timeout settings.</p>
 <div style="break-before: page; page-break-before: always;"></div>
+<h1 id="volumes-1"><a class="header" href="#volumes-1">Volumes</a></h1>
+<blockquote>
+<p><strong>Beta:</strong> The volume feature is still in beta. For workloads that can use a
+drive supplied only when cold-starting a sandbox, the <code>attachedDrives</code>
+feature on <code>POST /sandboxes-cold</code> is more extensively tested. See the
+<a href="#api-reference">API reference</a> for the extra-drive request schema.</p>
+</blockquote>
+<p>Volumes are persistent block filesystems managed independently from sandboxes.
+A volume has a stable ID, a unique name, a fixed size, and an access mode. You
+can mount it at an absolute guest path when creating a sandbox, then reuse its
+contents after that sandbox is deleted.</p>
+<p>The default volume size is 65536 MiB (64 GiB). By default, one sandbox may
+mount up to four volumes and each volume may be at most 262144 MiB (256 GiB).
+Administrators can change these limits in the <a href="#volume"><code>[volume]</code> configuration</a>.</p>
+<h2 id="access-modes"><a class="header" href="#access-modes">Access Modes</a></h2>
+<p>A volume’s mode is selected when the volume is created and cannot be changed.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Mode</th><th>Writable</th><th>Mount concurrency</th><th>Intended use</th></tr>
+</thead>
+<tbody>
+<tr><td><code>exclusive</code></td><td>Yes</td><td>One sandbox</td><td>Per-sandbox workspaces, caches, databases, and mutable state</td></tr>
+<tr><td><code>ro</code></td><td>No</td><td>Multiple sandboxes</td><td>Shared datasets, models, tools, and other immutable inputs</td></tr>
+</tbody>
+</table>
+</div>
+<p>An exclusive volume is reserved by its mounted sandbox. Another sandbox cannot
+mount or delete it until that reservation is released. A read-only volume can
+be mounted by multiple sandboxes at the same time, but guest writes fail.</p>
+<h2 id="recommended-workflow-fork-before-use"><a class="header" href="#recommended-workflow-fork-before-use">Recommended Workflow: Fork Before Use</a></h2>
+<p>Treat a shared volume as an immutable base and create a copy-on-write fork for
+each sandbox that needs to modify it. This gives every sandbox an independent
+exclusive volume without copying all source data eagerly.</p>
+<pre><code class="language-text">read-only base volume
+        |
+        +-- exclusive fork for sandbox A
+        +-- exclusive fork for sandbox B
+</code></pre>
+<p>Forks capture the source volume state at creation time. Later changes to a fork
+do not change the source or another fork. The fork must have the same size as
+its source. An exclusive source must be unmounted before a public fork is
+created; a read-only source may remain shared.</p>
+<h2 id="sandbox-forks-and-snapshots"><a class="header" href="#sandbox-forks-and-snapshots">Sandbox Forks and Snapshots</a></h2>
+<p>AgentENV automatically carries mounted volumes through sandbox fork and
+snapshot operations. You do not need to fork or snapshot each mounted volume
+separately.</p>
+<h3 id="fork-a-sandbox"><a class="header" href="#fork-a-sandbox">Fork a sandbox</a></h3>
+<p>When a sandbox is forked, AgentENV processes every mounted volume for every
+child sandbox:</p>
+<ul>
+<li>Each mounted <code>exclusive</code> volume gets an independent copy-on-write volume
+fork. The child mounts the new volume at the same guest path and can modify
+it without changing the source sandbox’s volume.</li>
+<li>Each mounted <code>ro</code> volume remains mounted from the same read-only volume. It
+is safe to share because neither the source nor a child can modify it.</li>
+</ul>
+<p>This behavior is separate from manually creating a reusable volume fork with
+<code>aenv volume create --from-volume</code>.</p>
+<h3 id="snapshot-a-sandbox"><a class="header" href="#snapshot-a-sandbox">Snapshot a sandbox</a></h3>
+<p>When a sandbox is snapshotted, every mounted volume is included automatically.
+The volume snapshot records its layers, size, mount path, and access mode.
+Starting a sandbox from that snapshot creates new volumes with the captured
+contents and mounts them at the same paths. An exclusive volume remains
+exclusive; a read-only volume remains read-only.</p>
+<p>Volume snapshots are independent from their source volumes. Deleting a source
+volume does not remove volume data already committed into a sandbox snapshot.</p>
+<h2 id="cli-examples"><a class="header" href="#cli-examples">CLI Examples</a></h2>
+<h3 id="create-and-mount-an-empty-volume"><a class="header" href="#create-and-mount-an-empty-volume">Create and mount an empty volume</a></h3>
+<pre><code class="language-bash">aenv volume create workspace --mode exclusive --size-mb 65536
+aenv start ubuntu --volume /workspace=workspace
+</code></pre>
+<p><code>--volume</code> accepts <code>MOUNT_PATH=VOLUME_ID_OR_NAME</code> and can be repeated. Mount
+paths must be absolute, cannot be <code>/</code>, and cannot overlap another mount.</p>
+<pre><code class="language-bash">aenv start ubuntu \
+  --volume /workspace=workspace \
+  --volume /models=models-base
+</code></pre>
+<h3 id="create-a-volume-from-an-oci-image"><a class="header" href="#create-a-volume-from-an-oci-image">Create a volume from an OCI image</a></h3>
+<p>Use <code>--image</code> to initialize a volume with the contents of an OCI image:</p>
+<pre><code class="language-bash">aenv volume create models-base \
+  --mode ro \
+  --image registry.example.com/team/models:latest
+</code></pre>
+<p>For a standard OCI image, AgentENV downloads and converts its layers when the
+volume is created. For an OverlayBD-native image, AgentENV keeps the remote
+layer references and does not download the layer contents during volume
+creation. Blocks are fetched from the OCI registry on demand when the mounted
+volume is read, and then retained in the local remote-block cache.</p>
+<h3 id="create-a-reusable-base-and-fork-it"><a class="header" href="#create-a-reusable-base-and-fork-it">Create a reusable base and fork it</a></h3>
+<p>First populate an exclusive seed volume:</p>
+<pre><code class="language-bash">aenv volume create dataset-seed --mode exclusive
+SANDBOX_ID=$(aenv start ubuntu -d --volume /data=dataset-seed)
+aenv exec "$SANDBOX_ID" sh -lc 'printf "%s\n" training-data &gt; /data/input.txt'
+aenv delete "$SANDBOX_ID"
+</code></pre>
+<p>Create a read-only base from the seed, then create one exclusive fork per
+sandbox:</p>
+<pre><code class="language-bash">aenv volume create dataset-base --mode ro --from-volume dataset-seed
+aenv volume create job-42-data --mode exclusive --from-volume dataset-base
+aenv start ubuntu --volume /data=job-42-data
+</code></pre>
+<p>These commands use the default 64 GiB size for every volume. When the source
+has a custom size, pass the same <code>--size-mb</code> value while creating its fork.</p>
+<h3 id="share-a-read-only-volume"><a class="header" href="#share-a-read-only-volume">Share a read-only volume</a></h3>
+<pre><code class="language-bash">SANDBOX_A=$(aenv start ubuntu -d --volume /models=models-base)
+SANDBOX_B=$(aenv start ubuntu -d --volume /models=models-base)
+</code></pre>
+<p>Both sandboxes can read <code>/models</code>. Neither sandbox can modify it.</p>
+<h3 id="inspect-lifecycle-state"><a class="header" href="#inspect-lifecycle-state">Inspect lifecycle state</a></h3>
+<pre><code class="language-bash">aenv volume list
+aenv volume inspect job-42-data
+aenv volume delete job-42-data
+</code></pre>
+<p>The volume status controls whether it can be mounted:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ready</code></td><td>The volume can be mounted.</td></tr>
+<tr><td><code>uploading</code></td><td>Publication is in progress; the volume is temporarily unavailable.</td></tr>
+<tr><td><code>failed</code></td><td>Publication failed; the volume is unavailable until recovered.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Deleting a mounted volume returns a conflict. Delete its sandbox first, then
+delete the volume.</p>
+<h2 id="http-api-examples"><a class="header" href="#http-api-examples">HTTP API Examples</a></h2>
+<p>Set the server URL and API key before running these examples:</p>
+<pre><code class="language-bash">export AENV_URL=http://127.0.0.1:8000
+export AENV_API_KEY=&lt;api-key&gt;
+</code></pre>
+<p>Create a read-only base volume:</p>
+<pre><code class="language-bash">curl -fsS -X POST "$AENV_URL/volumes" \
+  -H "X-API-Key: $AENV_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "dataset-base",
+    "sizeMB": 65536,
+    "mode": "ro",
+    "image": "ghcr.io/example/dataset:latest"
+  }'
+</code></pre>
+<p>Create an exclusive copy-on-write fork:</p>
+<pre><code class="language-bash">curl -fsS -X POST "$AENV_URL/volumes" \
+  -H "X-API-Key: $AENV_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "job-42-data",
+    "sizeMB": 65536,
+    "mode": "exclusive",
+    "fromVolume": "dataset-base"
+  }'
+</code></pre>
+<p>Mount the fork into a sandbox:</p>
+<pre><code class="language-bash">curl -fsS -X POST "$AENV_URL/sandboxes" \
+  -H "X-API-Key: $AENV_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "templateID": "ubuntu",
+    "volumeMounts": {
+      "/workspace/data": "job-42-data"
+    }
+  }'
+</code></pre>
+<p>List and inspect volumes:</p>
+<pre><code class="language-bash">curl -fsS "$AENV_URL/volumes" -H "X-API-Key: $AENV_API_KEY"
+curl -fsS "$AENV_URL/volumes/job-42-data" -H "X-API-Key: $AENV_API_KEY"
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
 <h1 id="custom-extension"><a class="header" href="#custom-extension">Custom Extension</a></h1>
 <p>The custom extension is an optional external HTTP service that AgentENV calls during the sandbox lifecycle. It lets you implement deployment-specific behavior — for example, connecting sandboxes into a VPN, custom firewall rules, or extra mounts — without changing AgentENV itself.</p>
 <p>The extension implements a small set of HTTP endpoints (“hooks”); AgentENV is the client. The interface is defined in <a href="https://github.com/kvcache-ai/AgentENV/blob/main/src/custom_extension_api/openapi.yml"><code>src/custom_extension_api/openapi.yml</code></a>.</p>
@@ -3223,6 +3433,18 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 </div>
 <p>The managed seed is node-local persistent state and must be included in backups of <code>$AENV_HOME</code>. AgentENV refuses to generate a replacement when persisted secure or private-ingress sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates existing sandbox access tokens.</p>
 <p>Configure <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> with the same value on every runtime node in a clustered deployment. Standalone runtime nodes use their managed seed when it is unset.</p>
+<h2 id="volume"><a class="header" href="#volume"><code>[volume]</code></a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_size_mb</code></td><td>integer</td><td><code>262144</code></td><td>Maximum persistent volume size in MiB (256 GiB).</td></tr>
+<tr><td><code>max_volume_count</code></td><td>integer</td><td><code>4</code></td><td>Maximum number of persistent volumes that one sandbox may mount. Must be between 1 and the Firecracker extra-drive limit.</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="orchestrator"><a class="header" href="#orchestrator"><code>[orchestrator]</code></a></h2>
 <p>Sandbox lifecycle management.</p>
 <div class="table-wrapper">

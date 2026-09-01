@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-95cfd7e3.js";
+            window.path_to_searchindex_js = "../searchindex-a333b07f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-d21ca9d8.js"></script>
+        <script src="../toc-a02e686b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -495,6 +495,18 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 </div>
 <p>The managed seed is node-local persistent state and must be included in backups of <code>$AENV_HOME</code>. AgentENV refuses to generate a replacement when persisted secure or private-ingress sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates existing sandbox access tokens.</p>
 <p>Configure <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> with the same value on every runtime node in a clustered deployment. Standalone runtime nodes use their managed seed when it is unset.</p>
+<h2 id="volume"><a class="header" href="#volume"><code>[volume]</code></a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_size_mb</code></td><td>integer</td><td><code>262144</code></td><td>Maximum persistent volume size in MiB (256 GiB).</td></tr>
+<tr><td><code>max_volume_count</code></td><td>integer</td><td><code>4</code></td><td>Maximum number of persistent volumes that one sandbox may mount. Must be between 1 and the Firecracker extra-drive limit.</td></tr>
+</tbody>
+</table>
+</div>
 <h2 id="orchestrator"><a class="header" href="#orchestrator"><code>[orchestrator]</code></a></h2>
 <p>Sandbox lifecycle management.</p>
 <div class="table-wrapper">

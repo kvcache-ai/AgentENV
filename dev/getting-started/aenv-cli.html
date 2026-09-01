@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-95cfd7e3.js";
+            window.path_to_searchindex_js = "../searchindex-a333b07f.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-d21ca9d8.js"></script>
+        <script src="../toc-a02e686b.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -401,6 +401,44 @@ extended attributes, or hard-link relationships.</p>
 <pre><code class="language-bash">aenv delete &lt;sandbox-id&gt;
 aenv rm &lt;sandbox-id&gt;
 </code></pre>
+<hr>
+<h2 id="volumes"><a class="header" href="#volumes">Volumes</a></h2>
+<h3 id="aenv-volume-create-name"><a class="header" href="#aenv-volume-create-name"><code>aenv volume create &lt;name&gt;</code></a></h3>
+<p>Create an independent persistent volume. Volumes default to 65536 MiB (64 GiB)
+and <code>exclusive</code> mode.</p>
+<pre><code class="language-bash">aenv volume create workspace
+aenv volume create models --mode ro --image ghcr.io/example/models:latest
+aenv volume create job-workspace --from-volume workspace
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--size-mb &lt;MiB&gt;</code></td><td>Volume size. A copy-on-write fork must use the same size as its source.</td></tr>
+<tr><td><code>--mode &lt;exclusive|ro&gt;</code></td><td>Access mode. Exclusive volumes are writable by one sandbox; read-only volumes can be shared.</td></tr>
+<tr><td><code>--from-volume &lt;volume&gt;</code></td><td>Create a copy-on-write fork from an existing volume ID or name.</td></tr>
+<tr><td><code>--image &lt;image&gt;</code></td><td>Initialize the volume from an OCI image.</td></tr>
+</tbody>
+</table>
+</div>
+<p>We recommend creating an exclusive fork for each sandbox instead of mounting a
+shared writable volume directly:</p>
+<pre><code class="language-bash">aenv volume create job-data --mode exclusive --from-volume dataset-base
+aenv start ubuntu --volume /workspace/data=job-data
+</code></pre>
+<p>See <a href="../concepts/volumes.html">Volumes</a> for access-mode semantics, lifecycle
+behavior, automatic sandbox fork and snapshot handling, and complete CLI and
+HTTP API examples.</p>
+<h3 id="inspect-and-delete-volumes"><a class="header" href="#inspect-and-delete-volumes">Inspect and delete volumes</a></h3>
+<pre><code class="language-bash">aenv volume list
+aenv volume list --output json
+aenv volume inspect job-data
+aenv volume delete job-data
+</code></pre>
+<p>A mounted volume cannot be deleted. <code>aenv volume ls</code> is an alias for
+<code>aenv volume list</code>.</p>
 <hr>
 <h2 id="snapshots"><a class="header" href="#snapshots">Snapshots</a></h2>
 <h3 id="aenv-snapshot-create-sandbox-id"><a class="header" href="#aenv-snapshot-create-sandbox-id"><code>aenv snapshot create &lt;sandbox-id&gt;</code></a></h3>
