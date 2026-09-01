@@ -8,6 +8,15 @@
   <style>
     html, body { margin: 0; padding: 0; height: 100%; }
     elements-api { display: block; height: 100vh; }
+    [data-testid="two-column-right"] {
+      width: 46%;
+      max-width: 640px !important;
+      margin-left: 48px;
+    }
+    [data-testid="two-column-right"] .sl-code-viewer,
+    [data-testid="two-column-right"] .sl-code-editor {
+      --fs-code: 15px !important;
+    }
   </style>
 </head>
 <body>
@@ -53,11 +62,18 @@
 
     const spec = jsyaml.load(await response.text());
 
-    // Keep the documentation navigation task-oriented without changing the
-    // source OpenAPI document used by the server and generated clients.
+    const tagDisplayNames = new Map([
+      ['sandboxes', 'Sandboxes'],
+      ['templates', 'Templates'],
+      ['snapshots', 'Snapshots'],
+      ['admin', 'Admin'],
+    ]);
     const tagByName = new Map((spec.tags || []).map(tag => [tag.name, tag]));
-    spec.tags = ['sandboxes', 'templates', 'snapshots', 'admin']
-      .map(name => tagByName.get(name) || { name });
+    spec.tags = [...tagDisplayNames]
+      .map(([name, displayName]) => ({
+        ...(tagByName.get(name) || {}),
+        name: displayName,
+      }));
 
     // Stoplight uses summary as the operation label in the sidebar.
     for (const [path, pathItem] of Object.entries(spec.paths || {})) {
@@ -71,6 +87,8 @@
         }
 
         operation.summary ||= operationTitles[`${method.toUpperCase()} ${path}`];
+        operation.tags = (operation.tags || [])
+          .map(tag => tagDisplayNames.get(tag) || tag);
 
         // The deployed control plane authenticates every protected operation
         // with X-API-Key, including operations whose compatibility schema
