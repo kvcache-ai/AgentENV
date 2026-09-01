@@ -49,6 +49,17 @@ socket_poll_ms = 1
 # levels are Error, Warning, Info, Debug, and Trace; unset disables it.
 # log_level = "Info"
 
+# Firecracker virtio-mem hard elasticity. Disabled keeps the existing fixed
+# memory behavior and does not create a hotplug device.
+[firecracker.memory_hotplug]
+# enabled = false
+# total_size_mib = 0
+# slot_size_mib = 128
+# block_size_mib = 2
+# requested_size_mib = 0
+# resize_timeout_secs = 30
+# resize_poll_interval_ms = 50
+
 [kernel]
 # Use an existing uncompressed Linux kernel image instead of downloading one.
 # The file must be a readable, non-empty regular file.

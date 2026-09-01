@@ -161,6 +161,46 @@ pub enum SandboxesSandboxIdGetResponse {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+pub enum SandboxesSandboxIdMemoryGetResponse {
+    /// Memory hotplug status
+    Status200_MemoryHotplugStatus(models::SandboxMemoryHotplugStatus),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
+    /// Unprocessable entity
+    Status422_UnprocessableEntity(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum SandboxesSandboxIdMemoryPatchResponse {
+    /// Memory resize converged
+    Status200_MemoryResizeConverged(models::SandboxMemoryHotplugStatus),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
+    /// Unprocessable entity
+    Status422_UnprocessableEntity(models::Error),
+    /// Gateway timeout
+    Status504_GatewayTimeout(models::SandboxMemoryHotplugStatus),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum SandboxesSandboxIdNetworkPutResponse {
     /// Successfully updated the sandbox network configuration
     Status204_SuccessfullyUpdatedTheSandboxNetworkConfiguration,
@@ -393,6 +433,33 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         claims: &Self::Claims,
         path_params: &models::SandboxesSandboxIdGetPathParams,
     ) -> Result<SandboxesSandboxIdGetResponse, E>;
+
+    /// Get sandbox virtio-mem status.
+    ///
+    /// SandboxesSandboxIdMemoryGet - GET /sandboxes/{sandboxID}/memory
+    async fn sandboxes_sandbox_id_memory_get(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdMemoryGetPathParams,
+    ) -> Result<SandboxesSandboxIdMemoryGetResponse, E>;
+
+    /// Resize sandbox virtio-mem memory.
+    ///
+    /// SandboxesSandboxIdMemoryPatch - PATCH /sandboxes/{sandboxID}/memory
+    async fn sandboxes_sandbox_id_memory_patch(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdMemoryPatchPathParams,
+        body: &models::SandboxMemoryHotplugResize,
+    ) -> Result<SandboxesSandboxIdMemoryPatchResponse, E>;
 
     /// Update sandbox network.
     ///

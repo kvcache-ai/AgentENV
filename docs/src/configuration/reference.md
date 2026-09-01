@@ -49,6 +49,40 @@ Firecracker VM binary and boot configuration.
 | `serial_dir` | string | `"$AENV_HOME/logs/serial"` | Directory for persistent Firecracker serial output (per-sandbox subdirectories) |
 | `log_level` | string | unset (disabled) | Optional Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`, case-insensitive). When set to a non-empty value, Firecracker's own logging is enabled and written to a `firecracker.log` file in each sandbox's log directory (alongside the serial output). Empty/unset disables it |
 
+### `[firecracker.memory_hotplug]`
+
+Optional Firecracker virtio-mem hard elasticity. It is disabled by default, so
+existing VMs retain fixed memory. When enabled, AgentENV creates the device only
+on a fresh pre-boot path; snapshot resume restores it from `vm_state.bin` and
+validates it with `GET /hotplug/memory` without issuing another PUT.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Create and manage a virtio-mem device |
+| `total_size_mib` | integer | `0` | Maximum hotpluggable region; must be positive and slot-aligned |
+| `slot_size_mib` | integer | `128` | Slot size; at least 128 MiB and block-aligned |
+| `block_size_mib` | integer | `2` | Logical block size; at least 2 MiB |
+| `requested_size_mib` | integer | `0` | Initial requested size; block-aligned and no greater than total |
+| `resize_timeout_secs` | integer | `30` | Deadline for exact requested/plugged convergence |
+| `resize_poll_interval_ms` | integer | `50` | Firecracker status polling interval |
+
+Enabled VMs require `memhp_default_state=online_movable`. AgentENV appends it
+after all cold-start extension arguments are merged when absent, preserves the
+same explicit value, and rejects a conflicting value. Resize timeout or partial
+convergence is an error; requested memory is not treated as reclaimed until
+Firecracker reports `plugged_size_mib == requested_size_mib`.
+
+For a fresh sandbox, `memoryMB` is the total requested/billable memory rather
+than the Firecracker boot-memory field. AgentENV configures immutable boot
+memory as `memoryMB - requested_size_mib`. The runtime endpoint
+`PATCH /sandboxes/{sandboxID}/memory` accepts
+`requestedHotplugMemoryMB`; its response reports requested, plugged,
+total/slot/block, boot and effective memory. Expansion is accounted before the
+Firecracker request. Shrink accounting is released only after exact
+convergence. A timed-out target is rolled back and verified; if rollback also
+stalls, the sandbox remains in a resize transition and can only be inspected or
+deleted, not snapshotted.
+
 ## `[kernel]`
 
 Linux kernel image for microVMs.

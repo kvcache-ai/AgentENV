@@ -150,6 +150,18 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    "422":
+      description: Unprocessable entity
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    "504":
+      description: Gateway timeout
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/SandboxMemoryHotplugStatus"
     "500":
       description: Server error
       content:
@@ -169,6 +181,93 @@ components:
       format: int32
       minimum: 128
       description: Memory for the sandbox in MiB
+
+    SandboxMemoryHotplugResize:
+      type: object
+      required:
+        - requestedHotplugMemoryMB
+      properties:
+        requestedHotplugMemoryMB:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Target requested size of the virtio-mem region in MiB.
+
+    SandboxMemoryHotplugStatus:
+      type: object
+      required:
+        - previousRequestedHotplugMemoryMB
+        - targetHotplugMemoryMB
+        - requestedHotplugMemoryMB
+        - pluggedHotplugMemoryMB
+        - totalHotplugMemoryMB
+        - slotSizeMB
+        - blockSizeMB
+        - bootMemoryMB
+        - effectiveMemoryMB
+        - accountedMemoryMB
+        - elapsedMs
+        - status
+      properties:
+        previousRequestedHotplugMemoryMB:
+          type: integer
+          format: int32
+          minimum: 0
+        targetHotplugMemoryMB:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Target requested by the current or most recent resize operation.
+        requestedHotplugMemoryMB:
+          type: integer
+          format: int32
+          minimum: 0
+        pluggedHotplugMemoryMB:
+          type: integer
+          format: int32
+          minimum: 0
+        totalHotplugMemoryMB:
+          type: integer
+          format: int32
+          minimum: 0
+        slotSizeMB:
+          type: integer
+          format: int32
+          minimum: 1
+        blockSizeMB:
+          type: integer
+          format: int32
+          minimum: 1
+        bootMemoryMB:
+          type: integer
+          format: int32
+          minimum: 128
+          description: Immutable memory configured in the Firecracker machine.
+        effectiveMemoryMB:
+          type: integer
+          format: int32
+          minimum: 128
+          description: Guest memory currently effective, equal to boot plus plugged memory.
+        accountedMemoryMB:
+          type: integer
+          format: int32
+          minimum: 128
+          description: Host scheduling grant retained for this sandbox.
+        elapsedMs:
+          type: integer
+          format: int64
+          minimum: 0
+        status:
+          type: string
+          enum: [converged, resizing, rolled_back, partial]
+        rollbackTargetHotplugMemoryMB:
+          type: integer
+          format: int32
+          minimum: 0
+          nullable: true
+        reason:
+          type: string
+          nullable: true
 
     DiskSizeMB:
       type: integer
@@ -1558,6 +1657,79 @@ paths:
           $ref: "#/components/responses/404"
         "401":
           $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandboxes/{sandboxID}/memory:
+    get:
+      summary: Get sandbox virtio-mem status
+      description: Get the latest stable or in-progress virtio-mem resize status.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      responses:
+        "200":
+          description: Memory hotplug status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxMemoryHotplugStatus"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "409":
+          $ref: "#/components/responses/409"
+        "422":
+          $ref: "#/components/responses/422"
+        "500":
+          $ref: "#/components/responses/500"
+
+    patch:
+      summary: Resize sandbox virtio-mem memory
+      description: >
+        Set the requested virtio-mem size and wait for exact requested/plugged
+        convergence. memoryMB continues to represent total accounted memory.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SandboxMemoryHotplugResize"
+      responses:
+        "200":
+          description: Memory resize converged
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxMemoryHotplugStatus"
+        "400":
+          $ref: "#/components/responses/400"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "409":
+          $ref: "#/components/responses/409"
+        "422":
+          $ref: "#/components/responses/422"
+        "504":
+          $ref: "#/components/responses/504"
         "500":
           $ref: "#/components/responses/500"
 

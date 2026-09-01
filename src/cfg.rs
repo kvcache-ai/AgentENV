@@ -11,7 +11,7 @@ pub use image::{
 };
 pub use network::{NetworkConfig, NetworkEgressConfig, NetworkInternalConfig};
 use overlaybd::config::UpperMode;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::virtualization::VirtualizationMode;
 
@@ -179,6 +179,101 @@ pub struct FirecrackerConfig {
     /// When set (non-empty), Firecracker logging is enabled and written to a
     /// `firecracker.log` file in the same directory as the Firecracker stdout log.
     pub log_level: Option<String>,
+    /// Optional virtio-mem hard-elasticity policy. Disabled by default.
+    #[config(nested)]
+    pub memory_hotplug: MemoryHotplugPolicy,
+}
+
+/// Firecracker virtio-mem device and resize policy.
+#[derive(Debug, Clone, Config, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryHotplugPolicy {
+    #[config(default = false)]
+    pub enabled: bool,
+    #[config(default = 0u32)]
+    pub total_size_mib: u32,
+    #[config(default = 128u32)]
+    pub slot_size_mib: u32,
+    #[config(default = 2u32)]
+    pub block_size_mib: u32,
+    #[config(default = 0u32)]
+    pub requested_size_mib: u32,
+    #[config(default = 30u64)]
+    #[serde(default = "default_memory_resize_timeout_secs", skip_serializing)]
+    pub resize_timeout_secs: u64,
+    #[config(default = 50u64)]
+    #[serde(default = "default_memory_resize_poll_interval_ms", skip_serializing)]
+    pub resize_poll_interval_ms: u64,
+}
+
+fn default_memory_resize_timeout_secs() -> u64 {
+    30
+}
+
+fn default_memory_resize_poll_interval_ms() -> u64 {
+    50
+}
+
+impl Default for MemoryHotplugPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            total_size_mib: 0,
+            slot_size_mib: 128,
+            block_size_mib: 2,
+            requested_size_mib: 0,
+            resize_timeout_secs: 30,
+            resize_poll_interval_ms: 50,
+        }
+    }
+}
+
+impl MemoryHotplugPolicy {
+    pub fn validate(&self) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let prefix = "firecracker.memory_hotplug";
+        if self.total_size_mib == 0 {
+            bail!("{prefix}.total_size_mib must be > 0 when enabled");
+        }
+        if self.slot_size_mib < 128 {
+            bail!("{prefix}.slot_size_mib must be >= 128");
+        }
+        if self.block_size_mib < 2 {
+            bail!("{prefix}.block_size_mib must be >= 2");
+        }
+        if self.total_size_mib % self.slot_size_mib != 0 {
+            bail!("{prefix}.total_size_mib must be aligned to slot_size_mib");
+        }
+        if self.slot_size_mib % self.block_size_mib != 0 {
+            bail!("{prefix}.slot_size_mib must be aligned to block_size_mib");
+        }
+        if self.requested_size_mib > self.total_size_mib {
+            bail!("{prefix}.requested_size_mib must not exceed total_size_mib");
+        }
+        if self.requested_size_mib % self.block_size_mib != 0 {
+            bail!("{prefix}.requested_size_mib must be aligned to block_size_mib");
+        }
+        for (name, value) in [
+            ("total_size_mib", self.total_size_mib),
+            ("slot_size_mib", self.slot_size_mib),
+            ("block_size_mib", self.block_size_mib),
+            ("requested_size_mib", self.requested_size_mib),
+        ] {
+            i32::try_from(value)
+                .with_context(|| format!("{prefix}.{name} exceeds Firecracker i32 range"))?;
+        }
+        if self.resize_timeout_secs == 0 {
+            bail!("{prefix}.resize_timeout_secs must be > 0");
+        }
+        if self.resize_poll_interval_ms == 0 {
+            bail!("{prefix}.resize_poll_interval_ms must be > 0");
+        }
+        if u128::from(self.resize_poll_interval_ms) > u128::from(self.resize_timeout_secs) * 1000 {
+            bail!("{prefix}.resize_poll_interval_ms must not exceed resize_timeout_secs");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Config, Clone)]
@@ -930,6 +1025,32 @@ impl AppConfig {
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
+        self.firecracker.memory_hotplug.validate()?;
+        self.validate_memory_hotplug_boot_args()?;
+        Ok(())
+    }
+
+    fn validate_memory_hotplug_boot_args(&self) -> Result<()> {
+        if !self.firecracker.memory_hotplug.enabled {
+            return Ok(());
+        }
+        let Some(args) = self.firecracker.boot_args.as_deref() else {
+            return Ok(());
+        };
+        let values = args
+            .split_whitespace()
+            .filter_map(|arg| arg.strip_prefix("memhp_default_state="))
+            .collect::<Vec<_>>();
+        if values.len() > 1 {
+            bail!(
+                "firecracker.boot_args contains duplicate memhp_default_state values: {values:?}"
+            );
+        }
+        if values.iter().any(|value| *value != "online_movable") {
+            bail!(
+                "firecracker.boot_args conflicts with memory hotplug: expected memhp_default_state=online_movable, found {values:?}"
+            );
+        }
         Ok(())
     }
 
@@ -1465,6 +1586,88 @@ mod tests {
         config
             .validate()
             .expect("disabled disk rate limit config is not validated");
+    }
+
+    #[test]
+    fn memory_hotplug_defaults_disabled() {
+        let policy = MemoryHotplugPolicy::default();
+        assert!(!policy.enabled);
+        assert_eq!(policy.slot_size_mib, 128);
+        assert_eq!(policy.block_size_mib, 2);
+        policy.validate().expect("disabled policy is compatible");
+    }
+
+    #[test]
+    fn memory_hotplug_validates_alignment_and_range() {
+        let valid = MemoryHotplugPolicy {
+            enabled: true,
+            total_size_mib: 512,
+            requested_size_mib: 128,
+            ..Default::default()
+        };
+        valid.validate().expect("aligned policy");
+
+        for (policy, expected) in [
+            (
+                {
+                    let mut p = valid.clone();
+                    p.total_size_mib = 300;
+                    p
+                },
+                "total_size_mib",
+            ),
+            (
+                {
+                    let mut p = valid.clone();
+                    p.slot_size_mib = 96;
+                    p
+                },
+                "slot_size_mib",
+            ),
+            (
+                {
+                    let mut p = valid.clone();
+                    p.block_size_mib = 3;
+                    p
+                },
+                "block_size_mib",
+            ),
+            (
+                {
+                    let mut p = valid.clone();
+                    p.requested_size_mib = 129;
+                    p
+                },
+                "requested_size_mib",
+            ),
+            (
+                {
+                    let mut p = valid.clone();
+                    p.requested_size_mib = 514;
+                    p
+                },
+                "requested_size_mib",
+            ),
+        ] {
+            let err = policy.validate().expect_err("invalid policy");
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_hotplug_rejects_conflicting_config_boot_arg() {
+        let mut config = AppConfig::default();
+        config.firecracker.memory_hotplug = MemoryHotplugPolicy {
+            enabled: true,
+            total_size_mib: 512,
+            ..Default::default()
+        };
+        config.firecracker.boot_args = Some("console=ttyS0 memhp_default_state=online".into());
+        let err = config.validate().expect_err("conflicting boot argument");
+        assert!(err.to_string().contains("online_movable"));
     }
 
     #[test]

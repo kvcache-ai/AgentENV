@@ -14,8 +14,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    EnvdAccessToken, Executor, FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput,
-    SandboxLaunchConfig, SandboxNetworkPolicy,
+    EnvdAccessToken, Executor, FreshSandboxBuildSpec, MemoryHotplugUnsupported, MemoryResizeResult,
+    ProcessHandle, ProcessOpts, ProcessOutput, SandboxLaunchConfig, SandboxNetworkPolicy,
 };
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::RunnableSnapshot;
@@ -191,6 +191,21 @@ pub trait SandboxBackend: Send + 'static {
     /// Should be called after [`start_nowait`][Self::start_nowait] before any
     /// workload is submitted.
     async fn wait_for_ready(&self) -> Result<()>;
+
+    /// Resize a configured virtio-mem device. Unsupported backends fail
+    /// explicitly rather than treating the request as successful.
+    async fn resize_memory_hotplug(
+        &mut self,
+        _requested_size_mib: u32,
+    ) -> Result<MemoryResizeResult> {
+        Err(MemoryHotplugUnsupported::new("sandbox backend does not expose virtio-mem").into())
+    }
+
+    /// Return the observed virtio-mem device state for accounting and API
+    /// readback. Backends without a persisted virtio-mem device fail closed.
+    async fn memory_hotplug_status(&mut self) -> Result<super::MemoryHotplugStatus> {
+        Err(MemoryHotplugUnsupported::new("sandbox backend does not expose virtio-mem").into())
+    }
 
     /// Pause the sandbox and capture its state for later resume.
     ///

@@ -139,6 +139,18 @@ pub struct SandboxesSandboxIdGetPathParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxesSandboxIdMemoryGetPathParams {
+    pub sandbox_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxesSandboxIdMemoryPatchPathParams {
+    pub sandbox_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxesSandboxIdNetworkPutPathParams {
     pub sandbox_id: String,
 }
@@ -5738,6 +5750,522 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxLifec
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into SandboxLifecycle - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxMemoryHotplugResize {
+    /// Target requested size of the virtio-mem region in MiB.
+    #[serde(rename = "requestedHotplugMemoryMB")]
+    #[validate(range(min = 0u32))]
+    pub requested_hotplug_memory_mb: u32,
+}
+
+impl SandboxMemoryHotplugResize {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(requested_hotplug_memory_mb: u32) -> SandboxMemoryHotplugResize {
+        SandboxMemoryHotplugResize {
+            requested_hotplug_memory_mb,
+        }
+    }
+}
+
+/// Converts the SandboxMemoryHotplugResize value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxMemoryHotplugResize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("requestedHotplugMemoryMB".to_string()),
+            Some(self.requested_hotplug_memory_mb.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxMemoryHotplugResize value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxMemoryHotplugResize {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub requested_hotplug_memory_mb: Vec<u32>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxMemoryHotplugResize".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "requestedHotplugMemoryMB" => {
+                        intermediate_rep.requested_hotplug_memory_mb.push(
+                            <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                        )
+                    }
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing SandboxMemoryHotplugResize".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxMemoryHotplugResize {
+            requested_hotplug_memory_mb: intermediate_rep
+                .requested_hotplug_memory_mb
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "requestedHotplugMemoryMB missing in SandboxMemoryHotplugResize".to_string()
+                })?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxMemoryHotplugResize> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxMemoryHotplugResize>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxMemoryHotplugResize>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxMemoryHotplugResize - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxMemoryHotplugResize> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxMemoryHotplugResize as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxMemoryHotplugResize - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxMemoryHotplugStatus {
+    #[serde(rename = "previousRequestedHotplugMemoryMB")]
+    #[validate(range(min = 0u32))]
+    pub previous_requested_hotplug_memory_mb: u32,
+
+    /// Target requested by the current or most recent resize operation.
+    #[serde(rename = "targetHotplugMemoryMB")]
+    #[validate(range(min = 0u32))]
+    pub target_hotplug_memory_mb: u32,
+
+    #[serde(rename = "requestedHotplugMemoryMB")]
+    #[validate(range(min = 0u32))]
+    pub requested_hotplug_memory_mb: u32,
+
+    #[serde(rename = "pluggedHotplugMemoryMB")]
+    #[validate(range(min = 0u32))]
+    pub plugged_hotplug_memory_mb: u32,
+
+    #[serde(rename = "totalHotplugMemoryMB")]
+    #[validate(range(min = 0u32))]
+    pub total_hotplug_memory_mb: u32,
+
+    #[serde(rename = "slotSizeMB")]
+    #[validate(range(min = 1u32))]
+    pub slot_size_mb: u32,
+
+    #[serde(rename = "blockSizeMB")]
+    #[validate(range(min = 1u32))]
+    pub block_size_mb: u32,
+
+    /// Immutable memory configured in the Firecracker machine.
+    #[serde(rename = "bootMemoryMB")]
+    #[validate(range(min = 128u32))]
+    pub boot_memory_mb: u32,
+
+    /// Guest memory currently effective, equal to boot plus plugged memory.
+    #[serde(rename = "effectiveMemoryMB")]
+    #[validate(range(min = 128u32))]
+    pub effective_memory_mb: u32,
+
+    /// Host scheduling grant retained for this sandbox.
+    #[serde(rename = "accountedMemoryMB")]
+    #[validate(range(min = 128u32))]
+    pub accounted_memory_mb: u32,
+
+    #[serde(rename = "elapsedMs")]
+    #[validate(range(min = 0u64))]
+    pub elapsed_ms: u64,
+
+    /// Note: inline enums are not fully supported by openapi-generator
+    #[serde(rename = "status")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub status: String,
+
+    #[serde(rename = "rollbackTargetHotplugMemoryMB")]
+    #[validate(range(min = 0u32))]
+    #[serde(deserialize_with = "deserialize_optional_nullable")]
+    #[serde(default = "default_optional_nullable")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_target_hotplug_memory_mb: Option<Nullable<u32>>,
+
+    #[serde(rename = "reason")]
+    #[serde(deserialize_with = "deserialize_optional_nullable")]
+    #[serde(default = "default_optional_nullable")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<Nullable<String>>,
+}
+
+impl SandboxMemoryHotplugStatus {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        previous_requested_hotplug_memory_mb: u32,
+        target_hotplug_memory_mb: u32,
+        requested_hotplug_memory_mb: u32,
+        plugged_hotplug_memory_mb: u32,
+        total_hotplug_memory_mb: u32,
+        slot_size_mb: u32,
+        block_size_mb: u32,
+        boot_memory_mb: u32,
+        effective_memory_mb: u32,
+        accounted_memory_mb: u32,
+        elapsed_ms: u64,
+        status: String,
+    ) -> SandboxMemoryHotplugStatus {
+        SandboxMemoryHotplugStatus {
+            previous_requested_hotplug_memory_mb,
+            target_hotplug_memory_mb,
+            requested_hotplug_memory_mb,
+            plugged_hotplug_memory_mb,
+            total_hotplug_memory_mb,
+            slot_size_mb,
+            block_size_mb,
+            boot_memory_mb,
+            effective_memory_mb,
+            accounted_memory_mb,
+            elapsed_ms,
+            status,
+            rollback_target_hotplug_memory_mb: None,
+            reason: None,
+        }
+    }
+}
+
+/// Converts the SandboxMemoryHotplugStatus value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxMemoryHotplugStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("previousRequestedHotplugMemoryMB".to_string()),
+            Some(self.previous_requested_hotplug_memory_mb.to_string()),
+            Some("targetHotplugMemoryMB".to_string()),
+            Some(self.target_hotplug_memory_mb.to_string()),
+            Some("requestedHotplugMemoryMB".to_string()),
+            Some(self.requested_hotplug_memory_mb.to_string()),
+            Some("pluggedHotplugMemoryMB".to_string()),
+            Some(self.plugged_hotplug_memory_mb.to_string()),
+            Some("totalHotplugMemoryMB".to_string()),
+            Some(self.total_hotplug_memory_mb.to_string()),
+            Some("slotSizeMB".to_string()),
+            Some(self.slot_size_mb.to_string()),
+            Some("blockSizeMB".to_string()),
+            Some(self.block_size_mb.to_string()),
+            Some("bootMemoryMB".to_string()),
+            Some(self.boot_memory_mb.to_string()),
+            Some("effectiveMemoryMB".to_string()),
+            Some(self.effective_memory_mb.to_string()),
+            Some("accountedMemoryMB".to_string()),
+            Some(self.accounted_memory_mb.to_string()),
+            Some("elapsedMs".to_string()),
+            Some(self.elapsed_ms.to_string()),
+            Some("status".to_string()),
+            Some(self.status.to_string()),
+            self.rollback_target_hotplug_memory_mb.as_ref().map(
+                |rollback_target_hotplug_memory_mb| {
+                    [
+                        "rollbackTargetHotplugMemoryMB".to_string(),
+                        rollback_target_hotplug_memory_mb
+                            .as_ref()
+                            .map_or("null".to_string(), |x| x.to_string()),
+                    ]
+                    .join(",")
+                },
+            ),
+            self.reason.as_ref().map(|reason| {
+                [
+                    "reason".to_string(),
+                    reason
+                        .as_ref()
+                        .map_or("null".to_string(), |x| x.to_string()),
+                ]
+                .join(",")
+            }),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxMemoryHotplugStatus value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxMemoryHotplugStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub previous_requested_hotplug_memory_mb: Vec<u32>,
+            pub target_hotplug_memory_mb: Vec<u32>,
+            pub requested_hotplug_memory_mb: Vec<u32>,
+            pub plugged_hotplug_memory_mb: Vec<u32>,
+            pub total_hotplug_memory_mb: Vec<u32>,
+            pub slot_size_mb: Vec<u32>,
+            pub block_size_mb: Vec<u32>,
+            pub boot_memory_mb: Vec<u32>,
+            pub effective_memory_mb: Vec<u32>,
+            pub accounted_memory_mb: Vec<u32>,
+            pub elapsed_ms: Vec<u64>,
+            pub status: Vec<String>,
+            pub rollback_target_hotplug_memory_mb: Vec<u32>,
+            pub reason: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxMemoryHotplugStatus".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "previousRequestedHotplugMemoryMB" => intermediate_rep.previous_requested_hotplug_memory_mb.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "targetHotplugMemoryMB" => intermediate_rep.target_hotplug_memory_mb.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "requestedHotplugMemoryMB" => intermediate_rep.requested_hotplug_memory_mb.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "pluggedHotplugMemoryMB" => intermediate_rep.plugged_hotplug_memory_mb.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "totalHotplugMemoryMB" => intermediate_rep.total_hotplug_memory_mb.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "slotSizeMB" => intermediate_rep.slot_size_mb.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "blockSizeMB" => intermediate_rep.block_size_mb.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "bootMemoryMB" => intermediate_rep.boot_memory_mb.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "effectiveMemoryMB" => intermediate_rep.effective_memory_mb.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "accountedMemoryMB" => intermediate_rep.accounted_memory_mb.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "elapsedMs" => intermediate_rep.elapsed_ms.push(<u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "status" => intermediate_rep.status.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    "rollbackTargetHotplugMemoryMB" => return std::result::Result::Err("Parsing a nullable type in this style is not supported in SandboxMemoryHotplugStatus".to_string()),
+                    "reason" => return std::result::Result::Err("Parsing a nullable type in this style is not supported in SandboxMemoryHotplugStatus".to_string()),
+                    _ => return std::result::Result::Err("Unexpected key while parsing SandboxMemoryHotplugStatus".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxMemoryHotplugStatus {
+            previous_requested_hotplug_memory_mb: intermediate_rep
+                .previous_requested_hotplug_memory_mb
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "previousRequestedHotplugMemoryMB missing in SandboxMemoryHotplugStatus"
+                        .to_string()
+                })?,
+            target_hotplug_memory_mb: intermediate_rep
+                .target_hotplug_memory_mb
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "targetHotplugMemoryMB missing in SandboxMemoryHotplugStatus".to_string()
+                })?,
+            requested_hotplug_memory_mb: intermediate_rep
+                .requested_hotplug_memory_mb
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "requestedHotplugMemoryMB missing in SandboxMemoryHotplugStatus".to_string()
+                })?,
+            plugged_hotplug_memory_mb: intermediate_rep
+                .plugged_hotplug_memory_mb
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "pluggedHotplugMemoryMB missing in SandboxMemoryHotplugStatus".to_string()
+                })?,
+            total_hotplug_memory_mb: intermediate_rep
+                .total_hotplug_memory_mb
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "totalHotplugMemoryMB missing in SandboxMemoryHotplugStatus".to_string()
+                })?,
+            slot_size_mb: intermediate_rep
+                .slot_size_mb
+                .into_iter()
+                .next()
+                .ok_or_else(|| "slotSizeMB missing in SandboxMemoryHotplugStatus".to_string())?,
+            block_size_mb: intermediate_rep
+                .block_size_mb
+                .into_iter()
+                .next()
+                .ok_or_else(|| "blockSizeMB missing in SandboxMemoryHotplugStatus".to_string())?,
+            boot_memory_mb: intermediate_rep
+                .boot_memory_mb
+                .into_iter()
+                .next()
+                .ok_or_else(|| "bootMemoryMB missing in SandboxMemoryHotplugStatus".to_string())?,
+            effective_memory_mb: intermediate_rep
+                .effective_memory_mb
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "effectiveMemoryMB missing in SandboxMemoryHotplugStatus".to_string()
+                })?,
+            accounted_memory_mb: intermediate_rep
+                .accounted_memory_mb
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    "accountedMemoryMB missing in SandboxMemoryHotplugStatus".to_string()
+                })?,
+            elapsed_ms: intermediate_rep
+                .elapsed_ms
+                .into_iter()
+                .next()
+                .ok_or_else(|| "elapsedMs missing in SandboxMemoryHotplugStatus".to_string())?,
+            status: intermediate_rep
+                .status
+                .into_iter()
+                .next()
+                .ok_or_else(|| "status missing in SandboxMemoryHotplugStatus".to_string())?,
+            rollback_target_hotplug_memory_mb: std::result::Result::Err(
+                "Nullable types not supported in SandboxMemoryHotplugStatus".to_string(),
+            )?,
+            reason: std::result::Result::Err(
+                "Nullable types not supported in SandboxMemoryHotplugStatus".to_string(),
+            )?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxMemoryHotplugStatus> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxMemoryHotplugStatus>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxMemoryHotplugStatus>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxMemoryHotplugStatus - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxMemoryHotplugStatus> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxMemoryHotplugStatus as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxMemoryHotplugStatus - {err}"#
                     )),
                 }
             }

@@ -11,8 +11,8 @@ use firecracker_client::models::vm::State as VmState;
 use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig, PartialDrive};
 use firecracker_client::models::{
     Balloon, BootSource, DirtyMemoryRanges, Drive, InstanceActionInfo, Logger,
-    MachineConfiguration, MemoryBackend, NetworkInterface, NetworkOverride, RateLimiter,
-    SnapshotCreateParams, SnapshotLoadParams, Vm,
+    MachineConfiguration, MemoryBackend, MemoryHotplugConfig, MemoryHotplugSizeUpdate,
+    NetworkInterface, NetworkOverride, RateLimiter, SnapshotCreateParams, SnapshotLoadParams, Vm,
 };
 use hyper::Method;
 use nix::sys::signal::{kill, Signal};
@@ -30,6 +30,54 @@ use super::socket::UnixSocketClient;
 /// injected via the extra MMDS metadata pass-through.
 const MMDS_SIZE_LIMIT: usize = 1_048_576;
 const HTTP_API_MAX_PAYLOAD_SIZE: usize = MMDS_SIZE_LIMIT;
+
+/// Validated, unsigned view of Firecracker's virtio-mem status response.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryHotplugStatus {
+    pub total_size_mib: u32,
+    pub slot_size_mib: u32,
+    pub block_size_mib: u32,
+    pub requested_size_mib: u32,
+    pub plugged_size_mib: u32,
+}
+
+/// Result of a virtio-mem resize after exact requested/plugged convergence.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryResizeResult {
+    pub previous_requested_size_mib: u32,
+    pub requested_size_mib: u32,
+    pub plugged_size_mib: u32,
+    pub total_size_mib: u32,
+    pub slot_size_mib: u32,
+    pub block_size_mib: u32,
+    pub elapsed_ms: u64,
+}
+
+fn mib_to_i32(value: u32, field: &str) -> Result<i32> {
+    i32::try_from(value).with_context(|| format!("{field} ({value}) exceeds Firecracker i32 range"))
+}
+
+fn required_mib(value: Option<i32>, field: &str) -> Result<u32> {
+    let value =
+        value.with_context(|| format!("Firecracker memory hotplug status omitted {field}"))?;
+    u32::try_from(value).with_context(|| {
+        format!("Firecracker memory hotplug status returned negative {field}: {value}")
+    })
+}
+
+impl TryFrom<firecracker_client::models::MemoryHotplugStatus> for MemoryHotplugStatus {
+    type Error = anyhow::Error;
+
+    fn try_from(value: firecracker_client::models::MemoryHotplugStatus) -> Result<Self> {
+        Ok(Self {
+            total_size_mib: required_mib(value.total_size_mib, "total_size_mib")?,
+            slot_size_mib: required_mib(value.slot_size_mib, "slot_size_mib")?,
+            block_size_mib: required_mib(value.block_size_mib, "block_size_mib")?,
+            requested_size_mib: required_mib(value.requested_size_mib, "requested_size_mib")?,
+            plugged_size_mib: required_mib(value.plugged_size_mib, "plugged_size_mib")?,
+        })
+    }
+}
 
 pub(crate) struct FirecrackerInstance {
     client: UnixSocketClient,
@@ -423,6 +471,56 @@ impl FirecrackerInstance {
             .context("Failed to set balloon configuration")
     }
 
+    /// Creates the virtio-mem device. Pre-boot only and intentionally absent
+    /// from snapshot resume, where vm_state.bin restores the device.
+    pub async fn put_memory_hotplug(
+        &self,
+        total_size_mib: u32,
+        slot_size_mib: u32,
+        block_size_mib: u32,
+    ) -> Result<()> {
+        let mut config = MemoryHotplugConfig::new();
+        config.total_size_mib = Some(mib_to_i32(total_size_mib, "total_size_mib")?);
+        config.slot_size_mib = Some(mib_to_i32(slot_size_mib, "slot_size_mib")?);
+        config.block_size_mib = Some(mib_to_i32(block_size_mib, "block_size_mib")?);
+        self.client
+            .request_no_content(Method::PUT, "/hotplug/memory", Some(&config))
+            .await
+            .context("Failed to configure virtio-mem device")
+    }
+
+    /// Updates the runtime virtio-mem requested size.
+    pub async fn patch_memory_hotplug(
+        &self,
+        requested_size_mib: u32,
+    ) -> Result<MemoryHotplugStatus> {
+        let mut update = MemoryHotplugSizeUpdate::new();
+        update.requested_size_mib = Some(mib_to_i32(requested_size_mib, "requested_size_mib")?);
+        self.client
+            .request_no_content(Method::PATCH, "/hotplug/memory", Some(&update))
+            .await
+            .with_context(|| {
+                format!("Failed to request virtio-mem size {requested_size_mib} MiB")
+            })?;
+        self.get_memory_hotplug()
+            .await
+            .context("read back virtio-mem status after PATCH")
+    }
+
+    /// Reads and validates the complete runtime virtio-mem status.
+    pub async fn get_memory_hotplug(&self) -> Result<MemoryHotplugStatus> {
+        let status = self
+            .client
+            .request::<(), firecracker_client::models::MemoryHotplugStatus>(
+                Method::GET,
+                "/hotplug/memory",
+                None,
+            )
+            .await
+            .context("Failed to get virtio-mem status")?;
+        status.try_into()
+    }
+
     /// Starts the microVM.
     pub async fn start(&self) -> Result<()> {
         let action = InstanceActionInfo::new(ActionType::InstanceStart);
@@ -613,6 +711,33 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use tempfile::tempdir;
+
+    #[test]
+    fn memory_hotplug_mib_conversion_rejects_i32_overflow() {
+        assert_eq!(mib_to_i32(i32::MAX as u32, "size").unwrap(), i32::MAX);
+        assert!(mib_to_i32(i32::MAX as u32 + 1, "size").is_err());
+    }
+
+    #[test]
+    fn memory_hotplug_status_rejects_missing_and_negative_fields() {
+        let mut raw = firecracker_client::models::MemoryHotplugStatus::new();
+        raw.total_size_mib = Some(512);
+        raw.slot_size_mib = Some(128);
+        raw.block_size_mib = Some(2);
+        raw.requested_size_mib = Some(128);
+        raw.plugged_size_mib = Some(128);
+        assert_eq!(
+            MemoryHotplugStatus::try_from(raw.clone())
+                .unwrap()
+                .plugged_size_mib,
+            128
+        );
+
+        raw.plugged_size_mib = Some(-1);
+        assert!(MemoryHotplugStatus::try_from(raw.clone()).is_err());
+        raw.plugged_size_mib = None;
+        assert!(MemoryHotplugStatus::try_from(raw).is_err());
+    }
 
     #[tokio::test]
     async fn wait_for_ready_times_out_when_socket_never_appears() {

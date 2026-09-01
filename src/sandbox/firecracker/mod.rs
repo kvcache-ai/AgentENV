@@ -22,6 +22,7 @@ pub use config::{
 };
 pub use factory::FirecrackerSandboxFactory;
 pub(super) use instance::FirecrackerInstance;
+pub use instance::{MemoryHotplugStatus, MemoryResizeResult};
 pub use manifest::FirecrackerSnapshotManifest;
 pub use pool::FirecrackerPool;
 pub use sandbox::{FirecrackerCapturedSnapshot, FirecrackerPausedState, FirecrackerSandbox};

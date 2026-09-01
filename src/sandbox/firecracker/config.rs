@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::mmds::MmdsMetadata;
-use crate::cfg::{AppConfig, ConfigManager, EnvdConfig, ToolsConfig};
+use crate::cfg::{AppConfig, ConfigManager, EnvdConfig, MemoryHotplugPolicy, ToolsConfig};
 use crate::sandbox::ublk::UblkConfig;
 use crate::sandbox::SandboxNetworkPolicy;
 use crate::sandbox::UblkBackend;
@@ -162,6 +162,10 @@ pub struct FirecrackerCommonConfig {
     /// the process-global config.
     #[serde(default)]
     pub disk_rate_limit: crate::cfg::DiskRateLimitConfig,
+    /// Effective virtio-mem policy, persisted so restored VMs are validated
+    /// against the device state contained in vm_state.bin.
+    #[serde(default)]
+    pub memory_hotplug: MemoryHotplugPolicy,
     /// Runtime-only envd credential. It is re-derived from sandbox metadata on
     /// resume and is intentionally excluded from persisted snapshot configs.
     #[serde(skip)]
@@ -199,6 +203,7 @@ impl FirecrackerCommonConfig {
             network_policy: None,
             custom_extension_params: None,
             disk_rate_limit: crate::cfg::DiskRateLimitConfig::default(),
+            memory_hotplug: MemoryHotplugPolicy::default(),
             envd_access_token: None,
         }
     }
@@ -211,6 +216,7 @@ impl FirecrackerCommonConfig {
         let mut common = Self::new(firecracker_binary, tools_drive_version, runtime_policy);
         common.envd_version = config.envd.version.clone();
         common.disk_rate_limit = config.machine.disk_rate_limit.clone();
+        common.memory_hotplug = config.firecracker.memory_hotplug.clone();
         common.track_dirty_pages = config.memory_snapshot.track_dirty_pages;
         common.rootfs_allow_shrink = config.ublk.overlaybd.allow_shrink;
         common.control_plane_port = config.tools.control_plane_port;
@@ -279,6 +285,9 @@ impl FirecrackerCommonConfig {
     }
 
     fn validate_persisted_artifacts(&self) -> Result<()> {
+        self.memory_hotplug
+            .validate()
+            .context("validate persisted virtio-mem policy")?;
         validate_overlaybd_extra_drive_set(&self.extra_drives)?;
         if matches!(self.rootfs_virtual_size, Some(0)) {
             anyhow::bail!("rootfs virtual size must be non-zero");
@@ -507,6 +516,11 @@ impl FirecrackerSnapshotConfig {
         // starts for the first time. When resuming from a snapshot, the full CPU state
         // is already serialised inside vm_state.bin, so re-applying a template would
         // be incorrect and is rejected by Firecracker anyway.
+        let mut persisted_memory_hotplug = manifest.memory_hotplug.clone();
+        persisted_memory_hotplug.resize_timeout_secs =
+            base_common.memory_hotplug.resize_timeout_secs;
+        persisted_memory_hotplug.resize_poll_interval_ms =
+            base_common.memory_hotplug.resize_poll_interval_ms;
         let snapshot_common = FirecrackerCommonConfig {
             ublk_config: Some(overlaybd_ublk_config),
             envd_version: snapshot.committed().runtime_versions.envd_version.clone(),
@@ -516,6 +530,7 @@ impl FirecrackerSnapshotConfig {
             rootfs_image_config: Some(rootfs_image_config),
             rootfs_virtual_size: Some(manifest.rootfs.virtual_size),
             extra_drives: manifest.extra_drives(),
+            memory_hotplug: persisted_memory_hotplug,
             ..base_common
         };
 
@@ -674,6 +689,19 @@ mod tests {
 
     fn test_runtime_policy() -> FirecrackerRuntimePolicy {
         FirecrackerRuntimePolicy::from_app_config(&base_app_config())
+    }
+
+    #[test]
+    fn legacy_common_config_defaults_memory_hotplug_to_disabled() {
+        let common = FirecrackerCommonConfig::new(
+            "firecracker".into(),
+            "0.1.0".into(),
+            test_runtime_policy(),
+        );
+        let mut value = serde_json::to_value(common).unwrap();
+        value.as_object_mut().unwrap().remove("memory_hotplug");
+        let decoded: FirecrackerCommonConfig = serde_json::from_value(value).unwrap();
+        assert!(!decoded.memory_hotplug.enabled);
     }
 
     #[test]
