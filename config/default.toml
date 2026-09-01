@@ -342,6 +342,19 @@ concurrency = 4
 # cannot resize it.
 max_inflight_blocks = 16
 
+[template_build]
+# Compress snapshot artifacts captured by template builds, independent of
+# [memory_snapshot].compression_enabled (template builds consult only this
+# section). When enabled, both memory layers and the sealed rootfs read-write
+# layer are compressed. Pause/snapshot captures of running sandboxes are not
+# affected.
+compression_enabled = false
+# Supported algorithms are "lz4" and "zstd".
+compression_algorithm = "lz4"
+# Workers compressing 4 KiB blocks. One is sequential; higher values run in
+# parallel without changing the output layout.
+compression_workers = 1
+
 [observability]
 # Expose node identity, host metrics, and orchestrator runtime metrics.
 enabled = true

@@ -558,3 +558,17 @@ and are then re-fetched on demand.
 | `block_size` | integer | `16777216` | Background download chunk size in bytes (16 MiB): one source request fetches a chunk of this size, aligned down to whole cache blocks. The cache keeps its own smaller block size for foreground reads, so background downloads keep large-request throughput while foreground keeps fine-grained on-demand reads. Peak scratch per active layer download is `block_size × concurrency`. |
 | `concurrency` | integer | `4` | Maximum number of in-flight block remote reads within a single remote layer. `1` keeps the historical serial behavior. Must be greater than zero. |
 | `max_inflight_blocks` | integer | `16` | Cap on concurrently downloading chunks enforced by each file-cache backend's download scheduler, shared by every concurrent layer download on that backend; bounds total scratch memory to `max_inflight_blocks` × the download chunk size (`block_size`). The value is fixed when the backend is created from the global config; a per-image `download` override never resizes the scheduler-owned cap (the first mismatch per scheduler is logged as `max_inflight_blocks_override_ignored`). Must be greater than zero. |
+
+## `[template_build]`
+
+Compression settings applied when a template build captures its snapshot.
+This section is fully independent of `[memory_snapshot].compression_enabled`:
+template builds consult only these keys, for both memory layers and the
+sealed rootfs read-write layer. Pause/snapshot captures of running sandboxes
+are not affected, and rootfs seals stay raw there.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `compression_enabled` | bool | `false` | Enable compression for snapshot artifacts captured by template builds. When enabled, both the memory layers and the sealed rootfs read-write layer are written as ZFile-compressed layers. |
+| `compression_algorithm` | string | `"lz4"` | Compression algorithm. Valid values are only `lz4` and `zstd`. Parsed but ignored when compression is disabled. |
+| `compression_workers` | integer | `1` | Number of blocking threads used to compress 4 KiB blocks within a layer. `1` is sequential; higher values run in parallel without changing the output layout. Clamped to 64. |

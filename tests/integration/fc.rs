@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agentenv::cfg::{ConfigManager, MemorySnapshotCompressionAlgorithm};
+use agentenv::cfg::{ConfigManager, OverlaybdCompressionAlgorithm};
 use agentenv::sandbox::{
     BaseSandboxNetworkPolicy, FirecrackerSandbox, FirecrackerSnapshotConfig, SandboxBackend,
     SandboxExecutor, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
@@ -144,8 +144,8 @@ async fn assert_memory_layer_matches_config(snapshot: &FirecrackerSnapshotConfig
     }
 
     let expected_algo = match memory_config.compression_algorithm {
-        MemorySnapshotCompressionAlgorithm::Lz4 => CompressOptions::LZ4,
-        MemorySnapshotCompressionAlgorithm::Zstd => CompressOptions::ZSTD,
+        OverlaybdCompressionAlgorithm::Lz4 => CompressOptions::LZ4,
+        OverlaybdCompressionAlgorithm::Zstd => CompressOptions::ZSTD,
     };
     assert_eq!(
         zfile_flag,

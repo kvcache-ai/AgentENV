@@ -188,6 +188,10 @@ pub struct FirecrackerSandbox {
     extra_drive_runtimes: Vec<OverlaybdRuntimeHandle>,
     current_rootfs_virtual_size: Option<u64>,
     live_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
+    /// Per-snapshot compression override. Template builds set this to isolate
+    /// their compression switch from `[memory_snapshot]`; when unset, memory
+    /// layers follow `[memory_snapshot]` and rootfs seals stay raw.
+    snapshot_compression_override: Option<OverlaybdCompactOutput>,
     /// Delivers the custom extension stop hook exactly once: `stop()` calls
     /// [`CustomExtensionHookGuard::stop`], otherwise its own drop fires the
     /// best-effort notification. `None` when no start hook was delivered (or
@@ -655,6 +659,14 @@ impl FirecrackerSandbox {
         Ok(snapshot)
     }
 
+    /// Override the compression applied to snapshot artifacts captured by this
+    /// sandbox. Template builds use this to isolate their compression switch
+    /// from `[memory_snapshot]`; when unset, memory layers follow
+    /// `[memory_snapshot]` and rootfs seals stay raw.
+    pub(crate) fn set_snapshot_compression_override(&mut self, output: OverlaybdCompactOutput) {
+        self.snapshot_compression_override = Some(output);
+    }
+
     /// Pause the running sandbox and persist its snapshot artifacts into a caller-managed directory.
     #[tracing::instrument(skip(self, snapshot_dir))]
     pub async fn pause_to_dir(
@@ -683,9 +695,11 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
-        let memory_output = OverlaybdCompactOutput::from_memory_snapshot_config(
-            &ConfigManager::global_config().memory_snapshot,
-        );
+        let memory_output = self.snapshot_compression_override.unwrap_or_else(|| {
+            OverlaybdCompactOutput::from_memory_snapshot_config(
+                &ConfigManager::global_config().memory_snapshot,
+            )
+        });
         let (mem_layer_path, mem_virtual_size) = self
             .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, memory_output)
             .await?;
@@ -745,6 +759,10 @@ impl FirecrackerSandbox {
                 overlaybd_source.read_only,
                 &rootfs_runtime.image_config_path,
                 snapshot_dir,
+                // Rootfs seals stay raw unless a per-sandbox override
+                // (template builds) requests compression.
+                self.snapshot_compression_override
+                    .unwrap_or(OverlaybdCompactOutput::Raw),
             )
             .await
             .context("snapshot overlaybd runtime state to persistent dir")?;
@@ -1184,6 +1202,7 @@ impl FirecrackerSandbox {
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),
             live_snapshot_root: None,
+            snapshot_compression_override: None,
             custom_extension_hook_guard: None,
         })
     }
@@ -1821,6 +1840,8 @@ impl FirecrackerSandbox {
                 &runtime.image_config_path,
                 &snapshot_dir.join("drives").join(drive.drive_id()),
                 "drive",
+                // Attached drive seals always stay raw.
+                OverlaybdCompactOutput::Raw,
             )
             .await
             .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;

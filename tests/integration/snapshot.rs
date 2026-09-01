@@ -28,6 +28,43 @@ fn sample_runtime_versions() -> SnapshotRuntimeVersions {
     }
 }
 
+/// When the run's config enables `[template_build].compression_enabled`, the
+/// newest (freshly sealed) rootfs and memory lowers of a template-built
+/// snapshot must be ZFile-compressed. Otherwise the check is a no-op so the
+/// same test passes under default configs.
+async fn assert_sealed_layers_compressed_when_enabled(
+    runnable: &agentenv::snapshot::RunnableSnapshot,
+) -> Result<()> {
+    if !ConfigManager::global_config()
+        .template_build
+        .compression_enabled
+    {
+        return Ok(());
+    }
+    for image_config_path in [
+        &runnable.manifest().rootfs.image_config_path,
+        &runnable.manifest().memory.image_config_path,
+    ] {
+        let image_config = overlaybd::config::load_image_config(image_config_path)
+            .with_context(|| format!("load resolved image config {image_config_path:?}"))?;
+        let latest = image_config
+            .lowers
+            .last()
+            .ok_or_else(|| anyhow!("resolved image config has no lowers"))?;
+        anyhow::ensure!(
+            !latest.file.is_empty(),
+            "newest lower is remote (no local file); cannot probe sealed layer compression"
+        );
+        let file: std::sync::Arc<dyn overlaybd::virtual_file::VirtualFile> = std::sync::Arc::new(
+            overlaybd::backend::local::LocalFile::open_ro(std::path::Path::new(&latest.file))
+                .with_context(|| format!("open sealed layer {}", latest.file))?,
+        );
+        let zfile = overlaybd::zfile::is_zfile(file).await?;
+        assert_eq!(zfile, 1, "sealed layer {} must be zfile", latest.file);
+    }
+    Ok(())
+}
+
 async fn write_guest_file(sandbox: &FirecrackerSandbox, path: &str, contents: &str) -> Result<()> {
     let escaped_path = path.replace('\'', "'\\''");
     let escaped_contents = contents.replace('\'', "'\\''");
@@ -247,6 +284,7 @@ async fn built_and_derived_snapshot_can_be_launched() -> Result<()> {
     let runnable = snapshot_manager
         .resolve_runnable(loaded_base.clone())
         .await?;
+    assert_sealed_layers_compressed_when_enabled(&runnable).await?;
     let derived_id = SnapshotId::generate();
     builder
         .build_from_snapshot_and_publish(
@@ -271,6 +309,7 @@ async fn built_and_derived_snapshot_can_be_launched() -> Result<()> {
     );
 
     let runnable = snapshot_manager.resolve_runnable(derived.clone()).await?;
+    assert_sealed_layers_compressed_when_enabled(&runnable).await?;
     let mut sandbox =
         FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default())?;
     sandbox.start().await?;

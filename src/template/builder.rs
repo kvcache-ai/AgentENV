@@ -11,7 +11,7 @@ use super::errors::{
 };
 use super::runner::{TemplateBuildBase, TemplateBuildContext, TemplateBuildRunner};
 use crate::cfg::ConfigManager;
-use crate::sandbox::UblkConfig;
+use crate::sandbox::{OverlaybdCompactOutput, UblkConfig};
 use crate::snapshot::{
     CommandContext, RunnableSnapshot, SnapshotId, SnapshotManager, SnapshotPublishMetadata,
     SnapshotPublishSource, SnapshotRecord, StartupCommand, TemplateBuildErrorReason,
@@ -47,6 +47,14 @@ impl TemplateBuilder {
 
     fn current_cpu_config(&self) -> Option<String> {
         self.cpu_config_arc.as_ref()?.read().unwrap().clone()
+    }
+
+    /// Snapshot compression for template builds, resolved from the isolated
+    /// `[template_build]` switch (never `[memory_snapshot]`).
+    fn snapshot_compression_from_config() -> OverlaybdCompactOutput {
+        OverlaybdCompactOutput::from_template_build_config(
+            &ConfigManager::global_config().template_build,
+        )
     }
 
     /// Builds a new snapshot from `config`, publishes it, and returns the committed record.
@@ -213,6 +221,7 @@ impl TemplateBuilder {
             base,
             cpu_config_json: self.current_cpu_config(),
             virtualization_mode: ConfigManager::global_config().virtualization_mode,
+            snapshot_compression: Self::snapshot_compression_from_config(),
         })
     }
 
@@ -277,6 +286,7 @@ impl TemplateBuilder {
             },
             cpu_config_json: self.current_cpu_config(),
             virtualization_mode: base_mode,
+            snapshot_compression: Self::snapshot_compression_from_config(),
         })
     }
 
@@ -412,6 +422,26 @@ mod tests {
             .expect_err("snapshot-based build should reject resource changes");
 
         assert!(matches!(err, TemplateBuildError::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn fresh_context_carries_template_build_snapshot_compression() {
+        use crate::types::ImageConfigs;
+
+        let tempdir = TempDir::new().expect("tempdir");
+        let image_config_path = tempdir.path().join("image.json");
+        std::fs::write(&image_config_path, "{}").expect("write image config placeholder");
+        let manager = TemplateBuilder::new();
+        let context = manager
+            .prepare_fresh_context(
+                &TemplateBuildSpec::new()
+                    .with_resolved_overlaybd_image(&image_config_path, ImageConfigs::new()),
+                crate::snapshot::SnapshotId::generate(),
+            )
+            .expect("fresh context preparation should succeed");
+
+        // The default `[template_build]` config disables compression.
+        assert_eq!(context.snapshot_compression, OverlaybdCompactOutput::Raw);
     }
 
     #[test]

@@ -13,8 +13,9 @@ use super::build_spec::TemplateBuildStep;
 use super::errors::{command_output_suffix, TemplateBuildFailure};
 use super::step_executor::TemplateStepExecutor;
 use crate::sandbox::{
-    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotManifest, ProcessHandle,
-    ProcessOpts, SandboxExecutor, SandboxLaunchConfig, UblkConfig,
+    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotManifest,
+    OverlaybdCompactOutput, ProcessHandle, ProcessOpts, SandboxExecutor, SandboxLaunchConfig,
+    UblkConfig,
 };
 use crate::snapshot::{
     CommandContext, RunnableSnapshot, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions,
@@ -69,6 +70,10 @@ pub(crate) struct TemplateBuildContext {
     pub base: TemplateBuildBase,
     pub cpu_config_json: Option<String>,
     pub virtualization_mode: VirtualizationMode,
+    /// Compression applied to the snapshot artifacts captured by this build,
+    /// resolved from `[template_build]`; isolates template builds from
+    /// `[memory_snapshot]`.
+    pub snapshot_compression: OverlaybdCompactOutput,
 }
 
 impl TemplateBuildContext {
@@ -204,6 +209,7 @@ impl TemplateBuildRunner {
         let initial_context = context.initial_context.clone();
         let startup = context.startup.clone();
         let override_startup = context.override_startup;
+        let snapshot_compression = context.snapshot_compression;
 
         let handle =
             spawn_with_trace_context(worker_span, move || -> Result<TemplateBuildExecution> {
@@ -213,6 +219,7 @@ impl TemplateBuildRunner {
                     .context("create tokio runtime")?;
                 rt.block_on(async move {
                     let mut sandbox = create_sandbox()?;
+                    sandbox.set_snapshot_compression_override(snapshot_compression);
                     let run_result = async {
                         debug!(
                             cpu_count = resources.cpu_count,

@@ -126,6 +126,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub memory_snapshot: MemorySnapshotConfig,
     #[config(nested)]
+    pub template_build: TemplateBuildConfig,
+    #[config(nested)]
     pub pool: PoolTomlConfig,
     #[config(nested)]
     pub p2p: P2pConfig,
@@ -439,7 +441,7 @@ pub struct UblkOverlaybdTomlConfig {
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum MemorySnapshotCompressionAlgorithm {
+pub enum OverlaybdCompressionAlgorithm {
     #[default]
     Lz4,
     Zstd,
@@ -456,13 +458,28 @@ pub struct MemorySnapshotConfig {
     #[config(default = false)]
     pub compression_enabled: bool,
     #[config(default = "lz4")]
-    pub compression_algorithm: MemorySnapshotCompressionAlgorithm,
+    pub compression_algorithm: OverlaybdCompressionAlgorithm,
     /// Number of blocking threads used to compress 4KiB blocks within a
     /// memory layer. 1 = sequential (identical output layout at any value).
     #[config(default = 1)]
     pub compression_workers: usize,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
+}
+
+/// Compression settings applied when a template build captures its snapshot.
+/// Independent of `[memory_snapshot]`: template builds consult only this
+/// section, for both memory layers and the sealed rootfs read-write layer.
+#[derive(Debug, Config, Clone)]
+pub struct TemplateBuildConfig {
+    #[config(default = false)]
+    pub compression_enabled: bool,
+    #[config(default = "lz4")]
+    pub compression_algorithm: OverlaybdCompressionAlgorithm,
+    /// Number of blocking threads used to compress 4KiB blocks within a
+    /// layer. 1 = sequential (identical output layout at any value).
+    #[config(default = 1)]
+    pub compression_workers: usize,
 }
 
 #[derive(Debug, Config, Clone)]

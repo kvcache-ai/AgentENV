@@ -12,13 +12,13 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::device::UblkDevice;
-use crate::cfg::{MemorySnapshotCompressionAlgorithm, MemorySnapshotConfig};
+use crate::cfg::{MemorySnapshotConfig, OverlaybdCompressionAlgorithm, TemplateBuildConfig};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OverlaybdCompactOutput {
     Raw,
     ZFile {
-        algorithm: MemorySnapshotCompressionAlgorithm,
+        algorithm: OverlaybdCompressionAlgorithm,
         workers: usize,
     },
 }
@@ -29,12 +29,30 @@ impl OverlaybdCompactOutput {
     const MAX_COMPRESSION_WORKERS: usize = 64;
 
     pub(crate) fn from_memory_snapshot_config(config: &MemorySnapshotConfig) -> Self {
-        if config.compression_enabled {
+        Self::from_compression_parts(
+            config.compression_enabled,
+            config.compression_algorithm,
+            config.compression_workers,
+        )
+    }
+
+    pub(crate) fn from_template_build_config(config: &TemplateBuildConfig) -> Self {
+        Self::from_compression_parts(
+            config.compression_enabled,
+            config.compression_algorithm,
+            config.compression_workers,
+        )
+    }
+
+    fn from_compression_parts(
+        enabled: bool,
+        algorithm: OverlaybdCompressionAlgorithm,
+        workers: usize,
+    ) -> Self {
+        if enabled {
             Self::ZFile {
-                algorithm: config.compression_algorithm,
-                workers: config
-                    .compression_workers
-                    .clamp(1, Self::MAX_COMPRESSION_WORKERS),
+                algorithm,
+                workers: workers.clamp(1, Self::MAX_COMPRESSION_WORKERS),
             }
         } else {
             Self::Raw
@@ -51,8 +69,8 @@ pub(crate) async fn create_commit_args(
         OverlaybdCompactOutput::Raw => CommitArgs::new(output),
         OverlaybdCompactOutput::ZFile { algorithm, workers } => {
             let algorithm = match algorithm {
-                MemorySnapshotCompressionAlgorithm::Lz4 => CompressOptions::LZ4,
-                MemorySnapshotCompressionAlgorithm::Zstd => CompressOptions::ZSTD,
+                OverlaybdCompressionAlgorithm::Lz4 => CompressOptions::LZ4,
+                OverlaybdCompressionAlgorithm::Zstd => CompressOptions::ZSTD,
             };
             let mut compress_args = CompressArgs::new(CompressOptions::new(
                 algorithm,
@@ -282,7 +300,7 @@ mod tests {
             (
                 "lz4",
                 OverlaybdCompactOutput::ZFile {
-                    algorithm: MemorySnapshotCompressionAlgorithm::Lz4,
+                    algorithm: OverlaybdCompressionAlgorithm::Lz4,
                     // Exercise the segmented parallel compression path.
                     workers: 2,
                 },
@@ -291,7 +309,7 @@ mod tests {
             (
                 "zstd",
                 OverlaybdCompactOutput::ZFile {
-                    algorithm: MemorySnapshotCompressionAlgorithm::Zstd,
+                    algorithm: OverlaybdCompressionAlgorithm::Zstd,
                     workers: 1,
                 },
                 1,
@@ -325,5 +343,45 @@ mod tests {
             before
         );
         assert!(!output_path.with_extension("commit.tmp").exists());
+    }
+
+    #[test]
+    fn compact_output_from_template_build_config() {
+        let disabled = TemplateBuildConfig {
+            compression_enabled: false,
+            compression_algorithm: OverlaybdCompressionAlgorithm::Lz4,
+            compression_workers: 1,
+        };
+        assert_eq!(
+            OverlaybdCompactOutput::from_template_build_config(&disabled),
+            OverlaybdCompactOutput::Raw
+        );
+
+        let zstd = TemplateBuildConfig {
+            compression_enabled: true,
+            compression_algorithm: OverlaybdCompressionAlgorithm::Zstd,
+            // Zero workers clamps to sequential.
+            compression_workers: 0,
+        };
+        assert_eq!(
+            OverlaybdCompactOutput::from_template_build_config(&zstd),
+            OverlaybdCompactOutput::ZFile {
+                algorithm: OverlaybdCompressionAlgorithm::Zstd,
+                workers: 1,
+            }
+        );
+
+        let clamped = TemplateBuildConfig {
+            compression_enabled: true,
+            compression_algorithm: OverlaybdCompressionAlgorithm::Lz4,
+            compression_workers: usize::MAX,
+        };
+        assert_eq!(
+            OverlaybdCompactOutput::from_template_build_config(&clamped),
+            OverlaybdCompactOutput::ZFile {
+                algorithm: OverlaybdCompressionAlgorithm::Lz4,
+                workers: OverlaybdCompactOutput::MAX_COMPRESSION_WORKERS,
+            }
+        );
     }
 }
