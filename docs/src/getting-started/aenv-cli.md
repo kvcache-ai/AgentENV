@@ -115,14 +115,15 @@ or snapshot ID or alias, or an OCI image reference with `--cold`.
 
 ```bash
 aenv start my-ubuntu
-aenv start --secure my-ubuntu               # require token-authenticated envd access
 aenv start --cold ubuntu:24.04              # start directly from an OCI image
 ```
+
+Sandboxes started by `aenv` always require token-authenticated envd access. The
+CLI obtains and manages the access token automatically.
 
 | Flag | Description |
 |------|-------------|
 | `--cold` | Start directly from an external OCI image instead of a template |
-| `--secure` | Require token authentication for envd control communication |
 | `--timeout <secs>` | Sandbox TTL in seconds (default: 300) |
 | `--cpu <count>` | CPU cores; only valid with `--cold`. Defaults to `[machine].vcpu_count` on the server. Alias: `--cpu-count`. |
 | `--memory <MiB>` | Memory in MiB; only valid with `--cold`. Defaults to `[machine].mem_size_mib` on the server. Aliases: `--memory-mb`, `--mem`. |
