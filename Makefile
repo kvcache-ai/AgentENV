@@ -55,7 +55,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	fmt clippy \
 	mutants coverage \
 	test test-unit test-integration prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
-	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all \
+	test-e2e test-e2e-compose test-e2e-p2p test-e2e-k8s test-e2e-all \
 	bench bench-snapshot bench-ublk bench-orchestrator-store \
 	ci-deps ci-deps-protoc \
 	firecracker-client envd-http-client agentenv-server custom-extension-client start-server start-server-release \
@@ -202,6 +202,23 @@ test-e2e:
 
 test-e2e-compose:
 	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" E2E_MODE=compose bash $(TEST_SCRIPTS_DIR)/e2e/run_e2e.sh
+
+P2P_E2E_RUST_LOG ?= info,agentenv::p2p=debug,agentenv::overlaybd::p2p=debug,iroh=debug,iroh_blobs=debug,netwatch=debug,noq=debug
+
+test-e2e-p2p:
+	@set -eu; \
+	test -x "$(CURDIR)/scripts/tests/e2e/suites/15_p2p_multinode.sh"; \
+	p2p_config="$$(mktemp --suffix=.toml /tmp/agentenv-p2p-e2e.XXXXXX)"; \
+	trap 'rm -f "$$p2p_config"' 0 1 2 3 15; \
+	awk '/^\[/ { section = $$0 } section == "[p2p]" && /^enabled = (false|true)$$/ { print "enabled = true"; p2p_enabled = 1; next } section == "[pool]" && /^low_watermark = [0-9]+$$/ { print "low_watermark = 0"; pool_low = 1; next } section == "[pool]" && /^high_watermark = [0-9]+$$/ { print "high_watermark = 0"; pool_high = 1; next } { print } END { if (!(p2p_enabled && pool_low && pool_high)) exit 1 }' \
+		"$(CURDIR)/config/default.toml" > "$$p2p_config"; \
+	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" \
+	E2E_MODE=compose \
+	E2E_P2P_ENABLED=1 \
+	SUITE_FILTER=15_p2p_multinode.sh \
+	CONFIG_PATH="$$p2p_config" \
+	RUST_LOG="$(P2P_E2E_RUST_LOG)" \
+		bash $(TEST_SCRIPTS_DIR)/e2e/run_e2e.sh
 
 test-e2e-k8s:
 	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" E2E_MODE=k8s bash $(TEST_SCRIPTS_DIR)/e2e/run_e2e.sh
