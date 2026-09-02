@@ -3,6 +3,7 @@
 //! This crate provides reusable pool mechanics for resources that are expensive
 //! to create but can be reset and reused. It handles:
 //! - Watermark-based refill/drain decisions
+//! - Idle TTL decay of the geometric refill target
 //! - Background maintenance worker with condvar signaling
 //! - Shutdown coordination with safe resource cleanup
 //! - Process exit hooks for static singleton pools
@@ -12,6 +13,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// Action computed by watermark logic for the maintenance worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +52,11 @@ pub struct PoolConfig {
     /// Advisory flag for callers that can prewarm once a reusable resource
     /// shape is known. `WarmPool` itself only owns generic pool mechanics.
     pub startup_prewarm: bool,
+    /// Maximum time without acquisitions before the geometric fill target
+    /// decays back to the low watermark and idle resources above it are
+    /// drained. `None` keeps the fill target ratcheted for the process
+    /// lifetime.
+    pub idle_ttl: Option<Duration>,
 }
 
 impl PoolConfig {
@@ -63,7 +70,132 @@ impl PoolConfig {
             );
             self.low_watermark = self.high_watermark;
         }
+        // A zero idle TTL would expire on every cycle: `idle_ttl_remaining`
+        // would always return zero and the maintenance worker would schedule
+        // back-to-back cycles (busy loop) even after the pool reached its
+        // target. The external config documents 0 as "never decay", so
+        // normalize to `None` here; internal uses can then assume `Some(d)`
+        // always carries d > 0.
+        if self.idle_ttl == Some(Duration::ZERO) {
+            self.idle_ttl = None;
+        }
         self
+    }
+}
+
+/// Demand-side pool state: last acquisition time, geometric fill target, and
+/// the idle-decay lifecycle. Kept under one mutex so every maintenance action
+/// is computed from a single atomic snapshot of demand: a concurrent
+/// acquisition can never be observed halfway (new timestamp but stale decay
+/// state or fill target).
+#[derive(Debug)]
+struct DemandState {
+    /// Last time an acquisition was attempted. Drives idle TTL decay.
+    last_acquisition: Instant,
+    /// Current refill target. Starts at the low watermark and grows toward the
+    /// high watermark under acquisition pressure. With `idle_ttl` unset this
+    /// intentionally ratchets upward for the process lifetime: after a node
+    /// observes bursty demand, it keeps extra warm capacity instead of
+    /// shrinking back to cold-start behavior. When `idle_ttl` is set, a
+    /// sustained idle period decays the target back to the low watermark so
+    /// warm capacity (and the resources it holds) is released.
+    fill_target: usize,
+    /// Persistent "draining after idle decay" state. Set when the idle TTL
+    /// expires, cleared by any acquisition, and cleared once the pool has
+    /// verifiably drained to the decayed fill target (see
+    /// `WarmPool::try_drain_one_for_maintenance`). Keeps the drain target
+    /// pinned to the low watermark across partially-failed drain cycles, so
+    /// the decay event cannot be consumed by a single action computation.
+    decaying: bool,
+}
+
+impl DemandState {
+    /// Compute the maintenance action from one synchronized demand snapshot.
+    ///
+    /// The action is a point-in-time plan: callers executing a `Drain` must
+    /// re-validate each removal with `WarmPool::try_drain_one_for_maintenance`
+    /// because an interleaved acquisition cancels the decay and a concurrent
+    /// release/acquire changes the pool length.
+    fn compute_maintenance_action(
+        &mut self,
+        config: &PoolConfig,
+        pool_len: usize,
+        now: Instant,
+    ) -> PoolMaintenanceAction {
+        // Apply the idle TTL decay transition, if any. The idle clock
+        // restarts on each expiry so a fully decayed pool does not retrigger
+        // every cycle, while `decaying` persists until the pool verifiably
+        // reaches the decayed target: a partially-failed drain cycle or an
+        // interleaved computation cannot consume the decay event and retain
+        // the excess for another full TTL.
+        if let Some(ttl) = config.idle_ttl {
+            if now.saturating_duration_since(self.last_acquisition) >= ttl {
+                self.last_acquisition = now;
+                let low = config.low_watermark.min(config.high_watermark);
+                self.fill_target = self.fill_target.min(low);
+                self.decaying = true;
+            }
+        }
+
+        let fill_target = self.fill_target.min(config.high_watermark);
+        if self.decaying && pool_len <= fill_target {
+            // The live pool (this length is always read under the pool lock
+            // by `WarmPool::compute_maintenance_action`) is verifiably at or
+            // below the decayed target — including when it was empty when
+            // the TTL expired and no Drain action ever ran. The decay
+            // lifecycle completes only on this synchronized observation,
+            // never on a merely PLANNED refill: if the fill then fails or a
+            // concurrent release raises the pool again, `decaying` is
+            // already false only because the pool genuinely reached the
+            // target, and resources between the low and high watermarks are
+            // legitimately retained by the high watermark.
+            self.decaying = false;
+        }
+        if pool_len < fill_target {
+            let to_fill = fill_target.saturating_sub(pool_len);
+            if to_fill > 0 {
+                return PoolMaintenanceAction::Fill(to_fill);
+            }
+        }
+        // After an idle TTL decay the pool shrinks toward the decayed fill
+        // target (the low watermark); otherwise only the high watermark caps
+        // idle resources.
+        let drain_target = if self.decaying {
+            fill_target
+        } else {
+            config.high_watermark
+        };
+        if pool_len > drain_target {
+            // Drain the full excess in one maintenance cycle. Resource-specific
+            // cleanup happens outside the pool lock, and shutdown paths already
+            // have to tolerate draining the whole pool.
+            let to_drain = pool_len - drain_target;
+            if to_drain > 0 {
+                return PoolMaintenanceAction::Drain(to_drain);
+            }
+        }
+        PoolMaintenanceAction::Idle
+    }
+
+    /// Record an acquisition attempt: resets the idle clock, cancels any
+    /// in-progress decay, and grows the fill target geometrically when the
+    /// pool dipped below the low watermark.
+    fn record_acquisition(&mut self, config: &PoolConfig, pool_len: usize, now: Instant) {
+        self.last_acquisition = now;
+        // New demand cancels any in-progress idle decay: the fill target may
+        // grow again and the high watermark caps idle resources.
+        self.decaying = false;
+        if pool_len >= config.low_watermark || config.high_watermark == 0 {
+            return;
+        }
+
+        let low = config.low_watermark.min(config.high_watermark);
+        self.fill_target = self
+            .fill_target
+            .max(low)
+            .max(1)
+            .saturating_mul(2)
+            .min(config.high_watermark);
     }
 }
 
@@ -87,12 +219,9 @@ pub struct WarmPool<T: Send> {
     pool: Mutex<VecDeque<T>>,
     /// Watermark config.
     config: PoolConfig,
-    /// Current refill target. Starts at the low watermark and grows toward the
-    /// high watermark under acquisition pressure. This intentionally ratchets
-    /// upward for the process lifetime: after a node observes bursty demand, it
-    /// keeps extra warm capacity instead of shrinking back to cold-start
-    /// behavior.
-    fill_target: Mutex<usize>,
+    /// Demand state under a single mutex so decay decisions are atomic
+    /// snapshots of the last acquisition, fill target, and decay lifecycle.
+    demand_state: Mutex<DemandState>,
     /// Background maintenance worker state.
     maintenance_signal: Mutex<PoolMaintenanceSignal>,
     /// Wakes the maintenance worker.
@@ -112,7 +241,11 @@ impl<T: Send> WarmPool<T> {
         let fill_target = config.low_watermark.min(config.high_watermark);
         Self {
             pool: Mutex::new(VecDeque::new()),
-            fill_target: Mutex::new(fill_target),
+            demand_state: Mutex::new(DemandState {
+                last_acquisition: Instant::now(),
+                fill_target,
+                decaying: false,
+            }),
             config,
             maintenance_signal: Mutex::new(PoolMaintenanceSignal::default()),
             maintenance_cv: Condvar::new(),
@@ -142,50 +275,40 @@ impl<T: Send> WarmPool<T> {
         self.len() == 0
     }
 
-    /// Compute the maintenance action based on current pool size.
-    pub fn compute_maintenance_action(&self, pool_len: usize) -> PoolMaintenanceAction {
-        let fill_target = self.current_fill_target();
-        if pool_len < fill_target {
-            let to_fill = fill_target.saturating_sub(pool_len);
-            if to_fill > 0 {
-                return PoolMaintenanceAction::Fill(to_fill);
-            }
-        }
-        if pool_len > self.config.high_watermark {
-            // Drain the full excess in one maintenance cycle. Resource-specific
-            // cleanup happens outside the pool lock, and shutdown paths already
-            // have to tolerate draining the whole pool.
-            let to_drain = pool_len - self.config.high_watermark;
-            if to_drain > 0 {
-                return PoolMaintenanceAction::Drain(to_drain);
-            }
-        }
-        PoolMaintenanceAction::Idle
+    /// Compute the maintenance action from the live pool length.
+    ///
+    /// Locks in the crate-wide demand_state → pool order and reads the pool
+    /// length under the pool lock while holding the demand state, so decay
+    /// lifecycle transitions (which mutate `decaying`) and the returned plan
+    /// are always computed from a live, synchronized length — never from a
+    /// caller-supplied snapshot that may be stale.
+    ///
+    /// The returned action is still a point-in-time plan. A `Drain` plan can
+    /// go stale before the caller finishes executing it (an interleaved
+    /// acquisition cancels an in-progress decay; concurrent
+    /// releases/acquisitions change the pool length), so maintenance drains
+    /// must claim each resource through `try_drain_one_for_maintenance`,
+    /// which re-validates the decision at execution time.
+    pub fn compute_maintenance_action(&self) -> PoolMaintenanceAction {
+        let mut state = self.demand_state.lock().unwrap();
+        let pool_len = self.pool.lock().unwrap().len();
+        state.compute_maintenance_action(&self.config, pool_len, Instant::now())
     }
 
-    fn current_fill_target(&self) -> usize {
-        (*self.fill_target.lock().unwrap()).min(self.config.high_watermark)
+    /// Time until the idle TTL expires, if decay is configured.
+    fn idle_ttl_remaining(&self) -> Option<Duration> {
+        let ttl = self.config.idle_ttl?;
+        let elapsed = self.demand_state.lock().unwrap().last_acquisition.elapsed();
+        Some(ttl.saturating_sub(elapsed))
     }
 
-    fn grow_fill_target_after_pressure(&self, pool_len: usize) {
-        if pool_len >= self.config.low_watermark || self.config.high_watermark == 0 {
-            return;
-        }
-
-        let low = self.config.low_watermark.min(self.config.high_watermark);
-        let mut target = self.fill_target.lock().unwrap();
-        let next = (*target)
-            .max(low)
-            .max(1)
-            .saturating_mul(2)
-            .min(self.config.high_watermark);
-        *target = next;
-    }
-
-    fn record_acquisition_pressure(&self, pool_len: usize) {
-        self.grow_fill_target_after_pressure(pool_len);
+    /// Wake maintenance when the pool is below its fill target. Called after
+    /// the acquisition has been recorded under the demand-state lock and
+    /// both locks have been released (`compute_maintenance_action` re-locks
+    /// demand_state → pool).
+    fn request_maintenance_if_fill(&self) {
         if matches!(
-            self.compute_maintenance_action(pool_len),
+            self.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(_)
         ) {
             self.request_maintenance();
@@ -216,11 +339,19 @@ impl<T: Send> WarmPool<T> {
         if self.is_shutting_down() {
             return None;
         }
+        // Lock order is demand_state → pool everywhere (see
+        // `try_drain_one_for_maintenance`): the pop and the acquisition
+        // record must be atomic, otherwise a maintenance drain can lock
+        // `demand_state` in the gap, observe a stale `decaying`, and remove
+        // a resource that resumed demand has already claimed.
+        let mut state = self.demand_state.lock().unwrap();
         let mut pool = self.pool.lock().unwrap();
         let resource = pool.pop_front();
         let next_pool_len = pool.len();
+        state.record_acquisition(&self.config, next_pool_len, Instant::now());
         drop(pool);
-        self.record_acquisition_pressure(next_pool_len);
+        drop(state);
+        self.request_maintenance_if_fill();
         resource
     }
 
@@ -231,14 +362,19 @@ impl<T: Send> WarmPool<T> {
         if self.is_shutting_down() {
             return None;
         }
+        // Same atomic pop-and-record under the demand_state → pool lock
+        // order as `try_acquire`.
+        let mut state = self.demand_state.lock().unwrap();
         let mut pool = self.pool.lock().unwrap();
         let resource = pool
             .iter()
             .position(&mut predicate)
             .and_then(|idx| pool.remove(idx));
         let next_pool_len = pool.len();
+        state.record_acquisition(&self.config, next_pool_len, Instant::now());
         drop(pool);
-        self.record_acquisition_pressure(next_pool_len);
+        drop(state);
+        self.request_maintenance_if_fill();
         resource
     }
 
@@ -261,6 +397,49 @@ impl<T: Send> WarmPool<T> {
     pub fn try_drain_one(&self) -> Option<T> {
         let mut pool = self.pool.lock().unwrap();
         pool.pop_back()
+    }
+
+    /// Drain one idle resource as part of a maintenance drain, re-validating
+    /// the drain decision against the live demand state and pool length at
+    /// execution time.
+    ///
+    /// A previously computed `Drain` action can be stale by the time the
+    /// caller executes it: an interleaved acquisition cancels an in-progress
+    /// decay, and a concurrent release/acquire changes the pool length.
+    /// Re-checking under the demand-state and pool locks while claiming each
+    /// resource keeps the drain consistent — decay-driven drains stop as soon
+    /// as an acquisition cancels the decay, and decay completion is marked
+    /// only once the pool is verifiably at/below the decayed target, so a
+    /// stale length snapshot cannot end the cycle early and strand resources.
+    ///
+    /// The lock order here (demand_state → pool) is the same one acquisition
+    /// paths use to pop a resource and record the acquisition atomically
+    /// (`try_acquire`/`try_acquire_where`), so a drain can never observe a
+    /// half-recorded acquisition (resource popped but `decaying` still set).
+    pub fn try_drain_one_for_maintenance(&self) -> Option<T> {
+        let mut state = self.demand_state.lock().unwrap();
+        let mut pool = self.pool.lock().unwrap();
+        let drain_target = if state.decaying {
+            state.fill_target.min(self.config.high_watermark)
+        } else {
+            self.config.high_watermark
+        };
+        if pool.len() <= drain_target {
+            if state.decaying {
+                // The pool verifiably reached the decayed fill target: the
+                // decay cycle is complete and the high watermark caps idle
+                // resources again.
+                state.decaying = false;
+            }
+            return None;
+        }
+        let resource = pool.pop_back();
+        if state.decaying && pool.len() <= drain_target {
+            // This removal brought the pool to the decayed target: the decay
+            // cycle is complete.
+            state.decaying = false;
+        }
+        resource
     }
 
     /// Return a resource to the pool.
@@ -343,7 +522,22 @@ impl<T: Send> WarmPool<T> {
             if !has_immediate_work {
                 let mut signal = self.maintenance_signal.lock().unwrap();
                 while !signal.stop && !signal.pending {
-                    signal = self.maintenance_cv.wait(signal).unwrap();
+                    match self.idle_ttl_remaining() {
+                        Some(remaining) => {
+                            // Wake when the idle TTL expires even if nothing
+                            // requested maintenance, so the fill target can
+                            // decay and excess idle resources drain.
+                            let (new_signal, timeout) =
+                                self.maintenance_cv.wait_timeout(signal, remaining).unwrap();
+                            signal = new_signal;
+                            if timeout.timed_out() && !signal.stop && !signal.pending {
+                                signal.pending = true;
+                            }
+                        }
+                        None => {
+                            signal = self.maintenance_cv.wait(signal).unwrap();
+                        }
+                    }
                 }
                 if signal.stop {
                     break;
@@ -361,13 +555,10 @@ impl<T: Send> WarmPool<T> {
                 break;
             }
 
-            has_immediate_work = {
-                let pool_len = self.pool.lock().unwrap().len();
-                !matches!(
-                    self.compute_maintenance_action(pool_len),
-                    PoolMaintenanceAction::Idle
-                )
-            };
+            has_immediate_work = !matches!(
+                self.compute_maintenance_action(),
+                PoolMaintenanceAction::Idle
+            );
         }
     }
 
@@ -402,6 +593,7 @@ mod tests {
             high_watermark: 32,
             maintenance_enabled: true,
             startup_prewarm: false,
+            idle_ttl: None,
         }
         .validate();
         assert_eq!(config.low_watermark, 32);
@@ -415,13 +607,21 @@ mod tests {
             high_watermark: 10,
             maintenance_enabled: true,
             startup_prewarm: false,
+            idle_ttl: None,
         });
+        // Two idle resources below the low watermark: fill the missing two.
+        pool.release(1).unwrap();
+        pool.release(2).unwrap();
         assert_eq!(
-            pool.compute_maintenance_action(2),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(2)
         );
+        // Seven idle resources within the watermarks: no action.
+        for value in 3..=7 {
+            pool.release(value).unwrap();
+        }
         assert_eq!(
-            pool.compute_maintenance_action(7),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Idle
         );
     }
@@ -433,10 +633,11 @@ mod tests {
             high_watermark: 10,
             maintenance_enabled: true,
             startup_prewarm: false,
+            idle_ttl: None,
         });
 
         assert_eq!(
-            pool.compute_maintenance_action(0),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(2)
         );
 
@@ -444,13 +645,13 @@ mod tests {
         pool.release(2).unwrap();
         assert_eq!(pool.try_acquire(), Some(1));
         assert_eq!(
-            pool.compute_maintenance_action(1),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(3)
         );
 
         assert_eq!(pool.try_acquire(), Some(2));
         assert_eq!(
-            pool.compute_maintenance_action(0),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(8)
         );
     }
@@ -462,23 +663,24 @@ mod tests {
             high_watermark: 10,
             maintenance_enabled: false,
             startup_prewarm: false,
+            idle_ttl: None,
         });
 
         assert_eq!(pool.try_acquire(), None);
         assert_eq!(
-            pool.compute_maintenance_action(0),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(4)
         );
 
         assert_eq!(pool.try_acquire(), None);
         assert_eq!(
-            pool.compute_maintenance_action(0),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(8)
         );
 
         assert_eq!(pool.try_acquire_where(|_| true), None);
         assert_eq!(
-            pool.compute_maintenance_action(0),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(10)
         );
     }
@@ -490,6 +692,7 @@ mod tests {
             high_watermark: 10,
             maintenance_enabled: true,
             startup_prewarm: false,
+            idle_ttl: None,
         });
 
         assert!(!pool.maintenance_signal.lock().unwrap().pending);
@@ -504,13 +707,22 @@ mod tests {
             high_watermark: 4,
             maintenance_enabled: true,
             startup_prewarm: false,
+            idle_ttl: None,
         });
+        // Eight idle resources above the high watermark: drain the excess.
+        for value in 1..=8 {
+            pool.release(value).unwrap();
+        }
         assert_eq!(
-            pool.compute_maintenance_action(8),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Drain(4)
         );
+        // At the high watermark: no action.
+        for _ in 0..4 {
+            assert!(pool.try_drain_one().is_some());
+        }
         assert_eq!(
-            pool.compute_maintenance_action(4),
+            pool.compute_maintenance_action(),
             PoolMaintenanceAction::Idle
         );
     }
@@ -522,6 +734,7 @@ mod tests {
             high_watermark: 10,
             maintenance_enabled: false,
             startup_prewarm: false,
+            idle_ttl: None,
         });
         assert!(pool.try_acquire().is_none());
     }
@@ -533,6 +746,7 @@ mod tests {
             high_watermark: 10,
             maintenance_enabled: false,
             startup_prewarm: false,
+            idle_ttl: None,
         });
         pool.release(42).unwrap();
         assert_eq!(pool.try_acquire(), Some(42));
@@ -545,6 +759,7 @@ mod tests {
             high_watermark: 2,
             maintenance_enabled: false,
             startup_prewarm: false,
+            idle_ttl: None,
         });
         assert!(pool.release(1).is_ok());
         assert!(pool.release(2).is_ok());
@@ -558,6 +773,7 @@ mod tests {
             high_watermark: 2,
             maintenance_enabled: true,
             startup_prewarm: false,
+            idle_ttl: None,
         });
         assert!(pool.release(1).is_ok());
         assert!(pool.release(2).is_ok());
@@ -572,6 +788,7 @@ mod tests {
             high_watermark: 10,
             maintenance_enabled: false,
             startup_prewarm: false,
+            idle_ttl: None,
         });
         pool.release(1).unwrap();
         pool.release(2).unwrap();
@@ -588,6 +805,7 @@ mod tests {
             high_watermark: 10,
             maintenance_enabled: false,
             startup_prewarm: false,
+            idle_ttl: None,
         });
         pool.release(42).unwrap();
         pool.drain_all();
@@ -601,8 +819,384 @@ mod tests {
             high_watermark: 10,
             maintenance_enabled: false,
             startup_prewarm: false,
+            idle_ttl: None,
         });
         pool.drain_all();
         assert_eq!(pool.release(42), Err(42));
+    }
+
+    #[test]
+    fn zero_idle_ttl_is_normalized_to_none() {
+        // A zero TTL would expire every cycle and busy-loop the maintenance
+        // worker; the external config documents 0 as "never decay".
+        let config = PoolConfig {
+            low_watermark: 0,
+            high_watermark: 2,
+            maintenance_enabled: true,
+            startup_prewarm: false,
+            idle_ttl: Some(Duration::ZERO),
+        }
+        .validate();
+        assert_eq!(config.idle_ttl, None);
+    }
+
+    /// Rewind the idle clock so the idle TTL has expired, without sleeping.
+    fn expire_idle_ttl<T: Send>(pool: &WarmPool<T>) {
+        let ttl = pool.config().idle_ttl.expect("idle TTL configured");
+        pool.demand_state.lock().unwrap().last_acquisition = Instant::now() - ttl;
+    }
+
+    #[test]
+    fn idle_ttl_decays_fill_target_and_drains_to_low_watermark() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 10,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+            idle_ttl: Some(Duration::from_secs(60)),
+        });
+
+        // Ratchet the fill target up to 8 under acquisition pressure.
+        pool.release(1).unwrap();
+        pool.release(2).unwrap();
+        assert_eq!(pool.try_acquire(), Some(1));
+        assert_eq!(pool.try_acquire(), Some(2));
+        assert_eq!(
+            pool.compute_maintenance_action(),
+            PoolMaintenanceAction::Fill(8)
+        );
+
+        for value in 1..=6 {
+            pool.release(value).unwrap();
+        }
+
+        expire_idle_ttl(&pool);
+
+        // Idle past the TTL: excess drains toward the decayed fill target
+        // (low watermark) instead of lingering below the high watermark.
+        assert_eq!(
+            pool.compute_maintenance_action(),
+            PoolMaintenanceAction::Drain(4)
+        );
+        // The decay is not consumed by the first computation: if a drain
+        // cycle only partially succeeds, the next computation keeps draining
+        // toward the low watermark instead of retaining the excess for
+        // another full TTL.
+        assert_eq!(
+            pool.compute_maintenance_action(),
+            PoolMaintenanceAction::Drain(4)
+        );
+        // Simulate a partially successful drain cycle: after one verified
+        // removal, the computation keeps draining the remaining excess.
+        assert!(pool.try_drain_one_for_maintenance().is_some());
+        assert_eq!(
+            pool.compute_maintenance_action(),
+            PoolMaintenanceAction::Drain(3)
+        );
+
+        // Execute the rest of the drain through the maintenance claim path:
+        // each removal is re-validated, and the decay completes only once
+        // the pool verifiably reaches the decayed target.
+        for _ in 0..3 {
+            assert!(pool.try_drain_one_for_maintenance().is_some());
+            assert_eq!(pool.demand_state.lock().unwrap().decaying, pool.len() > 2);
+        }
+        assert_eq!(pool.len(), 2);
+        assert!(pool.try_drain_one_for_maintenance().is_none());
+
+        // The decay cycle ended: the high watermark caps idle resources again.
+        for value in 7..=10 {
+            pool.release(value).unwrap();
+        }
+        assert_eq!(
+            pool.compute_maintenance_action(),
+            PoolMaintenanceAction::Idle
+        );
+        for _ in 0..5 {
+            assert!(pool.try_drain_one().is_some());
+        }
+        assert_eq!(
+            pool.compute_maintenance_action(),
+            PoolMaintenanceAction::Fill(1)
+        );
+    }
+
+    #[test]
+    fn acquisitions_reset_idle_ttl_clock() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 10,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+            idle_ttl: Some(Duration::from_secs(60)),
+        });
+
+        assert_eq!(pool.try_acquire(), None);
+        assert_eq!(pool.try_acquire(), None);
+
+        // Half the TTL has elapsed since the last acquisition: no decay, the
+        // ratcheted fill target is preserved.
+        let ttl = pool.config().idle_ttl.unwrap();
+        pool.demand_state.lock().unwrap().last_acquisition = Instant::now() - ttl / 2;
+        assert_eq!(
+            pool.compute_maintenance_action(),
+            PoolMaintenanceAction::Fill(8)
+        );
+
+        expire_idle_ttl(&pool);
+        assert_eq!(
+            pool.compute_maintenance_action(),
+            PoolMaintenanceAction::Fill(2)
+        );
+    }
+
+    #[test]
+    fn demand_state_idle_ttl_uses_injected_clock() {
+        let config = PoolConfig {
+            low_watermark: 2,
+            high_watermark: 10,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+            idle_ttl: Some(Duration::from_secs(30)),
+        }
+        .validate();
+        let t0 = Instant::now();
+        let mut state = DemandState {
+            last_acquisition: t0,
+            fill_target: 8,
+            decaying: false,
+        };
+
+        // Just before expiry: no decay.
+        assert_eq!(
+            state.compute_maintenance_action(&config, 8, t0 + Duration::from_secs(29)),
+            PoolMaintenanceAction::Idle
+        );
+        // At expiry: decay kicks in and drains toward the low watermark.
+        assert_eq!(
+            state.compute_maintenance_action(&config, 8, t0 + Duration::from_secs(30)),
+            PoolMaintenanceAction::Drain(6)
+        );
+
+        // An acquisition resets the idle clock and cancels the decay.
+        state.record_acquisition(&config, 7, t0 + Duration::from_secs(31));
+        assert!(!state.decaying);
+        assert_eq!(
+            state.compute_maintenance_action(&config, 7, t0 + Duration::from_secs(40)),
+            PoolMaintenanceAction::Idle
+        );
+    }
+
+    #[test]
+    fn acquisition_cancels_stale_decay_drain_at_execution_time() {
+        // Regression: a Drain action computed during decay goes stale when an
+        // acquisition lands before the caller executes it; each removal must
+        // be re-validated so resumed demand actually cancels the in-progress
+        // decay instead of being drained toward the low watermark.
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 10,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+            idle_ttl: Some(Duration::from_secs(60)),
+        });
+        for value in 1..=6 {
+            pool.release(value).unwrap();
+        }
+        expire_idle_ttl(&pool);
+        assert_eq!(
+            pool.compute_maintenance_action(),
+            PoolMaintenanceAction::Drain(4)
+        );
+
+        // Demand resumes after the computation but before the drain executes.
+        assert!(pool.try_acquire().is_some());
+
+        // The stale drain must not remove resources held for resumed demand.
+        assert!(pool.try_drain_one_for_maintenance().is_none());
+        assert_eq!(pool.len(), 5);
+    }
+
+    #[test]
+    fn idle_ttl_decay_completes_without_drain_when_pool_at_decayed_target() {
+        // Regression: when the TTL expires while the pool is already at/below
+        // the decayed target, the decay lifecycle must complete without a
+        // Drain action — `try_drain_one_for_maintenance` only runs for Drain
+        // actions, so a lingering `decaying` flag would let a later release
+        // be drained immediately with no new idle period.
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 0,
+            high_watermark: 10,
+            maintenance_enabled: true,
+            startup_prewarm: false,
+            idle_ttl: Some(Duration::from_secs(60)),
+        });
+        expire_idle_ttl(&pool);
+        assert_eq!(
+            pool.compute_maintenance_action(),
+            PoolMaintenanceAction::Idle
+        );
+        assert!(!pool.demand_state.lock().unwrap().decaying);
+
+        // A fresh release after the completed decay is normal idle capacity,
+        // not decay excess: maintenance must not drain it.
+        pool.release(1).unwrap();
+        assert!(pool.try_drain_one_for_maintenance().is_none());
+        assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn decay_completion_uses_verified_pool_length() {
+        // Regression: decay completion must be decided from a pool-length
+        // snapshot synchronized with the pool mutation, not from a length the
+        // caller sampled earlier. A release landing after the sample raises
+        // the pool above the decayed target; the decay must stay active until
+        // the pool verifiably reaches it.
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 10,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+            idle_ttl: Some(Duration::from_secs(60)),
+        });
+        for value in 1..=4 {
+            pool.release(value).unwrap();
+        }
+        expire_idle_ttl(&pool);
+        assert_eq!(
+            pool.compute_maintenance_action(),
+            PoolMaintenanceAction::Drain(2)
+        );
+
+        // Drain one (pool 3), then a concurrent release raises the pool back
+        // to 4 — below the high watermark, so nothing re-signals maintenance.
+        assert!(pool.try_drain_one_for_maintenance().is_some());
+        pool.release(5).unwrap();
+
+        // The decay is still active and drains the extra resource too.
+        assert!(pool.demand_state.lock().unwrap().decaying);
+        assert_eq!(
+            pool.compute_maintenance_action(),
+            PoolMaintenanceAction::Drain(2)
+        );
+        assert!(pool.try_drain_one_for_maintenance().is_some());
+        assert!(pool.try_drain_one_for_maintenance().is_some());
+        assert!(!pool.demand_state.lock().unwrap().decaying);
+        assert!(pool.try_drain_one_for_maintenance().is_none());
+        assert_eq!(pool.len(), 2);
+    }
+
+    #[test]
+    fn maintenance_worker_wakes_on_idle_ttl_and_drains() {
+        let pool: &'static WarmPool<u32> = Box::leak(Box::new(WarmPool::new(PoolConfig {
+            low_watermark: 0,
+            high_watermark: 4,
+            maintenance_enabled: true,
+            startup_prewarm: false,
+            idle_ttl: Some(Duration::from_millis(50)),
+        })));
+        pool.start_maintenance_worker(move || {
+            if let PoolMaintenanceAction::Drain(to_drain) =
+                pool.compute_maintenance_action()
+            {
+                for _ in 0..to_drain {
+                    if pool.try_drain_one_for_maintenance().is_none() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        pool.release(1).unwrap();
+        pool.release(2).unwrap();
+        pool.release(3).unwrap();
+
+        // No acquisition happens, so the idle TTL wake-up drains everything
+        // (low watermark is 0) without any explicit maintenance request.
+        // Poll with a generous deadline instead of asserting after a fixed
+        // sleep, so CI scheduling delays cannot fail the test.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !pool.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "maintenance worker did not drain the pool after the idle TTL"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(pool.len(), 0);
+
+        pool.drain_all();
+    }
+
+    #[test]
+    fn acquisition_clears_decay_state_before_next_computation() {
+        // Regression: an acquisition landing after the idle TTL expiry must
+        // cancel the drain-to-low transition atomically; a later computation
+        // must not observe the new acquisition timestamp together with the
+        // stale decaying state and return a low-watermark Drain for resumed
+        // demand.
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 10,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+            idle_ttl: Some(Duration::from_secs(60)),
+        });
+
+        for value in 1..=6 {
+            pool.release(value).unwrap();
+        }
+        expire_idle_ttl(&pool);
+
+        // TTL expired: the decay starts and drains toward the low watermark.
+        assert_eq!(
+            pool.compute_maintenance_action(),
+            PoolMaintenanceAction::Drain(4)
+        );
+
+        // Demand resumes mid-drain: the acquisition resets the idle clock
+        // and clears the decaying state in the same locked section, so the
+        // high watermark caps idle resources again.
+        assert!(pool.try_acquire().is_some());
+        assert_eq!(
+            pool.compute_maintenance_action(),
+            PoolMaintenanceAction::Idle
+        );
+    }
+
+    #[test]
+    fn concurrent_acquisition_and_decay_keep_state_consistent() {
+        // Regression: acquisitions and action computations race on the
+        // demand state from multiple threads; the fill target must stay
+        // within watermarks and no thread may observe a torn state.
+        let pool = std::sync::Arc::new(WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 8,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+            idle_ttl: Some(Duration::from_millis(5)),
+        }));
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let pool = std::sync::Arc::clone(&pool);
+            handles.push(std::thread::spawn(move || {
+                for value in 0..200u32 {
+                    pool.release(value).unwrap();
+                    let _ = pool.try_acquire();
+                    let action = pool.compute_maintenance_action();
+                    if let PoolMaintenanceAction::Drain(n) | PoolMaintenanceAction::Fill(n) = action
+                    {
+                        assert!(n <= 8, "action size beyond high watermark: {n}");
+                    }
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let state = pool.demand_state.lock().unwrap();
+        assert!(state.fill_target <= 8);
     }
 }

@@ -301,6 +301,7 @@ Component sections:
 | `[pool.firecracker]` | `maintenance_enabled` | boolean | `true` | Enable the background Firecracker process maintenance worker |
 | `[pool.firecracker]` | `startup_prewarm` | boolean | `true` | Spawn warm Firecracker entries up to the low watermark during server startup |
 | `[pool.firecracker]` | `fill_concurrency` | integer | `4` | Maximum number of warm Firecracker processes created concurrently by one maintenance refill batch |
+| `[pool.firecracker]` | `idle_ttl_secs` | integer | `600` | Seconds without warm-process acquisitions before the refill target decays back to the low watermark and excess warm processes are drained (`0` disables decay) |
 
 Validation rules:
 

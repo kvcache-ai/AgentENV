@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 pub(crate) mod image;
 pub(crate) mod network;
@@ -219,6 +220,12 @@ pub struct FirecrackerProcessPoolConfig {
     pub startup_prewarm: bool,
     #[config(default = 4usize)]
     pub fill_concurrency: usize,
+    /// Seconds without pool acquisitions before the geometric fill target
+    /// decays back to the low watermark and excess warm processes are drained.
+    /// 0 disables decay and keeps the fill target ratcheted for the process
+    /// lifetime.
+    #[config(default = 600u64)]
+    pub idle_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -809,6 +816,9 @@ impl AppConfig {
             high_watermark: self.pool.high_watermark,
             maintenance_enabled: pool.enabled && pool.maintenance_enabled,
             startup_prewarm: pool.startup_prewarm,
+            // The network slot pool holds no processes; keep its historical
+            // ratchet behavior without idle decay.
+            idle_ttl: None,
         }
     }
 
@@ -826,6 +836,7 @@ impl AppConfig {
             // reusable device shape is image/size dependent.
             maintenance_enabled: false,
             startup_prewarm: pool.startup_prewarm,
+            idle_ttl: None,
         })
     }
 
@@ -842,6 +853,7 @@ impl AppConfig {
                 high_watermark: self.pool.high_watermark,
                 maintenance_enabled: pool.maintenance_enabled,
                 startup_prewarm: pool.startup_prewarm,
+                idle_ttl: (pool.idle_ttl_secs > 0).then(|| Duration::from_secs(pool.idle_ttl_secs)),
             },
             fill_concurrency: pool.fill_concurrency,
         })
