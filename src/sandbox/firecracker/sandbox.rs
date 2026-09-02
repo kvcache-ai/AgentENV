@@ -2333,6 +2333,8 @@ impl FirecrackerSandbox {
                 output_dir,
                 &snapshot_layer_file_name,
                 "volume",
+                // Persistent volume seals always stay raw.
+                OverlaybdCompactOutput::Raw,
             )
             .await
             .with_context(|| format!("snapshot persistent volume '{}'", drive.drive_id()))?;
