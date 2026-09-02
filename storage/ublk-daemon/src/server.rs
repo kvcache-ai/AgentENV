@@ -1511,12 +1511,10 @@ async fn refill_idle_pool(
             dev_sectors: placeholder_image.num_lbas(),
             _placeholder_image: Arc::clone(&placeholder_image),
         };
-        if pool.idle.len() >= pool.prewarm_high_watermark {
-            stop_excess_idle_device(pool, ctrl_ring.clone(), pooled).await;
-            break;
-        }
-
-        if let Err(pooled) = pool.idle.try_push_bounded(pooled) {
+        if let Err(pooled) = pool
+            .idle
+            .try_push_bounded_to(pooled, pool.prewarm_high_watermark)
+        {
             stop_excess_idle_device(pool, ctrl_ring.clone(), pooled).await;
             break;
         }
