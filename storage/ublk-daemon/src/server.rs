@@ -1546,7 +1546,8 @@ async fn stop_excess_idle_device(
     tracing::info!(
         dev_id,
         high_watermark = pool.idle.config().high_watermark,
-        "idle overlaybd pool is full; stopping returned device"
+        prewarm_high_watermark = pool.prewarm_high_watermark,
+        "idle overlaybd pool rejected excess device"
     );
     stop_overlaybd_device(ctrl_ring, pooled.dev).await;
 }
