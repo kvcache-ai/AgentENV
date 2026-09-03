@@ -5,7 +5,7 @@ The multi-node control plane lives in `services/` as a separate Go module. It ro
 ## Components
 
 - **Gateway** (`services/gateway/`): HTTP reverse proxy that routes by sandbox ID
-- **Scheduler** (`services/scheduler/`): gRPC service for node selection, sandbox-to-node binding, observed node snapshots, and P2P peer endpoint discovery
+- **Scheduler** (`services/scheduler/`): gRPC service for node selection, sandbox-to-node binding, observed node snapshots, P2P peer endpoint discovery, and fleet planning
 
 ## Build and Test
 
@@ -32,10 +32,11 @@ make -C services run-gateway
 
 ## Discovery Modes
 
-The scheduler supports two node discovery modes:
+The scheduler supports three node discovery modes:
 
 - **static** (default): explicit node list from config
 - **kubernetes**: watches EndpointSlices for a headless Service, using ready Pod IPs as backends
+- **heartbeat**: accepts unknown nodes only when the heartbeat carries the configured registration token and a valid node HTTP endpoint
 
 ## Deployment
 
@@ -67,7 +68,9 @@ Deployment model:
 
 Proto contract: `services/api/proto/scheduler.proto`
 
-RPCs: `Schedule`, `ListNodes`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ListObservedNodes`, `ListP2pPeers`, `GetNode`, `UnregisterNode`
+RPCs: `Schedule`, `ListNodes`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ListObservedNodes`, `ListP2pPeers`, `GetNode`, `UnregisterNode`, `GetFleetPlan`, `CordonNode`, `UncordonNode`
+
+Fleet planning stays provider-neutral. Scheduler decides desired capacity and exact cordon/delete generations from AgentENV state. A separate infrastructure executor owns cloud API calls and feeds current infrastructure member IDs into `GetFleetPlan`.
 
 Runtime node heartbeats may include an opaque `P2pEndpoint` containing a backend name and backend-specific address. The scheduler stores that endpoint with the observed-node record and returns ready peers through `ListP2pPeers(cluster_id, backend, exclude_node_id)`. The scheduler does not query artifact catalogs and never forwards artifact data.
 

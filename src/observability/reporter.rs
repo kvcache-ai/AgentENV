@@ -32,6 +32,8 @@ struct HeartbeatNodeNotConfigured;
 struct ReporterConfig {
     scheduler_endpoint: String,
     interval: Duration,
+    node_endpoint: String,
+    registration_token: String,
 }
 
 pub struct ObservabilityReporter {
@@ -264,7 +266,13 @@ impl ObservabilityReporter {
         snapshot.machine_info.cpu_config_json = cpu_config_json.clone();
         let node_id = snapshot.node_id.clone();
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let req = Self::build_heartbeat_request(snapshot, now_ms, p2p_endpoint);
+        let req = Self::build_heartbeat_request(
+            snapshot,
+            now_ms,
+            p2p_endpoint,
+            &config.node_endpoint,
+            &config.registration_token,
+        );
 
         let mut request = Request::new(req);
         request.set_timeout(GRPC_CALL_TIMEOUT);
@@ -365,6 +373,8 @@ impl ObservabilityReporter {
         snapshot: super::NodeSnapshot,
         now_ms: i64,
         p2p_endpoint: Option<&P2pEndpoint>,
+        node_endpoint: &str,
+        registration_token: &str,
     ) -> scheduler::HeartbeatRequest {
         scheduler::HeartbeatRequest {
             node_id: snapshot.node_id,
@@ -417,6 +427,8 @@ impl ObservabilityReporter {
                 backend: endpoint.backend.clone(),
                 address: endpoint.address.clone(),
             }),
+            endpoint: node_endpoint.to_string(),
+            registration_token: registration_token.to_string(),
         }
     }
 
@@ -492,6 +504,18 @@ impl ReporterConfig {
         Some(ReporterConfig {
             scheduler_endpoint,
             interval: Duration::from_secs(config.interval_secs.max(1)),
+            node_endpoint: config
+                .node_endpoint
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string(),
+            registration_token: config
+                .registration_token
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string(),
         })
     }
 }
@@ -514,6 +538,8 @@ mod tests {
         ObservabilitySchedulerReportConfig {
             enabled: enabled.unwrap_or_default(),
             interval_secs: interval_secs.unwrap_or(5),
+            node_endpoint: Some("http://10.0.0.10:8000".to_string()),
+            registration_token: Some("registration-secret".to_string()),
         }
     }
 
@@ -548,6 +574,8 @@ mod tests {
         let result = ReporterConfig::resolve(&cfg, &cluster).unwrap();
         assert_eq!(result.scheduler_endpoint, "http://scheduler:9090");
         assert_eq!(result.interval, Duration::from_secs(10));
+        assert_eq!(result.node_endpoint, "http://10.0.0.10:8000");
+        assert_eq!(result.registration_token, "registration-secret");
     }
 
     #[test]

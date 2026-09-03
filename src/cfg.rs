@@ -553,6 +553,15 @@ pub struct ObservabilitySchedulerReportConfig {
     pub enabled: bool,
     #[config(default = 5u64, env = "AENV_OBSERVABILITY_REPORT_INTERVAL_SECS")]
     pub interval_secs: u64,
+    /// Node HTTP endpoint advertised to schedulers using heartbeat discovery.
+    #[config(env = "AENV_OBSERVABILITY_NODE_ENDPOINT", parse_env = parse_trimmed_string)]
+    pub node_endpoint: Option<String>,
+    /// Shared secret used to authenticate heartbeat-based registration.
+    #[config(
+        env = "AENV_OBSERVABILITY_REGISTRATION_TOKEN",
+        parse_env = parse_trimmed_string
+    )]
+    pub registration_token: Option<String>,
 }
 
 #[derive(Debug, Config, Clone)]

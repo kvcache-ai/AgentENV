@@ -36,6 +36,9 @@ type stubSchedulerClient struct {
 	lookupP2pArtifactFunc  func(context.Context, *schedulerv1.LookupP2PArtifactRequest, ...grpc.CallOption) (*schedulerv1.LookupP2PArtifactResponse, error)
 	getNodeFunc            func(context.Context, *schedulerv1.GetNodeRequest, ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error)
 	unregisterNodeFunc     func(context.Context, *schedulerv1.UnregisterNodeRequest, ...grpc.CallOption) (*schedulerv1.UnregisterNodeResponse, error)
+	getFleetPlanFunc       func(context.Context, *schedulerv1.GetFleetPlanRequest, ...grpc.CallOption) (*schedulerv1.GetFleetPlanResponse, error)
+	cordonNodeFunc         func(context.Context, *schedulerv1.CordonNodeRequest, ...grpc.CallOption) (*schedulerv1.CordonNodeResponse, error)
+	uncordonNodeFunc       func(context.Context, *schedulerv1.UncordonNodeRequest, ...grpc.CallOption) (*schedulerv1.UncordonNodeResponse, error)
 }
 
 type trackingReadCloser struct {
@@ -146,6 +149,27 @@ func (s stubSchedulerClient) UnregisterNode(ctx context.Context, req *schedulerv
 		return nil, fmt.Errorf("unexpected UnregisterNode call")
 	}
 	return s.unregisterNodeFunc(ctx, req, opts...)
+}
+
+func (s stubSchedulerClient) GetFleetPlan(ctx context.Context, req *schedulerv1.GetFleetPlanRequest, opts ...grpc.CallOption) (*schedulerv1.GetFleetPlanResponse, error) {
+	if s.getFleetPlanFunc == nil {
+		return nil, fmt.Errorf("unexpected GetFleetPlan call")
+	}
+	return s.getFleetPlanFunc(ctx, req, opts...)
+}
+
+func (s stubSchedulerClient) CordonNode(ctx context.Context, req *schedulerv1.CordonNodeRequest, opts ...grpc.CallOption) (*schedulerv1.CordonNodeResponse, error) {
+	if s.cordonNodeFunc == nil {
+		return nil, fmt.Errorf("unexpected CordonNode call")
+	}
+	return s.cordonNodeFunc(ctx, req, opts...)
+}
+
+func (s stubSchedulerClient) UncordonNode(ctx context.Context, req *schedulerv1.UncordonNodeRequest, opts ...grpc.CallOption) (*schedulerv1.UncordonNodeResponse, error) {
+	if s.uncordonNodeFunc == nil {
+		return nil, fmt.Errorf("unexpected UncordonNode call")
+	}
+	return s.uncordonNodeFunc(ctx, req, opts...)
 }
 
 const testAPIKey = "test-api-key"
