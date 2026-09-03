@@ -165,10 +165,11 @@ curl http://127.0.0.1:8000/proxy/health \
   -H "X-Access-Token: $ENVD_ACCESS_TOKEN"
 ```
 
-The `aenv` CLI handles this automatically. Use `--secure` when starting a sandbox:
+The `aenv` CLI always requests secure sandbox authentication and handles the
+envd access token automatically:
 
 ```bash
-aenv start --secure <template-or-snapshot>
+aenv start <template-or-snapshot>
 ```
 
 For `connect`, `exec`, `upload`, and

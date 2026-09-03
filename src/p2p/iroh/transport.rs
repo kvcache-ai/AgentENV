@@ -553,7 +553,7 @@ impl P2pTransport for IrohBlobsP2pTransport {
 
     #[instrument(
         skip(self, descriptor),
-        fields(key = %descriptor.key, offset, len)
+        fields(key = %descriptor.key, offset = offset, len = len)
     )]
     async fn fetch_byte_range(
         &self,

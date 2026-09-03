@@ -11,8 +11,7 @@ pub struct NewSandbox<'a> {
     pub template_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub secure: Option<bool>,
+    pub secure: bool,
     #[serde(skip_serializing_if = "Option::is_none", rename = "volumeMounts")]
     pub volume_mounts: Option<HashMap<String, String>>,
 }
@@ -28,8 +27,7 @@ pub struct NewColdSandbox<'a> {
     pub memory_mb: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "diskSizeMB")]
     pub disk_size_mb: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub secure: Option<bool>,
+    pub secure: bool,
     #[serde(skip_serializing_if = "Option::is_none", rename = "volumeMounts")]
     pub volume_mounts: Option<HashMap<String, String>>,
 }
@@ -82,13 +80,12 @@ impl Client {
         &self,
         template_id: &str,
         timeout: Option<u32>,
-        secure: bool,
         volume_mounts: Option<HashMap<String, String>>,
     ) -> Result<Sandbox> {
         let body = NewSandbox {
             template_id,
             timeout,
-            secure: secure.then_some(true),
+            secure: true,
             volume_mounts,
         };
         let resp = handle_status(self.post("/sandboxes").send_json(&body))?;
@@ -104,7 +101,6 @@ impl Client {
         cpu_count: Option<u32>,
         memory_mb: Option<u32>,
         disk_size_mb: Option<u32>,
-        secure: bool,
         volume_mounts: Option<HashMap<String, String>>,
     ) -> Result<Sandbox> {
         let body = NewColdSandbox {
@@ -113,7 +109,7 @@ impl Client {
             cpu_count,
             memory_mb,
             disk_size_mb,
-            secure: secure.then_some(true),
+            secure: true,
             volume_mounts,
         };
         let resp = handle_status(self.post("/sandboxes-cold").send_json(&body))?;
@@ -195,7 +191,7 @@ mod tests {
         let body = NewSandbox {
             template_id: "base-template",
             timeout: Some(300),
-            secure: Some(true),
+            secure: true,
             volume_mounts: None,
         };
 
@@ -215,7 +211,7 @@ mod tests {
             cpu_count: Some(2),
             memory_mb: Some(1024),
             disk_size_mb: Some(8192),
-            secure: Some(true),
+            secure: true,
             volume_mounts: None,
         };
 

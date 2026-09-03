@@ -22,9 +22,6 @@ pub struct Args {
     /// Start directly from an external OCI image instead of a template/snapshot
     #[arg(long)]
     cold: bool,
-    /// Require an envd access token for sandbox control communication
-    #[arg(long)]
-    secure: bool,
     /// Sandbox TTL in seconds
     #[arg(long, default_value_t = super::DEFAULT_TIMEOUT_SECS)]
     timeout: u32,
@@ -61,14 +58,13 @@ pub fn run(args: Args) -> Result<()> {
             args.resources.cpu_count,
             args.resources.memory_mb,
             args.disk_size_mb,
-            args.secure,
             volume_mounts,
         )?
     } else {
         if args.resources.is_set() || args.disk_size_mb.is_some() {
             anyhow::bail!("--cpu-count, --memory-mb, and --disk-size-mb require --cold");
         }
-        client.create_sandbox(&args.target, Some(args.timeout), args.secure, volume_mounts)?
+        client.create_sandbox(&args.target, Some(args.timeout), volume_mounts)?
     };
     let sandbox_id = sandbox.sandbox_id;
 
@@ -189,7 +185,20 @@ async fn wait_for_envd(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_volume_mounts;
+    use super::{parse_volume_mounts, Args};
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(flatten)]
+        args: Args,
+    }
+
+    #[test]
+    fn secure_flag_is_not_accepted() {
+        assert!(TestCli::try_parse_from(["test", "my-template"]).is_ok());
+        assert!(TestCli::try_parse_from(["test", "--secure", "my-template"]).is_err());
+    }
 
     #[test]
     fn parses_volume_mounts() {

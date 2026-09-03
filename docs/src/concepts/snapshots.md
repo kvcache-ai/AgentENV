@@ -148,9 +148,11 @@ aenv start <snapshot-id-or-name>
 | Argument or option | Default | Description |
 | --- | --- | --- |
 | `<snapshot-id-or-name>` | Required | Snapshot ID or alias to start from. |
-| `--secure` | Disabled | Requires an envd access token for sandbox control communication. |
 | `--timeout <seconds>` | `300` | Sets the sandbox TTL; see [Auto-Eviction](sandboxes.md#auto-eviction). |
 | `-d`, `--detach` | Disabled | Prints the new sandbox ID without attaching an interactive shell. |
+
+The CLI always enables secure sandbox authentication and manages the envd
+access token automatically.
 
 ### Delete a Snapshot
 

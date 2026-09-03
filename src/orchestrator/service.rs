@@ -629,8 +629,8 @@ where
 
     #[tracing::instrument(
         name = "fork_sandbox",
-        skip(self),
-        fields(source_sandbox_id = %source_sandbox_id, count)
+        skip(self, child_specs),
+        fields(source_sandbox_id = %source_sandbox_id, count = child_specs.len())
     )]
     async fn fork_sandbox_inner(
         self: Arc<Self>,

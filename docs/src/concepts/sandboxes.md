@@ -65,13 +65,14 @@ Warm-start options:
 | Argument or option | Default | Description |
 |---|---|---|
 | `<template-or-snapshot>` | Required | Template or snapshot ID or alias. |
-| `--secure` | Off | Require an envd access token for command and file operations. The CLI manages the token automatically; see [Authentication](./authentication.md#secure-sandbox-authentication). |
 | `--timeout <seconds>` | `300` | Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see [Auto-Eviction](#auto-eviction). |
 | `-d`, `--detach` | Off | Print the sandbox ID and exit instead of attaching an interactive shell. |
 
 Without `--detach`, `aenv start` waits for the sandbox to become ready and then
 attaches an interactive shell. CPU, memory, and disk settings are inherited
-from the template or snapshot and cannot be overridden on a warm start.
+from the template or snapshot and cannot be overridden on a warm start. The CLI
+always enables secure sandbox authentication and manages the envd access token
+automatically; see [Authentication](./authentication.md#secure-sandbox-authentication).
 
 To retrieve the current state and configuration of one sandbox, use the HTTP
 API:
@@ -105,12 +106,13 @@ Cold-start options:
 |---|---|---|
 | `<image>` | Required | External OCI image reference. |
 | `--cold` | Required for an OCI image | Cold start directly from `<image>`. |
-| `--secure` | Off | Require an envd access token for command and file operations. The CLI manages the token automatically; see [Authentication](./authentication.md#secure-sandbox-authentication). |
 | `--timeout <seconds>` | `300` | Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see [Auto-Eviction](#auto-eviction). |
 | `--cpu <count>` | `[machine].vcpu_count` from your AgentENV config file | Set the sandbox's vCPU count. Alias: `--cpu-count`. |
 | `--memory <MiB>` | `[machine].mem_size_mib` from your config file | Set sandbox memory. Aliases: `--memory-mb`, `--mem`. |
 | `--disk-size-mb <MiB>` | Source image virtual size | Set root filesystem size. The value must be greater than zero and divisible by 1024 MiB. Alias: `--disk-mb`. |
 | `-d`, `--detach` | Off | Print the sandbox ID and exit instead of attaching an interactive shell. |
+
+Cold-started sandboxes also use secure sandbox authentication by default.
 
 The AgentENV config file is `config/default.toml` by default, or the file
 specified by `AENV_CONFIG_PATH`.
