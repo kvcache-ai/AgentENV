@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-3634a6fe.js";
+            window.path_to_searchindex_js = "searchindex-3ec94f5d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a02e686b.js"></script>
@@ -474,9 +474,10 @@ aenv template delete &lt;template-id&gt;
 <p>Start a sandbox and attach an interactive shell. <code>&lt;target&gt;</code> accepts a template
 or snapshot ID or alias, or an OCI image reference with <code>--cold</code>.</p>
 <pre><code class="language-bash">aenv start my-ubuntu
-aenv start --secure my-ubuntu               # require token-authenticated envd access
 aenv start --cold ubuntu:24.04              # start directly from an OCI image
 </code></pre>
+<p>Sandboxes started by <code>aenv</code> always require token-authenticated envd access. The
+CLI obtains and manages the access token automatically.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -484,7 +485,6 @@ aenv start --cold ubuntu:24.04              # start directly from an OCI image
 </thead>
 <tbody>
 <tr><td><code>--cold</code></td><td>Start directly from an external OCI image instead of a template</td></tr>
-<tr><td><code>--secure</code></td><td>Require token authentication for envd control communication</td></tr>
 <tr><td><code>--timeout &lt;secs&gt;</code></td><td>Sandbox TTL in seconds (default: 300)</td></tr>
 <tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores; only valid with <code>--cold</code>. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory in MiB; only valid with <code>--cold</code>. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
@@ -1840,8 +1840,9 @@ ENVD_ACCESS_TOKEN=$(printf '%s' "$SANDBOX_RESPONSE" | jq -r '.envdAccessToken')
   -H "x-agentenv-target-port: 49983" \
   -H "X-Access-Token: $ENVD_ACCESS_TOKEN"
 </code></pre>
-<p>The <code>aenv</code> CLI handles this automatically. Use <code>--secure</code> when starting a sandbox:</p>
-<pre><code class="language-bash">aenv start --secure &lt;template-or-snapshot&gt;
+<p>The <code>aenv</code> CLI always requests secure sandbox authentication and handles the
+envd access token automatically:</p>
+<pre><code class="language-bash">aenv start &lt;template-or-snapshot&gt;
 </code></pre>
 <p>For <code>connect</code>, <code>exec</code>, <code>upload</code>, and
 <code>download</code>, it obtains the token through the authenticated AgentENV API and
@@ -2075,7 +2076,6 @@ aenv start 018f0d93-aaaa-bbbb-cccc-0123456789ab
 </thead>
 <tbody>
 <tr><td><code>&lt;template-or-snapshot&gt;</code></td><td>Required</td><td>Template or snapshot ID or alias.</td></tr>
-<tr><td><code>--secure</code></td><td>Off</td><td>Require an envd access token for command and file operations. The CLI manages the token automatically; see <a href="#secure-sandbox-authentication">Authentication</a>.</td></tr>
 <tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
 <tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
 </tbody>
@@ -2083,7 +2083,9 @@ aenv start 018f0d93-aaaa-bbbb-cccc-0123456789ab
 </div>
 <p>Without <code>--detach</code>, <code>aenv start</code> waits for the sandbox to become ready and then
 attaches an interactive shell. CPU, memory, and disk settings are inherited
-from the template or snapshot and cannot be overridden on a warm start.</p>
+from the template or snapshot and cannot be overridden on a warm start. The CLI
+always enables secure sandbox authentication and manages the envd access token
+automatically; see <a href="#secure-sandbox-authentication">Authentication</a>.</p>
 <p>To retrieve the current state and configuration of one sandbox, use the HTTP
 API:</p>
 <pre><code class="language-bash">curl -H 'X-API-Key: test-key' \
@@ -2108,7 +2110,6 @@ aenv start --cold ubuntu:24.04 --cpu 4 --memory 4096 --disk-size-mb 65536
 <tbody>
 <tr><td><code>&lt;image&gt;</code></td><td>Required</td><td>External OCI image reference.</td></tr>
 <tr><td><code>--cold</code></td><td>Required for an OCI image</td><td>Cold start directly from <code>&lt;image&gt;</code>.</td></tr>
-<tr><td><code>--secure</code></td><td>Off</td><td>Require an envd access token for command and file operations. The CLI manages the token automatically; see <a href="#secure-sandbox-authentication">Authentication</a>.</td></tr>
 <tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
 <tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your AgentENV config file</td><td>Set the sandbox’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set sandbox memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
@@ -2117,6 +2118,7 @@ aenv start --cold ubuntu:24.04 --cpu 4 --memory 4096 --disk-size-mb 65536
 </tbody>
 </table>
 </div>
+<p>Cold-started sandboxes also use secure sandbox authentication by default.</p>
 <p>The AgentENV config file is <code>config/default.toml</code> by default, or the file
 specified by <code>AENV_CONFIG_PATH</code>.</p>
 <p>An OverlayBD-native image can start without downloading
@@ -2549,12 +2551,13 @@ aenv snapshot list --sandbox-id &lt;sandbox-id&gt;
 </thead>
 <tbody>
 <tr><td><code>&lt;snapshot-id-or-name&gt;</code></td><td>Required</td><td>Snapshot ID or alias to start from.</td></tr>
-<tr><td><code>--secure</code></td><td>Disabled</td><td>Requires an envd access token for sandbox control communication.</td></tr>
 <tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Sets the sandbox TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
 <tr><td><code>-d</code>, <code>--detach</code></td><td>Disabled</td><td>Prints the new sandbox ID without attaching an interactive shell.</td></tr>
 </tbody>
 </table>
 </div>
+<p>The CLI always enables secure sandbox authentication and manages the envd
+access token automatically.</p>
 <h3 id="delete-a-snapshot"><a class="header" href="#delete-a-snapshot">Delete a Snapshot</a></h3>
 <p>Snapshots and templates share the same catalog. Delete a snapshot by passing
 its required ID or alias to the template delete command:</p>

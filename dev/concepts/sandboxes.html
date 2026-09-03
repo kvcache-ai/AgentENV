@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3634a6fe.js";
+            window.path_to_searchindex_js = "../searchindex-3ec94f5d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-a02e686b.js"></script>
@@ -242,7 +242,6 @@ aenv start 018f0d93-aaaa-bbbb-cccc-0123456789ab
 </thead>
 <tbody>
 <tr><td><code>&lt;template-or-snapshot&gt;</code></td><td>Required</td><td>Template or snapshot ID or alias.</td></tr>
-<tr><td><code>--secure</code></td><td>Off</td><td>Require an envd access token for command and file operations. The CLI manages the token automatically; see <a href="./authentication.html#secure-sandbox-authentication">Authentication</a>.</td></tr>
 <tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
 <tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
 </tbody>
@@ -250,7 +249,9 @@ aenv start 018f0d93-aaaa-bbbb-cccc-0123456789ab
 </div>
 <p>Without <code>--detach</code>, <code>aenv start</code> waits for the sandbox to become ready and then
 attaches an interactive shell. CPU, memory, and disk settings are inherited
-from the template or snapshot and cannot be overridden on a warm start.</p>
+from the template or snapshot and cannot be overridden on a warm start. The CLI
+always enables secure sandbox authentication and manages the envd access token
+automatically; see <a href="./authentication.html#secure-sandbox-authentication">Authentication</a>.</p>
 <p>To retrieve the current state and configuration of one sandbox, use the HTTP
 API:</p>
 <pre><code class="language-bash">curl -H 'X-API-Key: test-key' \
@@ -275,7 +276,6 @@ aenv start --cold ubuntu:24.04 --cpu 4 --memory 4096 --disk-size-mb 65536
 <tbody>
 <tr><td><code>&lt;image&gt;</code></td><td>Required</td><td>External OCI image reference.</td></tr>
 <tr><td><code>--cold</code></td><td>Required for an OCI image</td><td>Cold start directly from <code>&lt;image&gt;</code>.</td></tr>
-<tr><td><code>--secure</code></td><td>Off</td><td>Require an envd access token for command and file operations. The CLI manages the token automatically; see <a href="./authentication.html#secure-sandbox-authentication">Authentication</a>.</td></tr>
 <tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
 <tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your AgentENV config file</td><td>Set the sandbox’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set sandbox memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
@@ -284,6 +284,7 @@ aenv start --cold ubuntu:24.04 --cpu 4 --memory 4096 --disk-size-mb 65536
 </tbody>
 </table>
 </div>
+<p>Cold-started sandboxes also use secure sandbox authentication by default.</p>
 <p>The AgentENV config file is <code>config/default.toml</code> by default, or the file
 specified by <code>AENV_CONFIG_PATH</code>.</p>
 <p>An OverlayBD-native image can start without downloading

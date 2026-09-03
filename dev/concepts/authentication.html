@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3634a6fe.js";
+            window.path_to_searchindex_js = "../searchindex-3ec94f5d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-a02e686b.js"></script>
@@ -307,8 +307,9 @@ ENVD_ACCESS_TOKEN=$(printf '%s' "$SANDBOX_RESPONSE" | jq -r '.envdAccessToken')
   -H "x-agentenv-target-port: 49983" \
   -H "X-Access-Token: $ENVD_ACCESS_TOKEN"
 </code></pre>
-<p>The <code>aenv</code> CLI handles this automatically. Use <code>--secure</code> when starting a sandbox:</p>
-<pre><code class="language-bash">aenv start --secure &lt;template-or-snapshot&gt;
+<p>The <code>aenv</code> CLI always requests secure sandbox authentication and handles the
+envd access token automatically:</p>
+<pre><code class="language-bash">aenv start &lt;template-or-snapshot&gt;
 </code></pre>
 <p>For <code>connect</code>, <code>exec</code>, <code>upload</code>, and
 <code>download</code>, it obtains the token through the authenticated AgentENV API and

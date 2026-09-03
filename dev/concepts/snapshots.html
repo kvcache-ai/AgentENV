@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3634a6fe.js";
+            window.path_to_searchindex_js = "../searchindex-3ec94f5d.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-a02e686b.js"></script>
@@ -310,12 +310,13 @@ aenv snapshot list --sandbox-id &lt;sandbox-id&gt;
 </thead>
 <tbody>
 <tr><td><code>&lt;snapshot-id-or-name&gt;</code></td><td>Required</td><td>Snapshot ID or alias to start from.</td></tr>
-<tr><td><code>--secure</code></td><td>Disabled</td><td>Requires an envd access token for sandbox control communication.</td></tr>
 <tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Sets the sandbox TTL; see <a href="sandboxes.html#auto-eviction">Auto-Eviction</a>.</td></tr>
 <tr><td><code>-d</code>, <code>--detach</code></td><td>Disabled</td><td>Prints the new sandbox ID without attaching an interactive shell.</td></tr>
 </tbody>
 </table>
 </div>
+<p>The CLI always enables secure sandbox authentication and manages the envd
+access token automatically.</p>
 <h3 id="delete-a-snapshot"><a class="header" href="#delete-a-snapshot">Delete a Snapshot</a></h3>
 <p>Snapshots and templates share the same catalog. Delete a snapshot by passing
 its required ID or alias to the template delete command:</p>
