@@ -1394,7 +1394,9 @@ impl std::fmt::Display for ImageFormat {
 
 fn classify_manifest(manifest: &OciManifest) -> ImageResult<ImageFormat> {
     if manifest.layers.is_empty() {
-        return Err(ImageError::Other(anyhow!("OCI manifest has no layers")));
+        return Err(ImageError::UnsupportedImage {
+            reason: "OCI manifest has no layers".to_string(),
+        });
     }
 
     let turbo_unsupported = |detail: String| ImageError::UnsupportedImage {
@@ -2344,6 +2346,17 @@ mod tests {
             classify_manifest(&manifest).unwrap(),
             ImageFormat::OverlaybdNative
         );
+    }
+
+    #[test]
+    fn classify_manifest_rejects_manifest_without_layers() {
+        let manifest = OciManifest {
+            artifact_type: None,
+            config: manifest_config(),
+            layers: vec![],
+        };
+        let err = classify_manifest(&manifest).unwrap_err();
+        assert!(err.is_user_error(), "empty-layers image must map to 4xx");
     }
 
     #[test]
