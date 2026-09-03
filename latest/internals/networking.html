@@ -1,0 +1,409 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Sandbox Network Architecture - AgentENV Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-3ec94f5d.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-a02e686b.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">AgentENV Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kvcache-ai/AgentENV" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kvcache-ai/AgentENV/edit/main/docs/src/internals/networking.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="sandbox-network-architecture"><a class="header" href="#sandbox-network-architecture">Sandbox Network Architecture</a></h1>
+<p>This document describes the network data plane for one AgentENV node. It covers the Linux network namespaces used by Firecracker sandboxes, host and namespace iptables, runtime egress policy updates, and the namespace-local egress proxy.</p>
+<p>The user-facing policy contract is documented in the public
+<a href="https://github.com/kvcache-ai/AgentENV/blob/main/docs/src/concepts/sandboxes.md#network-access">Sandboxes documentation</a>.
+This page explains how that contract is implemented.</p>
+<h2 id="topology"><a class="header" href="#topology">Topology</a></h2>
+<p>Each running sandbox has a dedicated network namespace. The Firecracker VM is connected to the namespace through a TAP device. The namespace is connected to the host through a veth pair; the namespace side is named <code>vpeer</code> and the host side is named <code>veth-{slot}</code>.</p>
+<pre class="mermaid">flowchart LR
+    subgraph sandbox["Sandbox network namespace"]
+        direction LR
+        subgraph vm["Firecracker VM"]
+            direction LR
+            eth0["eth0\n169.254.0.21"]
+        end
+        tap["tap0\n169.254.0.22"]
+        vpeer["vpeer\nveth pool 10.12.0.0/16\n/31 per slot"]
+        proxy["EgressProxy listener\n0.0.0.0:15000"]
+        eth0 &lt;--&gt; tap
+        tap &lt;--&gt; vpeer
+        tap -. "TCP 80/443 REDIRECT" .-&gt; proxy
+        proxy --&gt; vpeer
+    end
+    style sandbox fill:transparent,stroke:gray
+
+    subgraph host["Host network namespace"]
+        direction LR
+        veth["veth-{slot}\n10.12.0.0/16\n/31 per slot"]
+        host-interaction["Host interaction IP\n10.11.0.0/16\n/31 per slot"]
+        internet["Internet"]
+        veth &lt;-- "Host routing" --&gt; host-interaction
+        veth -- "Host routing" --&gt; internet
+    end
+    style host fill:transparent,stroke:gray
+
+    vpeer &lt;--&gt; veth
+</pre>
+
+<p>The process contains one global <code>NetworkManager</code> and one global <code>EgressProxy</code> registry. The registry is shared for lifecycle and policy bookkeeping, but each namespace that uses proxy-backed policy has its own listener socket and listener thread. The fixed port <code>15000</code> is therefore reusable across namespaces without a host-port collision.</p>
+<h2 id="ownership"><a class="header" href="#ownership">Ownership</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Owner</th><th>Source</th><th>Responsibility</th></tr>
+</thead>
+<tbody>
+<tr><td><code>NetworkManager</code></td><td><code>src/sandbox/network/manager.rs</code></td><td>Process-wide slot bitmap, warm pool, global host iptables, proxy registry, shutdown</td></tr>
+<tr><td><code>Slot</code></td><td><code>src/sandbox/network/slot.rs</code></td><td>One namespace, veth/TAP setup, address plan, namespace iptables, policy application, cleanup</td></tr>
+<tr><td>Address plan</td><td><code>src/sandbox/network/address_plan.rs</code></td><td>Slot-derived host interaction, veth, and VM-link addresses and internal deny ranges</td></tr>
+<tr><td>Policy</td><td><code>src/sandbox/network/policy.rs</code></td><td>API-normalized base/allow/deny semantics, absolute deny checks, proxy interception ports</td></tr>
+<tr><td>Egress proxy</td><td><code>src/sandbox/network/egress_proxy.rs</code></td><td>Namespace-local listener, original-destination inspection, Host/SNI parsing, relay, staged policy state</td></tr>
+<tr><td>Host resolver</td><td><code>src/sandbox/network/resolver.rs</code></td><td>Process-wide long-lived host-netns DNS worker used for trusted domain resolution</td></tr>
+<tr><td>Firecracker backend</td><td><code>src/sandbox/firecracker/sandbox.rs</code></td><td>Allocates/releases slots and applies the launch or updated policy at VM lifecycle boundaries</td></tr>
+<tr><td>Orchestrator/API</td><td><code>src/orchestrator/</code>, <code>src/api/impls/sandbox.rs</code></td><td>Validates requests, persists policy, and replaces the running sandbox policy</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="address-plan"><a class="header" href="#address-plan">Address Plan</a></h2>
+<p><code>NetworkAddressPlan</code> derives addresses from <code>[network.internal]</code> and allocates them from the slot index:</p>
+<ul>
+<li><code>host_interaction_ip</code>: one address per slot from <code>host_interaction_cidr</code>. Host routes use this address to reach the VM through the namespace.</li>
+<li><code>veth_host_ip</code> and <code>veth_vm_ip</code>: the two endpoints of the slot’s <code>/31</code> veth link. The host endpoint is assigned to <code>veth-{slot}</code> and the namespace endpoint is assigned to <code>vpeer</code>.</li>
+<li><code>vm_ip</code> and <code>tap_ip</code>: fixed endpoints of the VM link on <code>vm_link_cidr</code>. The VM receives <code>vm_ip</code>; the namespace TAP interface receives <code>tap_ip</code>.</li>
+</ul>
+<p>The namespace adds a default route through <code>veth_host_ip</code>. Firecracker receives an <code>ip=</code> boot argument containing the VM address, TAP link, netmask, and the guest DNS server selected from the host resolver configuration.</p>
+<p>The complete internal pools are denied before user egress rules. This prevents a sandbox from reaching another slot’s host-interaction address, veth link, or VM link even when a user policy otherwise allows the destination.</p>
+<h2 id="namespace-setup"><a class="header" href="#namespace-setup">Namespace Setup</a></h2>
+<p><code>Slot::create_network()</code> performs namespace setup on a dedicated thread because network namespace membership is thread-local:</p>
+<ol>
+<li>Create and bind-mount a persistent namespace file under the configured runtime <code>netns</code> directory.</li>
+<li>Unshare <code>CLONE_NEWNET</code> and create the veth pair.</li>
+<li>Move the host endpoint to the process’s baseline host namespace.</li>
+<li>Configure <code>lo</code>, <code>vpeer</code>, <code>tap0</code>, addresses, link state, and the namespace default route.</li>
+<li>Enable namespace IPv4 forwarding and configure namespace NAT/filter rules.</li>
+<li>Configure the host veth address and a host route for the slot’s <code>host_interaction_ip</code>.</li>
+</ol>
+<p>The baseline namespace rules are installed once during setup. Per-sandbox user rules and proxy redirects are replaced later by <code>set_egress_policy()</code>.</p>
+<h2 id="packet-paths"><a class="header" href="#packet-paths">Packet Paths</a></h2>
+<pre class="mermaid">flowchart TB
+    vm["Firecracker VM"] --&gt; tap["tap0"]
+    tap --&gt; prerouting["namespace nat/PREROUTING"]
+    prerouting -. "TCP 80/443 REDIRECT" .-&gt; proxy["Namespace-local\nEgressProxy"]
+    prerouting --&gt; forward["namespace filter/FORWARD\nAGENTENV-EGRESS"]
+    proxy --&gt; upstream_proxy["Proxy upstream connection"]
+    forward --&gt; nsnat["namespace POSTROUTING\nSNAT to host_interaction_ip"]
+    upstream_proxy --&gt; nsnat
+    nsnat --&gt; vpeer["vpeer / veth"]
+    vpeer --&gt; host["Host FORWARD + POSTROUTING\nMASQUERADE"]
+    host --&gt; internet["External destination"]
+    internet -. "return traffic" .-&gt; host
+    host -. "ESTABLISHED,RELATED" .-&gt; vpeer
+    vpeer -. "return traffic" .-&gt; tap
+    tap -. "return traffic" .-&gt; vm
+</pre>
+
+<h3 id="sandbox-originated-internet-traffic"><a class="header" href="#sandbox-originated-internet-traffic">Sandbox-originated internet traffic</a></h3>
+<ol>
+<li>The VM sends a packet through <code>eth0</code> to <code>tap0</code>.</li>
+<li>The namespace NAT <code>PREROUTING</code> chain may redirect TCP ports 80 and 443 to the namespace-local proxy.</li>
+<li>Packets that continue as routed traffic traverse <code>filter/FORWARD</code> from <code>tap0</code> to <code>vpeer</code>, entering <code>AGENTENV-EGRESS</code>.</li>
+<li>The namespace <code>POSTROUTING</code> chain SNATs VM-originated traffic to the slot’s <code>host_interaction_ip</code>. Proxy-originated upstream connections are SNATed from the namespace <code>vpeer</code> address to the same slot identity.</li>
+<li>The host <code>FORWARD</code> and <code>POSTROUTING</code> rules accept the slot source range and MASQUERADE it for the external route.</li>
+</ol>
+<h3 id="return-traffic"><a class="header" href="#return-traffic">Return traffic</a></h3>
+<p>Return packets are classified as <code>ESTABLISHED,RELATED</code> and are accepted before the user egress chain in the namespace. The host also accepts established traffic returning to <code>veth-{slot}</code>. This preserves host/envd/proxy responses and existing outbound flows while policy rules are replaced.</p>
+<h3 id="host-to-vm-traffic"><a class="header" href="#host-to-vm-traffic">Host-to-VM traffic</a></h3>
+<p>Host-side proxy and envd traffic targets the slot’s <code>host_interaction_ip</code>. Namespace <code>PREROUTING</code> on <code>vpeer</code> DNATs that address to the VM’s fixed <code>vm_ip</code>. The corresponding return path is accepted by the established/related rules.</p>
+<h2 id="host-firewall"><a class="header" href="#host-firewall">Host Firewall</a></h2>
+<p><code>NetworkManager</code> installs one process-wide set of host rules for the configured host interaction CIDR. The rules are inserted/appended symmetrically and removed during manager shutdown:</p>
+<pre><code class="language-text">INPUT      -i veth-+ -s &lt;host_interaction_cidr&gt; -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+INPUT      -i veth-+ -s &lt;host_interaction_cidr&gt; -j REJECT
+FORWARD    -i veth-+ -s &lt;host_interaction_cidr&gt; -j ACCEPT
+FORWARD    -o veth-+ -d &lt;host_interaction_cidr&gt; --state ESTABLISHED,RELATED -j ACCEPT
+POSTROUTING -s &lt;host_interaction_cidr&gt; -j MASQUERADE
+</code></pre>
+<p>The <code>INPUT</code> pair prevents guest-originated new connections from reaching arbitrary host services while preserving established host-originated traffic. The <code>FORWARD</code> and <code>MASQUERADE</code> rules handle namespace-to-internet forwarding after namespace SNAT.</p>
+<h2 id="namespace-firewall"><a class="header" href="#namespace-firewall">Namespace Firewall</a></h2>
+<p>Each namespace has three managed chains:</p>
+<ul>
+<li><code>AGENTENV-EGRESS</code> is the static chain reached from <code>FORWARD</code> for guest traffic.</li>
+<li><code>AGENTENV-USER-EGRESS</code> contains the replaceable user policy.</li>
+<li><code>AGENTENV-EGRESS-PROXY</code> is the replaceable NAT chain reached from <code>nat/PREROUTING</code> for proxy-backed traffic.</li>
+</ul>
+<p>The static filter chain is ordered as follows:</p>
+<ol>
+<li>Accept <code>ESTABLISHED,RELATED</code> traffic from <code>tap0</code> to <code>vpeer</code>.</li>
+<li>Allow UDP/TCP DNS traffic to the configured guest DNS address on port 53.</li>
+<li>Reject the complete internal address pools and configured <code>always_denied_cidrs</code>.</li>
+<li>Jump to <code>AGENTENV-USER-EGRESS</code>.</li>
+</ol>
+<p>The user chain is rendered in this order:</p>
+<ol>
+<li>Explicit <code>allowOut</code> CIDR/IP rules (<code>ACCEPT</code>).</li>
+<li>Explicit <code>denyOut</code> CIDR/IP rules (<code>REJECT</code>).</li>
+<li>A <code>0.0.0.0/0</code> reject when the base policy is <code>Deny</code>.</li>
+</ol>
+<p>This ordering gives user allow rules precedence over overlapping user denies, while static internal/platform denies remain non-overridable.</p>
+<h2 id="egress-proxy"><a class="header" href="#egress-proxy">Egress Proxy</a></h2>
+<p>The egress proxy is namespace-local and transparent. It does not terminate TLS or rewrite HTTP. A policy that requires proxy mediation redirects only TCP ports 80 and 443 to <code>0.0.0.0:15000</code> inside that namespace.</p>
+<h3 id="connection-flow"><a class="header" href="#connection-flow">Connection flow</a></h3>
+<ol>
+<li><code>EgressProxy::ensure_listener()</code> enters the target namespace with <code>setns</code>, binds the listener, and starts a nonblocking accept loop.</li>
+<li>The listener accepts a connection and copies the active policy for that connection.</li>
+<li>The connection handler reads <code>SO_ORIGINAL_DST</code> to recover the destination altered by <code>REDIRECT</code>.</li>
+<li>It buffers the initial request/handshake up to 64 KiB and extracts HTTP <code>Host</code> or TLS ClientHello SNI. TLS handshake bytes are accumulated across record boundaries.</li>
+<li>A domain match is sent to the process-wide resolver worker, which remains in the host network namespace. Each candidate IPv4 address is checked by <code>SandboxNetworkPolicy::is_domain_allowed</code>, including absolute platform and internal-range denies, before it is selected.</li>
+<li>A domain connection is dialed to the selected trusted address. An IP/CIDR connection uses the original destination after <code>is_ip_allowed</code>.</li>
+<li>The buffered preface is written to the upstream and both directions are relayed with half-close handling.</li>
+</ol>
+<p>An empty or unrecognized hostname cannot fall back to the base allow policy when a domain allowlist is present. This keeps domain policies fail-closed. Domain allow rules require the API request to include an explicit <code>denyOut: ["0.0.0.0/0"]</code>.</p>
+<h3 id="policy-replacement"><a class="header" href="#policy-replacement">Policy replacement</a></h3>
+<p>The running policy update is a replacement operation:</p>
+<ol>
+<li>Stage the new policy in the proxy’s <code>pending</code> map.</li>
+<li>Ensure the namespace listener exists when proxy mediation is required.</li>
+<li>Apply the filter and NAT chain replacement as one <code>iptables-restore</code> batch.</li>
+<li>When an active proxy policy already exists, activate the pending policy only after the namespace batch succeeds.</li>
+<li>When proxy mediation is being enabled for a namespace with no active proxy policy, activate the prepared policy before installing the redirect. This preserves the namespace’s previous default-allow behavior until the atomic iptables batch has completed; no connection can reach the listener through <code>REDIRECT</code> before that batch succeeds.</li>
+<li>If an update fails while an active proxy policy exists, discard the pending policy and retain the previous active policy.</li>
+</ol>
+<p>Each accepted connection holds a copy of the active policy selected at accept time. Therefore updates primarily affect new connections; existing relays are not proactively terminated. Removing a policy or a slot closes tracked handler sockets and joins their threads before namespace resources are removed.</p>
+<h3 id="namespace-ownership"><a class="header" href="#namespace-ownership">Namespace ownership</a></h3>
+<p>The process-global registry is keyed by <code>host_interaction_ip</code>, but listeners are not shared between namespaces. Every namespace has its own listener thread and socket. When a policy no longer requires proxy mediation, the listener and active/pending policy are removed. Full slot cleanup stops the listener before deleting the veth and unmounting the namespace.</p>
+<h2 id="lifecycle-and-warm-pool"><a class="header" href="#lifecycle-and-warm-pool">Lifecycle and Warm Pool</a></h2>
+<p><code>NetworkManager::allocate_any()</code> first acquires a warm <code>Slot</code>. If none is available it allocates a new slot index and creates the namespace/veth/TAP resources. The Firecracker backend then applies the launch policy before boot or resume continues.</p>
+<p>On stop, a slot may return to the warm pool. The namespace and baseline networking remain available for reuse; <code>user_egress_rules_present</code> tracks whether the next tenant needs a user-chain replacement. The next policy application clears or replaces stale user rules and removes stale proxy policy as appropriate. Slots drained from the pool are fully cleaned up.</p>
+<p>On shutdown, the manager stops pool maintenance, drains warm slots, stops all proxy listeners, removes global host rules, and removes namespace/veth state. An <code>atexit</code> hook and <code>Drop</code> path provide best-effort cleanup for abnormal exits.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../internals/architecture.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../internals/sandbox-testing.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../internals/architecture.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../internals/sandbox-testing.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/version-selector-067fd7db.js"></script>
+        <script src="../mermaid-init-3bdacd7b.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

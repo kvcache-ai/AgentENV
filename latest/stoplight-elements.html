@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentENV API Reference — Stoplight Elements</title>
+  <link rel="stylesheet" href="https://unpkg.com/@stoplight/elements@8.5.2/styles.min.css">
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; }
+    elements-api { display: block; height: 100vh; }
+    [data-testid="two-column-right"] {
+      width: 46%;
+      max-width: 640px !important;
+      margin-left: 48px;
+    }
+    [data-testid="two-column-right"] .sl-code-viewer,
+    [data-testid="two-column-right"] .sl-code-editor {
+      --fs-code: 15px !important;
+    }
+  </style>
+</head>
+<body>
+<elements-api
+  router="hash"
+  layout="sidebar"
+  hideSchemas="false"
+  hideExport="true"
+  tryItCredentialsPolicy="same-origin">
+</elements-api>
+<script src="https://unpkg.com/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
+<script src="https://unpkg.com/@stoplight/elements@8.5.2/web-components.min.js"></script>
+<script>
+  const apiReference = document.querySelector('elements-api');
+
+  const operationTitles = {
+    'POST /sandboxes-cold': 'Create sandbox from OCI image',
+    'GET /sandboxes/{sandboxID}/custom-extension-params': 'Get custom extension params',
+    'PATCH /sandboxes/{sandboxID}/custom-extension-params': 'Update custom extension params',
+    'GET /snapshots/{snapshotID}': 'Get snapshot',
+  };
+
+  const waitForCustomElement = (name, timeoutMs = 10000) =>
+    new Promise((resolve, reject) => {
+      const timeoutId = window.setTimeout(
+        () => reject(new Error(`${name} failed to load within ${timeoutMs}ms`)),
+        timeoutMs
+      );
+      customElements.whenDefined(name).then(() => {
+        window.clearTimeout(timeoutId);
+        resolve();
+      }, error => {
+        window.clearTimeout(timeoutId);
+        reject(error);
+      });
+    });
+
+  const prepareDocumentationSpec = async () => {
+    const response = await fetch('./openapi.yml');
+    if (!response.ok) {
+      throw new Error(`Failed to load openapi.yml: ${response.status}`);
+    }
+
+    const spec = jsyaml.load(await response.text());
+
+    const tagDisplayNames = new Map([
+      ['sandboxes', 'Sandboxes'],
+      ['templates', 'Templates'],
+      ['snapshots', 'Snapshots'],
+      ['admin', 'Admin'],
+    ]);
+    const tagByName = new Map((spec.tags || []).map(tag => [tag.name, tag]));
+    spec.tags = [...tagDisplayNames]
+      .map(([name, displayName]) => ({
+        ...(tagByName.get(name) || {}),
+        name: displayName,
+      }));
+
+    // Stoplight uses summary as the operation label in the sidebar.
+    for (const [path, pathItem] of Object.entries(spec.paths || {})) {
+      for (const method of ['get', 'post', 'put', 'patch', 'delete']) {
+        const operation = pathItem[method];
+        if (!operation) continue;
+
+        if (operation.deprecated === true) {
+          delete pathItem[method];
+          continue;
+        }
+
+        operation.summary ||= operationTitles[`${method.toUpperCase()} ${path}`];
+        operation.tags = (operation.tags || [])
+          .map(tag => tagDisplayNames.get(tag) || tag);
+
+        // The deployed control plane authenticates every protected operation
+        // with X-API-Key, including operations whose compatibility schema
+        // advertises provider or admin alternatives.
+        if (Array.isArray(operation.security) && operation.security.length > 0) {
+          operation.security = [{ ApiKeyAuth: [] }];
+        }
+      }
+
+      const hasOperation = ['get', 'post', 'put', 'patch', 'delete']
+        .some(method => pathItem[method]);
+      if (!hasOperation) delete spec.paths[path];
+    }
+
+    const apiKeyAuth = spec.components?.securitySchemes?.ApiKeyAuth;
+    if (apiKeyAuth) {
+      spec.components.securitySchemes = { ApiKeyAuth: apiKeyAuth };
+    }
+    if (Array.isArray(spec.security) && spec.security.length > 0) {
+      spec.security = [{ ApiKeyAuth: [] }];
+    }
+
+    await waitForCustomElement('elements-api');
+    apiReference.apiDescriptionDocument = spec;
+  };
+
+  const updateLayout = () => {
+    apiReference.setAttribute(
+      'layout',
+      document.documentElement.clientWidth < 1100 ? 'stacked' : 'sidebar'
+    );
+  };
+
+  const initialize = async () => {
+    try {
+      updateLayout();
+      if ('ResizeObserver' in window) {
+        new ResizeObserver(updateLayout).observe(document.documentElement);
+      } else {
+        window.addEventListener('resize', updateLayout);
+      }
+      await prepareDocumentationSpec();
+    } catch (error) {
+      console.error(error);
+      apiReference.replaceWith(document.createTextNode(
+        'Unable to load the API reference. See the browser console for details.'
+      ));
+    }
+  };
+
+  initialize();
+</script>
+</body>
+</html>
