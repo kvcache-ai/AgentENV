@@ -138,7 +138,7 @@ PVM currently requires x86_64 and the `kvm_pvm` host module.
 
 The network subsystem is managed by a process-wide `NetworkManager` and per-slot `Slot` objects. See [Sandbox Network Architecture](./networking.md) for the namespace topology, address plan, packet paths, firewall ordering, egress proxy, policy replacement, warm-pool behavior, and verification steps.
 
-Snapshot resume can also use `[pool.firecracker]` to pre-spawn `(network slot, Firecracker process)` pairs. A warm entry transfers its network slot, process, and Firecracker CWD to the resumed sandbox, which avoids the spawn and API-socket wait in the resume critical path. `[pool.block]` controls the ublk daemon's overlaybd warm-device pool; it shares the same top-level watermarks but performs async refill from request paths because reusable block devices are image/size-specific.
+Snapshot resume can also use `[pool.firecracker]` to pre-spawn `(network slot, Firecracker process)` pairs. A warm entry transfers its network slot, process, and Firecracker CWD to the resumed sandbox, which avoids the spawn and API-socket wait in the resume critical path. `[pool.block]` controls the ublk daemon's overlaybd warm-device pool; returned devices share the top-level idle-cache capacity, while an optional block-specific prewarm watermark caps async proactive refill from request paths because reusable devices are image/size-specific.
 
 ### Observability Data Flow
 

@@ -919,36 +919,24 @@ mod tests {
         stderr: &str,
         exit_code: i32,
     ) -> std::path::PathBuf {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
 
         let stdout_path = dir.join("stdout");
         let stderr_path = dir.join("stderr");
+        let exit_code_path = dir.join("exit_code");
         std::fs::write(&stdout_path, stdout).expect("write stdout fixture");
         std::fs::write(&stderr_path, stderr).expect("write stderr fixture");
+        std::fs::write(&exit_code_path, exit_code.to_string()).expect("write exit code fixture");
 
         // The script locates its fixtures relative to `$0` rather than
-        // embedding absolute paths, so a TMPDIR containing shell
-        // metacharacters cannot break or inject into the generated script.
-        //
-        // Staged write + rename so the binary is never observed half-written or
-        // non-executable, matching how the real dependency installer stages
-        // downloads.
+        // embedding absolute paths, so a TMPDIR containing shell metacharacters
+        // cannot break or inject into it. Link a stable, checked-in executable
+        // instead of writing and immediately executing a new inode, which can
+        // intermittently make exec(2) fail with ETXTBSY on shared CI runners.
         let binary = dir.join("regctl");
-        let staged = dir.join("regctl.staged");
-        {
-            let mut file = std::fs::File::create(&staged).expect("create fake regctl");
-            write!(
-                file,
-                "#!/bin/sh\ndir=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nprintf '%s\\n' \"$@\" > \"$dir/argv\"\ncat \"$dir/stdout\"\ncat \"$dir/stderr\" >&2\nexit {exit_code}\n",
-            )
-            .expect("write fake regctl");
-            file.sync_all().expect("sync fake regctl");
-        }
-        let mut permissions = std::fs::metadata(&staged).expect("stat").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&staged, permissions).expect("chmod fake regctl");
-        std::fs::rename(&staged, &binary).expect("publish fake regctl");
+        let fixture =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/image/testdata/fake-regctl");
+        symlink(&fixture, &binary).expect("link fake regctl");
         binary
     }
 

@@ -296,6 +296,7 @@ Component sections:
 |---------|-----|------|---------|-------------|
 | `[pool.network]` | `maintenance_enabled` | boolean | `true` | Enable the background network-slot maintenance worker |
 | `[pool.block]` | `enabled` | boolean | `true` | Enable the ublk overlaybd warm-device pool |
+| `[pool.block]` | `prewarm_high_watermark` | integer | `pool.high_watermark` | Maximum idle-device count reached by proactive block-device refill. Returned devices may still fill `pool.high_watermark`; `0` disables proactive refill |
 | `[pool.block]` | `startup_prewarm` | boolean | capability-based | Prewarm block devices after the first reusable image shape is known. When omitted, it is enabled only if the kernel supports `UBLK_F_UPDATE_SIZE`; an explicit value overrides detection |
 | `[pool.firecracker]` | `enabled` | boolean | `true` | Enable pre-spawned Firecracker processes for snapshot resume |
 | `[pool.firecracker]` | `maintenance_enabled` | boolean | `true` | Enable the background Firecracker process maintenance worker |
@@ -305,6 +306,7 @@ Component sections:
 Validation rules:
 
 - `low_watermark <= high_watermark`
+- `[pool.block].prewarm_high_watermark <= high_watermark`
 - `[pool.firecracker].fill_concurrency > 0`
 
 ## `[node_identity]`
