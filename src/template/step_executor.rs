@@ -34,9 +34,12 @@ impl TemplateStepExecutor {
         // into their locally recorded stack traces ("base" / "finalize" /
         // int(step)), and anything non-numeric crashes the Python SDK's error
         // path before it can raise the real build error. The instruction text
-        // belongs in the message.
+        // belongs in the message. The number must be the client-visible one:
+        // source_step carries it when a front-end expanded one request step
+        // into several internal steps, and the positional fallback covers the
+        // front-ends that map 1:1.
         for (index, step) in steps.iter().enumerate() {
-            let step_no = index + 1;
+            let step_no = step.source_step.unwrap_or(index + 1);
             match &step.kind {
                 TemplateBuildStepKind::Env { key, value } => {
                     context = context.with_env_var(key.clone(), value.clone());
@@ -464,5 +467,28 @@ mod tests {
         assert_eq!(failure.reason.step.as_deref(), Some("2"));
         assert!(failure.reason.message.contains("RUN false"));
         assert!(failure.reason.message.contains("status 1"));
+    }
+
+    #[tokio::test]
+    async fn run_step_failure_reports_the_source_step_over_its_position() {
+        let sandbox = RecordingSandbox::failing();
+        // One client ENV step with two pairs arrives as two internal steps;
+        // the failing RUN sits at internal position 3 but is client step 2.
+        let mut steps = vec![
+            TemplateBuildStep::env("A", "1"),
+            TemplateBuildStep::env("B", "2"),
+            TemplateBuildStep::run("false"),
+        ];
+        steps[0].source_step = Some(1);
+        steps[1].source_step = Some(1);
+        steps[2].source_step = Some(2);
+        let error = TemplateStepExecutor::new()
+            .execute(&sandbox, &steps, CommandContext::default())
+            .await
+            .expect_err("a non-zero exit should fail the build");
+        let failure = error
+            .downcast_ref::<TemplateBuildFailure>()
+            .expect("the error should be a TemplateBuildFailure");
+        assert_eq!(failure.reason.step.as_deref(), Some("2"));
     }
 }

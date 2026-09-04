@@ -72,8 +72,10 @@ pub(super) fn template_build_spec_from_start_request(
         spec = spec.ready_cmd(ready_cmd.clone());
     }
 
-    for step in body.steps.as_deref().unwrap_or_default() {
+    for (index, step) in body.steps.as_deref().unwrap_or_default().iter().enumerate() {
+        let appended_from = spec.step_count();
         spec = apply_e2b_template_step(spec, step)?;
+        spec = spec.stamp_source_steps(appended_from, index + 1);
     }
 
     Ok(spec)
@@ -223,8 +225,43 @@ fn apply_e2b_template_step(
 
 #[cfg(test)]
 mod tests {
-    use super::{template_build_start_base_source, TemplateBuildStartBaseSource};
+    use super::{
+        template_build_spec_from_start_request, template_build_start_base_source,
+        TemplateBuildStartBaseSource,
+    };
+    use crate::types::SandboxResources;
     use agentenv_http_server::models;
+
+    #[test]
+    fn expanded_env_pairs_share_their_client_step_number() {
+        let mut body = models::TemplateBuildStartV2::new();
+        body.steps = Some(vec![
+            models::TemplateStep {
+                r_type: "ENV".to_string(),
+                args: Some(vec![
+                    "A".to_string(),
+                    "1".to_string(),
+                    "B".to_string(),
+                    "2".to_string(),
+                ]),
+                files_hash: None,
+                force: None,
+            },
+            models::TemplateStep {
+                r_type: "RUN".to_string(),
+                args: Some(vec!["false".to_string()]),
+                files_hash: None,
+                force: None,
+            },
+        ]);
+        let spec = template_build_spec_from_start_request(&body, None, SandboxResources::default())
+            .expect("spec should parse");
+        let sources: Vec<Option<usize>> =
+            spec.steps().iter().map(|step| step.source_step).collect();
+        // One ENV request with two pairs expands to two internal steps; both
+        // must report as client step 1, and the RUN as client step 2.
+        assert_eq!(sources, vec![Some(1), Some(1), Some(2)]);
+    }
 
     #[test]
     fn start_base_source_defaults_when_not_specified() {
