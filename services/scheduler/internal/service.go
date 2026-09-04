@@ -89,7 +89,7 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	for _, n := range discovered {
 		rich = append(rich, RichNode{
 			Node:     n,
-			Snapshot: s.nodes.PeekObserved(n.ID),
+			Snapshot: s.nodes.SchedulingSnapshot(n.ID, start),
 		})
 	}
 
@@ -130,7 +130,7 @@ func summarizeScheduleHint(hint *schedulerv1.ScheduleRequestHint) string {
 		c := k.NewColdSandbox
 		return fmt.Sprintf("new_cold_sandbox cpu=%d memory_mb=%d images=%v", c.GetCpuCount(), c.GetMemoryMb(), c.GetImages())
 	case *schedulerv1.ScheduleRequestHint_NewSandbox:
-		return "new_sandbox"
+		return fmt.Sprintf("new_sandbox template=%q", k.NewSandbox.GetTemplateId())
 	default:
 		return "none"
 	}
