@@ -29,14 +29,24 @@ impl TemplateStepExecutor {
         let mut context = initial_context;
 
         debug!("executing template build steps");
-        for step in steps {
+        // On failure, reason.step must carry the 1-based step number, the way
+        // e2b Cloud reports it: the official SDKs parse the field as an index
+        // into their locally recorded stack traces ("base" / "finalize" /
+        // int(step)), and anything non-numeric crashes the Python SDK's error
+        // path before it can raise the real build error. The instruction text
+        // belongs in the message. The number must be the client-visible one:
+        // source_step carries it when a front-end expanded one request step
+        // into several internal steps, and the positional fallback covers the
+        // front-ends that map 1:1.
+        for (index, step) in steps.iter().enumerate() {
+            let step_no = step.source_step.unwrap_or(index + 1);
             match &step.kind {
                 TemplateBuildStepKind::Env { key, value } => {
                     context = context.with_env_var(key.clone(), value.clone());
                 }
                 TemplateBuildStepKind::Workdir { path } => {
                     let resolved = resolve_workdir(&context.workdir, &path.to_string_lossy());
-                    self.ensure_workdir(sandbox, &resolved).await?;
+                    self.ensure_workdir(sandbox, &resolved, step_no).await?;
                     context = context.with_workdir(resolved);
                 }
                 TemplateBuildStepKind::User { value } => {
@@ -62,7 +72,7 @@ impl TemplateStepExecutor {
                     context = context.with_labels(labels);
                 }
                 TemplateBuildStepKind::Run { cmd } => {
-                    self.run_step(sandbox, &context.workdir, &context.env_vars, cmd)
+                    self.run_step(sandbox, &context.workdir, &context.env_vars, cmd, step_no)
                         .await?;
                 }
             }
@@ -80,9 +90,17 @@ impl TemplateStepExecutor {
     /// `mkdir`: minimal images (scratch, distroless, Nix-style) may ship no
     /// userland at all, and Docker itself creates WORKDIR without consulting
     /// the image.
-    async fn ensure_workdir(&self, sandbox: &impl SandboxExecutor, path: &str) -> Result<()> {
+    async fn ensure_workdir(
+        &self,
+        sandbox: &impl SandboxExecutor,
+        path: &str,
+        step_no: usize,
+    ) -> Result<()> {
         sandbox.create_dir_all(path).await.with_context(|| {
-            TemplateBuildFailure::with_step("build step failed", format!("WORKDIR {path}"))
+            TemplateBuildFailure::with_step(
+                format!("build step failed: WORKDIR {path}"),
+                step_no.to_string(),
+            )
         })
     }
 
@@ -92,6 +110,7 @@ impl TemplateStepExecutor {
         workdir: &str,
         env: &HashMap<String, String>,
         cmd: &str,
+        step_no: usize,
     ) -> Result<()> {
         let opts = ProcessOpts {
             envs: env.clone(),
@@ -103,15 +122,18 @@ impl TemplateStepExecutor {
             .run_command_with_opts("/bin/bash", &["-lc", cmd], &opts)
             .await
             .with_context(|| {
-                TemplateBuildFailure::with_step("build step failed", format!("RUN {cmd}"))
+                TemplateBuildFailure::with_step(
+                    format!("build step failed: RUN {cmd}"),
+                    step_no.to_string(),
+                )
             })?;
         if output.exit_code != 0 {
             let message = format!(
-                "build step failed: command exited with status {}{}",
+                "build step failed: RUN {cmd}: command exited with status {}{}",
                 output.exit_code,
                 command_output_suffix(&output.stdout, &output.stderr)
             );
-            return Err(TemplateBuildFailure::with_step(message, format!("RUN {cmd}")).into());
+            return Err(TemplateBuildFailure::with_step(message, step_no.to_string()).into());
         }
         Ok(())
     }
@@ -419,6 +441,54 @@ mod tests {
         let failure = error
             .downcast_ref::<TemplateBuildFailure>()
             .expect("the error should be a TemplateBuildFailure");
-        assert_eq!(failure.reason.step.as_deref(), Some("WORKDIR /app"));
+        // The e2b SDKs parse reason.step as a number; the instruction text is
+        // in the message.
+        assert_eq!(failure.reason.step.as_deref(), Some("1"));
+        assert!(failure.reason.message.contains("WORKDIR /app"));
+    }
+
+    #[tokio::test]
+    async fn run_step_failure_reports_its_one_based_position() {
+        let sandbox = RecordingSandbox::failing();
+        let error = TemplateStepExecutor::new()
+            .execute(
+                &sandbox,
+                &[
+                    TemplateBuildStep::env("A", "1"),
+                    TemplateBuildStep::run("false"),
+                ],
+                CommandContext::default(),
+            )
+            .await
+            .expect_err("a non-zero exit should fail the build");
+        let failure = error
+            .downcast_ref::<TemplateBuildFailure>()
+            .expect("the error should be a TemplateBuildFailure");
+        assert_eq!(failure.reason.step.as_deref(), Some("2"));
+        assert!(failure.reason.message.contains("RUN false"));
+        assert!(failure.reason.message.contains("status 1"));
+    }
+
+    #[tokio::test]
+    async fn run_step_failure_reports_the_source_step_over_its_position() {
+        let sandbox = RecordingSandbox::failing();
+        // One client ENV step with two pairs arrives as two internal steps;
+        // the failing RUN sits at internal position 3 but is client step 2.
+        let mut steps = vec![
+            TemplateBuildStep::env("A", "1"),
+            TemplateBuildStep::env("B", "2"),
+            TemplateBuildStep::run("false"),
+        ];
+        steps[0].source_step = Some(1);
+        steps[1].source_step = Some(1);
+        steps[2].source_step = Some(2);
+        let error = TemplateStepExecutor::new()
+            .execute(&sandbox, &steps, CommandContext::default())
+            .await
+            .expect_err("a non-zero exit should fail the build");
+        let failure = error
+            .downcast_ref::<TemplateBuildFailure>()
+            .expect("the error should be a TemplateBuildFailure");
+        assert_eq!(failure.reason.step.as_deref(), Some("2"));
     }
 }
