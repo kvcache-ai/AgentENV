@@ -11,6 +11,7 @@ use tracing_log::log::LevelFilter;
 
 use overlaybd::image_service::ImageService;
 use storage_util::io_ring::spawn_io_ring_worker;
+use uvm_ublk::ublk_caps;
 use uvm_ublk_daemon::{server::UblkDaemonServer, ResizeToolSpec};
 
 mod metrics_server;
@@ -28,6 +29,10 @@ struct Cli {
     /// Path to overlaybd global config JSON.
     #[arg(long)]
     global_config: PathBuf,
+
+    /// Path to the OverlayBD global config used only by overlaybd-resize.
+    #[arg(long)]
+    resize_global_config: PathBuf,
 
     /// Path to AgentENV TOML config. Pool settings are read from [pool.block].
     #[arg(long)]
@@ -191,7 +196,7 @@ fn load_resize_tool_config(
     );
     Ok(Some(ResizeToolSpec {
         binary: deps_path.join("overlaybd/bin/overlaybd-resize"),
-        lib_dir: Some(deps_path.join("overlaybd/lib")),
+        lib_dir: None,
         timeout_secs: resize_timeout_secs,
     }))
 }
@@ -294,6 +299,7 @@ fn main() -> Result<()> {
             cli.socket_path.clone(),
             ctrl_ring,
             image_service,
+            cli.resize_global_config.clone(),
             cli.p2p_publish_url.clone(),
         );
         let daemon_config =
@@ -311,14 +317,26 @@ fn main() -> Result<()> {
             high_watermark: cli.pool_high_watermark,
             startup_prewarm: cli.pool_startup_prewarm,
         };
-        if let Some(pool_config) =
+        let startup_prewarm = pool_overrides.startup_prewarm.or_else(|| {
+            daemon_config
+                .as_ref()
+                .and_then(|config| config.pool.as_ref())
+                .and_then(|pool| pool.block.as_ref())
+                .and_then(|block| block.startup_prewarm)
+        });
+        if let Some(mut pool_config) =
             load_pool_config(daemon_config.as_ref(), cli.enable_pool, &pool_overrides)
                 .context("load warm pool config")?
         {
-            server
-                .enable_pool(pool_config)
-                .await
-                .context("enable warm pool")?;
+            let features = server.detect_ublk_features().await?;
+            let update_size_supported = features & ublk_caps::UBLK_F_UPDATE_SIZE != 0;
+            pool_config.startup_prewarm = startup_prewarm.unwrap_or(update_size_supported);
+            tracing::info!(
+                features = format!("{:#x}", features),
+                update_size_supported,
+                "detected ublk features"
+            );
+            server.enable_pool(pool_config, features);
         }
 
         // Open a pidfd for the parent process. When the parent process

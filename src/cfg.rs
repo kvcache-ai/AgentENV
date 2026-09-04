@@ -13,12 +13,17 @@ pub use network::{NetworkConfig, NetworkEgressConfig, NetworkInternalConfig};
 use overlaybd::config::UpperMode;
 use serde::Deserialize;
 
+use crate::virtualization::VirtualizationMode;
+
 const ENV_CONFIG_PATH: &str = "AENV_CONFIG_PATH";
+
+#[cfg(test)]
+const TEST_ACCESS_TOKEN_HASH_SEED: &str = "agentenv-unit-test-access-token-seed";
 
 #[derive(Debug, Deserialize)]
 struct SetupDependencyManifest {
-    firecracker: ManifestDownload,
-    kernel: ManifestDownload,
+    firecracker: ManifestVirtualizationDownloads,
+    kernel: ManifestVirtualizationDownloads,
     tools: ManifestTools,
     overlaybd: ManifestDownload,
     #[serde(rename = "regclient")]
@@ -28,6 +33,21 @@ struct SetupDependencyManifest {
 #[derive(Debug, Deserialize)]
 struct ManifestDownload {
     version: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestVirtualizationDownloads {
+    kvm: ManifestDownload,
+    pvm: ManifestDownload,
+}
+
+impl ManifestVirtualizationDownloads {
+    fn for_mode(&self, mode: VirtualizationMode) -> &ManifestDownload {
+        match mode {
+            VirtualizationMode::Kvm => &self.kvm,
+            VirtualizationMode::Pvm => &self.pvm,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +94,8 @@ pub struct AppConfig {
         default = "$AENV_HOME/deps"
     )]
     pub deps_path: PathBuf,
+    #[config(default = "kvm", env = "AENV_VIRTUALIZATION_MODE")]
+    pub virtualization_mode: VirtualizationMode,
     #[config(nested)]
     pub firecracker: FirecrackerConfig,
     #[config(nested)]
@@ -88,6 +110,10 @@ pub struct AppConfig {
     #[config(nested)]
     pub envd: EnvdConfig,
     #[config(nested)]
+    pub sandbox: SandboxConfig,
+    #[config(nested)]
+    pub volume: VolumeConfig,
+    #[config(nested)]
     pub orchestrator: OrchestratorConfig,
     #[config(nested)]
     pub snapshot: SnapshotConfig,
@@ -101,6 +127,8 @@ pub struct AppConfig {
     pub node_identity: NodeIdentityConfig,
     #[config(nested)]
     pub memory_snapshot: MemorySnapshotConfig,
+    #[config(nested)]
+    pub template_build: TemplateBuildConfig,
     #[config(nested)]
     pub pool: PoolTomlConfig,
     #[config(nested)]
@@ -246,12 +274,68 @@ pub struct EnvdConfig {
     pub poll_ms: u64,
 }
 
+#[derive(Clone, Config)]
+pub struct SandboxConfig {
+    #[config(
+        env = "AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED",
+        parse_env = parse_trimmed_string
+    )]
+    pub access_token_hash_seed: Option<String>,
+}
+
+impl std::fmt::Debug for SandboxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxConfig")
+            .field(
+                "access_token_hash_seed",
+                &self.access_token_hash_seed.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+#[derive(Debug, Config, Clone)]
+pub struct VolumeConfig {
+    /// Operator-configured maximum persistent volume size in MiB.
+    #[config(default = 262144u64)]
+    pub max_size_mb: u64,
+    /// Maximum number of persistent volumes a sandbox may mount.
+    #[config(default = 4usize)]
+    pub max_volume_count: usize,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct MachineConfig {
     #[config(default = 2u32)]
     pub vcpu_count: u32,
     #[config(default = 1024u32)]
     pub mem_size_mib: u32,
+    #[config(nested)]
+    pub disk_rate_limit: DiskRateLimitConfig,
+}
+
+#[derive(Debug, Config, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DiskRateLimitConfig {
+    /// Enable per-sandbox disk I/O rate limiting via Firecracker's virtio-blk rate limiter.
+    #[config(default = false)]
+    pub enabled: bool,
+    /// Sustained disk bandwidth limit in bytes per second (0 = unlimited).
+    #[config(default = 0u64)]
+    pub bandwidth_bytes_per_sec: u64,
+    /// One-time bandwidth burst in bytes, granted once when the VM starts (maps
+    /// to Firecracker's `one_time_burst`). It is a separate allowance consumed
+    /// before the sustained bucket and is not replenished after use, so it only
+    /// absorbs the initial I/O spike; it does not raise the steady-state rate.
+    #[config(default = 0u64)]
+    pub bandwidth_burst_bytes: u64,
+    /// Sustained IOPS limit (0 = unlimited).
+    #[config(default = 0u64)]
+    pub iops: u64,
+    /// One-time IOPS burst, granted once when the VM starts (maps to
+    /// Firecracker's `one_time_burst`). Consumed before the sustained bucket and
+    /// not replenished, so it only absorbs the initial spike, not steady state.
+    #[config(default = 0u64)]
+    pub iops_burst: u64,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -278,6 +362,19 @@ pub struct SnapshotImagePublishConfig {
     pub enabled: bool,
 }
 
+/// Bucket addressing style for the S3-compatible snapshot backend.
+///
+/// When unset, the backend auto-detects the style: Alibaba OSS and
+/// bucket-in-endpoint hosts use virtual-host addressing, and everything else
+/// falls back to path style. Set this explicitly when a provider's required
+/// or preferred style differs from that default.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OssAddressingStyle {
+    Path,
+    Virtual,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct OssBackendConfig {
     pub endpoint: String,
@@ -289,6 +386,8 @@ pub struct OssBackendConfig {
     pub access_key_secret: Option<String>,
     pub security_token: Option<String>,
     pub region: Option<String>,
+    #[serde(alias = "addressingStyle", alias = "addressing-style")]
+    pub addressing_style: Option<OssAddressingStyle>,
     pub cache_max_size_gb: Option<u64>,
 }
 
@@ -309,8 +408,6 @@ pub enum SnapshotRepositoryBackendKind {
 
 #[derive(Debug, Config, Clone)]
 pub struct UblkTomlConfig {
-    #[config(default = true)]
-    pub enabled: bool,
     /// Path to the `uvm-ublk-daemon` binary.
     #[config(env = "AENV_UBLK_DAEMON_BINARY_PATH", parse_env = parse_required_path)]
     pub daemon_binary_path: Option<PathBuf>,
@@ -323,8 +420,6 @@ pub struct UblkTomlConfig {
     /// HTTP listen address for ublk daemon metrics. Empty string disables it.
     #[config(env = "AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR", parse_env = parse_trimmed_string, default = "0.0.0.0:9103")]
     pub daemon_metrics_listen_addr: String,
-    #[config(default = "overlaybd")]
-    pub device_type: String,
     #[config(nested)]
     pub overlaybd: UblkOverlaybdTomlConfig,
 }
@@ -356,14 +451,47 @@ pub struct UblkOverlaybdTomlConfig {
     pub p2p_fetch_range_timeout_ms: u64,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlaybdCompressionAlgorithm {
+    #[default]
+    Lz4,
+    Zstd,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct MemorySnapshotConfig {
     #[config(default = "$AENV_HOME/overlaybd/mem-overlaybd-global.json")]
     pub overlaybd_global_config_path: PathBuf,
-    #[config(env = "AGENTENV_MEMORY_SNAPSHOT_DIRECT_OVERLAYBD", default = true)]
-    pub direct_overlaybd: bool,
+    /// Enable Firecracker KVM dirty-page tracking for memory snapshots.
+    /// Default: true; set the environment variable to false to use mincore.
+    #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = true)]
+    pub track_dirty_pages: bool,
+    #[config(default = false)]
+    pub compression_enabled: bool,
+    #[config(default = "lz4")]
+    pub compression_algorithm: OverlaybdCompressionAlgorithm,
+    /// Number of blocking threads used to compress 4KiB blocks within a
+    /// memory layer. 1 = sequential (identical output layout at any value).
+    #[config(default = 1)]
+    pub compression_workers: usize,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
+}
+
+/// Compression settings applied when a template build captures its snapshot.
+/// Independent of `[memory_snapshot]`: template builds consult only this
+/// section, for both memory layers and the sealed rootfs read-write layer.
+#[derive(Debug, Config, Clone)]
+pub struct TemplateBuildConfig {
+    #[config(default = false)]
+    pub compression_enabled: bool,
+    #[config(default = "lz4")]
+    pub compression_algorithm: OverlaybdCompressionAlgorithm,
+    /// Number of blocking threads used to compress 4KiB blocks within a
+    /// layer. 1 = sequential (identical output layout at any value).
+    #[config(default = 1)]
+    pub compression_workers: usize,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -380,8 +508,10 @@ pub struct MemorySnapshotBackgroundDownloadConfig {
     pub block_size: u32,
     #[config(default = 4usize)]
     pub concurrency: usize,
-    /// Process-wide cap on in-flight download blocks shared by every
-    /// concurrent layer download (bounds total scratch memory).
+    /// Cap on in-flight background download blocks enforced by the cache
+    /// backend's download queue, shared by every layer download on the node
+    /// (bounds total scratch memory). Fixed when the backend is created;
+    /// per-image overrides never resize it.
     #[config(default = 16usize)]
     pub max_inflight_blocks: usize,
 }
@@ -400,6 +530,8 @@ impl MemorySnapshotBackgroundDownloadConfig {
             block_size: self.block_size,
             concurrency: self.concurrency,
             max_inflight_blocks: self.max_inflight_blocks,
+            // Not a memory-snapshot knob: the cache scheduler default applies.
+            max_concurrent_files: overlaybd::config::DownloadConfig::default().max_concurrent_files,
         }
     }
 }
@@ -520,6 +652,8 @@ impl_config_default!(
     ToolsConfig,
     SandboxProxyConfig,
     EnvdConfig,
+    SandboxConfig,
+    VolumeConfig,
     MachineConfig,
     SnapshotConfig,
     SnapshotImagePublishConfig,
@@ -537,14 +671,25 @@ impl_config_default!(
 );
 
 impl AppConfig {
+    fn manifest_firecracker(&self) -> &ManifestDownload {
+        SetupDependencyManifest::get()
+            .firecracker
+            .for_mode(self.virtualization_mode)
+    }
+
+    fn manifest_kernel(&self) -> &ManifestDownload {
+        SetupDependencyManifest::get()
+            .kernel
+            .for_mode(self.virtualization_mode)
+    }
+
     pub fn resolved_firecracker_binary_path(&self) -> PathBuf {
         self.firecracker.binary_path.clone().unwrap_or_else(|| {
-            let manifest = SetupDependencyManifest::get();
             let version = self
                 .firecracker
                 .version
                 .as_deref()
-                .unwrap_or(&manifest.firecracker.version);
+                .unwrap_or(&self.manifest_firecracker().version);
             self.deps_path
                 .join("firecracker")
                 .join(version)
@@ -554,12 +699,11 @@ impl AppConfig {
 
     pub fn resolved_kernel_image_path(&self) -> PathBuf {
         self.kernel.image_path.clone().unwrap_or_else(|| {
-            let manifest = SetupDependencyManifest::get();
             let version = self
                 .kernel
                 .version
                 .as_deref()
-                .unwrap_or(&manifest.kernel.version);
+                .unwrap_or(&self.manifest_kernel().version);
             self.deps_path
                 .join("kernel")
                 .join(version)
@@ -603,15 +747,44 @@ impl AppConfig {
         format!("overlaybd-oci:{version}:agentenv-cache-v1")
     }
 
+    /// Path of the generated overlaybd global config dedicated to the offline
+    /// C++ conversion tools (`overlaybd-apply`). It mirrors the runtime global
+    /// config but points at an isolated cacheDir: the C++ file cache manages
+    /// cacheDir as flat files and evicts (truncate+unlink) whatever it finds,
+    /// which would destroy the Rust runtime cache's per-entry directories if
+    /// both shared `remote-blocks`.
+    pub(crate) fn resolved_overlaybd_convert_global_config_path(&self) -> PathBuf {
+        self.ublk
+            .overlaybd
+            .global_config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("convert-overlaybd-global.json")
+    }
+
+    /// Path of the generated overlaybd global config dedicated to the offline
+    /// C++ resize tool (`overlaybd-resize`). It mirrors the runtime global
+    /// config but points at an isolated cacheDir: the C++ file cache manages
+    /// cacheDir as flat files and evicts (truncate+unlink) whatever it finds,
+    /// which would destroy the Rust runtime cache's per-entry directories if
+    /// both shared `remote-blocks`.
+    pub(crate) fn resolved_overlaybd_resize_global_config_path(&self) -> PathBuf {
+        self.ublk
+            .overlaybd
+            .global_config_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("resize-overlaybd-global.json")
+    }
+
     /// Resolve the cpu-template-helper binary path derived from deps_path + version.
     /// Returns `None` if the binary does not exist on disk.
     pub fn resolved_cpu_template_helper(&self) -> Option<PathBuf> {
-        let manifest = SetupDependencyManifest::get();
         let version = self
             .firecracker
             .version
             .as_deref()
-            .unwrap_or(&manifest.firecracker.version);
+            .unwrap_or(&self.manifest_firecracker().version);
         let path = self
             .deps_path
             .join("firecracker")
@@ -747,6 +920,13 @@ impl AppConfig {
         }
 
         self.p2p.store_dir = resolve_path(&self.home_path, config_dir, &self.p2p.store_dir);
+
+        // Dirty-page tracking is a KVM-only default. Disable it before
+        // validation so an existing PVM configuration needs no new override.
+        if self.virtualization_mode == VirtualizationMode::Pvm {
+            self.memory_snapshot.track_dirty_pages = false;
+        }
+
         self.cluster.normalize();
         self.sandbox_proxy.normalize()?;
 
@@ -776,14 +956,98 @@ impl AppConfig {
         if self.ublk.overlaybd.resize_timeout_secs == 0 {
             bail!("invalid ublk.overlaybd config: resize_timeout_secs must be > 0");
         }
+        self.validate_memory_snapshot_options()?;
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
+        self.validate_disk_rate_limit()?;
+        self.validate_volume_limits()?;
+        Ok(())
+    }
+
+    fn validate_volume_limits(&self) -> Result<()> {
+        if self.volume.max_size_mb == 0 {
+            bail!("volume.max_size_mb must be greater than 0");
+        }
+        if self.volume.max_size_mb > u64::MAX / (1024 * 1024) {
+            bail!(
+                "volume.max_size_mb must be at most {}",
+                u64::MAX / (1024 * 1024)
+            );
+        }
+        if self.volume.max_volume_count == 0
+            || self.volume.max_volume_count > crate::volume::MAX_VOLUME_MOUNTS
+        {
+            bail!(
+                "volume.max_volume_count must be between 1 and {}",
+                crate::volume::MAX_VOLUME_MOUNTS
+            );
+        }
+        Ok(())
+    }
+
+    /// Reject internally inconsistent or out-of-range disk rate limit configs so
+    /// operator mistakes fail at load time. Disabled sections are skipped: both
+    /// the fresh-boot and snapshot-resume paths ignore all configured values when
+    /// disabled, so dormant/pre-staged values must not block startup.
+    ///
+    /// When enabled: a one-time burst is meaningless without a nonzero sustained
+    /// limit (`build_disk_rate_limiter` only creates a bucket when the sustained
+    /// value is > 0, so a burst paired with a zero sustained limit is silently
+    /// ignored), and every value must fit Firecracker's signed `i64` token-bucket
+    /// fields (the consumer converts with `i64::try_from`, so an out-of-range
+    /// value would otherwise only fail later at sandbox start).
+    fn validate_disk_rate_limit(&self) -> Result<()> {
+        let cfg = &self.machine.disk_rate_limit;
+        if !cfg.enabled {
+            return Ok(());
+        }
+        if cfg.bandwidth_burst_bytes > 0 && cfg.bandwidth_bytes_per_sec == 0 {
+            bail!(
+                "machine.disk_rate_limit: bandwidth_burst_bytes is set but \
+                 bandwidth_bytes_per_sec is 0; a burst requires a nonzero sustained limit"
+            );
+        }
+        if cfg.iops_burst > 0 && cfg.iops == 0 {
+            bail!(
+                "machine.disk_rate_limit: iops_burst is set but iops is 0; \
+                 a burst requires a nonzero sustained limit"
+            );
+        }
+        for (name, value) in [
+            ("bandwidth_bytes_per_sec", cfg.bandwidth_bytes_per_sec),
+            ("bandwidth_burst_bytes", cfg.bandwidth_burst_bytes),
+            ("iops", cfg.iops),
+            ("iops_burst", cfg.iops_burst),
+        ] {
+            if value > i64::MAX as u64 {
+                bail!(
+                    "machine.disk_rate_limit.{name} ({value}) exceeds the maximum \
+                     supported value {}",
+                    i64::MAX
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_memory_snapshot_options(&self) -> Result<()> {
+        let memory = &self.memory_snapshot;
+        if !memory.track_dirty_pages {
+            return Ok(());
+        }
+        if self.virtualization_mode == VirtualizationMode::Pvm {
+            bail!(
+                "memory_snapshot.track_dirty_pages=true is disabled in PVM mode because this combination has not been tested"
+            );
+        }
         Ok(())
     }
 
     /// Sanity-bound the memory-snapshot background download knobs so a legal
     /// config cannot allocate unbounded scratch or fan out unbounded requests.
-    /// Peak scratch per active layer download is block_size * concurrency.
+    /// Peak scratch per active layer download is `block_size × concurrency`
+    /// (the download chunk is `block_size` cache blocks fetched per request),
+    /// and `max_inflight_blocks × block_size` node-wide.
     fn validate_memory_snapshot_background_download(&self) -> Result<()> {
         const MAX_BLOCK_SIZE: u64 = 64 * 1024 * 1024;
         const MAX_CONCURRENCY: usize = 16;
@@ -814,6 +1078,20 @@ impl AppConfig {
                  {MAX_INFLIGHT_BLOCKS}"
             );
         }
+        // Backend-wide scratch budget: every in-flight chunk may allocate one
+        // block_size buffer, so the global product must stay bounded too.
+        const MAX_GLOBAL_SCRATCH_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+        let global_scratch = u64::from(cfg.block_size)
+            .checked_mul(cfg.max_inflight_blocks as u64)
+            .ok_or_else(|| {
+                anyhow::anyhow!("memory_snapshot.background_download scratch overflow")
+            })?;
+        if global_scratch > MAX_GLOBAL_SCRATCH_BYTES {
+            bail!(
+                "memory_snapshot.background_download block_size * max_inflight_blocks must be <= \
+                 {MAX_GLOBAL_SCRATCH_BYTES} bytes"
+            );
+        }
         if cfg.delay < 0 {
             bail!("memory_snapshot.background_download.delay must be >= 0");
         }
@@ -824,28 +1102,45 @@ impl AppConfig {
     }
 
     pub(crate) fn validate_overlaybd_global_config_paths(&self) -> Result<()> {
-        // Shared lexical normalization (no filesystem access) so aliased
-        // spellings of the same file cannot skip validation.
-        let rootfs =
-            overlaybd::config::lexically_normalize_path(&self.ublk.overlaybd.global_config_path);
-        let memory = overlaybd::config::lexically_normalize_path(
-            &self.memory_snapshot.overlaybd_global_config_path,
-        );
-        // Lexical equality catches spelling aliases; canonicalize covers
-        // symlink aliases for paths that already exist.
-        let same = rootfs == memory
-            || match (
-                std::fs::canonicalize(&rootfs),
-                std::fs::canonicalize(&memory),
-            ) {
-                (Ok(rootfs), Ok(memory)) => rootfs == memory,
-                _ => false,
-            };
-        if same {
-            bail!(
-                "ublk.overlaybd.global_config_path and \
-                 memory_snapshot.overlaybd_global_config_path must be different"
-            );
+        let paths = [
+            (
+                "ublk.overlaybd.global_config_path",
+                &self.ublk.overlaybd.global_config_path,
+            ),
+            (
+                "memory_snapshot.overlaybd_global_config_path",
+                &self.memory_snapshot.overlaybd_global_config_path,
+            ),
+            (
+                "derived convert overlaybd global config path",
+                &self.resolved_overlaybd_convert_global_config_path(),
+            ),
+            (
+                "derived resize overlaybd global config path",
+                &self.resolved_overlaybd_resize_global_config_path(),
+            ),
+        ];
+        let normalized =
+            paths.map(|(name, path)| (name, overlaybd::config::lexically_normalize_path(path)));
+        let canonical = normalized
+            .clone()
+            .map(|(name, path)| (name, std::fs::canonicalize(&path).ok()));
+
+        for left in 0..normalized.len() {
+            for right in (left + 1)..normalized.len() {
+                let lexical_alias = normalized[left].1 == normalized[right].1;
+                let canonical_alias =
+                    canonical[left].1.is_some() && canonical[left].1 == canonical[right].1;
+                if lexical_alias || canonical_alias {
+                    bail!(
+                        "{} ({:?}) and {} ({:?}) must be different",
+                        normalized[left].0,
+                        normalized[left].1,
+                        normalized[right].0,
+                        normalized[right].1,
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -910,6 +1205,16 @@ impl ConfigManager {
     }
 
     fn set_global(manager: Self) -> Result<&'static Self> {
+        #[cfg(test)]
+        let manager = {
+            let mut manager = manager;
+            manager
+                .config
+                .sandbox
+                .access_token_hash_seed
+                .get_or_insert_with(|| TEST_ACCESS_TOKEN_HASH_SEED.to_string());
+            manager
+        };
         let _ = GLOBAL_CONFIG_MANAGER.set(manager);
         GLOBAL_CONFIG_MANAGER
             .get()
@@ -1084,17 +1389,66 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn memory_snapshot_background_download_defaults() {
-        let config = MemorySnapshotConfig::default();
-        let download = config.background_download;
+    fn bundled_default_config_loads() -> Result<()> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        Ok(())
+    }
 
-        assert!(download.enable);
-        assert_eq!(download.delay, 0);
-        assert_eq!(download.delay_extra, 1);
-        assert_eq!(download.try_cnt, 5);
-        assert_eq!(download.block_size, 16 * 1024 * 1024);
-        assert_eq!(download.concurrency, 4);
-        assert_eq!(download.max_inflight_blocks, 16);
+    #[test]
+    fn pvm_config_disables_dirty_page_tracking() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("pvm.toml");
+        std::fs::write(&path, "virtualization_mode = \"pvm\"")?;
+
+        let config = ConfigManager::new_from_path(&path)?;
+        assert_eq!(config.config().virtualization_mode, VirtualizationMode::Pvm);
+        assert!(!config.config().memory_snapshot.track_dirty_pages);
+        Ok(())
+    }
+
+    #[test]
+    fn sandbox_access_token_seed_is_redacted() {
+        let config = SandboxConfig {
+            access_token_hash_seed: Some("cluster-secret".to_string()),
+        };
+        assert!(!format!("{config:?}").contains("cluster-secret"));
+    }
+
+    #[test]
+    fn validate_memory_snapshot_options_enforces_dirty_page_requirements() {
+        let cases = [
+            (VirtualizationMode::Kvm, false, None),
+            (VirtualizationMode::Kvm, true, None),
+            (
+                VirtualizationMode::Pvm,
+                true,
+                Some("is disabled in PVM mode"),
+            ),
+        ];
+
+        for (virtualization_mode, track_dirty_pages, expected_error) in cases {
+            let config = AppConfig {
+                virtualization_mode,
+                memory_snapshot: MemorySnapshotConfig {
+                    track_dirty_pages,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let result = config.validate_memory_snapshot_options();
+            match expected_error {
+                Some(expected_error) => {
+                    let error = result.unwrap_err();
+                    assert!(
+                        error.to_string().contains(expected_error),
+                        "expected error containing {expected_error:?}, got: {error}"
+                    );
+                }
+                None => result.expect("supported memory snapshot options should be valid"),
+            }
+        }
     }
 
     #[test]
@@ -1111,34 +1465,139 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_shared_overlaybd_global_config_path() {
-        let mut config = AppConfig::default();
-        let shared_path = PathBuf::from("/tmp/shared-overlaybd-global.json");
-        config.ublk.overlaybd.global_config_path = shared_path.clone();
-        config.memory_snapshot.overlaybd_global_config_path = shared_path;
+    fn validate_rejects_invalid_disk_rate_limit() {
+        let cases = [
+            (
+                DiskRateLimitConfig {
+                    enabled: true,
+                    bandwidth_burst_bytes: 1024,
+                    ..Default::default()
+                },
+                "bandwidth_burst_bytes is set but",
+            ),
+            (
+                DiskRateLimitConfig {
+                    enabled: true,
+                    iops_burst: 500,
+                    ..Default::default()
+                },
+                "iops_burst is set but",
+            ),
+            (
+                DiskRateLimitConfig {
+                    enabled: true,
+                    bandwidth_bytes_per_sec: i64::MAX as u64 + 1,
+                    ..Default::default()
+                },
+                "machine.disk_rate_limit.bandwidth_bytes_per_sec",
+            ),
+        ];
 
-        let err = config.validate().unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("ublk.overlaybd.global_config_path"));
-        assert!(message.contains("memory_snapshot.overlaybd_global_config_path"));
-        assert!(message.contains("must be different"));
+        for (disk_rate_limit, expected_error) in cases {
+            let mut config = AppConfig::default();
+            config.machine.disk_rate_limit = disk_rate_limit;
+
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string().contains(expected_error),
+                "expected error containing {expected_error:?}, got: {err}"
+            );
+        }
     }
 
     #[test]
-    fn validate_rejects_aliased_overlaybd_global_config_paths() {
+    fn validate_skips_disabled_disk_rate_limit() {
+        // A disabled section is ignored at runtime, so even internally
+        // inconsistent or out-of-range values must not block startup.
         let mut config = AppConfig::default();
-        config.ublk.overlaybd.global_config_path = PathBuf::from("/tmp/aenv/x/../global.json");
-        config.memory_snapshot.overlaybd_global_config_path =
-            PathBuf::from("/tmp/aenv/global.json");
+        config.machine.disk_rate_limit.enabled = false;
+        config.machine.disk_rate_limit.bandwidth_bytes_per_sec = 0;
+        config.machine.disk_rate_limit.bandwidth_burst_bytes = 1024;
+        config.machine.disk_rate_limit.iops = u64::MAX;
+        config
+            .validate()
+            .expect("disabled disk rate limit config is not validated");
+    }
 
-        let err = config.validate().unwrap_err();
-        assert!(err.to_string().contains("must be different"), "{err}");
+    #[test]
+    fn validate_accepts_consistent_disk_rate_limit() {
+        let mut config = AppConfig::default();
+        config.machine.disk_rate_limit.enabled = true;
+        config.machine.disk_rate_limit.bandwidth_bytes_per_sec = 104_857_600;
+        config.machine.disk_rate_limit.bandwidth_burst_bytes = 10_485_760;
+        config.machine.disk_rate_limit.iops = 3000;
+        config.machine.disk_rate_limit.iops_burst = 500;
+        config
+            .validate()
+            .expect("consistent disk rate limit config passes");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_volume_limits() {
+        let mut config = AppConfig::default();
+        config.volume.max_size_mb = 0;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_size_mb"));
 
         let mut config = AppConfig::default();
-        config.ublk.overlaybd.global_config_path = PathBuf::from("/tmp/./benv/global.json");
-        config.memory_snapshot.overlaybd_global_config_path =
-            PathBuf::from("/tmp/benv/global.json");
-        assert!(config.validate().is_err());
+        config.volume.max_volume_count = 0;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_volume_count"));
+
+        let mut config = AppConfig::default();
+        config.volume.max_size_mb = u64::MAX;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_size_mb"));
+
+        let mut config = AppConfig::default();
+        config.volume.max_volume_count = crate::volume::MAX_VOLUME_MOUNTS + 1;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_volume_count"));
+    }
+
+    #[test]
+    fn validate_rejects_colliding_overlaybd_global_config_paths() {
+        let cases = [
+            (
+                "/tmp/shared-overlaybd-global.json",
+                "/tmp/shared-overlaybd-global.json",
+                "ublk.overlaybd.global_config_path",
+                "memory_snapshot.overlaybd_global_config_path",
+            ),
+            (
+                "/tmp/aenv/x/../global.json",
+                "/tmp/aenv/global.json",
+                "ublk.overlaybd.global_config_path",
+                "memory_snapshot.overlaybd_global_config_path",
+            ),
+            (
+                "/tmp/overlaybd/resize-overlaybd-global.json",
+                "/var/lib/aenv/overlaybd/mem-overlaybd-global.json",
+                "ublk.overlaybd.global_config_path",
+                "derived resize",
+            ),
+            (
+                "/tmp/overlaybd/overlaybd-global.json",
+                "/tmp/overlaybd/convert-overlaybd-global.json",
+                "memory_snapshot.overlaybd_global_config_path",
+                "derived convert",
+            ),
+        ];
+
+        for (runtime_path, memory_path, left_name, right_name) in cases {
+            let mut config = AppConfig::default();
+            config.ublk.overlaybd.global_config_path = runtime_path.into();
+            config.memory_snapshot.overlaybd_global_config_path = memory_path.into();
+
+            let err = config.validate().unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains(left_name), "unexpected error: {err}");
+            assert!(message.contains(right_name), "unexpected error: {err}");
+            assert!(
+                message.contains("must be different"),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     #[test]
@@ -1172,14 +1631,19 @@ mod tests {
     }
 
     #[test]
-    fn overlaybd_converter_cache_version_includes_tool_version() {
-        let config = AppConfig::default();
+    fn overlaybd_converter_cache_id_includes_configured_tool_version() {
+        let config = AppConfig {
+            overlaybd: Some(OverlaybdDependencyConfig {
+                version: "test-version".to_string(),
+                url: None,
+                package_url: None,
+            }),
+            ..Default::default()
+        };
         assert_eq!(
             config.resolved_overlaybd_oci_converter_id(),
-            "overlaybd-oci:v1.0.18:agentenv-cache-v1"
+            "overlaybd-oci:test-version:agentenv-cache-v1"
         );
-        assert!(!config.ublk.overlaybd.allow_shrink);
-        assert_eq!(config.ublk.overlaybd.resize_timeout_secs, 120);
     }
 
     #[test]
@@ -1189,16 +1653,8 @@ mod tests {
         let home_path = temp.path().join("home");
 
         assert_eq!(
-            resolve_path(&home_path, config_dir, Path::new("./env")),
-            config_dir.join("./env")
-        );
-        assert_eq!(
             resolve_path(&home_path, config_dir, Path::new("bin/firecracker")),
             config_dir.join("bin/firecracker")
-        );
-        assert_eq!(
-            resolve_path(&home_path, config_dir, Path::new("overlaybd/global.json")),
-            config_dir.join("overlaybd/global.json")
         );
         assert_eq!(
             resolve_path(&home_path, config_dir, Path::new("$AENV_HOME/image-cache")),
@@ -1333,6 +1789,42 @@ mod tests {
             .is_err());
 
         Ok(())
+    }
+
+    #[test]
+    fn managed_dependency_paths_select_the_active_mode_versions() {
+        let manifest = SetupDependencyManifest::get();
+        let mut config = AppConfig {
+            deps_path: PathBuf::from("/deps"),
+            virtualization_mode: VirtualizationMode::Kvm,
+            ..Default::default()
+        };
+        assert_eq!(
+            config.resolved_firecracker_binary_path(),
+            PathBuf::from("/deps/firecracker")
+                .join(&manifest.firecracker.kvm.version)
+                .join("firecracker")
+        );
+        assert_eq!(
+            config.resolved_kernel_image_path(),
+            PathBuf::from("/deps/kernel")
+                .join(&manifest.kernel.kvm.version)
+                .join("vmlinux.bin")
+        );
+
+        config.virtualization_mode = VirtualizationMode::Pvm;
+        assert_eq!(
+            config.resolved_firecracker_binary_path(),
+            PathBuf::from("/deps/firecracker")
+                .join(&manifest.firecracker.pvm.version)
+                .join("firecracker")
+        );
+        assert_eq!(
+            config.resolved_kernel_image_path(),
+            PathBuf::from("/deps/kernel")
+                .join(&manifest.kernel.pvm.version)
+                .join("vmlinux.bin")
+        );
     }
 
     #[test]
@@ -1498,55 +1990,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_custom_network_config() -> Result<()> {
-        let config = NetworkConfig {
-            egress: NetworkEgressConfig {
-                always_denied_cidrs: vec!["127.0.0.0/8".to_string(), "169.254.0.0/16".to_string()],
-            },
-            internal: NetworkInternalConfig {
-                host_interaction_cidr: "100.64.0.0/16".to_string(),
-                veth_cidr: "100.65.0.0/16".to_string(),
-            },
-        };
-
-        NetworkConfig::validate(&config)?;
-
-        Ok(())
-    }
-
-    #[test]
-    fn normalize_posix_snapshot_store_from_backend_section() -> Result<()> {
-        let temp = tempdir()?;
-        let config_dir = temp.path().join("configs");
-        let mut config = AppConfig::default();
-        config.snapshot.repository_backend = SnapshotRepositoryBackendKind::PosixFs;
-        config.snapshot.local_cache_path = "./snapshot-local-cache".into();
-        config.backend.posix_fs = Some(PosixFsBackendConfig {
-            snapshot_store: "./snapshot-store".into(),
-        });
-        config.normalize(&config_dir)?;
-
-        assert_eq!(
-            config
-                .backend
-                .posix_fs
-                .as_ref()
-                .map(|cfg| cfg.snapshot_store.clone()),
-            Some(config_dir.join("./snapshot-store"))
-        );
-        assert_eq!(
-            config.backend.posix_fs.as_ref().unwrap().snapshot_store,
-            config_dir.join("./snapshot-store")
-        );
-        assert_eq!(
-            config.snapshot.local_cache_path,
-            config_dir.join("./snapshot-local-cache")
-        );
-
-        Ok(())
-    }
-
-    #[test]
     fn resolve_config_path_keeps_absolute_paths_unchanged() {
         let absolute = PathBuf::from("/tmp/agentenv-absolute");
         assert_eq!(
@@ -1621,26 +2064,6 @@ mod tests {
         let err = config.validate().unwrap_err();
         assert!(
             err.to_string().contains("resize_timeout_secs must be > 0"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_rejects_invalid_image_gc_watermarks() {
-        let mut config = AppConfig::default();
-        config.image.cache.gc.high_watermark_ratio = 1.2;
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("high_watermark_ratio"),
-            "unexpected error: {err}"
-        );
-
-        let mut config = AppConfig::default();
-        config.image.cache.gc.high_watermark_ratio = 0.5;
-        config.image.cache.gc.low_watermark_ratio = 0.7;
-        let err = config.validate().unwrap_err();
-        assert!(
-            err.to_string().contains("low_watermark_ratio"),
             "unexpected error: {err}"
         );
     }

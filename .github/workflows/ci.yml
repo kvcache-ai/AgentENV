@@ -78,6 +78,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v6
+      - name: Install shell validators
+        run: sudo apt-get update && sudo apt-get install -y bash-completion fish zsh
       - name: Shell syntax
         run: bash -n scripts/install-completions.sh scripts/install-cli.sh scripts/install.sh scripts/tests/verify-completion-install.sh
       - name: Functional checks

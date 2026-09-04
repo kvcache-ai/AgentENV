@@ -23,6 +23,13 @@ pub struct FirecrackerSnapshotManifest {
     pub memory: FirecrackerMemoryArtifacts,
     pub rootfs: FirecrackerRootfsArtifacts,
     pub attached_drives: Vec<FirecrackerAttachedDriveArtifacts>,
+    /// Number of reserved virtio-block slots available for launch-time volumes.
+    #[serde(default)]
+    pub volume_drive_slots: usize,
+    /// Number of attached drives represented by IDs in the Firecracker snapshot.
+    /// Launch-time volumes use the reserved slots that follow these drives.
+    #[serde(default)]
+    pub physical_extra_drive_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +92,8 @@ impl FirecrackerSnapshotManifest {
                 virtual_size: rootfs_virtual_size,
             },
             attached_drives: Vec::new(),
+            volume_drive_slots: 0,
+            physical_extra_drive_count: attached_drives.len(),
         }
         .with_extra_drives(attached_drives)
     }
@@ -103,6 +112,8 @@ impl FirecrackerSnapshotManifest {
                 )
                 .unwrap_or_else(|_| ExtraDrive::default_mount_path(&drive.drive_id)),
                 sub_path: drive.sub_path.clone(),
+                snapshot_output_dir: None,
+                volume: false,
             })
             .collect()
     }
@@ -160,6 +171,7 @@ impl FirecrackerSnapshotManifest {
                 .join(&drive.drive_id)
                 .join("image.json");
         }
+        manifest.volume_drive_slots = 4;
 
         manifest
     }
@@ -209,6 +221,8 @@ mod tests {
                 virtual_size: 4096,
             },
             attached_drives: vec![known],
+            volume_drive_slots: 0,
+            physical_extra_drive_count: 1,
         };
 
         let drives = manifest.extra_drives();
@@ -224,6 +238,8 @@ mod tests {
             mount_path: ExtraDrive::default_mount_path("data"),
             virtual_size: None,
             sub_path: None,
+            snapshot_output_dir: None,
+            volume: false,
         };
 
         let err = FirecrackerSnapshotManifest::new(
@@ -257,6 +273,8 @@ mod tests {
             mount_path: ExtraDrive::default_mount_path("data"),
             virtual_size: Some(0),
             sub_path: None,
+            snapshot_output_dir: None,
+            volume: false,
         };
 
         let err = manifest

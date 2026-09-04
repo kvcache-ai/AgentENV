@@ -7,6 +7,8 @@ mod store;
 #[cfg(test)]
 mod mock;
 
+pub(crate) use service::ImageCacheService;
+
 pub(crate) use store::{
     local_image_services_from_app_config, local_image_services_from_global_config,
     CachedImageConfig, OverlaybdLayerLocation, OverlaybdLayerStore, RuntimeImageOwner,

@@ -11,7 +11,7 @@ use super::errors::{
 };
 use super::runner::{TemplateBuildBase, TemplateBuildContext, TemplateBuildRunner};
 use crate::cfg::ConfigManager;
-use crate::sandbox::UblkConfig;
+use crate::sandbox::{OverlaybdCompactOutput, UblkConfig};
 use crate::snapshot::{
     CommandContext, RunnableSnapshot, SnapshotId, SnapshotManager, SnapshotPublishMetadata,
     SnapshotPublishSource, SnapshotRecord, StartupCommand, TemplateBuildErrorReason,
@@ -47,6 +47,14 @@ impl TemplateBuilder {
 
     fn current_cpu_config(&self) -> Option<String> {
         self.cpu_config_arc.as_ref()?.read().unwrap().clone()
+    }
+
+    /// Snapshot compression for template builds, resolved from the isolated
+    /// `[template_build]` switch (never `[memory_snapshot]`).
+    fn snapshot_compression_from_config() -> OverlaybdCompactOutput {
+        OverlaybdCompactOutput::from_template_build_config(
+            &ConfigManager::global_config().template_build,
+        )
     }
 
     /// Builds a new snapshot from `config`, publishes it, and returns the committed record.
@@ -135,7 +143,9 @@ impl TemplateBuilder {
                     startup: build_execution.startup,
                     resources,
                     runtime_versions: build_execution.runtime_versions,
+                    virtualization_mode: context.virtualization_mode,
                     image_configs: build_execution.image_configs,
+                    volume_snapshots: Vec::new(),
                     // Template builds intentionally do not propagate the base
                     // snapshot's extension custom config: it is a per-sandbox
                     // user setting, not part of the built image content.
@@ -211,6 +221,8 @@ impl TemplateBuilder {
             steps: spec.steps().to_vec(),
             base,
             cpu_config_json: self.current_cpu_config(),
+            virtualization_mode: ConfigManager::global_config().virtualization_mode,
+            snapshot_compression: Self::snapshot_compression_from_config(),
         })
     }
 
@@ -229,6 +241,15 @@ impl TemplateBuilder {
             return Err(TemplateBuildError::invalid_input(
                 "snapshot-based build must not override the rootfs base",
             ));
+        }
+
+        let node_mode = ConfigManager::global_config().virtualization_mode;
+        let base_mode = base_snapshot.committed().virtualization_mode;
+        if base_mode != node_mode {
+            return Err(TemplateBuildError::invalid_input(format!(
+                "base snapshot '{}' uses virtualization mode '{base_mode}', but this node runs in mode '{node_mode}'",
+                base_snapshot.record().id
+            )));
         }
 
         let resources = *base_snapshot.resources();
@@ -265,6 +286,8 @@ impl TemplateBuilder {
                 base_snapshot: Box::new(base_snapshot.clone()),
             },
             cpu_config_json: self.current_cpu_config(),
+            virtualization_mode: base_mode,
+            snapshot_compression: Self::snapshot_compression_from_config(),
         })
     }
 
@@ -288,7 +311,7 @@ impl TemplateBuilder {
                 image_configs,
             } => {
                 Self::ensure_path_exists(image_config_path, "overlaybd image config")?;
-                let ublk_config = Self::load_overlaybd_build_ublk_config(image_config_path)?;
+                let ublk_config = Self::load_overlaybd_build_ublk_config(image_config_path);
                 Ok(TemplateBuildBase::Rootfs {
                     launch_rootfs_path: image_config_path.clone(),
                     ublk_config: Some(ublk_config),
@@ -298,21 +321,13 @@ impl TemplateBuilder {
         }
     }
 
-    fn load_overlaybd_build_ublk_config(
-        image_config_path: &Path,
-    ) -> TemplateBuildResult<UblkConfig> {
+    fn load_overlaybd_build_ublk_config(image_config_path: &Path) -> UblkConfig {
         let ublk = &ConfigManager::global_config().ublk;
-        if !ublk.enabled {
-            return Err(TemplateBuildError::invalid_input(
-                "overlaybd build base requires ublk to be enabled",
-            ));
-        }
-
-        Ok(UblkConfig::overlaybd_with_runtime_upper_mode(
+        UblkConfig::overlaybd_with_runtime_upper_mode(
             image_config_path.to_path_buf(),
             ublk.overlaybd.read_only,
             ublk.overlaybd.runtime_upper_mode,
-        ))
+        )
     }
 
     fn ensure_path_exists(path: &Path, kind: &str) -> TemplateBuildResult<()> {
@@ -411,6 +426,26 @@ mod tests {
     }
 
     #[test]
+    fn fresh_context_carries_template_build_snapshot_compression() {
+        use crate::types::ImageConfigs;
+
+        let tempdir = TempDir::new().expect("tempdir");
+        let image_config_path = tempdir.path().join("image.json");
+        std::fs::write(&image_config_path, "{}").expect("write image config placeholder");
+        let manager = TemplateBuilder::new();
+        let context = manager
+            .prepare_fresh_context(
+                &TemplateBuildSpec::new()
+                    .with_resolved_overlaybd_image(&image_config_path, ImageConfigs::new()),
+                crate::snapshot::SnapshotId::generate(),
+            )
+            .expect("fresh context preparation should succeed");
+
+        // The default `[template_build]` config disables compression.
+        assert_eq!(context.snapshot_compression, OverlaybdCompactOutput::Raw);
+    }
+
+    #[test]
     fn snapshot_base_context_rejects_reusing_base_snapshot_id() {
         let manager = TemplateBuilder::new();
         let runnable = RunnableSnapshot::mock();
@@ -423,6 +458,38 @@ mod tests {
             .expect_err("snapshot-based build should reject target id reuse");
 
         assert!(matches!(err, TemplateBuildError::InvalidInput { .. }));
+    }
+
+    #[test]
+    fn snapshot_base_context_rejects_other_virtualization_mode() {
+        let manager = TemplateBuilder::new();
+        let node_mode = ConfigManager::global_config().virtualization_mode;
+        let base_mode = match node_mode {
+            crate::virtualization::VirtualizationMode::Kvm => {
+                crate::virtualization::VirtualizationMode::Pvm
+            }
+            crate::virtualization::VirtualizationMode::Pvm => {
+                crate::virtualization::VirtualizationMode::Kvm
+            }
+        };
+        let mut committed = CommittedSnapshot::mock();
+        committed.virtualization_mode = base_mode;
+        let runnable =
+            RunnableSnapshot::from_test_manifest(SnapshotRecord::mock_ready(committed), Vec::new());
+
+        let error = manager
+            .prepare_snapshot_base_context(
+                &TemplateBuildSpec::new(),
+                SnapshotId::generate(),
+                &runnable,
+            )
+            .expect_err("snapshot-based build must reject the other mode");
+
+        assert!(
+            matches!(error, TemplateBuildError::InvalidInput { ref reason }
+                if reason.contains(&format!("uses virtualization mode '{base_mode}'"))
+                    && reason.contains(&format!("node runs in mode '{node_mode}'")))
+        );
     }
 
     #[test]

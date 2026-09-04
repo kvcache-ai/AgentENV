@@ -18,7 +18,7 @@
 #
 # Build example:
 #
-#   make -C tools-image TOOLS_VERSION=0.1.0 ENVD_REF=2026.16
+#   make -C tools-image TOOLS_VERSION=0.1.0 ENVD_REF=2026.17
 #
 # Important build args:
 #   TOOLS_VERSION        Immutable AgentENV tools drive release version.
@@ -29,8 +29,7 @@
 
 ARG BUSYBOX_IMAGE=busybox:1.37.0-musl
 ARG DEBIAN_VERSION=bookworm
-ARG GO_VERSION=1.25.4
-ARG TARGETPLATFORM=linux/amd64
+ARG GO_VERSION=1.25.9
 ARG TOOLS_VERSION=0.1.0
 
 # ---------------------------------------------------------------------------
@@ -41,7 +40,7 @@ ARG TOOLS_VERSION=0.1.0
 # ---------------------------------------------------------------------------
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-${DEBIAN_VERSION} AS envd-builder
 
-ARG ENVD_REF=2026.16
+ARG ENVD_REF=2026.17
 ARG ENVD_UPSTREAM_REPO=https://github.com/e2b-dev/infra.git
 ARG TARGETARCH
 

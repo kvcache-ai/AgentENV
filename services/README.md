@@ -69,13 +69,22 @@ Start scheduler:
 make run-scheduler
 ```
 
-Start gateway:
+Start gateway with the same API key configured on every AgentENV runtime node:
 
 ```bash
+export AENV_API_KEY="e2b_$(openssl rand -hex 32)"
 make run-gateway
 ```
 
 The default local config uses `127.0.0.1:9090` for the scheduler.
+
+The gateway and runtime nodes require the same API key for control-plane APIs.
+The gateway reads `AENV_API_KEY` or `/run/secrets/api-key`; it does not generate
+a key. The gateway routes data-plane requests without authenticating them
+because only the owning runtime has the sandbox policy needed to distinguish
+public ingress, private ingress, and secure envd. Private application proxy
+requests use the sandbox response's `trafficAccessToken` in the
+`e2b-traffic-access-token` header; secure envd requests use `X-Access-Token`.
 
 ## Scheduler configuration
 
@@ -176,6 +185,7 @@ LOG_FORMAT=json make run-gateway
 From **repository root**, start gateway + scheduler + two backend nodes:
 
 ```bash
+# Run scripts/docker-setup.sh first for host prerequisites.
 make deploy-up
 ```
 

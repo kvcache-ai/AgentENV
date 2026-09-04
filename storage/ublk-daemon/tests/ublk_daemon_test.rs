@@ -463,66 +463,6 @@ mod client_tests {
         assert!(format!("{err:#}").contains("unexpected response"));
     }
 
-    // ── create_cow ──────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn create_cow_success() {
-        let server = MockServer::start(Box::new(|req| match req {
-            DaemonRequest::CreateCow { origin, cow } => {
-                assert_eq!(origin, PathBuf::from("/origin.img"));
-                assert_eq!(cow, PathBuf::from("/cow.img"));
-                DaemonResponse::DeviceCreated {
-                    dev_id: 3,
-                    device_path: PathBuf::from("/dev/ublkb3"),
-                }
-            }
-            _ => DaemonResponse::Error {
-                message: "unexpected".into(),
-            },
-        }))
-        .await;
-
-        let client = server.client();
-        let (dev_id, path) = client
-            .create_cow(Path::new("/origin.img"), Path::new("/cow.img"))
-            .await
-            .unwrap();
-        assert_eq!(dev_id, 3);
-        assert_eq!(path, PathBuf::from("/dev/ublkb3"));
-    }
-
-    #[tokio::test]
-    async fn create_cow_error() {
-        let server = MockServer::start(Box::new(|_| DaemonResponse::Error {
-            message: "origin not found".into(),
-        }))
-        .await;
-
-        let client = server.client();
-        let err = client
-            .create_cow(Path::new("/origin"), Path::new("/cow"))
-            .await
-            .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("origin not found"), "error: {msg}");
-    }
-
-    #[tokio::test]
-    async fn create_cow_unexpected_response() {
-        let server = MockServer::start(Box::new(|_| DaemonResponse::RestackSnapshotCreated {
-            descriptor: None,
-        }))
-        .await;
-
-        let client = server.client();
-        let err = client
-            .create_cow(Path::new("/o"), Path::new("/c"))
-            .await
-            .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("unexpected"), "error: {msg}");
-    }
-
     // ── delete ──────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -576,6 +516,8 @@ mod client_tests {
                     digest: "sha256:abc".to_string(),
                     size: 4096,
                 }),
+                data_stat: None,
+                ext4_used_bytes: None,
             },
             _ => DaemonResponse::Error {
                 message: "unexpected".into(),
@@ -584,12 +526,12 @@ mod client_tests {
         .await;
 
         let client = server.client();
-        let descriptor = client
+        let stats = client
             .restack_snapshot(2, Path::new("/snapshots/layer0"))
             .await
             .unwrap();
         assert_eq!(
-            descriptor,
+            stats.descriptor,
             Some(overlaybd::LayerDescriptor {
                 digest: "sha256:abc".to_string(),
                 size: 4096,
@@ -600,7 +542,7 @@ mod client_tests {
     #[tokio::test]
     async fn snapshot_error() {
         let server = MockServer::start(Box::new(|_| DaemonResponse::Error {
-            message: "snapshot not supported for cow".into(),
+            message: "snapshot failed".into(),
         }))
         .await;
 
@@ -610,7 +552,7 @@ mod client_tests {
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
-        assert!(msg.contains("snapshot not supported"), "error: {msg}");
+        assert!(msg.contains("snapshot failed"), "error: {msg}");
     }
 
     #[tokio::test]
@@ -734,12 +676,6 @@ mod client_tests {
         assert!(format!("{err:#}").contains("not running"));
 
         let err = client
-            .create_cow(Path::new("/o"), Path::new("/c"))
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("not running"));
-
-        let err = client
             .restack_snapshot(0, Path::new("/out"))
             .await
             .unwrap_err();
@@ -763,14 +699,12 @@ mod client_tests {
                     dev_id: 10,
                     device_path: PathBuf::from("/dev/ublkb10"),
                 },
-                DaemonRequest::CreateCow { .. } => DaemonResponse::DeviceCreated {
-                    dev_id: 20,
-                    device_path: PathBuf::from("/dev/ublkb20"),
-                },
                 DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
-                DaemonRequest::RestackSnapshot { .. } => {
-                    DaemonResponse::RestackSnapshotCreated { descriptor: None }
-                }
+                DaemonRequest::RestackSnapshot { .. } => DaemonResponse::RestackSnapshotCreated {
+                    descriptor: None,
+                    data_stat: None,
+                    ext4_used_bytes: None,
+                },
                 DaemonRequest::Shutdown => DaemonResponse::Ok,
                 DaemonRequest::GetFeatures => DaemonResponse::Features { flags: 0 },
                 DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
@@ -798,34 +732,25 @@ mod client_tests {
             .create_overlaybd(Path::new("/config/img.json"), Path::new("/global.json"))
             .await
             .unwrap();
-        client
-            .create_cow(Path::new("/origin.bin"), Path::new("/cow.bin"))
-            .await
-            .unwrap();
         client.delete(30).await.unwrap();
         client
             .restack_snapshot(40, Path::new("/snap/output"))
             .await
             .unwrap();
         let requests = captured.lock().unwrap();
-        assert_eq!(requests.len(), 4);
+        assert_eq!(requests.len(), 3);
 
         assert!(requests[0].contains("CreateOverlaybd"));
         assert!(requests[0].contains("img.json"));
         assert!(requests[0].contains("global.json"));
         assert!(!requests[0].contains("dev_id"));
 
-        assert!(requests[1].contains("CreateCow"));
-        assert!(requests[1].contains("origin.bin"));
-        assert!(requests[1].contains("cow.bin"));
-        assert!(!requests[1].contains("dev_id"));
+        assert!(requests[1].contains("Delete"));
+        assert!(requests[1].contains("30"));
 
-        assert!(requests[2].contains("Delete"));
-        assert!(requests[2].contains("30"));
-
-        assert!(requests[3].contains("RestackSnapshot"));
-        assert!(requests[3].contains("40"));
-        assert!(requests[3].contains("output"));
+        assert!(requests[2].contains("RestackSnapshot"));
+        assert!(requests[2].contains("40"));
+        assert!(requests[2].contains("output"));
     }
 }
 
@@ -872,7 +797,12 @@ mod server_tests {
 
         let image_service = test_image_service(dir.path()).await;
         let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
-        let server = UblkDaemonServer::new(sock_path.clone(), ctrl_ring, image_service);
+        let server = UblkDaemonServer::new(
+            sock_path.clone(),
+            ctrl_ring,
+            image_service,
+            dir.path().join("resize-overlaybd-global.json"),
+        );
 
         // Run server in background.
         let server_task = tokio::spawn(async move { server.run().await });
@@ -911,6 +841,7 @@ mod server_tests {
             sock_path.clone(),
             ctrl_ring,
             image_service,
+            dir.path().join("resize-overlaybd-global.json"),
         ));
 
         let server_clone = Arc::clone(&server);
@@ -946,6 +877,7 @@ mod server_tests {
             sock_path.clone(),
             ctrl_ring,
             image_service,
+            dir.path().join("resize-overlaybd-global.json"),
         ));
 
         let server_clone = Arc::clone(&server);
@@ -977,7 +909,12 @@ mod server_tests {
 
         let image_service = test_image_service(dir.path()).await;
         let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
-        let server = UblkDaemonServer::new(sock_path.clone(), ctrl_ring, image_service);
+        let server = UblkDaemonServer::new(
+            sock_path.clone(),
+            ctrl_ring,
+            image_service,
+            dir.path().join("resize-overlaybd-global.json"),
+        );
 
         // Server should fail because the socket is in use.
         let result = server.run().await;
@@ -997,6 +934,7 @@ mod server_tests {
             sock_path.clone(),
             ctrl_ring,
             image_service,
+            dir.path().join("resize-overlaybd-global.json"),
         ));
 
         let server_clone = Arc::clone(&server);
@@ -1041,6 +979,7 @@ mod server_tests {
             sock_path.clone(),
             ctrl_ring,
             image_service,
+            dir.path().join("resize-overlaybd-global.json"),
         ));
 
         let server_clone = Arc::clone(&server);
@@ -1085,6 +1024,7 @@ mod server_tests {
             sock_path.clone(),
             ctrl_ring,
             image_service,
+            dir.path().join("resize-overlaybd-global.json"),
         ));
 
         let server_clone = Arc::clone(&server);
@@ -1125,6 +1065,7 @@ mod server_tests {
             sock_path.clone(),
             ctrl_ring,
             image_service,
+            dir.path().join("resize-overlaybd-global.json"),
         ));
 
         let server_clone = Arc::clone(&server);

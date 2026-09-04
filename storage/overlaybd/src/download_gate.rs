@@ -115,6 +115,11 @@ impl Drop for BkReadPermit {
 /// Those tests hold this mutex for their whole body, so their foreground
 /// guard can never leak into a concurrently running download test and park
 /// its block reads at the floor (which would flake concurrency assertions).
+/// `gate_block_read` holds the mutex only for a single admission check —
+/// never across the parking sleep — so a parked download cannot starve the
+/// tests that serialize on it. Tests that manipulate the counters directly
+/// (the gate unit tests in this module) instead hold the
+/// mutex for their whole body and call `gate_block_read_inner` directly.
 /// Production code never touches this.
 #[cfg(test)]
 static GATE_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -130,21 +135,51 @@ static GATE_TEST_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 /// The check-then-increment race can briefly push the floor one block higher
 /// than configured; that is benign and accepted over taking a lock.
 pub(crate) async fn gate_block_read(running: &AtomicBool) -> Option<BkReadPermit> {
-    #[cfg(test)]
-    let _test_guard = GATE_TEST_MUTEX.lock().await;
-    gate_block_read_inner(running).await
+    loop {
+        {
+            // Hold the test mutex only for this admission check, never across
+            // the parking sleep, so a parked download cannot starve tests
+            // that serialize on GATE_TEST_MUTEX.
+            #[cfg(test)]
+            let _test_guard = GATE_TEST_MUTEX.lock().await;
+            if let Some(permit) = try_admit_block_read(running) {
+                return Some(permit);
+            }
+            if !running.load(Ordering::SeqCst) {
+                return None;
+            }
+        }
+        tokio::time::sleep(GATE_BACKOFF).await;
+    }
 }
 
+/// One admission check: admit immediately unless foreground reads are in
+/// flight and the background floor is used up.
+fn try_admit_block_read(running: &AtomicBool) -> Option<BkReadPermit> {
+    if !running.load(Ordering::SeqCst) {
+        return None;
+    }
+    let foreground_busy = FG_REMOTE_INFLIGHT.load(Ordering::SeqCst) > 0;
+    if !foreground_busy {
+        BK_REMOTE_INFLIGHT.fetch_add(1, Ordering::SeqCst);
+        return Some(BkReadPermit);
+    }
+    BK_REMOTE_INFLIGHT
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |background| {
+            (background < BK_FLOOR_INFLIGHT).then_some(background + 1)
+        })
+        .ok()
+        .map(|_| BkReadPermit)
+}
+
+#[cfg(test)]
 async fn gate_block_read_inner(running: &AtomicBool) -> Option<BkReadPermit> {
     loop {
+        if let Some(permit) = try_admit_block_read(running) {
+            return Some(permit);
+        }
         if !running.load(Ordering::SeqCst) {
             return None;
-        }
-        let foreground_busy = FG_REMOTE_INFLIGHT.load(Ordering::SeqCst) > 0;
-        let background = BK_REMOTE_INFLIGHT.load(Ordering::SeqCst);
-        if !foreground_busy || background < BK_FLOOR_INFLIGHT {
-            BK_REMOTE_INFLIGHT.fetch_add(1, Ordering::SeqCst);
-            return Some(BkReadPermit);
         }
         tokio::time::sleep(GATE_BACKOFF).await;
     }
@@ -189,6 +224,46 @@ mod tests {
             .await
             .expect("admitted after release");
         assert!(third.is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn gate_floor_is_exact_under_concurrent_admission() {
+        let _serialize = GATE_TEST_MUTEX.lock().await;
+        let _fg = FgReadGuard::new();
+        let running = AtomicBool::new(true);
+        // Holding GATE_TEST_MUTEX blocks new admissions from concurrent
+        // download tests, but permits granted before we locked it may still
+        // be live. Wait for them to drain so every iteration starts at BK=0.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while BK_REMOTE_INFLIGHT.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pre-existing background permits must drain");
+        for _ in 0..50 {
+            let barrier = std::sync::Barrier::new(32);
+            let admitted = std::thread::scope(|scope| {
+                let handles = (0..32)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            try_admit_block_read(&running)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .filter_map(|handle| handle.join().expect("admission thread"))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                admitted.len(),
+                1,
+                "foreground pressure admits only the floor"
+            );
+            drop(admitted);
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

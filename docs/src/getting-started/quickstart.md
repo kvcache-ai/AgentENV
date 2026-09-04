@@ -2,12 +2,15 @@
 
 ## Prerequisites
 
-- **Linux kernel 6.8+**; the install script additionally requires **Ubuntu 24.04**
+- **Linux kernel 6.8+**
 - `/dev/kvm` access for Firecracker microVM execution
 
+> If your server does not support standard KVM, use the dedicated
+> [PVM Deployment](../deployment/pvm.md) guide instead.
+
 The install script attempts to install missing download and checksum commands,
-provisions KVM permissions, loads the `ublk_drv` kernel module, and downloads
-all runtime assets on first run.
+provisions `/dev/kvm` permissions, loads the `ublk_drv` kernel module, and
+downloads the required AgentENV runtime assets.
 
 Installation requires root, but the installed service does not run as root. It
 uses a dedicated `aenv` system account with `CAP_NET_ADMIN` and
@@ -17,7 +20,7 @@ uses a dedicated `aenv` system account with `CAP_NET_ADMIN` and
 
 ### 1. Install and start the server
 
-**Option A — Install Script (Linux x86_64)**
+**Option A — Install Script**
 
 The script installs both the server and the `aenv` CLI. Set `AENV_HOME_PATH` to
 choose the data directory; if it is not set, AENV stores runtime dependencies
@@ -47,6 +50,7 @@ default. Transient namespace and daemon-socket state lives under `/run/aenv`.
 curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/docker-setup.sh | sudo bash
 docker pull ghcr.io/kvcache-ai/aenv-server:latest
 docker run --rm -it \
+  --name aenv-server \
   --device /dev/kvm --privileged -v /dev:/dev \
   -p 8000:8000 \
   ghcr.io/kvcache-ai/aenv-server:latest
@@ -58,6 +62,7 @@ To customize the server configuration, download and edit the configuration file,
 curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/config/default.toml -o config.toml
 vim config.toml
 docker run --rm -it \
+  --name aenv-server \
   --device /dev/kvm --privileged -v /dev:/dev \
   -v "$PWD/config.toml:/workspace/config/default.toml:ro" \
   -p 8000:8000 \
@@ -84,13 +89,22 @@ curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/in
 
 ### 3. Authenticate
 
+The server generates the key on its first normal startup. Native installations
+reuse the managed key; a normal Docker container keeps it in its writable
+container layer:
+
+```bash
+# Native
+sudo cat /var/lib/aenv/secrets/api-key
+# Docker
+docker exec aenv-server cat /workspace/env/secrets/api-key
+```
+
 ```bash
 aenv auth
 # AENV server URL [http://localhost:8000]: http://127.0.0.1:8000
-# API key: dummy
+# API key: <paste the generated key>
 ```
-
-For local development, any non-empty string works as the API key.
 
 ### 4. Pull a template and run a sandbox
 
@@ -102,6 +116,7 @@ aenv start ubuntu            # starts a sandbox and attaches an interactive shel
 ## Next Steps
 
 - [Deployment](../deployment/manual-compile.md) — build from source, multi-node options
+- [PVM Deployment](../deployment/pvm.md) — deploy when standard KVM is unavailable
 - [Core Concepts](../concepts/overview.md) — how sandboxes, templates, and snapshots work
 - [E2B](../integration/e2b.md) — SDK and CLI compatibility
 - [API Reference](../api/index.md) — full HTTP API

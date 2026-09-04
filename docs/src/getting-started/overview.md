@@ -38,3 +38,4 @@ AgentENV exposes an HTTP API. There are four ways to use it:
 
 - **[Quick Start](./quickstart.md)** — Install the server, run your first sandbox. Takes ~5 minutes on a supported Linux host.
 - **[Deployment](../deployment/manual-compile.md)** — Build from source, Docker Compose multi-node, or Kubernetes.
+- **[PVM Deployment](../deployment/pvm.md)** — Use AgentENV on a server where standard KVM is unavailable.

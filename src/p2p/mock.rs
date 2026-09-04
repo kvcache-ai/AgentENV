@@ -26,6 +26,8 @@ pub(crate) struct MockTransport {
     pub(crate) fetch_bytes_count: Arc<AtomicUsize>,
     pub(crate) fetch_range_count: Arc<AtomicUsize>,
     pub(crate) publish_count: Arc<AtomicUsize>,
+    pub(crate) unpublish_count: Arc<AtomicUsize>,
+    pub(crate) unpublished_keys: Arc<RwLock<Vec<P2pArtifactKey>>>,
     pub(crate) lookup_delay: Option<Duration>,
     pub(crate) fetch_range_delay: Option<Duration>,
     pub(crate) fail_lookup: Arc<AtomicBool>,
@@ -180,6 +182,8 @@ impl P2pTransport for MockTransport {
     }
 
     async fn unpublish(&self, key: &P2pArtifactKey) -> P2pResult<bool> {
+        self.unpublish_count.fetch_add(1, Ordering::Relaxed);
+        self.unpublished_keys.write().await.push(key.clone());
         let removed = self.descriptors.write().await.remove(key).is_some();
         self.blobs.write().await.remove(key);
         debug!(?key, removed, "unpublished");

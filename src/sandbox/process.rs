@@ -182,13 +182,13 @@ impl ProcessHandle {
 /// A handle for executing processes inside a running sandbox.
 ///
 /// Obtained via [`SandboxExecutor::executor`][crate::sandbox::SandboxExecutor::executor].
-/// Holds a borrow of the sandbox's [`EnvdInstance`] so no clone is performed on each command dispatch.
-pub struct Executor<'a> {
-    envd_instance: &'a EnvdInstance,
+/// Owns a lightweight clone of the sandbox's envd connection settings.
+pub struct Executor {
+    envd_instance: EnvdInstance,
 }
 
-impl<'a> Executor<'a> {
-    pub(super) fn new(envd_instance: &'a EnvdInstance) -> Self {
+impl Executor {
+    pub(super) fn new(envd_instance: EnvdInstance) -> Self {
         Self { envd_instance }
     }
 

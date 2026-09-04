@@ -61,7 +61,13 @@ impl Snapshots<()> for ApiImpl {
     ) -> Result<SnapshotsGetResponse, ()> {
         let cursor = match query_params.next_token.as_deref() {
             Some(token) => match PaginationCursor::<SnapshotId>::parse(token) {
-                Ok(cursor) => cursor,
+                Ok(cursor) if cursor.is_descending() => cursor,
+                Ok(_) => {
+                    return Ok(SnapshotsGetResponse::Status400_BadRequest(Self::error(
+                        400,
+                        "next token was issued for a different sort order".to_string(),
+                    )));
+                }
                 Err(err) => {
                     return Ok(SnapshotsGetResponse::Status400_BadRequest(Self::error(
                         400,
@@ -69,7 +75,7 @@ impl Snapshots<()> for ApiImpl {
                     )));
                 }
             },
-            None => PaginationCursor::new(SystemTime::now(), SnapshotId::max()),
+            None => PaginationCursor::new_descending(SystemTime::now(), SnapshotId::max()),
         };
 
         let summaries = match self
@@ -100,7 +106,7 @@ impl Snapshots<()> for ApiImpl {
                 )
             },
             |record| {
-                PaginationCursor::new(
+                PaginationCursor::new_descending(
                     system_time_from_unix_ms(record.created_at_unix_ms),
                     record.id.clone(),
                 )

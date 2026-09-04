@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
 use uvm_ublk_daemon::{
-    CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotTerminalFailure, UblkDaemonClient,
-    UblkDaemonSpawnConfig,
+    CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotStats, RestackSnapshotTerminalFailure,
+    UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 
 use super::overlaybd::OverlaybdConfig;
@@ -27,10 +27,30 @@ pub struct UblkConfig {
     pub backend: UblkBackend,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub enum UblkBackend {
-    Cow,
     Overlaybd(OverlaybdConfig),
+}
+
+impl<'de> Deserialize<'de> for UblkBackend {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum PersistedUblkBackend {
+            #[serde(rename = "Cow")]
+            LegacyCow,
+            Overlaybd(OverlaybdConfig),
+        }
+
+        match PersistedUblkBackend::deserialize(deserializer)? {
+            PersistedUblkBackend::Overlaybd(config) => Ok(Self::Overlaybd(config)),
+            PersistedUblkBackend::LegacyCow => Err(serde::de::Error::custom(
+                "the legacy CoW ublk backend is no longer supported; this persisted sandbox cannot be resumed and must be rebuilt with OverlayBD",
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -49,12 +69,6 @@ pub(crate) struct OverlaybdRuntimeDevice {
 }
 
 impl UblkConfig {
-    pub fn cow() -> Self {
-        Self {
-            backend: UblkBackend::Cow,
-        }
-    }
-
     pub fn overlaybd(image_config_path: PathBuf, read_only: bool) -> Self {
         Self::overlaybd_with_runtime_upper_mode(
             image_config_path,
@@ -83,6 +97,8 @@ pub struct UblkDaemonConfig {
     pub daemon_binary: PathBuf,
     pub socket_path: PathBuf,
     pub global_config: PathBuf,
+    /// OverlayBD global config used by the daemon only for overlaybd-resize.
+    pub resize_global_config: PathBuf,
     pub app_config: Option<PathBuf>,
     /// Log file path for the daemon. If `None`, the daemon logs to stderr.
     pub log_file: Option<PathBuf>,
@@ -99,20 +115,16 @@ pub struct UblkDaemonConfig {
 impl UblkDaemonConfig {
     /// Resolve daemon configuration from the application config.
     ///
-    /// Returns `Ok(None)` if ublk is not enabled. Returns `Err` if ublk is
-    /// enabled but the daemon binary cannot be found (fail-fast).
-    pub fn from_app_config(config: &crate::cfg::AppConfig) -> Result<Option<Self>> {
+    /// Returns `Err` if the daemon binary cannot be found (fail-fast).
+    pub fn from_app_config(config: &crate::cfg::AppConfig) -> Result<Self> {
         let ublk = &config.ublk;
-        if !ublk.enabled {
-            return Ok(None);
-        }
         let daemon_binary = ublk
             .daemon_binary_path
             .clone()
             .or_else(|| which::which("uvm-ublk-daemon").ok())
             .ok_or_else(|| {
                 anyhow!(
-                    "ublk is enabled but daemon binary not found; \
+                    "ublk daemon binary not found; \
                      set ublk.daemon_binary_path in config or ensure uvm-ublk-daemon is in PATH"
                 )
             })?;
@@ -121,10 +133,11 @@ impl UblkDaemonConfig {
         let runtime_device_timeout =
             runtime_device_timeout(config.ublk.overlaybd.resize_timeout_secs);
 
-        Ok(Some(Self {
+        Ok(Self {
             daemon_binary,
             socket_path: ublk.daemon_socket_path.clone(),
             global_config: ublk.overlaybd.global_config_path.clone(),
+            resize_global_config: config.resolved_overlaybd_resize_global_config_path(),
             app_config: crate::cfg::ConfigManager::global()
                 .config_path()
                 .map(PathBuf::from),
@@ -133,7 +146,7 @@ impl UblkDaemonConfig {
             pool_config,
             p2p_publish_url: None,
             runtime_device_timeout,
-        }))
+        })
     }
 }
 
@@ -197,6 +210,7 @@ impl UblkDeviceManager {
                             binary_path: &cfg.daemon_binary,
                             socket_path: cfg.socket_path,
                             global_config: &cfg.global_config,
+                            resize_global_config: &cfg.resize_global_config,
                             app_config: cfg.app_config.as_deref(),
                             log_file: cfg.log_file.as_deref(),
                             metrics_listen_addr: &cfg.metrics_listen_addr,
@@ -223,10 +237,9 @@ impl UblkDeviceManager {
 
     /// Convenience: resolve daemon config from [`AppConfig`] and initialize.
     ///
-    /// Returns an error if ublk is enabled but the daemon binary cannot be
-    /// found. Returns `Ok(())` if ublk is disabled or initialization succeeds.
+    /// Returns an error if the daemon binary cannot be found.
     pub async fn init_global_from_config(config: &crate::cfg::AppConfig) -> Result<()> {
-        Self::init_global(UblkDaemonConfig::from_app_config(config)?).await;
+        Self::init_global(Some(UblkDaemonConfig::from_app_config(config)?)).await;
         Ok(())
     }
 
@@ -236,10 +249,8 @@ impl UblkDeviceManager {
         p2p_publish_url: Option<&str>,
     ) -> Result<()> {
         let mut daemon_config = UblkDaemonConfig::from_app_config(config)?;
-        if let Some(cfg) = daemon_config.as_mut() {
-            cfg.p2p_publish_url = p2p_publish_url.map(|s| s.to_string());
-        }
-        Self::init_global(daemon_config).await;
+        daemon_config.p2p_publish_url = p2p_publish_url.map(|s| s.to_string());
+        Self::init_global(Some(daemon_config)).await;
         Ok(())
     }
 
@@ -252,16 +263,15 @@ impl UblkDeviceManager {
             .expect("UblkDeviceManager::init_global() must be called before global()")
     }
 
-    /// Returns `true` if the ublk daemon client is available (i.e. ublk is
-    /// enabled in the config and the daemon was successfully spawned).
-    pub fn is_enabled(&self) -> bool {
+    /// Returns `true` if the ublk daemon client was successfully spawned.
+    pub fn is_available(&self) -> bool {
         self.client.is_some()
     }
 
     fn require_client(&self) -> Result<&Arc<UblkDaemonClient>> {
         self.client
             .as_ref()
-            .context("ublk daemon client not initialized; is ublk enabled in config?")
+            .context("ublk daemon client is unavailable")
     }
 
     /// Tell the daemon the sandbox owning `device_key` finished booting,
@@ -389,6 +399,7 @@ impl UblkDeviceManager {
         &self,
         device: &UblkDevice,
         output_layer_path: &Path,
+        kind: &'static str,
     ) -> Result<Option<overlaybd::LayerDescriptor>> {
         let client = self.require_client()?;
         debug!(
@@ -402,15 +413,16 @@ impl UblkDeviceManager {
             .await;
         metric.finish(&result);
         match result {
-            Ok(descriptor) => {
+            Ok(stats) => {
+                record_restack_usage_stats(device.dev_id, kind, &stats);
                 debug!(
                     dev_id = device.dev_id,
                     output = %output_layer_path.display(),
-                    digest = descriptor.as_ref().map(|d| d.digest.as_str()),
-                    size = descriptor.as_ref().map(|d| d.size),
+                    digest = stats.descriptor.as_ref().map(|d| d.digest.as_str()),
+                    size = stats.descriptor.as_ref().map(|d| d.size),
                     "overlaybd restack snapshot completed"
                 );
-                Ok(descriptor)
+                Ok(stats.descriptor)
             }
             Err(err) => {
                 if err
@@ -691,5 +703,50 @@ pub(crate) struct UblkDevice {
 impl UblkDevice {
     pub fn device_path(&self) -> &Path {
         &self.device_path
+    }
+}
+
+/// Record per-device overlaybd/ext4 usage gauges piggybacked on a restack RPC.
+fn record_restack_usage_stats(dev_id: u32, kind: &'static str, stats: &RestackSnapshotStats) {
+    let dev_id = dev_id.to_string();
+    if let Some(stat) = &stats.data_stat {
+        metrics::gauge!(
+            "agentenv_overlaybd_data_bytes",
+            "dev_id" => dev_id.clone(),
+            "kind" => kind,
+            "stat" => "valid",
+        )
+        .set(stat.valid_data_size as f64);
+    }
+    if let Some(used) = stats.ext4_used_bytes {
+        metrics::gauge!(
+            "agentenv_ext4_used_bytes",
+            "dev_id" => dev_id.clone(),
+            "kind" => kind,
+        )
+        .set(used as f64);
+        if let Some(stat) = &stats.data_stat {
+            metrics::gauge!(
+                "agentenv_trim_reclaimable_bytes",
+                "dev_id" => dev_id,
+                "kind" => kind,
+            )
+            .set(stat.valid_data_size.saturating_sub(used) as f64);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_persisted_cow_backend_with_migration_guidance() {
+        let error = serde_json::from_str::<UblkBackend>(r#""Cow""#)
+            .expect_err("persisted CoW backend must be rejected");
+        let message = error.to_string();
+
+        assert!(message.contains("cannot be resumed"), "error: {message}");
+        assert!(message.contains("OverlayBD"), "error: {message}");
     }
 }

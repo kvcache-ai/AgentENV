@@ -4,55 +4,41 @@ AgentENV runs AI agents inside isolated, snapshot-capable Firecracker microVMs. 
 
 ## System Overview
 
+```mermaid
+flowchart TD
+    subgraph node[AgentENV Node]
+        direction TB
+        api["API<br/>(Axum)"] --> orchestrator["Orchestrator<br/>(lifecycle)"]
+        orchestrator --> vm["Firecracker VM"]
+        vm --> rootfs["/dev/vda (rootfs)"]
+        rootfs --> ublkN["ublk (/dev/ublkbN)<br/>userspace block device"]
+        ublkN --> overlay["overlaybd"]
+        overlay --> upper["upper<br/>(r/w)"]
+        overlay --> layer0["layer 0, 1, 2, ...<br/>(r/o)"]
+        vm --> extra["/dev/vdb (extra)"]
+        extra --> ublkExtra["ublk device"]
+        ublkExtra --> overlayExtra["overlaybd<br/>(extra drive)"]
+        vm --> memory["VM memory"]
+        memory --> ublkM["ublk (/dev/ublkbM)<br/>read-only memory block device (shared across same-snapshot sandboxes via refcounting)"]
+        ublkM --> memLayers["overlaybd<br/>(mem layers)"]
+        memLayers --> snapN["snap N<br/>(r/o)"]
+        memLayers --> snap0["snap 0, 1, 2, ...<br/>(r/o)"]
+    end
+    style node fill:transparent,stroke:gray
 ```
-                    ┌───────────────────────────────────────────────────────────┐
-                    │                       AgentENV Node                       │
-                    │                                                           │
-                    │  ┌──────────┐   ┌──────────────┐                          │
-                    │  │ API      │──>│ Orchestrator │                          │
-                    │  │ (Axum)   │   │ (lifecycle)  │                          │
-                    │  └──────────┘   └──────┬───────┘                          │
-                    │                        │                                  │
-                    │              ┌─────────▼───────────┐                      │
-                    │              │  Firecracker VM     │                      │
-                    │              │                     │                      │
-                    │              │  /dev/vda (rootfs)  │                      │
-                    │              │  /dev/vdb (extra)───┼───┐                  │
-                    │              │  VM memory ─────────┼───┼──┐               │
-                    │              │                     │   │  │               │
-                    │              └─────────────────────┘   │  │               │
-                    │                                        │  │               │
-                    │    Block device path:                  │  │               │
-                    │              ┌────────────────────────▼──┐│               │
-                    │              │  ublk (/dev/ublkbN)       ││               │
-                    │              │  userspace block device   ││               │
-                    │              └────────────┬──────────────┘│               │
-                    │                           │               │               │
-                    │              ┌─────────────▼─────────────┐│               │
-                    │              │  overlaybd                ││               │
-                    │              │  ┌───────┐ ┌───────┐      ││               │
-                    │              │  │ upper │ │layer 0│ ...  ││               │
-                    │              │  │ (r/w) │ │(r/o)  │      ││               │
-                    │              │  └───────┘ └───────┘      ││               │
-                    │              └───────────────────────────┘│               │
-                    │                                           │               │
-                    │    Memory restore path:                   │               │
-                    │              ┌────────────────────────────▼───┐           │
-                    │              │  ublk (/dev/ublkbM)            │           │
-                    │              │  read-only memory block device │           │
-                    │              │  (shared across same-snapshot  │           │
-                    │              │   sandboxes via refcounting)   │           │
-                    │              └────────────┬───────────────────┘           │
-                    │                           │                               │
-                    │              ┌─────────────▼──────────────┐               │
-                    │              │  overlaybd (mem layers)    │               │
-                    │              │  ┌───────┐ ┌───────┐       │               │
-                    │              │  │snap N │ │snap 0 │ ...   │               │
-                    │              │  │(r/o)  │ │(r/o)  │       │               │
-                    │              │  └───────┘ └───────┘       │               │
-                    │              └────────────────────────────┘               │
-                    └───────────────────────────────────────────────────────────┘
-```
+
+## Key Components
+
+| Component | Location | Responsibility |
+|---|---|---|
+| **API Server** | `src/api/` | Exposes the E2B-compatible HTTP API and reverse proxy endpoints. |
+| **Orchestrator** | `src/orchestrator/` | Coordinates sandbox lifecycle transitions, persistence, and cleanup. |
+| **Firecracker Runtime** | `src/sandbox/firecracker/` | Creates and controls the microVM used by each sandbox. |
+| **Block Device Layer** | `storage/overlaybd/`, `storage/ublk/` | Provides layered root filesystems, attached drives, and snapshot-backed block devices. |
+| **envd Integration** | `thirdparty/envd/`, `src/sandbox/` | Handles in-guest command execution, file operations, process interaction, and health reporting. |
+| **Reverse Proxy** | `src/api/proxy.rs` | Routes HTTP, SSE, and WebSocket traffic to services inside sandboxes. |
+| **Snapshot Manager** | `src/snapshot/` | Commits, resolves, and deletes durable sandbox snapshots. |
+| **Template Builder** | `src/template/` | Builds user-facing templates and publishes their committed snapshots. |
 
 ## Storage 
 
@@ -82,7 +68,7 @@ LSMT (Log Structured Merge Tree) based layered image format.
 
 ### ublk (`storage/ublk/`)
 
-Async userspace block device server using Linux's ublk kernel driver. Exposes overlaybd images (or raw CoW files) as `/dev/ublkbN` block devices.
+Async userspace block device server using Linux's ublk kernel driver. Exposes OverlayBD images as `/dev/ublkbN` block devices.
 
 **Device lifecycle**:
 1. `UVMUblkCtrlBuilder` sends `ADD` to `/dev/ublk-control` via io_uring `UringCmd`
@@ -91,19 +77,18 @@ Async userspace block device server using Linux's ublk kernel driver. Exposes ov
 4. Kernel dispatches block I/O to mmap'd `ublksrv_io_desc` arrays; userspace processes them asynchronously
 5. `delete_dev()` tears down the device
 
-**Target implementations** (`UVMUblkTarget` trait):
+**Target implementation** (`UVMUblkTarget` trait):
 - `OverlaybdTarget`: wraps `ImageFile` for full layered image I/O
-- `BasicCowTarget`: chunk-based copy-on-write over a read-only origin file. Per-chunk `AtomicU8` state tracking (Origin -> Copying -> Cow) prevents duplicate copies. Coalesces adjacent reads.
 
 **I/O buffers**: `AutoRegBuffer` (zero-copy via sparse buffer table, kernel 6.8+) or `UserBuffer` (traditional allocation).
 
-**Key files**: `lib.rs` (public API), `ctrl.rs` (device controller), `dev.rs` (device + queue management), `queue.rs` (I/O descriptor handling), `io_buffer.rs`, `impls/cow.rs`, `impls/overlaybd_target.rs`.
+**Key files**: `lib.rs` (public API), `ctrl.rs` (device controller), `dev.rs` (device + queue management), `queue.rs` (I/O descriptor handling), `io_buffer.rs`, `impls/overlaybd_target.rs`.
 
 ### ublk-daemon (`storage/ublk-daemon/`)
 
 Long-running daemon process (`uvm-ublk-daemon`) that manages all ublk devices in one process and communicates with the AgentENV node over a Unix domain socket.
 
-- Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD/COW device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.
+- Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.
 - `UblkDaemonClient` spawns and monitors the daemon process from the node runtime.
 - `UblkDeviceManager` (`src/sandbox/ublk/device.rs`) is the node-facing singleton that delegates lifecycle operations to the daemon client; device IDs are allocated in the daemon.
 
@@ -129,13 +114,15 @@ Memory snapshot restore uses ublk-backed overlaybd devices rather than userfault
 
 **Sharing**: Multiple sandboxes booting from the same snapshot template share a single memory ublk device via reference counting. This allows the Linux page cache to be reused across all sandboxes using the same memory image, significantly reducing I/O for concurrent launches from the same template.
 
-**Memory snapshot creation**: On pause, Firecracker's native diff snapshot (`SnapshotType::Diff`) produces a sparse `mem.bin` (using mincore internally to find present pages). This sparse file is then packaged into an overlaybd layer via `convert_sparse_mem_to_overlaybd`. Parent layers from previous snapshots are stacked, forming the full layered memory image.
+**Memory snapshot creation**: On pause, Firecracker creates a state-only diff snapshot. AgentENV queries Firecracker's dirty/present memory ranges, reads the selected memory with `process_vm_readv`, and directly creates the OverlayBD memory layer. Parent layers from previous snapshots are stacked, forming the full layered memory image.
 
 > **Note**: `storage/uffd-core/` contains an alternative userfaultfd-based memory restore implementation that is retained for reference but excluded from the workspace build.
 
 ## Per-Node Subsystems
 
-Each node is an AgentENV server binary (`src/bin/server.rs`) on a Linux host with `/dev/kvm`.
+Each node is an AgentENV server binary (`src/bin/server.rs`) on a Linux host
+with `/dev/kvm` and one configured virtualization mode. KVM is the default;
+PVM currently requires x86_64 and the `kvm_pvm` host module.
 
 | Subsystem | Location | Responsibility |
 |-----------|----------|---------------|
@@ -149,16 +136,7 @@ Each node is an AgentENV server binary (`src/bin/server.rs`) on a Linux host wit
 
 ### Sandbox Networking
 
-Sandbox networking is managed by a process-wide `NetworkManager` (`src/sandbox/network/manager.rs`) plus per-slot `Slot` objects (`src/sandbox/network/slot.rs`).
-
-- Each slot owns a stable index-derived address bundle from `[network.internal]` (defaulting to `10.11.0.0/16` and `10.12.0.0/16`) plus the fixed VM tap link `169.254.0.20/30`, together with the host veth name, namespace path, and iptables rules for one sandbox network namespace.
-- Network policy supports base allow/deny plus explicit egress rules. The `/sandboxes/{sandboxID}/network` endpoint replaces per-sandbox `allowOut` (CIDR/IP/domain patterns) and `denyOut` (CIDR/IP only) rules at runtime; allow rules always take precedence.
-- `allocate_any()` first tries a warm-slot pool and falls back to creating a new namespace/veth/tap/iptables setup on demand.
-- Warm-pool maintenance uses a single Condvar-driven background worker with low/high watermarks.
-- `release()` enqueues slots back to the warm pool; when maintenance is enabled, even releases above high watermark are first enqueued and then drained asynchronously by the worker.
-- `[pool]` provides shared watermarks and `[pool.network].maintenance_enabled` controls network worker behavior.
-- Because the manager is a process-wide singleton, orchestrator shutdown explicitly calls `NetworkManager::shutdown()` after deleting remaining sandboxes so cached slots are drained and no new allocations race with teardown.
-- Although calling `NetworkManager::shutdown()` on exit is recommended for clean teardown, the manager also has a `Drop` and `libc::atexit` handler to best-effort cleanup of any remaining namespaces and veth interfaces on unexpected shutdown and during testing.
+The network subsystem is managed by a process-wide `NetworkManager` and per-slot `Slot` objects. See [Sandbox Network Architecture](./networking.md) for the namespace topology, address plan, packet paths, firewall ordering, egress proxy, policy replacement, warm-pool behavior, and verification steps.
 
 Snapshot resume can also use `[pool.firecracker]` to pre-spawn `(network slot, Firecracker process)` pairs. A warm entry transfers its network slot, process, and Firecracker CWD to the resumed sandbox, which avoids the spawn and API-socket wait in the resume critical path. `[pool.block]` controls the ublk daemon's overlaybd warm-device pool; it shares the same top-level watermarks but performs async refill from request paths because reusable block devices are image/size-specific.
 
@@ -216,13 +194,13 @@ See [P2P Artifact Transport](./p2p-design.md) for the detailed design.
 
 The multi-node control plane in `services/` routes client traffic across multiple AgentENV backend nodes.
 
-```
-    Client ──HTTP──> Gateway (:8080) ──gRPC──> Scheduler (:9090)
-                        │                          │
-                        │    ┌─────────────────────┘
-                        │    │ node selection / lookup
-                        ▼    ▼
-                   Node A (:8000)    Node B (:8000)
+```mermaid
+flowchart LR
+    client["Client"] -->|HTTP| gateway["Gateway<br/>(:8080)"]
+    gateway -->|gRPC| scheduler["Scheduler<br/>(:9090)"]
+    gateway -->|proxy HTTP| nodeA["Node A<br/>(:8000)"]
+    gateway -->|proxy HTTP| nodeB["Node B<br/>(:8000)"]
+    scheduler -.->|node selection /<br/> lookup result| gateway
 ```
 
 **Gateway** (`services/gateway/`): HTTP reverse proxy. Extracts sandbox data-plane routes from headers (`x-agentenv-sandbox-id` / `e2b-sandbox-id`) or configured host-based proxy domains (`{port}-{sandboxID}.{domain}`). Host-based routes are only enabled for explicit `gateway.sandbox_proxy_domains` entries, require RFC 952/1123 DNS-label-compatible sandbox IDs, and require the full `{port}-{sandboxID}` label to fit the 63-character DNS label limit. Runtime nodes have their own `[sandbox_proxy].domains` setting for the same host-based URL shape and return the first configured domain in sandbox metadata. In multi-node deployments, repository helpers can apply one `SANDBOX_PROXY_DOMAINS` value to both gateway and runtime node configuration. Sandbox control-plane routes such as `/sandboxes/{id}/pause` are routed by sandbox ID from the URL path; sandbox data-plane traffic is not inferred from URL path alone. For new sandboxes, calls `Schedule()` to pick a node. For existing sandboxes, calls `LookupNode()`. After sandbox creation, calls `RecordAssignment()` to seed a sandbox-to-node binding. Without explicit routing headers, it also handles cluster aggregation of `GET /sandboxes`, `GET /v2/sandboxes`, `GET /nodes`, and resolves `GET /nodes/{id}` via scheduler before proxying to the resolved node.
@@ -246,10 +224,11 @@ Discovery modes:
 **Deployment**:
 
 ```bash
+export AENV_API_KEY="e2b_$(openssl rand -hex 32)" # shared by local runtime and gateway processes
 # local dev (single node)
 make start-server && make -C services run-scheduler && make -C services run-gateway
 
-# docker compose (multi-node)
+# docker compose (multi-node; shared auth volume is provisioned automatically)
 make deploy-up     # gateway + scheduler + 2 backend nodes
 make deploy-down   # teardown
 
@@ -261,6 +240,7 @@ make k8s-apply
 In Kubernetes deployments, AgentENV runtime nodes run as a privileged DaemonSet
 so each host gets exactly one runtime Pod with access to `/dev/kvm`,
 iptables/network-namespace operations, and a hostPath-backed workspace cache.
+Runtime Pods on a host must all use the host's selected KVM/PVM mode.
 The deployment helpers materialize the DaemonSet ConfigMap from `config/default.toml`
 at render/apply time so AgentENV runtime config remains single-sourced.
 
@@ -290,7 +270,6 @@ storage/
 │   ├── queue.rs                # I/O descriptor handling
 │   ├── io_buffer.rs            # zero-copy + traditional buffers
 │   └── impls/                  # target implementations
-│       ├── cow.rs              # BasicCowTarget
 │       └── overlaybd_target.rs # OverlaybdTarget
 ├── ublk-daemon/src/            # ublk daemon (unix socket RPC)
 │   ├── client.rs               # daemon client used by node runtime

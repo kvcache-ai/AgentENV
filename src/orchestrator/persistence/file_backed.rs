@@ -14,6 +14,7 @@ use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::orchestrator::{store::SandboxMetadata, SandboxState};
 use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
 use crate::types::SandboxId;
+use crate::virtualization::VirtualizationMode;
 
 const RECORD_VERSION: u32 = 1;
 const RECORD_DB_DIR: &str = "records.db";
@@ -53,6 +54,12 @@ impl PersistedPausedRecord {
 
         Ok(self.metadata)
     }
+
+    fn into_metadata_without_runtime_state(mut self) -> SandboxMetadata {
+        self.metadata.state = SandboxState::Paused;
+        self.metadata.paused_state = None;
+        self.metadata
+    }
 }
 
 fn decode_record(bytes: &[u8]) -> PersistenceResult<PersistedPausedRecord> {
@@ -78,21 +85,29 @@ fn ensure_supported_version(version: u32) -> PersistenceResult<()> {
 
 pub struct FileBackedSandboxPersister {
     root: PathBuf,
+    virtualization_mode: VirtualizationMode,
     durability: LocalStoreDurability,
     db: OnceCell<LocalKvStore>,
 }
 
 impl FileBackedSandboxPersister {
-    pub fn new(root: PathBuf) -> Self {
-        Self::with_durability(root, LocalStoreDurability::Sync)
-    }
-
-    pub fn with_durability(root: PathBuf, durability: LocalStoreDurability) -> Self {
+    pub fn new(root: PathBuf, virtualization_mode: VirtualizationMode) -> Self {
         Self {
             root,
-            durability,
+            virtualization_mode,
+            durability: LocalStoreDurability::Sync,
             db: OnceCell::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(root: PathBuf) -> Self {
+        Self::new(root, VirtualizationMode::Kvm)
+    }
+
+    pub fn with_durability(mut self, durability: LocalStoreDurability) -> Self {
+        self.durability = durability;
+        self
     }
 
     fn records_db_path(&self) -> PathBuf {
@@ -266,6 +281,18 @@ impl SandboxPersister for FileBackedSandboxPersister {
                 continue;
             }
 
+            if record.metadata.virtualization_mode != self.virtualization_mode {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    record_mode = %record.metadata.virtualization_mode,
+                    node_mode = %self.virtualization_mode,
+                    "loading paused sandbox metadata without resumable runtime state because its virtualization mode is incompatible"
+                );
+                retained_artifacts.insert(sandbox_id);
+                sandboxes.push(record.into_metadata_without_runtime_state());
+                continue;
+            }
+
             match record.into_metadata(factory) {
                 Ok(metadata) => {
                     retained_artifacts.insert(sandbox_id);
@@ -422,6 +449,7 @@ mod tests {
             &self,
             _sandbox_id: SandboxId,
             _state: &dyn PausedSandboxState,
+            _envd_access_token: Option<crate::sandbox::EnvdAccessToken>,
         ) -> Result<Box<dyn SandboxBackend>> {
             unreachable!("persister tests only decode state")
         }
@@ -441,10 +469,8 @@ mod tests {
     }
 
     fn test_persister(root: &Path) -> FileBackedSandboxPersister {
-        FileBackedSandboxPersister::with_durability(
-            root.to_path_buf(),
-            LocalStoreDurability::Memory,
-        )
+        FileBackedSandboxPersister::new_for_test(root.to_path_buf())
+            .with_durability(LocalStoreDurability::Memory)
     }
 
     async fn persist_test_record(
@@ -454,6 +480,7 @@ mod tests {
         let paused_state = paused_state(snapshot_root);
         let metadata = SandboxMetadata {
             id: SandboxId::new(),
+            virtualization_mode: persister.virtualization_mode,
             paused_state: Some(Arc::clone(&paused_state)),
             ..Default::default()
         };
@@ -501,6 +528,68 @@ mod tests {
             .expect("paused state should be restored")
             .downcast_ref::<MockSnapshot>()
             .is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn paused_record_from_other_mode_is_visible_but_not_resumable() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let kvm_persister = test_persister(temp.path());
+        let snapshot_root = temp.path().join("artifacts");
+        let (sandbox_id, _paused_state) =
+            persist_test_record(&kvm_persister, &snapshot_root).await?;
+        drop(kvm_persister);
+        let pvm_persister =
+            FileBackedSandboxPersister::new(temp.path().to_path_buf(), VirtualizationMode::Pvm)
+                .with_durability(LocalStoreDurability::Memory);
+
+        let loaded = pvm_persister.load_all(&MockBackendFactory::new()).await?;
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, sandbox_id);
+        assert_eq!(loaded[0].state, SandboxState::Paused);
+        assert_eq!(loaded[0].virtualization_mode, VirtualizationMode::Kvm);
+        assert!(loaded[0].paused_state.is_none());
+        assert!(has_record(&pvm_persister, &sandbox_id).await?);
+        assert!(snapshot_root.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mixed_mode_records_are_both_visible_and_retained() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let kvm_persister = test_persister(temp.path());
+        let kvm_root = temp.path().join("kvm-artifacts");
+        let (kvm_id, _kvm_state) = persist_test_record(&kvm_persister, &kvm_root).await?;
+        drop(kvm_persister);
+
+        let pvm_persister =
+            FileBackedSandboxPersister::new(temp.path().to_path_buf(), VirtualizationMode::Pvm)
+                .with_durability(LocalStoreDurability::Memory);
+        let pvm_root = temp.path().join("pvm-artifacts");
+        let (pvm_id, _pvm_state) = persist_test_record(&pvm_persister, &pvm_root).await?;
+
+        let mut loaded = pvm_persister.load_all(&MockBackendFactory::new()).await?;
+        loaded.sort_by_key(|metadata| metadata.id);
+
+        let kvm_metadata = loaded
+            .iter()
+            .find(|metadata| metadata.id == kvm_id)
+            .expect("KVM metadata should remain visible");
+        assert_eq!(kvm_metadata.virtualization_mode, VirtualizationMode::Kvm);
+        assert!(kvm_metadata.paused_state.is_none());
+
+        let pvm_metadata = loaded
+            .iter()
+            .find(|metadata| metadata.id == pvm_id)
+            .expect("PVM metadata should load");
+        assert_eq!(pvm_metadata.virtualization_mode, VirtualizationMode::Pvm);
+        assert!(pvm_metadata.paused_state.is_some());
+
+        assert!(has_record(&pvm_persister, &kvm_id).await?);
+        assert!(has_record(&pvm_persister, &pvm_id).await?);
+        assert!(kvm_root.exists());
+        assert!(pvm_root.exists());
         Ok(())
     }
 

@@ -5,21 +5,16 @@ Run a full multi-node stack on a single host using Docker Compose. This simulate
 For a real multi-machine deployment without Kubernetes, see
 [Static Multi-Node](./static-multi-node.md).
 
-## What Gets Started
-
-| Service | Port | Description |
-|---------|------|-------------|
-| Gateway | `:8080` | HTTP/WebSocket reverse proxy |
-| Scheduler | `:9090` | gRPC node selection and sandbox binding |
-| agentenv-a | `:8001` | AgentENV runtime node A |
-| agentenv-b | `:8002` | AgentENV runtime node B |
-
 ## Prerequisites
 
 - Linux kernel 6.8+
 - `/dev/kvm` access (passed into the runtime containers)
-- Docker and Docker Compose
-- `build-essential` (`sudo apt install -y build-essential`)
+- Docker Engine with Docker Compose v2 (`docker compose version`)
+- `curl` for the verification commands
+
+The checked-in Compose setup uses standard KVM. If the host does not support
+it, read [PVM Deployment](./pvm.md) before adapting the runtime image and host
+configuration.
 
 ## Clone the Repository
 
@@ -34,6 +29,26 @@ cd AgentENV
 sudo bash scripts/docker-setup.sh
 make deploy-up
 ```
+
+`make deploy-up` builds the runtime, gateway, and scheduler images with Docker Compose
+before starting the stack. The Rust and Go toolchains are installed in the image
+build stages, so they are not required on the host.
+
+To build without starting, run `make deploy-build`. To start images that are
+already built, run `make deploy-up-no-build`:
+
+```bash
+# Build only
+make deploy-build
+
+# Start previously built images
+make deploy-up-no-build
+```
+
+On first startup, the runtime nodes atomically generate one API key and sandbox
+access-token seed in the shared `agentenv-auth` volume. The gateway mounts that
+volume read-only and reads the API key; sandbox tokens are validated by the
+runtime nodes. Normal `make deploy-down` calls preserve both values.
 
 To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when starting the stack:
@@ -51,13 +66,16 @@ usually through wildcard DNS for `*.sandbox.example.com`.
 
 ```bash
 # Health check via gateway
-curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8000/health
 
-# Cluster node snapshots via gateway
-curl http://127.0.0.1:8080/nodes
+# Authenticated cluster node snapshots via gateway
+export AENV_API_KEY="$(docker compose -f deploy/docker-compose.yml exec -T agentenv-a \
+  cat /workspace/env/secrets/api-key)"
+curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8000/nodes
 
-# Direct health check on a backend node
-curl http://127.0.0.1:8001/health
+# Health check from inside a backend container
+docker compose -f deploy/docker-compose.yml exec -T agentenv-a \
+  curl -fsS http://127.0.0.1:8000/health
 ```
 
 ## Management Commands
@@ -68,11 +86,22 @@ make deploy-logs    # Stream logs from all services
 make deploy-down    # Tear down the cluster
 ```
 
+Removing Compose volumes with `docker compose down -v` also removes both
+secrets. The next startup generates new values, so existing clients and sandbox
+access tokens are invalidated.
+
+To use an existing API key instead of the generated value, export
+`AENV_API_KEY` before starting the stack. Compose passes it to the gateway and
+both runtime nodes:
+
+```bash
+export AENV_API_KEY="e2b_..."
+make deploy-up
+```
+
 ## Configuration
 
 Container deployments use `deploy/docker/config/default.json`. Scheduler and backend node endpoints are configured for the Docker network.
-
-The runtime image includes `uvm-ublk` at `/usr/local/bin/uvm-ublk`. Compose uses that path instead of a host-built `env/ublk/uvm-ublk` binary.
 
 The compose manifest also wires node heartbeat reporting from runtime nodes to scheduler:
 

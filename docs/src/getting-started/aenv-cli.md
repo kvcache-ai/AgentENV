@@ -27,7 +27,7 @@ Save the server URL and API key. Credentials are stored at `~/.config/aenv/crede
 ```bash
 aenv auth
 # AENV server URL [http://localhost:8000]: The address of the AgentENV server
-# API key: dummy (Any non-empty string works for local development.)
+# API key: <the server's configured or generated API key>
 ```
 
 ---
@@ -45,27 +45,33 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 
 | Flag | Description |
 |------|-------------|
-| `--name <name>` | Override the template name |
+| `--name <name>` | Override the template name. Defaults to the image's repository segment. |
+| `--cpu <count>` | CPU cores for the template. Defaults to `[machine].vcpu_count` on the server. Alias: `--cpu-count`. |
+| `--memory <MiB>` | Memory for the template. Defaults to `[machine].mem_size_mib` on the server. Aliases: `--memory-mb`, `--mem`. |
 | `--start-cmd <cmd>` | Shell command to run inside the sandbox before capturing the template snapshot |
-| `--ready-cmd <cmd>` | Shell command used to wait until the sandbox is ready (polled until it exits 0) |
-| `--probe <PORT>` | Wait until `localhost:<PORT>` accepts TCP connections |
+| `--ready-cmd <cmd>` | Shell command polled until it exits 0. Defaults to `sleep 20` when `--start-cmd` is set; otherwise unset. |
+| `--probe <PORT>` | Wait until `localhost:<PORT>` accepts TCP connections. Conflicts with `--ready-cmd`. |
 | `-d, --detach` | Submit the build and return immediately without waiting |
-| `--timeout <SECS>` | Maximum seconds to wait for the build to complete |
+| `--timeout <SECS>` | Maximum seconds to wait for the build to complete. No timeout by default. Conflicts with `--detach`. |
 
-### `aenv build <dockerfile>`
+### `aenv build <dockerfile> --name <name>`
 
 Create a template from a local Dockerfile.
 
 ```bash
-aenv build ./Dockerfile
-aenv build ./Dockerfile -t my-app
-aenv build ./Dockerfile --image ghcr.io/myorg/base:latest
+aenv build ./Dockerfile --name my-app
+aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
 ```
 
 | Flag | Description |
 |------|-------------|
-| `-t, --tag <name>` | Template name. Defaults to the parent directory name |
-| `--image <image>` | Override the `FROM` image used as the rootfs base |
+| `--name <name>` | Required template name |
+| `--cpu <count>` | CPU cores for the template. Defaults to `[machine].vcpu_count` on the server. Alias: `--cpu-count`. |
+| `--memory <MiB>` | Memory for the template. Defaults to `[machine].mem_size_mib` on the server. Aliases: `--memory-mb`, `--mem`. |
+| `--image <image>` | Override the rootfs base. Defaults to the first concrete `FROM` image, then the server's `[image.resolver].default_image` if none is usable. Alias: `--user-image`. |
+
+`aenv build` submits the build and returns immediately. Use
+`aenv template watch <template>` to wait for completion.
 
 ### `aenv template list`
 
@@ -75,6 +81,10 @@ List all templates. Alias: `aenv template ls`, `aenv templates list`.
 aenv template list
 aenv template list --output json
 ```
+
+| Flag | Description |
+|------|-------------|
+| `--output <table\|json>` | Output format. Defaults to table on a TTY and JSON when redirected. |
 
 ### `aenv template watch <template>`
 
@@ -100,22 +110,27 @@ aenv template delete <template-id>
 
 ### `aenv start <target>`
 
-Start a sandbox and attach an interactive shell. `<target>` is a template name or template UUID.
+Start a sandbox and attach an interactive shell. `<target>` accepts a template
+or snapshot ID or alias, or an OCI image reference with `--cold`.
 
 ```bash
 aenv start my-ubuntu
 aenv start --cold ubuntu:24.04              # start directly from an OCI image
 ```
 
+Sandboxes started by `aenv` always require token-authenticated envd access. The
+CLI obtains and manages the access token automatically.
+
 | Flag | Description |
 |------|-------------|
 | `--cold` | Start directly from an external OCI image instead of a template |
 | `--timeout <secs>` | Sandbox TTL in seconds (default: 300) |
-| `--cpu-count <n>` / `--cpu` | CPU cores — only valid with `--cold` |
-| `--memory-mb <n>` / `--mem` | Memory in MiB — only valid with `--cold` |
+| `--cpu <count>` | CPU cores; only valid with `--cold`. Defaults to `[machine].vcpu_count` on the server. Alias: `--cpu-count`. |
+| `--memory <MiB>` | Memory in MiB; only valid with `--cold`. Defaults to `[machine].mem_size_mib` on the server. Aliases: `--memory-mb`, `--mem`. |
+| `--disk-size-mb <MiB>` | Root filesystem size; only valid with `--cold`. Defaults to the source image's virtual size; an explicit value must be at least 1024 and divisible by 1024 MiB. Alias: `--disk-mb`. |
 | `-d, --detach` | Print the sandbox ID and exit without attaching a shell |
 
-`<target>` accepts a template UUID, template name, or (with `--cold`) an OCI image reference.
+CPU, memory, and disk overrides are supported only for cold starts.
 
 ### `aenv pause <sandbox-id>`
 
@@ -135,7 +150,7 @@ aenv resume <sandbox-id>
 
 | Flag | Description |
 |------|-------------|
-| `--timeout <secs>` | TTL in seconds from now (default: 300) |
+| `--timeout <secs>` | TTL in seconds from now (default: 300). Must be longer than the sandbox's current remaining TTL. |
 
 ### `aenv timeout <sandbox-id> <seconds>`
 
@@ -227,7 +242,9 @@ List all sandboxes. Alias: `aenv ls`.
 aenv list
 ```
 
-Outputs a table on a TTY and JSON when piped. Override with `--output table|json`.
+| Flag | Description |
+|------|-------------|
+| `--output <table\|json>` | Output format. Defaults to table on a TTY and JSON when redirected. |
 
 ### `aenv delete <sandbox-id>`
 
@@ -237,6 +254,52 @@ Kill and delete a sandbox. Alias: `aenv rm`.
 aenv delete <sandbox-id>
 aenv rm <sandbox-id>
 ```
+
+---
+
+## Volumes
+
+### `aenv volume create <name>`
+
+Create an independent persistent volume. Volumes default to 65536 MiB (64 GiB)
+and `exclusive` mode.
+
+```bash
+aenv volume create workspace
+aenv volume create models --mode ro --image ghcr.io/example/models:latest
+aenv volume create job-workspace --from-volume workspace
+```
+
+| Flag | Description |
+|------|-------------|
+| `--size-mb <MiB>` | Volume size. A copy-on-write fork must use the same size as its source. |
+| `--mode <exclusive\|ro>` | Access mode. Exclusive volumes are writable by one sandbox; read-only volumes can be shared. |
+| `--from-volume <volume>` | Create a copy-on-write fork from an existing volume ID or name. |
+| `--image <image>` | Initialize the volume from an OCI image. |
+
+We recommend creating an exclusive fork for each sandbox instead of mounting a
+shared writable volume directly:
+
+```bash
+aenv volume create job-data --mode exclusive --from-volume dataset-base
+aenv start ubuntu --volume /workspace/data=job-data
+```
+
+See [Volumes](../concepts/volumes.md) for access-mode semantics, lifecycle
+behavior, automatic sandbox fork and snapshot handling, and complete CLI and
+HTTP API examples.
+
+### Inspect and delete volumes
+
+```bash
+aenv volume list
+aenv volume list --output json
+aenv volume inspect job-data
+aenv volume delete job-data
+```
+
+A mounted volume cannot be deleted. `aenv volume ls` is an alias for
+`aenv volume list`.
 
 ---
 
@@ -253,7 +316,7 @@ aenv snapshot create <sandbox-id> --name my-base
 
 | Flag | Description |
 |------|-------------|
-| `--name <name>` | Snapshot name or alias |
+| `--name <name>` | Snapshot name or alias. If omitted, the generated snapshot ID identifies the snapshot. |
 
 When source-registry image publication is enabled on the server, the command also prints the published OverlayBD-native image reference on an `Image:` line; that tag can be used directly as a `userImage`.
 
@@ -269,20 +332,119 @@ aenv snapshot list --sandbox-id <sandbox-id>
 | Flag | Description |
 |------|-------------|
 | `--sandbox-id <id>` | Filter snapshots by source sandbox ID |
-| `--output <format>` | Output format: `table` (default on TTY) or `json` |
+| `--output <table\|json>` | Output format. Defaults to table on a TTY and JSON when redirected. |
 
 The table output includes an `IMAGE REF` column (`-` when no image was published); JSON output includes the optional `imageRef` field.
 
 To delete a snapshot, use `aenv template delete <snapshot-id>` or `aenv template delete <name>` — snapshots share the same underlying store as templates and are deleted through the same command.
 
-## Automatic shell completion installation
+---
 
-The CLI installers install completion loaders into standard shell completion directories. `make install-aenv`, `scripts/install-cli.sh`, and the full `scripts/install.sh` installer manage only the completion files and never modify `.bashrc`, `.zshrc`, or Fish configuration files. `make uninstall-aenv` removes files created by the Make-based install while preserving unmanaged files.
+## Shell completion
 
-For a user-local Make install, use `AENV_INSTALL_PREFIX=~/.local AENV_INSTALL_SUDO= make install-aenv`. If Zsh does not find the installed user completion directory, add this before `compinit`:
+`aenv completion <shell>` prints a shell-completion registration script for the
+`aenv` CLI to stdout. Supported shells: `bash`, `zsh`, and `fish`.
+
+The script registers a completion function that calls back into the `aenv`
+binary at completion time (`COMPLETE=<shell> aenv ...`), so completion logic
+always matches the installed CLI version — upgrading `aenv` does not require
+regenerating the script. The script invokes `aenv` by name, so the binary must
+be on your `PATH`.
+
+### Generate and install a script
+
+#### Bash
+
+```bash
+mkdir -p ~/.local/share/bash-completion/completions
+aenv completion bash > ~/.local/share/bash-completion/completions/aenv
+```
+
+The Bash completion file is loaded on demand by
+[`bash-completion`](https://github.com/scop/bash-completion).
+This requires `bash-completion` to be installed and initialized in the current
+shell.
+
+#### Zsh
+
+```zsh
+mkdir -p ~/.local/share/zsh/site-functions
+aenv completion zsh > ~/.local/share/zsh/site-functions/_aenv
+```
+
+Zsh loads completion functions from directories listed in `fpath`.
+`~/.local/share/zsh/site-functions` is not included in `fpath` by default on
+all systems. Add the following lines to `~/.zshrc` before any existing
+`compinit` invocation:
 
 ```zsh
 fpath=(~/.local/share/zsh/site-functions $fpath)
 autoload -Uz compinit
 compinit
 ```
+
+#### Fish
+
+```shell
+mkdir -p ~/.config/fish/completions
+aenv completion fish > ~/.config/fish/completions/aenv.fish
+```
+
+### Activate without installing
+
+To test completion for the current shell session without saving a generated
+file:
+
+```bash
+source <(aenv completion bash)         # Bash
+eval "$(aenv completion zsh)"         # Zsh
+aenv completion fish | source          # Fish
+```
+
+### What completion covers
+
+Static completion covers the full CLI surface:
+
+```bash
+aenv <TAB>                       # top-level commands
+aenv snapshot <TAB>              # nested subcommands (create, list, ...)
+aenv list --output <TAB>         # enum values: table, json
+aenv build ./<TAB>               # local path arguments
+```
+
+Commands that take a sandbox ID also complete live sandbox IDs dynamically,
+filtered to the states each command accepts:
+
+| Command | Completed sandboxes |
+|---------|--------------------|
+| `pause`, `exec`, `timeout`, `upload`, `download`, `snapshot create` | running |
+| `resume` | paused |
+| `connect`, `delete` | running and paused |
+
+```bash
+aenv resume <TAB>                # paused sandbox IDs
+aenv exec <TAB>                  # running sandbox IDs
+```
+
+Where the shell supports it, candidates carry a description with the sandbox's
+template and state.
+
+Dynamic lookup is best-effort: it uses short timeouts (500 ms connect, 1 s
+request) and silently returns no candidates when credentials, the server, or
+the network are unavailable. Static command and flag completion keeps working
+in that case, and no diagnostic output is written to your command line.
+
+### Automatic installation
+
+The release installers can install managed completion loaders without editing
+`.bashrc`, `.zshrc`, or Fish configuration files. The loader calls the installed
+`aenv completion` command at shell completion time, so upgrades automatically
+use the current CLI command tree. Unmanaged completion files are preserved.
+
+```bash
+INSTALL_DIR="$HOME/.local/bin" bash scripts/install-cli.sh
+```
+
+If Zsh does not discover a user-local loader, add its directory to `fpath`
+before `compinit` as shown above. Use the matching uninstall action to remove
+only files managed by AgentENV.

@@ -7,10 +7,12 @@ use super::stack::{
 };
 use super::types::*;
 use crate::backend::local::LocalFile;
-use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile, VirtualFileWriter};
+#[cfg(feature = "io-uring")]
+use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
+use crate::io::virtual_file::{VirtualFile, VirtualFileWriter};
 use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer};
-use crate::lsmt::index::{ReadOnlyIndex, Segment, SegmentMapping};
-use crate::test_utils::test_io_ring;
+use crate::lsmt::index::Segment;
+use crate::lsmt::index::{ReadOnlyIndex, SegmentMapping};
 use anyhow::{bail, ensure, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -76,6 +78,7 @@ impl VirtualFile for CountingSizeFile {
         self.inner.write_bytes_at(offset, data).await
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -85,6 +88,7 @@ impl VirtualFile for CountingSizeFile {
         self.inner.read_at_with_ctx(ctx, offset, len)
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -94,6 +98,7 @@ impl VirtualFile for CountingSizeFile {
         self.inner.read_at_into_with_ctx(ctx, offset, dst)
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -103,6 +108,7 @@ impl VirtualFile for CountingSizeFile {
         self.inner.write_at_with_ctx(ctx, offset, data)
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_bytes_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -140,20 +146,11 @@ impl VirtualFile for CountingSizeFile {
 }
 
 async fn create_lsmt_env(dir: &TempDir, vsize: u64) -> (Arc<LocalFile>, Arc<LocalFile>, LSMTFile) {
-    let ring = test_io_ring();
     let data_path = dir.path().join("data.lsmt");
     let index_path = dir.path().join("index.lsmt");
 
-    let data_file = Arc::new(
-        LocalFile::new(&data_path, ring.clone())
-            .await
-            .expect("create data file"),
-    );
-    let index_file = Arc::new(
-        LocalFile::new(&index_path, ring)
-            .await
-            .expect("create index file"),
-    );
+    let data_file = Arc::new(LocalFile::new(&data_path).expect("create data file"));
+    let index_file = Arc::new(LocalFile::new(&index_path).expect("create index file"));
 
     let lsmt = LSMTFile::create(data_file.clone(), Some(index_file.clone()), vsize, false)
         .await
@@ -202,20 +199,20 @@ async fn prepared_log_and_hybrid_uppers_use_compatible_index_offset() {
         crate::image::helper::prepare_runtime_upper(&data_path, Some(&index_path), 8192, mode)
             .unwrap();
 
-        let ring = test_io_ring();
-        let data_file = Arc::new(
-            LocalFile::open_rw(data_path, false, ring.clone())
-                .await
-                .unwrap(),
-        );
-        let index_file = Arc::new(LocalFile::open_rw(index_path, false, ring).await.unwrap());
+        let data_file = Arc::new(LocalFile::open_rw(data_path, false).unwrap());
+        let index_file = Arc::new(LocalFile::open_rw(index_path, false).unwrap());
         assert_unsealed_upper_headers_and_reopen(data_file, index_file).await;
     }
 }
 
+// The two log-structured layouts are portable, so they are validated on every
+// target. Only the sparse case needs a filesystem that reports unwritten regions
+// as holes, so it is included exactly when that capability is present — keyed
+// off the same predicate the production guard uses, rather than a second copy of
+// the platform test that could drift away from it.
 #[test]
-fn validate_rw_header_pair_paths_accepts_all_layouts() {
-    for (mode, layout) in [
+fn validate_rw_header_pair_paths_accepts_all_supported_layouts() {
+    let mut cases = vec![
         (
             crate::config::UpperMode::LogStructured,
             RwLayout::LogStructured,
@@ -224,8 +221,12 @@ fn validate_rw_header_pair_paths_accepts_all_layouts() {
             crate::config::UpperMode::HybridLogStructured,
             RwLayout::HybridLogStructured,
         ),
-        (crate::config::UpperMode::Sparse, RwLayout::Sparse),
-    ] {
+    ];
+    if crate::sys::sparse_extents_are_reliable() {
+        cases.push((crate::config::UpperMode::Sparse, RwLayout::Sparse));
+    }
+
+    for (mode, layout) in cases {
         let dir = TempDir::new().unwrap();
         let data = dir.path().join("upper.data");
         let index = dir.path().join("upper.index");
@@ -233,6 +234,64 @@ fn validate_rw_header_pair_paths_accepts_all_layouts() {
         crate::image::helper::prepare_runtime_upper(&data, index_path, 8192, mode).unwrap();
         validate_rw_header_pair_paths(&data, index_path, 8192, layout).unwrap();
     }
+}
+
+/// The layout guard tracks the extent capability exactly: both log-structured
+/// layouts are always available, and sparse is available precisely when extent
+/// maps can be trusted.
+///
+/// This runs on every target. The sparse tests further down are compiled only on
+/// Linux because they need a filesystem that really reports holes, which would
+/// otherwise leave the *rejecting* half of this behaviour — the entire point of
+/// the guard — untested exactly where it takes effect.
+#[test]
+fn ensure_supported_tracks_the_extent_capability() {
+    RwLayout::LogStructured
+        .ensure_supported()
+        .expect("a log-structured upper is portable");
+    RwLayout::HybridLogStructured
+        .ensure_supported()
+        .expect("a hybrid upper is portable");
+    assert_eq!(
+        RwLayout::Sparse.ensure_supported().is_ok(),
+        crate::sys::sparse_extents_are_reliable(),
+        "sparse must be accepted exactly where extent maps are trustworthy"
+    );
+}
+
+/// Creating a sparse upper must fail *before* anything is written, on a platform
+/// whose extent maps cannot be trusted.
+///
+/// This pins the failure mode that motivated putting the guard on every entry
+/// point rather than only on the recovery scan: without it the upper is created,
+/// written to successfully, and only fails when it is reopened — by which point
+/// the guest's data is already in it.
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "Linux reports holes reliably, so a sparse upper is supported here"
+)]
+fn preparing_a_sparse_upper_is_refused_where_extents_are_unreliable() {
+    assert!(
+        !crate::sys::sparse_extents_are_reliable(),
+        "this test describes platforms without trustworthy extent maps"
+    );
+
+    let dir = TempDir::new().unwrap();
+    let data = dir.path().join("upper.data");
+    let err = crate::image::helper::prepare_runtime_upper(
+        &data,
+        None,
+        8192,
+        crate::config::UpperMode::Sparse,
+    )
+    .expect_err("a sparse upper must be refused where extents are unreliable");
+
+    let rendered = format!("{err:#}");
+    assert!(
+        rendered.contains("sparse RW layout is not supported"),
+        "expected the layout guard to reject this, got: {rendered}"
+    );
 }
 
 #[test]
@@ -328,17 +387,8 @@ fn validate_rw_header_pair_paths_rejects_header_and_layout_mismatches() {
 async fn created_log_and_hybrid_uppers_use_compatible_index_offset() {
     for layout in [RwLayout::LogStructured, RwLayout::HybridLogStructured] {
         let dir = TempDir::new().unwrap();
-        let ring = test_io_ring();
-        let data_file = Arc::new(
-            LocalFile::new(dir.path().join("upper.data"), ring.clone())
-                .await
-                .unwrap(),
-        );
-        let index_file = Arc::new(
-            LocalFile::new(dir.path().join("upper.index"), ring)
-                .await
-                .unwrap(),
-        );
+        let data_file = Arc::new(LocalFile::new(dir.path().join("upper.data")).unwrap());
+        let index_file = Arc::new(LocalFile::new(dir.path().join("upper.index")).unwrap());
         let mut args = LayerInfo::new(data_file.clone(), Some(index_file.clone()), 8192);
         args.rw_layout = layout;
         create_file_rw(args).await.unwrap();
@@ -347,14 +397,11 @@ async fn created_log_and_hybrid_uppers_use_compatible_index_offset() {
     }
 }
 
+// Only used by the Linux-gated sparse tests.
+#[cfg(target_os = "linux")]
 async fn create_sparse_lsmt_env(dir: &TempDir, vsize: u64) -> (Arc<LocalFile>, LSMTFile) {
-    let ring = test_io_ring();
     let data_path = dir.path().join("sparse-data.lsmt");
-    let data_file = Arc::new(
-        LocalFile::new(&data_path, ring)
-            .await
-            .expect("create sparse data file"),
-    );
+    let data_file = Arc::new(LocalFile::new(&data_path).expect("create sparse data file"));
 
     let lsmt = LSMTFile::create(data_file.clone(), None, vsize, true)
         .await
@@ -367,20 +414,11 @@ async fn create_hybrid_lsmt_env(
     dir: &TempDir,
     vsize: u64,
 ) -> (Arc<LocalFile>, Arc<LocalFile>, LSMTFile) {
-    let ring = test_io_ring();
     let data_path = dir.path().join("hybrid-data.lsmt");
     let index_path = dir.path().join("hybrid-index.lsmt");
 
-    let data_file = Arc::new(
-        LocalFile::new(&data_path, ring.clone())
-            .await
-            .expect("create hybrid data file"),
-    );
-    let index_file = Arc::new(
-        LocalFile::new(&index_path, ring)
-            .await
-            .expect("create hybrid index file"),
-    );
+    let data_file = Arc::new(LocalFile::new(&data_path).expect("create hybrid data file"));
+    let index_file = Arc::new(LocalFile::new(&index_path).expect("create hybrid index file"));
 
     let mut args = LayerInfo::new(data_file.clone(), Some(index_file.clone()), vsize);
     args.rw_layout = RwLayout::HybridLogStructured;
@@ -396,14 +434,12 @@ async fn create_blocking_hybrid_lsmt_env(
     vsize: u64,
     writes_before_block: usize,
 ) -> (Arc<BlockingWriteFile>, Arc<LocalFile>, LSMTFile) {
-    let ring = test_io_ring();
     let data_path = dir.path().join("hybrid-blocking-data.lsmt");
     let index_path = dir.path().join("hybrid-blocking-index.lsmt");
 
-    let local_data: Arc<dyn VirtualFile> =
-        Arc::new(LocalFile::new(&data_path, ring.clone()).await.unwrap());
+    let local_data: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&data_path).unwrap());
     let data_file = BlockingWriteFile::new(local_data, writes_before_block);
-    let index_file = Arc::new(LocalFile::new(&index_path, ring).await.unwrap());
+    let index_file = Arc::new(LocalFile::new(&index_path).unwrap());
     let mut args = LayerInfo::new(
         data_file.clone() as Arc<dyn VirtualFile>,
         Some(index_file.clone()),
@@ -421,16 +457,11 @@ async fn create_sealed_layer(
     vsize: u64,
     writes: &[(u64, u8)],
 ) -> Arc<LocalFile> {
-    let ring = test_io_ring();
     let data = Arc::new(
-        LocalFile::new(dir.path().join(format!("{name}.data")), ring.clone())
-            .await
-            .expect("create layer data"),
+        LocalFile::new(dir.path().join(format!("{name}.data"))).expect("create layer data"),
     );
     let index = Arc::new(
-        LocalFile::new(dir.path().join(format!("{name}.index")), ring)
-            .await
-            .expect("create layer index"),
+        LocalFile::new(dir.path().join(format!("{name}.index"))).expect("create layer index"),
     );
     let layer = LSMTFile::create(data.clone(), Some(index), vsize, false)
         .await
@@ -446,6 +477,8 @@ async fn create_sealed_layer(
     data
 }
 
+// Only used by the Linux-gated sparse tests below.
+#[cfg(target_os = "linux")]
 async fn open_sparse_lsmt_env(
     data_file: Arc<LocalFile>,
     lower_layers: Vec<Arc<dyn VirtualFile>>,
@@ -916,6 +949,10 @@ async fn test_create_open() {
     assert_eq!(lsmt2.size().await.unwrap(), vsize);
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sparse_rw() {
     let temp_dir = TempDir::new().unwrap();
@@ -985,17 +1022,8 @@ async fn test_hybrid_reopen_detects_file_type() {
 #[tokio::test]
 async fn test_open_rejects_sparse_and_hybrid_header() {
     let temp_dir = TempDir::new().unwrap();
-    let ring = test_io_ring();
-    let data = Arc::new(
-        LocalFile::new(temp_dir.path().join("invalid-rw.data"), ring.clone())
-            .await
-            .unwrap(),
-    );
-    let index = Arc::new(
-        LocalFile::new(temp_dir.path().join("invalid-rw.index"), ring)
-            .await
-            .unwrap(),
-    );
+    let data = Arc::new(LocalFile::new(temp_dir.path().join("invalid-rw.data")).unwrap());
+    let index = Arc::new(LocalFile::new(temp_dir.path().join("invalid-rw.index")).unwrap());
 
     let mut header = rw_header(
         1024 * 1024,
@@ -1437,9 +1465,8 @@ async fn test_stack_files() {
 
     let (upper_data, upper_index, _) = create_lsmt_env(&temp_dir, vsize).await;
 
-    let ring = test_io_ring();
     let raw_base_path = temp_dir.path().join("base.raw");
-    let raw_base_file = Arc::new(LocalFile::new(&raw_base_path, ring).await.unwrap());
+    let raw_base_file = Arc::new(LocalFile::new(&raw_base_path).unwrap());
     raw_base_file.write_at(4096, &base_content).await.unwrap();
 
     let lsmt_stacked = LSMTFile::open(
@@ -1464,6 +1491,10 @@ async fn test_stack_files() {
     assert_eq!(read_new[0], 0xCC);
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_stack_files_with_sparse_upper_and_sparse_lower() {
     let temp_dir = TempDir::new().unwrap();
@@ -1500,6 +1531,10 @@ async fn test_stack_files_with_sparse_upper_and_sparse_lower() {
     assert_eq!(lsmt_stacked.file_type(), LSMTFileType::SparseReadWrite);
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_stack_files_with_sparse_upper_and_multiple_sparse_lowers() {
     let base_dir = TempDir::new().unwrap();
@@ -1538,6 +1573,10 @@ async fn test_stack_files_with_sparse_upper_and_multiple_sparse_lowers() {
     assert_eq!(got12k.as_ref(), vec![0xAB; 4096].as_slice());
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sparse_restack_twice_preserves_lower_chain() {
     let temp_dir = TempDir::new().unwrap();
@@ -1664,6 +1703,10 @@ async fn test_update_vsize_after_write_preserves_close_seal_descriptor() {
     );
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sparse_close_seal_and_commit_roundtrip() {
     let temp_dir = TempDir::new().unwrap();
@@ -1679,9 +1722,8 @@ async fn test_sparse_close_seal_and_commit_roundtrip() {
     let read_back = ro_layer.read_at(8192, 4096).await.unwrap();
     assert_eq!(&read_back[..], &data_block[..]);
 
-    let ring = test_io_ring();
     let commit_path = temp_dir.path().join("sparse_ro_commit.lsmt");
-    let f_commit = Arc::new(LocalFile::new(&commit_path, ring).await.unwrap());
+    let f_commit = Arc::new(LocalFile::new(&commit_path).unwrap());
     ro_layer.commit(f_commit.clone()).await.unwrap();
 
     let final_ro = LSMTReadOnlyFile::open(f_commit).await.unwrap();
@@ -1716,17 +1758,10 @@ async fn create_counting_log_lsmt_env(
     dir: &TempDir,
     vsize: u64,
 ) -> (Arc<CountingSizeFile>, Arc<CountingSizeFile>, LSMTFile) {
-    let ring = test_io_ring();
-    let data_file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::new(dir.path().join("count-log-data.lsmt"), ring.clone())
-            .await
-            .unwrap(),
-    );
-    let index_file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::new(dir.path().join("count-log-index.lsmt"), ring)
-            .await
-            .unwrap(),
-    );
+    let data_file: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(dir.path().join("count-log-data.lsmt")).unwrap());
+    let index_file: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(dir.path().join("count-log-index.lsmt")).unwrap());
     let counted_data = CountingSizeFile::new(data_file);
     let counted_index = CountingSizeFile::new(index_file);
     let lsmt = LSMTFile::create(
@@ -1746,17 +1781,10 @@ async fn create_counting_hybrid_lsmt_env(
     dir: &TempDir,
     vsize: u64,
 ) -> (Arc<CountingSizeFile>, Arc<CountingSizeFile>, LSMTFile) {
-    let ring = test_io_ring();
-    let data_file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::new(dir.path().join("count-hybrid-data.lsmt"), ring.clone())
-            .await
-            .unwrap(),
-    );
-    let index_file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::new(dir.path().join("count-hybrid-index.lsmt"), ring)
-            .await
-            .unwrap(),
-    );
+    let data_file: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(dir.path().join("count-hybrid-data.lsmt")).unwrap());
+    let index_file: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(dir.path().join("count-hybrid-index.lsmt")).unwrap());
     let counted_data = CountingSizeFile::new(data_file);
     let counted_index = CountingSizeFile::new(index_file);
     let mut args = LayerInfo::new(
@@ -1849,21 +1877,12 @@ async fn test_log_discard_hot_path_avoids_size_calls() {
 #[tokio::test]
 async fn test_log_append_cursor_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
-    let ring = test_io_ring();
     let data_path = temp_dir.path().join("reopen-count-log-data.lsmt");
     let index_path = temp_dir.path().join("reopen-count-log-index.lsmt");
 
     {
-        let data_file = Arc::new(
-            LocalFile::new(&data_path, ring.clone())
-                .await
-                .expect("create log data file"),
-        );
-        let index_file = Arc::new(
-            LocalFile::new(&index_path, ring.clone())
-                .await
-                .expect("create log index file"),
-        );
+        let data_file = Arc::new(LocalFile::new(&data_path).expect("create log data file"));
+        let index_file = Arc::new(LocalFile::new(&index_path).expect("create log index file"));
         let lsmt = LSMTFile::create(data_file, Some(index_file), 1024 * 1024, false)
             .await
             .expect("create log LSMTFile");
@@ -1873,16 +1892,10 @@ async fn test_log_append_cursor_survives_reopen() {
         lsmt.sync().await.unwrap();
     }
 
-    let data_file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::open_rw(&data_path, false, ring.clone())
-            .await
-            .expect("reopen log data file"),
-    );
-    let index_file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::open_rw(&index_path, false, ring)
-            .await
-            .expect("reopen log index file"),
-    );
+    let data_file: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::open_rw(&data_path, false).expect("reopen log data file"));
+    let index_file: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::open_rw(&index_path, false).expect("reopen log index file"));
     let counted_data = CountingSizeFile::new(data_file);
     let counted_index = CountingSizeFile::new(index_file);
     let lsmt = LSMTFile::open(
@@ -1908,21 +1921,12 @@ async fn test_log_append_cursor_survives_reopen() {
 #[tokio::test]
 async fn test_hybrid_append_cursor_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
-    let ring = test_io_ring();
     let data_path = temp_dir.path().join("reopen-count-hybrid-data.lsmt");
     let index_path = temp_dir.path().join("reopen-count-hybrid-index.lsmt");
 
     {
-        let data_file = Arc::new(
-            LocalFile::new(&data_path, ring.clone())
-                .await
-                .expect("create hybrid data file"),
-        );
-        let index_file = Arc::new(
-            LocalFile::new(&index_path, ring.clone())
-                .await
-                .expect("create hybrid index file"),
-        );
+        let data_file = Arc::new(LocalFile::new(&data_path).expect("create hybrid data file"));
+        let index_file = Arc::new(LocalFile::new(&index_path).expect("create hybrid index file"));
         let mut args = LayerInfo::new(data_file, Some(index_file), 1024 * 1024);
         args.rw_layout = RwLayout::HybridLogStructured;
         let lsmt = create_file_rw(args).await.expect("create hybrid LSMTFile");
@@ -1933,16 +1937,10 @@ async fn test_hybrid_append_cursor_survives_reopen() {
         lsmt.sync().await.unwrap();
     }
 
-    let data_file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::open_rw(&data_path, false, ring.clone())
-            .await
-            .expect("reopen hybrid data file"),
-    );
-    let index_file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::open_rw(&index_path, false, ring)
-            .await
-            .expect("reopen hybrid index file"),
-    );
+    let data_file: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::open_rw(&data_path, false).expect("reopen hybrid data file"));
+    let index_file: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::open_rw(&index_path, false).expect("reopen hybrid index file"));
     let counted_data = CountingSizeFile::new(data_file);
     let counted_index = CountingSizeFile::new(index_file);
     let lsmt = LSMTFile::open(
@@ -1965,6 +1963,10 @@ async fn test_hybrid_append_cursor_survives_reopen() {
     assert_eq!(lsmt.read_at(8192, 4096).await.unwrap()[0], 0xB4);
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sparse_discard_range_persists_via_hole_punch() {
     let temp_dir = TempDir::new().unwrap();
@@ -2017,9 +2019,8 @@ async fn test_ro_layer_commit() {
 
     let ro_layer = LSMTReadOnlyFile::open(f_data.clone()).await.unwrap();
 
-    let ring = test_io_ring();
     let commit_path = temp_dir.path().join("ro_commit.lsmt");
-    let f_commit = Arc::new(LocalFile::new(&commit_path, ring).await.unwrap());
+    let f_commit = Arc::new(LocalFile::new(&commit_path).unwrap());
     ro_layer.commit(f_commit.clone()).await.unwrap();
 
     let final_ro = LSMTReadOnlyFile::open(f_commit).await.unwrap();
@@ -2070,9 +2071,8 @@ async fn test_commit_close_seal() {
         lsmt.write_at(offset, &buf).await.unwrap();
     }
 
-    let ring = test_io_ring();
     let commit_path = temp_dir.path().join("commit.lsmt");
-    let f_commit = Arc::new(LocalFile::new(&commit_path, ring).await.unwrap());
+    let f_commit = Arc::new(LocalFile::new(&commit_path).unwrap());
     lsmt.commit(f_commit.clone()).await.unwrap();
 
     let ro_commit = LSMTReadOnlyFile::open(f_commit).await.unwrap();
@@ -2209,17 +2209,8 @@ async fn test_large_write_chunking() {
 #[tokio::test]
 async fn test_lsmt_factory_methods() {
     let temp_dir = TempDir::new().unwrap();
-    let ring = test_io_ring();
-    let data = Arc::new(
-        LocalFile::new(temp_dir.path().join("rw.data"), ring.clone())
-            .await
-            .unwrap(),
-    );
-    let index = Arc::new(
-        LocalFile::new(temp_dir.path().join("rw.index"), ring)
-            .await
-            .unwrap(),
-    );
+    let data = Arc::new(LocalFile::new(temp_dir.path().join("rw.data")).unwrap());
+    let index = Arc::new(LocalFile::new(temp_dir.path().join("rw.index")).unwrap());
     let mut args = LayerInfo::new(data.clone(), Some(index.clone()), 8 * 1024 * 1024);
     args.uuid = Uuid::new_v4();
 
@@ -2247,19 +2238,10 @@ async fn test_lsmt_factory_methods() {
 #[tokio::test]
 async fn test_open_merge_stack_flatten() {
     let temp_dir = TempDir::new().unwrap();
-    let ring = test_io_ring();
     let vsize = 4 * 1024 * 1024;
 
-    let data0 = Arc::new(
-        LocalFile::new(temp_dir.path().join("l0.data"), ring.clone())
-            .await
-            .unwrap(),
-    );
-    let index0 = Arc::new(
-        LocalFile::new(temp_dir.path().join("l0.index"), ring.clone())
-            .await
-            .unwrap(),
-    );
+    let data0 = Arc::new(LocalFile::new(temp_dir.path().join("l0.data")).unwrap());
+    let index0 = Arc::new(LocalFile::new(temp_dir.path().join("l0.index")).unwrap());
     let l0 = LSMTFile::create(data0.clone(), Some(index0), vsize, false)
         .await
         .unwrap();
@@ -2267,16 +2249,8 @@ async fn test_open_merge_stack_flatten() {
     l0.close_seal().await.unwrap();
     drop(l0);
 
-    let data1 = Arc::new(
-        LocalFile::new(temp_dir.path().join("l1.data"), ring.clone())
-            .await
-            .unwrap(),
-    );
-    let index1 = Arc::new(
-        LocalFile::new(temp_dir.path().join("l1.index"), ring.clone())
-            .await
-            .unwrap(),
-    );
+    let data1 = Arc::new(LocalFile::new(temp_dir.path().join("l1.data")).unwrap());
+    let index1 = Arc::new(LocalFile::new(temp_dir.path().join("l1.index")).unwrap());
     let l1 = LSMTFile::create(data1.clone(), Some(index1), vsize, false)
         .await
         .unwrap();
@@ -2290,11 +2264,7 @@ async fn test_open_merge_stack_flatten() {
     assert_eq!(lower.read_at(4096, 4096).await.unwrap()[0], 0x11);
     assert_eq!(lower.read_at(8192, 4096).await.unwrap()[0], 0x22);
 
-    let merged = Arc::new(
-        LocalFile::new(temp_dir.path().join("merged.lsmt"), ring.clone())
-            .await
-            .unwrap(),
-    );
+    let merged = Arc::new(LocalFile::new(temp_dir.path().join("merged.lsmt")).unwrap());
     merge_files_ro(
         &[data0.clone(), data1.clone()],
         CommitArgs::new(merged.clone()),
@@ -2305,16 +2275,8 @@ async fn test_open_merge_stack_flatten() {
     assert_eq!(merged_ro.read_at(4096, 4096).await.unwrap()[0], 0x11);
     assert_eq!(merged_ro.read_at(8192, 4096).await.unwrap()[0], 0x22);
 
-    let up_data = Arc::new(
-        LocalFile::new(temp_dir.path().join("up.data"), ring.clone())
-            .await
-            .unwrap(),
-    );
-    let up_index = Arc::new(
-        LocalFile::new(temp_dir.path().join("up.index"), ring.clone())
-            .await
-            .unwrap(),
-    );
+    let up_data = Arc::new(LocalFile::new(temp_dir.path().join("up.data")).unwrap());
+    let up_index = Arc::new(LocalFile::new(temp_dir.path().join("up.index")).unwrap());
     let upper = LSMTFile::create(up_data, Some(up_index), vsize, false)
         .await
         .unwrap();
@@ -2322,11 +2284,7 @@ async fn test_open_merge_stack_flatten() {
     stacked.write_at(4096, &[0x33; 4096]).await.unwrap();
     assert_eq!(stacked.read_at(4096, 4096).await.unwrap()[0], 0x33);
 
-    let flat = Arc::new(
-        LocalFile::new(temp_dir.path().join("flat.lsmt"), ring)
-            .await
-            .unwrap(),
-    );
+    let flat = Arc::new(LocalFile::new(temp_dir.path().join("flat.lsmt")).unwrap());
     stacked.flatten(flat.clone()).await.unwrap();
     let flat_ro = open_file_ro(flat).await.unwrap();
     assert_eq!(flat_ro.read_at(4096, 4096).await.unwrap()[0], 0x33);
@@ -2354,12 +2312,7 @@ async fn test_flatten_keeps_zero_written_blocks_as_data_segments() {
         source_mappings.iter().all(|m| !m.zeroed),
         "source image should keep zero-written blocks as data mappings before compact"
     );
-    let ring = test_io_ring();
-    let flat = Arc::new(
-        LocalFile::new(temp_dir.path().join("flat-zero.lsmt"), ring)
-            .await
-            .unwrap(),
-    );
+    let flat = Arc::new(LocalFile::new(temp_dir.path().join("flat-zero.lsmt")).unwrap());
     ro.flatten(flat.clone()).await.unwrap();
 
     let flat_ro = open_file_ro(flat).await.unwrap();
@@ -2385,13 +2338,9 @@ async fn test_flatten_keeps_zero_written_blocks_as_data_segments() {
 #[tokio::test]
 async fn test_compact_to_rejects_short_reads() {
     let temp_dir = TempDir::new().unwrap();
-    let ring = test_io_ring();
     let src: Arc<dyn VirtualFile> = Arc::new(ShortReadFile::new(vec![0x5a; 4096], 1));
-    let dest: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::new(temp_dir.path().join("short-read-flat.lsmt"), ring)
-            .await
-            .unwrap(),
-    );
+    let dest: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(temp_dir.path().join("short-read-flat.lsmt")).unwrap());
     let args = CommitArgs::new(dest);
     let err = compact_to(
         &[src],
@@ -2404,15 +2353,14 @@ async fn test_compact_to_rejects_short_reads() {
     assert_err_contains(&err, "failed to read");
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sparse_factory_without_index() {
     let temp_dir = TempDir::new().unwrap();
-    let ring = test_io_ring();
-    let data = Arc::new(
-        LocalFile::new(temp_dir.path().join("sparse.data"), ring)
-            .await
-            .unwrap(),
-    );
+    let data = Arc::new(LocalFile::new(temp_dir.path().join("sparse.data")).unwrap());
 
     let mut args = LayerInfo::new(data.clone(), None, 8 * 1024 * 1024);
     args.rw_layout = RwLayout::Sparse;
@@ -2534,6 +2482,66 @@ async fn test_premerged_index_lock_map_drops_idle_entries() {
             .is_some_and(|current| Arc::ptr_eq(&current, &replacement)));
     }
     release_premerged_index_lock(&stale_key, &replacement).await;
+}
+
+#[tokio::test]
+async fn test_premerged_index_prune_state_is_per_dir_and_elects_one_scan() {
+    let temp_dir = TempDir::new().unwrap();
+    let cache_a = temp_dir.path().join("cache-a");
+    let cache_b = temp_dir.path().join("cache-b");
+
+    let a = premerged_index_prune_state(&cache_a).await;
+    assert!(Arc::ptr_eq(
+        &a,
+        &premerged_index_prune_state(&cache_a).await
+    ));
+    let b = premerged_index_prune_state(&cache_b).await;
+    assert!(!Arc::ptr_eq(&a, &b));
+
+    // Budget 64 triggers one scan per 8 new bytes (`max_dir_bytes` / 8).
+    let budget = 64;
+
+    // First charge on each fresh state seeds one scan regardless of threshold.
+    assert!(a.elect_scan(7, budget));
+    assert!(b.elect_scan(1, budget));
+    assert!(!a.scan_finished(budget));
+    assert!(!b.scan_finished(budget));
+
+    // After seeding, growth below the trigger no longer elects.
+    assert!(!a.elect_scan(7, budget));
+    // The winner's charge resets: the next scan needs a fresh trigger of
+    // post-election growth.
+    assert!(a.elect_scan(1, budget));
+
+    // Crossings while a scan runs lose the election but keep their charge:
+    // when they cross the trigger, scan_finished chains one follow-up scan
+    // instead of waiting for new writes.
+    assert!(!a.elect_scan(8, budget));
+    assert!(a.scan_finished(budget));
+    assert!(!a.elect_scan(1, budget));
+    // Below the trigger: the chain ends and the gate is released.
+    assert!(!a.scan_finished(budget));
+    assert!(a.elect_scan(8, budget));
+    // No growth during the scan: no follow-up.
+    assert!(!a.scan_finished(budget));
+
+    // A failed scan releases the gate but keeps concurrent charges.
+    assert!(a.elect_scan(8, budget));
+    assert!(!a.elect_scan(7, budget));
+    a.scan_aborted();
+    assert!(a.elect_scan(1, budget));
+    assert!(!a.scan_finished(budget));
+
+    // A sub-fraction budget floors the trigger at one byte instead of zero
+    // (which would elect a scan per write).
+    assert!(a.elect_scan(1, 0));
+    assert!(!a.scan_finished(0));
+
+    // Saturating accounting: a u64::MAX charge on a near-trigger counter
+    // must cross the trigger, not wrap 7 + MAX back below it.
+    assert!(!a.elect_scan(7, budget));
+    assert!(a.elect_scan(u64::MAX, budget));
+    assert!(!a.scan_finished(budget));
 }
 
 fn premerged_artifact_count(cache_dir: &std::path::Path) -> usize {
@@ -2661,49 +2669,24 @@ async fn test_premerged_index_artifact_corruption_falls_back_and_rewrites() {
 #[tokio::test]
 async fn test_open_files_ro_uses_topmost_nonzero_vsize() {
     let temp_dir = TempDir::new().unwrap();
-    let ring = test_io_ring();
-    let base_data = Arc::new(
-        LocalFile::new(temp_dir.path().join("base.data"), ring.clone())
-            .await
-            .unwrap(),
-    );
-    let base_index = Arc::new(
-        LocalFile::new(temp_dir.path().join("base.index"), ring.clone())
-            .await
-            .unwrap(),
-    );
+    let base_data = Arc::new(LocalFile::new(temp_dir.path().join("base.data")).unwrap());
+    let base_index = Arc::new(LocalFile::new(temp_dir.path().join("base.index")).unwrap());
     let base = LSMTFile::create(base_data.clone(), Some(base_index), 2 * 1024 * 1024, false)
         .await
         .unwrap();
     base.close_seal().await.unwrap();
     drop(base);
 
-    let mid_data = Arc::new(
-        LocalFile::new(temp_dir.path().join("mid.data"), ring.clone())
-            .await
-            .unwrap(),
-    );
-    let mid_index = Arc::new(
-        LocalFile::new(temp_dir.path().join("mid.index"), ring.clone())
-            .await
-            .unwrap(),
-    );
+    let mid_data = Arc::new(LocalFile::new(temp_dir.path().join("mid.data")).unwrap());
+    let mid_index = Arc::new(LocalFile::new(temp_dir.path().join("mid.index")).unwrap());
     let mid = LSMTFile::create(mid_data.clone(), Some(mid_index), 4 * 1024 * 1024, false)
         .await
         .unwrap();
     mid.close_seal().await.unwrap();
     drop(mid);
 
-    let top_data = Arc::new(
-        LocalFile::new(temp_dir.path().join("top.data"), ring.clone())
-            .await
-            .unwrap(),
-    );
-    let top_index = Arc::new(
-        LocalFile::new(temp_dir.path().join("top.index"), ring)
-            .await
-            .unwrap(),
-    );
+    let top_data = Arc::new(LocalFile::new(temp_dir.path().join("top.data")).unwrap());
+    let top_index = Arc::new(LocalFile::new(temp_dir.path().join("top.index")).unwrap());
     let top = LSMTFile::create(top_data.clone(), Some(top_index), 0, false)
         .await
         .unwrap();
@@ -2719,23 +2702,14 @@ async fn test_open_files_ro_uses_topmost_nonzero_vsize() {
 #[tokio::test]
 async fn test_stack_files_check_order_detects_uuid_chain_mismatch() {
     let temp_dir = TempDir::new().unwrap();
-    let ring = test_io_ring();
     let vsize = 4 * 1024 * 1024;
 
     let base_uuid = Uuid::new_v4();
     let mid_uuid = Uuid::new_v4();
     let top_uuid = Uuid::new_v4();
     let wrong_parent = Uuid::new_v4();
-    let base_data = Arc::new(
-        LocalFile::new(temp_dir.path().join("chain.base.data"), ring.clone())
-            .await
-            .unwrap(),
-    );
-    let base_index = Arc::new(
-        LocalFile::new(temp_dir.path().join("chain.base.index"), ring.clone())
-            .await
-            .unwrap(),
-    );
+    let base_data = Arc::new(LocalFile::new(temp_dir.path().join("chain.base.data")).unwrap());
+    let base_index = Arc::new(LocalFile::new(temp_dir.path().join("chain.base.index")).unwrap());
     let mut base_args = LayerInfo::new(base_data.clone(), Some(base_index), vsize);
     base_args.uuid = base_uuid;
     let base = create_file_rw(base_args).await.unwrap();
@@ -2743,16 +2717,8 @@ async fn test_stack_files_check_order_detects_uuid_chain_mismatch() {
     base.close_seal().await.unwrap();
     drop(base);
 
-    let mid_data = Arc::new(
-        LocalFile::new(temp_dir.path().join("chain.mid.data"), ring.clone())
-            .await
-            .unwrap(),
-    );
-    let mid_index = Arc::new(
-        LocalFile::new(temp_dir.path().join("chain.mid.index"), ring.clone())
-            .await
-            .unwrap(),
-    );
+    let mid_data = Arc::new(LocalFile::new(temp_dir.path().join("chain.mid.data")).unwrap());
+    let mid_index = Arc::new(LocalFile::new(temp_dir.path().join("chain.mid.index")).unwrap());
     let mut mid_args = LayerInfo::new(mid_data.clone(), Some(mid_index), vsize);
     mid_args.uuid = mid_uuid;
     mid_args.parent_uuid = Some(wrong_parent);
@@ -2761,16 +2727,8 @@ async fn test_stack_files_check_order_detects_uuid_chain_mismatch() {
     mid.close_seal().await.unwrap();
     drop(mid);
 
-    let top_data = Arc::new(
-        LocalFile::new(temp_dir.path().join("chain.top.data"), ring.clone())
-            .await
-            .unwrap(),
-    );
-    let top_index = Arc::new(
-        LocalFile::new(temp_dir.path().join("chain.top.index"), ring.clone())
-            .await
-            .unwrap(),
-    );
+    let top_data = Arc::new(LocalFile::new(temp_dir.path().join("chain.top.data")).unwrap());
+    let top_index = Arc::new(LocalFile::new(temp_dir.path().join("chain.top.index")).unwrap());
     let mut top_args = LayerInfo::new(top_data.clone(), Some(top_index), vsize);
     top_args.uuid = top_uuid;
     top_args.parent_uuid = Some(mid_uuid);
@@ -2784,16 +2742,8 @@ async fn test_stack_files_check_order_detects_uuid_chain_mismatch() {
     let top = top_data;
     let lower = open_files_ro(&[base, mid, top]).await.unwrap();
 
-    let upper_data = Arc::new(
-        LocalFile::new(temp_dir.path().join("upper.data"), ring.clone())
-            .await
-            .unwrap(),
-    );
-    let upper_index = Arc::new(
-        LocalFile::new(temp_dir.path().join("upper.index"), ring)
-            .await
-            .unwrap(),
-    );
+    let upper_data = Arc::new(LocalFile::new(temp_dir.path().join("upper.data")).unwrap());
+    let upper_index = Arc::new(LocalFile::new(temp_dir.path().join("upper.index")).unwrap());
     let upper = LSMTFile::create(upper_data, Some(upper_index), vsize, false)
         .await
         .unwrap();
@@ -2816,21 +2766,12 @@ async fn test_export_upper_as_sealed() {
     drop(base_lsmt);
 
     // 2. Open base as RO, create upper RW layer, stack them
-    let ring = test_io_ring();
     let base_ro = LSMTReadOnlyFile::open(base_data.clone()).await.unwrap();
 
     let upper_data_path = temp_dir.path().join("upper_data.lsmt");
     let upper_index_path = temp_dir.path().join("upper_index.lsmt");
-    let upper_data = Arc::new(
-        LocalFile::new(&upper_data_path, ring.clone())
-            .await
-            .unwrap(),
-    );
-    let upper_index = Arc::new(
-        LocalFile::new(&upper_index_path, ring.clone())
-            .await
-            .unwrap(),
-    );
+    let upper_data = Arc::new(LocalFile::new(&upper_data_path).unwrap());
+    let upper_index = Arc::new(LocalFile::new(&upper_index_path).unwrap());
     let upper_rw = LSMTFile::create(upper_data.clone(), Some(upper_index.clone()), vsize, false)
         .await
         .unwrap();
@@ -2844,8 +2785,7 @@ async fn test_export_upper_as_sealed() {
 
     // 4. Call export_upper_as_sealed — writes only upper dirty blocks to a new file
     let snap_path = temp_dir.path().join("snapshot.lsmt");
-    let snap_file: Arc<dyn VirtualFile> =
-        Arc::new(LocalFile::new(&snap_path, ring.clone()).await.unwrap());
+    let snap_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&snap_path).unwrap());
     let snap_uuid = Uuid::new_v4();
     stacked
         .export_upper_as_sealed(CommitArgs {
@@ -2933,8 +2873,7 @@ async fn test_export_upper_as_sealed() {
 
     // 10. Second snapshot includes ALL accumulated dirty blocks (dirty1 + dirty2 + dirty3)
     let snap2_path = temp_dir.path().join("snapshot2.lsmt");
-    let snap2_file: Arc<dyn VirtualFile> =
-        Arc::new(LocalFile::new(&snap2_path, ring.clone()).await.unwrap());
+    let snap2_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&snap2_path).unwrap());
     stacked
         .export_upper_as_sealed(CommitArgs {
             writer: Arc::new(VirtualFileWriter::new(snap2_file.clone())),
@@ -2984,7 +2923,6 @@ async fn test_export_upper_as_sealed_parent_uuid() {
     drop(base_lsmt);
 
     let mut lower_layers: Vec<Arc<dyn VirtualFile>> = vec![base_data];
-    let ring = test_io_ring();
 
     for id in 1..=5 {
         // 2. Open base as RO, create upper RW layer, stack them
@@ -2992,16 +2930,8 @@ async fn test_export_upper_as_sealed_parent_uuid() {
 
         let upper_data_path = temp_dir.path().join(format!("upper_data{id}.lsmt"));
         let upper_index_path = temp_dir.path().join(format!("upper_index{id}.lsmt"));
-        let upper_data = Arc::new(
-            LocalFile::new(&upper_data_path, ring.clone())
-                .await
-                .unwrap(),
-        );
-        let upper_index = Arc::new(
-            LocalFile::new(&upper_index_path, ring.clone())
-                .await
-                .unwrap(),
-        );
+        let upper_data = Arc::new(LocalFile::new(&upper_data_path).unwrap());
+        let upper_index = Arc::new(LocalFile::new(&upper_index_path).unwrap());
         let upper_rw =
             LSMTFile::create(upper_data.clone(), Some(upper_index.clone()), vsize, false)
                 .await
@@ -3019,8 +2949,7 @@ async fn test_export_upper_as_sealed_parent_uuid() {
 
         // 4. Call export_upper_as_sealed — writes only upper dirty blocks to a new file
         let snap_path = temp_dir.path().join(format!("snapshot{id}.lsmt"));
-        let snap_file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::new(&snap_path, ring.clone()).await.unwrap());
+        let snap_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&snap_path).unwrap());
         let snap_uuid = Uuid::new_v4();
         stacked
             .export_upper_as_sealed(CommitArgs {
@@ -3161,9 +3090,8 @@ async fn test_lsmt_readonly_read_at_into() {
     let base_ro_index = load_base_index(f_data.clone()).await;
 
     // Create a raw file that serves as the base layer's data
-    let ring = test_io_ring();
     let raw_base_path = base_dir.path().join("base.raw");
-    let raw_base_file = Arc::new(LocalFile::new(&raw_base_path, ring).await.unwrap());
+    let raw_base_file = Arc::new(LocalFile::new(&raw_base_path).unwrap());
     raw_base_file.write_at(0, &data_a).await.unwrap();
     raw_base_file.write_at(8192, &data_b).await.unwrap();
 
@@ -3328,6 +3256,10 @@ async fn test_lsmt_size() {
     assert_eq!(lsmt.size().await.unwrap(), 8192);
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sparse_write_read() {
     let dir = TempDir::new().unwrap();
@@ -3338,6 +3270,10 @@ async fn test_sparse_write_read() {
     assert_eq!(buf[0], 0xAA);
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn test_sparse_commit_matches_logical_content_of_log_structured() {
     let temp_dir = TempDir::new().unwrap();
@@ -3358,16 +3294,11 @@ async fn test_sparse_commit_matches_logical_content_of_log_structured() {
         .await
         .unwrap();
 
-    let ring = test_io_ring();
     let log_commit_path = temp_dir.path().join("commit-log.lsmt");
     let sparse_commit_path = temp_dir.path().join("commit-sparse.lsmt");
-    let log_commit: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::new(&log_commit_path, ring.clone())
-            .await
-            .unwrap(),
-    );
+    let log_commit: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&log_commit_path).unwrap());
     let sparse_commit: Arc<dyn VirtualFile> =
-        Arc::new(LocalFile::new(&sparse_commit_path, ring).await.unwrap());
+        Arc::new(LocalFile::new(&sparse_commit_path).unwrap());
     log_lsmt.commit(log_commit.clone()).await.unwrap();
     sparse_lsmt.commit(sparse_commit.clone()).await.unwrap();
 
@@ -3391,24 +3322,18 @@ async fn create_lsmt_env_direct_io(
     dir: &TempDir,
     vsize: u64,
 ) -> (Arc<LocalFile>, Arc<LocalFile>, LSMTFile) {
-    let ring = test_io_ring();
     let data_path = dir.path().join("data.lsmt");
     let index_path = dir.path().join("index.lsmt");
 
     let data_file = Arc::new(
-        LocalFile::builder(ring.clone())
+        LocalFile::builder()
             .direct_io(true)
             .truncate(true)
             .open(&data_path)
-            .await
             .expect("create direct-io data file"),
     );
     // Index file stays buffered — direct-IO is only for the data file.
-    let index_file = Arc::new(
-        LocalFile::new(&index_path, ring)
-            .await
-            .expect("create buffered index file"),
-    );
+    let index_file = Arc::new(LocalFile::new(&index_path).expect("create buffered index file"));
 
     let lsmt = LSMTFile::create(data_file.clone(), Some(index_file.clone()), vsize, false)
         .await
@@ -3488,6 +3413,10 @@ async fn test_direct_io_close_seal() {
     }
 }
 
+// Sparse LSMT files are rejected where the filesystem does not guarantee
+// that unwritten regions read back as holes; see
+// `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(target_os = "linux")]
 /// `LSMTFile::create` with `sparse_rw = true` on an O_DIRECT data file
 /// (no index file required for sparse mode).  Verifies that the
 /// 4096-byte aligned header write path works for sparse files too, and
@@ -3496,15 +3425,13 @@ async fn test_direct_io_close_seal() {
 async fn test_direct_io_create_sparse() {
     let temp = TempDir::new().unwrap();
     let vsize = 64 * 1024 * 1024u64;
-    let ring = test_io_ring();
     let data_path = temp.path().join("sparse_data.lsmt");
 
     let data_file = Arc::new(
-        LocalFile::builder(ring)
+        LocalFile::builder()
             .direct_io(true)
             .truncate(true)
             .open(&data_path)
-            .await
             .expect("create direct-io data file for sparse"),
     );
 

@@ -69,7 +69,10 @@ pub enum TemplatesTemplateIdDeleteResponse {
 #[allow(clippy::large_enum_variant)]
 pub enum TemplatesTemplateIdGetResponse {
     /// Successfully returned the template with its builds
-    Status200_SuccessfullyReturnedTheTemplateWithItsBuilds(models::TemplateWithBuilds),
+    Status200_SuccessfullyReturnedTheTemplateWithItsBuilds {
+        body: models::TemplateWithBuilds,
+        x_next_token: Option<String>,
+    },
     /// Authentication error
     Status401_AuthenticationError(models::Error),
     /// Not found

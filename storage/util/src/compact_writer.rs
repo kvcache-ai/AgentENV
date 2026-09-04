@@ -58,6 +58,14 @@ pub trait CompactWriter: Send + Sync {
     /// The buffer size should align at ALIGNMENT (currently this is 512 B)
     fn buffer_size(&self) -> usize;
 
+    /// Whether writes must use strictly increasing, contiguous logical offsets.
+    ///
+    /// When this returns `true`, each write must start at the logical end of the
+    /// preceding write. The default permits random writes.
+    fn requires_ordered_writes(&self) -> bool {
+        false
+    }
+
     /// Write the first `len` bytes of `buf` at `offset` in the destination
     /// file. Consumes the buffer (pooled implementations return it on drop).
     /// The `len` param helps if only want to write partial content in `buf`.
@@ -79,6 +87,14 @@ pub trait CompactWriter: Send + Sync {
             self.write(buf, off, chunk.len()).await?;
             off += chunk.len() as u64;
         }
+        Ok(())
+    }
+
+    /// Complete format-level output after all writes have finished.
+    ///
+    /// This does not imply flushing or syncing data to durable storage. The
+    /// default implementation is a no-op.
+    async fn finalize(&self) -> Result<()> {
         Ok(())
     }
 }

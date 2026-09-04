@@ -1,96 +1,151 @@
-# AENV configuration.
-# Runtime dependency versions and download URLs live in
-# config/deps_manifest.toml. Set explicit paths here to override packaged
-# setup assets.
-# Host-level sysctl tuning is skipped automatically in containers. Set
-# AENV_FORCE_SYSCTL_TUNING=1 only for privileged containers with writable
-# host sysctls.
+# AgentENV node configuration. See docs/src/configuration/reference.md for the
+# complete reference and docs/src/configuration/env-vars.md for environment
+# variable overrides.
+#
+# Dependency versions and download URLs come from config/deps_manifest.toml.
+# Set component overrides below only when using custom runtime artifacts.
 
-# Overridden by AENV_HOME_PATH when set. Persistent state, caches, logs,
-# generated configs, and downloaded dependencies derive from this directory.
-# Use the component-specific path keys only when a deployment needs an advanced
-# override. AENV_RUNTIME_PATH separately defaults to "/run/aenv".
+# Base directory for persistent state, caches, logs, and generated files.
+# AENV_HOME_PATH overrides this value.
 home_path = "/var/lib/aenv"
 
+# Transient sockets and network namespace state. AENV_RUNTIME_PATH overrides it.
+# runtime_path = "/run/aenv"
+
+# Downloaded runtime assets. AENV_DEPS_PATH overrides it.
+# deps_path = "$AENV_HOME/deps"
+
+# "$AENV_HOME" and "$AENV_RUNTIME" are config path placeholders. Other relative
+# paths resolve against the directory containing this file.
+
+# Node-wide virtualization backend: "kvm" or "pvm". Snapshots and paused
+# sandboxes can only be restored in the mode in which they were created.
+# AENV_VIRTUALIZATION_MODE overrides this value.
+virtualization_mode = "kvm"
+
 [firecracker]
-# Boot arguments passed to the guest kernel. This value takes precedence over
-# the DEFAULT_BOOT_ARGS constant in src/sandbox/firecracker/config.rs.
-# Keep the DAMON reclaim parameters in sync between both locations.
-boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/init damon_reclaim.enabled=Y damon_reclaim.min_age=60000000 damon_reclaim.quota_ms=100 damon_reclaim.quota_sz=1073741824 damon_reclaim.quota_reset_interval_ms=1000 damon_reclaim.wmarks_high=900 damon_reclaim.wmarks_mid=700 damon_reclaim.wmarks_low=200 damon_reclaim.skip_anon=Y damon_reclaim.wmarks_interval=5000000"
-# Optional allowlist for cold-start extraBootArgs prefixes. If omitted or empty,
-# no request-provided extra boot args are appended.
+# Use an existing Firecracker executable instead of downloading one. It must
+# be a readable, non-empty, executable regular file.
+# binary_path = "/opt/agentenv/bin/firecracker"
+
+# Complete kernel command line passed to guest VMs. Editing it replaces the
+# shipped boot and DAMON reclaim settings; it does not append to them.
+boot_args = "console=ttyS0 reboot=k panic=1 pci=off mitigations=off init=/init damon_reclaim.enabled=Y damon_reclaim.min_age=60000000 damon_reclaim.quota_ms=100 damon_reclaim.quota_sz=1073741824 damon_reclaim.quota_reset_interval_ms=1000 damon_reclaim.wmarks_high=900 damon_reclaim.wmarks_mid=700 damon_reclaim.wmarks_low=200 damon_reclaim.skip_anon=Y damon_reclaim.wmarks_interval=5000000"
+
+# Prefix allowlist for cold-start request extraBootArgs. Empty means none.
 # allowed_extra_boot_args_prefixes = ["aenv-custom."]
+
+# Maximum API-socket wait in seconds.
 socket_timeout_secs = 3
+# API-socket polling interval in milliseconds.
 socket_poll_ms = 1
-# Firecracker work and serial directories default under AENV_HOME. Advanced
-# deployments can override them with work_dir/serial_dir or their environment
-# variables.
-# Optional Firecracker log level. When set to a non-empty value (Error, Warning,
-# Info, Debug, or Trace), Firecracker's own logging is enabled and written to a
-# `firecracker.log` file in the same per-sandbox log directory as the serial
-# output. Leave unset/empty to disable Firecracker logging (default).
+
+# Per-sandbox work directories contain sockets, local logs, and writable
+# OverlayBD upper layers. Serial logs persist separately by sandbox ID.
+# work_dir = "$AENV_HOME/firecracker-work"
+# serial_dir = "$AENV_HOME/logs/serial"
+
+# Enable Firecracker's own firecracker.log beside the serial log. Supported
+# levels are Error, Warning, Info, Debug, and Trace; unset disables it.
 # log_level = "Info"
 
 [kernel]
+# Use an existing uncompressed Linux kernel image instead of downloading one.
+# The file must be a readable, non-empty regular file.
+# image_path = "/opt/agentenv/vmlinux.bin"
 
 [tools]
-# version = "0.1.0-custom.1"               # required with drive_path
-# drive_path = "../env/tools/tools.ext4"   # imported into the versioned dependency directory
+# Import an existing ext4 tools drive. This also requires an explicit version;
+# the file is copied into the versioned dependency directory.
+# version = "0.1.0-custom.1"
+# drive_path = "../env/tools/tools.ext4"
+
+# Port used by envd inside each guest.
 control_plane_port = 49983
 
 [image.resolver]
+# Rootfs image used when a template build omits fromImage.
 default_image = "ubuntu:24.04"
+
+# Registries tried, in order, when resolving short image names.
 search_registries = ["docker.io", "ghcr.io"]
-# When true, AgentENV converts standard OCI tar-layer images into local
-# overlaybd commits. Set false to require overlaybd-native images/referrers and
-# fail fast on standard OCI images.
+
+# Convert standard OCI tar layers into local OverlayBD commits. Set false to
+# require OverlayBD-native images or referrers and fail fast otherwise.
 convert_standard_oci = true
-# Whitelist of registry hosts. Omit the key (as below) for no restriction;
-# When set to a non-empty list, only references whose registry host is in the list resolve;
-# anything else is rejected as a client (4xx) error.
+
+# Optional registry allowlist. Omitting it allows all registries; an explicit
+# empty list denies all. It applies to full and short-name references; rejected
+# references return a client (4xx) error.
 # allowed_registries = ["docker.io", "ghcr.io"]
+
+# Image-reference prefixes eligible for OCI referrer discovery. Matching uses
+# starts_with, so include a trailing slash. Lookup failures fall back to the
+# source image.
 try_referrers_overlaybd_prefixes = []
 
 [image.cache]
+# Root for converted commits, resolution indexes, configs, and remote blocks.
+# root_dir = "$AENV_HOME/image-cache"
+
+# Local commit budget in GiB. Capacity eviction runs only when GC is enabled.
 capacity_gb = 100
 
 [image.cache.remote_blocks]
-max_size_gb = 10
+# Maximum registry-backed remote block-cache size in GiB.
+max_size_gb = 100
 
 [image.cache.gc]
+# Reconcile cache metadata and delete unreferenced hard commits in the
+# background. Capacity eviction removes least-recently-used source configs.
 enabled = true
+
+# GC interval in seconds (1800 = 30 minutes).
 interval_secs = 1800
+# Minimum idle age in seconds before capacity eviction (600 = 10 minutes).
 min_age_secs = 600
+# Start capacity eviction at this fraction of capacity_gb (0.95 = 95%).
 high_watermark_ratio = 0.95
+# Evict down to this fraction of capacity_gb (0.70 = 70%).
 low_watermark_ratio = 0.70
 
+# EXPERIMENTAL: P2P has not been tested in production. Keep it disabled in
+# production unless the deployment accepts that operational risk.
 [p2p]
+# Master switch for peer-to-peer artifact transport.
 enabled = false
+# Transport implementation: "iroh" or "disabled".
 transport = "iroh"
+# Local content store for the transport.
+# store_dir = "$AENV_HOME/p2p/store"
+# Local endpoint address; port 0 asks the OS to select a free port.
 listen_addr = "0.0.0.0:0"
+# Peer catalog lookup timeout in milliseconds (5000 = 5 seconds).
 lookup_timeout_ms = 5000
+# Peer artifact fetch timeout in milliseconds (30000 = 30 seconds).
 fetch_timeout_ms = 30000
+# Seconds between scheduler peer-list refreshes; values below 1 clamp to 1.
 peer_discovery_refresh_interval_secs = 5
 
 [custom_extension]
-# Optional HTTP base URL of the custom extension service.
-# Leave unset to disable the custom extension integration (default).
+# HTTP base URL for sandbox lifecycle hooks. Leave unset to disable the
+# integration; non-empty customExtensionParams are then rejected.
 # url = "http://127.0.0.1:9090"
-# Timeout for custom extension HTTP calls, in milliseconds.
+# Timeout in milliseconds for non-stop extension hook calls.
 # timeout_ms = 5000
 
 [cluster]
-# Shared gRPC endpoint for cluster-level services such as scheduler heartbeat
-# reporting and P2P peer discovery (e.g. "http://127.0.0.1:9090").
+# Shared scheduler gRPC endpoint for node reporting and P2P peer discovery.
 # scheduler_endpoint = "http://127.0.0.1:9090"
 
 [sandbox_proxy]
+# DNS suffixes accepted for host-based routes such as
+# {port}-{sandboxID}.{domain}. The first entry is advertised to clients.
 domains = []
 
 [network.egress]
-# Node-level destinations that sandbox egress policy cannot override.
-# Deployments can remove selected RFC1918 ranges when sandbox egress to those
-# destinations is required.
+# Destinations denied before per-sandbox allowOut/denyOut rules are evaluated.
+# Remove selected private ranges only when sandbox access to them is required.
 always_denied_cidrs = [
   "10.0.0.0/8",
   "100.64.0.0/10",
@@ -101,114 +156,224 @@ always_denied_cidrs = [
 ]
 
 [network.internal]
-# AENV-internal address plan used for sandbox network namespaces.
-# Change these only when they overlap with host or deployment network ranges.
+# Internal address pools for sandbox network namespaces. Change them only when
+# they overlap deployment networks. They must not overlap each other or the
+# fixed VM tap link at 169.254.0.20/30.
+# The host-interaction pool needs 32768 addresses.
 host_interaction_cidr = "10.11.0.0/16"
+# The veth pool needs 65536 addresses.
 veth_cidr = "10.12.0.0/16"
 
 [machine]
+# Default guest memory in MiB (1024 = 1 GiB).
 mem_size_mib = 1024
+# Default number of guest vCPUs.
 vcpu_count = 2
 
+[machine.disk_rate_limit]
+# Optional per-sandbox virtio-blk limits. Zero means unlimited. Each one-time
+# burst requires its matching sustained limit to be nonzero.
+# enabled = true
+# bandwidth_bytes_per_sec = 104857600  # 100 MB/s sustained
+# bandwidth_burst_bytes = 10485760     # 10 MB startup burst; not replenished
+# iops = 3000                          # 3000 sustained IOPS
+# iops_burst = 500                     # 500 startup IOPS; not replenished
+
 [envd]
+# Expected envd version baked into the tools drive.
 version = "0.5.15"
+# Maximum envd initialization wait in seconds (60 = 1 minute).
 init_timeout_secs = 60
+# envd readiness polling interval in milliseconds.
 poll_ms = 3
 
+[sandbox]
+# Optional secret used to derive per-sandbox envd and traffic access tokens. When unset,
+# AgentENV creates a node-local seed under $AENV_HOME/secrets. Configure the
+# same explicit value on every node when cross-node sandbox recovery is required.
+# access_token_hash_seed = "replace-with-a-secret"
+[volume]
+# Maximum persistent volume size in MiB (256 GiB by default).
+max_size_mb = 262144
+# Maximum number of persistent volumes a sandbox may mount.
+max_volume_count = 4
+
 [orchestrator]
+# Expired-sandbox eviction interval in milliseconds (1000 = 1 second).
 auto_evict_interval_ms = 1000
+# Default sandbox lifetime in seconds when a request omits it.
 default_sandbox_timeout_secs = 15
+# Minimum auto-resumed lifetime in seconds (300 = 5 minutes).
 auto_resume_min_sandbox_timeout_secs = 300
+# Durable paused-sandbox metadata restored after a server restart.
+# persisted_sandbox_store_path = "$AENV_HOME/persisted-sandboxes"
 
 [snapshot]
+# Node-local cache for snapshot artifacts.
+# local_cache_path = "$AENV_HOME/snapshot-local-cache"
+
+# Durable repository backend:
+# - "posix_fs" stores snapshots on a local or shared filesystem.
+# - "oss" stores snapshots in S3-compatible object storage.
 repository_backend = "posix_fs"
+
+# EXPERIMENTAL: publish snapshot artifacts to P2P and use P2P during OSS
+# resolution. Effective only when [p2p].enabled is also true. POSIX fixed
+# artifacts remain authoritative in their repository.
 p2p_enabled = true
-# Supported repository backends:
-#   - "posix_fs": store committed snapshots on a shared/local filesystem.
-#     Requires [backend.posix_fs].snapshot_store.
-#   - "oss": store committed snapshots in object storage.
-#     Requires [backend.oss] to be configured.
-#
-# Advanced: only takes effect with repository_backend = "oss". Enable only when
-# source images already live in an overlaybd-capable registry and AENV has push
-# credentials (from ~/.docker/config.json). When enabled, AENV publishes each
-# snapshot rootfs as a new overlaybd image tag "agentenv-snapshot-{snapshot_id}"
-# in the original source registry: existing remote layers are referenced by
-# digest and only new delta layers are uploaded, so the snapshot can also be
-# addressed and reused as an image version there. The published reference is
-# returned as `imageRef` in snapshot APIs. Memory and VM-state artifacts always
-# stay in the snapshot repository. Locally converted (non-overlaybd) source
-# images fall back to object storage; incompatible remote-backed layouts fail
-# the publish instead of mixing sources.
+
+# OSS only: publish a compatible rootfs back to its source registry as
+# agentenv-snapshot-{snapshot_id}. Existing remote layers are reused by digest;
+# only new deltas are uploaded, and APIs return the tag as imageRef. Memory and
+# VM state remain in the snapshot repository. Requires an OverlayBD-capable
+# source registry and Docker push credentials. Locally converted images fall
+# back to object storage; incompatible remote layouts fail publication.
 # [snapshot.image_publish]
 # enabled = true
 
-# The POSIX snapshot store defaults to "$AENV_HOME/snapshot-store". Configure
-# this section when snapshots should live on an independent/shared filesystem.
+# POSIX storage defaults under AENV_HOME. Set this for a shared or independent
+# snapshot filesystem.
 # [backend.posix_fs]
 # snapshot_store = "/mnt/aenv-snapshots"
 
-# Uncomment this section and set `repository_backend = "oss"` above to use the OSS backend.
+# OSS requires an endpoint, bucket, region, and either credential_process or
+# static credentials. credential_process takes precedence over static values.
 # [backend.oss]
 # endpoint = "https://oss-cn-beijing-internal.aliyuncs.com"
-# bucket = "agentenv-oss-validation"
+# bucket = "agentenv-snapshots"
 # region = "cn-beijing"
-# prefix = "validation/"
-# credential_process = ""
-# cache_max_size_gb = 10
+# Bucket addressing style: "virtual" or "path". Leave unset to use
+# endpoint-based auto-detection.
+# addressing_style = "virtual" # or "path"
+# prefix = "snapshots/"
+# credential_process = "/usr/local/bin/get-oss-credentials"
+# access_key_id = "..."
+# access_key_secret = "..."
+# security_token = "..."
+# cache_max_size_gb = 10              # 10 GiB node-local artifact cache
 
 [ublk]
-enabled = true
+# Explicit daemon executable. The default is under $AENV_HOME/ublk.
+# daemon_binary_path = "$AENV_HOME/ublk/uvm-ublk-daemon"
+# Control socket and daemon log paths.
+# daemon_socket_path = "$AENV_RUNTIME/ublk-daemon.sock"
+# daemon_log_path = "$AENV_HOME/logs/ublk-daemon.log"
+# Prometheus metrics listen address; an empty string disables the endpoint.
 daemon_metrics_listen_addr = "0.0.0.0:9103"
-device_type = "overlaybd" # or "cow"
 
 [ublk.overlaybd]
+# Generated OverlayBD runtime config. The server rewrites it at every startup;
+# configure behavior here rather than editing the generated JSON.
+# global_config_path = "$AENV_HOME/overlaybd/overlaybd-global.json"
+
+# Mount rootfs devices without a writable upper layer.
 read_only = false
+# Writable upper format for new images: "logStructured",
+# "hybridLogStructured", or "sparse". Existing uppers retain their format.
 runtime_upper_mode = "hybridLogStructured"
+# Permit cold-start shrink. Explicit sizes are MiB and must be divisible by
+# 1024. Growth is always allowed; snapshot resume never resizes.
 allow_shrink = false
+# Cold-start resize timeout in seconds; must be positive (120 = 2 minutes).
 resize_timeout_secs = 120
+# Enable layer-level background download for remote rootfs layers.
 download_enable = false
+# P2P descriptor lookup timeout in milliseconds; timeout is a cacheable miss.
 p2p_lookup_timeout_ms = 300
+# P2P range-fetch timeout in milliseconds before origin fallback (2000 = 2s).
 p2p_fetch_range_timeout_ms = 2000
 
 [pool]
+# Shared idle-resource targets. Pools start low and grow their refill target
+# toward the high watermark as acquisitions drain them. Low must not exceed high.
 low_watermark = 2
 high_watermark = 64
 
 [pool.network]
+# Refill the network-slot pool in the background.
 maintenance_enabled = true
 
 [pool.block]
+# Enable the reusable OverlayBD ublk-device pool.
 enabled = true
-startup_prewarm = true
+# Omit to prewarm only when the kernel supports UBLK_F_UPDATE_SIZE. Set an
+# explicit boolean to override capability-based selection.
+# startup_prewarm = true
 
 [pool.firecracker]
+# Enable pre-spawned Firecracker processes for snapshot resume.
 enabled = true
+# Populate the process pool during server startup.
 startup_prewarm = true
+# Maximum concurrent process creations in one refill batch.
 fill_concurrency = 4
 
 [memory_snapshot]
-# Experimental: create memory overlaybd layers directly from Firecracker dirty
-# ranges via process_vm_readv, skipping the intermediate mem.bin file.
-direct_overlaybd = true
+# Generated OverlayBD config dedicated to memory snapshot devices.
+# overlaybd_global_config_path = "$AENV_HOME/overlaybd/mem-overlaybd-global.json"
+
+# EXPERIMENTAL: use Firecracker KVM dirty-page tracking instead of mincore.
+# It is automatically disabled for PVM. Memory snapshot packaging always uses the direct
+# OverlayBD path. Disable with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false.
+track_dirty_pages = true
+
+# Compress memory snapshot layers. The algorithm is parsed but ignored when
+# compression is disabled.
+compression_enabled = false
+# Supported algorithms are "lz4" and "zstd".
+compression_algorithm = "lz4"
+# Workers compressing 4 KiB blocks. One is sequential; higher values run in
+# parallel without changing the output layout.
+compression_workers = 1
 
 [memory_snapshot.background_download]
+# Download missing blocks from remote memory layers; never start before envd
+# becomes ready.
 enable = true
-delay = 0 # delay after envd is ready (downloads never start before envd readiness; a 20s fallback applies if the ready signal is lost)
-delay_extra = 1 # random extra delay is [0, delay_extra), so 1 adds no jitter
+# Base delay in seconds. A 20-second fallback applies if readiness is lost.
+delay = 0
+# Exclusive upper bound for random extra delay; 1 adds no jitter.
+delay_extra = 1
+# Retry count for each background download task.
 try_cnt = 5
-block_size = 16777216 # 16 MiB per block; peak scratch memory is block_size * concurrency per layer download
-concurrency = 4 # max in-flight block remote reads per remote layer; layers download sequentially
-max_inflight_blocks = 16 # process-wide cap on in-flight download blocks shared by every layer download
+# Bytes per source request (16777216 = 16 MiB), aligned to cache blocks.
+# Foreground reads retain the cache's smaller block size. Maximum is 64 MiB.
+block_size = 16777216
+# Source reads per layer (1-16). block_size * concurrency must not exceed
+# 256 MiB. Layer tasks also obey maxConcurrentFiles (default 8).
+concurrency = 4
+# Backend-wide chunk cap (1-128), shared by all layers. The product with
+# block_size must not exceed 2 GiB; defaults use 256 MiB. Per-image overrides
+# cannot resize it.
+max_inflight_blocks = 16
+
+[template_build]
+# Compress snapshot artifacts captured by template builds, independent of
+# [memory_snapshot].compression_enabled (template builds consult only this
+# section). When enabled, both memory layers and the sealed rootfs read-write
+# layer are compressed. Pause/snapshot captures of running sandboxes are not
+# affected.
+compression_enabled = false
+# Supported algorithms are "lz4" and "zstd".
+compression_algorithm = "lz4"
+# Workers compressing 4 KiB blocks. One is sequential; higher values run in
+# parallel without changing the output layout.
+compression_workers = 1
 
 [observability]
+# Expose node identity, host metrics, and orchestrator runtime metrics.
 enabled = true
 
 [observability.scheduler_report]
+# Send heartbeats and lifecycle events. Requires cluster.scheduler_endpoint.
 enabled = false
+# Scheduler report interval in seconds.
 interval_secs = 5
 
 [node_identity]
+# Stable node identifier returned by node APIs and scheduler heartbeats.
 node_id = "node-a"
+# Logical cluster UUID.
 cluster_id = "00000000-0000-0000-0000-000000000000"
+# Identifier for this service instance.
 service_instance_id = "service-instance-a"

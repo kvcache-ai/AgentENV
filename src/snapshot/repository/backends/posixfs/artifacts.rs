@@ -25,8 +25,19 @@ impl PosixFsArtifactStore {
         Self { root }
     }
 
+    pub(crate) fn managed_layer_path(&self, digest: &str) -> PathBuf {
+        PosixFsSnapshotArtifactLayout::managed_layer_path(&self.root, digest)
+    }
+
     fn committed_layout(&self, snapshot_id: &SnapshotId) -> PosixFsSnapshotArtifactLayout {
         PosixFsSnapshotArtifactLayout::new(&self.root, snapshot_id)
+    }
+
+    pub(crate) fn publish_volume_backing(
+        &self,
+        image_config_path: &Path,
+    ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
+        self.derive_rootfs_layers(image_config_path, true)
     }
 
     /// Imports manager-owned local build artifacts into committed repository storage.
@@ -65,7 +76,7 @@ impl PosixFsArtifactStore {
                 // The committed attached-drive manifest stores logical layers only.
                 // The build-time image config is used here as an input for deriving
                 // those layers, but is not copied into the committed repository.
-                let rootfs_layers = self.derive_rootfs_layers(&drive.image_config_path)?;
+                let rootfs_layers = self.derive_rootfs_layers(&drive.image_config_path, false)?;
                 Ok(CommittedAttachedDrive::Overlaybd {
                     drive_id: drive.drive_id.clone(),
                     layers: rootfs_layers,
@@ -83,7 +94,7 @@ impl PosixFsArtifactStore {
             })
             .collect::<RepositoryResult<Vec<_>>>()?;
 
-        let rootfs_layers = self.derive_rootfs_layers(&manifest.rootfs.image_config_path)?;
+        let rootfs_layers = self.derive_rootfs_layers(&manifest.rootfs.image_config_path, false)?;
 
         Ok(CollectedBuiltArtifacts {
             rootfs_layers,
@@ -396,6 +407,7 @@ impl PosixFsArtifactStore {
     fn derive_rootfs_layers(
         &self,
         image_config_path: &Path,
+        allow_descriptorless: bool,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
         let image_config = load_overlaybd_image_config(image_config_path).map_err(|error| {
             RepositoryError::backend(
@@ -423,9 +435,11 @@ impl PosixFsArtifactStore {
                             )
                             .map(OverlaybdLayerRef::Managed);
                     }
-                    if crate::image::local_layer::rootfs_layer_is_runtime_generated_delta(
-                        layer_path,
-                    ) {
+                    if allow_descriptorless
+                        || crate::image::local_layer::rootfs_layer_is_runtime_generated_delta(
+                            layer_path,
+                        )
+                    {
                         return self
                             .import_descriptorless_rootfs_layer(layer_path)
                             .map(OverlaybdLayerRef::Managed);
@@ -706,7 +720,12 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::MetadataExt;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
+    use overlaybd::backend::local::LocalFile;
+    use overlaybd::index_file::{CommitArgs, LSMTFile};
+    use overlaybd::virtual_file::VirtualFile;
+    use overlaybd::zfile::{is_zfile, CompressArgs, CompressOptions, ZFileCompactWriter};
     use serde_json::json;
     use tempfile::TempDir;
 
@@ -758,7 +777,9 @@ mod tests {
         )
         .expect("write image config");
 
-        let layers = store.derive_rootfs_layers(&image).expect("derive layers");
+        let layers = store
+            .derive_rootfs_layers(&image, false)
+            .expect("derive layers");
 
         assert_eq!(
             layers,
@@ -824,6 +845,8 @@ mod tests {
                 mount_path: crate::sandbox::ExtraDrive::default_mount_path("data"),
                 virtual_size: Some(4096),
                 sub_path: None,
+                snapshot_output_dir: None,
+                volume: false,
             }])
             .expect("attached drive manifest should include virtual size");
 
@@ -995,6 +1018,100 @@ mod tests {
                 .path(SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config)
                 .exists(),
             "committed snapshot dir should not persist mem_image.json"
+        );
+    }
+
+    /// Write a real ZFile-compressed sealed LSMT layer, mirroring the memory
+    /// snapshot output when `[memory_snapshot].compression_enabled = true`.
+    async fn write_zfile_lsmt_layer(path: &std::path::Path) {
+        let data =
+            Arc::new(LocalFile::new(path.with_extension("data")).expect("create layer data file"));
+        let index = Arc::new(
+            LocalFile::new(path.with_extension("index")).expect("create layer index file"),
+        );
+        let layer = LSMTFile::create(data, Some(index), 2 * 4096, false)
+            .await
+            .expect("create layer");
+        layer
+            .write_at(0, &[0x5A; 4096])
+            .await
+            .expect("write layer page 0");
+        layer
+            .write_at(4096, &[0xA5; 4096])
+            .await
+            .expect("write layer page 1");
+        let output = Arc::new(LocalFile::new(path).expect("create zfile layer output"));
+        let compress_args = CompressArgs::new(CompressOptions::new(
+            CompressOptions::LZ4,
+            CompressOptions::DEFAULT_BLOCK_SIZE,
+            0,
+        ));
+        let writer = Arc::new(
+            ZFileCompactWriter::new(output, &compress_args)
+                .await
+                .expect("create zfile compact writer"),
+        );
+        layer
+            .commit_with_args(CommitArgs::from_writer(writer))
+            .await
+            .expect("commit zfile layer");
+    }
+
+    #[tokio::test]
+    async fn import_built_artifacts_preserves_zfile_memory_lower_bytes() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let store = test_store(tempdir.path());
+        let snapshot_id = SnapshotId::generate();
+        let local_dir = tempdir.path().join("local");
+        let (_, _, manifest) = write_mock_built_artifacts(local_dir.as_path())
+            .expect("mock built artifacts should write");
+
+        // Replace the mock memory lower with a real ZFile layer. Production
+        // mem image configs carry no digest/size for the freshly written
+        // lower, so the import hashes the physical file.
+        let zfile_lower = local_dir.join("mem.zfile.commit");
+        write_zfile_lsmt_layer(&zfile_lower).await;
+        let zfile_descriptor =
+            FileDigest::describe_blocking(&zfile_lower).expect("describe zfile lower");
+        fs::write(
+            &manifest.memory.image_config_path,
+            format!(r#"{{"lowers":[{{"file":"{}"}}]}}"#, zfile_lower.display()),
+        )
+        .expect("write zfile memory image config");
+
+        let built = store
+            .import_built_artifacts(&snapshot_id, &manifest)
+            .expect("import built artifacts");
+
+        assert_eq!(built.memory_layers.len(), 1);
+        let managed = &built.memory_layers[0];
+        assert_eq!(managed.digest, zfile_descriptor.sha256);
+        assert_eq!(managed.size, zfile_descriptor.size);
+        // ZFile wraps the raw LSMT header, so no layer UUID is exposed.
+        assert!(managed.uuid.is_none());
+
+        let managed_path = tempdir
+            .path()
+            .join("managed-layers")
+            .join(managed_layer_file_name(&managed.digest));
+        assert_eq!(
+            fs::read(&managed_path).expect("read managed layer"),
+            fs::read(&zfile_lower).expect("read source zfile lower"),
+            "managed layer must preserve the physical ZFile bytes"
+        );
+        assert_eq!(
+            fs::metadata(&managed_path)
+                .expect("managed layer metadata")
+                .len(),
+            fs::metadata(&zfile_lower)
+                .expect("source zfile metadata")
+                .len()
+        );
+        // The stored bytes still probe as a ZFile with the source algorithm.
+        let managed_file = Arc::new(LocalFile::open_ro(&managed_path).expect("open managed layer"));
+        assert_eq!(
+            is_zfile(managed_file).await.expect("probe managed layer"),
+            1
         );
     }
 }

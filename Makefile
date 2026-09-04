@@ -32,7 +32,8 @@ AENV_INSTALL_SUDO ?= sudo
 TEST_SCRIPTS_DIR := ./scripts/tests
 
 # Runner for tests that require AENV's network and namespace capabilities.
-CAPABILITY_RUNNER := CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$(CURDIR)/scripts/run-with-capabilities.sh"
+CARGO_HOST_TARGET_ENV = $(shell $(CARGO) -vV | sed -n 's/^host: //p' | tr '[:lower:]-' '[:upper:]_')
+CAPABILITY_RUNNER = CARGO_TARGET_$(CARGO_HOST_TARGET_ENV)_RUNNER="$(CURDIR)/scripts/run-with-capabilities.sh"
 AENV_TEST_STATE_ID ?= $(if $(GITHUB_RUN_ID),$(GITHUB_RUN_ID)-$(GITHUB_RUN_ATTEMPT),local-$$(id -u))
 AENV_TEST_STATE_DIR ?= /tmp/aenv-test-$(AENV_TEST_STATE_ID)
 AENV_TEST_DEPS_PATH ?= $(if $(AENV_DEPS_PATH),$(AENV_DEPS_PATH),/var/lib/aenv/deps)

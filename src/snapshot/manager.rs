@@ -77,6 +77,12 @@ impl SnapshotManager {
         }
     }
 
+    /// Returns the configured durable repository so sibling resource catalogs
+    /// can share the same PosixFS/OSS source of truth.
+    pub fn repository(&self) -> Arc<dyn SnapshotRepository> {
+        Arc::clone(&self.repository)
+    }
+
     pub async fn create(
         &self,
         record: SnapshotRecord,

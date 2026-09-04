@@ -13,14 +13,16 @@ use super::build_spec::TemplateBuildStep;
 use super::errors::{command_output_suffix, TemplateBuildFailure};
 use super::step_executor::TemplateStepExecutor;
 use crate::sandbox::{
-    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotManifest, ProcessHandle,
-    ProcessOpts, SandboxExecutor, SandboxLaunchConfig, UblkConfig,
+    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotManifest,
+    OverlaybdCompactOutput, ProcessHandle, ProcessOpts, SandboxExecutor, SandboxLaunchConfig,
+    UblkConfig,
 };
 use crate::snapshot::{
     CommandContext, RunnableSnapshot, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions,
     StartupCommand,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::virtualization::VirtualizationMode;
 
 /// Default command to use for ready check when start command is provided but ready command is not.
 /// Use the same default ready command as E2B
@@ -67,6 +69,11 @@ pub(crate) struct TemplateBuildContext {
     pub steps: Vec<TemplateBuildStep>,
     pub base: TemplateBuildBase,
     pub cpu_config_json: Option<String>,
+    pub virtualization_mode: VirtualizationMode,
+    /// Compression applied to the snapshot artifacts captured by this build,
+    /// resolved from `[template_build]`; isolates template builds from
+    /// `[memory_snapshot]`.
+    pub snapshot_compression: OverlaybdCompactOutput,
 }
 
 impl TemplateBuildContext {
@@ -202,6 +209,7 @@ impl TemplateBuildRunner {
         let initial_context = context.initial_context.clone();
         let startup = context.startup.clone();
         let override_startup = context.override_startup;
+        let snapshot_compression = context.snapshot_compression;
 
         let handle =
             spawn_with_trace_context(worker_span, move || -> Result<TemplateBuildExecution> {
@@ -211,6 +219,7 @@ impl TemplateBuildRunner {
                     .context("create tokio runtime")?;
                 rt.block_on(async move {
                     let mut sandbox = create_sandbox()?;
+                    sandbox.set_snapshot_compression_override(snapshot_compression);
                     let run_result = async {
                         debug!(
                             cpu_count = resources.cpu_count,
@@ -633,7 +642,7 @@ mod tests {
 
     #[async_trait(?Send)]
     impl SandboxExecutor for RecordingSandbox {
-        fn executor(&self) -> Result<Executor<'_>> {
+        fn executor(&self) -> Result<Executor> {
             Err(anyhow!("not used by this test"))
         }
 
@@ -737,7 +746,7 @@ mod tests {
 
     #[async_trait(?Send)]
     impl SandboxExecutor for ScriptRecordingSandbox {
-        fn executor(&self) -> Result<Executor<'_>> {
+        fn executor(&self) -> Result<Executor> {
             Err(anyhow!("not used by this test"))
         }
 
@@ -869,7 +878,7 @@ mod tests {
 
         #[async_trait(?Send)]
         impl SandboxExecutor for BrokenSandbox {
-            fn executor(&self) -> Result<Executor<'_>> {
+            fn executor(&self) -> Result<Executor> {
                 Err(anyhow!("not used"))
             }
             async fn run_command_with_opts(

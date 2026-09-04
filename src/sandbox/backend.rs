@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    Executor, FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput,
+    EnvdAccessToken, Executor, FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput,
     SandboxLaunchConfig, SandboxNetworkPolicy,
 };
 use crate::sandbox::CustomExtensionParams;
@@ -35,6 +35,10 @@ pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
     /// The orchestrator only carries this value to the image-liveness layer; it
     /// does not interpret the backend-specific artifact identities inside it.
     fn runtime_artifacts(&self) -> RuntimeArtifactSet;
+    /// Effective envd control-plane port persisted with the paused runtime, when available.
+    fn control_plane_port(&self) -> Option<u16> {
+        None
+    }
 }
 
 impl dyn PausedSandboxState {
@@ -79,6 +83,15 @@ impl From<anyhow::Error> for SandboxCaptureError {
 
 pub type SandboxCaptureResult<T> = std::result::Result<T, SandboxCaptureError>;
 pub type SandboxForkResult = anyhow::Result<Box<dyn SandboxBackend>>;
+
+#[derive(Clone, Debug)]
+pub struct SandboxForkSpec {
+    pub sandbox_id: SandboxId,
+    pub envd_access_token: Option<EnvdAccessToken>,
+    pub extra_drives: Vec<super::ExtraDrive>,
+    /// Pairs of `(source_drive_id, replacement_drive_id)`.
+    pub replace_drive_ids: Vec<(String, String)>,
+}
 
 /// Opaque set of local runtime artifacts a sandbox needs while it is alive.
 ///
@@ -214,11 +227,19 @@ pub trait SandboxBackend: Send + 'static {
     /// as safely runnable.
     async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot>;
 
+    /// Flush and seal writable persistent-volume upper layers while keeping
+    /// the sandbox running.
+    ///
+    /// The sealed layers are node-local until the volume catalog publishes
+    /// them. This operation provides the runtime half of that publication
+    /// barrier without capturing rootfs, memory, or VM state.
+    async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()>;
+
     /// Fork this running sandbox into ready child backends.
     ///
     /// The outer error is reserved for failures before child startup begins.
     /// After the source has been restored, implementations must attempt every
-    /// child concurrently and return one result per `child_ids` entry in the
+    /// child concurrently and return one result per `spec` entry in the
     /// same order. Successful children stay running when a sibling fails.
     ///
     /// [`SandboxCaptureError::Terminal`] indicates the fork attempt mutated the
@@ -227,7 +248,7 @@ pub trait SandboxBackend: Send + 'static {
     /// recovery belong in the corresponding [`SandboxForkResult`].
     async fn fork(
         &mut self,
-        child_ids: &[SandboxId],
+        spec: &[SandboxForkSpec],
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>>;
 
     /// Stop the sandbox and release all associated system resources.
@@ -287,6 +308,7 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         &self,
         sandbox_id: crate::types::SandboxId,
         state: &dyn PausedSandboxState,
+        envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>>;
 }
 
@@ -306,7 +328,7 @@ pub trait SandboxExecutor: Send {
     /// Obtain a process executor backed by this sandbox's envd connection.
     ///
     /// Returns an error if the sandbox is not running.
-    fn executor(&self) -> Result<Executor<'_>>;
+    fn executor(&self) -> Result<Executor>;
 
     /// Run a command inside the sandbox and wait for it to complete.
     ///

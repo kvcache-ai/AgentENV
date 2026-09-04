@@ -36,7 +36,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use overlaybd::tools::{ConvertLayerRequest, OverlaybdTools};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
@@ -49,6 +49,7 @@ use super::{
     env_vars_from_entries, ImageBaseContext, ImageError, ImageResolutionMetadata, ImageResult,
 };
 use crate::digest;
+use crate::p2p::P2pArtifactKey;
 
 /// GOMAXPROCS ceiling applied to every spawned `regctl` process; see
 /// [`regctl_command`] for the rationale.
@@ -65,6 +66,9 @@ const OCI_INDEX_MEDIA_TYPES: &[&str] = &[
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
 ];
+
+const CONVERTED_LAYER_P2P_PROTOCOL: &str = "agentenv-oci-layer-v1";
+const CONVERTED_LAYER_P2P_KEY_PREFIX: &str = "oci-layer/v1";
 
 /// Outcome of resolving an OCI image reference for overlaybd consumption.
 ///
@@ -105,7 +109,8 @@ pub(crate) struct OverlaybdConversionEnv<'a> {
     pub(crate) regctl_binary: &'a Path,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct LayerConversionKey {
     pub(crate) source_layer_digest: String,
     pub(crate) converter_id: String,
@@ -113,6 +118,46 @@ pub(crate) struct LayerConversionKey {
     pub(crate) mkfs: bool,
     pub(crate) parent_commit_digest: Option<String>,
     pub(crate) expected_layer_uuid: Uuid,
+}
+
+impl LayerConversionKey {
+    /// Stable key for the conversion context, excluding the output digest so
+    /// peers can discover a converted layer before knowing its local filename.
+    pub(crate) fn p2p_key(&self) -> P2pArtifactKey {
+        let context = serde_json::to_vec(self)
+            .expect("layer conversion context serialization should not fail");
+        format!(
+            "{CONVERTED_LAYER_P2P_KEY_PREFIX}/{}",
+            digest::sha256_hex(&context)
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConvertedLayerP2pMetadata {
+    pub(crate) protocol: String,
+    pub(crate) commit_digest: String,
+    pub(crate) size: u64,
+}
+
+impl ConvertedLayerP2pMetadata {
+    pub(crate) fn from_local_layer(layer: &LocalLayer) -> Self {
+        Self {
+            protocol: CONVERTED_LAYER_P2P_PROTOCOL.to_string(),
+            commit_digest: layer.digest.clone(),
+            size: layer.size,
+        }
+    }
+
+    pub(crate) fn parse(raw: &serde_json::Value) -> Result<Self> {
+        let metadata: ConvertedLayerP2pMetadata = serde_json::from_value(raw.clone())
+            .context("parse converted image layer P2P metadata")?;
+        if metadata.protocol != CONVERTED_LAYER_P2P_PROTOCOL {
+            bail!("unexpected converted image layer P2P metadata protocol");
+        }
+        Ok(metadata)
+    }
 }
 
 #[async_trait]
@@ -1599,6 +1644,17 @@ mod tests {
             assert_eq!(uuid.get_variant(), Variant::RFC4122);
             assert_eq!(uuid.get_version(), Some(Version::Custom));
         }
+    }
+
+    #[test]
+    fn converted_layer_p2p_metadata_rejects_protocol_mismatch() {
+        let metadata = ConvertedLayerP2pMetadata {
+            protocol: "other-protocal".to_string(),
+            commit_digest: "sha256:aaa".to_string(),
+            size: 1234,
+        };
+        let serialized = serde_json::to_value(&metadata).expect("serialize metadata");
+        assert!(ConvertedLayerP2pMetadata::parse(&serialized).is_err());
     }
 
     #[test]

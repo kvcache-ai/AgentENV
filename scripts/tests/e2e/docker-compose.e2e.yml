@@ -1,4 +1,12 @@
 services:
-  agentenv-a: {}
+  gateway:
+    environment:
+      GATEWAY_DEBUG_MODE: "true"
 
-  agentenv-b: {}
+  agentenv-a:
+    ports:
+      - "8001:8000"
+
+  agentenv-b:
+    ports:
+      - "8002:8000"

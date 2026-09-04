@@ -97,20 +97,34 @@ pub struct DownloadConfig {
     pub enable: bool,
     pub delay: i32,
     pub delay_extra: i32,
-    /// Rate limit shared by the concurrent block downloads of one layer, in
+    /// Rate limit shared by the concurrent chunk downloads of one layer, in
     /// MiB/s; 0 disables throttling. Backward compatible with the historical
     /// `maxMBps` JSON knob, which older configs may still carry.
     #[serde(rename = "maxMBps")]
     pub max_mbps: i32,
     pub try_cnt: i32,
+    /// Background download chunk size in bytes: one source request fetches a
+    /// chunk of this size (aligned down to whole cache blocks), covering
+    /// `blockSize / cacheBlockSize` cache blocks. The cache keeps storing and
+    /// exposing data in its own smaller block size, so foreground reads keep
+    /// their fine-grained on-demand granularity while background downloads
+    /// keep large-request throughput.
     pub block_size: u32,
     pub concurrency: usize,
-    /// Process-wide cap on in-flight download block I/O, shared by every
-    /// concurrent layer download in the process (bounds total scratch memory
-    /// to maxInflightBlocks × block_size), independent of the per-image
-    /// `concurrency` knob. The first download to run fixes the process-wide
-    /// value; every layer on a node is expected to share it.
+    /// Cap on concurrently downloading chunks enforced by the cache backend's
+    /// download scheduler (bounds total scratch memory to maxInflightBlocks ×
+    /// the download chunk size), independent of the per-image `concurrency`
+    /// knob. The global value fixes the scheduler's capacity when the
+    /// file-cache backend is created. A per-image `download` override may
+    /// still carry this field for serialization compatibility, but it never
+    /// resizes the scheduler-owned cap; the first mismatch per scheduler is
+    /// logged under the fixed category `max_inflight_blocks_override_ignored`.
     pub max_inflight_blocks: usize,
+    /// Cap on concurrently running background-download layer tasks per
+    /// file-cache backend. Tasks beyond the cap stay registered and run when
+    /// a slot frees; submission itself is never rejected. Only the global
+    /// value takes effect (per-image overrides are ignored).
+    pub max_concurrent_files: usize,
 }
 
 impl Default for DownloadConfig {
@@ -121,9 +135,10 @@ impl Default for DownloadConfig {
             delay_extra: 30,
             max_mbps: 100,
             try_cnt: 5,
-            block_size: 262_144,
+            block_size: 16 * 1024 * 1024,
             concurrency: 1,
             max_inflight_blocks: 16,
+            max_concurrent_files: 8,
         }
     }
 }
@@ -196,6 +211,9 @@ pub struct OssConfig {
     pub credential_process: String,
     pub default_region: String,
     pub default_endpoint: String,
+    /// Bucket addressing style: `"virtual"`, `"path"`, or empty to use
+    /// endpoint-based auto-detection.
+    pub default_addressing_style: String,
     /// Per-request timeout in seconds (connect + transfer). Default 30.
     pub timeout_secs: u64,
     /// Number of retries on transient failures. Default 3.
@@ -212,6 +230,7 @@ impl Default for OssConfig {
             credential_process: String::new(),
             default_region: String::new(),
             default_endpoint: String::new(),
+            default_addressing_style: String::new(),
             timeout_secs: 30,
             retry_count: 3,
         }
@@ -350,7 +369,8 @@ pub struct GlobalConfig {
     pub user_agent: String,
     pub credential_config: CredentialConfig,
 
-    /// The number of io urings
+    /// Legacy compatibility field. Local files no longer allocate io_uring
+    /// workers through `ImageService`; ublk owns its queue-local rings.
     pub nr_io_rings: usize,
 }
 
@@ -504,18 +524,68 @@ pub fn lexically_normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-fn validate_download_concurrency(cfg: &DownloadConfig, field: &str) -> Result<()> {
+/// Chunk knobs that are honored in every `DownloadConfig` context, including
+/// per-image overrides: chunk size and per-layer concurrency.
+fn validate_download_chunk_knobs(cfg: &DownloadConfig, field: &str) -> Result<()> {
+    const MAX_BLOCK_SIZE: u64 = 64 * 1024 * 1024;
+    const MAX_CONCURRENCY: usize = 16;
+    const MAX_LAYER_SCRATCH_BYTES: u64 = 256 * 1024 * 1024;
     ensure!(cfg.concurrency > 0, "{field} must be > 0");
+    ensure!(
+        cfg.concurrency <= MAX_CONCURRENCY,
+        "download.concurrency must be <= {MAX_CONCURRENCY} (in {field})"
+    );
+    ensure!(
+        cfg.block_size > 0,
+        "download.blockSize must be > 0 (in {field})"
+    );
+    ensure!(
+        u64::from(cfg.block_size) <= MAX_BLOCK_SIZE,
+        "download.blockSize must be <= {MAX_BLOCK_SIZE} bytes (in {field})"
+    );
+    ensure!(
+        u64::from(cfg.block_size) * cfg.concurrency as u64 <= MAX_LAYER_SCRATCH_BYTES,
+        "download.blockSize * concurrency must be <= {MAX_LAYER_SCRATCH_BYTES} bytes (in {field})"
+    );
+    Ok(())
+}
+
+/// Scheduler caps, meaningful only for the *global* download config that
+/// creates the backend scheduler: per-image overrides ignore these fields.
+fn validate_download_scheduler_caps(cfg: &DownloadConfig, field: &str) -> Result<()> {
+    const MAX_INFLIGHT_BLOCKS: usize = 128;
+    const MAX_CONCURRENT_FILES: usize = 128;
+    const MAX_GLOBAL_SCRATCH_BYTES: u64 = 2 * 1024 * 1024 * 1024;
     ensure!(
         cfg.max_inflight_blocks > 0,
         "download.maxInflightBlocks must be > 0 (in {field})"
+    );
+    ensure!(
+        cfg.max_inflight_blocks <= MAX_INFLIGHT_BLOCKS,
+        "download.maxInflightBlocks must be <= {MAX_INFLIGHT_BLOCKS} (in {field})"
+    );
+    ensure!(
+        cfg.max_concurrent_files > 0,
+        "download.maxConcurrentFiles must be > 0 (in {field})"
+    );
+    ensure!(
+        cfg.max_concurrent_files <= MAX_CONCURRENT_FILES,
+        "download.maxConcurrentFiles must be <= {MAX_CONCURRENT_FILES} (in {field})"
+    );
+    let global_scratch = u64::from(cfg.block_size)
+        .checked_mul(cfg.max_inflight_blocks as u64)
+        .context("download scratch budget overflow")?;
+    ensure!(
+        global_scratch <= MAX_GLOBAL_SCRATCH_BYTES,
+        "download.blockSize * maxInflightBlocks must be <= {MAX_GLOBAL_SCRATCH_BYTES} bytes (in {field})"
     );
     Ok(())
 }
 
 pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
     ensure!(cfg.io_engine <= 2, "unknown ioEngine {}", cfg.io_engine);
-    validate_download_concurrency(&cfg.download, "download.concurrency")?;
+    validate_download_chunk_knobs(&cfg.download, "download.concurrency")?;
+    validate_download_scheduler_caps(&cfg.download, "download")?;
 
     match cfg.cache_config.cache_type.as_str() {
         "file" | "ocf" | "download" => {}
@@ -579,16 +649,25 @@ pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
                     && !cfg.oss_config.secret_access_key.is_empty()),
             "ossConfig.securityToken requires accessKeyId and secretAccessKey"
         );
+        ensure!(
+            matches!(
+                cfg.oss_config.default_addressing_style.trim(),
+                "" | "virtual" | "path"
+            ),
+            "ossConfig.defaultAddressingStyle must be 'virtual', 'path', or empty for auto-detection, got '{}'",
+            cfg.oss_config.default_addressing_style
+        );
     }
-
-    ensure!(cfg.nr_io_rings != 0, "nr_io_rings cannot be zero");
 
     Ok(())
 }
 
 pub fn validate_image_config(cfg: &ImageConfig) -> Result<()> {
     if let Some(download) = &cfg.download_override {
-        validate_download_concurrency(download, "download override concurrency")?;
+        // Per-image overrides only honor the chunk knobs; the scheduler caps
+        // (maxInflightBlocks/maxConcurrentFiles) are fixed at backend
+        // creation and ignored here.
+        validate_download_chunk_knobs(download, "download override concurrency")?;
     }
 
     ensure!(
@@ -646,6 +725,91 @@ mod tests {
         assert_eq!(DownloadConfig::default().concurrency, 1);
         // The historical maxMBps knob remains accepted for compatibility.
         assert_eq!(cfg.max_mbps, 80);
+    }
+
+    #[test]
+    fn test_download_config_external_json_schema_round_trip() {
+        let raw = r#"
+        {
+          "enable": true,
+          "delay": 12,
+          "delayExtra": 3,
+          "maxMBps": 80,
+          "tryCnt": 7,
+          "blockSize": 1048576,
+          "concurrency": 4,
+          "maxInflightBlocks": 9
+        }"#;
+        let cfg: DownloadConfig =
+            serde_json::from_str(raw).expect("parse external download config");
+        assert!(cfg.enable);
+        assert_eq!(cfg.delay, 12);
+        assert_eq!(cfg.delay_extra, 3);
+        assert_eq!(cfg.max_mbps, 80);
+        assert_eq!(cfg.try_cnt, 7);
+        assert_eq!(cfg.block_size, 1_048_576);
+        assert_eq!(cfg.concurrency, 4);
+        assert_eq!(cfg.max_inflight_blocks, 9);
+
+        let serialized = serde_json::to_value(&cfg).expect("serialize download config");
+        let object = serialized
+            .as_object()
+            .expect("download config serializes to an object");
+        for field in [
+            "enable",
+            "delay",
+            "delayExtra",
+            "maxMBps",
+            "tryCnt",
+            "blockSize",
+            "concurrency",
+            "maxInflightBlocks",
+            "maxConcurrentFiles",
+        ] {
+            assert!(
+                object.contains_key(field),
+                "missing external download field {field}"
+            );
+        }
+        assert_eq!(object.len(), 9, "unexpected external field drift");
+
+        let reparsed: DownloadConfig =
+            serde_json::from_value(serialized).expect("reparse serialized download config");
+        assert_eq!(reparsed, cfg);
+    }
+
+    #[test]
+    fn test_image_config_download_enabled_remote_lower_needs_no_layer_dir() {
+        let raw = r#"
+        {
+          "repoBlobUrl":"https://example.io/v2/repo/blobs",
+          "lowers":[{"digest":"sha256:abc","size":1234}],
+          "download": {
+            "enable": true,
+            "maxMBps": 40,
+            "tryCnt": 2,
+            "blockSize": 65536,
+            "concurrency": 2
+          }
+        }"#;
+        let cfg: ImageConfig = serde_json::from_str(raw).expect("parse image config with download");
+        let download = cfg.download_override.as_ref().expect("download override");
+        assert!(download.enable);
+        assert_eq!(download.max_mbps, 40);
+        assert_eq!(download.try_cnt, 2);
+        assert_eq!(download.block_size, 65536);
+        assert_eq!(download.concurrency, 2);
+
+        // Background download fills the remote file cache, so an enabled
+        // remote lower requires neither a layer directory nor a local commit
+        // destination.
+        assert!(cfg.lowers[0].dir.is_empty());
+        assert!(cfg.lowers[0].file.is_empty());
+        validate_image_config(&cfg).expect("download-enabled remote lower needs no layer dir");
+
+        let serialized = serde_json::to_value(&cfg).expect("serialize image config");
+        assert_eq!(serialized["download"]["enable"], true);
+        assert_eq!(serialized["download"]["maxMBps"], 40);
     }
 
     #[test]

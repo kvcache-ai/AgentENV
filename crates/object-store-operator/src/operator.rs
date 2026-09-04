@@ -14,7 +14,7 @@ pub const DEFAULT_MAX_RETRIES: usize = 3;
 
 pub type ObjectStoreOperatorResult<T> = std::result::Result<T, ObjectStoreOperatorError>;
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AddressingStyle {
     Virtual,
     Path,

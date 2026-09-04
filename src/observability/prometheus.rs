@@ -123,6 +123,10 @@ pub struct MetricGuard {
 #[derive(Clone, Copy)]
 enum MetricGuardLabel {
     Operation(&'static str),
+    OperationArtifact {
+        operation: &'static str,
+        artifact: &'static str,
+    },
     Stage(&'static str),
 }
 
@@ -134,6 +138,26 @@ impl MetricGuard {
         Self {
             metric,
             label: MetricGuardLabel::Operation(operation),
+            start: Instant::now(),
+            status: "canceled",
+            recorded: false,
+        }
+    }
+
+    /// Operation metric with an additional artifact dimension, used by OSS
+    /// upload operations so per-artifact latency and cancellation stay
+    /// visible (a dropped guard still records with status "canceled").
+    pub fn operation_artifact(
+        metric: &'static str,
+        operation: &'static str,
+        artifact: &'static str,
+    ) -> Self {
+        Self {
+            metric,
+            label: MetricGuardLabel::OperationArtifact {
+                operation,
+                artifact,
+            },
             start: Instant::now(),
             status: "canceled",
             recorded: false,
@@ -166,6 +190,18 @@ impl MetricGuard {
                 metrics::histogram!(
                     self.metric,
                     "operation" => operation,
+                    "status" => self.status,
+                )
+                .record(elapsed);
+            }
+            MetricGuardLabel::OperationArtifact {
+                operation,
+                artifact,
+            } => {
+                metrics::histogram!(
+                    self.metric,
+                    "operation" => operation,
+                    "artifact" => artifact,
                     "status" => self.status,
                 )
                 .record(elapsed);

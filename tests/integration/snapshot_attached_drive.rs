@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common;
 
+use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{
     ExtraDrive, FirecrackerSandbox, FirecrackerSandboxConfig, OverlaybdConfig, SandboxBackend,
     SandboxExecutor, SandboxLaunchConfig,
@@ -159,7 +160,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
     assert_eq!(setup.exit_code, 0);
 
     let captured = SandboxBackend::snapshot(&mut sandbox).await?;
-    let _ = sandbox.stop().await;
+    sandbox.stop().await?;
 
     let metadata = SnapshotPublishMetadata {
         id: SnapshotId::generate(),
@@ -178,9 +179,13 @@ async fn publish_sandbox_snapshot_with_attached_drive(
             kernel_version: "test-kernel".to_string(),
             firecracker_version: "test-firecracker".to_string(),
             envd_version: "test-envd".to_string(),
-            tools_drive_version: "0.1.0".to_string(),
+            tools_drive_version: ConfigManager::global_config()
+                .resolved_tools_version()
+                .to_string(),
         },
+        virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
         image_configs: agentenv::types::ImageConfigs::new(),
+        volume_snapshots: Vec::new(),
         custom_extension_params: None,
     };
 

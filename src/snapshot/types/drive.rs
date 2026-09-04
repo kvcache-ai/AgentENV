@@ -56,6 +56,8 @@ impl ResolvedAttachedDrive {
                 mount_path: mount_path.clone(),
                 virtual_size: Some(*virtual_size),
                 sub_path: sub_path.clone(),
+                snapshot_output_dir: None,
+                volume: false,
             },
         }
     }

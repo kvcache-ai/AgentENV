@@ -8,9 +8,10 @@ use tokio::net::UnixStream;
 use tokio::time::{Duration, Instant};
 use warm_pool::PoolConfig;
 
-use crate::protocol::{recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse};
+use crate::protocol::{
+    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, RestackSnapshotStats,
+};
 use overlaybd::config::UpperMode;
-use overlaybd::LayerDescriptor;
 
 /// Default timeout for daemon RPC calls.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -115,6 +116,7 @@ pub struct UblkDaemonSpawnConfig<'a> {
     pub binary_path: &'a Path,
     pub socket_path: PathBuf,
     pub global_config: &'a Path,
+    pub resize_global_config: &'a Path,
     pub app_config: Option<&'a Path>,
     pub log_file: Option<&'a Path>,
     pub metrics_listen_addr: &'a str,
@@ -150,6 +152,7 @@ impl UblkDaemonClient {
             binary = %config.binary_path.display(),
             socket = %config.socket_path.display(),
             global_config = %config.global_config.display(),
+            resize_global_config = %config.resize_global_config.display(),
             app_config = ?config.app_config,
             log_file = ?config.log_file,
             metrics_listen_addr = config.metrics_listen_addr,
@@ -166,6 +169,8 @@ impl UblkDaemonClient {
             .arg(&config.socket_path)
             .arg("--global-config")
             .arg(config.global_config)
+            .arg("--resize-global-config")
+            .arg(config.resize_global_config)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
 
@@ -429,29 +434,6 @@ impl UblkDaemonClient {
         }
     }
 
-    /// Create a new COW-backed ublk device.
-    ///
-    /// Returns the kernel-assigned device ID and path (e.g. `/dev/ublkb0`).
-    pub async fn create_cow(&self, origin: &Path, cow: &Path) -> Result<(u32, PathBuf)> {
-        let request = DaemonRequest::CreateCow {
-            origin: origin.to_path_buf(),
-            cow: cow.to_path_buf(),
-        };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
-            DaemonResponse::DeviceCreated {
-                dev_id,
-                device_path,
-            } => Ok((dev_id, device_path)),
-            DaemonResponse::TerminalError { message } => {
-                bail!("daemon: create cow failed terminally: {message}")
-            }
-            DaemonResponse::Error { message } => {
-                bail!("daemon: create cow failed: {message}")
-            }
-            other => bail!("daemon: unexpected response for create cow: {other:?}"),
-        }
-    }
-
     /// Delete a ublk device.
     pub async fn delete(&self, dev_id: u32) -> Result<()> {
         let request = DaemonRequest::Delete { dev_id };
@@ -472,13 +454,21 @@ impl UblkDaemonClient {
         &self,
         dev_id: u32,
         output_layer_path: &Path,
-    ) -> Result<Option<LayerDescriptor>> {
+    ) -> Result<RestackSnapshotStats> {
         let request = DaemonRequest::RestackSnapshot {
             dev_id,
             output_layer_path: output_layer_path.to_path_buf(),
         };
         match self.call(request, SNAPSHOT_TIMEOUT).await? {
-            DaemonResponse::RestackSnapshotCreated { descriptor } => Ok(descriptor),
+            DaemonResponse::RestackSnapshotCreated {
+                descriptor,
+                data_stat,
+                ext4_used_bytes,
+            } => Ok(RestackSnapshotStats {
+                descriptor,
+                data_stat,
+                ext4_used_bytes,
+            }),
             DaemonResponse::TerminalError { message } => Err(
                 RestackSnapshotTerminalFailure::new(format!(
                     "daemon: restack snapshot dev_id={dev_id} failed after mutating live state: {message}"
@@ -682,11 +672,6 @@ mod tests {
         );
 
         let err = client.delete(0).await;
-        assert!(err.is_err());
-
-        let err = client
-            .create_cow(Path::new("/origin"), Path::new("/cow"))
-            .await;
         assert!(err.is_err());
 
         let err = client.restack_snapshot(0, Path::new("/out")).await;

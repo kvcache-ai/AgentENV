@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::path::Path;
@@ -40,6 +41,7 @@ use crate::p2p::types::{
 use crate::p2p::P2pByteStream;
 
 const CATALOG_DB_DIR: &str = "catalog.db";
+const MAX_CONCURRENT_CATALOG_LOOKUPS: usize = 4;
 const ENDPOINT_ADDR_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_STORE_GC_INTERVAL: Duration = Duration::from_mins(5);
 const PUBLISH_TAG_PREFIX: &str = "agentenv:p2p:v1:";
@@ -220,21 +222,19 @@ impl IrohBlobsP2pTransport {
         peers: Vec<P2pPeer>,
         key: &P2pArtifactKey,
     ) -> Option<P2pArtifactDescriptor> {
-        // TODO: parallelize lookups to multiple peers.
-        // No shuffling or prioritization for now since the scheduler should already have done that work for us.
-        for peer in peers {
+        first_some_buffered_in_order(peers, MAX_CONCURRENT_CATALOG_LOOKUPS, |peer| async move {
             if peer.node_id == self.node_id || peer.endpoint == self.local_endpoint {
-                let Some(descriptor) = self.get_local(key).await else {
-                    continue;
-                };
-                trace!("P2P lookup found local descriptor matching peer discovery");
-                return Some(descriptor);
+                let descriptor = self.get_local(key).await;
+                if descriptor.is_some() {
+                    trace!("P2P lookup found local descriptor matching peer discovery");
+                }
+                return descriptor;
             }
             match self.lookup_peer_with_timeout(&peer, key).await {
-                Ok(None) => continue,
+                Ok(None) => None,
                 Ok(Some(descriptor)) => {
                     trace!(peer = %peer.node_id, "P2P lookup found remote descriptor");
-                    return Some(descriptor);
+                    Some(descriptor)
                 }
                 Err(err) => {
                     debug!(
@@ -242,10 +242,11 @@ impl IrohBlobsP2pTransport {
                         error = %err,
                         "P2P artifact catalog lookup failed; trying remaining peers"
                     );
+                    None
                 }
             }
-        }
-        None
+        })
+        .await
     }
 
     async fn get_local(&self, key: &P2pArtifactKey) -> Option<P2pArtifactDescriptor> {
@@ -552,7 +553,7 @@ impl P2pTransport for IrohBlobsP2pTransport {
 
     #[instrument(
         skip(self, descriptor),
-        fields(key = %descriptor.key, offset, len)
+        fields(key = %descriptor.key, offset = offset, len = len)
     )]
     async fn fetch_byte_range(
         &self,
@@ -720,6 +721,24 @@ fn blob_hash_from_descriptor(descriptor: &P2pArtifactDescriptor) -> Result<iroh_
     })
 }
 
+async fn first_some_buffered_in_order<I, F, Fut, T>(
+    items: impl IntoIterator<Item = I>,
+    concurrency: usize,
+    lookup: F,
+) -> Option<T>
+where
+    F: FnMut(I) -> Fut,
+    Fut: Future<Output = Option<T>>,
+{
+    let mut results = stream::iter(items).map(lookup).buffered(concurrency.max(1));
+    while let Some(result) = results.next().await {
+        if result.is_some() {
+            return result;
+        }
+    }
+    None
+}
+
 fn resolve_remote_local_providers(
     mut descriptor: P2pArtifactDescriptor,
     response_peer: &P2pPeer,
@@ -765,6 +784,9 @@ fn gated_gc_config(interval: Duration, pending_gc: Arc<AtomicBool>) -> GcConfig 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::{Barrier, Notify};
+
     use crate::cfg::P2pConfig;
     use crate::p2p::config::ResolvedP2pConfig;
     use crate::p2p::discovery::P2pPeerDiscovery;
@@ -772,6 +794,111 @@ mod tests {
     use crate::p2p::{NoopP2pPeerDiscovery, P2pPeer, P2pTransportKind, StaticP2pPeerDiscovery};
 
     const TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    #[tokio::test]
+    async fn buffered_lookup_preserves_candidate_order() {
+        let release_first = Arc::new(Notify::new());
+        let first_started = Arc::new(Notify::new());
+        let second_finished = Arc::new(Notify::new());
+
+        let lookup = tokio::spawn({
+            let release_first = release_first.clone();
+            let first_started = first_started.clone();
+            let second_finished = second_finished.clone();
+            async move {
+                first_some_buffered_in_order([0, 1], 2, move |candidate| {
+                    let release_first = release_first.clone();
+                    let first_started = first_started.clone();
+                    let second_finished = second_finished.clone();
+                    async move {
+                        match candidate {
+                            0 => {
+                                first_started.notify_one();
+                                release_first.notified().await;
+                                Some("first")
+                            }
+                            1 => {
+                                second_finished.notify_one();
+                                Some("second")
+                            }
+                            _ => None,
+                        }
+                    }
+                })
+                .await
+            }
+        });
+
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            first_started.notified().await;
+            second_finished.notified().await;
+        })
+        .await
+        .expect("initial buffered lookups should complete");
+        assert!(
+            !lookup.is_finished(),
+            "a lower-priority result must wait for earlier candidates"
+        );
+
+        release_first.notify_one();
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, lookup)
+                .await
+                .expect("ordered lookup should complete")
+                .expect("lookup task"),
+            Some("first")
+        );
+    }
+
+    #[tokio::test]
+    async fn buffered_lookup_limits_in_flight_candidates() {
+        let current = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let first_window_ready = Arc::new(Barrier::new(5));
+        let release_first_window = Arc::new(Barrier::new(5));
+
+        let lookup = tokio::spawn({
+            let current = current.clone();
+            let maximum = maximum.clone();
+            let first_window_ready = first_window_ready.clone();
+            let release_first_window = release_first_window.clone();
+            async move {
+                first_some_buffered_in_order(0..8, 4, move |candidate| {
+                    let current = current.clone();
+                    let maximum = maximum.clone();
+                    let first_window_ready = first_window_ready.clone();
+                    let release_first_window = release_first_window.clone();
+                    async move {
+                        let active = current.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(active, Ordering::SeqCst);
+                        if candidate < 4 {
+                            first_window_ready.wait().await;
+                            release_first_window.wait().await;
+                        }
+                        current.fetch_sub(1, Ordering::SeqCst);
+                        None::<()>
+                    }
+                })
+                .await
+            }
+        });
+
+        tokio::time::timeout(TEST_TIMEOUT, first_window_ready.wait())
+            .await
+            .expect("initial concurrency window should fill");
+        assert_eq!(current.load(Ordering::SeqCst), 4);
+        tokio::time::timeout(TEST_TIMEOUT, release_first_window.wait())
+            .await
+            .expect("initial concurrency window should be released");
+        assert_eq!(
+            tokio::time::timeout(TEST_TIMEOUT, lookup)
+                .await
+                .expect("bounded lookup should complete")
+                .expect("lookup task"),
+            None
+        );
+        assert_eq!(maximum.load(Ordering::SeqCst), 4);
+    }
 
     async fn collect_range_stream(mut stream: P2pByteStream) -> Result<Vec<u8>> {
         let mut out = Vec::new();

@@ -4,6 +4,7 @@ use clap::Args as ClapArgs;
 
 #[derive(ClapArgs)]
 pub struct Args {
+    #[arg(add = crate::commands::completion::add_running_sandbox_candidates())]
     sandbox_id: String,
 }
 

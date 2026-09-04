@@ -1,10 +1,9 @@
 pub mod backend;
-#[cfg(feature = "full")]
-pub mod bk_download;
 mod compression;
 pub mod config;
 pub mod dense_export;
 pub mod download_gate;
+pub mod ext4_stat;
 mod image;
 mod io;
 mod layer;
@@ -39,10 +38,8 @@ pub mod snapshot {
     #[cfg(feature = "full")]
     pub use crate::image::snapshot::*;
 }
+mod sys;
 pub mod tools;
-pub mod transient_io_ring {
-    pub use crate::io::transient_io_ring::*;
-}
 pub mod vfile_io {
     pub use crate::io::vfile_io::*;
 }
@@ -52,9 +49,6 @@ pub mod virtual_file {
 pub mod zfile {
     pub use crate::compression::zfile::*;
 }
-
-#[cfg(test)]
-pub(crate) mod test_utils;
 
 #[cfg(feature = "full")]
 pub use image_file::{ImageFile, RestackSnapshotTerminalFailure};

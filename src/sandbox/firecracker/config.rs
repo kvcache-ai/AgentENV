@@ -14,7 +14,9 @@ use crate::cfg::{AppConfig, ConfigManager, EnvdConfig, ToolsConfig};
 use crate::sandbox::ublk::UblkConfig;
 use crate::sandbox::SandboxNetworkPolicy;
 use crate::sandbox::UblkBackend;
-use crate::sandbox::{validate_drive_id, ExtraDrive, OverlaybdConfig, SandboxLaunchConfig};
+use crate::sandbox::{
+    validate_drive_id, EnvdAccessToken, ExtraDrive, OverlaybdConfig, SandboxLaunchConfig,
+};
 use crate::snapshot::RunnableSnapshot;
 use anyhow::{bail, Context, Result};
 use overlaybd::config::UpperMode;
@@ -127,6 +129,10 @@ pub struct FirecrackerCommonConfig {
     /// is enabled and written to a `firecracker.log` file alongside the stdout log.
     pub firecracker_log_level: Option<String>,
     pub runtime_policy: FirecrackerRuntimePolicy,
+    /// Enable Firecracker KVM dirty-page tracking for memory snapshot capture.
+    /// The serde default keeps older persisted snapshot configs compatible.
+    #[serde(default)]
+    pub track_dirty_pages: bool,
     pub envd_version: String,
     /// Control plane port inside the VM (default: 49983).
     pub control_plane_port: u16,
@@ -141,6 +147,13 @@ pub struct FirecrackerCommonConfig {
     #[serde(default)]
     pub rootfs_allow_shrink: bool,
     pub extra_drives: Vec<ExtraDrive>,
+    /// Extra drives physically present in the Firecracker snapshot before its
+    /// reserved launch-time volume slots.
+    #[serde(default)]
+    pub physical_extra_drive_count: usize,
+    /// Existing placeholder drives that can be rebound to launch-time volumes.
+    #[serde(default)]
+    pub volume_drive_slots: usize,
     pub ublk_config: Option<UblkConfig>,
     /// Cluster-wide CPU intersection received from the scheduler.
     /// When set, applied via `PUT /cpu-config` before the VM boots.
@@ -150,6 +163,16 @@ pub struct FirecrackerCommonConfig {
     /// start-fresh / start-resume hooks. Persisted with snapshot configs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<crate::sandbox::CustomExtensionParams>,
+    /// Effective disk I/O rate limit for the user rootfs drive. Carried in the
+    /// common config so fresh boot and snapshot resume apply the same config
+    /// and it persists across pause/resume, instead of each path reaching for
+    /// the process-global config.
+    #[serde(default)]
+    pub disk_rate_limit: crate::cfg::DiskRateLimitConfig,
+    /// Runtime-only envd credential. It is re-derived from sandbox metadata on
+    /// resume and is intentionally excluded from persisted snapshot configs.
+    #[serde(skip)]
+    pub envd_access_token: Option<EnvdAccessToken>,
 }
 
 impl FirecrackerCommonConfig {
@@ -167,6 +190,7 @@ impl FirecrackerCommonConfig {
             stderr_path: None,
             firecracker_log_level: None,
             runtime_policy,
+            track_dirty_pages: true,
             envd_version: EnvdConfig::default().version,
             control_plane_port: ToolsConfig::default().control_plane_port,
             env_vars: None,
@@ -177,10 +201,14 @@ impl FirecrackerCommonConfig {
             rootfs_virtual_size: None,
             rootfs_allow_shrink: false,
             extra_drives: Vec::new(),
+            physical_extra_drive_count: 0,
+            volume_drive_slots: 0,
             ublk_config: None,
             cpu_config_json: None,
             network_policy: None,
             custom_extension_params: None,
+            disk_rate_limit: crate::cfg::DiskRateLimitConfig::default(),
+            envd_access_token: None,
         }
     }
 
@@ -191,6 +219,8 @@ impl FirecrackerCommonConfig {
 
         let mut common = Self::new(firecracker_binary, tools_drive_version, runtime_policy);
         common.envd_version = config.envd.version.clone();
+        common.disk_rate_limit = config.machine.disk_rate_limit.clone();
+        common.track_dirty_pages = config.memory_snapshot.track_dirty_pages;
         common.rootfs_allow_shrink = config.ublk.overlaybd.allow_shrink;
         common.control_plane_port = config.tools.control_plane_port;
         common.firecracker_work_base_dir = config.firecracker.work_dir.clone();
@@ -202,14 +232,6 @@ impl FirecrackerCommonConfig {
             .as_ref()
             .map(|level| level.trim().to_string())
             .filter(|level| !level.is_empty());
-
-        if config.ublk.enabled {
-            match config.ublk.device_type.trim().to_ascii_lowercase().as_str() {
-                "" | "cow" => common.ublk_config = Some(UblkConfig::cow()),
-                "overlaybd" => {}
-                other => bail!("unsupported ublk.device_type: {}", other),
-            };
-        }
 
         Ok(common)
     }
@@ -271,13 +293,12 @@ impl FirecrackerCommonConfig {
             anyhow::bail!("rootfs virtual size must be non-zero");
         }
         if let Some(ublk_config) = &self.ublk_config {
-            if let UblkBackend::Overlaybd(overlaybd_cfg) = &ublk_config.backend {
-                if !overlaybd_cfg.image_config_path.exists() {
-                    anyhow::bail!(
-                        "overlaybd image config not found at {}",
-                        overlaybd_cfg.image_config_path.display()
-                    );
-                }
+            let UblkBackend::Overlaybd(overlaybd_cfg) = &ublk_config.backend;
+            if !overlaybd_cfg.image_config_path.exists() {
+                anyhow::bail!(
+                    "overlaybd image config not found at {}",
+                    overlaybd_cfg.image_config_path.display()
+                );
             }
         }
         Ok(())
@@ -346,6 +367,7 @@ impl FirecrackerSandboxConfig {
             read_only: false,
             runtime_upper_mode: UpperMode::LogStructured,
         });
+        common.disk_rate_limit = app_config.machine.disk_rate_limit;
         Self {
             common,
             kernel_image,
@@ -367,13 +389,11 @@ impl FirecrackerSandboxConfig {
 
         let mut common = FirecrackerCommonConfig::from_app_config(config)?;
         common.rootfs_image_config = Some(user_image_config.clone());
-        if ublk.enabled && ublk.device_type.trim().eq_ignore_ascii_case("overlaybd") {
-            common.ublk_config = Some(UblkConfig::overlaybd_with_runtime_upper_mode(
-                user_image_config.image_config_path.clone(),
-                user_image_config.read_only,
-                runtime_upper_mode,
-            ));
-        }
+        common.ublk_config = Some(UblkConfig::overlaybd_with_runtime_upper_mode(
+            user_image_config.image_config_path.clone(),
+            user_image_config.read_only,
+            runtime_upper_mode,
+        ));
 
         Ok(Self {
             common,
@@ -403,10 +423,12 @@ impl FirecrackerSandboxConfig {
         }
         self.common.mmds_metadata = Some(
             MmdsMetadata::new(launch_config.sandbox_id, launch_config.snapshot_id.clone())
+                .with_access_token(launch_config.envd_access_token.as_ref())
                 .with_extra(launch_config.extra_mmds.clone()),
         );
         self.common.network_policy = launch_config.network.clone();
         self.common.custom_extension_params = launch_config.custom_extension_params.clone();
+        self.common.envd_access_token = launch_config.envd_access_token.clone();
         self
     }
 
@@ -460,8 +482,14 @@ impl FirecrackerSnapshotConfig {
         let manifest = snapshot.manifest();
 
         let app_config = ConfigManager::global_config();
-        if !app_config.ublk.enabled {
-            bail!("repository-backed snapshot launch requires ublk to be enabled");
+        let snapshot_mode = snapshot.committed().virtualization_mode;
+        if snapshot_mode != app_config.virtualization_mode {
+            bail!(
+                "snapshot '{}' uses virtualization mode '{}', but this node runs in mode '{}'",
+                snapshot.record().id,
+                snapshot_mode,
+                app_config.virtualization_mode
+            );
         }
         let tools_drive_version = &snapshot.committed().runtime_versions.tools_drive_version;
         if tools_drive_version.trim().is_empty() {
@@ -488,6 +516,14 @@ impl FirecrackerSnapshotConfig {
         // starts for the first time. When resuming from a snapshot, the full CPU state
         // is already serialised inside vm_state.bin, so re-applying a template would
         // be incorrect and is rejected by Firecracker anyway.
+        let extra_drives = manifest.extra_drives();
+        let physical_extra_drive_count = if manifest.volume_drive_slots == 0 {
+            // Snapshots created before reserved volume slots existed contain
+            // only physical attached drives.
+            extra_drives.len()
+        } else {
+            manifest.physical_extra_drive_count
+        };
         let snapshot_common = FirecrackerCommonConfig {
             ublk_config: Some(overlaybd_ublk_config),
             envd_version: snapshot.committed().runtime_versions.envd_version.clone(),
@@ -496,7 +532,9 @@ impl FirecrackerSnapshotConfig {
             default_user: build_context.user.clone(),
             rootfs_image_config: Some(rootfs_image_config),
             rootfs_virtual_size: Some(manifest.rootfs.virtual_size),
-            extra_drives: manifest.extra_drives(),
+            extra_drives,
+            physical_extra_drive_count,
+            volume_drive_slots: manifest.volume_drive_slots,
             ..base_common
         };
 
@@ -597,13 +635,17 @@ fn validate_overlaybd_extra_drive(
     if !drive_ids.insert(drive_id.to_string()) {
         anyhow::bail!("duplicate extra drive id: {}", drive_id);
     }
-    crate::sandbox::validate_mount_path(drive.mount_path())?;
-    if !mount_paths.insert(drive.mount_path().to_path_buf()) {
+    let mount_path = crate::sandbox::normalize_mount_path(drive.mount_path().to_path_buf())?;
+    if mount_paths
+        .iter()
+        .any(|existing| existing.starts_with(&mount_path) || mount_path.starts_with(existing))
+    {
         anyhow::bail!(
-            "duplicate extra drive mount path: {}",
+            "overlapping extra drive mount path: {}",
             drive.mount_path().display()
         );
     }
+    mount_paths.insert(mount_path);
     if matches!(drive.virtual_size(), Some(0)) {
         anyhow::bail!("extra drive virtual size must be non-zero: {}", drive_id);
     }
@@ -621,7 +663,7 @@ fn validate_overlaybd_extra_drive(
 mod tests {
     use super::*;
     use crate::cfg::{UblkOverlaybdTomlConfig, UblkTomlConfig};
-    use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
+    use crate::snapshot::{CommittedSnapshot, ResolvedAttachedDrive, SnapshotRecord};
     use std::fs;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
@@ -675,27 +717,10 @@ mod tests {
     }
 
     #[test]
-    fn common_config_rejects_unsupported_ublk_device_type() {
+    fn from_app_config_does_not_bind_ublk_without_user_image() -> Result<()> {
         let mut config = base_app_config();
         config.ublk = UblkTomlConfig {
-            enabled: true,
             daemon_binary_path: None,
-            device_type: "mystery".to_string(),
-            daemon_log_path: None,
-            ..UblkTomlConfig::default()
-        };
-
-        let err = FirecrackerCommonConfig::from_app_config(&config).expect_err("unsupported ublk");
-        assert!(err.to_string().contains("unsupported ublk.device_type"));
-    }
-
-    #[test]
-    fn from_app_config_accepts_overlaybd_device_type_without_global_image() -> Result<()> {
-        let mut config = base_app_config();
-        config.ublk = UblkTomlConfig {
-            enabled: true,
-            daemon_binary_path: None,
-            device_type: "overlaybd".to_string(),
             daemon_log_path: None,
             overlaybd: UblkOverlaybdTomlConfig {
                 global_config_path: "overlaybd_global.json".into(),
@@ -711,12 +736,10 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_config_binds_overlaybd_device_type_to_user_image() -> Result<()> {
+    fn sandbox_config_binds_overlaybd_to_user_image() -> Result<()> {
         let mut config = base_app_config();
         config.ublk = UblkTomlConfig {
-            enabled: true,
             daemon_binary_path: None,
-            device_type: "overlaybd".to_string(),
             daemon_log_path: None,
             overlaybd: UblkOverlaybdTomlConfig {
                 global_config_path: "overlaybd_global.json".into(),
@@ -774,6 +797,8 @@ mod tests {
                 mount_path: ExtraDrive::default_mount_path("data"),
                 virtual_size: None,
                 sub_path: None,
+                snapshot_output_dir: None,
+                volume: false,
             },
             ExtraDrive::Overlaybd {
                 drive_id: "data".to_string(),
@@ -782,6 +807,8 @@ mod tests {
                 mount_path: ExtraDrive::default_mount_path("data"),
                 virtual_size: None,
                 sub_path: None,
+                snapshot_output_dir: None,
+                volume: false,
             },
         ];
 
@@ -803,7 +830,7 @@ mod tests {
         );
         config.extra_drives = (0..=MAX_EXTRA_DRIVES)
             .map(|i| {
-                let drive_id = format!("data-{i}");
+                let drive_id = format!("data_{i}");
                 ExtraDrive::Overlaybd {
                     mount_path: ExtraDrive::default_mount_path(&drive_id),
                     drive_id,
@@ -814,6 +841,8 @@ mod tests {
                     read_only: true,
                     virtual_size: None,
                     sub_path: None,
+                    snapshot_output_dir: None,
+                    volume: false,
                 }
             })
             .collect();
@@ -895,6 +924,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_runnable_snapshot_treats_manifest_drives_as_physical() -> Result<()> {
+        let drive = ResolvedAttachedDrive::Overlaybd {
+            drive_id: "data".to_owned(),
+            image_config_path: "/tmp/data.json".into(),
+            read_only: true,
+            virtual_size: 4096,
+            mount_path: ExtraDrive::default_mount_path("data"),
+            sub_path: None,
+        };
+        let snapshot = RunnableSnapshot::from_test_legacy_manifest(
+            SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
+            vec![drive],
+        );
+
+        let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
+
+        assert_eq!(config.common.physical_extra_drive_count, 1);
+        assert_eq!(config.common.volume_drive_slots, 0);
+        Ok(())
+    }
+
+    #[test]
     fn runnable_snapshot_without_tools_drive_version_is_not_launchable() {
         let mut committed = CommittedSnapshot::mock();
         committed.runtime_versions.tools_drive_version.clear();
@@ -907,5 +958,27 @@ mod tests {
         assert!(err
             .to_string()
             .contains("snapshot does not record a tools drive version"));
+    }
+
+    #[test]
+    fn runnable_snapshot_rejects_cross_virtualization_mode() {
+        use crate::virtualization::VirtualizationMode;
+
+        let node_mode = ConfigManager::global_config().virtualization_mode;
+        let snapshot_mode = match node_mode {
+            VirtualizationMode::Kvm => VirtualizationMode::Pvm,
+            VirtualizationMode::Pvm => VirtualizationMode::Kvm,
+        };
+        let mut committed = CommittedSnapshot::mock();
+        committed.virtualization_mode = snapshot_mode;
+        let snapshot =
+            RunnableSnapshot::from_test_manifest(SnapshotRecord::mock_ready(committed), Vec::new());
+
+        let err = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)
+            .expect_err("node must reject a snapshot from the other virtualization mode");
+
+        assert!(err
+            .to_string()
+            .contains(&format!("uses virtualization mode '{snapshot_mode}'")));
     }
 }

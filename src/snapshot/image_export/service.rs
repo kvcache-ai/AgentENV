@@ -1,7 +1,7 @@
 //! Committed-snapshot rootfs image export: load the record, resolve the
-//! target, and publish the rootfs layer stack plus a minimal OCI config as a
-//! plain OCI image through `regctl`. Attached drives and memory snapshots
-//! never participate.
+//! target, and publish the rootfs layer stack plus the snapshot runtime OCI
+//! config as a plain OCI image through `regctl`. Attached drives and memory
+//! snapshots never participate.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,8 +15,8 @@ use super::target::{
 use crate::cfg::{ConfigManager, SnapshotImageStoragePolicy, SnapshotRepositoryBackendKind};
 use crate::digest;
 use crate::snapshot::repository::backends::common::acr::{
-    build_oci_image_manifest, host_architecture_for_oci, minimal_oci_config_blob, OciDescriptor,
-    SourceRegistryRepository,
+    build_oci_image_manifest, host_architecture_for_oci, snapshot_oci_config_blob, OciDescriptor,
+    SnapshotOciConfigInput, SourceRegistryRepository,
 };
 use crate::snapshot::repository::backends::{oss, posixfs};
 use crate::snapshot::repository::{RepositoryError, RepositoryResult, SnapshotRepository};
@@ -87,6 +87,7 @@ impl SnapshotImageService {
                         config.region().to_string(),
                         config.prefix().to_string(),
                         config.credential_source(),
+                        config.addressing_style(),
                     )?);
                     let repository = Arc::new(oss::OssSnapshotRepository::new(
                         Arc::clone(&client),
@@ -149,10 +150,14 @@ impl SnapshotImageService {
             });
         }
 
-        // The minimal config and the manifest are deterministic per snapshot
+        // The snapshot config and the manifest are deterministic per snapshot
         // and tag, so the manifest digest identifies the exact image.
+        let config_input = SnapshotOciConfigInput::new(
+            &committed.context,
+            committed.image_configs.rootfs_config(),
+        );
         let (config_bytes, config_digest, config_size) =
-            minimal_oci_config_blob(host_architecture_for_oci())?;
+            snapshot_oci_config_blob(host_architecture_for_oci(), config_input)?;
         let descriptors = committed
             .rootfs_layers
             .iter()
@@ -374,8 +379,10 @@ async fn materialize_downloaded_layer(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::fs;
 
+    use serde_json::json;
     use tempfile::TempDir;
 
     use super::super::regctl::fixture::{
@@ -387,7 +394,7 @@ mod tests {
     use crate::snapshot::mock::MockSnapshotRepository;
     use crate::snapshot::repository::backends::posixfs::PosixFsSnapshotArtifactLayout;
     use crate::snapshot::{
-        rootfs_snapshot_image_tag, PersistedDiskImagePublication, SnapshotRecord,
+        rootfs_snapshot_image_tag, CommandContext, PersistedDiskImagePublication, SnapshotRecord,
     };
 
     const TARGET_REPOSITORY: &str = "reg.example/team/newapp";
@@ -530,7 +537,20 @@ mod tests {
             &digests[1],
             b"managed local layer",
         );
-        let committed = committed_with_layers(layers);
+        let mut committed = committed_with_layers(layers);
+        committed.context = CommandContext::new(
+            HashMap::from([("APP_ENV".to_string(), "snapshot".to_string())]),
+            "/workspace",
+        );
+        committed.image_configs.add(
+            None::<String>,
+            "/",
+            json!({
+                "Env": ["APP_ENV=source"],
+                "WorkingDir": "/source",
+                "StopSignal": "SIGTERM"
+            }),
+        );
 
         let result = publish(&service, &committed).await.unwrap();
 
@@ -543,6 +563,12 @@ mod tests {
         for digest in digests.iter().map(String::as_str).chain([config_digest]) {
             assert!(blob_path(dir.path(), TARGET_REPOSITORY, digest).exists());
         }
+        let config_bytes =
+            fs::read(blob_path(dir.path(), TARGET_REPOSITORY, config_digest)).expect("config blob");
+        let config: serde_json::Value = serde_json::from_slice(&config_bytes).unwrap();
+        assert_eq!(config["config"]["Env"], json!(["APP_ENV=snapshot"]));
+        assert_eq!(config["config"]["WorkingDir"], "/workspace");
+        assert_eq!(config["config"]["StopSignal"], "SIGTERM");
         let piped = fs::read(blob_path(dir.path(), TARGET_REPOSITORY, &digests[2])).unwrap();
         assert_eq!(piped, b"cross-registry layer");
 

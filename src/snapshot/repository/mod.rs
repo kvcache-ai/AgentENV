@@ -3,4 +3,6 @@ pub mod errors;
 pub mod interfaces;
 
 pub use errors::{RepositoryError, RepositoryResult};
-pub use interfaces::{SnapshotListFilter, SnapshotRepository, SnapshotRuntimeResolver};
+pub use interfaces::{
+    SnapshotListFilter, SnapshotRepository, SnapshotRuntimeResolver, VolumeRecordPage,
+};

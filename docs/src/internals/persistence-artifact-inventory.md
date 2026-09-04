@@ -9,13 +9,14 @@ This document lists AgentENV artifacts that can remain on disk or in object stor
 | `home_path` | `/var/lib/aenv` | `src/cfg.rs` | Base for paths containing the literal `$AENV_HOME` placeholder. `AENV_HOME_PATH` overrides it before placeholder expansion. |
 | `runtime_path` | `/run/aenv` | `src/cfg.rs`, `src/sandbox/network/*` | Base for transient namespace mount points and daemon sockets. `AENV_RUNTIME_PATH` overrides it. |
 | `deps_path` | `$AENV_HOME/deps` | `src/cfg.rs`, `src/setup/*` | Base for downloaded runtime dependencies. `AENV_DEPS_PATH` can place these rebuildable assets outside `home_path`. |
+| Managed sandbox access-token seed | `$AENV_HOME/secrets/sandbox-access-token-hash-seed` | `src/sandbox/access.rs` | Node-local secret used to derive envd and traffic tokens when `[sandbox].access_token_hash_seed` is unset. It must be preserved with persisted secure or private-ingress sandboxes. |
 | Firecracker sandbox work dirs | `$AENV_HOME/firecracker-work` with `agentenv-fc-` children | `src/sandbox/firecracker/*` | Per-sandbox runtime directories for sockets, symlinks, ublk runtime dirs, local logs, and writable OverlayBD upper layer data (`overlaybd/upper.data`, `overlaybd/upper.index`). An explicit `[firecracker].work_dir` overrides the root. |
 | `firecracker.serial_dir` | `$AENV_HOME/logs/serial` | `src/sandbox/firecracker/*` | Durable Firecracker stdout/stderr root, grouped by sandbox ID. An explicit `[firecracker].serial_dir` overrides the root. |
 | `managed_snapshot_root` | `<firecracker-work-base>/managed-snapshots` | `src/sandbox/firecracker/*` | In-process live snapshot artifact root used to keep captured snapshots alive until publish or drop. |
 | `persisted_sandbox_store_path` | `$AENV_HOME/persisted-sandboxes` | `src/orchestrator/persistence/*` | Durable paused sandbox records and artifacts. |
 | `snapshot_store` | `$AENV_HOME/snapshot-store` | `src/snapshot/repository/*` | Durable committed snapshot repository root. The configured backend uses `<snapshot_store>/repository`. Relative explicit paths are resolved against the config file directory. |
 | `snapshot.local_cache_path` | `$AENV_HOME/snapshot-local-cache` | `src/snapshot/artifact_cache.rs`, runtime resolvers | Node-local cache for materialized runtime artifacts. Relative explicit paths are resolved against the config file directory. |
-| `image.cache.root_dir` | `$AENV_HOME/image-cache` | `src/image/*`, overlaybd runtime | Node-local image cache root. Contains `configs/`, `indexes/`, `commits/`, and `remote-blocks/`. |
+| `image.cache.root_dir` | `$AENV_HOME/image-cache` | `src/image/*`, overlaybd runtime | Node-local image cache root. Contains `configs/`, `indexes/`, `commits/`, and `remote-blocks/`. The offline C++ tools own isolated sibling cache roots: `convert-blocks/` (`overlaybd-apply`) and `resize-blocks/` (`overlaybd-resize`). |
 | `p2p.store_dir` | `$AENV_HOME/p2p/store` | `src/p2p/*`, `src/cfg.rs` | Local store for P2P artifact transport backends. Relative explicit paths are resolved against the config file directory. |
 | `image.cache.remote_blocks` | `<image.cache.root_dir>/remote-blocks` | overlaybd runtime config | Remote block cache root. Overlaybd also stores `premerged-index/` under this cache dir. Its size limit comes from `image.cache.remote_blocks.max_size_gb`. |
 | `ublk.daemon_socket_path` | `$AENV_RUNTIME/ublk-daemon.sock` | `src/sandbox/ublk/*`, `storage/ublk-daemon/*` | Unix socket used for server-to-daemon IPC. |
@@ -31,11 +32,12 @@ Owned by `src/setup/*` and `src/cfg.rs`.
 | CPU template helper | `<deps_path>/firecracker/{version}/cpu-template-helper` | Optional Firecracker helper executable | Detects host CPU config for cluster-wide CPU intersection | Extracted from Firecracker package when present. |
 | Kernel image | `<deps_path>/kernel/{version}/vmlinux.bin` | Guest kernel | VM boot source | Downloaded during setup. Old versions are retained until manually removed. |
 | Tools drive | `<deps_path>/tools/{version}/tools.ext4` | Read-only ext4 image with envd/tools | Firecracker root drive shared by sandboxes and pinned by snapshots through its immutable release version | Extracted from OCI or imported from `tools.drive_path` during setup. Old versions are retained until manually removed. |
-| Overlaybd tools | `<deps_path>/overlaybd/bin/*`, `<deps_path>/overlaybd/lib/*` | `overlaybd-create`, `overlaybd-apply`, `overlaybd-commit`, `overlaybd-resize`, libraries | OCI-to-overlaybd conversion and packaging | Installed during setup when release metadata does not match. |
+| Overlaybd tools | `<deps_path>/overlaybd/bin/*` | Statically linked `overlaybd-create`, `overlaybd-apply`, `overlaybd-commit`, and `overlaybd-resize` | OCI-to-overlaybd conversion and packaging | Installed during setup when release metadata does not match. |
 | Overlaybd release metadata | `<deps_path>/overlaybd/tools-release.json` | Installed overlaybd release identifier | Detects whether tools need reinstalling | Rewritten on setup when release changes. |
-| Overlaybd package downloads | `<deps_path>/overlaybd/downloads/*` | Downloaded package archives | Setup cache for overlaybd release packages | Kept after install; no automatic GC. |
-| Generated overlaybd config | `$AENV_HOME/overlaybd/overlaybd-global.json`, `$AENV_HOME/overlaybd/mem-overlaybd-global.json` | Runtime global config, cache path, credentials config | Configures overlaybd runtime and memory snapshot overlaybd access | Rewritten during setup/startup. |
-| Overlaybd runtime log | `<deps_path>/overlaybd/overlaybd.log` | Overlaybd runtime logs | Debugging | Appended by overlaybd runtime; no automatic GC. |
+| Overlaybd package downloads | `<deps_path>/overlaybd/downloads/*` | Temporary downloaded package archives | Setup staging for overlaybd release packages | Removed after a successful install. |
+| Generated overlaybd config | `$AENV_HOME/overlaybd/overlaybd-global.json`, `$AENV_HOME/overlaybd/mem-overlaybd-global.json`, `$AENV_HOME/overlaybd/convert-overlaybd-global.json`, `$AENV_HOME/overlaybd/resize-overlaybd-global.json` | Runtime global config, cache path, credentials config | Configures overlaybd runtime, memory snapshot overlaybd access, and the offline C++ tools (`overlaybd-apply`, `overlaybd-resize`), which get dedicated configs with isolated cacheDirs (`convert-blocks`, `resize-blocks`) and download disabled | Rewritten during setup/startup. |
+| Overlaybd runtime log | `$AENV_HOME/overlaybd/overlaybd.log` | Overlaybd runtime logs | Debugging | Appended by overlaybd runtime; no automatic GC. |
+| Managed sandbox access-token seed | `$AENV_HOME/secrets/sandbox-access-token-hash-seed` | 32 random bytes encoded as lowercase hexadecimal | Derives stable per-sandbox envd and traffic access tokens when no explicit seed is configured | Atomically created with mode `0600` during normal startup and reused thereafter. Must not be deleted while secure or private-ingress sandboxes are persisted. |
 
 ## Firecracker Sandbox
 
@@ -46,9 +48,8 @@ Owned by `src/sandbox/firecracker/*`.
 | Artifact                     | Location                                                     | Contents                                                  | Purpose                                                      | Lifecycle                                                    | Rebuildable                                                  |
 | ---------------------------- | ------------------------------------------------------------ | --------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
 | Managed live snapshot root   | `<firecracker-work-base>/managed-snapshots/{sandbox_id}/{uuid}/...` | Firecracker snapshot artifacts kept alive in-process      | Holds captured running-sandbox snapshots until publish, and supports in-process pause state | Created by `FirecrackerSandbox::pause()` or `snapshot()`. Removed when `PersistentSnapshotRootGuard` drops. | No.                                                          |
-| Snapshot VM state            | snapshot artifact dir `vm_state.bin`                         | Firecracker VM state                                      | Pause/resume and snapshot publish input                      | Created by Firecracker `create_snapshot`. Owner depends on caller: persister, managed root, or repository publish input. | No.                                                          |
-| Raw memory diff              | snapshot artifact dir `mem.bin`                              | Sparse Firecracker diff memory dump                       | Input to memory overlaybd conversion and source for virtual memory size | Created by Firecracker `create_snapshot`. Removed best-effort after the memory overlaybd layer is committed. | Temporary input only; not reconstructed after cleanup. |
-| Memory overlaybd layer       | snapshot artifact dir `mem_overlaybd/overlaybd.commit`       | Sealed overlaybd layer for memory pages                   | Runtime memory restore and publish input                     | Created by packaging `mem.bin`. Imported into repository managed layers during publish. | No, unless raw `mem.bin` is still present.                   |
+| Snapshot VM state            | snapshot artifact dir `vm_state.bin`                         | Firecracker VM state                                      | Pause/resume and snapshot publish input                      | Created by Firecracker's state-only diff snapshot. Owner depends on caller: persister, managed root, or repository publish input. | No.                                                          |
+| Memory overlaybd layer       | snapshot artifact dir `mem_overlaybd/overlaybd.commit`       | Sealed OverlayBD layer for memory pages                   | Runtime memory restore and publish input                     | Created directly from Firecracker dirty/present memory ranges read with `process_vm_readv`. Imported into repository managed layers during publish. | No.                                                          |
 | Memory image config          | snapshot artifact dir `mem_image.json`                       | Overlaybd image config stacking memory layers             | Resume paused sandbox and publish memory layers              | Written after memory conversion. Later repository resolvers regenerate runtime memory configs from committed layers. | Yes after publish; no for paused sandbox unless layers are known. |
 | Rootfs snapshot config       | snapshot artifact dir `rootfs/image.json`                    | Overlaybd image config for captured rootfs state          | Resume paused sandbox and publish rootfs layers              | Staged from live runtime config after restack/seal.          | Yes only from associated layers and metadata.                |
 | Rootfs snapshot layer        | snapshot artifact dir `rootfs/snapshot.commit`               | Sealed writable upper from live rootfs                    | Captures disk writes since previous lower stack              | Created by ublk daemon restack for writable overlaybd rootfs. | No.                                                          |
@@ -77,6 +78,35 @@ Owned by `src/sandbox/extra_drive.rs` and Firecracker snapshot code.
 | Extra-drive symlink           | sandbox work dir `extra-drive-{drive_id}`          | Symlink to `/dev/ublkbN` device path             | Firecracker drive attachment path                            | Created after ublk runtime device creation. Removed on rollback or work dir cleanup. | Yes.                                      |
 | Extra-drive snapshot artifact | snapshot artifact dir `drives/{drive_id}/...`      | Captured drive overlaybd config and commit layer | Preserve attached-drive writable state across pause/resume/publish | Created during sandbox snapshot/pause. Later owned by persister, managed root, or repository publish flow. | No.                                       |
 
+## Snapshot Storage Model
+
+Snapshot data passes through three storage layers with different ownership and
+lifetime rules:
+
+1. **Builder staging** is a manager-owned temporary workspace under
+   `<snapshot.local_cache_path>/snapshots/<id>/`. It holds local rootfs,
+   memory, VM-state, and attached-drive artifacts while a build or capture is
+   in progress. It is not the durable snapshot record.
+2. **The committed snapshot repository** stores the snapshot catalog,
+   aliases, `snapshot.json`, `firecracker-manifest.json`, `vm_state.bin`, and
+   referenced managed layers. This is the durable source of truth exposed by
+   the template and snapshot APIs.
+3. **The node-local runtime cache** materializes runnable rootfs, memory, and
+   drive `image.json` files under
+   `<snapshot.local_cache_path>/runtime/<id>/` before launch. These files are
+   derived runtime inputs and can be rebuilt from committed state.
+
+The committed `snapshot.json` records the captured runtime context, startup
+configuration, and rootfs, drive, and memory layer references. The Firecracker
+manifest records launch metadata such as virtual sizes and attached-drive
+configuration. Temporary upper files and generated `image.json` files are not
+committed snapshot truth.
+
+During runtime resolution, AgentENV converts the committed layer references
+into node-local rootfs, memory, and attached-drive configs, hydrates the
+Firecracker manifest with node-local paths, and resolves the committed
+`vm_state.bin` into a runnable path.
+
 ## Image Resolver
 
 Owned by `src/image/*`.
@@ -87,6 +117,7 @@ Owned by `src/image/*`.
 | Image metadata sidecar | `<image.cache.root_dir>/configs/*.metadata.json` | Base env/workdir metadata from OCI image config | Preserves image launch context beside cached image config | Written after image config. Rebuilt if missing while image config is usable. |
 | Overlaybd commit cache | `<image.cache.root_dir>/commits/{digest-slug}/overlaybd.commit` | Content-addressed overlaybd commit layers from standard OCI conversion, and target dirs for remote overlaybd-native layers | Node-local reusable layer store for user image layers | Standard OCI conversion writes commits. Remote overlaybd-native configs point `dir` here for runtime population. No unified GC today. |
 | OCI conversion index | `<image.cache.root_dir>/indexes/{source-digest}/...json` | Mapping from OCI source layer/context to overlaybd commit digest and size | Skips repeated layer conversion when converted commits exist | Written after successful standard OCI conversion. No unified GC today. |
+| Converted OCI layer P2P artifact | P2P catalog key `oci-layer/v1/{context-hash}` | A completed OverlayBD commit plus its conversion context and output digest/size | Lets another node reuse a compatible standard-OCI conversion | Published as a Reference after the local commit is durable; ownership is persisted on the hard-commit record and removed by image-cache GC. |
 | Temporary OCI pull/conversion work | process temp dir | OCI layout and per-layer conversion workspace | Intermediate input for standard OCI conversion | Owned by `TempDir`; removed after conversion scope exits. |
 
 ## Snapshot Repository
@@ -166,6 +197,7 @@ Owned by `storage/overlaybd/*`.
 | Artifact | Location | Contents | Purpose | Lifecycle | Rebuildable |
 | --- | --- | --- | --- | --- | --- |
 | Remote block cache | configured `cacheConfig.cacheDir`, derived from `<image.cache.root_dir>/remote-blocks` | Cached registryfs_v2 block ranges | Speeds remote overlaybd-native layer reads | Managed by overlaybd cache settings. | Yes. |
+| Offline C++ tool block caches | `<image.cache.root_dir>/convert-blocks` (`overlaybd-apply`), `<image.cache.root_dir>/resize-blocks` (`overlaybd-resize`) | C++ file-cache entries for the offline tools | Keeps C++ cache eviction (truncate+unlink of flat cacheDir files) away from the Rust runtime cache's per-entry directories | Owned and evicted by the C++ tools via their dedicated generated global configs; download is disabled in those configs. Never shared with the Rust runtime `remote-blocks` cache. | Yes. |
 | Premerged index cache | `cacheConfig.cacheDir/premerged-index/*.pmidx` | Serialized merged read-only lower index | Speeds opening repeated lower stacks | Written asynchronously on read-only open. Pruned by size limit derived from cache size. | Yes. |
 | Sealed overlaybd commit files | Various owner paths: image cache, snapshot dirs, repository managed layers | Overlaybd layer data and index trailer | Immutable lower layers for block devices and memory images | Lifecycle is owned by the module that stores the file. Overlaybd only defines the format and open/merge behavior. | Depends on owner. |
 

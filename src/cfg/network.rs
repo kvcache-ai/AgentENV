@@ -159,3 +159,23 @@ fn is_valid_dns_label(label: &str) -> bool {
         .take(bytes.len().saturating_sub(2))
         .all(|byte| matches!(*byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_accepts_custom_network_config() -> Result<()> {
+        let config = NetworkConfig {
+            egress: NetworkEgressConfig {
+                always_denied_cidrs: vec!["127.0.0.0/8".to_string(), "169.254.0.0/16".to_string()],
+            },
+            internal: NetworkInternalConfig {
+                host_interaction_cidr: "100.64.0.0/16".to_string(),
+                veth_cidr: "100.65.0.0/16".to_string(),
+            },
+        };
+
+        NetworkConfig::validate(&config)
+    }
+}

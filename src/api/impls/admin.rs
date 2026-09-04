@@ -160,7 +160,6 @@ impl Admin<()> for ApiImpl {
             models::NodeStatus::NodeStatusReady,
             node.sandbox_count,
             node.metrics.into(),
-            vec![],
             node.create_successes,
             node.create_fails,
             node.paused_sandbox_count,

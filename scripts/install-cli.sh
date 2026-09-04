@@ -202,15 +202,39 @@ install_completion_files() {
         zsh_path="$prefix/share/zsh/site-functions/_aenv"
         fish_path="$prefix/share/fish/vendor_completions.d/aenv.fish"
     fi
-    if [[ "$DEST" == *"'"* || "$DEST" == *$'\n'* || "$DEST" == *$'\r'* ]]; then
-        echo "warning: completion binary path contains unsupported characters; skipping" >&2
+    case "$DEST" in
+        *"'"*|*"\\"*|*$'\n'*|*$'\r'*)
+            echo "warning: completion binary path contains unsupported characters; skipping" >&2
+            return 0
+            ;;
+    esac
+    dest_dir="${DEST%/*}"
+    [[ "$dest_dir" == "$DEST" ]] && dest_dir="."
+    dest_dir="$(canonical_dir "$dest_dir")" || {
+        echo "warning: could not canonicalize completion binary path; skipping" >&2
+        return 0
+    }
+    DEST="$dest_dir/${DEST##*/}"
+    if [[ ! -x "$DEST" ]]; then
+        echo "warning: completion binary is not executable: ${DEST}; skipping" >&2
         return 0
     fi
     quoted_binary="'$DEST'"
 
-    put_loader() {
-        local path="$1" body="$2" dir tmp
+    put_loader() (
+        local path="$1" body="$2" dir tmp lock_dir
         dir="${path%/*}"
+        local runner=()
+        if ! (mkdir -p "$dir" 2>/dev/null && [[ -w "$dir" ]]); then
+            runner=(run_privileged)
+        fi
+        "${runner[@]}" mkdir -p "$dir" || { echo "warning: could not create ${dir}" >&2; return 0; }
+        lock_dir="$dir/.aenv-completion.lock"
+        if ! mkdir "$lock_dir" 2>/dev/null; then
+            echo "warning: completion directory is busy; skipping ${path}" >&2
+            return 0
+        fi
+        trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
         if [[ -L "$path" ]]; then
             echo "warning: refusing to replace symlink ${path}" >&2
             return 0
@@ -219,11 +243,6 @@ install_completion_files() {
             echo "warning: leaving unmanaged completion file ${path} untouched" >&2
             return 0
         fi
-        local runner=()
-        if ! (mkdir -p "$dir" 2>/dev/null && [[ -w "$dir" ]]); then
-            runner=(run_privileged)
-        fi
-        "${runner[@]}" mkdir -p "$dir" || { echo "warning: could not create ${dir}" >&2; return 0; }
         tmp="$("${runner[@]}" mktemp "$dir/.aenv-completion.XXXXXX")" || {
             echo "warning: could not stage ${path}" >&2
             return 0
@@ -241,11 +260,16 @@ install_completion_files() {
                 return 0
             fi
         fi
+        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
+            "${runner[@]}" rm -f "$tmp"
+            echo "warning: leaving newly-created unmanaged completion file ${path} untouched" >&2
+            return 0
+        fi
         if ! "${runner[@]}" chmod 0644 "$tmp" || ! "${runner[@]}" mv -f "$tmp" "$path"; then
             "${runner[@]}" rm -f "$tmp"
             echo "warning: could not install ${path}" >&2
         fi
-    }
+    )
 
     put_loader "$bash_path" "if [[ -x $quoted_binary ]]; then source <($quoted_binary completion bash); fi"
     zsh_body="#compdef aenv

@@ -1,22 +1,26 @@
-[firecracker]
+[firecracker.kvm]
 version = "1.15.1-patch-v1"
-url = "https://pub-4ee15c400f554ab7a9eac3f5bc8f53de.r2.dev/firecracker-{version}-{arch}.tgz"
+url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/firecracker-{version}-{arch}.tgz"
 
-[kernel]
+[firecracker.pvm]
+version = "v1.17.0-next.1"
+url = "https://github.com/kvcache-ai/firecracker-next/releases/download/{version}/firecracker-next-{version}-{arch}.tgz"
+
+[kernel.kvm]
 version = "vmlinux-6.1.175"
-url = "https://pub-4ee15c400f554ab7a9eac3f5bc8f53de.r2.dev/{version}"
+url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/{version}-{arch}"
+
+[kernel.pvm]
+version = "6.12.33-pvm"
+url = "https://github.com/kvcache-ai/linux/releases/download/pvm-kernel-6.12.33/vmlinux-guest-6.12.33-pvm"
 
 [tools]
 version = "0.1.0"
-url = "ghcr.io/zlzgithub-0801/agentenv-tools:{version}"
+url = "ghcr.io/kvcache-ai/agentenv-tools:{version}"
 
 [overlaybd]
-version = "v1.0.18"
-# The official release asset filename embeds the release date and git hash.
-# When bumping `version`, update the full filename in `package_url` too.
-# Automatic overlaybd package download currently targets Ubuntu release
-# assets only; other distros must provide overlaybd with path overrides.
-package_url = "https://github.com/containerd/overlaybd/releases/download/{version}/overlaybd-1.0.18-20260710.cee2186.{target}.deb"
+version = "v1.0.18-aenv.1"
+package_url = "https://github.com/kvcache-ai/overlaybd/releases/download/static-{version}/overlaybd-tools-{version}-linux-{arch}.tar.gz"
 
 [regclient]
 version = "v0.11.5"
@@ -36,28 +40,17 @@ url = "https://github.com/protocolbuffers/protobuf/releases/download/v{version}/
 common = [
   "ca-certificates",
 ]
-ubuntu = [
-  "libaio1t64|libaio1",
-]
-debian = [
-  "libaio1t64|libaio1",
-]
-centos = [
-  "libaio",
-]
-rhel = [
-  "libaio",
-]
-arch = [
-  "libaio",
-]
+ubuntu = []
+debian = []
+centos = []
+rhel = []
+arch = []
 
 [packages.runtime_commands]
 # NOTE: same as [packages.runtime] above, this list is not read by the
 # Dockerfile; update `deploy/docker/Dockerfile.agentenv` manually to match.
 curl = { default = "curl" }
 "debugfs" = { default = "e2fsprogs" }
-"dpkg-deb" = { default = "dpkg" }
 "ip" = { default = "iproute2", centos = "iproute", rhel = "iproute" }
 "iptables-restore" = { default = "iptables" }
 "iptables-save" = { default = "iptables" }
@@ -67,4 +60,3 @@ jq = { default = "jq" }
 sudo = { default = "sudo" }
 umoci = { default = "umoci" }
 zstd = { default = "zstd" }
-

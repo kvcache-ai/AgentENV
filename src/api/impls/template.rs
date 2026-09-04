@@ -355,7 +355,13 @@ impl Templates<()> for ApiImpl {
     ) -> Result<V2TemplatesGetResponse, ()> {
         let cursor = match query_params.next_token.as_deref() {
             Some(token) => match PaginationCursor::<SnapshotId>::parse(token) {
-                Ok(cursor) => cursor,
+                Ok(cursor) if cursor.is_descending() => cursor,
+                Ok(_) => {
+                    return Ok(V2TemplatesGetResponse::Status400_BadRequest(Self::error(
+                        400,
+                        "next token was issued for a different sort order".to_string(),
+                    )));
+                }
                 Err(err) => {
                     return Ok(V2TemplatesGetResponse::Status400_BadRequest(Self::error(
                         400,
@@ -363,7 +369,7 @@ impl Templates<()> for ApiImpl {
                     )));
                 }
             },
-            None => PaginationCursor::new(SystemTime::now(), SnapshotId::max()),
+            None => PaginationCursor::new_descending(SystemTime::now(), SnapshotId::max()),
         };
 
         let records = match self
@@ -391,7 +397,7 @@ impl Templates<()> for ApiImpl {
                 )
             },
             |record| {
-                PaginationCursor::new(
+                PaginationCursor::new_descending(
                     SystemTime::from(datetime_from_unix_ms(record.created_at_unix_ms)),
                     record.id.clone(),
                 )
@@ -504,8 +510,8 @@ impl Templates<()> for ApiImpl {
         let updated_at = datetime_from_unix_ms(record.updated_at_unix_ms);
 
         Ok(
-            TemplatesTemplateIdGetResponse::Status200_SuccessfullyReturnedTheTemplateWithItsBuilds(
-                models::TemplateWithBuilds::new(
+            TemplatesTemplateIdGetResponse::Status200_SuccessfullyReturnedTheTemplateWithItsBuilds {
+                body: models::TemplateWithBuilds::new(
                     record.id.to_string(),
                     true,
                     build_record_names(&record),
@@ -515,7 +521,8 @@ impl Templates<()> for ApiImpl {
                     0,
                     builds,
                 ),
-            ),
+                x_next_token: None,
+            },
         )
     }
 

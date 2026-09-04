@@ -52,13 +52,16 @@ func TestIntersectCpuConfigs_Empty(t *testing.T) {
 }
 
 func TestIntersectCpuConfigs_Single(t *testing.T) {
-	input := buildConfig(nil, nil, nil)
+	safe := cpuidModifier{Leaf: "0x1", Subleaf: "0x0", Modifiers: []registerMod{{Register: "eax", Bitmap: bm32(1)}}}
+	readOnly := []cpuidModifier{{Leaf: "0xb", Subleaf: "0x1", Modifiers: []registerMod{{Register: "eax", Bitmap: bm32(2)}}}, {Leaf: "0x1f", Subleaf: "0x1", Modifiers: []registerMod{{Register: "eax", Bitmap: bm32(2)}}}}
+	input := buildConfig(nil, append([]cpuidModifier{safe}, readOnly...), nil)
+	want := buildConfig(nil, []cpuidModifier{safe}, nil)
 	out, err := IntersectCpuConfigs([]string{input})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if out != input {
-		t.Errorf("single config: want %q, got %q", input, out)
+	if out != want {
+		t.Errorf("single config: want %q, got %q", want, out)
 	}
 }
 

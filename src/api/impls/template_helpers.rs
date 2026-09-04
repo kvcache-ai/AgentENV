@@ -31,22 +31,6 @@ fn resolve_resources(
     })
 }
 
-fn ensure_template_build_ublk_enabled() -> Result<(), models::Error> {
-    let config = &ConfigManager::global_config().ublk;
-    let uses_overlaybd =
-        config.enabled && config.device_type.trim().eq_ignore_ascii_case("overlaybd");
-
-    if !uses_overlaybd {
-        return Err(models::Error::new(
-            500,
-            "template builds require `ublk.enabled=true` with `ublk.device_type=\"overlaybd\"`"
-                .to_string(),
-        ));
-    }
-
-    Ok(())
-}
-
 pub(super) fn template_build_record_from_v3_request(
     body: &models::TemplateBuildRequestV3,
     id: SnapshotId,
@@ -77,8 +61,6 @@ pub(super) fn template_build_spec_from_start_request(
     alias: Option<&SnapshotAlias>,
     resources: SandboxResources,
 ) -> Result<TemplateBuildSpec, models::Error> {
-    ensure_template_build_ublk_enabled()?;
-
     let mut spec = TemplateBuildSpec::new().resources(resources.cpu_count, resources.memory_mib);
     if let Some(alias) = alias {
         spec = spec.alias(alias.to_string());

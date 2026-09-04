@@ -41,14 +41,10 @@ type cpuidLeafKey struct {
 // IntersectCpuConfigs computes a conservative bitwise AND intersection of
 // Firecracker cpu_config_json strings. Only entries present in every input
 // config are retained; bitmap fields for shared entries are ANDed together.
-// Returns an empty string when jsons is empty; returns jsons[0] unchanged
-// when only one config is provided.
+// Returns an empty string when jsons is empty.
 func IntersectCpuConfigs(jsons []string) (string, error) {
 	if len(jsons) == 0 {
 		return "", nil
-	}
-	if len(jsons) == 1 {
-		return jsons[0], nil
 	}
 
 	configs := make([]cpuConfig, len(jsons))
@@ -81,7 +77,8 @@ func IntersectCpuConfigs(jsons []string) (string, error) {
 }
 
 var kvmReadOnlyLeafIDs = map[uint32]bool{
-	0xb: true,
+	0xb:  true,
+	0x1f: true,
 }
 
 func intersectCpuidModifiers(configs []cpuConfig) ([]cpuidModifier, error) {

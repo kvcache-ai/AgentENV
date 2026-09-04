@@ -11,7 +11,7 @@
 #            service -> /etc/systemd/system/aenv.service
 #            env     -> /etc/default/aenv
 # Runs:      sudo server --setup-only  (provisions runtime dependencies)
-#            sudo server --setup-host  (provisions KVM, ublk, and networking)
+#            sudo server --setup-host  (provisions virtualization access, ublk, and networking)
 #
 # Usage:
 #   curl -fsSL https://github.com/kvcache-ai/AgentENV/releases/latest/download/install.sh | sudo bash
@@ -40,15 +40,30 @@ SERVICE_GROUP="${AENV_SERVICE_GROUP:-aenv}"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 ENV_FILE="/etc/default/${SERVICE_NAME}"
 RUNTIME_DIR="/run/aenv"
+VIRTUALIZATION_MODE="${AENV_VIRTUALIZATION_MODE:-kvm}"
 
-ARCH="$(uname -m)"
-case "$ARCH" in
-    x86_64) ARCH_TAG="x86_64" ;;
+case "$VIRTUALIZATION_MODE" in
+    kvm|pvm) ;;
     *)
-        echo "error: unsupported architecture: $ARCH (server requires x86_64)" >&2
+        echo "error: unsupported AENV_VIRTUALIZATION_MODE=${VIRTUALIZATION_MODE@Q}; expected kvm or pvm" >&2
         exit 1
         ;;
 esac
+
+ARCH="$(uname -m)"
+case "$ARCH" in
+    x86_64|amd64) ARCH_TAG="x86_64" ;;
+    aarch64|arm64) ARCH_TAG="aarch64" ;;
+    *)
+        echo "error: unsupported architecture: $ARCH (supported: x86_64/amd64, aarch64/arm64)" >&2
+        exit 1
+        ;;
+esac
+
+if [[ "$VIRTUALIZATION_MODE" == "pvm" && "$ARCH_TAG" != "x86_64" ]]; then
+    echo "error: PVM virtualization mode is only supported on x86_64 hosts" >&2
+    exit 1
+fi
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 if [[ "$OS" != "linux" ]]; then
@@ -57,7 +72,11 @@ if [[ "$OS" != "linux" ]]; then
 fi
 
 RELEASE_API="https://api.github.com/repos/${REPO}/releases/latest"
-TARBALL="aenv-server-${OS}-${ARCH_TAG}.tar.gz"
+if [[ "$VIRTUALIZATION_MODE" == "pvm" ]]; then
+    TARBALL="aenv-server-${OS}-${ARCH_TAG}-pvm.tar.gz"
+else
+    TARBALL="aenv-server-${OS}-${ARCH_TAG}.tar.gz"
+fi
 
 curl_get() {
     curl -fsSL --retry 5 --retry-delay 10 --retry-max-time 60 "$@"
@@ -74,8 +93,16 @@ if ((${#missing_packages[@]} > 0)); then
         echo "Installing required commands: ${missing_packages[*]} ..."
         sudo apt-get update
         sudo apt-get install -y "${missing_packages[@]}"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "Installing required commands: ${missing_packages[*]} ..."
+        sudo dnf install -y "${missing_packages[@]}"
+    elif command -v yum >/dev/null 2>&1; then
+        echo "Installing required commands: ${missing_packages[*]} ..."
+        sudo yum install -y "${missing_packages[@]}"
     else
-        echo "error: missing required commands and apt-get is unavailable: ${missing_packages[*]}" >&2
+        echo \
+            "error: missing required commands and no supported package manager is available: ${missing_packages[*]}" \
+            >&2
         exit 1
     fi
 fi
@@ -178,9 +205,16 @@ install_completion_files() {
     local fish_path="/usr/local/share/fish/vendor_completions.d/aenv.fish"
     quoted_binary="'$binary'"
 
-    put_loader() {
-        local path="$1" body="$2" dir tmp
+    put_loader() (
+        local path="$1" body="$2" dir tmp lock_dir
         dir="${path%/*}"
+        sudo mkdir -p "$dir" || { echo "warning: could not create ${dir}" >&2; return 0; }
+        lock_dir="$dir/.aenv-completion.lock"
+        if ! sudo mkdir "$lock_dir" 2>/dev/null; then
+            echo "warning: completion directory is busy; skipping ${path}" >&2
+            return 0
+        fi
+        trap 'sudo rmdir "$lock_dir" 2>/dev/null || true' EXIT
         if [[ -L "$path" ]]; then
             echo "warning: refusing to replace symlink ${path}" >&2
             return 0
@@ -189,7 +223,6 @@ install_completion_files() {
             echo "warning: leaving unmanaged completion file ${path} untouched" >&2
             return 0
         fi
-        sudo mkdir -p "$dir" || { echo "warning: could not create ${dir}" >&2; return 0; }
         tmp="$(sudo mktemp "$dir/.aenv-completion.XXXXXX")" || {
             echo "warning: could not stage ${path}" >&2
             return 0
@@ -207,11 +240,16 @@ install_completion_files() {
                 return 0
             fi
         fi
+        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
+            sudo rm -f "$tmp"
+            echo "warning: leaving newly-created unmanaged completion file ${path} untouched" >&2
+            return 0
+        fi
         if ! sudo chmod 0644 "$tmp" || ! sudo mv -f "$tmp" "$path"; then
             sudo rm -f "$tmp"
             echo "warning: could not install ${path}" >&2
         fi
-    }
+    )
 
     put_loader "$bash_path" "if [[ -x $quoted_binary ]]; then source <($quoted_binary completion bash); fi"
     zsh_body="#compdef aenv
@@ -265,10 +303,12 @@ if [[ "$SKIP_SETUP" == "1" ]]; then
 else
     echo "Running dependency setup ..."
     sudo AENV_CONFIG_PATH="${CONFIG_PATH}" AENV_HOME_PATH="${DATA_DIR}" \
+        AENV_VIRTUALIZATION_MODE="${VIRTUALIZATION_MODE}" \
         "${INSTALL_DIR}/server" --setup-only
 
-    echo "Provisioning KVM, ublk, and host networking for ${SERVICE_USER} ..."
+    echo "Provisioning virtualization device access, ublk, and host networking for ${SERVICE_USER} ..."
     sudo AENV_CONFIG_PATH="${CONFIG_PATH}" AENV_HOME_PATH="${DATA_DIR}" \
+        AENV_VIRTUALIZATION_MODE="${VIRTUALIZATION_MODE}" \
         "${INSTALL_DIR}/server" --setup-host \
         --runtime-user "$SERVICE_USER" --runtime-group "$SERVICE_GROUP"
 fi
@@ -287,11 +327,13 @@ sudo chmod 0640 "$CONFIG_PATH"
 if [[ -d /run/systemd/system ]]; then
     ENV_FILE_STATUS="exists"
     if [[ ! -f "$ENV_FILE" ]]; then
+        sudo install -o root -g "$SERVICE_GROUP" -m 0640 /dev/null "$ENV_FILE"
         sudo tee "$ENV_FILE" > /dev/null <<EOF
 API_ADDR="127.0.0.1:8000"
 AENV_CONFIG_PATH="${CONFIG_PATH}"
 AENV_HOME_PATH="${DATA_DIR}"
 AENV_RUNTIME_PATH="${RUNTIME_DIR}"
+AENV_VIRTUALIZATION_MODE="${VIRTUALIZATION_MODE}"
 EOF
         ENV_FILE_STATUS="written"
     else
@@ -314,6 +356,7 @@ EOF
         found_config=0
         found_home=0
         found_runtime=0
+        found_virtualization=0
         while IFS= read -r line || [[ -n "$line" ]]; do
             case "$line" in
                 AENV_CONFIG_PATH=*)
@@ -327,6 +370,10 @@ EOF
                 AENV_RUNTIME_PATH=*)
                     printf 'AENV_RUNTIME_PATH="%s"\n' "$RUNTIME_DIR" >> "$tmp_env"
                     found_runtime=1
+                    ;;
+                AENV_VIRTUALIZATION_MODE=*)
+                    printf 'AENV_VIRTUALIZATION_MODE="%s"\n' "$VIRTUALIZATION_MODE" >> "$tmp_env"
+                    found_virtualization=1
                     ;;
                 *)
                     printf '%s\n' "$line" >> "$tmp_env"
@@ -342,7 +389,10 @@ EOF
         if [[ "$found_runtime" == "0" ]]; then
             printf 'AENV_RUNTIME_PATH="%s"\n' "$RUNTIME_DIR" >> "$tmp_env"
         fi
-        sudo install -m 0644 "$tmp_env" "$ENV_FILE"
+        if [[ "$found_virtualization" == "0" ]]; then
+            printf 'AENV_VIRTUALIZATION_MODE="%s"\n' "$VIRTUALIZATION_MODE" >> "$tmp_env"
+        fi
+        sudo install -o root -g "$SERVICE_GROUP" -m 0640 "$tmp_env" "$ENV_FILE"
         rm -f "$current_env" "$tmp_env"
         ENV_FILE_STATUS="updated"
     fi
@@ -392,6 +442,8 @@ echo "  CLI    : ${INSTALL_DIR}/aenv"
 echo "  Server : ${INSTALL_DIR}/server"
 echo "  Data   : ${DATA_DIR}"
 echo "  Config : ${CONFIG_PATH}"
+echo "  API key: ${DATA_DIR}/secrets/api-key (auto-generated when no API key is configured)"
+echo "  Mode   : ${VIRTUALIZATION_MODE}"
 if [[ -d /run/systemd/system ]]; then
     if [[ "$ENV_FILE_STATUS" == "written" ]]; then
         echo "  Env    : ${ENV_FILE}"
@@ -417,6 +469,7 @@ else
     echo "    --inh-caps=+net_admin,+sys_admin --ambient-caps=+net_admin,+sys_admin \\"
     echo "    --bounding-set=-all,+net_admin,+sys_admin --nnp \\"
     echo "    env AENV_CONFIG_PATH=${CONFIG_PATH} AENV_HOME_PATH=${DATA_DIR} AENV_RUNTIME_PATH=${RUNTIME_DIR} \\"
+    echo "    AENV_VIRTUALIZATION_MODE=${VIRTUALIZATION_MODE} \\"
     echo "    API_ADDR=127.0.0.1:8000 ${INSTALL_DIR}/server"
 fi
 echo ""

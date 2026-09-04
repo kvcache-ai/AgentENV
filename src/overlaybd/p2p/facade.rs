@@ -362,9 +362,9 @@ async fn lookup_descriptor(
             debug!(
                 key = %artifact_key,
                 timeout_ms = state.lookup_timeout.as_millis(),
-                "p2p lookup timed out; treating as miss"
+                "p2p lookup timed out; retrying on next read rather than caching a miss"
             );
-            None
+            return None;
         }
     };
     let should_cache = descriptor.as_ref().is_none_or(|descriptor| {
@@ -1278,6 +1278,44 @@ mod tests {
         let second = get_range(&format!("{}/{}", facade.address(), origin_url), 64, 127).await;
         assert_eq!(second.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(transport.lookup_count.load(Ordering::Relaxed), 1);
+        facade.shutdown().await.unwrap();
+        origin_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn lookup_timeouts_are_not_cached_as_misses() {
+        let blob: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (origin, origin_handle) = spawn_origin(OriginState {
+            blob: Arc::new(blob),
+            hits: hits.clone(),
+            force_200: false,
+        })
+        .await;
+        let transport = Arc::new(MockTransport {
+            lookup_delay: Some(Duration::from_millis(50)),
+            ..Default::default()
+        });
+        let facade = start_test_facade_with_config(
+            transport.clone(),
+            P2pHttpFacadeConfig {
+                lookup_timeout: Duration::from_millis(10),
+                fetch_range_timeout: DEFAULT_FETCH_RANGE_TIMEOUT,
+                descriptor_cache_ttl: Duration::from_secs(60),
+                descriptor_miss_cache_ttl: Duration::from_secs(60),
+                descriptor_cache_max_entries: DEFAULT_DESCRIPTOR_CACHE_MAX_ENTRIES,
+                allowed_publish_roots: Vec::new(),
+            },
+        )
+        .await;
+        let origin_url = format!("{origin}/v2/ns/repo/blobs/sha256:abababababababababababababababababababababababababababababababab?sig=one");
+
+        let first = get_range(&format!("{}/{}", facade.address(), origin_url), 0, 63).await;
+        assert_eq!(first.status(), StatusCode::PARTIAL_CONTENT);
+        let second = get_range(&format!("{}/{}", facade.address(), origin_url), 64, 127).await;
+        assert_eq!(second.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(transport.lookup_count.load(Ordering::Relaxed), 2);
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
         facade.shutdown().await.unwrap();
         origin_handle.abort();
     }

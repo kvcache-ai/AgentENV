@@ -26,6 +26,10 @@ impl SandboxId {
     pub fn max() -> Self {
         Self(Uuid::max())
     }
+
+    pub fn min() -> Self {
+        Self(Uuid::nil())
+    }
 }
 
 impl Default for SandboxId {

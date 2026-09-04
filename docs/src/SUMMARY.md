@@ -14,18 +14,21 @@
 - [Static Multi-Node (Without Kubernetes)](./deployment/static-multi-node.md)
 - [Kubernetes (Multi-Node)](./deployment/kubernetes.md)
 - [Manual Compile (Single Node)](./deployment/manual-compile.md)
+- [PVM Deployment (When KVM Is Unavailable)](./deployment/pvm.md)
 
-# Configuration
+# Use Cases
 
-- [Configuration Reference](./configuration/reference.md)
-- [Environment Variables](./configuration/env-vars.md)
+- [Run Python Code](./use-cases/python.md)
+- [Train Terminal-Bench-2 with Miles](./use-cases/miles.md)
 
 # Core Concepts
 
 - [How AgentENV Works](./concepts/overview.md)
+- [Authentication](./concepts/authentication.md)
 - [Templates](./concepts/templates.md)
 - [Sandboxes](./concepts/sandboxes.md)
 - [Snapshots](./concepts/snapshots.md)
+- [Volumes](./concepts/volumes.md)
 - [Custom Extension](./concepts/custom-extension.md)
 - [Proxy](./concepts/proxy.md)
 
@@ -41,11 +44,17 @@
 
 - [Common Issues](./troubleshooting/common-issues.md)
 
+# Configuration
+
+- [Configuration Reference](./configuration/reference.md)
+- [Environment Variables](./configuration/env-vars.md)
+
 ---
 
 # Developer Internals
 
 - [System Architecture](./internals/architecture.md)
+- [Sandbox Network Architecture](./internals/networking.md)
 - [Sandbox Internals and Testing](./internals/sandbox-testing.md)
 - [Template Builder and Testing](./internals/template-builder-testing.md)
 - [Persistence Artifact Inventory](./internals/persistence-artifact-inventory.md)

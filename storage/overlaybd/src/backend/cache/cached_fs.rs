@@ -8,14 +8,16 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use storage_util::io_ring::IoRingHandle;
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::full_file_cache::cache_pool::FileCacheBackend;
 use super::full_file_cache::cache_store::CachedFile;
 use super::O_CACHE_ONLY;
 use crate::backend::local::LocalFile;
-use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile};
+use crate::io::virtual_file::VirtualFile;
+#[cfg(feature = "io-uring")]
+use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
+use crate::sys;
 
 #[async_trait]
 pub trait CachedFsSource: Send + Sync {
@@ -81,14 +83,12 @@ pub trait CachedFsSource: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct LocalFsSource {
     root: PathBuf,
-    io_ring: IoRingHandle,
 }
 
 impl LocalFsSource {
-    pub fn new(root: impl AsRef<Path>, io_ring: IoRingHandle) -> Self {
+    pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
-            io_ring,
         }
     }
 
@@ -126,14 +126,13 @@ impl CachedFsSource for LocalFsSource {
                 tokio::fs::create_dir_all(parent).await?;
             }
         }
-        let file = LocalFile::builder(self.io_ring.clone())
+        let file = LocalFile::builder()
             .read(read)
             .write(write)
             .create(create)
             .truncate(truncate)
             .mode(mode)
-            .open(&path)
-            .await?;
+            .open(&path)?;
         Ok(Arc::new(file))
     }
 
@@ -228,99 +227,28 @@ impl CachedFsSource for LocalFsSource {
         let path = self.resolve_path(path);
         let cpath = Self::path_to_cstring(&path)?;
         let cname = CString::new(name).context("xattr name contains interior NUL byte")?;
-        // SAFETY: pointers are valid; null destination with 0 length queries size.
-        let need =
-            unsafe { libc::getxattr(cpath.as_ptr(), cname.as_ptr(), std::ptr::null_mut(), 0) };
-        if need < 0 {
-            return Err(Errno::last().into());
-        }
-        let need = usize::try_from(need).context("xattr length overflow")?;
-        let mut out = vec![0u8; need];
-        // SAFETY: destination is valid for `need` bytes; pointers remain valid.
-        let got = unsafe {
-            libc::getxattr(
-                cpath.as_ptr(),
-                cname.as_ptr(),
-                out.as_mut_ptr() as *mut libc::c_void,
-                need,
-            )
-        };
-        if got < 0 {
-            return Err(Errno::last().into());
-        }
-        let got = usize::try_from(got).context("xattr length overflow")?;
-        out.truncate(got);
-        Ok(out)
+        sys::getxattr(&cpath, &cname).with_context(|| format!("getxattr {name} on {path:?}"))
     }
 
     async fn listxattr(&self, path: &str) -> Result<Vec<String>> {
         let path = self.resolve_path(path);
         let cpath = Self::path_to_cstring(&path)?;
-        // SAFETY: pointers are valid; null destination with 0 length queries size.
-        let need = unsafe { libc::listxattr(cpath.as_ptr(), std::ptr::null_mut(), 0) };
-        if need < 0 {
-            return Err(Errno::last().into());
-        }
-        let need = usize::try_from(need).context("xattr list length overflow")?;
-        if need == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut buf = vec![0u8; need];
-        // SAFETY: destination is valid for `need` bytes; pointers remain valid.
-        let got =
-            unsafe { libc::listxattr(cpath.as_ptr(), buf.as_mut_ptr() as *mut libc::c_char, need) };
-        if got < 0 {
-            return Err(Errno::last().into());
-        }
-        let got = usize::try_from(got).context("xattr list length overflow")?;
-        buf.truncate(got);
-
-        let mut names = Vec::new();
-        let mut begin = 0usize;
-        while begin < buf.len() {
-            let Some(end_rel) = buf[begin..].iter().position(|b| *b == 0) else {
-                break;
-            };
-            if end_rel > 0 {
-                let end = begin + end_rel;
-                names.push(String::from_utf8_lossy(&buf[begin..end]).to_string());
-            }
-            begin += end_rel + 1;
-        }
-        Ok(names)
+        sys::listxattr(&cpath).with_context(|| format!("listxattr on {path:?}"))
     }
 
     async fn setxattr(&self, path: &str, name: &str, value: &[u8], flags: i32) -> Result<()> {
         let path = self.resolve_path(path);
         let cpath = Self::path_to_cstring(&path)?;
         let cname = CString::new(name).context("xattr name contains interior NUL byte")?;
-        // SAFETY: pointers are valid for the provided lengths and remain live during call.
-        let ret = unsafe {
-            libc::setxattr(
-                cpath.as_ptr(),
-                cname.as_ptr(),
-                value.as_ptr() as *const libc::c_void,
-                value.len(),
-                flags,
-            )
-        };
-        if ret == 0 {
-            return Ok(());
-        }
-        Err(Errno::last().into())
+        sys::setxattr(&cpath, &cname, value, flags)
+            .with_context(|| format!("setxattr {name} on {path:?}"))
     }
 
     async fn removexattr(&self, path: &str, name: &str) -> Result<()> {
         let path = self.resolve_path(path);
         let cpath = Self::path_to_cstring(&path)?;
         let cname = CString::new(name).context("xattr name contains interior NUL byte")?;
-        // SAFETY: pointers are valid and remain live during call.
-        let ret = unsafe { libc::removexattr(cpath.as_ptr(), cname.as_ptr()) };
-        if ret == 0 {
-            return Ok(());
-        }
-        Err(Errno::last().into())
+        sys::removexattr(&cpath, &cname).with_context(|| format!("removexattr {name} on {path:?}"))
     }
 }
 
@@ -418,6 +346,7 @@ impl VirtualFile for LazySourceFile {
         self.open_if_needed().await?.fremovexattr(name).await
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -430,6 +359,7 @@ impl VirtualFile for LazySourceFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -442,6 +372,7 @@ impl VirtualFile for LazySourceFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -454,6 +385,7 @@ impl VirtualFile for LazySourceFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_bytes_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,

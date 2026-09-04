@@ -19,8 +19,8 @@ use warm_pool::{PoolConfig, PoolMaintenanceAction, WarmPool};
 
 use storage_util::io_ring::IoRingHandle;
 use uvm_ublk::{
-    delete_dev, ublk_caps, wait_for_ublk_dev, BasicCowConfig, BasicCowTarget, OverlaybdTarget,
-    UVMUblkCtrlBuilder, UVMUblkDev, UVMUblkDevBuilder, UVMUblkTarget,
+    delete_dev, ublk_caps, wait_for_ublk_dev, OverlaybdTarget, UVMUblkCtrlBuilder, UVMUblkDev,
+    UVMUblkDevBuilder, UVMUblkTarget,
 };
 
 use crate::protocol::{
@@ -30,14 +30,9 @@ use crate::runtime;
 
 // ── Managed device wrapper ──────────────────────────────────────────────────
 
-enum ManagedDevice {
-    Overlaybd {
-        _dev: UVMUblkDev<OverlaybdTarget>,
-        image: Arc<ImageFile>,
-    },
-    Cow {
-        _dev: UVMUblkDev<BasicCowTarget>,
-    },
+struct ManagedDevice {
+    dev: UVMUblkDev<OverlaybdTarget>,
+    image: Arc<ImageFile>,
 }
 
 // ── Pooled device wrapper ───────────────────────────────────────────────────
@@ -263,6 +258,11 @@ pub struct UblkDaemonServer {
     devices: Arc<DashMap<u32, ManagedDevice>>,
     pool_state: Option<Arc<PoolState>>,
     resize_tool: Option<ResizeToolSpec>,
+    resize_global_config: PathBuf,
+    /// Daemon-wide permit serializing overlaybd-resize child processes: they
+    /// all share the single isolated resize cacheDir, so only one may run at
+    /// a time.
+    resize_permit: Arc<Mutex<()>>,
     shutdown: Arc<Notify>,
 }
 
@@ -271,14 +271,22 @@ impl UblkDaemonServer {
         socket_path: PathBuf,
         ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
         default_image_service: ImageService,
+        resize_global_config: PathBuf,
     ) -> Self {
-        Self::new_with_p2p_publish_url(socket_path, ctrl_ring, default_image_service, None)
+        Self::new_with_p2p_publish_url(
+            socket_path,
+            ctrl_ring,
+            default_image_service,
+            resize_global_config,
+            None,
+        )
     }
 
     pub fn new_with_p2p_publish_url(
         socket_path: PathBuf,
         ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
         default_image_service: ImageService,
+        resize_global_config: PathBuf,
         p2p_publish_url: Option<String>,
     ) -> Self {
         let mut cache = ImageServiceCache::new(p2p_publish_url);
@@ -301,6 +309,8 @@ impl UblkDaemonServer {
             devices: Arc::new(DashMap::new()),
             pool_state: None,
             resize_tool: None,
+            resize_global_config,
+            resize_permit: Arc::new(Mutex::new(())),
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -311,23 +321,19 @@ impl UblkDaemonServer {
         self.resize_tool = Some(resize_tool);
     }
 
+    pub async fn detect_ublk_features(&self) -> Result<u64> {
+        detect_ublk_features(&self.ctrl_ring).await
+    }
+
     /// Enable warm pooling with the given configuration.
     /// Must be called before `run()`.
-    pub async fn enable_pool(&mut self, config: PoolConfig) -> Result<()> {
-        // Detect ublk features at startup.
-        let features = detect_ublk_features(&self.ctrl_ring).await?;
-        tracing::info!(
-            features = format!("{:#x}", features),
-            update_size_supported = features & ublk_caps::UBLK_F_UPDATE_SIZE != 0,
-            "detected ublk features"
-        );
+    pub fn enable_pool(&mut self, config: PoolConfig, features: u64) {
         self.pool_state = Some(Arc::new(PoolState::new(
             config,
             features,
             self.default_image_service.clone(),
             self.pool_placeholder_dir(),
         )));
-        Ok(())
     }
 
     /// Daemon-owned directory for warm-pool placeholder images, kept separate
@@ -367,7 +373,11 @@ impl UblkDaemonServer {
 
         let listener = UnixListener::bind(&self.socket_path)
             .with_context(|| format!("bind daemon socket: {}", self.socket_path.display()))?;
-        tracing::info!(path = %self.socket_path.display(), "ublk daemon listening");
+        tracing::info!(
+            path = %self.socket_path.display(),
+            resize_global_config = %self.resize_global_config.display(),
+            "ublk daemon listening"
+        );
         signal_ready()?;
 
         // Note: spawned connection handlers may outlive the accept loop when
@@ -384,6 +394,8 @@ impl UblkDaemonServer {
                     let image_service_cache = Arc::clone(&self.image_service_cache);
                     let pool_state = self.pool_state.as_ref().map(Arc::clone);
                     let resize_tool = self.resize_tool.clone();
+                    let resize_global_config = self.resize_global_config.clone();
+                    let resize_permit = Arc::clone(&self.resize_permit);
                     let shutdown = Arc::clone(&self.shutdown);
                     tokio::spawn(async move {
                         if let Err(err) = handle_connection(
@@ -393,6 +405,8 @@ impl UblkDaemonServer {
                             image_service_cache,
                             pool_state,
                             resize_tool,
+                            resize_global_config,
+                            resize_permit,
                             shutdown,
                         ).await {
                             tracing::error!(?err, "daemon connection handler failed");
@@ -469,6 +483,7 @@ impl UblkDaemonServer {
 
 // ── Per-connection handler ──────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: tokio::net::UnixStream,
     devices: Arc<DashMap<u32, ManagedDevice>>,
@@ -476,6 +491,8 @@ async fn handle_connection(
     image_service_cache: Arc<ImageServiceCache>,
     pool_state: Option<Arc<PoolState>>,
     resize_tool: Option<ResizeToolSpec>,
+    resize_global_config: PathBuf,
+    resize_permit: Arc<Mutex<()>>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
     let Some(request) = recv_message::<DaemonRequest>(&mut stream).await? else {
@@ -515,6 +532,8 @@ async fn handle_connection(
                 requested_virtual_size,
                 known_source_virtual_size,
                 resize_tool: resize_tool.as_ref(),
+                resize_global_config: &resize_global_config,
+                resize_permit: Arc::clone(&resize_permit),
                 allow_shrink,
             };
             handle_create_overlaybd_runtime_device(
@@ -525,9 +544,6 @@ async fn handle_connection(
                 &pool_state,
             )
             .await
-        }
-        DaemonRequest::CreateCow { origin, cow } => {
-            handle_create_cow(&devices, ctrl_ring, &origin, &cow).await
         }
         DaemonRequest::Delete { dev_id } => handle_delete(&devices, ctrl_ring, dev_id).await,
         DaemonRequest::RestackSnapshot {
@@ -610,6 +626,8 @@ struct OverlaybdRuntimeDeviceRequest<'a> {
     requested_virtual_size: Option<u64>,
     known_source_virtual_size: Option<u64>,
     resize_tool: Option<&'a crate::protocol::ResizeToolSpec>,
+    resize_global_config: &'a Path,
+    resize_permit: Arc<Mutex<()>>,
     allow_shrink: bool,
 }
 
@@ -631,6 +649,8 @@ async fn handle_create_overlaybd_runtime_device(
             requested_virtual_size: request.requested_virtual_size,
             known_source_virtual_size: request.known_source_virtual_size,
             resize_tool: request.resize_tool,
+            resize_global_config: request.resize_global_config,
+            resize_permit: request.resize_permit,
             allow_shrink: request.allow_shrink,
         })
         .await
@@ -781,8 +801,8 @@ async fn create_overlaybd_device(
     let device_path = dev.device_path().to_path_buf();
     devices.insert(
         dev_id,
-        ManagedDevice::Overlaybd {
-            _dev: dev,
+        ManagedDevice {
+            dev,
             image: Arc::clone(&image),
         },
     );
@@ -792,55 +812,6 @@ async fn create_overlaybd_device(
         "overlaybd device created"
     );
     Ok((dev_id, device_path))
-}
-
-async fn handle_create_cow(
-    devices: &DashMap<u32, ManagedDevice>,
-    ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
-    origin: &Path,
-    cow: &Path,
-) -> Result<DaemonResponse> {
-    tracing::info!(origin = %origin.display(), cow = %cow.display(), "creating cow device");
-
-    let cow_config = BasicCowConfig {
-        origin: origin.to_path_buf(),
-        cow: cow.to_path_buf(),
-        origin_dio: false,
-        cow_dio: false,
-        chunksize_kb: 32,
-    };
-
-    let target = BasicCowTarget::new(&cow_config).context("create cow target")?;
-
-    let ctrl = UVMUblkCtrlBuilder::new()
-        .name("cow-blk")
-        .build(ctrl_ring.clone())
-        .context("build ublk ctrl")?;
-
-    let mut dev = UVMUblkDevBuilder::new(ctrl)
-        .set_target(target)
-        .build()
-        .await
-        .context("build ublk dev")?;
-
-    let dev_id = dev.dev_id();
-    if let Err(err) = dev.start().await.context("start ublk dev") {
-        cleanup_failed_ublk_start(ctrl_ring.clone(), dev).await;
-        return Err(err);
-    }
-    if let Err(err) = wait_for_ublk_dev(dev_id).context("wait for ublk device") {
-        cleanup_failed_ublk_start(ctrl_ring.clone(), dev).await;
-        return Err(err);
-    }
-
-    let device_path = dev.device_path().to_path_buf();
-    devices.insert(dev_id, ManagedDevice::Cow { _dev: dev });
-    tracing::info!(dev_id, path = %device_path.display(), "cow device created");
-
-    Ok(DaemonResponse::DeviceCreated {
-        dev_id,
-        device_path,
-    })
 }
 
 async fn handle_delete(
@@ -867,10 +838,7 @@ async fn handle_delete(
 }
 
 async fn quiesce_managed_device(device: &mut ManagedDevice) {
-    match device {
-        ManagedDevice::Overlaybd { _dev, .. } => quiesce_ublk_device(_dev).await,
-        ManagedDevice::Cow { _dev } => quiesce_ublk_device(_dev).await,
-    }
+    quiesce_ublk_device(&mut device.dev).await;
 }
 
 async fn quiesce_ublk_device<T: UVMUblkTarget>(dev: &mut UVMUblkDev<T>) {
@@ -989,14 +957,7 @@ async fn handle_restack_snapshot(
     output_layer_path: &Path,
 ) -> Result<DaemonResponse> {
     let (image, image_config) = if let Some(device_ref) = devices.get(&dev_id) {
-        let image = match device_ref.value() {
-            ManagedDevice::Overlaybd { image, .. } => Arc::clone(image),
-            ManagedDevice::Cow { .. } => {
-                bail!(
-                    "snapshot is only supported for overlaybd devices, not cow (dev_id={dev_id})"
-                );
-            }
-        };
+        let image = Arc::clone(&device_ref.image);
         drop(device_ref);
         (image, None)
     } else if let Some(pool) = pool_state {
@@ -1038,12 +999,21 @@ async fn handle_restack_snapshot(
         )
     })?;
 
+    // Best-effort usage observability; never fails the restack itself.
+    let data_stat = image.data_stat().await.ok();
+    let image_vf: Arc<dyn overlaybd::virtual_file::VirtualFile> = image.clone();
+    let ext4_used_bytes = overlaybd::ext4_stat::ext4_used_bytes(&image_vf).await.ok();
+
     tracing::info!(
         dev_id,
         output = %output_layer_path.display(),
         "ublk daemon restack snapshot completed"
     );
-    Ok(DaemonResponse::RestackSnapshotCreated { descriptor })
+    Ok(DaemonResponse::RestackSnapshotCreated {
+        descriptor,
+        data_stat,
+        ext4_used_bytes,
+    })
 }
 
 // ── Pool handlers ───────────────────────────────────────────────────────────
@@ -1634,7 +1604,10 @@ fn clear_page_cache(device_path: &Path) {
 
     // BLKFLSBUF ioctl number: flush buffer cache
     // Linux asm-generic/ioctl.h encodes _IO(0x12, 97) as (0x12 << 8) | 97.
-    const BLKFLSBUF: libc::c_ulong = 0x1261;
+    // libc models ioctl's request argument differently across Linux libc
+    // implementations (c_ulong on glibc, c_int on musl). Keep the request
+    // value libc-agnostic and infer the ABI-specific type at the call site.
+    const BLKFLSBUF: u32 = 0x1261;
 
     let file = match OpenOptions::new()
         .read(true)
@@ -1649,7 +1622,7 @@ fn clear_page_cache(device_path: &Path) {
     };
 
     let fd = file.as_raw_fd();
-    let ret = unsafe { libc::ioctl(fd, BLKFLSBUF) };
+    let ret = unsafe { libc::ioctl(fd, BLKFLSBUF as _) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
         tracing::warn!(?err, path = %device_path.display(), "failed to clear page cache");

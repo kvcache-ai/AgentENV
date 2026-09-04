@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-storage-util = { path = "../util" }
-overlaybd = { path = "../overlaybd" }
+storage-util = { path = "../util", features = ["io-uring"] }
+overlaybd = { path = "../overlaybd", features = ["io-uring"] }
 
 anyhow = "1.0"
 ublk-sys = { package = "libublk-rs-sys", git = "https://github.com/ublk-org/libublk-rs.git", rev = "c6a3e06" }
@@ -14,9 +14,7 @@ nix = { version = "0.30.1", features = ["event", "mman", "feature", "process", "
 libc = "0.2.174"
 tokio = { version = "1.44.2", features = ["full"] }
 async-trait = "0.1.88"
-futures-util = "0.3.31"
 clap = { version = "4.5.38", features = ["derive"] }
-dashmap = "6.1.0"
 bytes = "1.11.0"
 parking_lot = "0.12.5"
 serde = { version = "1.0", features = ["derive"] }
@@ -30,8 +28,7 @@ tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
 tracing-bunyan-formatter = "0.3.10"
 
 [dev-dependencies]
-rand = "0.10"
 tempfile = "3"
 axum = "0.8.6"
 sha2 = "0.10.9"
-storage-util = { path = "../util" }
+storage-util = { path = "../util", features = ["io-uring"] }

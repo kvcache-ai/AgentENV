@@ -1,11 +1,14 @@
 use anyhow::{anyhow, bail, Result};
+// Aliased to `_`: the trait methods are what we want, and the name `Context` is
+// already taken by `std::task::Context` below.
+use anyhow::Context as _;
 use bytes::Bytes;
-use nix::fcntl::FallocateFlags;
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::future::Future;
+use std::os::fd::AsFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -16,6 +19,7 @@ use super::super::meta::{
     fsync, now_unix_nanos, BlockLoadState, CacheMetaDisk, CacheMetaDiskHeader, EntryPaths,
 };
 use super::cache_pool::FileCacheBackendOptions;
+use crate::sys;
 use storage_util::MMapRegion;
 
 /// The core per-cache-entry object. One per remote file (keyed by cache_id).
@@ -51,6 +55,8 @@ pub(crate) struct CacheEntry {
     pub(crate) dirty: AtomicBool,
     // Open-file reference count
     pub(crate) open_count: AtomicUsize,
+    /// Coordinates block refills with logical eviction of this entry.
+    pub(crate) refill_eviction_barrier: tokio::sync::RwLock<()>,
 }
 
 impl std::fmt::Debug for CacheEntry {
@@ -73,6 +79,68 @@ pub(crate) enum AcquireRefillResult {
     InCache,
     /// We became the loader; proceed to fetch from source.
     ShouldLoad,
+}
+
+// ---------------------------------------------------------------------------
+// Disk range reservation
+// ---------------------------------------------------------------------------
+
+/// Outcome of preallocating a byte range of the sparse data file.
+pub(crate) enum RangeAllocation {
+    /// Disk blocks are reserved; a punch can roll the range back.
+    Reserved,
+    /// The platform or filesystem cannot reserve a range; nothing was reserved
+    /// and writes through the mmap keep the pre-reservation behavior — meaning
+    /// the SIGBUS-on-full-disk hazard this reservation exists to remove is
+    /// still present. This is the case on **all** of macOS, not just exotic
+    /// filesystems; see [`sys::reserve_space`] for why.
+    Unsupported,
+}
+
+/// RAII guard for a reserved-but-not-yet-published disk range, returned by
+/// [`CacheEntry::reserve_range`]. Dropping an armed guard punches the range
+/// back to a hole so a failed or cancelled refill leaves no allocated disk
+/// blocks that capacity accounting never saw. Call
+/// [`commit`](Self::commit) once the covered blocks are published.
+///
+/// The guard is armed only when the reservation actually happened, so on a
+/// platform reporting [`RangeAllocation::Unsupported`] the whole mechanism is
+/// inert — including the partially-written-page cleanup it provides on drop.
+pub(crate) struct ReservedRange<'a> {
+    entry: &'a CacheEntry,
+    offset: u64,
+    len: u64,
+    armed: bool,
+}
+
+impl ReservedRange<'_> {
+    /// Keep the reservation. Call this after the covered data is fully
+    /// written and before publishing the blocks in the bitmap, so an armed
+    /// guard never coexists with published blocks.
+    pub(crate) fn commit(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReservedRange<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Best-effort: the range was never published, so leaving it allocated
+        // only wastes disk until the entry is evicted (whole-file punch).
+        if let Err(err) =
+            sys::release_space_hint(self.entry.data_file.as_fd(), self.offset, self.len)
+        {
+            tracing::warn!(
+                cache_id = %self.entry.cache_id,
+                offset = self.offset,
+                len = self.len,
+                %err,
+                "failed to punch back reserved cache range"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +233,7 @@ impl CacheEntry {
             refills: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
             open_count: AtomicUsize::new(0),
+            refill_eviction_barrier: tokio::sync::RwLock::new(()),
         }))
     }
 
@@ -244,6 +313,7 @@ impl CacheEntry {
             refills: AtomicU64::new(meta.header.refills.get()),
             dirty: AtomicBool::new(false),
             open_count: AtomicUsize::new(0),
+            refill_eviction_barrier: tokio::sync::RwLock::new(()),
         }))
     }
 
@@ -280,7 +350,76 @@ impl CacheEntry {
         Ok(Some(Bytes::from_owner(slice)))
     }
 
+    /// Reserve disk blocks for `[offset, offset + len)` of the sparse data
+    /// file before writing through the mmap region.
+    ///
+    /// Writing into an unallocated hole of a shared file mapping makes the
+    /// kernel allocate blocks at page-fault time; if the filesystem is out of
+    /// space that fault fails and the process gets SIGBUS instead of an error
+    /// return. Allocating up front turns disk exhaustion into a plain ENOSPC
+    /// that the refill path can surface, after which reads fall back to the
+    /// source. Platforms and filesystems that cannot reserve a range keep the
+    /// old behavior and report [`RangeAllocation::Unsupported`]; that covers
+    /// all of macOS, so this protection is Linux-only in practice.
+    ///
+    /// Call this directly only when no fallible or cancellable step sits
+    /// between the reservation and publication of the covered blocks;
+    /// otherwise use [`reserve_range`](Self::reserve_range) so a failure
+    /// rolls the reservation back.
+    pub(crate) fn ensure_range_allocated(&self, offset: u64, len: u64) -> Result<RangeAllocation> {
+        if len == 0 {
+            return Ok(RangeAllocation::Unsupported);
+        }
+        // The reservation never moves the file length; the entry is rejected on
+        // reload if the data file size drifts from source_size.
+        match sys::reserve_space(self.data_file.as_fd(), offset, len) {
+            Ok(()) => Ok(RangeAllocation::Reserved),
+            // The platform or filesystem cannot reserve a range. Not an error:
+            // the caller has to keep working without a reservation, which is
+            // the pre-reservation behavior. Whole platforms land here — macOS
+            // has no interior-range equivalent of `fallocate` at all — so
+            // failing instead would break every refill there.
+            Err(err) if err.is_unsupported() => Ok(RangeAllocation::Unsupported),
+            Err(err) => Err(anyhow!(
+                "preallocate cache range failed: offset={offset}, len={len}: {err}"
+            )),
+        }
+    }
+
+    /// Reserve `[offset, offset + len)` and return a guard that punches the
+    /// range back to a hole on drop unless [`ReservedRange::commit`] is
+    /// called first.
+    ///
+    /// Use this when a fallible or cancellable step (such as an async source
+    /// read into the mmap) runs between reservation and publication: the
+    /// guard guarantees a failed refill leaves neither allocated-but-
+    /// unaccounted disk blocks nor partially written pages behind.
+    ///
+    /// # Punch invariant
+    ///
+    /// While the guard is armed, no block overlapping the range may be
+    /// published in the bitmap and the caller must be the sole elected
+    /// loader for every covered block — dropping the guard zeroes the range.
+    pub(crate) fn reserve_range(&self, offset: u64, len: u64) -> Result<ReservedRange<'_>> {
+        let armed = matches!(
+            self.ensure_range_allocated(offset, len)?,
+            RangeAllocation::Reserved
+        );
+        Ok(ReservedRange {
+            entry: self,
+            offset,
+            len,
+            armed,
+        })
+    }
+
     /// Write a block via the mmap region and mark it in the bitmap.
+    ///
+    /// The block's disk range is preallocated first so a full disk surfaces
+    /// as ENOSPC instead of SIGBUS. No rollback is needed: nothing between
+    /// the reservation and the bitmap publication below can fail or be
+    /// cancelled, and callers may overwrite already cached blocks, which a
+    /// punch-based rollback would corrupt.
     ///
     /// # Safety invariant
     /// The acquire/finish refill protocol guarantees at most one writer per
@@ -288,6 +427,7 @@ impl CacheEntry {
     /// writers for the same byte range.
     pub(crate) fn write_block(&self, block_id: u64, data: &[u8]) -> Result<()> {
         let offset = block_id.saturating_mul(self.block_size);
+        self.ensure_range_allocated(offset, data.len() as u64)?;
 
         let buf = unsafe {
             self.mem_region.get_mut(offset, data.len()).ok_or_else(|| {
@@ -308,27 +448,46 @@ impl CacheEntry {
     ///
     /// Uses `fallocate(PUNCH_HOLE | KEEP_SIZE)` to release disk blocks and
     /// page cache. This avoids munmap/remap while still freeing resources.
-    pub(crate) fn evict_all_blocks(&self) -> Result<()> {
-        // First, remove the on-disk index file.
-        match std::fs::remove_file(&self.paths.meta_path) {
-            Ok(_) => {}
-            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {}
-            Err(err) => return Err(err.into()),
-        }
+    pub(crate) async fn evict_all_blocks(&self) -> Result<u64> {
+        // Hold the write side across bitmap clearing, metadata removal, and
+        // hole punching so no refill can publish into the entry afterward.
+        let _barrier = self.refill_eviction_barrier.write().await;
+        let bytes_before = self.total_cached_bytes();
 
-        let source_size = self.source_size.load(Ordering::Relaxed);
-        if source_size > 0 {
-            nix::fcntl::fallocate(
-                &self.data_file,
-                FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
-                0,
-                source_size as i64,
-            )?;
-        }
-
+        // Clear the in-memory bitmap before any destructive filesystem
+        // operation: from here on every read misses and falls back to the
+        // source, so a failure partway can never leave a bitmap that claims
+        // cached data whose blocks are already gone.
         self.index.write().clear();
         self.dirty.store(true, Ordering::Relaxed);
-        Ok(())
+
+        // Filesystem operations can block under disk pressure — exactly when
+        // eviction runs — so keep them off the async executor.
+        let meta_path = self.paths.meta_path.clone();
+        let data_file = self.data_file.try_clone()?;
+        let source_size = self.source_size.load(Ordering::Relaxed);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            // Remove the on-disk index before punching: a crash after the
+            // punch with meta.bin still present would otherwise reload a
+            // bitmap claiming blocks the punch already released.
+            match std::fs::remove_file(&meta_path) {
+                Ok(_) => {}
+                Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(err) => return Err(err.into()),
+            }
+            if source_size > 0 {
+                // The bitmap was cleared above, so the bytes are already
+                // logically gone; this is purely about getting the disk space
+                // back. Failure still propagates: an eviction that cannot
+                // reclaim must not look like it succeeded.
+                sys::release_space_hint(data_file.as_fd(), 0, source_size)
+                    .with_context(|| format!("release {source_size} cached bytes"))?;
+            }
+            Ok(())
+        })
+        .await??;
+
+        Ok(bytes_before)
     }
 
     // -----------------------------------------------------------------------
@@ -345,6 +504,12 @@ impl CacheEntry {
     /// The caller must ensure exclusive access to this block. In the cache
     /// system this is guaranteed by the acquire_refill/finish_refill protocol
     /// (at most one loader per block).
+    ///
+    /// The caller must also reserve the block's disk range first (via
+    /// [`reserve_range`](Self::reserve_range) or
+    /// [`ensure_range_allocated`](Self::ensure_range_allocated)); writing the
+    /// returned slice over an unallocated hole raises SIGBUS when the disk
+    /// is full.
     #[allow(clippy::mut_from_ref)]
     pub(crate) unsafe fn mmap_mut_for_block(
         &self,
@@ -447,6 +612,10 @@ impl CacheEntry {
     /// are actually on disk. This is safe — the missing blocks will just
     /// be re-fetched from the remote source.
     pub(crate) async fn checkpoint(&self) -> Result<()> {
+        // Keep checkpoint publication ordered with logical eviction. Without
+        // this permit, an older bitmap snapshot could recreate meta.bin after
+        // eviction punched the data file and cleared the in-memory bitmap.
+        let _barrier = self.refill_eviction_barrier.read().await;
         let bitmap_snapshot = self.index.read().clone();
 
         let meta = CacheMetaDisk {

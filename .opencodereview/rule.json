@@ -1,0 +1,7 @@
+{
+    "exclude": [
+        "**/generated/**",
+        "thirdparty/envd/http-client/**",
+        "thirdparty/firecracker-client/**"
+    ]
+}

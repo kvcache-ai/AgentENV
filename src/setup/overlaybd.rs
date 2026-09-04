@@ -1,21 +1,13 @@
 use std::path::Path;
-use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use nix::unistd::{chown, Gid};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::cfg::OverlaybdDependencyConfig;
 
 use super::deps::{copy_file, download_file, set_executable, set_file_mode};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct OverlaybdReleaseTarget {
-    os_id: String,
-    version_id: String,
-    arch: String,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct OverlaybdInstalledRelease {
@@ -30,16 +22,6 @@ const OVERLAYBD_TOOL_NAMES: &[&str] = &[
     "overlaybd-commit",
     "overlaybd-resize",
 ];
-// Ubuntu release asset published by overlaybd upstream, used as a portable
-// fallback for non-Ubuntu (e.g. RPM-family) hosts. See
-// `configured_overlaybd_release`. Ubuntu 22.04 is chosen specifically because
-// it's the oldest published asset linked against OpenSSL 3 (`libssl.so.3`):
-// older assets (18.04/20.04) require `libssl.so.1.1`, which modern
-// RPM-family distros (RHEL 9 / TencentOS 4, etc.) no longer ship, while the
-// newer 24.04 asset requires `libaio.so.1t64`, which most non-Ubuntu distros
-// don't package either.
-const FALLBACK_UBUNTU_VERSION: &str = "22.04";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ConfiguredOverlaybdRelease {
     tag_name: String,
@@ -51,8 +33,7 @@ pub async fn ensure_release_tools(
     overlaybd_dir: &Path,
     arch: &str,
 ) -> Result<()> {
-    let target = detect_overlaybd_release_target(arch)?;
-    let configured_release = configured_overlaybd_release(overlaybd, &target)?;
+    let configured_release = configured_overlaybd_release(overlaybd, arch)?;
     let asset_name = configured_release
         .package_url
         .rsplit('/')
@@ -101,7 +82,7 @@ pub async fn ensure_release_tools(
         },
     )?;
 
-    // The downloaded .deb is only needed during extraction; remove it (and the
+    // The downloaded archive is only needed during extraction; remove it (and the
     // now-empty downloads dir) so it does not bloat container image layers built
     // via `--setup-only`.
     let _ = std::fs::remove_file(&package_path);
@@ -112,7 +93,7 @@ pub async fn ensure_release_tools(
 
 fn configured_overlaybd_release(
     overlaybd: &OverlaybdDependencyConfig,
-    target: &OverlaybdReleaseTarget,
+    arch: &str,
 ) -> Result<ConfiguredOverlaybdRelease> {
     let tag_name = overlaybd.version.trim();
     if tag_name.is_empty() {
@@ -129,49 +110,16 @@ fn configured_overlaybd_release(
         bail!("overlaybd.package_url not set in config");
     }
 
-    let target_fragment = match target.os_id.as_str() {
-        "ubuntu" => format!("ubuntu1.{}.{}", target.version_id, target.arch),
-        // Overlaybd upstream only publishes Ubuntu release assets. Each asset
-        // bundles its own shared libraries (see `install_overlaybd_release_tools`),
-        // so it runs fine on other glibc-based distros. Fall back to the
-        // oldest published Ubuntu build (lowest glibc requirement) for known
-        // RPM-family distros so the CLI tools install without a native asset.
-        "tencentos" | "centos" | "centos-stream" | "rhel" | "redhat" | "redhatenterpriseserver" => {
-            format!("ubuntu1.{}.{}", FALLBACK_UBUNTU_VERSION, target.arch)
-        }
-        other => bail!(
-            "unsupported overlaybd release target: os={} version={} arch={}",
-            other,
-            target.version_id,
-            target.arch
-        ),
-    };
+    match arch {
+        "x86_64" | "aarch64" => {}
+        other => bail!("unsupported overlaybd release architecture: {other}"),
+    }
 
     Ok(ConfiguredOverlaybdRelease {
         tag_name: tag_name.to_string(),
         package_url: package_url_template
             .replace("{version}", tag_name)
-            .replace("{target}", &target_fragment),
-    })
-}
-
-fn detect_overlaybd_release_target(arch: &str) -> Result<OverlaybdReleaseTarget> {
-    let os_release = std::fs::read_to_string("/etc/os-release").context("read /etc/os-release")?;
-    let mut os_id = None;
-    let mut version_id = None;
-
-    for line in os_release.lines() {
-        if let Some(value) = line.strip_prefix("ID=") {
-            os_id = Some(value.trim_matches('"').to_string());
-        } else if let Some(value) = line.strip_prefix("VERSION_ID=") {
-            version_id = Some(value.trim_matches('"').to_string());
-        }
-    }
-
-    Ok(OverlaybdReleaseTarget {
-        os_id: os_id.context("missing ID in /etc/os-release")?,
-        version_id: version_id.context("missing VERSION_ID in /etc/os-release")?,
-        arch: arch.to_string(),
+            .replace("{arch}", arch),
     })
 }
 
@@ -209,42 +157,31 @@ fn extract_overlaybd_package(package_path: &Path, destination: &Path) -> Result<
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    if package_name.ends_with(".deb") {
-        which::which("dpkg-deb").context("dpkg-deb is required to extract overlaybd .deb")?;
-        let status = Command::new("dpkg-deb")
-            .arg("-x")
-            .arg(package_path)
-            .arg(destination)
-            .status()
-            .context("run dpkg-deb to extract overlaybd package")?;
-        if !status.success() {
-            bail!("dpkg-deb failed to extract {}", package_path.display());
-        }
+    if package_name.ends_with(".tar.gz") {
+        let file = std::fs::File::open(package_path)
+            .with_context(|| format!("open overlaybd package {}", package_path.display()))?;
+        let decoder = flate2::read::GzDecoder::new(file);
+        let mut archive = tar::Archive::new(decoder);
+        archive
+            .unpack(destination)
+            .with_context(|| format!("extract overlaybd package {}", package_path.display()))?;
         return Ok(());
     }
 
     bail!(
-        "unsupported overlaybd package format for {} (only .deb is supported currently)",
+        "unsupported overlaybd package format for {} (expected .tar.gz)",
         package_path.display()
     );
 }
 
 fn install_overlaybd_release_tools(extracted_root: &Path, overlaybd_dir: &Path) -> Result<()> {
-    let source_bin_dir = extracted_root.join("opt/overlaybd/bin");
-    let source_lib_dir = extracted_root.join("opt/overlaybd/lib");
+    let source_bin_dir = extracted_root.join("bin");
     if !source_bin_dir.is_dir() {
         bail!(
             "overlaybd release payload missing bin dir at {}",
             source_bin_dir.display()
         );
     }
-    if !source_lib_dir.is_dir() {
-        bail!(
-            "overlaybd release payload missing lib dir at {}",
-            source_lib_dir.display()
-        );
-    }
-
     std::fs::create_dir_all(overlaybd_dir)
         .with_context(|| format!("create overlaybd dir '{}'", overlaybd_dir.display()))?;
     let staging = tempfile::Builder::new()
@@ -252,9 +189,7 @@ fn install_overlaybd_release_tools(extracted_root: &Path, overlaybd_dir: &Path) 
         .tempdir_in(overlaybd_dir)
         .context("create overlaybd release staging dir")?;
     let staged_bin = staging.path().join("bin");
-    let staged_lib = staging.path().join("lib");
     copy_dir_recursive(&source_bin_dir, &staged_bin)?;
-    copy_dir_recursive(&source_lib_dir, &staged_lib)?;
 
     for tool in OVERLAYBD_TOOL_NAMES {
         let staged = staged_bin.join(tool);
@@ -267,157 +202,43 @@ fn install_overlaybd_release_tools(extracted_root: &Path, overlaybd_dir: &Path) 
         set_executable(&staged)?;
     }
 
-    replace_overlaybd_release_dirs(overlaybd_dir, &staged_bin, &staged_lib)
+    replace_overlaybd_release_bin(overlaybd_dir, &staged_bin)?;
+    if let Err(error) = remove_legacy_overlaybd_lib(overlaybd_dir) {
+        warn!(
+            %error,
+            path = %overlaybd_dir.join("lib").display(),
+            "failed to remove legacy overlaybd libraries; continuing with installed static tools"
+        );
+    }
+    Ok(())
 }
 
-fn replace_overlaybd_release_dirs(
-    overlaybd_dir: &Path,
-    staged_bin: &Path,
-    staged_lib: &Path,
-) -> Result<()> {
+fn replace_overlaybd_release_bin(overlaybd_dir: &Path, staged_bin: &Path) -> Result<()> {
     let backup = tempfile::Builder::new()
         .prefix("release-backup-")
         .tempdir_in(overlaybd_dir)
         .context("create overlaybd release backup dir")?;
     let target_bin = overlaybd_dir.join("bin");
-    let target_lib = overlaybd_dir.join("lib");
     let backup_bin = backup.path().join("bin");
-    let backup_lib = backup.path().join("lib");
 
     let had_bin = target_bin.exists();
-    let had_lib = target_lib.exists();
-    let mut backed_up_bin = false;
-    let mut backed_up_lib = false;
     if had_bin {
         std::fs::rename(&target_bin, &backup_bin).context("backup installed overlaybd bin dir")?;
-        backed_up_bin = true;
-    }
-    if had_lib {
-        if let Err(err) = std::fs::rename(&target_lib, &backup_lib) {
-            let rollback = restore_release_backup(
-                &target_bin,
-                &target_lib,
-                &backup_bin,
-                &backup_lib,
-                backed_up_bin,
-                backed_up_lib,
-            );
-            return Err(swap_failure(
-                anyhow::Error::new(err).context("backup installed overlaybd lib dir"),
-                rollback,
-                backup,
-            ));
-        }
-        backed_up_lib = true;
     }
 
     if let Err(err) = std::fs::rename(staged_bin, &target_bin) {
-        let rollback = restore_release_backup(
-            &target_bin,
-            &target_lib,
-            &backup_bin,
-            &backup_lib,
-            backed_up_bin,
-            backed_up_lib,
-        );
+        let rollback = if had_bin {
+            std::fs::rename(&backup_bin, &target_bin).context("restore previous overlaybd bin dir")
+        } else {
+            Ok(())
+        };
         return Err(swap_failure(
             anyhow::Error::new(err).context("install staged overlaybd bin dir"),
             rollback,
             backup,
         ));
     }
-    if let Err(err) = std::fs::rename(staged_lib, &target_lib) {
-        let mut rollback_errors = Vec::new();
-        record_rename_error(
-            &target_bin,
-            staged_bin,
-            "move newly installed overlaybd bin back to staging",
-            &mut rollback_errors,
-        );
-        restore_release_backup_into(
-            &target_bin,
-            &target_lib,
-            &backup_bin,
-            &backup_lib,
-            backed_up_bin,
-            backed_up_lib,
-            &mut rollback_errors,
-        );
-        let rollback = rollback_result(rollback_errors);
-        return Err(swap_failure(
-            anyhow::Error::new(err).context("install staged overlaybd lib dir"),
-            rollback,
-            backup,
-        ));
-    }
-
     Ok(())
-}
-
-fn restore_release_backup(
-    target_bin: &Path,
-    target_lib: &Path,
-    backup_bin: &Path,
-    backup_lib: &Path,
-    backed_up_bin: bool,
-    backed_up_lib: bool,
-) -> Result<()> {
-    let mut errors = Vec::new();
-    restore_release_backup_into(
-        target_bin,
-        target_lib,
-        backup_bin,
-        backup_lib,
-        backed_up_bin,
-        backed_up_lib,
-        &mut errors,
-    );
-    rollback_result(errors)
-}
-
-fn restore_release_backup_into(
-    target_bin: &Path,
-    target_lib: &Path,
-    backup_bin: &Path,
-    backup_lib: &Path,
-    backed_up_bin: bool,
-    backed_up_lib: bool,
-    errors: &mut Vec<String>,
-) {
-    if backed_up_bin {
-        record_rename_error(
-            backup_bin,
-            target_bin,
-            "restore previous overlaybd bin dir",
-            errors,
-        );
-    }
-    if backed_up_lib {
-        record_rename_error(
-            backup_lib,
-            target_lib,
-            "restore previous overlaybd lib dir",
-            errors,
-        );
-    }
-}
-
-fn record_rename_error(source: &Path, target: &Path, action: &str, errors: &mut Vec<String>) {
-    if let Err(err) = std::fs::rename(source, target) {
-        errors.push(format!(
-            "{action} '{}' -> '{}': {err}",
-            source.display(),
-            target.display()
-        ));
-    }
-}
-
-fn rollback_result(errors: Vec<String>) -> Result<()> {
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        bail!(errors.join("; "))
-    }
 }
 
 fn swap_failure(
@@ -435,6 +256,25 @@ fn swap_failure(
             ))
         }
     }
+}
+
+fn remove_legacy_overlaybd_lib(overlaybd_dir: &Path) -> Result<()> {
+    let legacy_lib = overlaybd_dir.join("lib");
+    let metadata = match std::fs::symlink_metadata(&legacy_lib) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect legacy overlaybd lib {}", legacy_lib.display()))
+        }
+    };
+
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        std::fs::remove_dir_all(&legacy_lib)
+    } else {
+        std::fs::remove_file(&legacy_lib)
+    }
+    .with_context(|| format!("remove legacy overlaybd lib {}", legacy_lib.display()))
 }
 
 fn stage_overlaybd_default_config(extracted_root: &Path, overlaybd_dir: &Path) -> Result<()> {
@@ -534,88 +374,96 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{configured_overlaybd_release, install_default_config, OverlaybdReleaseTarget};
+    use super::{
+        configured_overlaybd_release, extract_overlaybd_package, install_default_config,
+        install_overlaybd_release_tools, OVERLAYBD_TOOL_NAMES,
+    };
     use crate::cfg::OverlaybdDependencyConfig;
     use nix::unistd::Gid;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     #[test]
-    fn configured_overlaybd_release_expands_ubuntu_target_url() {
+    fn configured_overlaybd_release_expands_arch_url() {
         let config = OverlaybdDependencyConfig {
-            version: "v1.0.18".to_string(),
+            version: "v1.0.18-aenv.1".to_string(),
             url: None,
             package_url: Some(
-                "https://example.invalid/{version}/overlaybd-foo.{target}.deb".to_string(),
+                "https://example.invalid/static-{version}/overlaybd-tools-{version}-linux-{arch}.tar.gz"
+                    .to_string(),
             ),
         };
 
-        let release = configured_overlaybd_release(
-            &config,
-            &OverlaybdReleaseTarget {
-                os_id: "ubuntu".to_string(),
-                version_id: "24.04".to_string(),
-                arch: "x86_64".to_string(),
-            },
-        )
-        .expect("configured overlaybd release");
+        let release =
+            configured_overlaybd_release(&config, "aarch64").expect("configured overlaybd release");
 
-        assert_eq!(release.tag_name, "v1.0.18");
+        assert_eq!(release.tag_name, "v1.0.18-aenv.1");
         assert_eq!(
             release.package_url,
-            "https://example.invalid/v1.0.18/overlaybd-foo.ubuntu1.24.04.x86_64.deb"
+            "https://example.invalid/static-v1.0.18-aenv.1/overlaybd-tools-v1.0.18-aenv.1-linux-aarch64.tar.gz"
         );
     }
 
     #[test]
-    fn configured_overlaybd_release_falls_back_to_ubuntu_for_rpm_family_target() {
+    fn configured_overlaybd_release_rejects_unsupported_architecture() {
         let config = OverlaybdDependencyConfig {
-            version: "v1.0.16".to_string(),
+            version: "v1.0.18-aenv.1".to_string(),
             url: None,
-            package_url: Some(
-                "https://example.invalid/{version}/overlaybd-foo.{target}.deb".to_string(),
-            ),
+            package_url: Some("https://example.invalid/{arch}.tar.gz".to_string()),
         };
 
-        for os_id in ["centos", "centos-stream", "tencentos", "rhel"] {
-            let release = configured_overlaybd_release(
-                &config,
-                &OverlaybdReleaseTarget {
-                    os_id: os_id.to_string(),
-                    version_id: "4.4".to_string(),
-                    arch: "x86_64".to_string(),
-                },
-            )
-            .unwrap_or_else(|_| panic!("configured overlaybd release for {os_id}"));
-
-            assert_eq!(
-                release.package_url,
-                "https://example.invalid/v1.0.16/overlaybd-foo.ubuntu1.22.04.x86_64.deb"
-            );
-        }
+        let err = configured_overlaybd_release(&config, "riscv64")
+            .expect_err("unsupported architecture should fail");
+        assert!(err
+            .to_string()
+            .contains("unsupported overlaybd release architecture"));
     }
 
     #[test]
-    fn configured_overlaybd_release_rejects_unsupported_target() {
-        let config = OverlaybdDependencyConfig {
-            version: "v1.0.18".to_string(),
-            url: None,
-            package_url: Some(
-                "https://example.invalid/{version}/overlaybd-foo.{target}".to_string(),
-            ),
-        };
+    fn extracts_static_overlaybd_tarball_layout() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("destination");
+        std::fs::create_dir_all(source.join("bin")).expect("create source bin");
+        std::fs::write(source.join("bin/overlaybd-create"), b"tool").expect("write tool");
+        let package = temp.path().join("overlaybd-tools.tar.gz");
+        let file = std::fs::File::create(&package).expect("create package");
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+        archive.append_dir_all(".", &source).expect("build package");
+        archive
+            .into_inner()
+            .expect("finish tar")
+            .finish()
+            .expect("finish gzip");
 
-        let err = configured_overlaybd_release(
-            &config,
-            &OverlaybdReleaseTarget {
-                os_id: "debian".to_string(),
-                version_id: "12".to_string(),
-                arch: "x86_64".to_string(),
-            },
-        )
-        .expect_err("unsupported target should fail");
-        assert!(err
-            .to_string()
-            .contains("unsupported overlaybd release target"));
+        extract_overlaybd_package(&package, &destination).expect("extract package");
+        assert_eq!(
+            std::fs::read(destination.join("bin/overlaybd-create")).expect("read tool"),
+            b"tool"
+        );
+    }
+
+    #[test]
+    fn installs_static_tools_without_lib_and_removes_legacy_lib() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let extracted = temp.path().join("extracted");
+        let overlaybd_dir = temp.path().join("installed");
+        std::fs::create_dir_all(extracted.join("bin")).expect("create extracted bin");
+        for tool in OVERLAYBD_TOOL_NAMES {
+            std::fs::write(extracted.join("bin").join(tool), b"static tool")
+                .expect("write static tool");
+        }
+        std::fs::create_dir_all(overlaybd_dir.join("lib")).expect("create legacy lib");
+        std::fs::write(overlaybd_dir.join("lib/liblegacy.so"), b"legacy")
+            .expect("write legacy library");
+
+        install_overlaybd_release_tools(&extracted, &overlaybd_dir)
+            .expect("install static overlaybd tools");
+
+        assert!(!overlaybd_dir.join("lib").exists());
+        for tool in OVERLAYBD_TOOL_NAMES {
+            assert!(overlaybd_dir.join("bin").join(tool).is_file());
+        }
     }
 
     #[test]

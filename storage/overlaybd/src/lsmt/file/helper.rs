@@ -9,7 +9,7 @@ use std::io::{self, ErrorKind};
 use std::mem::size_of;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
@@ -472,50 +472,165 @@ pub(super) fn decode_premerged_index_artifact(
     )))
 }
 
+/// Growth in artifact bytes that amortizes one full-dir prune scan.
+const PREMERGED_INDEX_PRUNE_SCAN_FRACTION: u64 = 8;
+
+/// Per-cache-dir growth accounting and scan serialization.
+pub(super) struct PremergedIndexPruneState {
+    account: StdMutex<PremergedIndexScanAccount>,
+}
+
+struct PremergedIndexScanAccount {
+    bytes_since_scan: u64,
+    scan_in_progress: bool,
+    initial_scan_done: bool,
+}
+
+pub(super) async fn premerged_index_prune_state(cache_dir: &Path) -> Arc<PremergedIndexPruneState> {
+    static STATES: OnceLock<Mutex<HashMap<PathBuf, Arc<PremergedIndexPruneState>>>> =
+        OnceLock::new();
+    STATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .await
+        .entry(cache_dir.to_path_buf())
+        .or_insert_with(|| {
+            Arc::new(PremergedIndexPruneState {
+                account: StdMutex::new(PremergedIndexScanAccount {
+                    bytes_since_scan: 0,
+                    scan_in_progress: false,
+                    initial_scan_done: false,
+                }),
+            })
+        })
+        .clone()
+}
+
+impl PremergedIndexPruneState {
+    /// Charge `written_bytes` and elect the single caller that runs the next scan.
+    /// The first charge on a fresh state always elects one seed scan, so a
+    /// cache dir already over budget at process start gets validated.
+    pub(super) fn elect_scan(&self, written_bytes: u64, max_dir_bytes: u64) -> bool {
+        let threshold = (max_dir_bytes / PREMERGED_INDEX_PRUNE_SCAN_FRACTION).max(1);
+        let mut account = self.account.lock().unwrap_or_else(|err| err.into_inner());
+        account.bytes_since_scan = account.bytes_since_scan.saturating_add(written_bytes);
+        if account.scan_in_progress {
+            return false;
+        }
+        let elected = !account.initial_scan_done || account.bytes_since_scan >= threshold;
+        if elected {
+            account.initial_scan_done = true;
+            account.bytes_since_scan = 0;
+            account.scan_in_progress = true;
+        }
+        elected
+    }
+
+    /// End the scan; returns true when growth charged while it ran crosses
+    /// the trigger and a follow-up scan should run.
+    pub(super) fn scan_finished(&self, max_dir_bytes: u64) -> bool {
+        let threshold = (max_dir_bytes / PREMERGED_INDEX_PRUNE_SCAN_FRACTION).max(1);
+        let mut account = self.account.lock().unwrap_or_else(|err| err.into_inner());
+        account.scan_in_progress = false;
+        if account.bytes_since_scan >= threshold {
+            account.bytes_since_scan = 0;
+            account.scan_in_progress = true;
+            return true;
+        }
+        false
+    }
+
+    /// Release a failed scan; concurrent charges are kept so the next write
+    /// re-elects.
+    pub(super) fn scan_aborted(&self) {
+        let mut account = self.account.lock().unwrap_or_else(|err| err.into_inner());
+        account.scan_in_progress = false;
+    }
+}
+
+/// One blocking task for the whole scan: async `tokio::fs` would cost a
+/// blocking-pool round-trip per directory entry.
 async fn prune_premerged_index_dir(dir: &Path, max_dir_bytes: u64) -> Result<()> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || prune_premerged_index_dir_blocking(&dir, max_dir_bytes))
+        .await
+        .context("join premerged index cache prune task")?
+}
+
+struct PremergedArtifactEntry {
+    path: PathBuf,
+    len: u64,
+    modified: SystemTime,
+}
+
+/// Delete oldest premerged index artifacts until `dir` fits `max_dir_bytes`.
+fn prune_premerged_index_dir_blocking(dir: &Path, max_dir_bytes: u64) -> Result<()> {
     let mut entries = Vec::new();
     let mut total = 0u64;
-    let mut reader = tokio::fs::read_dir(dir).await?;
-
-    while let Some(entry) = reader.next_entry().await? {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("read premerged index cache dir {}", dir.display()))?
+    {
+        let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|v| v.to_str()) != Some(PREMERGED_INDEX_EXT) {
             continue;
         }
-        let metadata = entry.metadata().await?;
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            // Entries deleted concurrently with the scan only shrink it.
+            Err(err) if err.kind() == ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("stat {}", path.display()));
+            }
+        };
         if !metadata.is_file() {
             continue;
         }
         let len = metadata.len();
         let modified = metadata.modified().unwrap_or(UNIX_EPOCH);
         total = total.saturating_add(len);
-        entries.push((path, len, modified));
+        entries.push(PremergedArtifactEntry {
+            path,
+            len,
+            modified,
+        });
     }
 
     if total <= max_dir_bytes {
         return Ok(());
     }
 
-    entries.sort_by_key(|(_, _, modified): &(PathBuf, u64, SystemTime)| *modified);
-    for (path, len, _) in entries {
+    entries.sort_by_key(|entry| entry.modified);
+    for entry in entries {
         if total <= max_dir_bytes {
             break;
         }
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => total = total.saturating_sub(len),
+        match std::fs::remove_file(&entry.path) {
+            Ok(()) => total = total.saturating_sub(entry.len),
+            // Already removed by someone else since the scan: those bytes
+            // left the dir too, so count them as freed.
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                total = total.saturating_sub(entry.len);
+            }
             Err(err) => {
-                tracing::warn!(?err, path = %path.display(), "remove premerged index artifact failed")
+                tracing::warn!(
+                    ?err,
+                    path = %entry.path.display(),
+                    "remove premerged index artifact failed"
+                )
             }
         }
     }
     Ok(())
 }
 
+/// Write the artifact atomically (tmp file + rename) and return its size in
+/// bytes so callers can account cache growth.
 async fn write_premerged_index_artifact(
     cache_dir: &Path,
     key: &PremergedIndexCacheKey,
     index: &ReadOnlyIndex,
-) -> Result<()> {
+) -> Result<u64> {
     let dir = cache_dir.join(PREMERGED_INDEX_DIR);
     tokio::fs::create_dir_all(&dir)
         .await
@@ -550,7 +665,7 @@ async fn write_premerged_index_artifact(
         });
     }
 
-    Ok(())
+    Ok(artifact.len() as u64)
 }
 
 pub(super) async fn try_read_premerged_index_artifact(
@@ -582,6 +697,34 @@ pub(super) async fn try_read_premerged_index_artifact(
     }
 }
 
+/// Charge `written` artifact bytes for `cache_dir` and run prune scans
+/// while the growth trigger keeps electing.
+async fn prune_premerged_index_cache(cache_dir: &Path, written: u64, max_dir_bytes: u64) {
+    let state = premerged_index_prune_state(cache_dir).await;
+    if !state.elect_scan(written, max_dir_bytes) {
+        return;
+    }
+    let dir = cache_dir.join(PREMERGED_INDEX_DIR);
+    loop {
+        match prune_premerged_index_dir(&dir, max_dir_bytes).await {
+            Ok(()) => {
+                if !state.scan_finished(max_dir_bytes) {
+                    return;
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    path = %dir.display(),
+                    "prune premerged index cache dir failed"
+                );
+                state.scan_aborted();
+                return;
+            }
+        }
+    }
+}
+
 pub(super) fn spawn_premerged_index_artifact_write(
     cache_dir: PathBuf,
     key: PremergedIndexCacheKey,
@@ -599,18 +742,15 @@ pub(super) fn spawn_premerged_index_artifact_write(
                 "write premerged index artifact failed"
             );
         }
-        let key_digest = key.digest_hex.clone();
+        // Release the merged index and the digest lock before the prune tail:
+        // the index can be hundreds of MB and the prune scan may pin it for
+        // the whole scan, while the held lock would block the next writer for
+        // the same digest.
+        drop(merged);
         drop(guard);
-        release_premerged_index_lock(&key_digest, &lock).await;
-        if write_result.is_ok() {
-            let dir = cache_dir.join(PREMERGED_INDEX_DIR);
-            if let Err(err) = prune_premerged_index_dir(&dir, max_dir_bytes).await {
-                tracing::warn!(
-                    ?err,
-                    path = %dir.display(),
-                    "prune premerged index cache dir failed"
-                );
-            }
+        release_premerged_index_lock(&key.digest_hex, &lock).await;
+        if let Ok(written) = write_result {
+            prune_premerged_index_cache(&cache_dir, written, max_dir_bytes).await;
         }
     });
 }
@@ -679,6 +819,7 @@ pub(crate) fn initialize_file_rw_paths(
     virtual_size: u64,
     rw_layout: RwLayout,
 ) -> Result<()> {
+    let rw_layout = rw_layout.ensure_supported()?;
     let uuid = Uuid::new_v4();
     let header = rw_header(virtual_size, rw_layout, uuid, None, None);
     let data_file = open_truncated_rw_file(data_path)?;
@@ -718,6 +859,35 @@ pub(crate) fn initialize_file_rw_paths(
 ///   the logic offset in the SegmentMapping. For example, if start_offset is 4K, then the
 ///   logic offset in the returned SegmentMapping will minus 4K from physical offset from the
 ///   file.
+///
+/// # The caller decides what "this range is data" is allowed to mean
+///
+/// The extent map is accurate about what it actually claims: which ranges are
+/// *allocated*. The trap is that allocated is not the same as written. APFS
+/// speculatively allocates around scattered writes — a gap smaller than roughly
+/// 16-20 MiB between two written blocks gets allocated whole, see
+/// [`crate::sys::sparse_extents_are_reliable`] — so a range can be reported as
+/// data without anyone ever having written it.
+///
+/// This function therefore reports allocation and leaves the interpretation to
+/// the caller, because the two callers need different things from it:
+///
+/// - Recovering a Sparse upper's index (`LSMTFile::open`) needs **written**, and
+///   reading allocation as written is **catastrophic**: a speculatively
+///   allocated block gets claimed as owned by the upper, the upper holds a hole
+///   there, so the read returns zeros and masks every lower layer. That caller
+///   gates on [`crate::sys::sparse_extents_are_reliable`].
+/// - Packaging a raw image into a sealed layer
+///   ([`crate::tools::package_raw_as_overlaybd`]) only needs **allocated**, and
+///   is happy to copy more than necessary: every reported range is read out of
+///   the source, where an unwritten block reads as zeros, then written to the
+///   output and indexed as ordinary data. The result is byte-for-byte correct
+///   and merely larger. That caller deliberately does not gate — refusing would
+///   leave a fully dense copy as the only option.
+///
+/// The reverse error — written data reported as a hole — would be silent data
+/// loss for both callers, but that would be a filesystem bug rather than a
+/// documented allocation heuristic.
 pub async fn create_mappings_from_sparse(
     file: &Arc<dyn VirtualFile>,
     start_offset: u64,
@@ -753,6 +923,20 @@ pub async fn create_mappings_from_sparse(
             cursor = end.max(start_offset);
             continue;
         }
+
+        // The block arithmetic below truncates, and `end` is clamped to the file
+        // size, so an extent boundary that is not a multiple of ALIGNMENT would
+        // silently drop the trailing partial block: it would read back as zeros
+        // with no error raised anywhere. Both platforms report extent boundaries
+        // at filesystem-block granularity, so in practice this only fires on a
+        // source whose *size* is not a multiple of ALIGNMENT — which is worth
+        // rejecting loudly rather than truncating.
+        ensure!(
+            begin.is_multiple_of(ALIGNMENT) && end.is_multiple_of(ALIGNMENT),
+            "unaligned data extent [{begin}, {end}) reported for a file scanned by \
+             create_mappings_from_sparse: extent boundaries must be multiples of \
+             {ALIGNMENT} bytes"
+        );
 
         let mut logical = (begin - start_offset) / ALIGNMENT;
         let mut physical = begin / ALIGNMENT;
@@ -983,7 +1167,7 @@ struct CompactChunkEntry {
 
 /// A group of source reads whose data collectively fills one
 /// [`CompactWriter`] buffer. Produced by the chunking phase in
-/// [`compact_to`] and consumed by [`compact_copy_chunk`].
+/// [`compact_to`] and consumed by [`compact_read_chunk`].
 #[derive(Clone)]
 struct CompactChunk {
     /// Ordered read operations. Each fills a portion of the buffer.
@@ -997,18 +1181,23 @@ struct CompactChunk {
     order: usize,
 }
 
-/// Read all entries in `chunk` into a single writer-provided buffer and
-/// write it to the destination in one call.
-///
-/// Returns the output index entries for this chunk.
-async fn compact_copy_chunk(
+struct PreparedCompactChunk {
+    order: usize,
+    destination_offset: u64,
+    len: usize,
+    buffer: Box<dyn storage_util::CompactBuffer>,
+    index: Vec<SegmentMapping>,
+}
+
+/// Read all entries in `chunk` into a single writer-provided buffer.
+async fn compact_read_chunk(
     src_layers: &[Arc<dyn VirtualFile>],
     writer: &dyn CompactWriter,
-    chunk: &CompactChunk,
-) -> Result<Vec<SegmentMapping>> {
-    let mut buf = writer.alloc_buffer().await?;
-    let buf_slice = buf.as_mut().as_mut();
-    let mut buf_offset = 0usize;
+    chunk: CompactChunk,
+) -> Result<PreparedCompactChunk> {
+    let mut buffer = writer.alloc_buffer().await?;
+    let buffer_slice = buffer.as_mut().as_mut();
+    let mut buffer_offset = 0usize;
     let mut index = Vec::with_capacity(chunk.entries.len());
 
     for entry in &chunk.entries {
@@ -1018,7 +1207,7 @@ async fn compact_copy_chunk(
         let got = src_layers[layer_idx]
             .read_at_into(
                 entry.src_offset,
-                &mut buf_slice[buf_offset..buf_offset + entry.len],
+                &mut buffer_slice[buffer_offset..buffer_offset + entry.len],
             )
             .await?;
         ensure!(
@@ -1031,7 +1220,7 @@ async fn compact_copy_chunk(
         );
 
         let block_len = (entry.len / ALIGNMENT_USIZE) as u32;
-        let dest_phys = chunk.dest_moffset + (buf_offset / ALIGNMENT_USIZE) as u64;
+        let dest_phys = chunk.dest_moffset + (buffer_offset / ALIGNMENT_USIZE) as u64;
         index.push(SegmentMapping::new(
             entry.logical_offset,
             block_len,
@@ -1040,14 +1229,35 @@ async fn compact_copy_chunk(
             entry.tag,
         ));
 
-        buf_offset += entry.len;
+        buffer_offset += entry.len;
     }
 
-    writer
-        .write(buf, chunk.dest_moffset * ALIGNMENT, chunk.total_len)
-        .await?;
+    Ok(PreparedCompactChunk {
+        order: chunk.order,
+        destination_offset: chunk.dest_moffset * ALIGNMENT,
+        len: chunk.total_len,
+        buffer,
+        index,
+    })
+}
 
-    Ok(index)
+async fn compact_write_chunk(
+    writer: &dyn CompactWriter,
+    prepared: PreparedCompactChunk,
+) -> Result<(usize, Vec<SegmentMapping>)> {
+    writer
+        .write(prepared.buffer, prepared.destination_offset, prepared.len)
+        .await?;
+    Ok((prepared.order, prepared.index))
+}
+
+async fn compact_copy_chunk(
+    src_layers: &[Arc<dyn VirtualFile>],
+    writer: &dyn CompactWriter,
+    chunk: CompactChunk,
+) -> Result<(usize, Vec<SegmentMapping>)> {
+    let prepared = compact_read_chunk(src_layers, writer, chunk).await?;
+    compact_write_chunk(writer, prepared).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,8 +1394,10 @@ async fn compact_copy_mapping_with_zero_detection(
 ///
 /// # Returns
 ///
-/// `Ok(())` once the header and all compacted data blocks have been flushed to
-/// the destination. Returns an error on any read or write failure.
+/// `Ok(())` once the complete logical format, including the trailer, has been
+/// written and the destination writer has been finalized. Finalization does not
+/// imply that the output has been synced to stable storage. Returns an error on
+/// any read, write, or finalization failure.
 pub async fn compact_to(
     src_layers: &[Arc<dyn VirtualFile>],
     mappings: &[SegmentMapping],
@@ -1247,7 +1459,7 @@ pub async fn compact_to(
         // directly in `compact_index` and skipped during chunking.
         let buf_size = writer.buffer_size();
         ensure!(
-            buf_size.is_multiple_of(ALIGNMENT_USIZE),
+            buf_size >= ALIGNMENT_USIZE && buf_size.is_multiple_of(ALIGNMENT_USIZE),
             "CompactWriter buffer size {buf_size} not aligned"
         );
         let mut chunks: Vec<CompactChunk> = Vec::new();
@@ -1281,7 +1493,9 @@ pub async fn compact_to(
                 });
 
                 let space = buf_size - chunk.total_len;
-                let take = remaining.min(space);
+                let take = remaining
+                    .min(space)
+                    .min(Segment::MAX_LENGTH as usize * ALIGNMENT_USIZE);
 
                 chunk.entries.push(CompactChunkEntry {
                     tag: m.tag,
@@ -1309,23 +1523,33 @@ pub async fn compact_to(
 
         // Phase 2: Copy data blocks, potentially in parallel.
         if concurrency == 1 {
-            for chunk in &chunks {
-                let entries = compact_copy_chunk(src_layers, writer.as_ref(), chunk).await?;
+            for chunk in chunks {
+                let (_, entries) = compact_copy_chunk(src_layers, writer.as_ref(), chunk).await?;
+                compact_index.extend(entries);
+            }
+        } else if writer.requires_ordered_writes() {
+            let src_layers: Arc<[Arc<dyn VirtualFile>]> = Arc::from(src_layers.to_vec());
+            let mut prepared = stream::iter(chunks)
+                .map(|chunk| {
+                    let layers = src_layers.clone();
+                    let writer = writer.clone();
+                    async move { compact_read_chunk(&layers, writer.as_ref(), chunk).await }
+                })
+                .buffered(concurrency);
+
+            while let Some(chunk) = prepared.next().await {
+                let (_, entries) = compact_write_chunk(writer.as_ref(), chunk?).await?;
                 compact_index.extend(entries);
             }
         } else {
-            let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+            // `buffer_unordered` already caps in-flight chunk copies at
+            // `concurrency`, so no extra semaphore is needed here.
             let src_layers: Arc<[Arc<dyn VirtualFile>]> = Arc::from(src_layers.to_vec());
             let mut results: Vec<(usize, Vec<SegmentMapping>)> = stream::iter(chunks)
                 .map(|chunk| {
-                    let sem = semaphore.clone();
                     let writer = writer.clone();
                     let layers = src_layers.clone();
-                    async move {
-                        let _permit = sem.acquire().await.context("semaphore closed")?;
-                        let entries = compact_copy_chunk(&layers, writer.as_ref(), &chunk).await?;
-                        Ok::<_, anyhow::Error>((chunk.order, entries))
-                    }
+                    async move { compact_copy_chunk(&layers, writer.as_ref(), chunk).await }
                 })
                 .buffer_unordered(concurrency)
                 .collect::<Vec<_>>()
@@ -1340,6 +1564,10 @@ pub async fn compact_to(
     }
 
     // Phase 3: Write the index and trailer.
+    // Zeroed mappings were pushed in phase 1 while data entries arrive in
+    // phase 2; restore logical-offset order before compressing so that
+    // partition_point lookups in ReadOnlyIndex see a sorted index.
+    compact_index.sort_unstable();
     compress_raw_index(&mut compact_index);
 
     let index_offset = dest_moffset * ALIGNMENT;
@@ -1380,6 +1608,7 @@ pub async fn compact_to(
     let trailer_bytes_enc = trailer.as_bytes();
     trailer_buf[..trailer_bytes_enc.len()].copy_from_slice(trailer_bytes_enc);
     writer.write_all_at(&trailer_buf, trailer_offset).await?;
+    writer.finalize().await?;
 
     Ok(())
 }

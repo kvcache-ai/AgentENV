@@ -100,8 +100,8 @@ This document describes the public sandbox API, the global `ConfigManager` under
         then waits for guest-level envd readiness.
     - `pause().await`
       - Sends `PATCH /vm` to pause the VM.
-      - Creates snapshot artifacts including `vm_state.bin`, `mem.bin`, the
-        packaged memory image config, and rootfs snapshot state.
+      - Creates snapshot artifacts including `vm_state.bin`, `mem_image.json`,
+        `mem_overlaybd/overlaybd.commit`, and rootfs snapshot state.
       - Returns a `FirecrackerSnapshotConfig` that owns the tempdir holding these files.
     - `resume().await`
       - Resumes a paused VM in-place by sending `PATCH /vm` with `Resumed`.
@@ -167,7 +167,8 @@ resumed_sandbox.stop().await?;
 ### Runtime prerequisites
 
 - Linux host
-- `/dev/kvm` accessible by current user
+- `/dev/kvm` accessible by the current user, with the host modules matching
+  `virtualization_mode` (KVM by default; PVM requires x86_64 and `kvm_pvm`)
 - `debugfs` (e2fsprogs) if you use init injection or disk-inspection helpers
 
 ## 2) Global Config Manager (`src/cfg.rs`)
@@ -292,15 +293,12 @@ enabled = false
   - `snapshot_store`: Committed snapshot store root. Defaults to `$AENV_HOME/snapshot-store`.
 
 - `[ublk]`
-  - `enabled`: Enables ublk-backed rootfs handling.
   - `daemon_binary_path`: Optional path to `uvm-ublk-daemon`.
   - `daemon_socket_path`: Optional unix socket path for daemon RPCs.
   - `daemon_log_path`: Optional log file path for the daemon process.
-  - `device_type`: `cow` or `overlaybd`.
-
 - `[ublk.overlaybd]`
   - `global_config_path`: path to the generated overlaybd runtime config.
-    Required for `overlaybd` device_type. Per-image configs are derived from
+    Required for ublk. Per-image configs are derived from
     template build `fromImage` values and live under
     `<image.cache.root_dir>/configs`.
 
@@ -407,7 +405,8 @@ resumed_sandbox.stop().await?;
 - `microvm_pause_transitions_to_paused`
   Validates pause + snapshot creation by:
   - Pausing a running VM via FC API.
-  - Creating `vm_state.bin` and `mem.bin`.
+  - Creating `vm_state.bin`, `mem_image.json`, and
+    `mem_overlaybd/overlaybd.commit`.
   - Ensuring those files exist on disk.
 
 - `microvm_resume_from_pause_transitions_to_running`
@@ -516,7 +515,8 @@ resumed_sandbox.stop().await?;
    performs validation only and never invokes `sudo`.
 3. Host setup installs a udev rule for `/dev/ublk-control`, `/dev/ublkc*`, and `/dev/ublkb*`, so the runtime group can access the control and dynamic device nodes.
 4. Update `config/default.toml` paths, or point `AENV_CONFIG_PATH` to a custom config file.
-5. Ensure `/dev/kvm` is accessible by the runtime user.
+5. Ensure `/dev/kvm` is accessible by the runtime user and the configured
+   virtualization mode matches the host modules.
 6. If you run template tests, ensure the host can run `regctl` (server setup installs it automatically from the `[regclient]` manifest entry) and access the registry for template `fromImage` resolution.
 7. Run `scripts/tests/e2e/run_e2e.sh` for API-level E2E coverage. The runner exports `E2E_TEMPLATE_USER_IMAGE`. Suite `05_template_lifecycle.sh` also creates a template build with `E2E_SHORT_USER_IMAGE` to verify short-name image resolution.
 8. Run `make test-agent-integration` to run the `agentenv` integration test modules in `tests/integration/` as a non-root user with the required capabilities, plus the Docker/MinIO-backed OSS snapshot repository test (`crates/e2e-tests/tests/snapshot_oss_e2e_test.rs`).

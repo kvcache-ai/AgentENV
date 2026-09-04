@@ -21,7 +21,8 @@ while (($#)); do
     shift
 done
 
-if [[ "$action" != install && "$action" != uninstall ]] || [[ -z "$prefix" || -z "$binary" ]]; then
+if [[ "$action" != install && "$action" != uninstall ]] || [[ -z "$prefix" ]] ||
+   [[ "$action" == install && -z "$binary" ]]; then
     usage
     exit 2
 fi
@@ -65,19 +66,19 @@ else
     fish_path="$prefix/share/fish/vendor_completions.d/aenv.fish"
 fi
 
-if [[ "$binary" == *"'"* || "$binary" == *$'\n'* || "$binary" == *$'\r'* ]]; then
-    printf 'warning: completion binary path contains unsupported characters; skipping\n' >&2
-    exit 0
-fi
-quoted_binary="'$binary'"
-
-write_loader() {
-    local path="$1" body="$2" dir tmp
+write_loader() (
+    local path="$1" body="$2" dir tmp lock_dir
     dir="${path%/*}"
     mkdir -p "$dir" 2>/dev/null || {
         printf 'warning: could not create completion directory %s\n' "$dir" >&2
         return 0
     }
+    lock_dir="$dir/.aenv-completion.lock"
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        printf 'warning: completion directory is busy; skipping %s\n' "$path" >&2
+        return 0
+    fi
+    trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
     if [[ -L "$path" ]]; then
         printf 'warning: refusing to replace symlink %s\n' "$path" >&2
         return 0
@@ -103,11 +104,19 @@ write_loader() {
             return 0
         fi
     fi
+    # Re-check immediately before replacement. The first check protects normal
+    # races between installers; this check protects a user file created while
+    # the temporary content was being generated.
+    if [[ -e "$path" ]] && ! grep -Fqx "$MARKER" "$path" 2>/dev/null; then
+        rm -f "$tmp"
+        printf 'warning: leaving newly-created unmanaged completion file %s untouched\n' "$path" >&2
+        return 0
+    fi
     if ! { chmod 0644 "$tmp" && mv -f "$tmp" "$path"; }; then
         rm -f "$tmp"
         printf 'warning: could not install completion file %s\n' "$path" >&2
     fi
-}
+)
 
 remove_loader() {
     local path="$1"
@@ -120,6 +129,20 @@ remove_loader() {
 }
 
 if [[ "$action" == install ]]; then
+    case "$binary" in
+        *"'"*|*"\\"*|*$'\n'*|*$'\r'*)
+            printf 'warning: completion binary path contains unsupported characters; skipping\n' >&2
+            exit 0
+            ;;
+    esac
+    [[ -x "$binary" ]] || {
+        printf 'warning: completion binary is not executable: %s\n' "$binary" >&2
+        exit 0
+    }
+    binary_dir="${binary%/*}"
+    [[ "$binary_dir" == "$binary" ]] && binary_dir="."
+    binary="$(cd "$binary_dir" && pwd -P)/${binary##*/}"
+    quoted_binary="'$binary'"
     write_loader "$bash_path" "if [[ -x $quoted_binary ]]; then source <($quoted_binary completion bash); fi"
     zsh_body="#compdef aenv
 if [[ -x $quoted_binary ]]; then eval \"\$($quoted_binary completion zsh)\"; fi"

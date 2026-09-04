@@ -15,6 +15,10 @@ cargo run --bin server -- --config /path/to/config.toml
 | `home_path` | string | `"/var/lib/aenv"` | Base directory for local AgentENV state. Overridden by `AENV_HOME_PATH` |
 | `runtime_path` | string | `"/run/aenv"` | Base directory for transient namespace and daemon-socket state. Overridden by `AENV_RUNTIME_PATH` |
 | `deps_path` | string | `"$AENV_HOME/deps"` | Root directory for auto-downloaded runtime assets. Overridden by `AENV_DEPS_PATH` |
+| `virtualization_mode` | `"kvm"` or `"pvm"` | `"kvm"` | Virtualization mode for this node. Keep the default unless following the [PVM Deployment](../deployment/pvm.md) guide. Overridden by `AENV_VIRTUALIZATION_MODE` |
+
+Snapshots and paused sandboxes can only be restored in the mode in which they
+were created.
 
 `$AENV_HOME` is a literal placeholder in state-path values, not a shell
 environment variable. AgentENV replaces it with the resolved `home_path` after
@@ -24,8 +28,9 @@ placeholders are resolved against the directory containing the configuration
 file.
 
 Packaged runtime dependency versions and download URLs live in
-`config/deps_manifest.toml`. `config.toml` should contain runtime behavior
-and explicit local path overrides, not the default dependency catalog.
+`config/deps_manifest.toml`. Only the dependencies for the selected mode are
+installed. User configuration should contain runtime behavior and explicit
+local path overrides, not the default dependency catalog.
 
 ## `[firecracker]`
 
@@ -170,7 +175,7 @@ Overlaybd registryfs_v2 remote block cache settings. The directory is always
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `max_size_gb` | integer | `10` | Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd `cacheConfig.cacheSizeGB` |
+| `max_size_gb` | integer | `100` | Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd `cacheConfig.cacheSizeGB` |
 
 Resolved image data is cached under:
 
@@ -246,6 +251,25 @@ In-guest `envd` daemon settings.
 | `init_timeout_secs` | integer | `60` | Max seconds to wait for envd to become ready after VM start |
 | `poll_ms` | integer | `3` | Poll interval (ms) for envd health check retries |
 
+## `[sandbox]`
+
+Sandbox control communication settings.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `access_token_hash_seed` | string | auto-generated | Optional override for the secret used to derive sandbox envd and traffic access tokens. When unset, normal server startup creates and reuses `$AENV_HOME/secrets/sandbox-access-token-hash-seed`. Configure an explicit shared value for clustered deployments. |
+
+The managed seed is node-local persistent state and must be included in backups of `$AENV_HOME`. AgentENV refuses to generate a replacement when persisted secure or private-ingress sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates existing sandbox access tokens.
+
+Configure `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` with the same value on every runtime node in a clustered deployment. Standalone runtime nodes use their managed seed when it is unset.
+
+## `[volume]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_size_mb` | integer | `262144` | Maximum persistent volume size in MiB (256 GiB). |
+| `max_volume_count` | integer | `4` | Maximum number of persistent volumes that one sandbox may mount. Must be between 1 and the Firecracker extra-drive limit. |
+
 ## `[orchestrator]`
 
 Sandbox lifecycle management.
@@ -272,7 +296,7 @@ Component sections:
 |---------|-----|------|---------|-------------|
 | `[pool.network]` | `maintenance_enabled` | boolean | `true` | Enable the background network-slot maintenance worker |
 | `[pool.block]` | `enabled` | boolean | `true` | Enable the ublk overlaybd warm-device pool |
-| `[pool.block]` | `startup_prewarm` | boolean | `true` | Prewarm block devices after the first reusable image shape is known |
+| `[pool.block]` | `startup_prewarm` | boolean | capability-based | Prewarm block devices after the first reusable image shape is known. When omitted, it is enabled only if the kernel supports `UBLK_F_UPDATE_SIZE`; an explicit value overrides detection |
 | `[pool.firecracker]` | `enabled` | boolean | `true` | Enable pre-spawned Firecracker processes for snapshot resume |
 | `[pool.firecracker]` | `maintenance_enabled` | boolean | `true` | Enable the background Firecracker process maintenance worker |
 | `[pool.firecracker]` | `startup_prewarm` | boolean | `true` | Spawn warm Firecracker entries up to the low watermark during server startup |
@@ -331,7 +355,12 @@ Shared cluster-level service endpoints.
 
 ## `[p2p]`
 
-Project-wide artifact transport configuration. The transport is disabled by default. When enabled, it is used by the overlaybd P2P HTTP facade and by snapshot publication/runtime resolution as an optional artifact visibility and acceleration path.
+> **Experimental:** P2P has not been tested in production. Keep it disabled in
+> production unless the deployment accepts that operational risk.
+
+Project-wide artifact transport configuration. The transport is disabled by
+default. When enabled, it is used by the overlaybd P2P HTTP facade and by
+snapshot publication/runtime resolution as an optional acceleration path.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -400,6 +429,7 @@ OSS-backed snapshot repository configuration. This section is required when `sna
 | `access_key_secret` | string | unset | Static OSS access key secret. Required when `credential_process` is not set |
 | `security_token` | string | unset | Optional session token paired with static access key credentials |
 | `region` | string | none | Region passed to the S3-compatible object-store client; required for current OSS backend |
+| `addressing_style` | string | auto-detect | Bucket addressing style, `"virtual"` or `"path"`. When unset, the backend auto-detects: Alibaba OSS and bucket-in-endpoint hosts use virtual-host style, other endpoints default to path style. Set either value when a provider's required or preferred style differs from the detected default |
 | `cache_max_size_gb` | integer | `10` | Maximum size of the node-local OSS artifact cache in GiB |
 
 Notes:
@@ -407,6 +437,18 @@ Notes:
 - `credential_process` and static access key settings are mutually exclusive in practice; when `credential_process` is set, the backend ignores static credential fields.
 - `credential_process` should be written as a portable argv-style command line. Avoid `$VAR`, backticks, `$(...)`, pipes, and shell builtins.
 - Although the config section is still named `oss`, the runtime path is implemented via a shared S3-compatible client, so `region` must be configured.
+- Leave `addressing_style` unset when endpoint-based detection is correct. Set it to `"virtual"` or `"path"` when the provider's required or preferred style differs from the detected default; for example, some Tigris or Cloudflare R2 deployments use virtual-host addressing.
+- The setting covers both halves of the data path: the snapshot repository client (metadata and artifact upload/download) and the generated OverlayBD runtime config (`ossConfig.defaultAddressingStyle`), which the runtime uses when reading remote managed snapshot layers during sandbox restore.
+
+For an S3-compatible provider where virtual-host addressing is required or preferred — for example [Tigris](https://www.tigrisdata.com/docs/) — set `addressing_style` explicitly:
+
+```toml
+[backend.oss]
+endpoint = "https://t3.storage.dev"
+bucket = "agentenv-snapshots"
+region = "auto"
+addressing_style = "virtual"
+```
 
 Other path override:
 
@@ -429,16 +471,14 @@ Protobuf compiler metadata for code generation lives in
 
 ## `[ublk]`
 
-Optional userspace block device configuration. When enabled, rootfs is served through a ublk device instead of a plain file, managed by `uvm-ublk-daemon`.
+Userspace block device configuration. Rootfs is served through an OverlayBD-backed ublk device managed by `uvm-ublk-daemon`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `enabled` | boolean | `true` | Enable ublk-backed rootfs |
 | `daemon_binary_path` | string | `"$AENV_HOME/ublk/uvm-ublk-daemon"` | Path to the `uvm-ublk-daemon` binary |
 | `daemon_socket_path` | string | `"$AENV_RUNTIME/ublk-daemon.sock"` | Unix socket path used by the daemon |
 | `daemon_log_path` | string | `"$AENV_HOME/logs/ublk-daemon.log"` | File path for daemon logs; deployments are responsible for rotation and retention |
 | `daemon_metrics_listen_addr` | string | `"0.0.0.0:9103"` | HTTP listen address for daemon Prometheus metrics; empty string disables it |
-| `device_type` | string | `"overlaybd"` | `"cow"` (copy-on-write) or `"overlaybd"` (layered image) |
 
 Environment variable override:
 
@@ -447,7 +487,7 @@ Environment variable override:
 
 ## `[ublk.overlaybd]`
 
-Overlaybd-specific configuration used when `ublk.device_type = "overlaybd"`.
+OverlayBD configuration for ublk. Legacy `enabled` and `device_type` keys are ignored.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -483,24 +523,38 @@ the default path on every startup.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `overlaybd_global_config_path` | string | `"$AENV_HOME/overlaybd/mem-overlaybd-global.json"` | Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file. |
-| `direct_overlaybd` | bool | `true` | Create memory overlaybd layers directly from Firecracker dirty memory ranges via `process_vm_readv`, skipping the intermediate `mem.bin` file. Set `AGENTENV_MEMORY_SNAPSHOT_DIRECT_OVERLAYBD=false` to force the legacy `mem.bin` conversion path. |
+| `track_dirty_pages` | bool | `true` | Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false` to disable it. |
+| `compression_enabled` | bool | `false` | Enable compression for memory snapshot layers. When disabled, `compression_algorithm` is still parsed but has no effect. This setting affects only memory layers; the physical file name remains `overlaybd.commit`. |
+| `compression_algorithm` | string | `"lz4"` | Compression algorithm for memory snapshot layers. Valid values are only `lz4` and `zstd`. |
 
 ## `[memory_snapshot.background_download]`
 
 Background download settings dedicated to remote memory-snapshot OverlayBD layers.
 They do not change the general rootfs or attached-drive defaults. All fields are
 serialized into the generated memory OverlayBD global config. Each remote layer
-is downloaded block by block: a sequential sparse-file scan collects the pending
-blocks, then at most `concurrency` block tasks fetch non-overlapping ranges in
-parallel on a dedicated multi-thread runtime. Layer files are still processed
-one at a time. Downloads of a sandbox-bound device start only after envd is
-ready (plus `delay`), with a 20s fallback if the ready signal is lost; while
-foreground remote reads are in flight, background block reads yield to a small
-guaranteed floor instead of competing at full speed. The generated memory
+is filled block by block into the node-local remote file cache: the cache-owned
+background-download scheduler registers one task per remote layer (deduplicated
+by blob, shared across sandboxes) and downloads only chunks still missing
+from the entry bitmap — each source request fetches `block_size` bytes
+(aligned to whole cache blocks) and publishes the chunk's cache blocks as
+soon as they land. Submission is never rejected under load — tasks run as
+scheduler capacity allows, with at most `maxConcurrentFiles` layer tasks
+concurrently per file-cache backend (from the generated overlaybd download
+config, default 8)
+and at most `concurrency` chunk reads in parallel per layer, subject to the
+scheduler's `max_inflight_blocks` cap. Downloads of a
+sandbox-bound device start only after envd is ready (plus `delay`), with a 20s
+fallback if the ready signal is lost; while foreground remote reads are in
+flight, background block reads yield to a small guaranteed floor instead of
+competing at full speed. The generated memory
 config leaves throttling off (`maxMBps = 0`); image configs that carry a positive
 `maxMBps` keep their historical shared rate limit across the block tasks.
-Completed layers are switched to the local file only after a full-file digest
-check; a failed or canceled block never switches.
+A completed cache block becomes visible to foreground reads as soon as it is
+committed to the cache bitmap; there is no staging file, no full-file digest
+check, and no switch-to-local, so a failed or canceled block simply stays
+uncached and is fetched on demand by foreground reads or a later retry. The
+cache is a bounded working set: blocks may be evicted under capacity pressure
+and are then re-fetched on demand.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -508,6 +562,20 @@ check; a failed or canceled block never switches.
 | `delay` | integer | `0` | Delay in seconds after envd is ready before background download begins (downloads never start before envd readiness; a 20s fallback applies if the ready signal is lost). |
 | `delay_extra` | integer | `1` | Exclusive upper bound for random extra delay. The default `1` ensures `delay = 0` adds no jitter. |
 | `try_cnt` | integer | `5` | Retry count, with the same semantics as OverlayBD `DownloadConfig.tryCnt`. |
-| `block_size` | integer | `16777216` | Download block size in bytes (16 MiB). Peak scratch memory per active layer download is `block_size * concurrency`. |
+| `block_size` | integer | `16777216` | Background download chunk size in bytes (16 MiB): one source request fetches a chunk of this size, aligned down to whole cache blocks. The cache keeps its own smaller block size for foreground reads, so background downloads keep large-request throughput while foreground keeps fine-grained on-demand reads. Peak scratch per active layer download is `block_size × concurrency`. |
 | `concurrency` | integer | `4` | Maximum number of in-flight block remote reads within a single remote layer. `1` keeps the historical serial behavior. Must be greater than zero. |
-| `max_inflight_blocks` | integer | `16` | Process-wide cap on in-flight download blocks shared by every concurrent layer download; bounds total scratch memory to `max_inflight_blocks * block_size`. Must be greater than zero. |
+| `max_inflight_blocks` | integer | `16` | Cap on concurrently downloading chunks enforced by each file-cache backend's download scheduler, shared by every concurrent layer download on that backend; bounds total scratch memory to `max_inflight_blocks` × the download chunk size (`block_size`). The value is fixed when the backend is created from the global config; a per-image `download` override never resizes the scheduler-owned cap (the first mismatch per scheduler is logged as `max_inflight_blocks_override_ignored`). Must be greater than zero. |
+
+## `[template_build]`
+
+Compression settings applied when a template build captures its snapshot.
+This section is fully independent of `[memory_snapshot].compression_enabled`:
+template builds consult only these keys, for both memory layers and the
+sealed rootfs read-write layer. Pause/snapshot captures of running sandboxes
+are not affected, and rootfs seals stay raw there.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `compression_enabled` | bool | `false` | Enable compression for snapshot artifacts captured by template builds. When enabled, both the memory layers and the sealed rootfs read-write layer are written as ZFile-compressed layers. |
+| `compression_algorithm` | string | `"lz4"` | Compression algorithm. Valid values are only `lz4` and `zstd`. Parsed but ignored when compression is disabled. |
+| `compression_workers` | integer | `1` | Number of blocking threads used to compress 4 KiB blocks within a layer. `1` is sequential; higher values run in parallel without changing the output layout. Clamped to 64. |

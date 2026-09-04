@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
 use std::time::{Duration, SystemTime};
 
+use anyhow::Context;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
@@ -14,12 +15,14 @@ use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
 use crate::sandbox::{
-    CustomExtensionClient, CustomExtensionParams, FirecrackerSandboxFactory, FreshSandboxBuildSpec,
-    PausedSandboxState, RuntimeArtifactSet, SandboxBackend, SandboxBackendFactory,
+    CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerSandboxFactory,
+    FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator,
+    SandboxBackend, SandboxBackendFactory, SandboxCaptureError, SandboxForkSpec,
     SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
+use crate::volume::VolumeManager;
 
 use super::launch_plan::{CreateLaunchSource, LaunchPlan};
 use super::metrics::{
@@ -29,8 +32,8 @@ use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, S
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
 use super::types::{
-    CreateSandboxRequest, SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType,
-    SandboxState, SnapshotCaptureResult,
+    CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource, SandboxLifecycleEvent,
+    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
 };
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
@@ -104,6 +107,8 @@ pub struct Orchestrator<
     shutdown_tx: watch::Sender<bool>,
     shutdown_outcome: OnceCell<ShutdownOutcome>,
     image_refs: Arc<dyn RuntimeImageRefs>,
+    access_tokens: SandboxAccessTokenGenerator,
+    volume_manager: Option<Arc<VolumeManager>>,
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
@@ -127,8 +132,24 @@ where
         let store = InMemoryMetadataStore::new();
         let persister = FileBackedSandboxPersister::new(
             config.orchestrator.persisted_sandbox_store_path.clone(),
+            config.virtualization_mode,
         );
         Self::new(store, factory, persister).await
+    }
+
+    pub async fn with_file_backed_store_factory_and_volumes(
+        factory: F,
+        volume_manager: Arc<VolumeManager>,
+    ) -> Result<Arc<Self>> {
+        let config = ConfigManager::global_config();
+        let store = InMemoryMetadataStore::new();
+        let persister = FileBackedSandboxPersister::new(
+            config.orchestrator.persisted_sandbox_store_path.clone(),
+            config.virtualization_mode,
+        );
+        let image_refs = local_image_services_from_global_config().runtime_refs;
+        Self::new_inner_with_volumes(store, factory, persister, image_refs, Some(volume_manager))
+            .await
     }
 }
 
@@ -149,6 +170,16 @@ where
         persister: P,
         image_refs: Arc<dyn RuntimeImageRefs>,
     ) -> Result<Arc<Self>> {
+        Self::new_inner_with_volumes(store, factory, persister, image_refs, None).await
+    }
+
+    async fn new_inner_with_volumes(
+        store: S,
+        factory: F,
+        persister: P,
+        image_refs: Arc<dyn RuntimeImageRefs>,
+        volume_manager: Option<Arc<VolumeManager>>,
+    ) -> Result<Arc<Self>> {
         let app_config = ConfigManager::global_config();
         let config = &app_config.orchestrator;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -158,6 +189,12 @@ where
         // Restore persisted sandboxes from the previous run, keeping the paused
         // ones (with their state) for the paused-protection reconcile below.
         let persisted = persister.load_all(&factory).await?;
+        let managed_seed_must_exist = persisted_sandboxes_require_managed_seed(&persisted);
+        let access_tokens = tokio::task::spawn_blocking(move || {
+            SandboxAccessTokenGenerator::load_or_create(app_config, managed_seed_must_exist)
+        })
+        .await
+        .context("join sandbox access-token seed loader")??;
         let restored_paused: Vec<(SandboxId, Arc<dyn PausedSandboxState>)> = persisted
             .iter()
             .filter(|metadata| metadata.state == SandboxState::Paused)
@@ -186,6 +223,8 @@ where
             shutdown_tx,
             shutdown_outcome: OnceCell::new(),
             image_refs,
+            access_tokens,
+            volume_manager,
         });
 
         // Start the auto-evict task.
@@ -262,6 +301,44 @@ where
 
     async fn release_image_refs(&self, owner: RuntimeImageOwner) {
         self.image_refs.unpin_best_effort(owner).await;
+    }
+
+    async fn publish_sandbox_volume_backings(
+        &self,
+        sandbox_id: SandboxId,
+        volume_ids: &[String],
+    ) -> Result<()> {
+        let Some(manager) = self.volume_manager.as_ref() else {
+            return Ok(());
+        };
+        manager
+            .recover_and_publish_backings(&sandbox_id.to_string(), volume_ids)
+            .await
+            .map_err(|error| OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::SnapshotVolumes,
+                source: error.into(),
+            })
+    }
+
+    async fn finalize_terminal_volumes(&self, metadata: &SandboxMetadata) {
+        let Some(manager) = self.volume_manager.as_ref() else {
+            return;
+        };
+        let volume_ids = metadata.volume_mounts.values().cloned().collect::<Vec<_>>();
+        if volume_ids.is_empty() {
+            return;
+        }
+        let owner = metadata.id.to_string();
+        if let Err(error) = manager
+            .recover_and_publish_backings(&owner, &volume_ids)
+            .await
+        {
+            warn!(sandbox_id = %metadata.id, %error, "failed to publish volumes during terminal sandbox cleanup");
+        }
+        if let Err(error) = manager.replace_owner_for(&owner, None, &volume_ids).await {
+            warn!(sandbox_id = %metadata.id, %error, "failed to release volumes during terminal sandbox cleanup");
+        }
     }
 
     /// Snapshot the running set's local runtime artifacts for maintenance.
@@ -352,14 +429,32 @@ where
             auto_resume,
             network_policy,
             custom_extension_params,
+            secure,
+            volume_mounts,
+            extra_drives: launch_extra_drives,
+            extra_drives_in_snapshot,
         } = request;
+        let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
         info!(timeout = ?timeout, "creating sandbox");
 
         let result = match source {
             SandboxLaunchSource::Snapshot(snapshot) => {
                 let record = snapshot.record();
                 let committed = snapshot.committed();
+                let configured_mode = ConfigManager::global_config().virtualization_mode;
+                if committed.virtualization_mode != configured_mode {
+                    self.counters.record_create_fail(1);
+                    return Err(OrchestratorError::VirtualizationModeMismatch {
+                        resource: format!("snapshot {}", record.id),
+                        resource_mode: committed.virtualization_mode,
+                        node_mode: configured_mode,
+                    });
+                }
                 let launch_image_configs = committed.image_configs.clone();
+                let mut extra_mmds = serde_json::Map::new();
+                if !launch_image_configs.is_empty() {
+                    extra_mmds.insert("imageConfigs".to_string(), launch_image_configs.to_value());
+                };
                 // Effective custom config: a launch-provided value overrides the
                 // one persisted in the source snapshot; otherwise inherit it.
                 // Store the effective value so publishing a snapshot from this
@@ -367,16 +462,23 @@ where
                 let effective_custom_extension_params = custom_extension_params
                     .clone()
                     .or_else(|| committed.custom_extension_params.clone());
-                let mut launch_config = SandboxLaunchConfig::new(sandbox_id, record.id.to_string());
-                launch_config.env_vars = env_vars;
-                launch_config.network = network_policy.runtime_policy();
-                launch_config.custom_extension_params = effective_custom_extension_params.clone();
-                let launch_config = launch_config.with_image_configs(&launch_image_configs);
+                let launch_config = SandboxLaunchConfig {
+                    sandbox_id,
+                    snapshot_id: record.id.to_string(),
+                    env_vars,
+                    network: network_policy.runtime_policy(),
+                    extra_mmds,
+                    custom_extension_params: effective_custom_extension_params.clone(),
+                    envd_access_token: envd_access_token.clone(),
+                    extra_drives: launch_extra_drives.clone(),
+                    extra_drives_in_snapshot,
+                };
 
                 let transitional_metadata = SandboxMetadata {
                     id: sandbox_id,
                     snapshot_id: record.id.to_string(),
                     snapshot_alias: record.alias.as_ref().map(ToString::to_string),
+                    virtualization_mode: committed.virtualization_mode,
                     runtime_versions: committed.runtime_versions.clone(),
                     resources: *snapshot.resources(),
                     context: committed.context.clone(),
@@ -387,6 +489,8 @@ where
                     user_metadata,
                     network_policy,
                     custom_extension_params: effective_custom_extension_params,
+                    volume_mounts: volume_mounts.clone(),
+                    secure,
                     ..Default::default()
                 };
 
@@ -404,18 +508,29 @@ where
                 overlaybd_config_path,
                 context,
                 resources,
-                extra_drives,
+                mut extra_drives,
                 extra_boot_args,
                 image_configs,
             } => {
                 let context = *context;
+                extra_drives.extend(launch_extra_drives);
                 let resources = resources.unwrap_or_else(default_fresh_sandbox_resources);
                 let launch_image_configs = *image_configs;
-                let mut launch_config = SandboxLaunchConfig::new(sandbox_id, image_ref.clone());
-                launch_config.env_vars = env_vars;
-                launch_config.network = network_policy.runtime_policy();
-                launch_config.custom_extension_params = custom_extension_params.clone();
-                let launch_config = launch_config.with_image_configs(&launch_image_configs);
+                let mut extra_mmds = serde_json::Map::new();
+                if !launch_image_configs.is_empty() {
+                    extra_mmds.insert("imageConfigs".to_string(), launch_image_configs.to_value());
+                };
+                let launch_config = SandboxLaunchConfig {
+                    sandbox_id,
+                    snapshot_id: image_ref.clone(),
+                    env_vars,
+                    network: network_policy.runtime_policy(),
+                    extra_mmds,
+                    custom_extension_params: custom_extension_params.clone(),
+                    envd_access_token,
+                    extra_drives: Vec::new(),
+                    extra_drives_in_snapshot: false,
+                };
                 let build_spec = FreshSandboxBuildSpec {
                     image_config_path: overlaybd_config_path,
                     context: context.clone(),
@@ -428,6 +543,7 @@ where
                     id: sandbox_id,
                     snapshot_id: image_ref,
                     snapshot_alias: None,
+                    virtualization_mode: ConfigManager::global_config().virtualization_mode,
                     runtime_versions: configured_runtime_versions(),
                     resources,
                     context,
@@ -437,6 +553,8 @@ where
                     user_metadata,
                     network_policy,
                     custom_extension_params,
+                    volume_mounts,
+                    secure,
                     ..Default::default()
                 };
 
@@ -475,9 +593,35 @@ where
         count: u32,
         new_timeout: NewTimeout,
     ) -> Result<Vec<SandboxForkOutcome>> {
+        if self
+            .store
+            .get(&source_sandbox_id)
+            .await?
+            .is_some_and(|metadata| !metadata.volume_mounts.is_empty())
+        {
+            return Err(OrchestratorError::InternalError(
+                "fork with volume mounts requires volume-aware child specs".to_string(),
+            ));
+        }
+        let child_specs = (0..count)
+            .map(|_| SandboxForkChildSpec {
+                sandbox_id: SandboxId::new(),
+                ..Default::default()
+            })
+            .collect();
+        self.fork_sandbox_with_specs(source_sandbox_id, child_specs, new_timeout)
+            .await
+    }
+
+    pub async fn fork_sandbox_with_specs(
+        self: &Arc<Self>,
+        source_sandbox_id: SandboxId,
+        child_specs: Vec<SandboxForkChildSpec>,
+        new_timeout: NewTimeout,
+    ) -> Result<Vec<SandboxForkOutcome>> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("fork", source_sandbox_id, async move {
-            this.fork_sandbox_inner(source_sandbox_id, count, new_timeout)
+            this.fork_sandbox_inner(source_sandbox_id, child_specs, new_timeout)
                 .await
         })
         .await
@@ -485,17 +629,33 @@ where
 
     #[tracing::instrument(
         name = "fork_sandbox",
-        skip(self),
-        fields(source_sandbox_id = %source_sandbox_id, count)
+        skip(self, child_specs),
+        fields(source_sandbox_id = %source_sandbox_id, count = child_specs.len())
     )]
     async fn fork_sandbox_inner(
         self: Arc<Self>,
         source_sandbox_id: SandboxId,
-        count: u32,
+        child_specs: Vec<SandboxForkChildSpec>,
         new_timeout: NewTimeout,
     ) -> Result<Vec<SandboxForkOutcome>> {
         self.ensure_accepting_lifecycle_operations()?;
 
+        let count = u32::try_from(child_specs.len())
+            .map_err(|_| OrchestratorError::InternalError("too many fork children".to_string()))?;
+        let mut child_ids = HashSet::with_capacity(child_specs.len());
+        for child in &child_specs {
+            if child.sandbox_id == source_sandbox_id || !child_ids.insert(child.sandbox_id) {
+                return Err(OrchestratorError::InternalError(
+                    "fork child sandbox IDs must be unique and differ from the source".to_string(),
+                ));
+            }
+            if self.store.get(&child.sandbox_id).await?.is_some() {
+                return Err(OrchestratorError::InternalError(format!(
+                    "fork child sandbox {} already exists",
+                    child.sandbox_id
+                )));
+            }
+        }
         info!("forking sandboxes");
 
         let source_handle = {
@@ -522,13 +682,23 @@ where
             })?
             .previous;
 
-        let child_ids = (0..count).map(|_| SandboxId::new()).collect::<Vec<_>>();
+        let backend_specs = child_specs
+            .iter()
+            .map(|child| SandboxForkSpec {
+                sandbox_id: child.sandbox_id,
+                envd_access_token: source_metadata
+                    .secure
+                    .then(|| self.access_tokens.generate(child.sandbox_id)),
+                extra_drives: child.extra_drives.clone(),
+                replace_drive_ids: child.replace_drive_ids.clone(),
+            })
+            .collect::<Vec<_>>();
 
         // Start to fork the sandbox.
         // This is a single operation that will return a list of results for each child sandbox.
         let fork_result = {
             let mut sandbox = source_handle.lock().await;
-            sandbox.fork(&child_ids).await
+            sandbox.fork(&backend_specs).await
         };
         let forked_backends = match fork_result {
             Ok(forked_backends) => forked_backends,
@@ -542,6 +712,7 @@ where
                         let mut sandbox = source_handle.lock().await;
                         sandbox.stop().await
                     };
+                    self.finalize_terminal_volumes(&source_metadata).await;
                     self.store.remove(&source_sandbox_id).await?;
                 } else {
                     let _ = self
@@ -575,10 +746,11 @@ where
         }
 
         // Register each forked sandbox in the store and runtime, and publish events.
-        let mut outcomes = Vec::with_capacity(child_ids.len());
+        let mut outcomes = Vec::with_capacity(child_specs.len());
         let mut successes = 0u64;
         let now = SystemTime::now();
-        for (sandbox_id, backend) in child_ids.into_iter().zip(forked_backends) {
+        for (child, backend) in child_specs.into_iter().zip(forked_backends) {
+            let sandbox_id = child.sandbox_id;
             let backend = match backend {
                 Ok(backend) => backend,
                 Err(err) => {
@@ -593,6 +765,7 @@ where
             metadata.state = SandboxState::Running;
             metadata.created_at = now;
             metadata.paused_state = None;
+            metadata.volume_mounts = child.volume_mounts;
             metadata.update_timeout(new_timeout);
 
             let proxy_target = match Self::proxy_target_from_sandbox(backend.as_ref()) {
@@ -670,12 +843,34 @@ where
     /// - If `states` is provided, only sandboxes in those states will be included.
     /// - If `user_metadata` is provided, only sandboxes whose user metadata contains
     ///   all the specified key-value pairs will be included.
+    /// - If `started_after` is provided, only sandboxes created at or after that instant
+    ///   will be included.
+    /// - If `template` is provided, only sandboxes using the matching snapshot ID or alias
+    ///   will be included.
     #[tracing::instrument(skip(self, filter))]
     pub async fn list_sandboxes_filtered(
         &self,
         filter: SandboxListFilter,
     ) -> Result<Vec<SandboxMetadata>> {
         Ok(self.store.list_filtered(filter).await?)
+    }
+
+    pub fn get_envd_access_token(&self, metadata: &SandboxMetadata) -> Option<EnvdAccessToken> {
+        metadata
+            .secure
+            .then(|| self.access_tokens.generate(metadata.id))
+    }
+
+    pub fn validate_envd_access_token(&self, sandbox_id: SandboxId, candidate: &str) -> bool {
+        self.access_tokens.matches(sandbox_id, candidate)
+    }
+
+    pub fn traffic_access_token(&self, sandbox_id: SandboxId) -> String {
+        self.access_tokens.generate_traffic(sandbox_id)
+    }
+
+    pub fn validate_traffic_access_token(&self, sandbox_id: SandboxId, candidate: &str) -> bool {
+        self.access_tokens.matches_traffic(sandbox_id, candidate)
     }
 
     /// Resolves the current proxyability of a sandbox without touching the sandbox mutex.
@@ -810,9 +1005,27 @@ where
     pub async fn delete_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("delete", sandbox_id, async move {
+            this.snapshot_volume_mounts_before_delete(sandbox_id)
+                .await?;
             this.delete_sandbox_inner(sandbox_id).await
         })
         .await
+    }
+
+    async fn snapshot_volume_mounts_before_delete(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> Result<()> {
+        // A running volume mount may contain writes that only exist in the VM's
+        // current upper layer. Pause first to seal those writes locally before
+        // the final volume state is published during deletion.
+        let should_snapshot = self.store.get(&sandbox_id).await?.is_some_and(|metadata| {
+            metadata.state == SandboxState::Running && !metadata.volume_mounts.is_empty()
+        });
+        if should_snapshot {
+            self.pause_sandbox_inner(sandbox_id).await?;
+        }
+        Ok(())
     }
 
     #[tracing::instrument(
@@ -894,6 +1107,59 @@ where
             }
         };
 
+        self.delete_sandbox_impl(sandbox_id, previous_state).await
+    }
+
+    async fn claim_expired_running_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        cutoff: SystemTime,
+        claimed_state: SandboxState,
+    ) -> Result<bool> {
+        match self
+            .store
+            .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
+                if metadata.is_expired(cutoff) {
+                    metadata.state = claimed_state;
+                }
+            })
+            .await
+        {
+            Ok(update) if update.current.state == claimed_state => Ok(true),
+            Ok(update) => {
+                debug!(
+                    expires_at = ?update.current.expires_at,
+                    ?cutoff,
+                    "skipping auto-eviction because sandbox expiry was updated"
+                );
+                Ok(false)
+            }
+            Err(StoreError::StateConflict { actual_state, .. }) => {
+                debug!(
+                    state = ?actual_state,
+                    "skipping auto-eviction because sandbox state changed"
+                );
+                Ok(false)
+            }
+            Err(StoreError::SandboxNotFound { .. }) => {
+                debug!("skipping auto-eviction because sandbox no longer exists");
+                Ok(false)
+            }
+            Err(err) => Err(OrchestratorError::from(err)),
+        }
+    }
+
+    async fn delete_sandbox_impl(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        previous_state: SandboxState,
+    ) -> Result<()> {
+        let volume_ids = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .map(|metadata| metadata.volume_mounts.into_values().collect::<Vec<_>>())
+            .unwrap_or_default();
         let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
 
         // If the sandbox is still in memory, attempt to stop it.
@@ -915,6 +1181,31 @@ where
                     sandbox_id,
                     operation: SandboxOperation::Stop,
                     source: err,
+                });
+            }
+        }
+
+        if let Some(manager) = self.volume_manager.as_ref() {
+            if let Err(err) = self
+                .publish_sandbox_volume_backings(sandbox_id, &volume_ids)
+                .await
+            {
+                self.store
+                    .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
+                    .await?;
+                return Err(err);
+            }
+            if let Err(err) = manager
+                .replace_owner_for(&sandbox_id.to_string(), None, &volume_ids)
+                .await
+            {
+                self.store
+                    .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
+                    .await?;
+                return Err(OrchestratorError::SandboxOperationFailed {
+                    sandbox_id,
+                    operation: SandboxOperation::Stop,
+                    source: err.into(),
                 });
             }
         }
@@ -1018,6 +1309,10 @@ where
             Err(err) => return Err(OrchestratorError::from(err)),
         }
 
+        self.pause_sandbox_impl(sandbox_id).await
+    }
+
+    async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         // Pin paused runtime artifacts before detaching from the running set.
         let runtime_artifacts = {
             let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
@@ -1072,6 +1367,9 @@ where
             warn!("sandbox handle not found while pausing, removing from store");
             self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                 .await;
+            if let Some(metadata) = self.store.get(&sandbox_id).await? {
+                self.finalize_terminal_volumes(&metadata).await;
+            }
             self.store.remove(&sandbox_id).await?;
             return Err(OrchestratorError::SandboxNotFound(sandbox_id));
         };
@@ -1098,6 +1396,9 @@ where
                     };
                     if let Err(stop_err) = stop_result {
                         warn!(error = ?stop_err, "failed to stop sandbox after terminal pause failure");
+                    }
+                    if let Some(metadata) = self.store.get(&sandbox_id).await? {
+                        self.finalize_terminal_volumes(&metadata).await;
                     }
                     self.store.remove(&sandbox_id).await?;
                 } else {
@@ -1156,6 +1457,9 @@ where
                 if let Err(stop_err) = stop_result {
                     warn!(error = ?stop_err, "failed to stop sandbox after pause failure");
                 }
+                if let Ok(Some(metadata)) = self.store.get(&sandbox_id).await {
+                    self.finalize_terminal_volumes(&metadata).await;
+                }
                 if let Err(error) = self.store.remove(&sandbox_id).await {
                     warn!(error = ?error, "failed to remove sandbox after pause failure");
                 }
@@ -1179,7 +1483,7 @@ where
             )));
         }
         let resources = persisted_metadata.resources;
-        self.store.update(persisted_metadata).await?;
+        self.store.update(persisted_metadata.clone()).await?;
 
         // Stop the sandbox to free up resources.
         let stop_result = {
@@ -1255,6 +1559,15 @@ where
             }
         }
 
+        let node_mode = ConfigManager::global_config().virtualization_mode;
+        if metadata.virtualization_mode != node_mode {
+            return Err(OrchestratorError::VirtualizationModeMismatch {
+                resource: format!("paused sandbox {sandbox_id}"),
+                resource_mode: metadata.virtualization_mode,
+                node_mode,
+            });
+        }
+
         match self
             .store
             .update_state_if_state(&sandbox_id, SandboxState::Resuming, &[SandboxState::Paused])
@@ -1310,6 +1623,9 @@ where
                 Arc::clone(paused_state),
                 timeout,
                 metadata.resources,
+                metadata
+                    .secure
+                    .then(|| self.access_tokens.generate(metadata.id)),
             ))
             .await;
         if let Ok(metadata) = resumed.as_ref() {
@@ -1336,6 +1652,123 @@ where
         .await
     }
 
+    async fn begin_snapshot_operation(&self, sandbox_id: SandboxId) -> Result<SandboxHandle> {
+        self.ensure_accepting_lifecycle_operations()?;
+        self.store
+            .update_state_if_state(
+                &sandbox_id,
+                SandboxState::Snapshotting,
+                &[SandboxState::Running],
+            )
+            .await
+            .map_err(|error| match error {
+                StoreError::StateConflict {
+                    actual_state: SandboxState::Killing,
+                    ..
+                } => OrchestratorError::SandboxNotFound(sandbox_id),
+                StoreError::StateConflict { actual_state, .. } => {
+                    OrchestratorError::InvalidSandboxState {
+                        sandbox_id,
+                        state: actual_state,
+                    }
+                }
+                error => OrchestratorError::from(error),
+            })?;
+
+        if let Some(handle) = self.sandboxes.read().await.get(&sandbox_id).cloned() {
+            return Ok(handle);
+        }
+        warn!("sandbox handle not found while snapshotting, removing from store");
+        self.detach_sandbox_handle_and_route(&sandbox_id).await;
+        if let Some(metadata) = self.store.get(&sandbox_id).await? {
+            self.finalize_terminal_volumes(&metadata).await;
+        }
+        self.store.remove(&sandbox_id).await?;
+        Err(OrchestratorError::SandboxNotFound(sandbox_id))
+    }
+
+    async fn fail_snapshot_operation<T>(
+        &self,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+        error: SandboxCaptureError,
+        operation: SandboxOperation,
+    ) -> Result<T> {
+        warn!(?error, ?operation, "sandbox snapshot operation failed");
+        if error.is_terminal() {
+            self.detach_sandbox_handle_and_route(&sandbox_id).await;
+            if let Err(stop_error) = handle.lock().await.stop().await {
+                warn!(
+                    ?stop_error,
+                    ?operation,
+                    "failed to stop sandbox after terminal snapshot failure"
+                );
+            }
+            if let Some(metadata) = self.store.get(&sandbox_id).await? {
+                self.finalize_terminal_volumes(&metadata).await;
+            }
+            self.store.remove(&sandbox_id).await?;
+        } else {
+            let _ = self
+                .store
+                .update_state_if_state(
+                    &sandbox_id,
+                    SandboxState::Running,
+                    &[SandboxState::Snapshotting],
+                )
+                .await;
+        }
+        Err(OrchestratorError::SandboxOperationFailed {
+            sandbox_id,
+            operation,
+            source: error.into(),
+        })
+    }
+
+    async fn finish_snapshot_operation(&self, sandbox_id: SandboxId) -> Result<()> {
+        self.store
+            .update_state_if_state(
+                &sandbox_id,
+                SandboxState::Running,
+                &[SandboxState::Snapshotting],
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Seals writable persistent-volume uppers without capturing the VM's
+    /// rootfs, memory, or device state so callers can clone them locally.
+    pub async fn snapshot_volume_mounts(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("snapshot_volumes", sandbox_id, async move {
+            this.snapshot_volume_mounts_inner(sandbox_id).await
+        })
+        .await
+    }
+
+    #[tracing::instrument(
+        name = "snapshot_volume_mounts",
+        skip(self),
+        fields(sandbox_id = %sandbox_id)
+    )]
+    async fn snapshot_volume_mounts_inner(self: Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        let handle = self.begin_snapshot_operation(sandbox_id).await?;
+        if let Err(error) = {
+            let mut sandbox = handle.lock().await;
+            sandbox.snapshot_volumes().await
+        } {
+            return self
+                .fail_snapshot_operation(
+                    sandbox_id,
+                    &handle,
+                    error,
+                    SandboxOperation::SnapshotVolumes,
+                )
+                .await;
+        }
+        self.finish_snapshot_operation(sandbox_id).await
+    }
+
     #[tracing::instrument(
         name = "capture_snapshot",
         skip(self),
@@ -1345,90 +1778,22 @@ where
         self: Arc<Self>,
         sandbox_id: SandboxId,
     ) -> Result<SnapshotCaptureResult> {
-        self.ensure_accepting_lifecycle_operations()?;
-
         info!("capturing sandbox snapshot");
-        match self
-            .store
-            .update_state_if_state(
-                &sandbox_id,
-                SandboxState::Snapshotting,
-                &[SandboxState::Running],
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(StoreError::StateConflict { actual_state, .. }) => {
-                return match actual_state {
-                    SandboxState::Killing => Err(OrchestratorError::SandboxNotFound(sandbox_id)),
-                    _ => Err(OrchestratorError::InvalidSandboxState {
-                        sandbox_id,
-                        state: actual_state,
-                    }),
-                };
-            }
-            Err(err) => return Err(OrchestratorError::from(err)),
-        }
-
-        // Get the sandbox handle.
-        let handle = {
-            let sandboxes = self.sandboxes.read().await;
-            sandboxes.get(&sandbox_id).cloned()
-        };
-        let Some(handle) = handle else {
-            warn!("sandbox handle not found while snapshotting, removing from store");
-            self.detach_sandbox_handle_and_route(&sandbox_id).await;
-            self.store.remove(&sandbox_id).await?;
-            return Err(OrchestratorError::SandboxNotFound(sandbox_id));
-        };
-
-        // Call sandbox backend to capture the snapshot.
-        let captured_snapshot_result = {
+        let handle = self.begin_snapshot_operation(sandbox_id).await?;
+        let result = {
             let mut sandbox = handle.lock().await;
             sandbox.snapshot().await
         };
-
-        // If snapshot capture failed, attempt to roll back to Running state and return an error.
-        let captured_snapshot = match captured_snapshot_result {
+        let captured_snapshot = match result {
             Ok(captured_snapshot) => captured_snapshot,
-            Err(err) => {
-                warn!(error = ?err, "failed to capture sandbox snapshot");
-                if err.is_terminal() {
-                    self.detach_sandbox_handle_and_route(&sandbox_id).await;
-                    let stop_result = {
-                        let mut sandbox = handle.lock().await;
-                        sandbox.stop().await
-                    };
-                    if let Err(stop_err) = stop_result {
-                        warn!(error = ?stop_err, "failed to stop sandbox after terminal snapshot failure");
-                    }
-                    self.store.remove(&sandbox_id).await?;
-                } else {
-                    let _ = self
-                        .store
-                        .update_state_if_state(
-                            &sandbox_id,
-                            SandboxState::Running,
-                            &[SandboxState::Snapshotting],
-                        )
-                        .await;
-                }
-                return Err(OrchestratorError::SandboxOperationFailed {
-                    sandbox_id,
-                    operation: SandboxOperation::Snapshot,
-                    source: err.into(),
-                });
+            Err(error) => {
+                return self
+                    .fail_snapshot_operation(sandbox_id, &handle, error, SandboxOperation::Snapshot)
+                    .await;
             }
         };
 
-        // Update the sandbox state back to Running and return the captured snapshot along with the latest metadata.
-        self.store
-            .update_state_if_state(
-                &sandbox_id,
-                SandboxState::Running,
-                &[SandboxState::Snapshotting],
-            )
-            .await?;
+        self.finish_snapshot_operation(sandbox_id).await?;
         let metadata = match self.store.get(&sandbox_id).await? {
             Some(metadata) => metadata,
             None => {
@@ -1465,7 +1830,7 @@ where
     async fn replace_sandbox_network_policy_inner(
         &self,
         sandbox_id: SandboxId,
-        network_policy: SandboxNetworkPolicy,
+        mut network_policy: SandboxNetworkPolicy,
     ) -> Result<()> {
         let metadata = self
             .store
@@ -1478,6 +1843,7 @@ where
                 state: metadata.state,
             });
         }
+        network_policy.allow_public_traffic = metadata.network_policy.allow_public_traffic;
 
         let sandbox = {
             let sandboxes = self.sandboxes.read().await;
@@ -1777,26 +2143,54 @@ where
             return Ok(Vec::new());
         }
 
-        let expired = self.store.list_expired(SystemTime::now()).await?;
+        let eviction_cutoff = SystemTime::now();
+        let expired = self.store.list_expired(eviction_cutoff).await?;
         let mut evicted_ids = Vec::new();
 
         for metadata in expired {
             if metadata.state != SandboxState::Running {
                 continue;
             }
-            if let Err(err) = match metadata.timeout_action {
-                SandboxTimeoutAction::Pause => self.pause_sandbox_inner(metadata.id).await,
-                SandboxTimeoutAction::Delete => self.delete_sandbox_inner(metadata.id).await,
-            } {
-                warn!(
+            let flush_volumes_before_delete =
+                matches!(metadata.timeout_action, SandboxTimeoutAction::Delete)
+                    && !metadata.volume_mounts.is_empty();
+            let claimed_state = match (metadata.timeout_action, flush_volumes_before_delete) {
+                (SandboxTimeoutAction::Pause, _) => SandboxState::Pausing,
+                (SandboxTimeoutAction::Delete, true) => SandboxState::Pausing,
+                (SandboxTimeoutAction::Delete, false) => SandboxState::Killing,
+            };
+            let result = match self
+                .claim_expired_running_sandbox(metadata.id, eviction_cutoff, claimed_state)
+                .await
+            {
+                Ok(true) => match metadata.timeout_action {
+                    SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
+                    SandboxTimeoutAction::Delete if flush_volumes_before_delete => {
+                        async {
+                            self.pause_sandbox_impl(metadata.id).await?;
+                            self.delete_sandbox_inner(metadata.id).await
+                        }
+                        .await
+                    }
+                    SandboxTimeoutAction::Delete => {
+                        self.delete_sandbox_impl(metadata.id, SandboxState::Running)
+                            .await
+                    }
+                }
+                .map(|_| true),
+                Ok(false) => Ok(false),
+                Err(err) => Err(err),
+            };
+            match result {
+                Ok(true) => evicted_ids.push(metadata.id),
+                Ok(false) => continue,
+                Err(err) => warn!(
                     sandbox_id = %metadata.id,
                     action = ?metadata.timeout_action,
                     error = ?err,
                     "failed to auto-evict expired sandbox"
-                );
-                continue;
+                ),
             }
-            evicted_ids.push(metadata.id);
         }
 
         Ok(evicted_ids)
@@ -2067,9 +2461,11 @@ where
                     .factory
                     .build((**build_spec).clone(), plan.launch_config.clone()),
             },
-            LaunchPlan::Resume(plan) => self
-                .factory
-                .build_from_paused_state(plan.sandbox_id, plan.paused_state.as_ref()),
+            LaunchPlan::Resume(plan) => self.factory.build_from_paused_state(
+                plan.sandbox_id,
+                plan.paused_state.as_ref(),
+                plan.envd_access_token.clone(),
+            ),
         };
         build_result.map_err(|source| {
             warn!(error = %format_args!("{source:#}"), "failed to build sandbox");
@@ -2280,9 +2676,8 @@ where
             let sandboxes = self
                 .store
                 .list_filtered(SandboxListFilter {
-                    states: None,
                     excluded_states: Some(vec![SandboxState::Paused]),
-                    user_metadata: None,
+                    ..SandboxListFilter::matches_all()
                 })
                 .await?;
             if sandboxes.is_empty() {
@@ -2373,6 +2768,12 @@ where
     }
 }
 
+fn persisted_sandboxes_require_managed_seed(persisted: &[SandboxMetadata]) -> bool {
+    persisted
+        .iter()
+        .any(|metadata| metadata.secure || !metadata.network_policy.allow_public_traffic)
+}
+
 #[cfg(test)]
 impl<S, F, P> Orchestrator<S, F, P>
 where
@@ -2433,6 +2834,32 @@ where
         metadata.auto_resume = auto_resume_enabled;
         self.store.update(metadata).await?;
 
+        Ok(())
+    }
+
+    pub(crate) async fn set_secure_for_test(
+        &self,
+        sandbox_id: &SandboxId,
+        secure: bool,
+    ) -> Result<()> {
+        let Some(mut metadata) = self.store.get(sandbox_id).await? else {
+            return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
+        };
+        metadata.secure = secure;
+        self.store.update(metadata).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn set_allow_public_traffic_for_test(
+        &self,
+        sandbox_id: &SandboxId,
+        allow_public_traffic: bool,
+    ) -> Result<()> {
+        let Some(mut metadata) = self.store.get(sandbox_id).await? else {
+            return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
+        };
+        metadata.network_policy.allow_public_traffic = allow_public_traffic;
+        self.store.update(metadata).await?;
         Ok(())
     }
 

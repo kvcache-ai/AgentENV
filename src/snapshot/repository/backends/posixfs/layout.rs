@@ -35,6 +35,34 @@ impl PosixFsSnapshotArtifactLayout {
         Self::catalog_dir(root).join("records")
     }
 
+    pub(super) fn volumes_dir(root: &Path) -> PathBuf {
+        root.join("volumes")
+    }
+
+    pub(super) fn volume_aliases_dir(root: &Path) -> PathBuf {
+        Self::volumes_dir(root).join("aliases")
+    }
+
+    pub(super) fn volume_records_dir(root: &Path) -> PathBuf {
+        Self::volumes_dir(root).join("records")
+    }
+
+    pub(super) fn volume_record_path(root: &Path, volume_id: &str) -> PathBuf {
+        Self::volume_records_dir(root).join(format!("{volume_id}.json"))
+    }
+
+    pub(super) fn volume_alias_path(root: &Path, alias: &str) -> PathBuf {
+        Self::volume_aliases_dir(root).join(alias)
+    }
+
+    pub(super) fn volume_alias_lock_path(root: &Path, alias: &str) -> PathBuf {
+        Self::volume_aliases_dir(root).join(format!("{alias}{LOCK_SUFFIX}"))
+    }
+
+    pub(super) fn volume_record_lock_path(root: &Path, volume_id: &str) -> PathBuf {
+        Self::volume_records_dir(root).join(format!("{volume_id}{LOCK_SUFFIX}"))
+    }
+
     pub(super) fn alias_path(root: &Path, alias: &SnapshotAlias) -> PathBuf {
         Self::aliases_dir(root).join(alias.to_string())
     }

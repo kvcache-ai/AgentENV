@@ -1,10 +1,7 @@
 openapi: 3.0.0
 info:
   version: 0.1.0
-  title: E2B API
-
-servers:
-  - url: https://api.e2b.app
+  title: AgentENV API
 
 components:
   securitySchemes:
@@ -109,6 +106,19 @@ components:
       schema:
         type: string
 
+  headers:
+    XNextToken:
+      description: Cursor to fetch the next page of results, if more exist
+      schema:
+        type: string
+    XTotalRunning:
+      description: >
+        Number of running sandboxes matching the filters, before pagination is applied.
+        Only present when running sandboxes were requested.
+      schema:
+        type: integer
+        format: int32
+
   responses:
     "400":
       description: Bad request
@@ -182,6 +192,14 @@ components:
         - running
         - paused
 
+    OrderDirection:
+      type: string
+      description: Sort direction
+      default: desc
+      enum:
+        - asc
+        - desc
+
     SnapshotInfo:
       type: object
       required:
@@ -226,6 +244,68 @@ components:
       additionalProperties:
         type: string
         description: Environment variables for the sandbox
+
+    Volume:
+      type: object
+      required:
+        - volumeID
+        - name
+        - sizeMB
+        - status
+      properties:
+        volumeID:
+          type: string
+          description: Stable identifier of the volume.
+        name:
+          type: string
+          pattern: "^[a-zA-Z0-9_-]+$"
+          description: Unique human-readable volume name.
+        mode:
+          type: string
+          description: Access mode (`ro` or `exclusive`).
+        sizeMB:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Effective volume size in MiB.
+        status:
+          type: string
+          description: Availability state (`ready`, `uploading`, or `failed`).
+
+    NewVolume:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          pattern: "^[a-zA-Z0-9_-]+$"
+          description: Unique volume name.
+        sizeMB:
+          type: integer
+          format: int64
+          minimum: 1
+          default: 65536
+          description: Volume size in MiB. Defaults to 65536 MiB (64 GiB).
+        mode:
+          type: string
+          description: Access mode (`ro` or `exclusive`).
+        fromVolume:
+          type: string
+          description: >-
+            Existing volume ID or name to use as a COW source. An exclusive
+            source must not be mounted by a sandbox; sandbox fork snapshots
+            and publishes its owned volumes internally before creating child
+            volumes.
+        image:
+          type: string
+          description: OCI or OverlayBD image reference for the initial content.
+
+    VolumeMounts:
+      type: object
+      description: Map of absolute guest mount paths to volume IDs or names.
+      additionalProperties:
+        type: string
 
     AttachedDriveSource:
       type: object
@@ -465,6 +545,8 @@ components:
           $ref: "#/components/schemas/SandboxNetworkConfig"
         lifecycle:
           $ref: "#/components/schemas/SandboxLifecycle"
+        volumeMounts:
+          $ref: "#/components/schemas/VolumeMounts"
 
     ListedSandbox:
       required:
@@ -512,6 +594,8 @@ components:
           $ref: "#/components/schemas/SandboxState"
         envdVersion:
           $ref: "#/components/schemas/EnvdVersion"
+        volumeMounts:
+          $ref: "#/components/schemas/VolumeMounts"
 
     NewSandbox:
       required:
@@ -553,6 +637,8 @@ components:
           $ref: "#/components/schemas/CustomExtensionParams"
         mcp:
           $ref: "#/components/schemas/Mcp"
+        volumeMounts:
+          $ref: "#/components/schemas/VolumeMounts"
 
     ResumedSandbox:
       properties:
@@ -585,6 +671,9 @@ components:
           description: Automatically pauses the sandbox after the timeout
         autoResume:
           $ref: "#/components/schemas/SandboxAutoResumeConfig"
+        secure:
+          type: boolean
+          description: Secure all system communication with sandbox
         allowInternetAccess:
           type: boolean
           description:
@@ -598,6 +687,8 @@ components:
           $ref: "#/components/schemas/EnvVars"
         customExtensionParams:
           $ref: "#/components/schemas/CustomExtensionParams"
+        volumeMounts:
+          $ref: "#/components/schemas/VolumeMounts"
         cpuCount:
           allOf:
             - $ref: "#/components/schemas/CPUCount"
@@ -1208,7 +1299,6 @@ components:
         - clusterID
         - status
         - sandboxCount
-        - cachedBuilds
         - createSuccesses
         - createFails
         - sandboxPausedCount
@@ -1242,11 +1332,6 @@ components:
           description: Number of sandboxes running on the node
         metrics:
           $ref: "#/components/schemas/NodeMetrics"
-        cachedBuilds:
-          type: array
-          description: List of cached builds id on the node
-          items:
-            type: string
         createSuccesses:
           type: integer
           format: uint64
@@ -1278,6 +1363,7 @@ tags:
   - name: templates
   - name: sandboxes
   - name: snapshots
+  - name: volumes
 
 paths:
   /health:
@@ -1289,6 +1375,122 @@ paths:
           description: The service is healthy
         "401":
           $ref: "#/components/responses/401"
+
+  /volumes:
+    get:
+      summary: List volumes
+      description: List independently managed persistent volumes.
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/paginationNextToken"
+        - $ref: "#/components/parameters/paginationLimit"
+      responses:
+        "200":
+          description: Volumes returned successfully
+          headers:
+            X-Next-Token:
+              $ref: "#/components/headers/XNextToken"
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Volume"
+        "401":
+          $ref: "#/components/responses/401"
+        "400":
+          $ref: "#/components/responses/400"
+        "500":
+          $ref: "#/components/responses/500"
+    post:
+      summary: Create a volume
+      description: Create an empty, image-backed, or copy-on-write volume.
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewVolume"
+      responses:
+        "201":
+          description: Volume created successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Volume"
+        "400":
+          $ref: "#/components/responses/400"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /volumes/{volumeID}:
+    get:
+      summary: Get a volume
+      description: Get a volume by ID or unique name.
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - name: volumeID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Volume returned successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Volume"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+    delete:
+      summary: Delete a volume
+      description: Delete a volume catalog entry when it is not reserved.
+      tags: [volumes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - name: volumeID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: Volume deleted successfully
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
 
   /sandboxes:
     get:
@@ -1359,6 +1561,8 @@ paths:
           $ref: "#/components/responses/401"
         "400":
           $ref: "#/components/responses/400"
+        "409":
+          $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1398,6 +1602,8 @@ paths:
           $ref: "#/components/responses/401"
         "400":
           $ref: "#/components/responses/400"
+        "409":
+          $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1429,16 +1635,35 @@ paths:
               $ref: "#/components/schemas/SandboxState"
           style: form
           explode: false
+        - name: order
+          in: query
+          description: Sort direction by sandbox start time. Defaults to desc (newest first).
+          required: false
+          schema:
+            $ref: "#/components/schemas/OrderDirection"
+        - name: startedAfter
+          in: query
+          description: Return sandboxes started at or after this timestamp.
+          required: false
+          schema:
+            type: string
+            format: date-time
+        - name: template
+          in: query
+          description: Filter sandboxes by a template ID or alias.
+          required: false
+          schema:
+            type: string
         - $ref: "#/components/parameters/paginationNextToken"
         - $ref: "#/components/parameters/paginationLimit"
       responses:
         "200":
           description: Successfully returned all running sandboxes
           headers:
-            x-next-token:
-              description: Pagination token for the next page. Returned only when more results are available.
-              schema:
-                type: string
+            X-Next-Token:
+              $ref: "#/components/headers/XNextToken"
+            X-Total-Running:
+              $ref: "#/components/headers/XTotalRunning"
           content:
             application/json:
               schema:
@@ -1558,6 +1783,8 @@ paths:
           $ref: "#/components/responses/409"
         "404":
           $ref: "#/components/responses/404"
+        "400":
+          $ref: "#/components/responses/400"
         "401":
           $ref: "#/components/responses/401"
         "500":
@@ -1649,6 +1876,8 @@ paths:
           $ref: "#/components/responses/401"
         "404":
           $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1881,10 +2110,8 @@ paths:
         "200":
           description: Successfully returned snapshots
           headers:
-            x-next-token:
-              description: Pagination token for the next page. Returned only when more results are available.
-              schema:
-                type: string
+            X-Next-Token:
+              $ref: "#/components/headers/XNextToken"
           content:
             application/json:
               schema:
@@ -1983,9 +2210,7 @@ paths:
           description: Successfully returned all templates
           headers:
             X-Next-Token:
-              description: Cursor to fetch the next page of results, if more exist
-              schema:
-                type: string
+              $ref: "#/components/headers/XNextToken"
           content:
             application/json:
               schema:
@@ -2053,6 +2278,9 @@ paths:
       responses:
         "200":
           description: Successfully returned the template with its builds
+          headers:
+            X-Next-Token:
+              $ref: "#/components/headers/XNextToken"
           content:
             application/json:
               schema:

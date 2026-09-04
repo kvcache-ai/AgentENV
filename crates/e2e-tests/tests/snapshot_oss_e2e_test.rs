@@ -13,6 +13,10 @@ use agentenv::snapshot::{
 use agentenv::types::SandboxResources;
 use agentenv_test_support::minio::{MinioFixture, MINIO_PASS, MINIO_USER};
 use anyhow::{Context, Result};
+use overlaybd::backend::local::LocalFile;
+use overlaybd::index_file::{CommitArgs, LSMTFile};
+use overlaybd::virtual_file::VirtualFile;
+use overlaybd::zfile::{CompressArgs, CompressOptions, ZFileCompactWriter};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -25,11 +29,45 @@ fn test_runtime_versions() -> SnapshotRuntimeVersions {
     }
 }
 
-fn write_built_artifacts(root: &Path) -> Result<(String, String, FirecrackerSnapshotManifest)> {
-    let (rootfs_lower, memory_lower, manifest) = write_mock_built_artifacts(root)?;
+/// Write a real ZFile-compressed sealed LSMT layer, mirroring the memory
+/// snapshot output when `[memory_snapshot].compression_enabled = true`.
+async fn write_zfile_memory_lower(path: &Path) -> Result<()> {
+    let data = Arc::new(LocalFile::new(path.with_extension("data"))?);
+    let index = Arc::new(LocalFile::new(path.with_extension("index"))?);
+    let layer = LSMTFile::create(data, Some(index), 2 * 4096, false).await?;
+    layer.write_at(0, &[0x5A; 4096]).await?;
+    layer.write_at(4096, &[0xA5; 4096]).await?;
+    let output = Arc::new(LocalFile::new(path)?);
+    let compress_args = CompressArgs::new(CompressOptions::new(
+        CompressOptions::LZ4,
+        CompressOptions::DEFAULT_BLOCK_SIZE,
+        0,
+    ));
+    let writer = Arc::new(ZFileCompactWriter::new(output, &compress_args).await?);
+    layer
+        .commit_with_args(CommitArgs::from_writer(writer))
+        .await?;
+    Ok(())
+}
+
+/// Returns the rootfs/memory lower digests, the memory lower path, and the
+/// manifest. The memory lower is a real ZFile layer referenced without
+/// digest/size in the image config, matching the production publish path for
+/// freshly written memory lowers (digest is derived from the physical bytes).
+async fn write_built_artifacts(
+    root: &Path,
+) -> Result<(String, String, PathBuf, FirecrackerSnapshotManifest)> {
+    let (rootfs_lower, _, manifest) = write_mock_built_artifacts(root)?;
+    let memory_lower = root.join("mem.zfile.commit");
+    write_zfile_memory_lower(&memory_lower).await?;
+    std::fs::write(
+        &manifest.memory.image_config_path,
+        format!(r#"{{"lowers":[{{"file":"{}"}}]}}"#, memory_lower.display()),
+    )?;
     Ok((
         digest_for_file(&rootfs_lower)?,
         digest_for_file(&memory_lower)?,
+        memory_lower,
         manifest,
     ))
 }
@@ -55,8 +93,9 @@ fn ensure_test_config() -> Result<()> {
     let deps_path = config_root.join("env");
     let local_cache = config_root.join("snapshot-local-cache");
     std::fs::create_dir_all(&config_root)?;
-    let config_path = workspace_root.join("config").join("oss_default.toml");
+    let config_path = workspace_root.join("config").join("default.toml");
     std::env::set_var("AENV_CONFIG_PATH", &config_path);
+    std::env::set_var("AENV_HOME_PATH", &config_root);
     std::env::set_var("AENV_DEPS_PATH", &deps_path);
     std::env::set_var("AENV_SNAPSHOT_LOCAL_CACHE_PATH", &local_cache);
 
@@ -82,6 +121,7 @@ fn test_oss_config(fixture: &MinioFixture, prefix: &str) -> OssBackendConfig {
         access_key_secret: Some(MINIO_PASS.to_string()),
         security_token: None,
         region: Some(fixture.region.clone()),
+        addressing_style: None,
         cache_max_size_gb: Some(1),
     }
 }
@@ -102,7 +142,8 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
     let cache_root = workspace.path().join("oss-cache");
     let (repository, resolver) = OssBackend::new(&oss, cache_root)?.into_parts();
     let artifacts_root = workspace.path().join("local-artifacts");
-    let (rootfs_digest, memory_digest, manifest) = write_built_artifacts(&artifacts_root)?;
+    let (rootfs_digest, memory_digest, memory_lower_path, manifest) =
+        write_built_artifacts(&artifacts_root).await?;
     let snapshot_id = SnapshotId::generate();
 
     let stored = repository
@@ -115,7 +156,9 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
                 startup: None,
                 resources: SandboxResources::default(),
                 runtime_versions: test_runtime_versions(),
+                virtualization_mode: ConfigManager::global_config().virtualization_mode,
                 image_configs: agentenv::types::ImageConfigs::new(),
+                volume_snapshots: Vec::new(),
                 custom_extension_params: None,
             },
             manifest,
@@ -131,6 +174,10 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
         [OverlaybdLayerRef::Managed(_)]
     ));
     assert_eq!(committed.memory_layers.len(), 1);
+    let source_zfile_bytes = std::fs::read(&memory_lower_path)?;
+    let managed_memory = &committed.memory_layers[0];
+    assert_eq!(managed_memory.digest, memory_digest);
+    assert_eq!(managed_memory.size, source_zfile_bytes.len() as u64);
 
     assert!(
         fixture
@@ -142,6 +189,20 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
             .object_exists(&format!("{prefix}/managed-layers/{memory_digest}"))
             .await?
     );
+    // The uploaded memory layer object must be byte-identical to the
+    // published ZFile: committed digest/size describe the physical bytes.
+    let object_bytes = fixture
+        .client
+        .get_object()
+        .bucket(&fixture.bucket)
+        .key(format!("{prefix}/managed-layers/{memory_digest}"))
+        .send()
+        .await?
+        .body
+        .collect()
+        .await?
+        .into_bytes();
+    assert_eq!(object_bytes.as_ref(), source_zfile_bytes.as_slice());
     assert!(
         fixture
             .object_exists(&format!("{prefix}/artifacts/{snapshot_id}/vm_state.bin"))
@@ -180,6 +241,10 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
     );
     assert_eq!(mem_config["lowers"][0]["digest"], memory_digest);
     assert_eq!(mem_config["lowers"][0]["file"], "");
+    assert_eq!(
+        mem_config["lowers"][0]["size"],
+        source_zfile_bytes.len() as u64
+    );
 
     Ok(())
 }
@@ -195,7 +260,7 @@ async fn snapshot_oss_resolve_alias_cleans_up_stale_binding() -> Result<()> {
 
     let (repository, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
     let artifacts_root = workspace.path().join("local-artifacts");
-    let (_, _, manifest) = write_built_artifacts(&artifacts_root)?;
+    let (_, _, _, manifest) = write_built_artifacts(&artifacts_root).await?;
     let alias = SnapshotAlias::parse("stale-alias").expect("alias should parse");
     let snapshot_id = SnapshotId::generate();
 
@@ -209,7 +274,9 @@ async fn snapshot_oss_resolve_alias_cleans_up_stale_binding() -> Result<()> {
                 startup: None,
                 resources: SandboxResources::default(),
                 runtime_versions: test_runtime_versions(),
+                virtualization_mode: ConfigManager::global_config().virtualization_mode,
                 image_configs: agentenv::types::ImageConfigs::new(),
+                volume_snapshots: Vec::new(),
                 custom_extension_params: None,
             },
             manifest,
@@ -250,7 +317,7 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
     let (repository, resolver) =
         OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
     let artifacts_root = workspace.path().join("local-artifacts");
-    let (rootfs_digest, _, manifest) = write_built_artifacts(&artifacts_root)?;
+    let (rootfs_digest, _, _, manifest) = write_built_artifacts(&artifacts_root).await?;
     let snapshot_id = SnapshotId::generate();
 
     let stored = repository
@@ -263,7 +330,9 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
                 startup: None,
                 resources: SandboxResources::default(),
                 runtime_versions: test_runtime_versions(),
+                virtualization_mode: ConfigManager::global_config().virtualization_mode,
                 image_configs: agentenv::types::ImageConfigs::new(),
+                volume_snapshots: Vec::new(),
                 custom_extension_params: None,
             },
             manifest,
@@ -307,7 +376,7 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
 
     let (repository, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
     let artifacts_root = workspace.path().join("local-artifacts");
-    let (_, _, manifest) = write_built_artifacts(&artifacts_root)?;
+    let (_, _, _, manifest) = write_built_artifacts(&artifacts_root).await?;
     let alias = SnapshotAlias::parse("delete-me").expect("alias should parse");
     let snapshot_id = SnapshotId::generate();
 
@@ -321,7 +390,9 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
                 startup: None,
                 resources: SandboxResources::default(),
                 runtime_versions: test_runtime_versions(),
+                virtualization_mode: ConfigManager::global_config().virtualization_mode,
                 image_configs: agentenv::types::ImageConfigs::new(),
+                volume_snapshots: Vec::new(),
                 custom_extension_params: None,
             },
             manifest,

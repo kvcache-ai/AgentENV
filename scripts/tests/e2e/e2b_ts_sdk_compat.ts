@@ -95,6 +95,7 @@ async function main(): Promise<void> {
         template: templateName,
       },
       timeoutMs: 90_000,
+      secure: true,
       ...connOpts,
     });
     check(!!sandbox.sandboxId, "sandbox create returned an empty sandboxId");
@@ -189,6 +190,7 @@ async function main(): Promise<void> {
           template: derivedTemplateName,
           baseTemplate: publicTemplate,
         },
+        secure: true,
         ...connOpts,
       });
       check(!!derivedSandbox.sandboxId, "from_template sandbox create returned an empty sandboxId");

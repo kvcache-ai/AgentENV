@@ -21,6 +21,8 @@ pub enum SandboxesColdPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Bad request
     Status400_BadRequest(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -52,6 +54,8 @@ pub enum SandboxesPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Bad request
     Status400_BadRequest(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -70,6 +74,8 @@ pub enum SandboxesSandboxIdConnectPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Not found
     Status404_NotFound(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -214,6 +220,8 @@ pub enum SandboxesSandboxIdResumePostResponse {
     Status409_Conflict(models::Error),
     /// Not found
     Status404_NotFound(models::Error),
+    /// Bad request
+    Status400_BadRequest(models::Error),
     /// Authentication error
     Status401_AuthenticationError(models::Error),
     /// Server error
@@ -258,6 +266,7 @@ pub enum V2SandboxesGetResponse {
     Status200_SuccessfullyReturnedAllRunningSandboxes {
         body: Vec<models::ListedSandbox>,
         x_next_token: Option<String>,
+        x_total_running: Option<i32>,
     },
     /// Authentication error
     Status401_AuthenticationError(models::Error),

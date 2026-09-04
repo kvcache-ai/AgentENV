@@ -28,10 +28,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 
 [lib]
 path = "src/lib.rs"
+
+[features]
+vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
 
 [dev-dependencies]
 tracing = "0.1"
@@ -47,6 +50,8 @@ opendal = { version = "0.55.0", features = ["services-s3"] }
 object-store-operator = { path = "crates/object-store-operator" }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+httparse = "1.10"
+tls-parser = "0.12.2"
 http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -58,7 +63,8 @@ nix = { version = "0.31", features = ["sched", "mount", "fs", "signal", "user", 
 libc = "0.2"
 rtnetlink = "0.20"
 netlink-packet-route = "0.28"
-ipnetwork = "0.21"
+ipnetwork = { version = "0.21", features = ["serde"] }
+hickory-resolver = "0.26.1"
 futures = "0.3"
 tonic = "0.14.2"
 tonic-prost = "0.14.2"
@@ -103,12 +109,16 @@ dashmap = "6.1.0"
 io-uring = "0.7.9"
 tokio-tungstenite = "0.28"
 sha2 = "0.10"
+hmac = "0.12"
+subtle = "2.6"
+hex = "0.4"
 semver = "1"
-iroh = { version = "=1.0.0-rc.0" }
-iroh-blobs = { version = "=0.101.0" }
+iroh = "1.0.3"
+iroh-blobs = "0.103.0"
 rand = "0.10"
 flate2 = "1"
 tar = "0.4"
+openssl-sys = { version = "0.9", optional = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"

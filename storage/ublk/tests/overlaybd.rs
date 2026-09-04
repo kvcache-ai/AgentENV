@@ -15,7 +15,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use storage_util::io_ring::IoRingHandle;
 use tempfile::TempDir;
 use tokio::time::sleep;
 
@@ -261,6 +260,7 @@ fn download_config() -> Result<DownloadConfig> {
         block_size: 262_144,
         concurrency: 1,
         max_inflight_blocks: 16,
+        max_concurrent_files: 8,
     })
 }
 
@@ -274,6 +274,7 @@ fn disabled_download_config() -> DownloadConfig {
         block_size: 262_144,
         concurrency: 1,
         max_inflight_blocks: 16,
+        max_concurrent_files: 8,
     }
 }
 
@@ -281,16 +282,13 @@ async fn create_initialized_upper(
     data_path: &Path,
     index_path: &Path,
     virtual_size: u64,
-    io_ring: IoRingHandle,
 ) -> Result<()> {
     let data_file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::new(data_path, io_ring.clone())
-            .await
+        LocalFile::new(data_path)
             .with_context(|| format!("create upper data failed: {}", data_path.display()))?,
     );
     let index_file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::new(index_path, io_ring)
-            .await
+        LocalFile::new(index_path)
             .with_context(|| format!("create upper index failed: {}", index_path.display()))?,
     );
     let args = LayerInfo::new(data_file, Some(index_file), virtual_size);
@@ -340,31 +338,62 @@ fn patterned_block(seed: u8, len: usize) -> Vec<u8> {
         .collect()
 }
 
-async fn wait_commits(image_cfg: &ImageConfig, timeout: Duration) -> Result<Vec<PathBuf>> {
-    let commits: Vec<PathBuf> = image_cfg
+/// Wait until every remote layer blob is fully present in the shared
+/// full-file cache. Background download fills `cache_dir/<cache_id>/data`
+/// (cache_id = sha256 of the blob URL) instead of producing per-layer
+/// `overlaybd.commit` files; completion is measured by the data file's
+/// allocated size reaching the blob size. Returns the cache data files.
+async fn wait_cached_layers(
+    image_cfg: &ImageConfig,
+    cache_dir: &Path,
+    timeout: Duration,
+) -> Result<Vec<PathBuf>> {
+    let layers: Vec<(PathBuf, u64)> = image_cfg
         .lowers
         .iter()
-        .filter(|lower| !lower.dir.is_empty())
-        .map(|lower| Path::new(&lower.dir).join("overlaybd.commit"))
+        .filter(|lower| lower.file.is_empty() && !lower.digest.is_empty())
+        .map(|lower| {
+            let blob_url = format!(
+                "{}/{}",
+                image_cfg.repo_blob_url.trim_end_matches('/'),
+                lower.digest
+            );
+            let cache_id = format!("{:x}", Sha256::digest(blob_url.as_bytes()));
+            (cache_dir.join(&cache_id).join("data"), lower.size)
+        })
         .collect();
-    if commits.is_empty() {
-        return Ok(commits);
+    if layers.is_empty() {
+        return Ok(Vec::new());
     }
 
+    let allocated = |path: &Path| -> u64 {
+        std::fs::metadata(path)
+            .map(|meta| std::os::unix::fs::MetadataExt::blocks(&meta) * 512)
+            .unwrap_or(0)
+    };
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if commits.iter().all(|path| path.exists()) {
-            return Ok(commits);
+        if layers.iter().all(|(path, size)| allocated(path) >= *size) {
+            return Ok(layers.into_iter().map(|(path, _)| path).collect());
         }
         sleep(Duration::from_millis(200)).await;
     }
 
-    let missing: Vec<String> = commits
+    let missing: Vec<String> = layers
         .iter()
-        .filter(|path| !path.exists())
-        .map(|path| path.display().to_string())
+        .filter(|(path, size)| allocated(path) < *size)
+        .map(|(path, size)| {
+            format!(
+                "{} (allocated {} of {size} bytes)",
+                path.display(),
+                allocated(path)
+            )
+        })
         .collect();
-    bail!("timed out waiting for commit files: {}", missing.join(", "));
+    bail!(
+        "timed out waiting for cached layers: {}",
+        missing.join(", ")
+    );
 }
 
 async fn read_ranges(image: &ImageFile, offsets: &[u64], read_len: usize) -> Result<Vec<Vec<u8>>> {
@@ -407,14 +436,13 @@ async fn create_image_file_with_retry(
     })
 }
 
-/// Background download stores the original registry blob locally.
-/// For overlaybd remote layers that blob is a tar archive whose payload is the
-/// actual `overlaybd.commit` zfile. Validate that wrapper rather than assuming
-/// the on-disk file is a bare LSMT commit.
-async fn validate_downloaded_commit_blob(path: &Path, io_ring: IoRingHandle) -> Result<()> {
+/// The background download stores the original registry blob in the shared
+/// full-file cache. For overlaybd remote layers that blob is a tar archive
+/// whose payload is the actual `overlaybd.commit` zfile. Validate that wrapper
+/// rather than assuming the cached bytes are a bare LSMT commit.
+async fn validate_downloaded_commit_blob(path: &Path) -> Result<()> {
     let local: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::open_ro(path, io_ring)
-            .await
+        LocalFile::open_ro(path)
             .with_context(|| format!("open downloaded commit blob failed: {}", path.display()))?,
     );
     let tar = new_tar_file_adaptor(local).await.with_context(|| {
@@ -513,16 +541,24 @@ async fn test_registry_e2e_read_download_verify() -> Result<()> {
     }
 
     let wait_secs = env_u64(ENV_WAIT_DOWNLOAD_SECS)?.unwrap_or(300);
-    let commit_paths = wait_commits(&image_cfg, Duration::from_secs(wait_secs)).await?;
-    if commit_paths.is_empty() {
-        bail!("download is enabled but no lower dirs exist to receive commit files");
+    // Background download fills the shared full-file cache instead of
+    // producing per-layer commit files: wait for every remote layer blob to
+    // be fully cached, then validate each cached blob still wraps a zfile
+    // commit payload.
+    let global_cfg: GlobalConfig = serde_json::from_slice(
+        &fs::read(&global_cfg_path).context("read generated global config failed")?,
+    )
+    .context("parse generated global config failed")?;
+    let cache_dir = PathBuf::from(&global_cfg.cache_config.cache_dir);
+    let cached_blobs =
+        wait_cached_layers(&image_cfg, &cache_dir, Duration::from_secs(wait_secs)).await?;
+    if cached_blobs.is_empty() {
+        bail!("download is enabled but no remote lowers exist to cache");
     }
-
-    // Validate each downloaded local blob still wraps a zfile commit payload.
-    for commit_path in &commit_paths {
-        validate_downloaded_commit_blob(commit_path, service.io_ring(commit_path))
+    for cached_blob in &cached_blobs {
+        validate_downloaded_commit_blob(cached_blob)
             .await
-            .with_context(|| format!("commit validation failed: {}", commit_path.display()))?;
+            .with_context(|| format!("cached blob validation failed: {}", cached_blob.display()))?;
     }
 
     drop(image);
@@ -570,7 +606,7 @@ async fn test_registry_e2e_upper_write_sync_reopen_persist() -> Result<()> {
 
     let upper_data = work_root.join("upper.data");
     let upper_index = work_root.join("upper.index");
-    create_initialized_upper(&upper_data, &upper_index, 0, service.io_ring(&upper_data)).await?;
+    create_initialized_upper(&upper_data, &upper_index, 0).await?;
     let upper_data_len_before = fs::metadata(&upper_data)
         .with_context(|| format!("stat upper data failed: {}", upper_data.display()))?
         .len();
@@ -709,7 +745,7 @@ async fn test_registry_e2e_upper_compact_to_local_lower() -> Result<()> {
 
     let upper_data = work_root.join("compact-upper.data");
     let upper_index = work_root.join("compact-upper.index");
-    create_initialized_upper(&upper_data, &upper_index, 0, service.io_ring(&upper_data)).await?;
+    create_initialized_upper(&upper_data, &upper_index, 0).await?;
     rw_cfg.upper = UpperConfig {
         mode: None,
         index: upper_index.to_string_lossy().into_owned(),
@@ -747,8 +783,7 @@ async fn test_registry_e2e_upper_compact_to_local_lower() -> Result<()> {
 
     let compact_path = work_root.join("flattened-lower.data");
     let compact_dest: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::new(&compact_path, service.io_ring(&compact_path))
-            .await
+        LocalFile::new(&compact_path)
             .with_context(|| format!("create compact dest failed: {}", compact_path.display()))?,
     );
     image

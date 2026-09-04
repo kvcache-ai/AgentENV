@@ -6,7 +6,7 @@ if [[ -z "${E2E_SERVER_SH_LOADED:-}" ]]; then
 
   : "${AENV_PORT:=18080}"
   : "${AENV_URL:=http://127.0.0.1:${AENV_PORT}}"
-  : "${AENV_API_KEY:=e2e-test-key}"
+  : "${AENV_API_KEY:=e2b_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef}"
   : "${SERVER_START_TIMEOUT:=30}"
 
   _SERVER_PID=""
@@ -15,6 +15,7 @@ if [[ -z "${E2E_SERVER_SH_LOADED:-}" ]]; then
     local binary="${1:?usage: start_server <binary> [config_path]}"
     local config="${2:-}"
 
+    export AENV_API_KEY
     local env_vars=(
       "API_ADDR=127.0.0.1:${AENV_PORT}"
       "RUST_LOG=agentenv=info,envd=info"

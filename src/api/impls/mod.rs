@@ -1,11 +1,12 @@
 mod admin;
 mod attached_drives;
-mod auth;
+pub(crate) mod auth;
 mod pagination;
 mod sandbox;
 mod snapshots;
 mod template;
 mod template_helpers;
+mod volumes;
 
 use std::sync::Arc;
 
@@ -13,12 +14,14 @@ use anyhow::Error as AnyhowError;
 use async_trait::async_trait;
 
 use super::proxy::{build_proxy_client, ProxyClient};
+use crate::api_key::ApiKey;
 use crate::image::ImageResolver;
 use crate::observability::ObservabilityService;
 use crate::orchestrator::Orchestrator;
 use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
+use crate::volume::VolumeManager;
 use agentenv_http_server::{apis, models};
 
 #[derive(Clone, Debug)]
@@ -30,28 +33,35 @@ pub struct ApiImpl {
     snapshot_manager: Arc<SnapshotManager>,
     template_builder: Arc<TemplateBuilder>,
     image_resolver: Arc<ImageResolver>,
+    volume_manager: Arc<VolumeManager>,
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
+    api_key: ApiKey,
 }
 
 impl ApiImpl {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         orchestrator: Arc<Orchestrator>,
         snapshot_manager: Arc<SnapshotManager>,
         template_builder: Arc<TemplateBuilder>,
         image_resolver: Arc<ImageResolver>,
+        volume_manager: Arc<VolumeManager>,
         observability: Option<Arc<ObservabilityService>>,
         sandbox_proxy_domains: Vec<String>,
+        api_key: ApiKey,
     ) -> Self {
         Self {
             orchestrator,
             snapshot_manager,
             template_builder,
             image_resolver,
+            volume_manager,
             observability,
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
+            api_key,
         }
     }
 
@@ -100,12 +110,13 @@ impl ApiImpl {
         match err {
             RepositoryError::InvalidRequest { .. } => Self::error(400, err.to_string()),
             RepositoryError::SnapshotNotFound { .. }
+            | RepositoryError::VolumeNotFound { .. }
             | RepositoryError::AliasNotFound { .. }
             | RepositoryError::ArtifactNotFound { .. }
             | RepositoryError::ManagedLayerNotFound { .. } => Self::error(404, err.to_string()),
-            RepositoryError::AliasConflict { .. } | RepositoryError::IntegrityMismatch { .. } => {
-                Self::error(409, err.to_string())
-            }
+            RepositoryError::AliasConflict { .. }
+            | RepositoryError::VolumeNameConflict { .. }
+            | RepositoryError::IntegrityMismatch { .. } => Self::error(409, err.to_string()),
             RepositoryError::Unsupported { .. } => Self::error(500, err.to_string()),
             RepositoryError::Backend { .. } => Self::internal_error(err),
         }

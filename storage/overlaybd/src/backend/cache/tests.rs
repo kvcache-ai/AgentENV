@@ -1,7 +1,8 @@
 use super::super::local::LocalFile;
 use super::*;
+use crate::backend::cache::full_file_cache::cache_store::CacheAdvice;
 use crate::io::virtual_file::VirtualFile;
-use crate::test_utils::test_io_ring;
+use crate::sys;
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -13,9 +14,216 @@ use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::tempdir;
+use tokio::sync::{Notify, Semaphore};
+
+#[derive(Debug, Clone)]
+struct SlowFirstReadSource {
+    inner: Arc<SlowFirstReadSourceInner>,
+}
+
+#[derive(Debug)]
+struct SlowFirstReadSourceInner {
+    data: Vec<u8>,
+    block_size: u64,
+    hang: Duration,
+    calls: Mutex<HashMap<u64, usize>>,
+    attempts: AtomicUsize,
+}
+
+impl SlowFirstReadSource {
+    fn new(data: Vec<u8>, block_size: u64, hang: Duration) -> Self {
+        Self {
+            inner: Arc::new(SlowFirstReadSourceInner {
+                data,
+                block_size,
+                hang,
+                calls: Mutex::new(HashMap::new()),
+                attempts: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    fn attempts(&self) -> usize {
+        self.inner.attempts.load(Ordering::Acquire)
+    }
+}
+
+#[async_trait]
+impl VirtualFile for SlowFirstReadSource {
+    async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
+        let block_id = offset / self.inner.block_size;
+        self.inner.attempts.fetch_add(1, Ordering::AcqRel);
+        let first_for_block = {
+            let mut calls = self.inner.calls.lock().unwrap();
+            let calls = calls.entry(block_id).or_default();
+            *calls += 1;
+            *calls == 1
+        };
+        if first_for_block {
+            tokio::time::sleep(self.inner.hang).await;
+        }
+        let size = self.inner.data.len() as u64;
+        if offset >= size || len == 0 {
+            return Ok(Bytes::new());
+        }
+        let end = offset.saturating_add(len as u64).min(size);
+        Ok(Bytes::copy_from_slice(
+            &self.inner.data[offset as usize..end as usize],
+        ))
+    }
+
+    async fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<usize> {
+        bail!("slow first read source is read-only");
+    }
+
+    async fn size(&self) -> Result<u64> {
+        Ok(self.inner.data.len() as u64)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ControlledSource {
+    inner: Arc<ControlledSourceInner>,
+}
+
+#[derive(Debug)]
+struct ControlledSourceInner {
+    data: Vec<u8>,
+    block_size: u64,
+    calls: Mutex<HashMap<u64, usize>>,
+    failures: Mutex<HashMap<u64, usize>>,
+    panic_next: AtomicBool,
+    gates: Mutex<HashMap<u64, Arc<Semaphore>>>,
+    changed: Notify,
+    completed: AtomicUsize,
+}
+
+impl ControlledSource {
+    fn new(data: Vec<u8>, block_size: u64) -> Self {
+        Self {
+            inner: Arc::new(ControlledSourceInner {
+                data,
+                block_size,
+                calls: Mutex::new(HashMap::new()),
+                failures: Mutex::new(HashMap::new()),
+                panic_next: AtomicBool::new(false),
+                gates: Mutex::new(HashMap::new()),
+                changed: Notify::new(),
+                completed: AtomicUsize::new(0),
+            }),
+        }
+    }
+
+    fn fail_block(&self, block_id: u64, times: usize) {
+        self.inner.failures.lock().unwrap().insert(block_id, times);
+    }
+
+    fn panic_next_read(&self) {
+        self.inner.panic_next.store(true, Ordering::Release);
+    }
+
+    fn gate_block(&self, block_id: u64) {
+        self.inner
+            .gates
+            .lock()
+            .unwrap()
+            .insert(block_id, Arc::new(Semaphore::new(0)));
+    }
+
+    fn release_block(&self, block_id: u64) {
+        if let Some(gate) = self.inner.gates.lock().unwrap().get(&block_id) {
+            gate.add_permits(1);
+        }
+    }
+
+    fn calls(&self, block_id: u64) -> usize {
+        self.inner
+            .calls
+            .lock()
+            .unwrap()
+            .get(&block_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn completed(&self) -> usize {
+        self.inner.completed.load(Ordering::Acquire)
+    }
+
+    async fn wait_calls(&self, block_id: u64, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if self.calls(block_id) >= expected {
+                    break;
+                }
+                let notified = self.inner.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.calls(block_id) >= expected {
+                    break;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("timed out waiting for source calls");
+    }
+}
+
+#[async_trait]
+impl VirtualFile for ControlledSource {
+    async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
+        let block_id = offset / self.inner.block_size;
+        {
+            let mut calls = self.inner.calls.lock().unwrap();
+            *calls.entry(block_id).or_default() += 1;
+        }
+        self.inner.changed.notify_waiters();
+        let gate = self.inner.gates.lock().unwrap().get(&block_id).cloned();
+        if let Some(gate) = gate {
+            let permit = gate.acquire().await.expect("gate open");
+            permit.forget();
+        }
+        assert!(
+            !self.inner.panic_next.swap(false, Ordering::AcqRel),
+            "forced source panic"
+        );
+        let should_fail = {
+            let mut failures = self.inner.failures.lock().unwrap();
+            let remaining = failures.entry(block_id).or_default();
+            if *remaining > 0 {
+                *remaining -= 1;
+                true
+            } else {
+                false
+            }
+        };
+        if should_fail {
+            bail!("forced source failure for block {block_id}");
+        }
+        let size = self.inner.data.len() as u64;
+        if offset >= size || len == 0 {
+            return Ok(Bytes::new());
+        }
+        let end = offset.saturating_add(len as u64).min(size);
+        self.inner.completed.fetch_add(1, Ordering::Release);
+        self.inner.changed.notify_waiters();
+        Ok(Bytes::copy_from_slice(
+            &self.inner.data[offset as usize..end as usize],
+        ))
+    }
+
+    async fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<usize> {
+        bail!("controlled source is read-only");
+    }
+
+    async fn size(&self) -> Result<u64> {
+        Ok(self.inner.data.len() as u64)
+    }
+}
 
 #[derive(Debug, Clone)]
 struct MockSource {
@@ -197,6 +405,7 @@ fn test_options(root: &Path) -> FileCacheBackendOptions {
         cache_dir: root.to_path_buf(),
         capacity_bytes: 1024 * 1024,
         block_size: 256 * 4096,
+        ..Default::default()
     }
 }
 
@@ -206,7 +415,7 @@ fn uniform_char_random_data(size: usize, seed: u64) -> Vec<u8> {
 }
 
 async fn write_local_file(path: &Path, data: &[u8]) -> Result<()> {
-    let file = LocalFile::new(path, test_io_ring()).await?;
+    let file = LocalFile::new(path)?;
     let _ = file.write_at(0, data).await?;
     file.sync().await?;
     Ok(())
@@ -223,6 +432,561 @@ fn assert_err_contains(err: &anyhow::Error, needle: &str) {
 fn err_is_errno(err: &anyhow::Error, errno: Errno) -> bool {
     err.downcast_ref::<Errno>()
         .is_some_and(|value| *value == errno)
+}
+
+fn background_config() -> crate::config::DownloadConfig {
+    crate::config::DownloadConfig {
+        delay: 0,
+        delay_extra: 0,
+        max_mbps: 0,
+        try_cnt: 1,
+        block_size: 4096,
+        concurrency: 1,
+        max_inflight_blocks: 1,
+        ..Default::default()
+    }
+}
+
+async fn wait_cached(file: &CachedFile, offset: u64, len: usize) {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while file.query(offset, len).await.expect("query cache") != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed out waiting for cached range");
+}
+
+async fn wait_not_registered(backend: &FileCacheBackend, cache_id: &str) {
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while backend.bk_download_registered(cache_id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("timed out waiting for download registration cleanup");
+}
+
+#[tokio::test]
+async fn test_background_download_exposes_completed_block_before_task_finishes() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let payload = vec![7u8; 8192];
+    let source = Arc::new(ControlledSource::new(payload.clone(), 4096));
+    source.gate_block(1);
+    let file = backend
+        .open_file_with_source_size(
+            "exposes-completed-block",
+            source.clone(),
+            payload.len() as u64,
+        )
+        .await
+        .expect("open cached file");
+
+    backend
+        .submit_bk_download(file.clone(), background_config(), None)
+        .expect("submit background download");
+    wait_cached(file.as_ref(), 0, 4096).await;
+    source.wait_calls(1, 1).await;
+
+    let cache_only = backend
+        .open_cache_only("exposes-completed-block", payload.len() as u64)
+        .await
+        .expect("open cache-only handle");
+    let first = cache_only
+        .read_at(0, 4096)
+        .await
+        .expect("read completed background block from cache only");
+    assert_eq!(first.as_ref(), &payload[..4096]);
+    assert!(cache_only.read_at(4096, 4096).await.is_err());
+    assert_eq!(
+        source.calls(0),
+        1,
+        "block 0 must land from exactly one source read"
+    );
+
+    source.release_block(1);
+    wait_cached(file.as_ref(), 0, payload.len()).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_background_download_registers_dedup_key_before_worker_poll() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let source = Arc::new(ControlledSource::new(vec![1u8; 4096], 4096));
+    source.gate_block(0);
+    let file = backend
+        .open_file_with_source_size("submit-dedup", source.clone(), 4096)
+        .await
+        .expect("open cached file");
+
+    backend
+        .submit_bk_download(file.clone(), background_config(), None)
+        .expect("first submit");
+    backend
+        .submit_bk_download(file.clone(), background_config(), None)
+        .expect("duplicate submit");
+    assert!(backend.bk_download_registered(file.cache_id()));
+    assert_eq!(
+        backend.bk_download_registered_count(),
+        1,
+        "duplicate submit must not register a second task"
+    );
+
+    source.release_block(0);
+    wait_cached(file.as_ref(), 0, 4096).await;
+    wait_not_registered(&backend, file.cache_id()).await;
+    assert_eq!(source.calls(0), 1);
+}
+
+#[tokio::test]
+async fn test_background_download_panic_releases_dedup_registration() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let panicking = Arc::new(ControlledSource::new(vec![12u8; 4096], 4096));
+    panicking.panic_next_read();
+    let file = backend
+        .open_file_with_source_size("panic-cleanup", panicking.clone(), 4096)
+        .await
+        .expect("open cached file");
+    backend
+        .submit_bk_download(file.clone(), background_config(), None)
+        .expect("submit panicking task");
+    panicking.wait_calls(0, 1).await;
+    wait_not_registered(&backend, file.cache_id()).await;
+
+    let healthy = Arc::new(ControlledSource::new(vec![13u8; 4096], 4096));
+    file.set_source(Some(healthy.clone()));
+    backend
+        .submit_bk_download(file.clone(), background_config(), None)
+        .expect("resubmit after panic");
+    wait_cached(file.as_ref(), 0, 4096).await;
+    assert_eq!(healthy.calls(0), 1);
+}
+
+#[tokio::test]
+async fn test_background_download_retry_reads_only_missing_blocks() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let payload = vec![4u8; 8192];
+    let source = Arc::new(ControlledSource::new(payload.clone(), 4096));
+    source.fail_block(1, 1);
+    let file = backend
+        .open_file_with_source_size("retry-missing", source.clone(), payload.len() as u64)
+        .await
+        .expect("open cached file");
+    let mut config = background_config();
+    config.try_cnt = 2;
+    backend
+        .submit_bk_download(file.clone(), config, None)
+        .expect("submit");
+
+    source.wait_calls(1, 2).await;
+    wait_cached(file.as_ref(), 0, payload.len()).await;
+    assert_eq!(source.calls(0), 1);
+    assert_eq!(source.calls(1), 2);
+}
+
+#[tokio::test]
+async fn test_active_background_download_prevents_eviction() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let source = Arc::new(ControlledSource::new(vec![5u8; 8192], 4096));
+    source.gate_block(1);
+    let file = backend
+        .open_file_with_source_size("active-eviction", source.clone(), 8192)
+        .await
+        .expect("open cached file");
+    backend
+        .submit_bk_download(file.clone(), background_config(), None)
+        .expect("submit");
+    source.wait_calls(1, 1).await;
+    drop(file);
+
+    assert_eq!(backend.evict_by_size(4096).await.expect("evict"), 0);
+    assert_eq!(
+        backend.file_stats("active-eviction").unwrap().bytes_used,
+        4096
+    );
+    source.release_block(1);
+    // Drain the scheduler before the test tears down its runtime/tempdir.
+    tokio::time::timeout(Duration::from_secs(3), backend.shutdown_bk_downloads())
+        .await
+        .expect("background download shutdown did not drain");
+}
+
+#[tokio::test]
+async fn test_background_download_shutdown_drains_started_io_without_new_dispatch() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let source = Arc::new(ControlledSource::new(vec![7u8; 8192], 4096));
+    source.gate_block(0);
+    let file = backend
+        .open_file_with_source_size("shutdown-started", source.clone(), 8192)
+        .await
+        .expect("open cached file");
+    backend
+        .submit_bk_download(file.clone(), background_config(), None)
+        .expect("submit");
+    source.wait_calls(0, 1).await;
+
+    drop(file);
+    // Let the started block read finish, then close the scheduler. On the
+    // current-thread runtime the shutdown leader flips `running` before the
+    // woken read continues, so no new block is dispatched after the drain.
+    source.release_block(0);
+    tokio::time::timeout(Duration::from_secs(3), backend.shutdown_bk_downloads())
+        .await
+        .expect("shutdown did not drain");
+    assert_eq!(source.completed(), 1, "started I/O was not drained");
+    assert_eq!(source.calls(1), 0, "shutdown dispatched a new block");
+}
+
+#[tokio::test]
+async fn test_background_download_saturated_scheduler_completes_all_tasks() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    options.bk_download_max_concurrent_files = 1;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+
+    // Three independent files share a single file slot, so their downloads
+    // run serially; saturation must queue, never skip or reject.
+    let mut files = Vec::new();
+    let mut payloads = Vec::new();
+    for index in 0..3u64 {
+        let payload = uniform_char_random_data(2 * 4096, 0x5a00 + index);
+        let src_path = tmp.path().join(format!("saturated-{index}"));
+        write_local_file(&src_path, &payload)
+            .await
+            .expect("write source");
+        let source = Arc::new(LocalFile::open_ro(&src_path).expect("open source"));
+        let file = backend
+            .open_file_with_source_size(format!("saturated-{index}"), source, payload.len() as u64)
+            .await
+            .expect("open cached file");
+        backend
+            .submit_bk_download(file.clone(), background_config(), None)
+            .expect("submit must not fail under saturation");
+        files.push(file);
+        payloads.push(payload);
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while backend.bk_download_registered_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("saturated scheduler did not drain all tasks");
+
+    for (file, payload) in files.iter().zip(payloads.iter()) {
+        wait_cached(file.as_ref(), 0, payload.len()).await;
+        let got = file
+            .read_at(0, payload.len())
+            .await
+            .expect("read cached file");
+        assert_eq!(got.as_ref(), payload.as_slice());
+    }
+}
+
+#[tokio::test]
+async fn test_pending_background_download_keeps_entry_evictable() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let source = Arc::new(ControlledSource::new(vec![14u8; 8192], 4096));
+    let file = backend
+        .open_file_with_source_size("pending-eviction", source.clone(), 8192)
+        .await
+        .expect("open cached file");
+    file.refill_range(0, 4096)
+        .await
+        .expect("prefill first block");
+    assert_eq!(source.calls(0), 1);
+
+    // A task with a huge configured delay never leaves the waiting phase
+    // during the test: it is registered but holds no cache entry, so the
+    // entry stays evictable.
+    let mut config = background_config();
+    config.delay = 3600;
+    backend
+        .submit_bk_download(file.clone(), config, None)
+        .expect("submit");
+    assert!(backend.bk_download_registered(file.cache_id()));
+    drop(file);
+
+    assert_eq!(backend.evict_by_size(4096).await.expect("evict"), 4096);
+    assert!(backend.file_stats("pending-eviction").is_none());
+
+    // Do not leak the pending timer past the test.
+    backend.shutdown_bk_downloads().await;
+}
+
+#[tokio::test]
+async fn test_background_download_block_timeout_reissues_read() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    options.bk_download_hedge_timeout = Duration::from_millis(50);
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let payload = vec![15u8; 4096];
+    // The first read attempt per block hangs past the hedge timeout; the
+    // reissued read returns immediately.
+    let source = Arc::new(SlowFirstReadSource::new(
+        payload.clone(),
+        4096,
+        Duration::from_millis(300),
+    ));
+    let file = backend
+        .open_file_with_source_size("hedge-reissue", source.clone(), 4096)
+        .await
+        .expect("open cached file");
+    backend
+        .submit_bk_download(file.clone(), background_config(), None)
+        .expect("submit");
+
+    wait_cached(file.as_ref(), 0, 4096).await;
+    assert!(
+        source.attempts() >= 2,
+        "timed-out block read must be reissued, attempts={}",
+        source.attempts()
+    );
+    let cache_only = backend
+        .open_cache_only("hedge-reissue", 4096)
+        .await
+        .expect("cache-only handle");
+    assert_eq!(
+        cache_only
+            .read_at(0, 4096)
+            .await
+            .expect("read cached block")
+            .as_ref(),
+        payload.as_slice()
+    );
+}
+
+#[tokio::test]
+async fn test_background_download_chunk_fills_multiple_cache_blocks_per_read() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let payload: Vec<u8> = (0..16384).map(|v| (v % 251) as u8).collect();
+    let source = Arc::new(ControlledSource::new(payload.clone(), 4096));
+    let file = backend
+        .open_file_with_source_size("chunk-coalesce", source.clone(), payload.len() as u64)
+        .await
+        .expect("open cached file");
+    let mut config = background_config();
+    config.block_size = 16384; // one chunk covers four 4096-byte cache blocks
+    backend
+        .submit_bk_download(file.clone(), config, None)
+        .expect("submit");
+
+    wait_cached(file.as_ref(), 0, payload.len()).await;
+    // One source request filled all four cache blocks.
+    assert_eq!(source.calls(0), 1);
+    assert_eq!(source.calls(1), 0);
+    assert_eq!(source.calls(2), 0);
+    assert_eq!(source.calls(3), 0);
+    let data = file.read_at(0, payload.len()).await.expect("cached read");
+    assert_eq!(data.as_ref(), payload.as_slice());
+}
+
+#[tokio::test]
+async fn test_background_download_chunk_skips_cached_blocks_and_splits_runs() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let payload: Vec<u8> = (0..16384).map(|v| (v % 251) as u8).collect();
+    let source = Arc::new(ControlledSource::new(payload.clone(), 4096));
+    let file = backend
+        .open_file_with_source_size("chunk-runs", source.clone(), payload.len() as u64)
+        .await
+        .expect("open cached file");
+    // Foreground pre-fill of block 1 before the background download starts.
+    let pre = file.read_at(4096, 4096).await.expect("foreground prefill");
+    assert_eq!(pre.as_ref(), &payload[4096..8192]);
+    assert_eq!(source.calls(1), 1);
+
+    let mut config = background_config();
+    config.block_size = 16384; // chunk [0,4) splits into runs [0] and [2,3]
+    backend
+        .submit_bk_download(file.clone(), config, None)
+        .expect("submit");
+    wait_cached(file.as_ref(), 0, payload.len()).await;
+
+    assert_eq!(source.calls(1), 1, "cached block must not be re-read");
+    assert_eq!(source.calls(0), 1, "run [0] is a single source read");
+    assert_eq!(
+        source.calls(2),
+        1,
+        "run [2,3] is a single source read at offset 8192"
+    );
+    assert_eq!(source.calls(3), 0);
+    let data = file.read_at(0, payload.len()).await.expect("cached read");
+    assert_eq!(data.as_ref(), payload.as_slice());
+}
+
+#[tokio::test]
+async fn test_foreground_waits_for_background_loader_at_refill_limit() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    // Two 64-block chunks elect 128 cache blocks, reaching
+    // DEFAULT_MAX_REFILLING while both source reads are gated.
+    let payload = vec![43u8; 128 * 4096];
+    let source = Arc::new(ControlledSource::new(payload.clone(), 4096));
+    source.gate_block(0);
+    source.gate_block(64);
+    let file = backend
+        .open_file_with_source_size(
+            "foreground-dedup-limit",
+            source.clone(),
+            payload.len() as u64,
+        )
+        .await
+        .expect("open cached file");
+    let mut config = background_config();
+    config.block_size = 64 * 4096;
+    config.concurrency = 2;
+    config.max_inflight_blocks = 2;
+    backend
+        .submit_bk_download(file.clone(), config, None)
+        .expect("submit");
+    source.wait_calls(0, 1).await;
+    source.wait_calls(64, 1).await;
+
+    let target_block = 32u64;
+    let foreground_file = file.clone();
+    let foreground =
+        tokio::spawn(async move { foreground_file.read_at(target_block * 4096, 4096).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        source.calls(target_block),
+        0,
+        "foreground must wait for the elected background loader, not read the source again"
+    );
+    source.release_block(0);
+    source.release_block(64);
+    let data = tokio::time::timeout(Duration::from_secs(2), foreground)
+        .await
+        .expect("foreground read must complete")
+        .expect("foreground task")
+        .expect("foreground read");
+    assert_eq!(
+        data.as_ref(),
+        &payload[target_block as usize * 4096..(target_block as usize + 1) * 4096]
+    );
+}
+
+#[tokio::test]
+async fn test_dropping_backend_clone_does_not_stop_background_downloads() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    drop(backend.clone());
+
+    let payload = vec![41u8; 4096];
+    let source = Arc::new(ControlledSource::new(payload.clone(), 4096));
+    let file = backend
+        .open_file_with_source_size("clone-drop", source, payload.len() as u64)
+        .await
+        .expect("open cached file");
+    backend
+        .submit_bk_download(file.clone(), background_config(), None)
+        .expect("submit after clone drop");
+
+    wait_cached(file.as_ref(), 0, payload.len()).await;
+    assert_eq!(
+        file.read_at(0, payload.len())
+            .await
+            .expect("cached read")
+            .as_ref(),
+        payload.as_slice()
+    );
+}
+
+#[tokio::test]
+async fn test_shutdown_can_resume_after_first_waiter_is_aborted() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let source = Arc::new(ControlledSource::new(vec![42u8; 4096], 4096));
+    let file = backend
+        .open_file_with_source_size("abort-shutdown", source, 4096)
+        .await
+        .expect("open cached file");
+    let mut config = background_config();
+    config.delay = 3600;
+    backend
+        .submit_bk_download(file, config, None)
+        .expect("submit delayed task");
+
+    let first_backend = backend.clone();
+    let first = tokio::spawn(async move {
+        first_backend.shutdown_bk_downloads().await;
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !backend.bk_download_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("first shutdown caller must become the drain leader");
+    assert!(!first.is_finished(), "delayed task must keep drain pending");
+    first.abort();
+    let _ = first.await;
+
+    tokio::time::timeout(Duration::from_secs(2), backend.shutdown_bk_downloads())
+        .await
+        .expect("a later shutdown caller must finish the abandoned drain");
 }
 
 #[tokio::test]
@@ -282,6 +1046,25 @@ async fn test_cache_persistence_reload() {
     let got = file2.read_at(0, 128).await.expect("read cached");
     assert_eq!(got.as_ref(), &payload[..128]);
     assert_eq!(src2.read_calls(), 0);
+}
+
+#[tokio::test]
+async fn test_load_from_disk_preserves_premerged_index_dir() {
+    let tmp = tempdir().expect("create tempdir");
+    let reserved = tmp.path().join(crate::lsmt::file::PREMERGED_INDEX_DIR);
+    std::fs::create_dir_all(&reserved).expect("create premerged-index dir");
+    let artifact = reserved.join("deadbeef.pmidx");
+    std::fs::write(&artifact, b"pmidx-bytes").expect("write artifact");
+
+    let backend = FileCacheBackend::with_options(test_options(tmp.path()))
+        .await
+        .expect("backend init");
+    drop(backend);
+
+    assert!(
+        artifact.try_exists().expect("stat artifact"),
+        "recovery must not remove the premerged-index artifact cache"
+    );
 }
 
 #[tokio::test]
@@ -541,11 +1324,7 @@ async fn test_ro_cached_fs_basic() {
         .await
         .expect("write source");
 
-    let source = Arc::new(
-        LocalFile::open_ro(&src_path, test_io_ring())
-            .await
-            .expect("open source"),
-    );
+    let source = Arc::new(LocalFile::open_ro(&src_path).expect("open source"));
     let mut opt = test_options(tmp.path());
     opt.block_size = 1024 * 1024;
     opt.capacity_bytes = 512 * 1024 * 1024;
@@ -622,11 +1401,7 @@ async fn test_ro_cached_fs_basic() {
     write_local_file(&small_path, &small_payload)
         .await
         .expect("write small source");
-    let small_source = Arc::new(
-        LocalFile::open_ro(&small_path, test_io_ring())
-            .await
-            .expect("open small"),
-    );
+    let small_source = Arc::new(LocalFile::open_ro(&small_path).expect("open small"));
     let small_cached = backend
         .open_file("/testDir/small", small_source)
         .await
@@ -647,11 +1422,7 @@ async fn test_ro_cached_fs_basic() {
     write_local_file(&refill_path, &refill_payload)
         .await
         .expect("write refill source");
-    let refill_source = Arc::new(
-        LocalFile::open_ro(&refill_path, test_io_ring())
-            .await
-            .expect("open refill"),
-    );
+    let refill_source = Arc::new(LocalFile::open_ro(&refill_path).expect("open refill"));
     let refill_cached = backend
         .open_file("/testDir/refill", refill_source)
         .await
@@ -687,14 +1458,14 @@ async fn test_ro_cached_fs_basic() {
     assert_eq!(prefetched.as_ref(), &payload[page_size..page_size * 3]);
 
     cached
-        .fadvise(234, (5000 * page_size) as u64, libc::POSIX_FADV_WILLNEED)
+        .fadvise(234, (5000 * page_size) as u64, CacheAdvice::WillNeed)
         .await
         .expect("fadvise large prefetch");
     cached
         .fadvise(
             (aligned_size - page_size) as u64,
             (5000 * page_size) as u64,
-            libc::POSIX_FADV_WILLNEED,
+            CacheAdvice::WillNeed,
         )
         .await
         .expect("fadvise tail prefetch");
@@ -840,44 +1611,29 @@ async fn test_ro_cached_fs_xattr() {
     let name = CString::new("user.testxattr").expect("name cstr");
     let value = b"yes";
 
-    unsafe {
-        // SAFETY: pointers are valid and lengths are exact for libc xattr calls.
-        let ret = libc::setxattr(
-            path_c.as_ptr(),
-            name.as_ptr(),
-            value.as_ptr() as *const libc::c_void,
-            value.len(),
-            0,
-        );
-        if ret != 0 {
-            let err = Errno::last();
-            let unsupported = err == Errno::ENOTSUP
-                || (libc::EOPNOTSUPP != libc::ENOTSUP && err == Errno::EOPNOTSUPP);
-            if unsupported {
-                return;
-            }
+    // Set the attribute out of band so the cached-fs layer has a real one to
+    // read back. Going through `crate::sys` rather than raw libc keeps this
+    // portable and drops the `unsafe` block.
+    if let Err(err) = sys::setxattr(&path_c, &name, value, 0) {
+        let sys::SysError::Errno(errno) = err else {
             panic!("setxattr failed: {err}");
+        };
+        // Compared rather than matched: `ENOTSUP` and `EOPNOTSUPP` share a value
+        // on Linux, so listing both as match arms would be an unreachable arm
+        // there while still being two distinct codes elsewhere.
+        if errno == Errno::ENOTSUP || errno == Errno::EOPNOTSUPP {
+            // This filesystem has no xattr support; nothing to exercise.
+            return;
         }
-
-        let mut out = [0u8; 32];
-        let got = libc::getxattr(
-            path_c.as_ptr(),
-            name.as_ptr(),
-            out.as_mut_ptr() as *mut libc::c_void,
-            out.len(),
-        );
-        assert_eq!(got as usize, value.len());
-        assert_eq!(&out[..value.len()], value);
-
-        let ret = libc::removexattr(path_c.as_ptr(), name.as_ptr());
-        assert_eq!(ret, 0);
+        panic!("setxattr failed: {errno}");
     }
 
-    let source = Arc::new(
-        LocalFile::open_rw(&path, false, test_io_ring())
-            .await
-            .expect("open source"),
-    );
+    let got = sys::getxattr(&path_c, &name).expect("getxattr");
+    assert_eq!(got, value);
+
+    sys::removexattr(&path_c, &name).expect("removexattr");
+
+    let source = Arc::new(LocalFile::open_rw(&path, false).expect("open source"));
     let backend = FileCacheBackend::with_options(test_options(tmp.path()))
         .await
         .expect("backend");
@@ -1027,6 +1783,7 @@ async fn test_cache_pool_style_rename_and_evict() {
         .await
         .expect("read renamed cache");
     assert_eq!(got.as_ref(), &payload[..4096]);
+    drop(cache_only);
 
     backend
         .evict_store_key("/cache/new")
@@ -1254,6 +2011,7 @@ async fn test_overlaybd_watermark_formula_alignment() {
         cache_dir: tmp.path().join("formula"),
         capacity_bytes: cap,
         block_size: DEFAULT_BLOCK_SIZE,
+        ..Default::default()
     };
     let backend = FileCacheBackend::with_options_and_trans_func(opt, None)
         .await
@@ -1320,7 +2078,7 @@ async fn test_cached_fs_facade_open_access_rename_and_unlink() {
     let backend = FileCacheBackend::with_options(test_options(&tmp.path().join("cache")))
         .await
         .expect("backend");
-    let source_fs = Arc::new(LocalFsSource::new(&src_root, test_io_ring()));
+    let source_fs = Arc::new(LocalFsSource::new(&src_root));
     let cached_fs = CachedFs::new(Some(source_fs.clone()), backend.clone());
 
     let cached = cached_fs.open("/dir/file", 0).await.expect("open cached");
@@ -1356,6 +2114,7 @@ async fn test_cached_fs_facade_open_access_rename_and_unlink() {
         .await
         .expect("read renamed cache");
     assert_eq!(got.as_ref(), &payload[..4096]);
+    drop(cache_only);
 
     cached_fs
         .unlink("/dir/file_renamed")
@@ -1423,12 +2182,13 @@ async fn test_cached_fs_facade_unlink_prefers_source_fs_status() {
     let backend = FileCacheBackend::with_options(test_options(&tmp.path().join("cache")))
         .await
         .expect("backend");
-    let source_fs = Arc::new(LocalFsSource::new(&src_root, test_io_ring()));
+    let source_fs = Arc::new(LocalFsSource::new(&src_root));
     let cached_fs = CachedFs::new(Some(source_fs), backend.clone());
 
     let cached = cached_fs.open("/unlink-me", 0).await.expect("open cached");
     let _ = cached.read_at(0, 1024).await.expect("populate cache");
     assert!(backend.contains_src_name("/unlink-me"));
+    drop(cached);
 
     cached_fs
         .unlink("/unlink-me")
@@ -1459,7 +2219,7 @@ async fn test_cached_fs_facade_path_xattr_passthrough() {
     let backend = FileCacheBackend::with_options(test_options(&tmp.path().join("cache")))
         .await
         .expect("backend");
-    let source_fs = Arc::new(LocalFsSource::new(&src_root, test_io_ring()));
+    let source_fs = Arc::new(LocalFsSource::new(&src_root));
     let cached_fs = CachedFs::new(Some(source_fs), backend);
 
     let name = "user.cachedfsxattr";
@@ -1520,7 +2280,7 @@ async fn test_cached_fs_facade_source_fs_passthrough_misc() {
     let backend = FileCacheBackend::with_options(test_options(&tmp.path().join("cache")))
         .await
         .expect("backend");
-    let source_fs = Arc::new(LocalFsSource::new(&src_root, test_io_ring()));
+    let source_fs = Arc::new(LocalFsSource::new(&src_root));
     let cached_fs = CachedFs::new(Some(source_fs), backend);
 
     cached_fs
@@ -1762,6 +2522,7 @@ async fn test_concurrent_read_during_capacity_eviction() {
         cache_dir: tmp.path().to_path_buf(),
         capacity_bytes: 4 * BLOCK_SIZE,
         block_size: BLOCK_SIZE,
+        ..Default::default()
     };
     let backend = FileCacheBackend::with_options(opt).await.expect("backend");
 
@@ -1847,4 +2608,152 @@ async fn test_concurrent_read_during_capacity_eviction() {
             panic!("task failed: {e}");
         }
     }
+}
+
+/// Regression for the 2026-08-11 cache-poison incident: eviction must clear
+/// the in-memory bitmap before any destructive filesystem operation, so a
+/// failed eviction can never leave a bitmap claiming blocks whose data is
+/// already gone (which would serve zeroed bytes to every later read).
+#[tokio::test]
+async fn test_eviction_clears_bitmap_before_destroying_data() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let payload = uniform_char_random_data(4096, 31);
+    let source = Arc::new(MockSource::new(payload.clone(), Duration::ZERO));
+    let file = backend
+        .open_file_with_source_size("evict-order", source, payload.len() as u64)
+        .await
+        .expect("open cached file");
+    assert_eq!(
+        file.read_at(0, 4096).await.expect("warm read").as_ref(),
+        payload.as_slice()
+    );
+
+    // Force eviction to fail at metadata removal: meta.bin is replaced by a
+    // directory (fresh entries have no meta.bin until the first checkpoint).
+    let entry = backend
+        .get_cache_entry(&super::cache_key_digest("evict-order"))
+        .expect("entry");
+    let meta_path = entry.paths.meta_path.clone();
+    let _ = std::fs::remove_file(&meta_path);
+    std::fs::create_dir(&meta_path).expect("replace meta.bin with a directory");
+    entry
+        .evict_all_blocks()
+        .await
+        .expect_err("eviction must fail when meta removal fails");
+
+    assert!(
+        entry.index.read().is_empty(),
+        "a failed eviction must leave the in-memory bitmap cleared"
+    );
+    std::fs::remove_dir(&meta_path).expect("cleanup meta directory");
+    assert_eq!(
+        file.read_at(0, 4096)
+            .await
+            .expect("read after failed eviction")
+            .as_ref(),
+        payload.as_slice(),
+        "reads after a failed eviction must fall back to the source"
+    );
+}
+
+#[tokio::test]
+async fn test_reserve_range_guard_punches_unless_committed() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let source = Arc::new(ControlledSource::new(vec![1u8; 8192], 4096));
+    let _file = backend
+        .open_file_with_source_size("reserve-guard", source, 8192)
+        .await
+        .expect("open cached file");
+    let entry = backend
+        .get_cache_entry(&super::cache_key_digest("reserve-guard"))
+        .expect("entry");
+    let data_path = entry.paths.data_path.clone();
+    let allocated_blocks = move || {
+        std::fs::metadata(&data_path)
+            .expect("stat cache data file")
+            .blocks()
+    };
+
+    let baseline = allocated_blocks();
+    let reservation = entry.reserve_range(0, 4096).expect("reserve");
+    if allocated_blocks() == baseline {
+        // Filesystem without fallocate support: reservation and punch are
+        // no-ops and there is nothing further to verify.
+        return;
+    }
+
+    drop(reservation);
+    assert_eq!(
+        allocated_blocks(),
+        baseline,
+        "dropping an uncommitted reservation must punch the range back"
+    );
+
+    entry.reserve_range(0, 4096).expect("reserve").commit();
+    assert!(
+        allocated_blocks() > baseline,
+        "a committed reservation must keep the disk blocks"
+    );
+}
+
+#[tokio::test]
+async fn test_failed_foreground_refill_leaves_no_reserved_blocks() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let payload = uniform_char_random_data(8192, 42);
+    let source = Arc::new(ControlledSource::new(payload.clone(), 4096));
+    // Fail the refill's source read once; the foreground read then falls
+    // back to a second, successful source read.
+    source.fail_block(0, 1);
+    let file = backend
+        .open_file_with_source_size("refill-rollback", source.clone(), payload.len() as u64)
+        .await
+        .expect("open cached file");
+
+    let bytes = file
+        .read_at(0, 4096)
+        .await
+        .expect("read must fall back to the source after the failed refill");
+    assert_eq!(bytes.as_ref(), &payload[..4096]);
+    assert_eq!(source.calls(0), 2, "refill attempt plus fallback read");
+
+    // The failed refill must neither publish the block nor account bytes...
+    let stats = backend.file_stats("refill-rollback").expect("file stats");
+    assert_eq!(stats.bytes_used, 0, "failed refill must not publish blocks");
+    assert_eq!(
+        backend.stats().bytes_used,
+        0,
+        "failed refill must not change capacity accounting"
+    );
+
+    // ...and must roll its reservation back: no allocated disk blocks may
+    // remain in the sparse data file.
+    let entry = backend
+        .get_cache_entry(&super::cache_key_digest("refill-rollback"))
+        .expect("entry");
+    assert_eq!(
+        std::fs::metadata(&entry.paths.data_path)
+            .expect("stat cache data file")
+            .blocks(),
+        0,
+        "failed refill must leave the data file fully sparse"
+    );
 }

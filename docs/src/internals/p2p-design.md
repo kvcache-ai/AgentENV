@@ -159,3 +159,6 @@ The P2P transport does not define what an artifact means. Each consuming module 
 - Deciding whether and when to publish local artifacts.
 
 This boundary keeps the transport reusable and avoids baking module-specific cache semantics into `src/p2p`.
+
+The image resolver uses the same boundary for standard OCI conversion artifacts. After a converted OverlayBD commit is durable in the node-local image cache, the image module publishes it under `oci-layer/v1/{context-hash}`. The hash is serialized from `LayerConversionKey`; descriptor metadata contains only the protocol version, output commit digest, and size. A consumer still resolves the source OCI manifest/config from the registry, then looks up each conversion context in P2P before falling back to local OCI download and conversion.
+Fetched bytes are verified as a sealed OverlayBD layer before being indexed locally. P2P publication and lookup failures are acceleration misses, while successful publications are recorded on the owning image-cache hard commit so GC can unpublish them before deleting the file.

@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,11 +25,83 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+const (
+	apiKeyEnv         = "AENV_API_KEY"
+	defaultAPIKeyPath = "/run/secrets/api-key"
+	maxAPIKeyLen      = 256
+	maxAPIKeyFileLen  = maxAPIKeyLen + 2
+)
+
 func newSchedulerConn(addr string) (*grpc.ClientConn, error) {
 	return grpc.NewClient(
 		addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
+}
+
+func loadAPIKey() (string, error) {
+	return loadAPIKeyFrom(os.LookupEnv, defaultAPIKeyPath)
+}
+
+func loadAPIKeyFrom(lookupEnv func(string) (string, bool), secretPath string) (string, error) {
+	value, source := "", apiKeyEnv
+	if explicit, present := lookupEnv(apiKeyEnv); present {
+		value = explicit
+	} else {
+		file, err := openSecretFile(secretPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return "", fmt.Errorf("%s must be set or %s must exist", apiKeyEnv, secretPath)
+			}
+			return "", fmt.Errorf("read secret %s: %w", secretPath, err)
+		}
+		defer file.Close()
+		contents, err := io.ReadAll(io.LimitReader(file, maxAPIKeyFileLen+1))
+		if err != nil {
+			return "", fmt.Errorf("read secret %s: %w", secretPath, err)
+		}
+		value = strings.TrimSuffix(strings.TrimSuffix(string(contents), "\n"), "\r")
+		source = secretPath
+	}
+	return validateAPIKey(value, source)
+}
+
+func openSecretFile(path string) (*os.File, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), path)
+	if file == nil {
+		_ = syscall.Close(fd)
+		return nil, fmt.Errorf("open returned an invalid file descriptor")
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, fmt.Errorf("must be a regular file")
+	}
+	return file, nil
+}
+
+func validateAPIKey(value, source string) (string, error) {
+	if len(value) < 32 || len(value) > maxAPIKeyLen {
+		return "", fmt.Errorf("API key from %s must contain between 32 and %d URL-safe characters", source, maxAPIKeyLen)
+	}
+	for _, char := range []byte(value) {
+		if (char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '.' || char == '_' || char == '~' || char == '-' {
+			continue
+		}
+		return "", fmt.Errorf("API key from %s must contain between 32 and %d URL-safe characters", source, maxAPIKeyLen)
+	}
+	return value, nil
 }
 
 func main() {
@@ -37,7 +112,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config failed: %v", err)
 	}
-
+	apiKey, err := loadAPIKey()
+	if err != nil {
+		log.Fatalf("load API key failed: %v", err)
+	}
 	logger, err := logging.New(cfg.LogLevel, cfg.LogFormat)
 	if err != nil {
 		log.Fatalf("init logger failed: %v", err)
@@ -65,6 +143,7 @@ func main() {
 	s, err := gateway.NewServer(logger, schedulerClient, gateway.ServerOptions{
 		RequestTimeout:           cfg.Gateway.RequestTimeout,
 		MaxResponseSize:          cfg.Gateway.ForwardResponseSize,
+		APIKey:                   apiKey,
 		DebugMode:                cfg.Gateway.DebugMode,
 		SandboxProxyDomains:      cfg.Gateway.SandboxProxyDomains,
 		QueryOnlySchedulerClient: queryOnlySchedulerClient,

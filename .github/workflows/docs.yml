@@ -3,49 +3,182 @@ name: Deploy Docs
 on:
   push:
     branches: [main]
+    tags: ["v*"]
     paths:
       - ".github/workflows/docs.yml"
       - "docs/**"
       - "src/api/openapi.yml"
   workflow_dispatch:
+    inputs:
+      ref:
+        description: >-
+          Optional: tag/branch/sha to (re)build docs from (e.g. "v0.1.0" to
+          rebuild an already-released version). Leave empty to build the ref
+          this run was triggered from. Always trigger this from "main" (via
+          the branch selector) so the current workflow logic is used; only
+          the "ref" input controls which content gets built and published.
+        required: false
+        type: string
 
 concurrency:
-  group: pages
+  group: docs-${{ github.ref }}
   cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: read
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ctx.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Determine target version
+        id: ctx
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "version=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          manual_ref="${{ inputs.ref }}"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "$manual_ref" ]]; then
+            if [[ "$manual_ref" =~ ^v[0-9] ]]; then
+              echo "version=$manual_ref" >> "$GITHUB_OUTPUT"
+            else
+              echo "version=dev" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          echo "version=dev" >> "$GITHUB_OUTPUT"
 
       - uses: taiki-e/install-action@mdbook
 
-      - name: Configure GitHub Pages
-        uses: actions/configure-pages@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: mdbook-mermaid@0.17.0
 
       - name: Build docs
         run: |
           ln -sf ../../src/api/openapi.yml docs/src/openapi.yml
           mdbook build docs
 
-      - name: Upload GitHub Pages artifact
-        uses: actions/upload-pages-artifact@v4
+      - name: Upload built docs
+        uses: actions/upload-artifact@v6
         with:
+          name: docs-book
           path: docs/book
+          retention-days: 7
 
-  deploy:
+  publish:
     needs: build
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     permissions:
-      pages: write
-      id-token: write
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+      contents: write
+    env:
+      VERSION: ${{ needs.build.outputs.version }}
     steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+      - uses: actions/checkout@v6
+
+      - name: Download built docs
+        uses: actions/download-artifact@v6
+        with:
+          name: docs-book
+          path: book-output
+
+      - name: Publish to gh-pages branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          book_output="$(cd book-output && pwd)"
+          redirect_page="$(cd docs/redirects && pwd)/index.html"
+
+          publish_dir="$(mktemp -d)"
+          cleanup() {
+            rm -rf "$publish_dir"
+          }
+          trap cleanup EXIT
+
+          cd "$publish_dir"
+          git init -q
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          max_attempts=5
+          for attempt in $(seq 1 "$max_attempts"); do
+            if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+              git fetch --depth=1 origin gh-pages
+              git checkout -B gh-pages FETCH_HEAD
+            else
+              git checkout --orphan gh-pages
+              git rm -rf . >/dev/null 2>&1 || true
+            fi
+
+            cp "$redirect_page" ./index.html
+
+            if [[ "$VERSION" == "dev" ]]; then
+              rm -rf dev
+              mkdir -p dev
+              cp -a "$book_output"/. dev/
+            else
+              rm -rf "$VERSION"
+              mkdir -p "$VERSION"
+              cp -a "$book_output"/. "$VERSION"/
+
+              if [[ -f versions.json ]]; then
+                existing="$(cat versions.json)"
+              else
+                existing='{"versions":[]}'
+              fi
+              echo "$existing" | jq \
+                --arg v "$VERSION" \
+                --arg d "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                '.versions = ([{version: $v, date: $d}] + (.versions | map(select(.version != $v))))' \
+                > versions.json.tmp
+              mv versions.json.tmp versions.json
+
+              # Only promote this build to /latest/ if it is the highest known
+              # version. This lets maintainers rebuild an older tag (e.g. via
+              # workflow_dispatch with a "ref" input) to pick up a docs-only
+              # fix without accidentally rolling /latest/ back to stale content.
+              newest_version="$(jq -r '.versions[].version' versions.json | sort -V | tail -n1)"
+              if [[ "$newest_version" == "$VERSION" ]]; then
+                rm -rf latest
+                mkdir -p latest
+                cp -a "$book_output"/. latest/
+              else
+                echo "Skipping /latest/ update: ${VERSION} is not the newest known version (${newest_version})."
+              fi
+            fi
+
+            git add -A
+            if git diff --cached --quiet; then
+              echo "No documentation changes to publish for ${VERSION}."
+              exit 0
+            fi
+
+            git commit -q -m "chore: publish ${VERSION} docs for ${GITHUB_SHA}"
+
+            if git push origin gh-pages; then
+              echo "Published ${VERSION} docs."
+              exit 0
+            fi
+
+            echo "Push rejected (attempt ${attempt}/${max_attempts}), retrying with latest gh-pages..."
+            git checkout -q --detach
+            git branch -D gh-pages
+            sleep $((attempt * 3))
+          done
+
+          echo "::error::Failed to push docs to gh-pages branch after ${max_attempts} attempts"
+          exit 1

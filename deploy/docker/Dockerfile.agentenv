@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1.7
 
+ARG AENV_VIRTUALIZATION_MODE=kvm
+
 FROM rust:1-bookworm AS chef
 
 WORKDIR /build
@@ -50,7 +52,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 
 FROM ubuntu:24.04 AS runtime-base
 ARG APT_MIRROR_BASE
-ARG TARGETARCH=amd64
+ARG TARGETARCH
 # Optional extra runtime packages, specified as a whitespace- or comma-separated build arg.
 ARG EXTRA_RUNTIME_PACKAGES=""
 COPY deploy/docker/apply_apt_mirror.sh /usr/local/bin/apply_apt_mirror.sh
@@ -62,12 +64,10 @@ RUN export DEBIAN_FRONTEND=noninteractive \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
-        dpkg \
         e2fsprogs \
         iproute2 \
         iptables \
         jq \
-        libaio1t64 \
         sudo \
         umoci \
         zstd \
@@ -90,15 +90,18 @@ RUN mkdir -p /workspace/config
 # `/usr/local/bin/regctl`. The final stage copies that tree as its own clean
 # layer, keeping the deps payload independent of the server binary.
 FROM runtime-base AS deps-stage
+ARG AENV_VIRTUALIZATION_MODE
 COPY --from=builder --chmod=0755 /out-server /server
 COPY config/default.toml /workspace/config/default.toml
 ENV AENV_CONFIG_PATH=/workspace/config/default.toml
 ENV AENV_HOME_PATH=/workspace/env
+ENV AENV_VIRTUALIZATION_MODE=${AENV_VIRTUALIZATION_MODE}
 RUN DEBIAN_FRONTEND=noninteractive /server --setup-only
 
 
 # final image.
 FROM runtime-base
+ARG AENV_VIRTUALIZATION_MODE
 
 # overlaybd-apply validates its built-in default service config path even when
 # AgentENV passes an explicit generated config at runtime.
@@ -118,6 +121,7 @@ COPY --from=builder --chmod=0755 /out-server /server
 COPY config/default.toml /workspace/config/default.toml
 ENV AENV_CONFIG_PATH=/workspace/config/default.toml
 ENV AENV_HOME_PATH=/workspace/env
+ENV AENV_VIRTUALIZATION_MODE=${AENV_VIRTUALIZATION_MODE}
 ENV AENV_UBLK_DAEMON_BINARY_PATH=/usr/local/bin/uvm-ublk-daemon
 
 # Authoritative final `--setup-only`. If the pre-bake above produced exactly

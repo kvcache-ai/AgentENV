@@ -19,6 +19,7 @@ use tokio::time::timeout;
   aenv download --user app --force <sandbox-id> result.txt ./result.txt")]
 pub struct Args {
     /// Sandbox ID
+    #[arg(add = crate::commands::completion::add_running_sandbox_candidates())]
     sandbox_id: String,
     /// Source file or directory path inside the sandbox
     remote_path: String,

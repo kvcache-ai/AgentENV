@@ -8,7 +8,6 @@ use storage_util::{CompactBuffer, CompactWriter};
 use tokio::sync::Mutex;
 
 use crate::backend::local::LocalFile;
-use crate::io::transient_io_ring::shared_transient_io_ring;
 use crate::io::virtual_file::VirtualFile;
 use crate::layer::layer_metadata::read_overlaybd_layer_is_sparse_rw;
 use crate::lsmt::file::{CommitArgs, LSMTReadOnlyFile};
@@ -97,6 +96,10 @@ impl CompactWriter for DigestCompactWriter {
         self.buf_size
     }
 
+    fn requires_ordered_writes(&self) -> bool {
+        true
+    }
+
     async fn write(&self, buf: Box<dyn CompactBuffer>, offset: u64, len: usize) -> Result<()> {
         let data = AsRef::<[u8]>::as_ref(buf.as_ref());
         if len > data.len() {
@@ -131,10 +134,8 @@ pub async fn describe_dense_layer(path: &Path) -> Result<DenseLayerDescriptor> {
 }
 
 pub async fn write_dense_layer_to(path: &Path, writer: Arc<dyn CompactWriter>) -> Result<()> {
-    let io_ring = shared_transient_io_ring();
     let source: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::open_ro(path, io_ring)
-            .await
+        LocalFile::open_ro(path)
             .with_context(|| format!("open sparse overlaybd layer '{}'", path.display()))?,
     );
     let layer = LSMTReadOnlyFile::open(source)
@@ -154,12 +155,14 @@ pub async fn write_dense_layer_to(path: &Path, writer: Arc<dyn CompactWriter>) -
         .with_context(|| format!("dense-export sparse overlaybd layer '{}'", path.display()))
 }
 
-#[cfg(test)]
+// Every test in this module builds a sparse LSMT layer, which is rejected where
+// the filesystem does not guarantee that unwritten regions read back as holes;
+// see `sys::sparse_extents_are_reliable`. Lift this together with that gate.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use std::sync::Arc;
 
     use crate::backend::local::LocalFile;
-    use crate::io::transient_io_ring::shared_transient_io_ring;
     use crate::io::virtual_file::VirtualFile;
     use crate::lsmt::file::{CommitArgs, LSMTFile, LSMTReadOnlyFile};
 
@@ -172,11 +175,7 @@ mod tests {
         let dense_path = temp.path().join("dense.commit");
         let virtual_size = 64 * 1024 * 1024;
 
-        let sparse_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&sparse_path, shared_transient_io_ring())
-                .await
-                .unwrap(),
-        );
+        let sparse_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&sparse_path).unwrap());
         let sparse = LSMTFile::create(sparse_file, None, virtual_size, true)
             .await
             .unwrap();
@@ -189,11 +188,7 @@ mod tests {
 
         assert!(should_dense_export_layer(&sparse_path));
 
-        let dense_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&dense_path, shared_transient_io_ring())
-                .await
-                .unwrap(),
-        );
+        let dense_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&dense_path).unwrap());
         write_dense_layer_to(&sparse_path, CommitArgs::new(dense_file.clone()).writer)
             .await
             .unwrap();

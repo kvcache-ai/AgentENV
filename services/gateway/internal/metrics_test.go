@@ -2,8 +2,10 @@ package gateway
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestGatewayRouteLabelIncludesV2Sandboxes(t *testing.T) {
@@ -35,6 +37,66 @@ func TestStatusRecorderRouteSourceLabel(t *testing.T) {
 	setGatewayRouteSource(recorder, routeSourceHost)
 	if got := recorder.routeSourceLabel(); got != string(routeSourceHost) {
 		t.Fatalf("routeSourceLabel() = %q, want %q", got, string(routeSourceHost))
+	}
+}
+
+func TestInstrumentGatewayHTTPSkipsOnlyLocalEndpoints(t *testing.T) {
+	server := newTestServer(
+		t,
+		stubSchedulerClient{},
+		time.Second,
+		1024,
+		withSandboxProxyDomains("sandbox-proxy.example.invalid"),
+	)
+
+	tests := []struct {
+		name        string
+		path        string
+		host        string
+		sandboxID   string
+		targetPort  string
+		wantWrapped bool
+	}{
+		{name: "local health", path: "/health"},
+		{name: "local metrics", path: "/metrics"},
+		{
+			name:        "header-routed metrics",
+			path:        "/metrics",
+			sandboxID:   "sbx-metrics",
+			targetPort:  "49983",
+			wantWrapped: true,
+		},
+		{
+			name:        "host-routed metrics",
+			path:        "/metrics",
+			host:        "49983-sbx-metrics.sandbox-proxy.example.invalid",
+			wantWrapped: true,
+		},
+		{name: "ordinary gateway route", path: "/sandboxes", wantWrapped: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wrapped := false
+			handler := server.instrumentGatewayHTTP(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, wrapped = w.(*statusRecorder)
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			if tt.host != "" {
+				req.Host = tt.host
+			}
+			if tt.sandboxID != "" {
+				req.Header.Set(headerSandboxID, tt.sandboxID)
+			}
+			if tt.targetPort != "" {
+				req.Header.Set(headerTargetPort, tt.targetPort)
+			}
+			handler.ServeHTTP(httptest.NewRecorder(), req)
+			if wrapped != tt.wantWrapped {
+				t.Fatalf("instrumentation wrapper present = %t, want %t", wrapped, tt.wantWrapped)
+			}
+		})
 	}
 }
 

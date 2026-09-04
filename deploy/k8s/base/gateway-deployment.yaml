@@ -27,6 +27,11 @@ spec:
             - name: http
               containerPort: 8080
           env:
+            - name: AENV_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agentenv-auth
+                  key: AENV_API_KEY
             - name: GATEWAY_SANDBOX_PROXY_DOMAINS
               valueFrom:
                 configMapKeyRef:

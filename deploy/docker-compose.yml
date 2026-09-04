@@ -3,7 +3,9 @@ x-agentenv-base: &agentenv-base
   init: true
   working_dir: /workspace
   environment: &agentenv-environment
+    AENV_API_KEY:
     AENV_CONFIG_PATH: /workspace/config/default.toml
+    AENV_VIRTUALIZATION_MODE: ${AENV_VIRTUALIZATION_MODE:-kvm}
     API_ADDR: 0.0.0.0:8000
     AENV_UBLK_DAEMON_BINARY_PATH: /usr/local/bin/uvm-ublk-daemon
     AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED: "true"
@@ -15,8 +17,9 @@ x-agentenv-base: &agentenv-base
     - /dev:/dev
     - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
     # Runtime assets are baked into the image by `server --setup-only`; compose
-    # persists only committed snapshots across container restarts.
+    # persists committed snapshots and deployment secrets across restarts.
     - agentenv-snapshot-store:/workspace/env/snapshot-store
+    - agentenv-auth:/workspace/env/secrets
   devices:
     - /dev/kvm:/dev/kvm
   privileged: true
@@ -54,8 +57,6 @@ services:
       timeout: 3s
       retries: 10
       start_period: 3s
-    ports:
-      - "9090:9090"
     restart: unless-stopped
 
   gateway:
@@ -68,13 +69,16 @@ services:
     depends_on:
       scheduler:
         condition: service_healthy
-    volumes: *control-plane-config-volume
+    volumes:
+      - ./docker/config/default.json:/config/default.json:ro
+      - agentenv-auth:/run/secrets:ro
     environment:
+      AENV_API_KEY:
       GATEWAY_HTTP_LISTEN_ADDR: :8080
       GATEWAY_SCHEDULER_ADDR: scheduler:9090
       GATEWAY_SANDBOX_PROXY_DOMAINS: ${SANDBOX_PROXY_DOMAINS:-}
     ports:
-      - "8080:8080"
+      - "8000:8080"
     restart: unless-stopped
 
   agentenv-a:
@@ -88,8 +92,6 @@ services:
     environment:
       <<: *agentenv-environment
       AENV_NODE_ID: node-a
-    ports:
-      - "8001:8000"
 
   agentenv-b:
     <<: *agentenv-base
@@ -97,8 +99,7 @@ services:
     environment:
       <<: *agentenv-environment
       AENV_NODE_ID: node-b
-    ports:
-      - "8002:8000"
 
 volumes:
+  agentenv-auth:
   agentenv-snapshot-store:

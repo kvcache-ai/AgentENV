@@ -36,6 +36,10 @@ pub async fn setup() {
 /// registry image.
 pub async fn setup_runtime_only() -> &'static agentenv::cfg::AppConfig {
     agentenv::logging::init_for_tests();
+    std::env::set_var(
+        "AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED",
+        "integration-test-seed",
+    );
     let config = ConfigManager::init_global()
         .expect("config manager")
         .config();

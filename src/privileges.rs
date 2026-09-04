@@ -170,8 +170,25 @@ mod tests {
             .collect())
     }
 
+    /// Status fields whose values prove the scoped-spawn capability contract.
+    ///
+    /// On `execve` the kernel regrants an euid-0 child the full bounding set
+    /// in `CapPrm`/`CapEff` unless `SECBIT_NOROOT` is set, so under root those
+    /// two fields say nothing about what the scoped spawn delegated. The
+    /// inheritable set survives `execve` unchanged and the ambient set can
+    /// only survive within the permitted ∩ inheritable intersection, so
+    /// `CapInh`/`CapAmb` stay zero (or exactly the requested capability)
+    /// regardless of the runner's uid.
+    fn capability_assertion_fields() -> &'static [&'static str] {
+        if nix::unistd::Uid::effective().is_root() {
+            &["CapInh:", "CapAmb:"]
+        } else {
+            &CAPABILITY_STATUS_FIELDS
+        }
+    }
+
     fn assert_child_has_no_capabilities(status: &str) {
-        for field in CAPABILITY_STATUS_FIELDS {
+        for field in capability_assertion_fields() {
             assert_eq!(
                 status_field(status, field),
                 "0000000000000000",
@@ -258,7 +275,9 @@ mod tests {
         let status = String::from_utf8(output.stdout)?;
 
         assert!(output.status.success());
-        for field in CAPABILITY_STATUS_FIELDS {
+        // Under root, execve regrants CapPrm/CapEff from the bounding set;
+        // CapInh/CapAmb keep exactly the delegated capability either way.
+        for field in capability_assertion_fields() {
             assert_eq!(
                 status_field(&status, field),
                 "0000000000001000",

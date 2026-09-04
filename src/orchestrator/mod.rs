@@ -7,6 +7,7 @@ mod store;
 mod types;
 
 use crate::types::SandboxId;
+use crate::virtualization::VirtualizationMode;
 
 pub use metrics::OrchestratorMetrics;
 pub use persistence::{
@@ -20,8 +21,8 @@ pub use store::{
     SandboxTimeoutAction,
 };
 pub use types::{
-    CreateSandboxRequest, SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType,
-    SandboxState, SnapshotCaptureResult,
+    CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource, SandboxLifecycleEvent,
+    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
 };
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;
@@ -35,6 +36,7 @@ pub enum SandboxOperation {
     Pause,
     Resume,
     Snapshot,
+    SnapshotVolumes,
     Fork,
     UpdateNetwork,
     PatchCustomExtensionParams,
@@ -45,15 +47,28 @@ pub enum SandboxOperation {
 pub enum OrchestratorError {
     #[error("failed to load sandbox config")]
     ConfigLoadFailed(#[from] anyhow::Error),
+
+    #[error(
+        "{resource} uses virtualization mode '{resource_mode}', but this node runs in mode '{node_mode}'"
+    )]
+    VirtualizationModeMismatch {
+        resource: String,
+        resource_mode: VirtualizationMode,
+        node_mode: VirtualizationMode,
+    },
+
     #[error("orchestrator is shutting down")]
     ShuttingDown,
+
     #[error("sandbox {0} not found")]
     SandboxNotFound(SandboxId),
+
     #[error("sandbox {sandbox_id} is in invalid state {state:?}")]
     InvalidSandboxState {
         sandbox_id: SandboxId,
         state: SandboxState,
     },
+
     #[error("sandbox {sandbox_id} operation {operation:?} failed: {source}")]
     SandboxOperationFailed {
         sandbox_id: SandboxId,
@@ -61,20 +76,25 @@ pub enum OrchestratorError {
         #[source]
         source: anyhow::Error,
     },
+
     #[error("sandbox {sandbox_id} operation {operation:?} conflicted with another operation")]
     SandboxOperationConflict {
         sandbox_id: SandboxId,
         operation: SandboxOperation,
     },
+
     #[error("store operation failed: {0}")]
     StoreOperationFailed(#[source] store::StoreError),
+
     #[error("sandbox persistence failed: {0}")]
     SandboxPersistenceFailed(#[from] SandboxPersistenceError),
+
     #[error("invalid timeout for {sandbox_id}: {timeout}")]
     InvalidTimeout {
         sandbox_id: SandboxId,
         timeout: String,
     },
+
     #[error("internal error: {0}")]
     InternalError(String),
 }

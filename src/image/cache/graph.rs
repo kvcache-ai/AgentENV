@@ -2,15 +2,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use overlaybd::config::{
     lexically_normalize_path, load_image_config as load_overlaybd_image_config,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::warn;
 
 use crate::local_store::{LocalKvBatchOp, LocalKvStore, LocalStoreDurability};
+use crate::p2p::P2pArtifactKey;
 
 const SCHEMA_VERSION: u32 = 1;
 const SCHEMA_VERSION_KEY: &[u8] = b"schema/version";
@@ -74,6 +77,7 @@ pub(super) struct CacheOwnedImageConfigFacts {
 #[derive(Clone, Debug)]
 pub(crate) struct ImageCacheMetadataStore {
     store: LocalKvStore,
+    object_update_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -147,6 +151,8 @@ pub(crate) struct HardCommitObjectRecord {
     pub(crate) file: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) size: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub(crate) p2p_keys: BTreeSet<P2pArtifactKey>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -199,7 +205,10 @@ impl ImageCacheMetadataStore {
         durability: LocalStoreDurability,
     ) -> Result<Self> {
         let store = LocalKvStore::open(path, durability).await?;
-        let metadata = Self { store };
+        let metadata = Self {
+            store,
+            object_update_lock: Arc::new(Mutex::new(())),
+        };
         metadata.ensure_schema_version().await?;
         Ok(metadata)
     }
@@ -209,7 +218,13 @@ impl ImageCacheMetadataStore {
         digest: HardCommitId,
         file: Option<PathBuf>,
         size: Option<u64>,
+        p2p_keys: BTreeSet<P2pArtifactKey>,
     ) -> Result<()> {
+        let _guard = self.object_update_lock.lock().await;
+        let mut p2p_keys = p2p_keys;
+        if let Some(existing) = self.get_hard_commit_object(&digest).await? {
+            p2p_keys.extend(existing.p2p_keys);
+        }
         self.store
             .put(
                 hard_commit_object_key(&digest),
@@ -217,6 +232,7 @@ impl ImageCacheMetadataStore {
                     digest: digest.clone(),
                     file,
                     size,
+                    p2p_keys,
                 })
                 .context("serialize hard commit object record")?,
             )
@@ -234,13 +250,20 @@ impl ImageCacheMetadataStore {
             .iter()
             .map(|reference| reference.digest.clone())
             .collect::<BTreeSet<_>>();
+        let _guard = self.object_update_lock.lock().await;
         let existing = self.config_refs_set(&config_id).await?;
         let mut ops = config_ref_replacement_ops(&config_id, &existing, &new_refs)?;
         for reference in &hard_refs {
+            let p2p_keys = self
+                .get_hard_commit_object(&reference.digest)
+                .await?
+                .map(|record| record.p2p_keys)
+                .unwrap_or_default();
             ops.push(hard_commit_object_put_op(
                 &reference.digest,
                 Some(reference.file.clone()),
                 Some(reference.size),
+                p2p_keys,
             )?);
         }
         // This path runs on every resolve (cache hit via record_source_image
@@ -277,6 +300,28 @@ impl ImageCacheMetadataStore {
             .delete(hard_commit_object_key(digest))
             .await
             .with_context(|| format!("remove hard commit object {digest}"))
+    }
+
+    pub(crate) async fn add_hard_commit_p2p_key(
+        &self,
+        digest: &HardCommitId,
+        key: &P2pArtifactKey,
+    ) -> Result<()> {
+        let _guard = self.object_update_lock.lock().await;
+        let Some(mut record) = self.get_hard_commit_object(digest).await? else {
+            bail!("hard commit object {digest} does not exist while recording P2P key '{key}'");
+        };
+        if !record.p2p_keys.insert(key.clone()) {
+            return Ok(());
+        }
+        self.store
+            .put(
+                hard_commit_object_key(digest),
+                serde_json::to_vec(&record).context("serialize hard commit object record")?,
+            )
+            .await
+            .with_context(|| format!("record P2P key for hard commit {digest}"))?;
+        Ok(())
     }
 
     pub(crate) async fn get_hard_commit_object(
@@ -437,6 +482,7 @@ impl ImageCacheMetadataStore {
                 configs_dir.display()
             )
         })?;
+        let _guard = self.object_update_lock.lock().await;
         let existing = self.config_ref_map().await?;
         let existing_last_used = self.config_last_used_map().await?;
         let now = unix_now_secs();
@@ -457,10 +503,16 @@ impl ImageCacheMetadataStore {
             let old_refs = existing.get(config_id).cloned().unwrap_or_default();
             ops.extend(config_ref_replacement_ops(config_id, &old_refs, &new_refs)?);
             for reference in hard_refs {
+                let p2p_keys = self
+                    .get_hard_commit_object(&reference.digest)
+                    .await?
+                    .map(|record| record.p2p_keys)
+                    .unwrap_or_default();
                 ops.push(hard_commit_object_put_op(
                     &reference.digest,
                     Some(reference.file.clone()),
                     Some(reference.size),
+                    p2p_keys,
                 )?);
             }
             // Rebuilds preserve recency; new configs get a baseline touch.
@@ -862,6 +914,7 @@ fn hard_commit_object_put_op(
     digest: &HardCommitId,
     file: Option<PathBuf>,
     size: Option<u64>,
+    p2p_keys: BTreeSet<P2pArtifactKey>,
 ) -> Result<LocalKvBatchOp> {
     put_json_op(
         hard_commit_object_key(digest),
@@ -869,6 +922,7 @@ fn hard_commit_object_put_op(
             digest: digest.clone(),
             file,
             size,
+            p2p_keys,
         },
         "serialize hard commit object record",
     )
@@ -1186,6 +1240,75 @@ mod tests {
             .expect("serialize config"),
         )
         .expect("write config");
+    }
+
+    #[tokio::test]
+    async fn hard_commit_p2p_keys_are_persisted_and_preserved_by_config_reconcile() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = test_store(&temp).await;
+        let digest = hard("sha256:layer");
+        let first_key = "overlaybd-layer/v1/sha256:layer".to_string();
+        let second_key = "overlaybd-layer/v1/uuid/test".to_string();
+
+        store
+            .record_hard_commit_object(
+                digest.clone(),
+                Some(temp.path().join("commits/layer")),
+                Some(10),
+                BTreeSet::from([first_key.clone()]),
+            )
+            .await
+            .expect("record hard commit object");
+        assert_eq!(
+            store
+                .get_hard_commit_object(&digest)
+                .await
+                .expect("load hard commit object")
+                .expect("hard commit object")
+                .p2p_keys,
+            BTreeSet::from([first_key.clone()])
+        );
+
+        store
+            .add_hard_commit_p2p_key(&digest, &second_key)
+            .await
+            .expect("add p2p key");
+
+        let config = temp.path().join("configs/image-image.json");
+        record_config(
+            &store,
+            &config,
+            json!([{
+                "file": "../commits/layer",
+                "digest": "sha256:layer",
+                "size": 10
+            }]),
+        )
+        .await;
+
+        assert_eq!(
+            store
+                .get_hard_commit_object(&digest)
+                .await
+                .expect("load reconciled hard commit object")
+                .expect("reconciled hard commit object")
+                .p2p_keys,
+            BTreeSet::from([first_key, second_key])
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_hard_commit_p2p_key_rejects_missing_object() {
+        let temp = TempDir::new().expect("tempdir");
+        let store = test_store(&temp).await;
+        let digest = hard("sha256:missing");
+        let key = "oci-layer/v1/missing".to_string();
+
+        let error = store
+            .add_hard_commit_p2p_key(&digest, &key)
+            .await
+            .expect_err("missing hard commit object must fail");
+        assert!(error.to_string().contains("does not exist"));
     }
 
     async fn record_config(

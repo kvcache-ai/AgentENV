@@ -5,6 +5,11 @@
 //! `close_seal + restack` the live upper before writing the persisted
 //! snapshot config.
 //!
+//! Sealed layers stay raw by default. Callers (template builds) may request
+//! compressed seal output, in which case only the staged snapshot artifact
+//! is recontainerized as ZFile — the live runtime keeps referencing the raw
+//! sealed layer written by the daemon.
+//!
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
@@ -18,20 +23,23 @@ use nix::unistd::Pid;
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::{ImageConfig, LayerConfig};
 use overlaybd::index::{Segment, SegmentMapping};
-use overlaybd::index_file::{compact_to, CommitArgs};
-use overlaybd::transient_io_ring::shared_transient_io_ring;
+use overlaybd::index_file::compact_to;
 use overlaybd::virtual_file::VirtualFile;
 use tracing::{debug, warn};
 
 use super::process_vm_reader::ProcessVmReader;
 use super::sandbox::managed_snapshot_base;
 use crate::cfg::ConfigManager;
+use crate::image::local_layer::SNAPSHOT_ZFILE_DELTA_LAYER_FILE;
 use crate::sandbox::ublk::UblkDevice;
-use crate::sandbox::ublk::{compact_layers, UblkDeviceManager};
+use crate::sandbox::ublk::{
+    compact_layers, create_commit_args, OverlaybdCompactOutput, UblkDeviceManager,
+};
 use crate::sandbox::SandboxCaptureError;
 
-/// Default maximum number of overlaybd snapshot layers before compaction triggers.
-/// Well below the hard limit of 255 (`MAX_STACK_LAYERS`) in overlaybd.
+/// Base budget of runtime-owned overlaybd snapshot lowers before compaction
+/// triggers; the effective budget shrinks as the stable prefix grows. Well
+/// below the hard limit of 255 (`MAX_STACK_LAYERS`) in overlaybd.
 const DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS: usize = 32;
 const INHERITED_LAYERS_DIR: &str = "inherited-layers";
 const MANAGED_BASE_LAYER_FILE: &str = "managed-base.commit";
@@ -334,6 +342,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
     snapshot_layer_path: Option<&Path>,
+    seal_output: OverlaybdCompactOutput,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -368,11 +377,30 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         None
     };
 
+    // Compress the freshly sealed layer when the caller requested compressed
+    // seal output. The live runtime config was already rewritten to reference
+    // the raw sealed layer; only the staged snapshot artifact is
+    // recontainerized as ZFile.
+    let appended_layer = match (appended_layer, seal_output) {
+        (Some(layer), OverlaybdCompactOutput::ZFile { .. }) => {
+            let compressed_path = output_dir.join(SNAPSHOT_ZFILE_DELTA_LAYER_FILE);
+            compact_layers(std::slice::from_ref(&layer), &compressed_path, seal_output)
+                .await
+                .context("compress sealed snapshot layer")?
+                .context("compress sealed snapshot layer produced no output")?;
+            Some(local_layer_config(&compressed_path))
+        }
+        (layer, _) => layer,
+    };
+
     let rewritten_lowers = rewrite_lowers_with_owned_runtime_suffix(
         image_config.lowers,
         output_dir,
         appended_layer,
         MANAGED_BASE_LAYER_FILE,
+        // Rootfs seals stay raw unless the caller (template builds) requested
+        // compressed seal output; memory snapshots have their own switch.
+        seal_output,
     )
     .await?;
     image_config.lowers = rewritten_lowers;
@@ -391,6 +419,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
     output_dir: &Path,
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
+    compaction_output: OverlaybdCompactOutput,
 ) -> Result<Vec<LayerConfig>> {
     rewrite_lowers_with_runtime_roots(
         existing_lowers,
@@ -398,6 +427,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
         appended_layer,
         compaction_output_name,
         canonicalized_runtime_owned_roots(),
+        compaction_output,
     )
     .await
 }
@@ -408,16 +438,23 @@ async fn rewrite_lowers_with_runtime_roots(
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
     runtime_owned_roots: &[PathBuf],
+    compaction_output: OverlaybdCompactOutput,
 ) -> Result<Vec<LayerConfig>> {
     let (mut lowers, mut runtime_owned_lowers) =
         split_runtime_suffix(existing_lowers, runtime_owned_roots);
 
-    // If the total number of lowers exceeds the default maximum, try to compact the
-    // runtime-owned suffix and appended layers into a single layer.
+    // Compact the runtime-owned suffix plus the appended layer once their count
+    // exceeds a budget that shrinks as the stable prefix grows: the full
+    // `DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS` with an empty prefix, one less per
+    // 4 prefix lowers (e.g. 24 with a 32-layer prefix), clamped to 1 so a lone
+    // layer is never pointlessly rewritten into itself. This keeps the total
+    // stack well below overlaybd's 255-layer hard limit without compacting on
+    // every pause when the prefix is already large.
+    let max_runtime_owned_layers = DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS
+        .saturating_sub(lowers.len() / 4)
+        .max(1);
     let compactable_count = runtime_owned_lowers.len() + usize::from(appended_layer.is_some());
-    if compactable_count > 1
-        && lowers.len() + compactable_count > DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS
-    {
+    if compactable_count > max_runtime_owned_layers {
         let mut runtime_suffix = runtime_owned_lowers;
         if let Some(layer) = appended_layer {
             runtime_suffix.push(layer);
@@ -425,8 +462,12 @@ async fn rewrite_lowers_with_runtime_roots(
         if runtime_suffix.iter().any(|lower| lower.file.is_empty()) {
             anyhow::bail!("cannot compact runtime-owned overlaybd suffix with remote lowers");
         }
-        if let Some(compacted_path) =
-            compact_layers(&runtime_suffix, &output_dir.join(compaction_output_name)).await?
+        if let Some(compacted_path) = compact_layers(
+            &runtime_suffix,
+            &output_dir.join(compaction_output_name),
+            compaction_output,
+        )
+        .await?
         {
             lowers.push(local_layer_config(&compacted_path));
         }
@@ -459,6 +500,8 @@ async fn capture_live_overlaybd_snapshot(
     read_only: bool,
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
+    snapshot_layer_file_name: &str,
+    kind: &'static str,
 ) -> Result<LiveOverlaybdSnapshotState> {
     if read_only {
         debug!(
@@ -470,7 +513,7 @@ async fn capture_live_overlaybd_snapshot(
 
     let live_upper_data_path = restack_target_upper_data_path(live_runtime_image_config_path)
         .context("resolve restack source upper path")?;
-    let snapshot_layer_path = output_dir.join("snapshot.commit");
+    let snapshot_layer_path = output_dir.join(snapshot_layer_file_name);
     prepare_specific_snapshot_layer_path(&snapshot_layer_path).await?;
     let live_snapshot_layer_path = if on_same_filesystem(&live_upper_data_path, output_dir)
         .context("validate restack snapshot filesystem precondition")?
@@ -480,7 +523,7 @@ async fn capture_live_overlaybd_snapshot(
         let live_snapshot_layer_path = live_upper_data_path
             .parent()
             .context("restack source upper path has no parent directory")?
-            .join("snapshot.commit");
+            .join(snapshot_layer_file_name);
         prepare_specific_snapshot_layer_path(&live_snapshot_layer_path)
             .await
             .with_context(|| {
@@ -493,7 +536,7 @@ async fn capture_live_overlaybd_snapshot(
     };
 
     let descriptor = UblkDeviceManager::global()
-        .restack_snapshot_device(ublk_device, &live_snapshot_layer_path)
+        .restack_snapshot_device(ublk_device, &live_snapshot_layer_path, kind)
         .await
         .context("request overlaybd restack snapshot from ublk device")?;
 
@@ -549,6 +592,7 @@ pub(super) async fn build_mem_snapshot_image_config(
     resume_mem_image_config_path: Option<&Path>,
     new_layer_path: &Path,
     output_dir: &Path,
+    memory_output: OverlaybdCompactOutput,
 ) -> Result<ImageConfig> {
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
@@ -558,6 +602,7 @@ pub(super) async fn build_mem_snapshot_image_config(
         output_dir,
         Some(new_layer),
         "mem_compacted.commit",
+        memory_output,
     )
     .await?;
 
@@ -572,12 +617,17 @@ pub(super) async fn build_mem_snapshot_image_config(
 ///
 /// Writable runtimes are first restacked in-place so the sealed old upper
 /// becomes the newest lower. Read-only runtimes skip the restack phase and
-/// only stage the persisted snapshot image config.
+/// only stage the persisted snapshot image config. `seal_output` controls
+/// whether the staged sealed layer is recontainerized as ZFile; the live
+/// runtime always keeps the raw sealed layer.
 pub(super) async fn restack_snapshot_overlaybd_device(
     ublk_device: &UblkDevice,
     read_only: bool,
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
+    snapshot_layer_file_name: &str,
+    kind: &'static str,
+    seal_output: OverlaybdCompactOutput,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -588,6 +638,8 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         read_only,
         live_runtime_image_config_path,
         output_dir,
+        snapshot_layer_file_name,
+        kind,
     )
     .await?;
 
@@ -595,6 +647,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         live_runtime_image_config_path,
         output_dir,
         live_snapshot.snapshot_layer_path(),
+        seal_output,
     )
     .await;
 
@@ -606,47 +659,54 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
     read_only: bool,
     live_runtime_image_config_path: &Path,
     snapshot_root: &Path,
+    seal_output: OverlaybdCompactOutput,
 ) -> Result<PathBuf> {
     restack_snapshot_overlaybd_device(
         ublk_device,
         read_only,
         live_runtime_image_config_path,
         &snapshot_root.join("rootfs"),
+        "snapshot.commit",
+        "rootfs",
+        seal_output,
     )
     .await
 }
 
-/// Convert a sparse memory snapshot file into a sealed overlaybd layer.
-///
-/// The sparse file is produced by Firecracker's diff snapshot
-/// (`SnapshotType::Diff`), where only dirty pages contain data and untouched
-/// pages are holes. `package_raw_as_overlaybd` scans the file with
-/// `seek_data`/`seek_hole` and compacts only the data extents.
-///
-/// Deletes the input sparse file after the layer has been committed.
-///
-/// Returns the path to the created overlaybd layer file.
-pub(crate) async fn convert_sparse_mem_to_overlaybd(
-    sparse_mem_path: &Path,
-    output_dir: &Path,
-) -> Result<PathBuf> {
-    tokio::fs::create_dir_all(output_dir)
-        .await
-        .with_context(|| format!("create mem overlaybd dir: {}", output_dir.display()))?;
-
-    let data_path = output_dir.join("overlaybd.commit");
-    overlaybd::tools::package_raw_as_overlaybd(sparse_mem_path, &data_path)
-        .await
-        .context("convert sparse mem.bin to overlaybd layer")?;
-    if let Err(error) = tokio::fs::remove_file(sparse_mem_path).await {
-        warn!(
-            mem_path = %sparse_mem_path.display(),
-            error = %error,
-            "failed to remove sparse mem snapshot after overlaybd commit"
+async fn publish_memory_overlaybd_layer(
+    src_layers: &[Arc<dyn VirtualFile>],
+    mappings: &[SegmentMapping],
+    virtual_size: u64,
+    output_path: &Path,
+    mode: OverlaybdCompactOutput,
+    concurrency: usize,
+) -> Result<()> {
+    let lower_tmp = output_path.with_extension("commit.tmp");
+    let build_result = async {
+        let output_file: Arc<dyn VirtualFile> = Arc::new(
+            LocalFile::new(&lower_tmp)
+                .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
         );
+        let commit_args = create_commit_args(output_file, mode, concurrency).await?;
+        compact_to(src_layers, mappings, virtual_size, commit_args)
+            .await
+            .context("compact memory layer")?;
+        tokio::fs::rename(&lower_tmp, output_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "move sealed memory lower into place failed: {}",
+                    output_path.display()
+                )
+            })?;
+        Ok(())
     }
+    .await;
 
-    Ok(data_path)
+    if build_result.is_err() {
+        let _ = tokio::fs::remove_file(&lower_tmp).await;
+    }
+    build_result
 }
 
 fn checked_i64_to_u64(value: i64, field: &str) -> Result<u64> {
@@ -738,45 +798,26 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
     firecracker_pid: Pid,
     dirty_ranges: &DirtyMemoryRanges,
     output_dir: &Path,
+    mode: OverlaybdCompactOutput,
 ) -> Result<(PathBuf, u64)> {
     tokio::fs::create_dir_all(output_dir)
         .await
         .with_context(|| format!("create mem overlaybd dir: {}", output_dir.display()))?;
 
     let data_path = output_dir.join("overlaybd.commit");
-    let lower_tmp = data_path.with_extension("commit.tmp");
     let (mappings, memory_size) = dirty_ranges_to_segment_mappings(dirty_ranges)?;
-    let io_ring = shared_transient_io_ring();
-
-    let build_result: Result<()> = async {
-        let source_file: Arc<dyn VirtualFile> = Arc::new(ProcessVmReader::new(firecracker_pid));
-        let output_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&lower_tmp, io_ring)
-                .await
-                .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
-        );
-        let src_layers = vec![source_file];
-        let mut commit_args = CommitArgs::new(output_file);
-        commit_args.concurrency = DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY;
-        compact_to(&src_layers, &mappings, memory_size, commit_args)
-            .await
-            .context("compact dirty memory ranges as overlaybd layer")?;
-        tokio::fs::rename(&lower_tmp, &data_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "move sealed dirty memory lower into place failed: {}",
-                    data_path.display()
-                )
-            })?;
-        Ok(())
-    }
-    .await;
-
-    if build_result.is_err() {
-        let _ = tokio::fs::remove_file(&lower_tmp).await;
-    }
-    build_result?;
+    let source_file: Arc<dyn VirtualFile> = Arc::new(ProcessVmReader::new(firecracker_pid));
+    let src_layers = vec![source_file];
+    publish_memory_overlaybd_layer(
+        &src_layers,
+        &mappings,
+        memory_size,
+        &data_path,
+        mode,
+        DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY,
+    )
+    .await
+    .context("compact dirty memory ranges as overlaybd layer")?;
 
     Ok((data_path, memory_size))
 }
@@ -786,6 +827,8 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
 
+    use async_trait::async_trait;
+    use bytes::Bytes;
     use firecracker_client::models::DirtyMemoryRange;
     use serde_json::json;
 
@@ -961,6 +1004,7 @@ mod tests {
             None,
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
         )
         .await
         .expect("rewrite inherited runtime layers");
@@ -990,6 +1034,132 @@ mod tests {
             assert_eq!(source_metadata.dev(), adopted_metadata.dev());
             assert_eq!(source_metadata.ino(), adopted_metadata.ino());
         }
+    }
+
+    #[tokio::test]
+    async fn rewrite_deep_stable_prefix_adopts_without_compaction() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        // A stable prefix deeper than DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS must
+        // not trigger compaction on its own: only the runtime-owned suffix counts
+        // toward the budget (32 - 33/4 = 24 here, and the suffix is just 2).
+        let mut lowers: Vec<LayerConfig> = (0..33)
+            .map(|index| LayerConfig {
+                file: String::new(),
+                digest: format!("sha256:base-{index}"),
+                size: 4096,
+                ..Default::default()
+            })
+            .collect();
+        let runtime_a = runtime_root.join("a.commit");
+        let runtime_b = runtime_root.join("b.commit");
+        std::fs::write(&runtime_a, b"runtime a").expect("write runtime layer a");
+        std::fs::write(&runtime_b, b"runtime b").expect("write runtime layer b");
+        lowers.push(local_layer_config(&runtime_a));
+        lowers.push(local_layer_config(&runtime_b));
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            lowers,
+            &output_dir,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+        )
+        .await
+        .expect("rewrite with deep stable prefix");
+
+        assert_eq!(rewritten.len(), 35);
+        assert!(rewritten[..33].iter().all(|lower| lower.file.is_empty()));
+        assert_eq!(rewritten[0].digest, "sha256:base-0");
+        for (index, rewritten_lower) in rewritten[33..].iter().enumerate() {
+            let adopted = PathBuf::from(&rewritten_lower.file);
+            let expected_parent = output_dir
+                .join(INHERITED_LAYERS_DIR)
+                .join(format!("{index:04}"));
+            assert!(adopted.starts_with(expected_parent));
+        }
+        assert!(!output_dir.join(MANAGED_BASE_LAYER_FILE).exists());
+    }
+
+    /// Seal a tiny raw overlaybd commit for compaction tests.
+    async fn seal_raw_test_layer(
+        dir: &Path,
+        name: &str,
+        vsize: u64,
+        writes: &[(u64, u8)],
+    ) -> PathBuf {
+        let data = Arc::new(
+            LocalFile::new(dir.join(format!("{name}.data"))).expect("create layer data file"),
+        );
+        let index = Arc::new(
+            LocalFile::new(dir.join(format!("{name}.index"))).expect("create layer index file"),
+        );
+        let layer = overlaybd::index_file::LSMTFile::create(data, Some(index), vsize, false)
+            .await
+            .expect("create layer");
+        for (offset, byte) in writes {
+            layer
+                .write_at(*offset, &[*byte; 4096])
+                .await
+                .expect("write layer page");
+        }
+        let commit_path = dir.join(format!("{name}.commit"));
+        let output: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::new(&commit_path).expect("create layer commit output"));
+        layer
+            .commit_with_args(overlaybd::index_file::CommitArgs::new(output))
+            .await
+            .expect("commit raw layer");
+        commit_path
+    }
+
+    #[tokio::test]
+    async fn rewrite_shrinking_budget_compacts_runtime_suffix() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        // A 124-layer stable prefix shrinks the budget to max(32 - 124/4, 1) = 1,
+        // so a two-layer runtime-owned suffix already triggers compaction.
+        let mut lowers: Vec<LayerConfig> = (0..124)
+            .map(|index| LayerConfig {
+                file: String::new(),
+                digest: format!("sha256:base-{index}"),
+                size: 4096,
+                ..Default::default()
+            })
+            .collect();
+        let layer_a = seal_raw_test_layer(&runtime_root, "a", 4096, &[(0, 0xAA)]).await;
+        let layer_b = seal_raw_test_layer(&runtime_root, "b", 4096, &[(0, 0xBB)]).await;
+        lowers.push(local_layer_config(&layer_a));
+        lowers.push(local_layer_config(&layer_b));
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            lowers,
+            &output_dir,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+        )
+        .await
+        .expect("rewrite with shrinking budget");
+
+        assert_eq!(rewritten.len(), 125);
+        assert!(rewritten[..124].iter().all(|lower| lower.file.is_empty()));
+        let compacted = PathBuf::from(&rewritten[124].file);
+        assert_eq!(compacted, output_dir.join(MANAGED_BASE_LAYER_FILE));
+        assert!(compacted.exists());
+        assert!(!compacted.with_extension("commit.tmp").exists());
     }
 
     #[tokio::test]
@@ -1025,6 +1195,7 @@ mod tests {
             &live_runtime_image_config_path,
             &output_dir,
             Some(&snapshot_lower),
+            OverlaybdCompactOutput::Raw,
         )
         .await
         .expect("stage snapshot");
@@ -1035,6 +1206,97 @@ mod tests {
         assert_eq!(PathBuf::from(&latest.file), snapshot_lower);
         assert_eq!(latest.digest, "sha256:descriptor");
         assert_eq!(latest.size, 8);
+    }
+
+    async fn read_sealed_layer_bytes(path: &Path, len: usize) -> Vec<u8> {
+        use overlaybd::backend::switch::new_switch_file;
+        use overlaybd::backend::tar::new_tar_file_adaptor;
+        use overlaybd::index_file::LSMTReadOnlyFile;
+
+        let local: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_ro(path).expect("open sealed layer"));
+        let display = path.display().to_string();
+        let tar_adapted = new_tar_file_adaptor(local).await.expect("tar adaptor");
+        let switched = new_switch_file(tar_adapted, true, Some(&display))
+            .await
+            .expect("switch file");
+        let layer = LSMTReadOnlyFile::open(switched)
+            .await
+            .expect("open sealed layer as LSMT");
+        layer
+            .read_at(0, len)
+            .await
+            .expect("read sealed layer")
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn stage_recontainerizes_sealed_layer_as_zfile_when_requested() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let live_dir = temp.path().join("live");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&live_dir).expect("create live dir");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        let vsize = 3 * 4096u64;
+        let sealed_path =
+            seal_raw_test_layer(&output_dir, "snapshot", vsize, &[(0, 0xAB), (4096, 0xCD)]).await;
+        let live_runtime_image_config_path = live_dir.join("image.json");
+        std::fs::write(
+            &live_runtime_image_config_path,
+            serde_json::to_vec_pretty(&json!({
+                "repoBlobUrl": "s3://bucket/prefix",
+                "lowers": [
+                    {
+                        "digest": "sha256:base",
+                        "size": 10
+                    },
+                    {
+                        "file": sealed_path,
+                    }
+                ],
+                "upper": {},
+                "resultFile": live_dir.join("result.txt"),
+                "download": {}
+            }))
+            .expect("serialize live image config"),
+        )
+        .expect("write live image config");
+
+        let output_path = stage_overlaybd_snapshot_from_live_runtime(
+            &live_runtime_image_config_path,
+            &output_dir,
+            Some(&sealed_path),
+            OverlaybdCompactOutput::ZFile {
+                algorithm: crate::cfg::OverlaybdCompressionAlgorithm::Lz4,
+                workers: 1,
+            },
+        )
+        .await
+        .expect("stage snapshot with compressed seal");
+
+        let staged =
+            overlaybd::config::load_image_config(&output_path).expect("load staged image config");
+        assert_eq!(staged.lowers.len(), 2);
+        assert_eq!(staged.lowers[0].digest, "sha256:base");
+
+        let staged_layer = PathBuf::from(&staged.lowers[1].file);
+        assert!(staged_layer.ends_with(SNAPSHOT_ZFILE_DELTA_LAYER_FILE));
+        let staged_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_ro(&staged_layer).expect("open staged zfile layer"));
+        assert_eq!(
+            overlaybd::zfile::is_zfile(staged_file)
+                .await
+                .expect("probe staged layer"),
+            1
+        );
+
+        // The live runtime's raw sealed layer is untouched, and the staged
+        // ZFile layer carries identical logical content.
+        assert_eq!(
+            read_sealed_layer_bytes(&staged_layer, vsize as usize).await,
+            read_sealed_layer_bytes(&sealed_path, vsize as usize).await
+        );
     }
 
     #[tokio::test]
@@ -1066,10 +1328,14 @@ mod tests {
         let new_layer = temp.path().join("mem_overlaybd").join("overlaybd.commit");
         std::fs::create_dir_all(new_layer.parent().unwrap()).expect("create mem layer dir");
         std::fs::write(&new_layer, b"memory delta").expect("write mem layer");
-        let image_config =
-            build_mem_snapshot_image_config(Some(&parent_config_path), &new_layer, temp.path())
-                .await
-                .expect("build memory image config");
+        let image_config = build_mem_snapshot_image_config(
+            Some(&parent_config_path),
+            &new_layer,
+            temp.path(),
+            OverlaybdCompactOutput::Raw,
+        )
+        .await
+        .expect("build memory image config");
 
         assert_eq!(image_config.repo_blob_url, repo_blob_url);
         assert_eq!(
@@ -1085,5 +1351,54 @@ mod tests {
         assert!(latest.digest.is_empty());
         assert_eq!(latest.size, 0);
         assert!(image_config.download_override.is_none());
+    }
+
+    struct FailingSource;
+
+    #[async_trait]
+    impl VirtualFile for FailingSource {
+        async fn read_at(&self, _offset: u64, _len: usize) -> Result<Bytes> {
+            anyhow::bail!("injected memory source read failure")
+        }
+
+        async fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<usize> {
+            anyhow::bail!("injected memory source write failure")
+        }
+
+        async fn size(&self) -> Result<u64> {
+            Ok(OVERLAYBD_ALIGNMENT)
+        }
+    }
+
+    fn one_page_mapping() -> Vec<SegmentMapping> {
+        vec![SegmentMapping::new(0, 1, 0, false, 0)]
+    }
+
+    #[tokio::test]
+    async fn publish_memory_layer_failure_removes_temp_and_preserves_final() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = temp.path().join("memory.commit");
+        let lower_tmp = output.with_extension("commit.tmp");
+        let existing = b"existing final";
+        tokio::fs::write(&output, existing)
+            .await
+            .expect("write existing final");
+        let source: Arc<dyn VirtualFile> = Arc::new(FailingSource);
+        publish_memory_overlaybd_layer(
+            &[source],
+            &one_page_mapping(),
+            OVERLAYBD_ALIGNMENT,
+            &output,
+            OverlaybdCompactOutput::Raw,
+            1,
+        )
+        .await
+        .expect_err("copy failure should be returned");
+
+        assert!(!lower_tmp.exists());
+        assert_eq!(
+            tokio::fs::read(&output).await.expect("read final"),
+            existing
+        );
     }
 }

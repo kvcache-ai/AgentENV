@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
 use object_store_operator::{
-    credential_source_from_fields, normalized_credential, CredentialFields, CredentialSource,
-    CredentialSourceOptions,
+    credential_source_from_fields, normalized_credential, AddressingStyle, CredentialFields,
+    CredentialSource, CredentialSourceOptions,
 };
 
-use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy};
+use crate::cfg::{OssAddressingStyle, OssBackendConfig, SnapshotImageStoragePolicy};
 
 #[derive(Debug, Clone)]
 pub(crate) struct NormalizedOssConfig {
@@ -14,6 +14,7 @@ pub(crate) struct NormalizedOssConfig {
     prefix: String,
     credential_source: CredentialSource,
     snapshot_image_storage: SnapshotImageStoragePolicy,
+    addressing_style: Option<AddressingStyle>,
 }
 
 impl NormalizedOssConfig {
@@ -54,6 +55,10 @@ impl NormalizedOssConfig {
                 required_secret_access_key_label: "backend.oss.access_key_secret",
             },
         )?;
+        let addressing_style = config.addressing_style.map(|style| match style {
+            OssAddressingStyle::Path => AddressingStyle::Path,
+            OssAddressingStyle::Virtual => AddressingStyle::Virtual,
+        });
         Ok(Self {
             bucket,
             endpoint,
@@ -61,6 +66,7 @@ impl NormalizedOssConfig {
             prefix,
             credential_source,
             snapshot_image_storage,
+            addressing_style,
         })
     }
 
@@ -78,6 +84,12 @@ impl NormalizedOssConfig {
 
     pub(crate) fn region(&self) -> &str {
         &self.region
+    }
+
+    /// Explicit bucket addressing style override, if configured. `None` means
+    /// the client should fall back to endpoint-based auto-detection.
+    pub(crate) fn addressing_style(&self) -> Option<AddressingStyle> {
+        self.addressing_style
     }
 
     pub(crate) fn credential_source(&self) -> CredentialSource {
@@ -114,6 +126,7 @@ mod tests {
             access_key_secret: Some(" sk ".to_string()),
             security_token: Some(" token ".to_string()),
             region: Some(" cn-hangzhou ".to_string()),
+            addressing_style: None,
             cache_max_size_gb: Some(8),
         }
     }

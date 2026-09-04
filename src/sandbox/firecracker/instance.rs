@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 use firecracker_client::models::drive::IoEngine;
 use firecracker_client::models::instance_action_info::ActionType;
 use firecracker_client::models::vm::State as VmState;
-use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig};
+use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig, PartialDrive};
 use firecracker_client::models::{
     Balloon, BootSource, DirtyMemoryRanges, Drive, InstanceActionInfo, Logger,
     MachineConfiguration, MemoryBackend, NetworkInterface, NetworkOverride, RateLimiter,
@@ -310,7 +310,10 @@ impl FirecrackerInstance {
     ///
     /// `is_root_device` must be `true` for the boot rootfs drive and `false`
     /// for any non-root extra drive. This API is only used during the
-    /// pre-boot configuration phase.
+    /// pre-boot configuration phase. `rate_limiter` attaches a pre-boot limiter
+    /// so throttling is in force from the guest's first I/O (a post-start PATCH
+    /// would leave a brief unthrottled window).
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_drive(
         &self,
         drive_id: &str,
@@ -319,17 +322,45 @@ impl FirecrackerInstance {
         read_only: bool,
         direct: bool,
         io_engine: IoEngine,
+        rate_limiter: Option<Box<RateLimiter>>,
     ) -> Result<()> {
         let mut drive = Drive::new(drive_id.to_string(), is_root_device);
         drive.path_on_host = Some(path_on_host.to_string_lossy().into_owned());
         drive.is_read_only = Some(read_only);
         drive.direct = Some(direct);
         drive.io_engine = Some(io_engine);
+        drive.rate_limiter = rate_limiter;
         let path = format!("/drives/{}", drive_id);
         self.client
             .request_no_content(Method::PUT, &path, Some(&drive))
             .await
             .with_context(|| format!("Failed to add/update drive {}", drive_id))
+    }
+
+    /// Updates the rate limiter on a running VM's drive via PATCH.
+    pub async fn patch_drive_rate_limiter(
+        &self,
+        drive_id: &str,
+        rate_limiter: Box<RateLimiter>,
+    ) -> Result<()> {
+        let mut partial = PartialDrive::new(drive_id.to_string());
+        partial.rate_limiter = Some(rate_limiter);
+        let path = format!("/drives/{}", drive_id);
+        self.client
+            .request_no_content(Method::PATCH, &path, Some(&partial))
+            .await
+            .with_context(|| format!("Failed to patch rate limiter on drive {}", drive_id))
+    }
+
+    /// Updates the host backing path for a drive on a loaded snapshot.
+    pub async fn patch_drive_path(&self, drive_id: &str, path_on_host: &Path) -> Result<()> {
+        let mut partial = PartialDrive::new(drive_id.to_string());
+        partial.path_on_host = Some(path_on_host.to_string_lossy().into_owned());
+        let path = format!("/drives/{}", drive_id);
+        self.client
+            .request_no_content(Method::PATCH, &path, Some(&partial))
+            .await
+            .with_context(|| format!("Failed to patch host path on drive {}", drive_id))
     }
 
     /// Adds a network interface.
@@ -430,21 +461,6 @@ impl FirecrackerInstance {
             .context("Failed to resume microVM")
     }
 
-    /// Creates a snapshot of the microVM.
-    #[tracing::instrument(skip(self), fields(snapshot_path = %snapshot_path.display(), mem_file_path = %mem_file_path.display()))]
-    pub async fn create_snapshot(&self, snapshot_path: &Path, mem_file_path: &Path) -> Result<()> {
-        let mut params = SnapshotCreateParams::new(snapshot_path.to_string_lossy().into_owned());
-        params.mem_file_path = Some(mem_file_path.to_string_lossy().into_owned());
-        // create diff snapshot, when not enable kvm dirty tracking, it will use mincore
-        // internally, to get the present pages and dump as a sparse file.
-        params.snapshot_type =
-            Some(firecracker_client::models::snapshot_create_params::SnapshotType::Diff);
-        self.client
-            .request_no_content(Method::PUT, "/snapshot/create", Some(&params))
-            .await
-            .context("Failed to create snapshot")
-    }
-
     /// Creates a diff snapshot containing VM state only.
     ///
     /// The memory data path is handled by AgentENV through dirty memory ranges.
@@ -510,6 +526,7 @@ impl FirecrackerInstance {
         mem_backend_path: &Path,
         network_overrides: &[(&str, &str)],
         resume_vm: bool,
+        track_dirty_pages: bool,
     ) -> Result<()> {
         let snapshot_path = self.resolve_host_path(snapshot_path);
         let mut params = SnapshotLoadParams::new(snapshot_path.to_string_lossy().into_owned());
@@ -518,6 +535,7 @@ impl FirecrackerInstance {
             mem_backend_path.to_string_lossy().into_owned(),
         )));
         params.resume_vm = Some(resume_vm);
+        params.track_dirty_pages = Some(track_dirty_pages);
         if !network_overrides.is_empty() {
             params.network_overrides = Some(
                 network_overrides
@@ -727,12 +745,12 @@ mod tests {
         let instance = FirecrackerInstance::new(temp.path().to_path_buf());
 
         assert_eq!(
-            instance.resolve_host_path(Path::new("mem.bin")),
-            temp.path().join("mem.bin")
+            instance.resolve_host_path(Path::new("vm_state.bin")),
+            temp.path().join("vm_state.bin")
         );
         assert_eq!(
-            instance.resolve_host_path(Path::new("/tmp/mem.bin")),
-            PathBuf::from("/tmp/mem.bin")
+            instance.resolve_host_path(Path::new("/tmp/vm_state.bin")),
+            PathBuf::from("/tmp/vm_state.bin")
         );
 
         Ok(())

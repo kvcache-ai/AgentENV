@@ -65,6 +65,7 @@ impl OssBackend {
             config.region().to_string(),
             config.prefix().to_string(),
             config.credential_source(),
+            config.addressing_style(),
         )?);
 
         let repository: Arc<dyn SnapshotRepository> = Arc::new(OssSnapshotRepository::new(

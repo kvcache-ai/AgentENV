@@ -11,6 +11,7 @@ use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{PausedSandboxState, SandboxNetworkPolicy};
 use crate::snapshot::{CommandContext, SnapshotRuntimeVersions, StartupCommand};
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::virtualization::VirtualizationMode;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum SandboxTimeoutAction {
@@ -37,6 +38,9 @@ pub struct SandboxMetadata {
     pub timeout_action: SandboxTimeoutAction,
     pub expires_at: Option<SystemTime>,
     pub auto_resume: bool,
+    /// Virtualization mode used by this sandbox for its entire lifecycle.
+    #[serde(default)]
+    pub virtualization_mode: VirtualizationMode,
     pub runtime_versions: SnapshotRuntimeVersions,
     pub resources: SandboxResources,
     pub context: CommandContext,
@@ -50,6 +54,13 @@ pub struct SandboxMetadata {
     /// unless overridden at create time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<CustomExtensionParams>,
+    /// Independently managed volume mounts keyed by guest path.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub volume_mounts: HashMap<String, String>,
+    /// Whether envd requires the access token derived from this sandbox's ID.
+    /// Older records deserialize as non-secure sandboxes.
+    #[serde(default)]
+    pub secure: bool,
     /// Paused state produced by the sandbox backend during `pause`.
     /// Passed back to the backend factory when `resume_sandbox` is called.
     #[serde(skip)]
@@ -68,6 +79,7 @@ impl Default for SandboxMetadata {
             timeout_action: SandboxTimeoutAction::Pause,
             expires_at: None,
             auto_resume: false,
+            virtualization_mode: VirtualizationMode::default(),
             runtime_versions: SnapshotRuntimeVersions::new(
                 "unknown".to_string(),
                 "unknown".to_string(),
@@ -81,6 +93,8 @@ impl Default for SandboxMetadata {
             user_metadata: None,
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
+            volume_mounts: HashMap::new(),
+            secure: false,
             paused_state: None,
         }
     }

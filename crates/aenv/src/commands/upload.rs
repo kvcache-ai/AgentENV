@@ -13,6 +13,7 @@ use walkdir::WalkDir;
   aenv upload --user app <sandbox-id> ./config.json config.json")]
 pub struct Args {
     /// Sandbox ID
+    #[arg(add = crate::commands::completion::add_running_sandbox_candidates())]
     sandbox_id: String,
     /// Local file or directory to upload
     local_path: PathBuf,

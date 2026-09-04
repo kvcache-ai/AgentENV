@@ -11,14 +11,16 @@ use serde::Deserialize;
 use tracing::{debug, info};
 
 use crate::cfg::{
-    AppConfig, OssBackendConfig, OverlaybdDependencyConfig, SnapshotRepositoryBackendKind,
+    AppConfig, OssAddressingStyle, OssBackendConfig, OverlaybdDependencyConfig,
+    ResolvedImageCacheConfig, SnapshotRepositoryBackendKind,
 };
 use crate::digest::FileDigest;
+use crate::virtualization::VirtualizationMode;
 
 #[derive(Debug, Deserialize)]
 struct SetupDependencyManifest {
-    firecracker: ManifestDownload,
-    kernel: ManifestDownload,
+    firecracker: ManifestVirtualizationDownloads,
+    kernel: ManifestVirtualizationDownloads,
     tools: ManifestTools,
     overlaybd: OverlaybdDependencyConfig,
     #[serde(rename = "regclient")]
@@ -29,6 +31,21 @@ struct SetupDependencyManifest {
 struct ManifestDownload {
     version: String,
     url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManifestVirtualizationDownloads {
+    kvm: ManifestDownload,
+    pvm: ManifestDownload,
+}
+
+impl ManifestVirtualizationDownloads {
+    fn for_mode(&self, mode: VirtualizationMode) -> &ManifestDownload {
+        match mode {
+            VirtualizationMode::Kvm => &self.kvm,
+            VirtualizationMode::Pvm => &self.pvm,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,11 +84,14 @@ pub async fn ensure(config: &AppConfig, deps_path: &Path) -> Result<()> {
 
     // Architecture is resolved once and reused across dependency URL/path derivation.
     let arch = detect_arch()?;
+    if config.virtualization_mode == VirtualizationMode::Pvm && arch != "x86_64" {
+        bail!("PVM virtualization mode is only supported on x86_64 hosts");
+    }
 
     std::fs::create_dir_all(deps_path)?;
 
     ensure_firecracker(config, manifest, &arch).await?;
-    ensure_kernel(config, manifest).await?;
+    ensure_kernel(config, manifest, &arch).await?;
 
     // regctl is a runtime dependency for all registry access, not just tools
     // drive extraction, so it remains provisioned for explicit tools drives.
@@ -105,16 +125,17 @@ async fn ensure_firecracker(
         return Ok(());
     }
 
+    let mode_manifest = manifest.firecracker.for_mode(config.virtualization_mode);
     let fc_version = config
         .firecracker
         .version
         .as_deref()
-        .unwrap_or(&manifest.firecracker.version);
+        .unwrap_or(&mode_manifest.version);
     let fc_url_template = config
         .firecracker
         .url
         .as_deref()
-        .unwrap_or(&manifest.firecracker.url);
+        .unwrap_or(&mode_manifest.url);
     let fc_dir = fc_path
         .parent()
         .context("resolved firecracker binary path has no parent")?;
@@ -129,7 +150,11 @@ async fn ensure_firecracker(
     Ok(())
 }
 
-async fn ensure_kernel(config: &AppConfig, manifest: &SetupDependencyManifest) -> Result<()> {
+async fn ensure_kernel(
+    config: &AppConfig,
+    manifest: &SetupDependencyManifest,
+    arch: &str,
+) -> Result<()> {
     if let Some(kernel_path) = config.kernel.image_path.as_deref() {
         return validate_explicit_file("kernel.image_path", kernel_path, false);
     }
@@ -140,13 +165,17 @@ async fn ensure_kernel(config: &AppConfig, manifest: &SetupDependencyManifest) -
         return Ok(());
     }
 
+    let mode_manifest = manifest.kernel.for_mode(config.virtualization_mode);
     let kernel_version = config
         .kernel
         .version
         .as_deref()
-        .unwrap_or(&manifest.kernel.version);
-    let kernel_url_template = config.kernel.url.as_deref().unwrap_or(&manifest.kernel.url);
-    let kernel_url = resolve_url(kernel_url_template, &[("version", kernel_version)]);
+        .unwrap_or(&mode_manifest.version);
+    let kernel_url_template = config.kernel.url.as_deref().unwrap_or(&mode_manifest.url);
+    let kernel_url = resolve_url(
+        kernel_url_template,
+        &[("version", kernel_version), ("arch", arch)],
+    );
     download_file(&kernel_url, &kernel_path).await
 }
 
@@ -291,16 +320,73 @@ pub(crate) fn write_generated_overlaybd_global_configs(
         .background_download
         .to_overlaybd_download_config();
 
-    for (path, download) in [
-        (&config.ublk.overlaybd.global_config_path, &rootfs_download),
-        (
-            &config.memory_snapshot.overlaybd_global_config_path,
-            &memory_download,
-        ),
-    ] {
-        write_generated_overlaybd_global_config(path, config, p2p_facade_address, download)
-            .with_context(|| format!("write overlaybd global config {}", path.display()))?;
-    }
+    let image_cache = config.image_cache_layout();
+    write_generated_overlaybd_global_config(
+        &config.ublk.overlaybd.global_config_path,
+        config,
+        &image_cache,
+        p2p_facade_address,
+        &rootfs_download,
+    )
+    .with_context(|| {
+        format!(
+            "write overlaybd global config {}",
+            config.ublk.overlaybd.global_config_path.display()
+        )
+    })?;
+
+    let mut memory_cache = image_cache.clone();
+    memory_cache.remote_blocks_dir = image_cache.root_dir.join("memory-blocks");
+    write_generated_overlaybd_global_config(
+        &config.memory_snapshot.overlaybd_global_config_path,
+        config,
+        &memory_cache,
+        p2p_facade_address,
+        &memory_download,
+    )
+    .with_context(|| {
+        format!(
+            "write overlaybd global config {}",
+            config
+                .memory_snapshot
+                .overlaybd_global_config_path
+                .display()
+        )
+    })?;
+
+    // The offline C++ conversion tools (`overlaybd-apply`) get a dedicated
+    // global config with an isolated cacheDir: the C++ file cache treats every
+    // file under cacheDir as a flat cache entry and evicts (truncate+unlink)
+    // them, which destroys the Rust runtime cache's per-entry directories when
+    // both share `remote-blocks`. Background download stays disabled because
+    // conversion only ever opens local layers.
+    let mut convert_cache = image_cache.clone();
+    convert_cache.remote_blocks_dir = image_cache.root_dir.join("convert-blocks");
+    let convert_path = config.resolved_overlaybd_convert_global_config_path();
+    write_generated_overlaybd_global_config(
+        &convert_path,
+        config,
+        &convert_cache,
+        p2p_facade_address,
+        &DownloadConfig::default(),
+    )
+    .with_context(|| format!("write overlaybd global config {}", convert_path.display()))?;
+
+    // The offline C++ resize tool (`overlaybd-resize`) gets a dedicated global
+    // config with an isolated cacheDir for the same reason as the conversion
+    // tools above: the C++ file cache would otherwise evict live entries from
+    // the shared Rust runtime cache. Background download stays disabled.
+    let mut resize_cache = image_cache.clone();
+    resize_cache.remote_blocks_dir = image_cache.root_dir.join("resize-blocks");
+    let resize_path = config.resolved_overlaybd_resize_global_config_path();
+    write_generated_overlaybd_global_config(
+        &resize_path,
+        config,
+        &resize_cache,
+        p2p_facade_address,
+        &DownloadConfig::default(),
+    )
+    .with_context(|| format!("write overlaybd global config {}", resize_path.display()))?;
     Ok(())
 }
 
@@ -567,23 +653,20 @@ fn extract_ext4_from_ghcr(
 fn write_generated_overlaybd_global_config(
     path: &Path,
     app_config: &AppConfig,
+    image_cache: &ResolvedImageCacheConfig,
     p2p_facade_address: Option<&str>,
     download: &DownloadConfig,
 ) -> Result<()> {
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let image_cache = app_config.image_cache_layout();
     let log_path = config_dir.join("overlaybd.log");
-    let credential_config = match detect_docker_credential_config() {
-        Some(credential_path) => {
-            info!("found docker credential file; wiring overlaybd runtime to reuse it for registry auth");
-            serde_json::json!({
-                "mode": "file",
-                "path": credential_path.to_string_lossy(),
-                "timeout": 5
-            })
-        }
-        None => serde_json::json!({"mode": "", "path": "", "timeout": 1}),
-    };
+    let credential_path = detect_docker_credential_config();
+    if credential_path.is_some() {
+        info!(
+            "found docker credential file; wiring overlaybd runtime to reuse it for registry auth"
+        );
+    }
+    let (credential_file_path, credential_config) =
+        overlaybd_credential_fields(credential_path.as_deref());
     let p2p_config = match p2p_facade_address {
         Some(address) => serde_json::json!({
             "enable": true,
@@ -607,6 +690,7 @@ fn write_generated_overlaybd_global_config(
             "refillSize": 262144,
             "blockSize": 65536
         },
+        "credentialFilePath": credential_file_path,
         "credentialConfig": credential_config,
         "ioEngine": 0,
         "download": download,
@@ -636,6 +720,26 @@ fn write_generated_overlaybd_global_config(
     Ok(())
 }
 
+fn overlaybd_credential_fields(credential_path: Option<&Path>) -> (String, serde_json::Value) {
+    match credential_path {
+        Some(credential_path) => {
+            let credential_path = credential_path.to_string_lossy().into_owned();
+            (
+                credential_path.clone(),
+                serde_json::json!({
+                    "mode": "file",
+                    "path": credential_path,
+                    "timeout": 5
+                }),
+            )
+        }
+        None => (
+            String::new(),
+            serde_json::json!({"mode": "", "path": "", "timeout": 1}),
+        ),
+    }
+}
+
 fn overlaybd_runtime_oss_config(oss: &OssBackendConfig) -> Result<serde_json::Value> {
     let credential_source = credential_source_from_fields(
         CredentialFields {
@@ -658,11 +762,19 @@ fn overlaybd_runtime_oss_config(oss: &OssBackendConfig) -> Result<serde_json::Va
         .filter(|region| !region.is_empty())
         .context("backend.oss.region must be set when generating overlaybd OSS config")?;
     let endpoint = oss.endpoint.trim();
+    let addressing_style = match oss.addressing_style {
+        Some(OssAddressingStyle::Path) => "path",
+        Some(OssAddressingStyle::Virtual) => "virtual",
+        None => "",
+    };
 
     let mut config = serde_json::json!({
         "enable": true,
         "defaultRegion": region,
         "defaultEndpoint": endpoint,
+        // Empty string means the overlaybd runtime auto-detects the style per
+        // endpoint, matching the snapshot repository client's behavior.
+        "defaultAddressingStyle": addressing_style,
     });
 
     match credential_source {
@@ -705,10 +817,10 @@ fn detect_docker_credential_config() -> Option<PathBuf> {
 mod tests {
     use super::{
         bundled_manifest, ensure_firecracker, ensure_kernel, ensure_tools, file_exists_nonempty,
-        overlaybd_runtime_oss_config, validate_explicit_file, version_output_mentions_exact_token,
-        write_generated_overlaybd_global_configs,
+        overlaybd_credential_fields, overlaybd_runtime_oss_config, validate_explicit_file,
+        version_output_mentions_exact_token, write_generated_overlaybd_global_configs,
     };
-    use overlaybd::config::DownloadConfig;
+    use overlaybd::config::{load_global_config, DownloadConfig};
 
     use crate::cfg::{
         AppConfig, MemorySnapshotConfig, OssBackendConfig, UblkOverlaybdTomlConfig, UblkTomlConfig,
@@ -724,6 +836,7 @@ mod tests {
             access_key_secret: Some(" sk ".to_string()),
             security_token: Some(" token ".to_string()),
             region: Some(" cn-hangzhou ".to_string()),
+            addressing_style: None,
             cache_max_size_gb: Some(4),
         }
     }
@@ -736,10 +849,8 @@ mod tests {
         AppConfig {
             deps_path: root.to_path_buf(),
             ublk: UblkTomlConfig {
-                enabled: true,
                 daemon_binary_path: None,
                 daemon_log_path: None,
-                device_type: "overlaybd".to_string(),
                 overlaybd: UblkOverlaybdTomlConfig {
                     global_config_path: rootfs_global,
                     ..Default::default()
@@ -748,7 +859,6 @@ mod tests {
             },
             memory_snapshot: MemorySnapshotConfig {
                 overlaybd_global_config_path: mem_global,
-                direct_overlaybd: false,
                 ..Default::default()
             },
             ..AppConfig::default()
@@ -780,6 +890,18 @@ mod tests {
             config["defaultEndpoint"],
             "https://oss-cn-hangzhou.aliyuncs.com"
         );
+        assert_eq!(config["defaultAddressingStyle"], "");
+    }
+
+    #[test]
+    fn overlaybd_runtime_oss_config_propagates_addressing_style() {
+        use crate::cfg::OssAddressingStyle;
+
+        let mut oss = sample_oss_config();
+        oss.addressing_style = Some(OssAddressingStyle::Virtual);
+
+        let config = overlaybd_runtime_oss_config(&oss).expect("derive overlaybd oss config");
+        assert_eq!(config["defaultAddressingStyle"], "virtual");
     }
 
     #[test]
@@ -844,7 +966,7 @@ mod tests {
         ensure_firecracker(&config, bundled_manifest(), "x86_64")
             .await
             .expect("accept explicit firecracker");
-        ensure_kernel(&config, bundled_manifest())
+        ensure_kernel(&config, bundled_manifest(), "x86_64")
             .await
             .expect("accept explicit kernel");
         ensure_tools(&config, &deps_path, bundled_manifest()).expect("import explicit tools");
@@ -952,6 +1074,61 @@ mod tests {
             .expect("parse generated global config")
     }
 
+    #[test]
+    fn overlaybd_credential_fields_keep_legacy_and_modern_modes_aligned() {
+        let (legacy_path, modern) = overlaybd_credential_fields(None);
+        assert!(legacy_path.is_empty());
+        assert_eq!(modern["mode"], "");
+        assert_eq!(modern["path"], legacy_path);
+        assert_eq!(modern["timeout"], 1);
+
+        let path = std::path::Path::new("/tmp/docker-config.json");
+        let (legacy_path, modern) = overlaybd_credential_fields(Some(path));
+        assert_eq!(legacy_path, path.to_string_lossy());
+        assert_eq!(modern["mode"], "file");
+        assert_eq!(modern["path"], legacy_path);
+        assert_eq!(modern["timeout"], 5);
+    }
+
+    #[test]
+    fn generated_overlaybd_global_configs_preserve_effective_credentials() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp.path().join("overlaybd-global.json");
+        let memory = temp.path().join("mem-overlaybd-global.json");
+        let config =
+            app_config_with_overlaybd_global_configs(temp.path(), rootfs.clone(), memory.clone());
+        let convert = config.resolved_overlaybd_convert_global_config_path();
+        let resize = config.resolved_overlaybd_resize_global_config_path();
+
+        write_generated_overlaybd_global_configs(&config, None).expect("write global configs");
+
+        for path in [&rootfs, &memory, &convert, &resize] {
+            let value = read_global_config_value(path);
+            assert_eq!(
+                value["credentialFilePath"],
+                value["credentialConfig"]["path"],
+                "legacy and modern credential paths differ in {}",
+                path.display()
+            );
+
+            let loaded = load_global_config(path).expect("reload generated global config");
+            assert_eq!(
+                loaded.credential_config.mode,
+                value["credentialConfig"]["mode"]
+                    .as_str()
+                    .expect("credential mode is a string"),
+                "effective credential mode changed while loading {}",
+                path.display()
+            );
+            assert_eq!(
+                loaded.credential_config.path,
+                loaded.credential_file_path,
+                "effective credential paths differ after loading {}",
+                path.display()
+            );
+        }
+    }
+
     fn assert_download_json(value: &serde_json::Value, expected: &DownloadConfig) {
         let download = &value["download"];
         assert_eq!(download["enable"], expected.enable);
@@ -961,6 +1138,11 @@ mod tests {
         assert_eq!(download["tryCnt"], expected.try_cnt);
         assert_eq!(download["blockSize"], expected.block_size);
         assert_eq!(download["concurrency"], expected.concurrency);
+        assert_eq!(download["maxInflightBlocks"], expected.max_inflight_blocks);
+        assert_eq!(
+            download["maxConcurrentFiles"],
+            expected.max_concurrent_files
+        );
     }
 
     #[test]
@@ -981,6 +1163,100 @@ mod tests {
             .to_overlaybd_download_config();
         let memory_value = read_global_config_value(&mem);
         assert_download_json(&memory_value, &expected_memory);
+    }
+
+    #[test]
+    fn generated_convert_overlaybd_global_config_uses_isolated_cache_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp.path().join("overlaybd-global.json");
+        let mem = temp.path().join("mem-overlaybd-global.json");
+        let mut config =
+            app_config_with_overlaybd_global_configs(temp.path(), rootfs.clone(), mem.clone());
+        config.image.cache.root_dir = temp.path().join("image-cache");
+
+        write_generated_overlaybd_global_configs(&config, None).expect("write global configs");
+
+        let convert = temp.path().join("convert-overlaybd-global.json");
+        let convert_value = read_global_config_value(&convert);
+        let rootfs_value = read_global_config_value(&rootfs);
+        let expected_cache_dir = temp.path().join("image-cache").join("convert-blocks");
+        assert_eq!(
+            convert_value["cacheConfig"]["cacheDir"].as_str(),
+            expected_cache_dir.to_str(),
+            "convert tools must use an isolated cacheDir"
+        );
+        assert_ne!(
+            convert_value["cacheConfig"]["cacheDir"], rootfs_value["cacheConfig"]["cacheDir"],
+            "convert tools must not share the runtime remote-blocks cacheDir"
+        );
+        assert_eq!(convert_value["download"]["enable"], false);
+    }
+
+    #[test]
+    fn resolved_overlaybd_resize_global_config_path_is_sibling_of_runtime_config() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp.path().join("overlaybd-global.json");
+        let mem = temp.path().join("mem-overlaybd-global.json");
+        let config = app_config_with_overlaybd_global_configs(temp.path(), rootfs, mem);
+
+        assert_eq!(
+            config.resolved_overlaybd_resize_global_config_path(),
+            temp.path().join("resize-overlaybd-global.json")
+        );
+    }
+
+    #[test]
+    fn generated_resize_overlaybd_global_config_uses_isolated_cache_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp.path().join("overlaybd-global.json");
+        let mem = temp.path().join("mem-overlaybd-global.json");
+        let mut config =
+            app_config_with_overlaybd_global_configs(temp.path(), rootfs.clone(), mem.clone());
+        config.image.cache.root_dir = temp.path().join("image-cache");
+
+        write_generated_overlaybd_global_configs(&config, None).expect("write global configs");
+
+        let resize = temp.path().join("resize-overlaybd-global.json");
+        let resize_value = read_global_config_value(&resize);
+        let rootfs_value = read_global_config_value(&rootfs);
+        let convert_value =
+            read_global_config_value(&temp.path().join("convert-overlaybd-global.json"));
+        let expected_resize_cache_dir = temp.path().join("image-cache").join("resize-blocks");
+        assert_eq!(
+            resize_value["cacheConfig"]["cacheDir"].as_str(),
+            expected_resize_cache_dir.to_str(),
+            "resize tool must use an isolated cacheDir"
+        );
+        assert_ne!(
+            resize_value["cacheConfig"]["cacheDir"], rootfs_value["cacheConfig"]["cacheDir"],
+            "resize tool must not share the runtime remote-blocks cacheDir"
+        );
+        assert_ne!(
+            resize_value["cacheConfig"]["cacheDir"], convert_value["cacheConfig"]["cacheDir"],
+            "resize tool must not share the conversion convert-blocks cacheDir"
+        );
+        assert_eq!(resize_value["download"]["enable"], false);
+
+        // Isolation only changes cache/download ownership: registry, credential
+        // and P2P fields stay identical to the runtime rootfs config.
+        assert_eq!(
+            resize_value["registryFsVersion"],
+            rootfs_value["registryFsVersion"]
+        );
+        assert_eq!(
+            resize_value["credentialConfig"],
+            rootfs_value["credentialConfig"]
+        );
+        assert_eq!(resize_value["p2pConfig"], rootfs_value["p2pConfig"]);
+        assert_eq!(resize_value["ioEngine"], rootfs_value["ioEngine"]);
+        assert_eq!(
+            resize_value["cacheConfig"]["cacheType"],
+            rootfs_value["cacheConfig"]["cacheType"]
+        );
+        assert_eq!(
+            resize_value["cacheConfig"]["cacheSizeGB"],
+            rootfs_value["cacheConfig"]["cacheSizeGB"]
+        );
     }
 
     #[test]
@@ -1005,6 +1281,37 @@ mod tests {
                 .to_overlaybd_download_config()
         };
         assert_download_json(&read_global_config_value(&mem), &expected_memory);
+    }
+
+    #[test]
+    fn generated_memory_overlaybd_global_config_uses_independent_cache_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp.path().join("overlaybd-global.json");
+        let mem = temp.path().join("mem-overlaybd-global.json");
+        let mut config =
+            app_config_with_overlaybd_global_configs(temp.path(), rootfs.clone(), mem.clone());
+        config.image.cache.root_dir = temp.path().join("image-cache");
+
+        write_generated_overlaybd_global_configs(&config, None).expect("write global configs");
+
+        let rootfs_value = read_global_config_value(&rootfs);
+        let memory_value = read_global_config_value(&mem);
+        let convert_value =
+            read_global_config_value(&temp.path().join("convert-overlaybd-global.json"));
+        let resize_value =
+            read_global_config_value(&temp.path().join("resize-overlaybd-global.json"));
+        let expected_memory_cache_dir = config.image.cache.root_dir.join("memory-blocks");
+        assert_eq!(
+            memory_value["cacheConfig"]["cacheDir"].as_str(),
+            expected_memory_cache_dir.to_str(),
+            "memory snapshots must use an independent Rust cacheDir"
+        );
+        for other in [&rootfs_value, &convert_value, &resize_value] {
+            assert_ne!(
+                memory_value["cacheConfig"]["cacheDir"], other["cacheConfig"]["cacheDir"],
+                "memory cacheDir must be distinct from every other cacheDir"
+            );
+        }
     }
 
     #[test]

@@ -9,6 +9,8 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 
 use crate::sandbox::CustomExtensionParams;
+use crate::virtualization::VirtualizationMode;
+use crate::volume::VolumeMode;
 use shell_util::shell_quote;
 
 use super::drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
@@ -17,7 +19,17 @@ use super::version::SnapshotRuntimeVersions;
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::types::{ImageConfigs, SandboxResources};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotVolume {
+    pub mount_path: String,
+    #[serde(default)]
+    pub mode: VolumeMode,
+    pub size_mb: u64,
+    pub layers: Vec<OverlaybdLayerRef>,
+}
+
+#[derive(Clone, Debug)]
 pub struct SnapshotPublishMetadata {
     pub id: SnapshotId,
     pub alias: Option<SnapshotAlias>,
@@ -26,11 +38,11 @@ pub struct SnapshotPublishMetadata {
     pub startup: Option<StartupCommand>,
     pub resources: SandboxResources,
     pub runtime_versions: SnapshotRuntimeVersions,
-    #[serde(default, skip_serializing_if = "ImageConfigs::is_empty")]
+    pub virtualization_mode: VirtualizationMode,
     pub image_configs: ImageConfigs,
+    pub volume_snapshots: Vec<SnapshotVolume>,
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Template launches inherit it unless overridden at create time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<CustomExtensionParams>,
 }
 
@@ -50,7 +62,9 @@ impl SnapshotPublishMetadata {
                 envd_version: "envd".to_string(),
                 tools_drive_version: "0.1.0".to_string(),
             },
+            virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
             image_configs: ImageConfigs::new(),
+            volume_snapshots: Vec::new(),
             custom_extension_params: None,
         }
     }
@@ -285,10 +299,17 @@ pub struct CommittedSnapshot {
     pub context: CommandContext,
     pub startup: Option<StartupCommand>,
     pub runtime_versions: SnapshotRuntimeVersions,
+    /// Node virtualization ABI used to capture this snapshot.
+    #[serde(default)]
+    pub virtualization_mode: VirtualizationMode,
     #[serde(default, skip_serializing_if = "ImageConfigs::is_empty")]
     pub image_configs: ImageConfigs,
     pub rootfs_layers: Vec<OverlaybdLayerRef>,
     pub attached_drives: Vec<CommittedAttachedDrive>,
+    /// Logical volume snapshots captured with the sandbox, without local
+    /// snapshot artifact paths.
+    #[serde(default)]
+    pub volume_snapshots: Vec<SnapshotVolume>,
     /// Managed overlaybd layers for the memory snapshot image, ordered bottom-up.
     pub memory_layers: Vec<ManagedLayer>,
     #[serde(default)]
@@ -310,9 +331,11 @@ impl CommittedSnapshot {
                 envd_version: "envd".to_string(),
                 tools_drive_version: "0.1.0".to_string(),
             },
+            virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
             image_configs: ImageConfigs::new(),
             rootfs_layers: Vec::new(),
             attached_drives: Vec::new(),
+            volume_snapshots: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,
@@ -555,6 +578,16 @@ impl RunnableSnapshot {
             _lease: default_runtime_artifact_lease(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_legacy_manifest(
+        record: SnapshotRecord,
+        attached_drives: Vec<ResolvedAttachedDrive>,
+    ) -> Self {
+        let mut snapshot = Self::from_test_manifest(record, attached_drives);
+        snapshot.manifest.volume_drive_slots = 0;
+        snapshot
+    }
 }
 
 impl fmt::Debug for RunnableSnapshot {
@@ -568,9 +601,12 @@ impl fmt::Debug for RunnableSnapshot {
 
 #[cfg(test)]
 mod tests {
+    use crate::volume::VolumeMode;
+
     use super::{
         rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ManagedLayer,
-        PersistedDiskImagePublication, SnapshotRecord, TemplateBuildErrorReason,
+        OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotRecord, SnapshotVolume,
+        TemplateBuildErrorReason,
     };
     use std::collections::HashMap;
 
@@ -604,6 +640,59 @@ mod tests {
             .runtime_versions
             .tools_drive_version
             .is_empty());
+    }
+
+    #[test]
+    fn snapshot_volume_is_logical() {
+        let mut record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        record
+            .committed
+            .as_mut()
+            .unwrap()
+            .volume_snapshots
+            .push(SnapshotVolume {
+                mount_path: "/mnt/data".to_string(),
+                mode: VolumeMode::ReadOnly,
+                size_mb: 1024,
+                layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
+                    digest: "sha256:abc".to_string(),
+                    size: 123,
+                    uuid: None,
+                })],
+            });
+
+        let value = serde_json::to_value(&record).expect("serialize snapshot record");
+        assert_eq!(
+            value["committed"]["volume_snapshots"][0]["layers"][0]["Managed"]["digest"],
+            "sha256:abc"
+        );
+        assert_eq!(
+            value["committed"]["volume_snapshots"][0]["mode"],
+            "ReadOnly"
+        );
+        assert!(!value.to_string().contains("snapshot_dir"));
+        let decoded: SnapshotRecord =
+            serde_json::from_value(value.clone()).expect("deserialize record");
+        assert_eq!(
+            decoded.committed.as_ref().unwrap().volume_snapshots[0].mount_path,
+            "/mnt/data"
+        );
+        assert_eq!(
+            decoded.committed.unwrap().volume_snapshots[0].mode,
+            VolumeMode::ReadOnly
+        );
+
+        let mut legacy = value;
+        legacy["committed"]["volume_snapshots"][0]
+            .as_object_mut()
+            .expect("volume snapshot must be an object")
+            .remove("mode");
+        let decoded: SnapshotRecord =
+            serde_json::from_value(legacy).expect("deserialize legacy record");
+        assert_eq!(
+            decoded.committed.unwrap().volume_snapshots[0].mode,
+            VolumeMode::Exclusive
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::task;
 
-use super::super::shared_runtime_cache_root;
+use super::super::{common::materialize_volume_image_config, shared_runtime_cache_root};
 use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
 use super::catalog::PosixFsCatalogStore;
 use super::runtime::PosixFsRuntimeResolver;
@@ -13,10 +13,13 @@ use crate::image::cache::{local_image_services_from_global_config, OverlaybdLaye
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
-use crate::snapshot::repository::{RepositoryError, RepositoryResult, SnapshotListFilter};
+use crate::snapshot::repository::{
+    RepositoryError, RepositoryResult, SnapshotListFilter, VolumeRecordPage,
+};
 use crate::snapshot::types::{
     CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
 };
+use crate::volume::VolumeRecord;
 
 #[derive(Clone, Debug)]
 pub struct PosixFsBackendConfig {
@@ -132,10 +135,12 @@ impl PosixFsSnapshotRepository {
             context: metadata.context.clone(),
             startup: metadata.startup.clone(),
             runtime_versions: metadata.runtime_versions.clone(),
+            virtualization_mode: metadata.virtualization_mode,
             image_configs: metadata.image_configs.clone(),
             custom_extension_params: metadata.custom_extension_params.clone(),
             rootfs_layers: built.rootfs_layers,
             attached_drives: built.attached_drives,
+            volume_snapshots: metadata.volume_snapshots.clone(),
             memory_layers: built.memory_layers,
             disk_publications: Vec::new(),
         }
@@ -143,6 +148,15 @@ impl PosixFsSnapshotRepository {
 
     fn create_sync(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         self.catalog_store.create(record)
+    }
+
+    async fn run_catalog<T, F>(&self, operation: &'static str, work: F) -> RepositoryResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&PosixFsCatalogStore) -> RepositoryResult<T> + Send + 'static,
+    {
+        let store = Arc::clone(&self.catalog_store);
+        run_repository_blocking(operation, move || work(&store)).await
     }
 
     fn publish_sync(
@@ -296,6 +310,118 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         let id = id.clone();
         run_repository_blocking("mark template build error", move || {
             repository.mark_error_sync(&id, reason)
+        })
+        .await
+    }
+
+    async fn get_volume(&self, reference: &str) -> RepositoryResult<Option<VolumeRecord>> {
+        let reference = reference.to_owned();
+        self.run_catalog("get volume", move |store| store.get_volume(&reference))
+            .await
+    }
+
+    async fn list_volumes_page(
+        &self,
+        after_volume_id: Option<&str>,
+        limit: usize,
+    ) -> RepositoryResult<VolumeRecordPage> {
+        let after_volume_id = after_volume_id.map(str::to_owned);
+        self.run_catalog("list volumes", move |store| {
+            store.list_volumes_page(after_volume_id.as_deref(), limit)
+        })
+        .await
+    }
+
+    async fn create_volume(&self, record: VolumeRecord) -> RepositoryResult<()> {
+        self.run_catalog("create volume", move |store| store.create_volume(&record))
+            .await
+    }
+
+    async fn put_volume(&self, record: VolumeRecord) -> RepositoryResult<()> {
+        let mut record = record;
+        record.backing_image_config = None;
+        self.run_catalog("put volume", move |store| store.put_volume(&record))
+            .await
+    }
+
+    async fn publish_volume_backing(
+        &self,
+        _volume_id: &str,
+        image_config_path: &std::path::Path,
+    ) -> RepositoryResult<Vec<crate::snapshot::OverlaybdLayerRef>> {
+        let repository = self.clone();
+        let image_config_path = image_config_path.to_path_buf();
+        run_repository_blocking("publish volume backing", move || {
+            repository
+                .artifact_store
+                .publish_volume_backing(&image_config_path)
+        })
+        .await
+    }
+
+    async fn materialize_volume_backing(
+        &self,
+        _volume_id: &str,
+        layers: &[crate::snapshot::OverlaybdLayerRef],
+        destination: &std::path::Path,
+    ) -> RepositoryResult<std::path::PathBuf> {
+        materialize_volume_image_config(layers, destination, |layer| {
+            overlaybd::config::LayerConfig {
+                file: self
+                    .artifact_store
+                    .managed_layer_path(&layer.digest)
+                    .to_string_lossy()
+                    .into_owned(),
+                digest: layer.digest.clone(),
+                size: layer.size,
+                uuid: layer.uuid.clone().unwrap_or_default(),
+                ..Default::default()
+            }
+        })
+        .await
+    }
+
+    async fn delete_volume(&self, volume_id: &str) -> RepositoryResult<()> {
+        let volume_id = volume_id.to_owned();
+        self.run_catalog("delete volume", move |store| {
+            store.delete_volume(&volume_id)
+        })
+        .await
+    }
+
+    async fn reserve_volume(
+        &self,
+        volume_id: &str,
+        owner: &str,
+    ) -> RepositoryResult<Option<String>> {
+        let volume_id = volume_id.to_owned();
+        let owner = owner.to_owned();
+        self.run_catalog("reserve volume", move |store| {
+            store.reserve_volume(&volume_id, &owner)
+        })
+        .await
+    }
+
+    async fn reserve_read_only_volume(&self, volume_id: &str, owner: &str) -> RepositoryResult<()> {
+        let volume_id = volume_id.to_owned();
+        let owner = owner.to_owned();
+        self.run_catalog("reserve read-only volume", move |store| {
+            store.reserve_read_only_volume(&volume_id, &owner)
+        })
+        .await
+    }
+
+    async fn replace_volume_owner_for(
+        &self,
+        volume_id: &str,
+        from: &str,
+        to: Option<&str>,
+    ) -> RepositoryResult<()> {
+        let volume_id = volume_id.to_owned();
+        let from = from.to_owned();
+        let to = to.map(str::to_owned);
+        self.run_catalog("replace volume owner", move |store| {
+            store.replace_volume_owner_for(&volume_id, &from, to.as_deref())
         })
         .await
     }
@@ -603,6 +729,8 @@ mod tests {
                     mount_path: ExtraDrive::default_mount_path("data"),
                     virtual_size: Some(32768),
                     sub_path: None,
+                    snapshot_output_dir: None,
+                    volume: false,
                 },
                 ExtraDrive::Overlaybd {
                     drive_id: "data".to_string(),
@@ -611,6 +739,8 @@ mod tests {
                     mount_path: ExtraDrive::default_mount_path("data"),
                     virtual_size: Some(32768),
                     sub_path: None,
+                    snapshot_output_dir: None,
+                    volume: false,
                 },
             ],
         );
@@ -639,6 +769,7 @@ mod tests {
             context: metadata.context.clone(),
             startup: metadata.startup.clone(),
             runtime_versions: metadata.runtime_versions.clone(),
+            virtualization_mode: metadata.virtualization_mode,
             image_configs: metadata.image_configs.clone(),
             rootfs_layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
                 digest: "sharedfs:missing".to_string(),
@@ -646,6 +777,7 @@ mod tests {
                 uuid: None,
             })],
             attached_drives: Vec::new(),
+            volume_snapshots: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,
@@ -695,6 +827,7 @@ mod tests {
             context: metadata.context.clone(),
             startup: metadata.startup.clone(),
             runtime_versions: metadata.runtime_versions.clone(),
+            virtualization_mode: metadata.virtualization_mode,
             image_configs: metadata.image_configs.clone(),
             rootfs_layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
                 digest: "sharedfs:test".to_string(),
@@ -702,6 +835,7 @@ mod tests {
                 uuid: Some("11111111-2222-3333-4444-555555555555".to_string()),
             })],
             attached_drives: Vec::new(),
+            volume_snapshots: Vec::new(),
             memory_layers: Vec::new(),
             disk_publications: Vec::new(),
             custom_extension_params: None,

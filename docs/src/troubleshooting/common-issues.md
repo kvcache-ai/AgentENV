@@ -1,14 +1,38 @@
 # Common Issues
 
-## `/dev/kvm` not accessible
+## `/dev/kvm` is missing or inaccessible
 
-**Symptom**: Server fails to start with a KVM-related error.
+**Symptom**: The server cannot find or open `/dev/kvm`.
 
-**Solution**: Ensure your host has hardware virtualization enabled (Intel VT-x or AMD-V) and that `/dev/kvm` is readable by the current user. On most systems:
+**Solution**: First check whether standard KVM is available:
+
+```bash
+ls -l /dev/kvm
+```
+
+If the device exists, ensure it is readable and writable by the runtime user.
+On most systems:
 
 ```bash
 sudo usermod -aG kvm $USER
 # Log out and back in for the group change to take effect
+```
+
+If the cloud server does not expose standard KVM, follow
+[PVM Deployment](../deployment/pvm.md). That guide covers the additional host
+setup needed before starting AgentENV.
+
+## The configured virtualization mode does not match the host
+
+**Symptom**: Startup reports that KVM cannot run while the PVM module is
+loaded, or that PVM requires additional host setup.
+
+**Solution**: Normal installations should use the default KVM mode. If the
+host was prepared for PVM, follow [PVM Deployment](../deployment/pvm.md) and
+ensure the service environment contains:
+
+```bash
+AENV_VIRTUALIZATION_MODE=pvm
 ```
 
 ## Permission denied for network operations
@@ -19,8 +43,8 @@ sudo usermod -aG kvm $USER
 its effective, permitted, and inheritable sets. The installed systemd unit
 configures these automatically. For a source checkout, use `make start-server`
 or `scripts/run-with-capabilities.sh <server-binary>`; do not run the whole
-server as root. Also verify that the runtime account belongs to the `kvm` group
-and can open `/dev/ublk-control`.
+server as root. Also verify that the runtime account belongs to the `kvm`
+group, can open `/dev/kvm`, and can open `/dev/ublk-control`.
 
 ## Sandbox namespaces are missing from `ip netns list`
 

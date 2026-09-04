@@ -43,6 +43,23 @@ Validation:
 - Sandbox ID must be a valid UUID format.
 - Target port must parse as `u16` and be greater than `0`.
 
+Authorization is evaluated by the owning runtime after route parsing:
+
+- Control-plane routes require the deployment `X-API-Key` and do not accept
+  sandbox credentials.
+- Node Prometheus `/metrics` and health `/health` are public to application
+  auth and should be protected separately at the deployment boundary.
+- Non-envd application routes require `e2b-traffic-access-token` only when the
+  sandbox has private ingress (`allowPublicTraffic: false`).
+- The envd port requires `X-Access-Token` only for secure sandboxes.
+- `X-API-Key` is never a data-plane credential.
+
+The distributed gateway deliberately does not make sandbox authorization
+decisions. It routes data-plane requests, including public ingress and insecure
+envd requests with no credential, to the owning runtime. The runtime has the
+sandbox metadata needed to apply the policy and performs the authoritative
+token validation.
+
 Host-based routing derives both fields from `Host`. The configured domain must
 match exactly after lowercase normalization and optional trailing-dot removal.
 Sandbox IDs in host routes must be valid UUIDs and the target port must fit in
@@ -75,7 +92,7 @@ This keeps hot-path reads lock-light and avoids reading sandbox instance interna
 
 `/proxy` can auto-resume paused sandboxes when lifecycle policy enables it.
 
-- Proxy never reads sandbox metadata directly.
+- Proxy route resolution does not read sandbox instance internals.
 - Orchestrator lookup returns `Paused { auto_resume }`, and proxy decides behavior from that signal.
 - Auto-resume is attempted once per request.
 - Resume timeout update uses `EnsureMinimum(5 minutes)`:
@@ -135,6 +152,14 @@ Control-plane routing headers are stripped before forwarding upstream:
 - `e2b-sandbox-id`
 - `e2b-sandbox-port`
 
+Sandbox credential handling:
+
+- `e2b-traffic-access-token` is stripped before forwarding.
+- A successfully validated secure-envd `X-Access-Token` is forwarded to envd;
+  otherwise that header is stripped.
+- A value matching the platform `X-API-Key` is stripped; other values are
+  forwarded as application headers.
+
 Hop-by-hop headers are stripped on both request and response paths, including:
 
 - Standard hop-by-hop headers (`Connection`, `Upgrade`, `TE`, `Trailer`, `Transfer-Encoding`, `Proxy-Authenticate`, `Proxy-Authorization`, `Keep-Alive`)
@@ -191,7 +216,7 @@ Handshake failure behavior:
 
 ```bash
 curl -i \
-  -H 'X-API-Key: test-key' \
+  -H 'e2b-traffic-access-token: <trafficAccessToken>' \
   -H 'x-agentenv-sandbox-id: <sandbox-uuid>' \
   -H 'x-agentenv-target-port: 8080' \
   'http://127.0.0.1:8000/proxy/health?full=true'

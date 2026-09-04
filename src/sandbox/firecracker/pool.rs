@@ -86,8 +86,12 @@ impl FirecrackerPool {
         // The pool is a process-wide singleton and can outlive the Tokio
         // runtime that first touched it in tests and benchmarks. Keep a small
         // owned runtime for the synchronous maintenance thread instead of
-        // storing `Handle::current()`.
+        // storing `Handle::current()`. A single worker is enough: maintenance
+        // only runs occasional I/O-bound `block_on` calls (spawn Firecracker,
+        // poll its API socket), while the default multi-thread runtime would
+        // park one worker thread per CPU core for its entire lifetime.
         let runtime = Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .thread_name("firecracker-pool-runtime")
             .build()

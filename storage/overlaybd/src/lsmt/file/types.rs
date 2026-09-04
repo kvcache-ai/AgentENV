@@ -19,7 +19,7 @@ pub(crate) const PARALLEL_LOAD_INDEX: usize = 32;
 
 pub const MAX_STACK_LAYERS: usize = 255;
 
-pub(super) const PREMERGED_INDEX_DIR: &str = "premerged-index";
+pub(crate) const PREMERGED_INDEX_DIR: &str = "premerged-index";
 pub(super) const PREMERGED_INDEX_EXT: &str = "pmidx";
 pub(super) const PREMERGED_INDEX_MAGIC: [u8; 8] = *b"PMIDX001";
 pub(super) const PREMERGED_INDEX_FORMAT_VERSION: u32 = 1;
@@ -127,6 +127,29 @@ impl RwLayout {
             RwLayout::HybridLogStructured => LSMTFileType::HybridReadWrite,
         }
     }
+
+    /// Reject a layout the current platform cannot support.
+    ///
+    /// `Sparse` pre-sizes the upper to the whole virtual disk and recovers "which
+    /// blocks were written" from the filesystem's extent map, so it only works
+    /// where unwritten regions are guaranteed to be reportable holes — see
+    /// [`crate::sys::sparse_extents_are_reliable`].
+    ///
+    /// Called from every entry point that creates *or* opens an upper, not just
+    /// from the recovery scan in `create_mappings_from_sparse`. Guarding only the
+    /// scan would let an unsupported platform create a sparse upper, write to it
+    /// successfully, and then fail to reopen it on the next restart — surfacing
+    /// the problem after the data is already there instead of before.
+    pub(super) fn ensure_supported(self) -> Result<Self> {
+        ensure!(
+            self != RwLayout::Sparse || crate::sys::sparse_extents_are_reliable(),
+            "sparse RW layout is not supported on this platform: it does not \
+             guarantee that unwritten regions are reported as holes, so the \
+             upper's extent map cannot be used to recover which blocks were \
+             written"
+        );
+        Ok(self)
+    }
 }
 
 impl From<crate::config::UpperMode> for RwLayout {
@@ -209,7 +232,7 @@ impl AppendDigestTracker {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DataStat {
     pub total_data_size: u64,
     pub valid_data_size: u64,

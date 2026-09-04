@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use overlaybd::config::UpperMode;
+use overlaybd::index_file::DataStat;
 use overlaybd::LayerDescriptor;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,12 +39,6 @@ pub enum DaemonRequest {
         known_source_virtual_size: Option<u64>,
         #[serde(default)]
         allow_shrink: bool,
-    },
-    /// Create a raw COW ublk device. This is separate from OverlayBD runtime
-    /// materialization and does not support restack snapshot.
-    CreateCow {
-        origin: PathBuf,
-        cow: PathBuf,
     },
     Delete {
         dev_id: u32,
@@ -130,6 +125,13 @@ pub enum DaemonResponse {
     Deleted,
     RestackSnapshotCreated {
         descriptor: Option<LayerDescriptor>,
+        /// Best-effort device usage stats captured after the restack. Absent
+        /// when produced by an older daemon or when computation failed.
+        #[serde(default)]
+        data_stat: Option<DataStat>,
+        /// Guest ext4 used bytes probed from the device, when it looks like ext4.
+        #[serde(default)]
+        ext4_used_bytes: Option<u64>,
     },
     Ok,
     TerminalError {
@@ -144,6 +146,14 @@ pub enum DaemonResponse {
 }
 
 // ── Wire helpers ────────────────────────────────────────────────────────────
+
+/// Client-side outcome of a restack snapshot RPC.
+#[derive(Debug, Clone, Default)]
+pub struct RestackSnapshotStats {
+    pub descriptor: Option<LayerDescriptor>,
+    pub data_stat: Option<DataStat>,
+    pub ext4_used_bytes: Option<u64>,
+}
 
 /// Send a length-prefixed JSON message over a Unix stream.
 ///
@@ -502,23 +512,6 @@ mod tests {
     // ── New serde round-trip tests for remaining variants ───────────────
 
     #[test]
-    fn request_create_cow_round_trip() {
-        let req = DaemonRequest::CreateCow {
-            origin: PathBuf::from("/data/origin.img"),
-            cow: PathBuf::from("/data/cow.img"),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
-        match decoded {
-            DaemonRequest::CreateCow { origin, cow } => {
-                assert_eq!(origin, PathBuf::from("/data/origin.img"));
-                assert_eq!(cow, PathBuf::from("/data/cow.img"));
-            }
-            _ => panic!("unexpected variant"),
-        }
-    }
-
-    #[test]
     fn request_restack_snapshot_round_trip() {
         let req = DaemonRequest::RestackSnapshot {
             dev_id: 5,
@@ -569,11 +562,20 @@ mod tests {
                 digest: "sha256:abc".to_string(),
                 size: 4096,
             }),
+            data_stat: Some(DataStat {
+                total_data_size: 8192,
+                valid_data_size: 4096,
+            }),
+            ext4_used_bytes: Some(2048),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
         match decoded {
-            DaemonResponse::RestackSnapshotCreated { descriptor } => {
+            DaemonResponse::RestackSnapshotCreated {
+                descriptor,
+                data_stat,
+                ext4_used_bytes,
+            } => {
                 assert_eq!(
                     descriptor,
                     Some(LayerDescriptor {
@@ -581,20 +583,54 @@ mod tests {
                         size: 4096,
                     })
                 );
+                assert_eq!(
+                    data_stat,
+                    Some(DataStat {
+                        total_data_size: 8192,
+                        valid_data_size: 4096,
+                    })
+                );
+                assert_eq!(ext4_used_bytes, Some(2048));
             }
             other => panic!("unexpected response: {other:?}"),
         }
     }
 
     #[test]
-    fn response_restack_snapshot_created_without_descriptor_round_trip() {
-        let resp = DaemonResponse::RestackSnapshotCreated { descriptor: None };
+    fn response_restack_snapshot_created_without_stats_round_trip() {
+        let resp = DaemonResponse::RestackSnapshotCreated {
+            descriptor: None,
+            data_stat: None,
+            ext4_used_bytes: None,
+        };
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             decoded,
-            DaemonResponse::RestackSnapshotCreated { descriptor: None }
+            DaemonResponse::RestackSnapshotCreated {
+                descriptor: None,
+                ..
+            }
         ));
+    }
+
+    #[test]
+    fn response_restack_snapshot_created_from_older_daemon() {
+        // Rolling upgrades: an old daemon's response carries no stats fields.
+        let json = r#"{"status":"restack_snapshot_created","descriptor":null}"#;
+        let decoded: DaemonResponse = serde_json::from_str(json).unwrap();
+        match decoded {
+            DaemonResponse::RestackSnapshotCreated {
+                descriptor,
+                data_stat,
+                ext4_used_bytes,
+            } => {
+                assert!(descriptor.is_none());
+                assert!(data_stat.is_none());
+                assert!(ext4_used_bytes.is_none());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 
     // ── Wire protocol edge case tests ──────────────────────────────────

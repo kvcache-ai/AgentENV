@@ -3,15 +3,21 @@ name = "storage-util"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+io-uring = ["dep:io-uring"]
+
 [dependencies]
 anyhow = "1.0"
-io-uring = "0.7.9"
 tokio = { version = "1.44.2", features = ["sync", "rt", "io-util", "net"] }
 async-trait = "0.1.88"
 slab = "0.4.11"
 libc = "0.2.174"
 nix = { version = "0.30.1", features = ["event", "fs", "mman"] }
 tracing = "0.1.41"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.7.9", optional = true }
 
 [dev-dependencies]
 rand = "0.10"

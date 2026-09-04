@@ -1,14 +1,15 @@
 use super::local::LocalFile;
 use super::tar::new_tar_file_adaptor;
 use crate::compression::zfile::{is_zfile, zfile_open_ro_vfile};
-use crate::io::virtual_file::{IoCtx, LocalBoxFuture, VirtualFile};
+use crate::io::virtual_file::VirtualFile;
+#[cfg(feature = "io-uring")]
+use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
-use storage_util::io_ring::IoRingHandle;
 use tokio::sync::RwLock;
 
 async fn try_open_zfile(
@@ -71,19 +72,13 @@ impl SwitchFile {
     }
 
     /// Mark this switch file as a local file, all later IO will goto local.
-    pub async fn set_switch_file(
-        &self,
-        filepath: impl AsRef<Path>,
-        io_ring: IoRingHandle,
-    ) -> Result<()> {
+    pub async fn set_switch_file(&self, filepath: impl AsRef<Path>) -> Result<()> {
         let path = filepath.as_ref();
         let display = path.to_string_lossy().into_owned();
         *self.m_filepath.write().await = Some(display.clone());
 
         let file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_ro(path, io_ring)
-                .await
-                .context(format!("open commit file `{display}` failed"))?,
+            LocalFile::open_ro(path).context(format!("open commit file `{display}` failed"))?,
         );
         let file = new_tar_file_adaptor(file)
             .await
@@ -183,6 +178,7 @@ impl VirtualFile for SwitchFile {
         self.current_file().await?.fremovexattr(name).await
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -195,6 +191,7 @@ impl VirtualFile for SwitchFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn read_at_into_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -207,6 +204,7 @@ impl VirtualFile for SwitchFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -219,6 +217,7 @@ impl VirtualFile for SwitchFile {
         })
     }
 
+    #[cfg(feature = "io-uring")]
     fn write_bytes_at_with_ctx<'a>(
         &'a self,
         ctx: IoCtx<'a>,
@@ -238,7 +237,6 @@ mod tests {
     use super::super::tar::new_tar_file_create;
     use super::*;
     use crate::compression::zfile::{zfile_compress, CompressArgs, CompressOptions};
-    use crate::test_utils::test_io_ring;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
 
@@ -329,7 +327,7 @@ mod tests {
     }
 
     async fn create_plain_tar_file(path: &Path, data: &[u8]) -> Result<()> {
-        let file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path, test_io_ring()).await?);
+        let file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path)?);
         let tar = new_tar_file_create(file).await?;
         write_all_at(tar.as_ref(), data, 0).await?;
         tar.close().await
@@ -337,7 +335,7 @@ mod tests {
 
     async fn create_zfile_tar_file(path: &Path, data: &[u8]) -> Result<()> {
         let src: Arc<dyn VirtualFile> = Arc::new(MemoryFile::new(data.to_vec()));
-        let dst: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path, test_io_ring()).await?);
+        let dst: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path)?);
         let tar = new_tar_file_create(dst).await?;
         let args = CompressArgs {
             opt: CompressOptions::new(CompressOptions::LZ4, 4096, 1),
@@ -395,7 +393,7 @@ mod tests {
         );
 
         switch
-            .set_switch_file(&local_path, test_io_ring())
+            .set_switch_file(&local_path)
             .await
             .expect("switch to local tar");
 
@@ -426,7 +424,7 @@ mod tests {
             .expect("open switch file");
 
         switch
-            .set_switch_file(&local_path, test_io_ring())
+            .set_switch_file(&local_path)
             .await
             .expect("switch to local zfile");
 
@@ -454,7 +452,7 @@ mod tests {
             .expect("open switch file");
 
         let error = switch
-            .set_switch_file(&missing_path, test_io_ring())
+            .set_switch_file(&missing_path)
             .await
             .expect_err("missing file must fail");
         let error_msg = format!("{error:#}");
@@ -490,9 +488,8 @@ mod tests {
         let switch = new_switch_file(source, false, Some("http://registry/blob"))
             .await
             .expect("open switch file");
-        let io_ring = test_io_ring();
         switch
-            .set_switch_file(&local_path, io_ring.clone())
+            .set_switch_file(&local_path)
             .await
             .expect("switch to local tar");
         assert_eq!(
@@ -503,7 +500,7 @@ mod tests {
         );
 
         let error = switch
-            .set_switch_file(&missing_path, io_ring)
+            .set_switch_file(&missing_path)
             .await
             .expect_err("missing file must fail");
         let error_msg = format!("{error:#}");
@@ -532,11 +529,8 @@ mod tests {
             .await
             .expect("create tar zfile");
 
-        let local: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_ro(&local_path, test_io_ring())
-                .await
-                .expect("open local"),
-        );
+        let local: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_ro(&local_path).expect("open local"));
         let local = new_tar_file_adaptor(local).await.expect("adapt local tar");
         let switch = new_switch_file(local, true, Some(local_path.to_string_lossy().as_ref()))
             .await

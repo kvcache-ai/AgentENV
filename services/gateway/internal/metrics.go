@@ -114,12 +114,12 @@ func setGatewayRouteSource(w http.ResponseWriter, source routeSource) {
 
 func (s *Server) instrumentGatewayHTTP(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/metrics" || s.isLocalGatewayHealthRequest(r) {
+		if s.isLocalGatewayEndpointRequest(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
-		// A sandbox-routed /health request is user traffic, so keep it
-		// instrumented like any other proxy call.
+		// Sandbox-routed /health and /metrics requests are user traffic, so
+		// keep them instrumented like any other proxy call.
 
 		method := gatewayMethodLabel(r.Method)
 		route := gatewayRouteLabel(r.URL.Path)
@@ -132,8 +132,8 @@ func (s *Server) instrumentGatewayHTTP(next http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) isLocalGatewayHealthRequest(r *http.Request) bool {
-	if r.URL.Path != "/health" || hasProxyRoutingHeaders(r.Header) {
+func (s *Server) isLocalGatewayEndpointRequest(r *http.Request) bool {
+	if (r.URL.Path != "/health" && r.URL.Path != "/metrics") || hasProxyRoutingHeaders(r.Header) {
 		return false
 	}
 	hostRoute, hostRouteErr := parseHostRoute(r.Host, s.sandboxProxyDomains)
