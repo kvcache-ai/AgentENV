@@ -117,4 +117,15 @@ assert_absent "$home/.local/share/bash-completion/completions/aenv"
 HOME="$home" bash "$helper" uninstall --prefix="$home/../outside" --binary="$bin/aenv-v1" >/dev/null
 assert_absent "$outside/share/bash-completion/completions/aenv"
 
+echo '==> unsupported loader paths are rejected'
+HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1\\tail" >/dev/null
+assert_absent "$bash_file"
+HOME="$home" bash "$helper" uninstall --prefix="$home/.local" >/dev/null
+
+echo '==> release installers retain the shared safety hardening'
+for installer in "$repo_root/scripts/install-cli.sh" "$repo_root/scripts/install.sh"; do
+    assert_contains "$installer" '.aenv-completion.lock'
+    assert_contains "$installer" 'leaving newly-created unmanaged completion file'
+done
+
 echo '==> completion installation checks passed'
