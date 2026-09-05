@@ -4,8 +4,11 @@ use headers::Host;
 use http::Method;
 
 use crate::observability::{DiskMetric, MachineInfo, NodeMetricsSnapshot, NodeSnapshot};
+use crate::orchestrator::{CpuAffinityRequest, OrchestratorError};
+use crate::types::SandboxId;
 use agentenv_http_server::{apis::admin::*, models};
 
+use super::sandbox::sandbox_not_found;
 use super::ApiImpl;
 
 impl From<MachineInfo> for models::MachineInfo {
@@ -165,5 +168,67 @@ impl Admin<()> for ApiImpl {
             node.paused_sandbox_count,
         );
         Ok(NodesNodeIdGetResponse::Status200_SuccessfullyReturnedTheNode(detail))
+    }
+
+    async fn sandboxes_sandbox_id_cpu_affinity_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdCpuAffinityPostPathParams,
+        body: &models::SandboxCpuAffinityRequest,
+    ) -> Result<SandboxesSandboxIdCpuAffinityPostResponse, ()> {
+        let path_id = &path_params.sandbox_id;
+        let Ok(sandbox_id) = SandboxId::parse_str(path_id) else {
+            return Ok(
+                SandboxesSandboxIdCpuAffinityPostResponse::Status404_NotFound(sandbox_not_found(
+                    path_id,
+                )),
+            );
+        };
+        let request = CpuAffinityRequest {
+            vcpu: body.vcpu.clone(),
+            core: body.core.clone(),
+        };
+
+        match self
+            .orchestrator
+            .bind_sandbox_cpu_affinity(sandbox_id, request)
+            .await
+        {
+            Ok(outcome) => Ok(SandboxesSandboxIdCpuAffinityPostResponse::Status200_CPUAffinityAppliedAndVerifiedSuccessfully(
+                models::SandboxCpuAffinity::new(
+                    path_id.clone(),
+                    outcome.vcpu,
+                    outcome.cores,
+                    outcome.ignored_offline_cores,
+                    outcome.bound_thread_count,
+                ),
+            )),
+            Err(OrchestratorError::SandboxNotFound(id)) => Ok(
+                SandboxesSandboxIdCpuAffinityPostResponse::Status404_NotFound(sandbox_not_found(
+                    id,
+                )),
+            ),
+            Err(err @ OrchestratorError::InvalidCpuAffinityRequest { .. }) => {
+                Ok(SandboxesSandboxIdCpuAffinityPostResponse::Status400_BadRequest(err.into()))
+            }
+            Err(
+                err @ (OrchestratorError::InvalidSandboxState { .. }
+                | OrchestratorError::SandboxOperationConflict { .. }),
+            ) => Ok(
+                SandboxesSandboxIdCpuAffinityPostResponse::Status409_Conflict(Self::error(
+                    409,
+                    err.to_string(),
+                )),
+            ),
+            Err(err @ OrchestratorError::ShuttingDown) => Ok(
+                SandboxesSandboxIdCpuAffinityPostResponse::Status503_ServiceUnavailable(err.into()),
+            ),
+            Err(err) => {
+                Ok(SandboxesSandboxIdCpuAffinityPostResponse::Status500_ServerError(err.into()))
+            }
+        }
     }
 }

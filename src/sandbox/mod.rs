@@ -1,5 +1,6 @@
 mod access;
 mod backend;
+mod cpu_affinity;
 pub(crate) mod custom_extension;
 mod envd;
 mod extra_drive;
@@ -25,6 +26,8 @@ pub use backend::{
     SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
     SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
+pub(crate) use cpu_affinity::{bind_process as bind_process_cpu_affinity, CpuAffinityError};
+pub use cpu_affinity::{CpuAffinityOutcome, CpuAffinityRequest};
 pub use extra_drive::{
     normalize_mount_path, normalize_mount_path_for_drive, validate_drive_id, validate_mount_path,
     validate_sub_path, ExtraDrive,

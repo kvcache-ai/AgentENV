@@ -34,7 +34,7 @@ use super::pagination::PaginationCursor;
 use super::volumes::{error_response as volume_error_response, resolve_volume_mounts};
 use super::ApiImpl;
 
-fn sandbox_not_found(id: impl Into<String>) -> models::Error {
+pub(crate) fn sandbox_not_found(id: impl Into<String>) -> models::Error {
     ApiImpl::error(404, format!("sandbox {} not found", id.into()))
 }
 
@@ -58,6 +58,7 @@ impl From<OrchestratorError> for models::Error {
             }
             OrchestratorError::SandboxNotFound(id) => sandbox_not_found(id),
             OrchestratorError::InvalidSandboxState { .. } => Self::new(400, err.to_string()),
+            OrchestratorError::InvalidCpuAffinityRequest { .. } => Self::new(400, err.to_string()),
             OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
                 operation,
@@ -1877,6 +1878,18 @@ impl Sandboxes<()> for ApiImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_affinity_errors_have_stable_http_codes() {
+        let invalid = models::Error::from(OrchestratorError::InvalidCpuAffinityRequest {
+            message: "bad cpu list".to_string(),
+        });
+        assert_eq!(invalid.code, 400);
+        assert!(invalid.message.contains("bad cpu list"));
+
+        let shutting_down = models::Error::from(OrchestratorError::ShuttingDown);
+        assert_eq!(shutting_down.code, 503);
+    }
 
     #[test]
     fn parse_metadata_filter_with_none_returns_none() {

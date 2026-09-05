@@ -614,6 +614,8 @@ func isSandboxControlPlaneRequest(r *http.Request) bool {
 	switch parts[2] {
 	case "pause", "resume", "fork", "connect", "timeout", "refreshes", "snapshots":
 		return r.Method == http.MethodPost
+	case "cpu-affinity":
+		return r.Method == http.MethodPost
 	case "network":
 		return r.Method == http.MethodPut
 	case "custom-extension-params":

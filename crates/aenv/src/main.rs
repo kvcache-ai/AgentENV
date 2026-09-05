@@ -42,6 +42,8 @@ enum Cmd {
     Connect(commands::connect::Args),
     /// Pause a running sandbox
     Pause(commands::pause::Args),
+    /// Bind selected Firecracker threads to online host CPUs
+    CpuBind(commands::cpu_bind::Args),
     /// Resume a paused sandbox
     Resume(commands::resume::Args),
     /// List sandboxes
@@ -76,6 +78,7 @@ fn main() -> Result<()> {
         Cmd::Completion(a) => commands::completion::run(a),
         Cmd::Connect(a) => commands::connect::run(a),
         Cmd::Pause(a) => commands::pause::run(a),
+        Cmd::CpuBind(a) => commands::cpu_bind::run(a),
         Cmd::Resume(a) => commands::resume::run(a),
         Cmd::List(a) => commands::list::run(a),
         Cmd::Delete(a) => commands::delete::run(a),

@@ -156,6 +156,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    "503":
+      description: Service unavailable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
 
   schemas:
     CPUCount:
@@ -163,6 +169,47 @@ components:
       format: int32
       minimum: 1
       description: CPU cores for the sandbox
+
+    SandboxCpuAffinityRequest:
+      type: object
+      required:
+        - vcpu
+        - core
+      properties:
+        vcpu:
+          type: string
+          maxLength: 16384
+          description: Firecracker vCPU list, or '*' to select every current Firecracker thread.
+          example: "0-1"
+        core:
+          type: string
+          maxLength: 16384
+          description: Host CPU list with optional range strides such as 0-10:2. Supported CPU IDs are 0-1023. Offline CPUs are ignored unless the online intersection is empty.
+          example: "4-5"
+
+    SandboxCpuAffinity:
+      type: object
+      required:
+        - sandboxID
+        - vcpu
+        - cores
+        - ignoredOfflineCores
+        - boundThreadCount
+      properties:
+        sandboxID:
+          type: string
+        vcpu:
+          type: string
+        cores:
+          type: string
+          description: Normalized online host CPUs that were applied.
+        ignoredOfflineCores:
+          type: string
+          description: Normalized requested CPUs that were offline, or an empty string.
+        boundThreadCount:
+          type: integer
+          format: int32
+          minimum: 1
 
     MemoryMB:
       type: integer
@@ -2467,3 +2514,38 @@ paths:
           $ref: "#/components/responses/404"
         "500":
           $ref: "#/components/responses/500"
+
+  /sandboxes/{sandboxID}/cpu-affinity:
+    post:
+      summary: Bind running sandbox CPUs
+      description: Bind selected Firecracker vCPU threads, or every current thread, to online host CPUs. Requires knowledge of the host CPU topology and can interfere with load balancing, so it is exposed on the admin interface.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+      parameters:
+        - $ref: "#/components/parameters/sandboxID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SandboxCpuAffinityRequest"
+      responses:
+        "200":
+          description: CPU affinity applied and verified successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SandboxCpuAffinity"
+        "400":
+          $ref: "#/components/responses/400"
+        "409":
+          $ref: "#/components/responses/409"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+        "503":
+          $ref: "#/components/responses/503"

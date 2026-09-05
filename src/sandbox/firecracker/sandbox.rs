@@ -479,6 +479,10 @@ impl SandboxBackend for FirecrackerSandbox {
         }
     }
 
+    fn runtime_process_id(&mut self) -> Result<i32> {
+        Ok(self.fc_instance.running_pid()?.as_raw())
+    }
+
     fn startup_artifacts(&self) -> RuntimeArtifactSet {
         let common = match &self.launch {
             LaunchMode::Fresh(config) => &config.common,

@@ -2,6 +2,7 @@ pub mod auth;
 pub mod build;
 pub mod completion;
 pub mod connect;
+pub mod cpu_bind;
 pub mod delete;
 pub mod download;
 pub mod exec;
