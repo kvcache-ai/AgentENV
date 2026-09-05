@@ -32,6 +32,16 @@ on:
       - ".github/workflows/ci.yml"
 
 jobs:
+  runtime-policy:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/rust-ci-setup
+        with:
+          install_ci_deps: "false"
+      - name: Funded lease, reservation and independent watchdog contracts
+        run: cargo test --locked -p runtime-policy
+
   fmt:
     runs-on: ubuntu-22.04
     steps:

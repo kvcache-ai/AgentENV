@@ -12,6 +12,7 @@ members = [
     "crates/benchmarks",
     "crates/e2e-tests",
     "crates/linux-cap",
+    "crates/runtime-policy",
     "crates/observability",
     "crates/object-store-operator",
     "crates/test-support",
