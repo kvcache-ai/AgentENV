@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, time::Duration};
 
 use agentenv_http_server::models;
 use anyhow::{ensure, Context, Result};
@@ -44,7 +44,7 @@ use crate::{
 
 #[derive(Default)]
 pub(crate) struct BuildSessions {
-    active: DashMap<String, Arc<BuildSession>>,
+    active: DashMap<String, BuildSession>,
     journal: OnceCell<LocalKvStore>,
     builder_template: OnceCell<RunnableSnapshot>,
 }
@@ -64,21 +64,16 @@ struct BuildJournal {
 }
 
 impl BuildJournal {
-    fn decode(bytes: &[u8]) -> Result<Self> {
-        // Recover journals written by the original shared-writable-cache implementation.
-        if bytes.first() != Some(&b'{') {
-            return Ok(Self {
-                cache: std::str::from_utf8(bytes)?.to_owned(),
-                parent: None,
-            });
-        }
-        Ok(serde_json::from_slice(bytes)?)
+    async fn persist(&self, journal: &LocalKvStore, id: &str) -> Result<()> {
+        journal
+            .put(format!("build/{id}"), serde_json::to_vec(self)?)
+            .await
     }
 }
 
+#[derive(Clone)]
 struct BuildSession {
     state: watch::Sender<SessionState>,
-    cache: String,
 }
 
 #[derive(Clone)]
@@ -91,6 +86,12 @@ enum SessionState {
 }
 
 impl BuildSession {
+    fn new() -> Self {
+        Self {
+            state: watch::channel(SessionState::Starting).0,
+        }
+    }
+
     fn ready(&self, address: SocketAddr) -> bool {
         self.state.send_if_modified(|state| {
             if !matches!(state, SessionState::Starting) {
@@ -159,7 +160,7 @@ impl ApiImpl {
         for (key, value) in journal.scan_prefix(b"build/".to_vec()).await? {
             let key_text = std::str::from_utf8(&key)?;
             let id = &key_text[6..];
-            let entry = BuildJournal::decode(&value)?;
+            let entry: BuildJournal = serde_json::from_slice(&value)?;
             self.release_builder(id, &entry.cache).await?;
             self.cleanup_build_cache(id, &entry).await?;
             if let Some(record) = self.snapshot_manager.get(id).await? {
@@ -186,37 +187,34 @@ impl ApiImpl {
     ) -> Result<models::TemplateRequestResponseV3, models::Error> {
         let api = self.clone();
         let body = body.clone();
-        tokio::spawn(async move { api.allocate_image_build(&body).await })
+        tokio::spawn(async move { api.allocate_image_build(body).await })
             .await
             .map_err(|error| Self::error(500, error.to_string()))?
     }
 
     async fn allocate_image_build(
         &self,
-        body: &models::TemplateBuildSessionRequest,
+        body: models::TemplateBuildSessionRequest,
     ) -> Result<models::TemplateRequestResponseV3, models::Error> {
         let name = body
             .template
             .name
             .as_deref()
-            .ok_or_else(|| Self::error(400, "template name must be provided"))?;
+            .ok_or_else(|| Self::error(400, "template name must be provided"))?
+            .to_owned();
         let id = SnapshotId::generate();
-        let record = template_build_record_from_v3_request(&body.template, id.clone(), name)?;
-        let cache = format!("aenv-buildkit-work-{id}");
+        let record = template_build_record_from_v3_request(&body.template, id.clone(), &name)?;
+        let entry = BuildJournal {
+            cache: format!("aenv-buildkit-work-{id}"),
+            parent: None,
+        };
         let journal = self
             .build_journal()
             .await
             .map_err(|err| Self::internal_error(err.as_ref()))?;
         let key = format!("build/{id}");
-        journal
-            .put(
-                key.as_bytes().to_vec(),
-                serde_json::to_vec(&BuildJournal {
-                    cache: cache.clone(),
-                    parent: None,
-                })
-                .map_err(|error| Self::error(500, error.to_string()))?,
-            )
+        entry
+            .persist(journal, &id.to_string())
             .await
             .map_err(|err| Self::internal_error(err.as_ref()))?;
         if let Err(err) = self.snapshot_manager.create(record.clone()).await {
@@ -228,33 +226,25 @@ impl ApiImpl {
                 SandboxId::parse_str(&id.to_string()).expect("build ID is a UUID"),
             )
             .await;
-        let session = Arc::new(BuildSession {
-            state: watch::channel(SessionState::Starting).0,
-            cache,
-        });
+        let session = BuildSession::new();
         self.build_sessions
             .active
             .insert(id.to_string(), session.clone());
         let api = self.clone();
-        let body = body.clone();
         tokio::spawn(async move {
-            api.run_image_build(record, body, session).await;
+            api.run_image_build(record, body, session, entry).await;
         });
         Ok(models::TemplateRequestResponseV3::new(
             id.to_string(),
             id.to_string(),
             true,
-            vec![name.to_owned()],
-            vec![name.to_owned()],
+            vec![name.clone()],
+            vec![name],
             vec![],
         ))
     }
 
-    fn session(
-        &self,
-        template_id: &str,
-        build_id: &str,
-    ) -> Result<Arc<BuildSession>, models::Error> {
+    fn session(&self, template_id: &str, build_id: &str) -> Result<BuildSession, models::Error> {
         if template_id != build_id {
             return Err(Self::error(404, "template build not found"));
         }
@@ -312,15 +302,10 @@ impl ApiImpl {
         // Finished is sent after successful cleanup removes the active entry.
         // A retained entry means release failed and needs another attempt.
         if self.build_sessions.active.contains_key(build_id) {
-            self.release_builder(build_id, &session.cache)
+            self.release_builder(build_id, &format!("aenv-buildkit-work-{build_id}"))
                 .await
                 .map_err(|err| Self::error(500, format!("builder cleanup failed: {err:#}")))?;
-            self.build_sessions.active.remove(build_id);
-            self.orchestrator
-                .unregister_template_build(
-                    SandboxId::parse_str(build_id).expect("build ID is a UUID"),
-                )
-                .await;
+            self.forget_image_build(build_id).await;
         }
         Ok(())
     }
@@ -329,7 +314,8 @@ impl ApiImpl {
         &self,
         record: SnapshotRecord,
         body: models::TemplateBuildSessionRequest,
-        session: Arc<BuildSession>,
+        session: BuildSession,
+        mut entry: BuildJournal,
     ) {
         let id = record.id.to_string();
         let deadline = Instant::now() + Duration::from_secs(body.timeout.unwrap_or(3600).into());
@@ -345,8 +331,8 @@ impl ApiImpl {
                     snapshot.context("builder template preparation deadline exceeded")??
                 }
             };
-            info!(build_id = %id, cache = %session.cache, "template builder starting");
-            let (address, executor) = self.prepare_builder(&id, &body, &session.cache, snapshot).await?;
+            info!(build_id = %id, cache = %entry.cache, "template builder starting");
+            let (address, executor) = self.prepare_builder(&id, &body, &mut entry, snapshot).await?;
             ensure!(!matches!(*state.borrow(), SessionState::Cancelled), "build cancelled");
             worker_command(&executor, START_BUILDKIT, 90).await?;
             ensure!(session.ready(address), "build cancelled");
@@ -371,7 +357,7 @@ impl ApiImpl {
             )
             .await
             .context("image import deadline exceeded")??;
-            self.release_builder(&id, &session.cache).await?;
+            self.release_builder(&id, &entry.cache).await?;
             let context = CommandContext::from(resolved.base_context);
             let (start, ready) = build_startup_commands(&body, &context, resolved.raw_config.as_ref())?;
             let mut configs = ImageConfigs::new();
@@ -399,82 +385,74 @@ impl ApiImpl {
             self.template_builder
                 .build_and_publish_with_id(self.snapshot_manager.as_ref(), record.id.clone(), spec)
                 .await?;
-            if let Err(error) = self.publish_build_cache(&id, &session.cache).await {
+            if let Err(error) = self.publish_build_cache(&id, &entry.cache).await {
                 warn!(build_id = %id, error = %format_args!("{error:#}"), "cache publication failed; keeping the previous cache seed");
             }
             Ok::<_, anyhow::Error>(())
         }
         .await;
-        self.finish_image_build(&record, &session, result).await;
+        self.finish_image_build(&record, &session, &entry, result)
+            .await;
     }
 
     async fn finish_image_build(
         &self,
         record: &SnapshotRecord,
         session: &BuildSession,
+        entry: &BuildJournal,
         result: Result<()>,
     ) {
         let id = record.id.to_string();
-        // Successful publication already released the worker before capturing
-        // the template. Only a failed build needs another release attempt.
-        let cleanup = if result.is_err() {
-            self.release_builder(&id, &session.cache).await
-        } else {
-            Ok(())
-        };
-        let cleanup_ok = cleanup.is_ok();
-        if let Err(error) = &cleanup {
-            warn!(build_id = %id, %error, "template worker cleanup failed; recovery will retry");
-        }
-        let cache_cleanup = if cleanup_ok {
-            self.cleanup_build_cache_from_journal(&id).await
-        } else {
-            Ok(())
-        };
-        if let Err(error) = &cache_cleanup {
-            warn!(build_id = %id, %error, "cache cleanup failed; recovery will retry");
-        }
-        let mut persisted = true;
-        match &result {
-            Ok(()) => info!(build_id = %id, "template build completed"),
+        let persisted = match &result {
+            Ok(()) => {
+                info!(build_id = %id, "template build completed");
+                Ok(())
+            }
             Err(error) => {
                 warn!(build_id = %id, error = %format_args!("{error:#}"), "template build failed");
-                if let Err(error) = self
-                    .snapshot_manager
+                self.snapshot_manager
                     .mark_build_error(
                         &record.id,
                         TemplateBuildErrorReason::new(format!("{error:#}")),
                     )
                     .await
-                {
-                    persisted = false;
-                    warn!(build_id = %id, %error, "failed to persist template build error");
-                }
             }
-        }
-        // Keep the recovery journal if cleanup failed, so restart can retry it.
-        if cleanup_ok && cache_cleanup.is_ok() && persisted {
-            if let Ok(journal) = self.build_journal().await {
-                let _ = journal.delete(format!("build/{id}").into_bytes()).await;
+        };
+        let cleanup = async {
+            // Successful publication already released the worker before capture.
+            if result.is_err() {
+                self.release_builder(&id, &entry.cache).await?;
             }
+            self.forget_image_build(&id).await;
+            self.cleanup_build_cache(&id, entry).await?;
+            persisted?;
+            self.build_journal()
+                .await?
+                .delete(format!("build/{id}"))
+                .await
         }
-        if cleanup_ok {
-            self.build_sessions.active.remove(&id);
-            self.orchestrator
-                .unregister_template_build(SandboxId::parse_str(&id).expect("build ID is a UUID"))
-                .await;
+        .await;
+        if let Err(error) = cleanup {
+            warn!(build_id = %id, %error, "build finalization failed; recovery journal retained for restart");
         }
         session.state.send_replace(SessionState::Finished);
+    }
+
+    async fn forget_image_build(&self, id: &str) {
+        self.build_sessions.active.remove(id);
+        self.orchestrator
+            .unregister_template_build(SandboxId::parse_str(id).expect("build ID is a UUID"))
+            .await;
     }
 
     async fn prepare_builder(
         &self,
         id: &str,
         body: &models::TemplateBuildSessionRequest,
-        cache: &str,
+        entry: &mut BuildJournal,
         snapshot: RunnableSnapshot,
     ) -> Result<(SocketAddr, Executor)> {
-        let volume = self.fork_build_cache(id, cache).await?;
+        let volume = self.fork_build_cache(id, entry).await?;
         let (drives, mounts) = super::volumes::resolve_volume_mounts(
             &self.volume_manager,
             &HashMap::from([("/var/lib/buildkit".to_owned(), volume.id)]),
@@ -721,6 +699,7 @@ exit 1
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn buildkit_cleanup_failure_preserves_success_and_recovery_journal() -> Result<()> {
@@ -781,20 +760,14 @@ mod tests {
         api.build_sessions.journal.set(journal).unwrap();
         let id = record.id.to_string();
         let key = format!("build/{id}").into_bytes();
-        api.build_journal()
-            .await?
-            .put(
-                key.clone(),
-                serde_json::to_vec(&BuildJournal {
-                    cache: "aenv-buildkit-work-test".into(),
-                    parent: None,
-                })?,
-            )
-            .await?;
-        let session = Arc::new(BuildSession {
-            state: watch::channel(SessionState::Submitted("sha256:result".into())).0,
+        let entry = BuildJournal {
             cache: "aenv-buildkit-work-test".into(),
-        });
+            parent: None,
+        };
+        entry.persist(api.build_journal().await?, &id).await?;
+        let session = BuildSession {
+            state: watch::channel(SessionState::Submitted("sha256:result".into())).0,
+        };
         api.build_sessions
             .active
             .insert(id.clone(), session.clone());
@@ -802,7 +775,8 @@ mod tests {
             .register_template_build(SandboxId::parse_str(&id)?)
             .await;
 
-        api.finish_image_build(&record, &session, Ok(())).await;
+        api.finish_image_build(&record, &session, &entry, Ok(()))
+            .await;
 
         let saved = manager.get(&id).await?.unwrap();
         assert_eq!(
@@ -819,10 +793,7 @@ mod tests {
     #[test]
     fn buildkit_status_waits_for_cache_publication() -> Result<()> {
         let sessions = BuildSessions::default();
-        let session = Arc::new(BuildSession {
-            state: watch::channel(SessionState::Starting).0,
-            cache: "cache".to_owned(),
-        });
+        let session = BuildSession::new();
         sessions.active.insert("build".to_owned(), session.clone());
         assert!(!sessions.is_finishing("build"));
         assert!(session.ready("127.0.0.1:1234".parse()?));
@@ -831,20 +802,6 @@ mod tests {
         session.state.send_replace(SessionState::Finished);
         assert!(!sessions.is_finishing("build"));
         assert!(!sessions.is_finishing("missing"));
-        Ok(())
-    }
-
-    #[test]
-    fn buildkit_recovers_old_and_new_cache_journals() -> Result<()> {
-        assert_eq!(BuildJournal::decode(b"old-cache")?.cache, "old-cache");
-        let entry = BuildJournal {
-            cache: "child".into(),
-            parent: Some("seed".into()),
-        };
-        let recovered = BuildJournal::decode(&serde_json::to_vec(&entry)?)?;
-        assert_eq!(recovered.cache, "child");
-        assert_eq!(recovered.parent.as_deref(), Some("seed"));
-        assert!(BuildJournal::decode(b"{broken").is_err());
         Ok(())
     }
 
@@ -920,10 +877,7 @@ mod tests {
     fn buildkit_submission_and_cancellation_are_mutually_exclusive() {
         let digest = crate::digest::sha256_digest(b"image");
         for cancel_first in [false, true] {
-            let session = BuildSession {
-                state: watch::channel(SessionState::Starting).0,
-                cache: "cache".into(),
-            };
+            let session = BuildSession::new();
             assert_eq!(session.submit(&digest).unwrap_err().code, 409);
             assert!(session.ready("127.0.0.1:1234".parse().unwrap()));
             if cancel_first {

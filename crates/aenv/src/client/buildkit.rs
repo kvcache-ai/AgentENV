@@ -1,19 +1,17 @@
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 #[cfg(not(unix))]
 pub(crate) use tokio::net::TcpListener as BuildkitListener;
 #[cfg(unix)]
 pub(crate) use tokio::net::UnixListener as BuildkitListener;
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    task::JoinSet,
-};
+use tokio::{io::AsyncWriteExt, task::JoinSet};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::{client::IntoClientRequest, Message},
+    tungstenite::{client::IntoClientRequest, Error, Message},
 };
+use tokio_util::io::ReaderStream;
 
 use super::Client;
 
@@ -85,23 +83,11 @@ where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let (mut read, mut write) = tokio::io::split(stream);
-    let (mut sender, mut receiver) = socket.split();
-    let upstream = async {
-        let mut buffer = vec![0u8; 64 * 1024];
-        let mut ping = tokio::time::interval(Duration::from_secs(20));
-        loop {
-            tokio::select! {
-                n = read.read(&mut buffer) => {
-                    let n = n?;
-                    if n == 0 { break; }
-                    sender.send(Message::Binary(buffer[..n].to_vec().into())).await?;
-                }
-                _ = ping.tick() => sender.send(Message::Ping(Vec::new().into())).await?,
-            }
-        }
-        Ok::<_, anyhow::Error>(())
-    };
+    let (read, mut write) = tokio::io::split(stream);
+    let (sender, mut receiver) = socket.split();
+    let upstream = ReaderStream::with_capacity(read, 64 * 1024)
+        .map(|chunk| chunk.map(Message::Binary).map_err(Error::Io))
+        .forward(sender);
     let downstream = async {
         while let Some(message) = receiver.next().await {
             match message? {
@@ -113,13 +99,15 @@ where
         }
         Ok::<_, anyhow::Error>(())
     };
-    tokio::select! { result = upstream => result, result = downstream => result }
+    tokio::select! { result = upstream => Ok(result?), result = downstream => result }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use futures::SinkExt;
     use std::os::unix::fs::PermissionsExt;
+    use tokio::io::AsyncReadExt;
     use tokio::net::{TcpListener, UnixStream};
 
     #[tokio::test]
@@ -150,6 +138,16 @@ mod tests {
                 }
             }
             assert_eq!(received, expected);
+            socket
+                .send(Message::Ping(b"keepalive".as_slice().into()))
+                .await?;
+            assert_eq!(
+                socket
+                    .next()
+                    .await
+                    .context("tunnel closed during keepalive")??,
+                Message::Pong(b"keepalive".as_slice().into())
+            );
             socket.send(Message::Binary(received.into())).await?;
             // Keep the WebSocket open until the client has read its response.
             while socket.next().await.is_some() {}

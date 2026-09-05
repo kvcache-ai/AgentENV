@@ -154,8 +154,7 @@ Cache publication adds cleanup time, but a failed cache upload does not fail an
 otherwise successful template build or replace the previous seed. Old cache
 volumes are removed after active children release their leases. BuildKit's
 garbage collector manages cache contents. Cache sharing uses the repository's
-existing API-key trust boundary. Earlier per-template and per-node caches are
-not imported automatically. Builder-template upgrade handling is not automatic.
+existing API-key trust boundary. Builder-template upgrade handling is not automatic.
 Registry credentials come from the local BuildKit session and normal Docker
 credential configuration.
 
