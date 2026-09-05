@@ -296,6 +296,7 @@ impl TemplateBuilder {
             start_cmd: spec.start_cmd_ref().unwrap_or_default().to_string(),
             ready_cmd: spec.ready_cmd_ref().unwrap_or_default().to_string(),
             context: CommandContext::default(),
+            shell: spec.startup_shell().map(str::to_owned),
         })
     }
 
@@ -624,6 +625,7 @@ mod tests {
     fn snapshot_base_context_inherits_base_startup_when_not_overridden() {
         let manager = TemplateBuilder::new();
         let startup = StartupCommand {
+            shell: None,
             start_cmd: "echo base".to_string(),
             ready_cmd: "echo ready".to_string(),
             context: CommandContext::new(
@@ -654,6 +656,7 @@ mod tests {
         let manager = TemplateBuilder::new();
         let record = SnapshotRecord::mock_ready(CommittedSnapshot {
             startup: Some(StartupCommand {
+                shell: None,
                 start_cmd: "echo base".to_string(),
                 ready_cmd: "echo base-ready".to_string(),
                 context: CommandContext::new(std::collections::HashMap::new(), "/base"),

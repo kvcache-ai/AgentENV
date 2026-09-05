@@ -292,6 +292,18 @@ pub struct StartupCommand {
     pub start_cmd: String,
     pub ready_cmd: String,
     pub context: CommandContext,
+    /// Absent for legacy templates, which use a Bash login shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+}
+
+impl StartupCommand {
+    pub(crate) fn shell_command(&self) -> (&str, &str) {
+        match self.shell.as_deref() {
+            Some(shell) => (shell, "-c"),
+            None => ("/bin/bash", "-lc"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -795,6 +807,21 @@ mod tests {
     #[test]
     fn effective_start_cmd_absent_returns_none() {
         assert_eq!(CommandContext::default().effective_start_cmd(), None);
+    }
+
+    #[test]
+    fn startup_shell_is_backward_compatible() {
+        let legacy = serde_json::json!({"start_cmd": "true", "ready_cmd": "true", "context": CommandContext::default()});
+        let mut startup: super::StartupCommand = serde_json::from_value(legacy).unwrap();
+        assert_eq!(startup.shell_command(), ("/bin/bash", "-lc"));
+        assert!(serde_json::to_value(&startup)
+            .unwrap()
+            .get("shell")
+            .is_none());
+        startup.shell = Some("/bin/sh".to_owned());
+        let restored: super::StartupCommand =
+            serde_json::from_value(serde_json::to_value(&startup).unwrap()).unwrap();
+        assert_eq!(restored.shell_command(), ("/bin/sh", "-c"));
     }
 
     #[test]

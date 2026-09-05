@@ -95,6 +95,7 @@ pub struct TemplateBuildSpec {
     resources: Option<SandboxResources>,
     start_cmd: Option<String>,
     ready_cmd: Option<String>,
+    startup_shell: Option<String>,
     base_context: Option<CommandContext>,
 }
 
@@ -248,6 +249,15 @@ impl TemplateBuildSpec {
 
     pub(crate) fn ready_cmd_ref(&self) -> Option<&str> {
         self.ready_cmd.as_deref()
+    }
+
+    pub(crate) fn with_startup_shell(mut self, shell: &str) -> Self {
+        self.startup_shell = Some(shell.to_owned());
+        self
+    }
+
+    pub(crate) fn startup_shell(&self) -> Option<&str> {
+        self.startup_shell.as_deref()
     }
 
     pub(crate) fn with_base_context(mut self, context: CommandContext) -> Self {

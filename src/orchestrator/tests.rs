@@ -119,6 +119,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
         volume_manager: None,
+        template_build_ids: RwLock::new(HashSet::new()),
     })
 }
 
@@ -2712,6 +2713,28 @@ async fn orchestrator_list_empty_returns_empty() -> Result<()> {
         "empty store should return empty filtered sandbox list"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn buildkit_workers_are_hidden_but_keep_scheduler_bindings() -> Result<()> {
+    let orchestrator = make_orchestrator().await;
+    let id = SandboxId::new();
+    orchestrator.register_template_build(id).await;
+    assert_eq!(orchestrator.list_sandbox_ids().await?, vec![id]);
+    let metadata = orchestrator
+        .create_template_builder(id, create_request(Some(60), &[]))
+        .await?;
+    assert!(metadata.template_builder);
+    assert_eq!(orchestrator.list_sandbox_ids().await?, vec![id]);
+    assert!(orchestrator
+        .list_sandboxes_filtered(SandboxListFilter::matches_all())
+        .await?
+        .is_empty());
+    orchestrator.delete_sandbox(id).await?;
+    assert_eq!(orchestrator.list_sandbox_ids().await?, vec![id]);
+    orchestrator.unregister_template_build(id).await;
+    assert!(orchestrator.list_sandbox_ids().await?.is_empty());
     Ok(())
 }
 

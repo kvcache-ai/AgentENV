@@ -1612,6 +1612,58 @@ mod tests {
         .await
     }
 
+    #[tokio::test]
+    async fn buildkit_control_endpoints_require_api_auth_and_validate_input() {
+        let api = build_api().await;
+        let id = SandboxId::new();
+        let app = server::new(api);
+        let tunnel = format!("/templates/{id}/builds/{id}/builder");
+        assert_eq!(
+            get_status(&app, &tunnel, &[]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_status(&app, &tunnel, &[(TRAFFIC_ACCESS_TOKEN_HEADER, "invalid")]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let body = json!({"digest": format!("sha256:{}", "a".repeat(64))});
+        for (key, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("incorrect"), StatusCode::UNAUTHORIZED),
+            (Some(TEST_API_KEY), StatusCode::NOT_FOUND),
+        ] {
+            let mut request = http::Request::builder()
+                .method("POST")
+                .uri(&tunnel)
+                .header("host", "localhost")
+                .header("content-type", "application/json");
+            if let Some(key) = key {
+                request = request.header(API_KEY_HEADER, key);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let body = json!({"digest": "sha256:../file"});
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("POST")
+                    .uri(tunnel)
+                    .header("host", "localhost")
+                    .header("content-type", "application/json")
+                    .header(API_KEY_HEADER, TEST_API_KEY)
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     async fn build_api() -> Arc<ApiImpl> {
         build_api_with_sandbox_proxy_domains(Vec::new()).await
     }

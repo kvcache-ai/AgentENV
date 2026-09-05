@@ -173,7 +173,7 @@ fn build_record_envd_version(record: &SnapshotRecord) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn template_build_status(record: &SnapshotRecord) -> TemplateBuildStatus {
+pub(super) fn template_build_status(record: &SnapshotRecord) -> TemplateBuildStatus {
     match &record.source {
         SnapshotSource::Template { build } => build.status,
         SnapshotSource::Sandbox { .. } => TemplateBuildStatus::Ready,
@@ -282,6 +282,74 @@ async fn mark_v2_build_error(
 #[async_trait]
 impl Templates<()> for ApiImpl {
     type Claims = super::Claims;
+
+    async fn templates_builds_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        body: &models::TemplateBuildSessionRequest,
+    ) -> Result<TemplatesBuildsPostResponse, ()> {
+        use TemplatesBuildsPostResponse::*;
+        Ok(match self.start_image_build(body).await {
+            Ok(body) => Status202_TheTemplateBuildHasStarted {
+                x_agentenv_build_id: Some(body.build_id.clone()),
+                body,
+            },
+            Err(err) => match err.code {
+                400 => Status400_BadRequest(err),
+                409 => Status409_Conflict(err),
+                _ => Status500_ServerError(err),
+            },
+        })
+    }
+
+    async fn templates_template_id_builds_build_id_builder_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path: &models::TemplatesTemplateIdBuildsBuildIdBuilderPostPathParams,
+        body: &models::TemplateBuildImage,
+    ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderPostResponse, ()> {
+        use TemplatesTemplateIdBuildsBuildIdBuilderPostResponse::*;
+        Ok(
+            match self.submit_image_build(&path.template_id, &path.build_id, &body.digest) {
+                Ok(()) => Status202_ImagePublicationAccepted,
+                Err(err) => match err.code {
+                    400 => Status400_BadRequest(err),
+                    404 => Status404_NotFound(err),
+                    _ => Status409_Conflict(err),
+                },
+            },
+        )
+    }
+
+    async fn templates_template_id_builds_build_id_builder_delete(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path: &models::TemplatesTemplateIdBuildsBuildIdBuilderDeletePathParams,
+    ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse, ()> {
+        use TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse::*;
+        Ok(
+            match self
+                .cancel_image_build(&path.template_id, &path.build_id)
+                .await
+            {
+                Ok(()) => Status204_BuilderReleased,
+                Err(err) => match err.code {
+                    404 => Status404_NotFound(err),
+                    409 => Status409_Conflict(err),
+                    _ => Status500_ServerError(err),
+                },
+            },
+        )
+    }
 
     async fn templates_aliases_alias_get(
         &self,

@@ -57,6 +57,24 @@ where
     let api_impl = api_impl.as_ref();
     if !proxy_request {
         return if api_impl.has_valid_api_key(request.headers()) {
+            if let Some(id) = request
+                .uri()
+                .path()
+                .strip_prefix("/sandboxes/")
+                .and_then(|path| path.split('/').next())
+                .and_then(|id| SandboxId::parse_str(id).ok())
+            {
+                if api_impl
+                    .orchestrator()
+                    .get_sandbox(&id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|metadata| metadata.template_builder)
+                {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+            }
             next.run(request).await
         } else {
             StatusCode::UNAUTHORIZED.into_response()
@@ -86,6 +104,10 @@ where
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
+
+    if metadata.template_builder {
+        return proxy::sandbox_not_found_response(sandbox_id);
+    }
 
     let envd_request = target_port == proxy::effective_envd_port(&metadata);
     let envd_authorized = envd_request
