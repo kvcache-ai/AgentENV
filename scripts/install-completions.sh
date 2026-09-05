@@ -73,7 +73,7 @@ fi
 # reclaimed when its recorded owner PID no longer exists, so a crash cannot
 # permanently disable future installs. Returns 1 if the directory is busy.
 with_lock() (
-    local dir="$1" fn="$2" lock_dir owner
+    local dir="$1" fn="$2" lock_dir owner stale staged_owner
     shift 2
     lock_dir="$dir/.aenv-completion.lock"
     if ! mkdir "$lock_dir" 2>/dev/null; then
@@ -81,9 +81,22 @@ with_lock() (
         if [[ -f "$lock_dir/pid" ]]; then
             owner="$(cat "$lock_dir/pid" 2>/dev/null || true)"
             if [[ "$owner" =~ ^[0-9]+$ ]] && ! ps -p "$owner" >/dev/null 2>&1; then
-                rm -rf "$lock_dir" 2>/dev/null || true
-                if mkdir "$lock_dir" 2>/dev/null; then
-                    reclaimed=1
+                stale="$lock_dir.stale.$$.$RANDOM"
+                # Rename preserves ownership: a new owner can acquire the
+                # original path, but cannot be deleted through this path.
+                if mv "$lock_dir" "$stale" 2>/dev/null; then
+                    staged_owner="$(cat "$stale/pid" 2>/dev/null || true)"
+                    if [[ "$staged_owner" == "$owner" ]] &&
+                       ! ps -p "$staged_owner" >/dev/null 2>&1; then
+                        rm -rf "$stale" 2>/dev/null || true
+                        if mkdir "$lock_dir" 2>/dev/null; then
+                            reclaimed=1
+                        fi
+                    else
+                        # Another installer changed ownership; restore its
+                        # lock if nobody acquired the original path meanwhile.
+                        mv "$stale" "$lock_dir" 2>/dev/null || true
+                    fi
                 fi
             fi
         fi
@@ -124,8 +137,9 @@ _write_loader() {
             return 0
         fi
     fi
-    # Re-check immediately before replacement so a user file created while the
-    # temporary content was generated is never clobbered.
+    # The lock serializes cooperating installer processes. A non-cooperating
+    # external writer cannot be made atomic by a portable shell script; the
+    # check below is defensive and preserves the documented installer guarantee.
     if [[ -e "$path" ]] && ! grep -Fqx "$MARKER" "$path" 2>/dev/null; then
         rm -f "$tmp"
         printf 'warning: leaving newly-created unmanaged completion file %s untouched\n' "$path" >&2
