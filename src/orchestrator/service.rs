@@ -98,6 +98,7 @@ pub struct Orchestrator<
     factory: F,
     persister: P,
     sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
+    template_build_ids: RwLock<HashSet<SandboxId>>,
     proxy_routes: RwLock<ProxyRouteTable>,
     next_proxy_route_version: AtomicU64,
     counters: OrchestratorCounters,
@@ -214,6 +215,7 @@ where
             factory,
             persister,
             sandboxes: RwLock::new(HashMap::new()),
+            template_build_ids: RwLock::new(HashSet::new()),
             proxy_routes: RwLock::new(ProxyRouteTable::default()),
             next_proxy_route_version: AtomicU64::new(1),
             counters: OrchestratorCounters::default(),
@@ -400,7 +402,19 @@ where
         let sandbox_id = SandboxId::new();
         let this = Arc::clone(self);
         self.run_cancellation_safe("create", sandbox_id, async move {
-            this.create_sandbox_inner(sandbox_id, request).await
+            this.create_sandbox_inner(sandbox_id, request, false).await
+        })
+        .await
+    }
+
+    pub(crate) async fn create_template_builder(
+        self: &Arc<Self>,
+        build_id: SandboxId,
+        request: CreateSandboxRequest,
+    ) -> Result<SandboxMetadata> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("create_builder", build_id, async move {
+            this.create_sandbox_inner(build_id, request, true).await
         })
         .await
     }
@@ -414,6 +428,7 @@ where
         self: Arc<Self>,
         sandbox_id: SandboxId,
         request: CreateSandboxRequest,
+        template_builder: bool,
     ) -> Result<SandboxMetadata> {
         if let Err(err) = self.ensure_accepting_lifecycle_operations() {
             self.counters.record_create_fail(1);
@@ -476,6 +491,7 @@ where
 
                 let transitional_metadata = SandboxMetadata {
                     id: sandbox_id,
+                    template_builder,
                     snapshot_id: record.id.to_string(),
                     snapshot_alias: record.alias.as_ref().map(ToString::to_string),
                     virtualization_mode: committed.virtualization_mode,
@@ -541,6 +557,7 @@ where
 
                 let transitional_metadata = SandboxMetadata {
                     id: sandbox_id,
+                    template_builder,
                     snapshot_id: image_ref,
                     snapshot_alias: None,
                     virtualization_mode: ConfigManager::global_config().virtualization_mode,
@@ -831,12 +848,25 @@ where
     /// Lists all sandboxes with their metadata.
     #[tracing::instrument(skip(self))]
     pub async fn list_sandboxes(&self) -> Result<Vec<SandboxMetadata>> {
-        Ok(self.store.list().await?)
+        self.list_sandboxes_filtered(SandboxListFilter::matches_all())
+            .await
     }
 
     /// Lists all sandbox IDs currently tracked by the store.
     pub async fn list_sandbox_ids(&self) -> Result<Vec<SandboxId>> {
-        Ok(self.store.list_ids().await?)
+        // Reserve builder routing while its image is resolving and while the
+        // final template is publishing, even when no VM is currently running.
+        let mut ids: HashSet<_> = self.store.list_ids().await?.into_iter().collect();
+        ids.extend(self.template_build_ids.read().await.iter().copied());
+        Ok(ids.into_iter().collect())
+    }
+
+    pub(crate) async fn register_template_build(&self, id: SandboxId) {
+        self.template_build_ids.write().await.insert(id);
+    }
+
+    pub(crate) async fn unregister_template_build(&self, id: SandboxId) {
+        self.template_build_ids.write().await.remove(&id);
     }
 
     /// Lists sandboxes that match the provided filter criteria:
@@ -852,7 +882,13 @@ where
         &self,
         filter: SandboxListFilter,
     ) -> Result<Vec<SandboxMetadata>> {
-        Ok(self.store.list_filtered(filter).await?)
+        Ok(self
+            .store
+            .list_filtered(filter)
+            .await?
+            .into_iter()
+            .filter(|metadata| !metadata.template_builder)
+            .collect())
     }
 
     pub fn get_envd_access_token(&self, metadata: &SandboxMetadata) -> Option<EnvdAccessToken> {
@@ -1154,10 +1190,11 @@ where
         sandbox_id: SandboxId,
         previous_state: SandboxState,
     ) -> Result<()> {
-        let volume_ids = self
-            .store
-            .get(&sandbox_id)
-            .await?
+        let metadata = self.store.get(&sandbox_id).await?;
+        let template_builder = metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.template_builder);
+        let volume_ids = metadata
             .map(|metadata| metadata.volume_mounts.into_values().collect::<Vec<_>>())
             .unwrap_or_default();
         let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
@@ -1190,10 +1227,18 @@ where
                 .publish_sandbox_volume_backings(sandbox_id, &volume_ids)
                 .await
             {
-                self.store
-                    .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
-                    .await?;
-                return Err(err);
+                if template_builder {
+                    warn!(%sandbox_id, error = %err, "builder cache publication failed; discarding cache and releasing worker");
+                } else {
+                    self.store
+                        .update_state_if_state(
+                            &sandbox_id,
+                            previous_state,
+                            &[SandboxState::Killing],
+                        )
+                        .await?;
+                    return Err(err);
+                }
             }
             if let Err(err) = manager
                 .replace_owner_for(&sandbox_id.to_string(), None, &volume_ids)
@@ -2846,6 +2891,15 @@ where
             return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
         };
         metadata.secure = secure;
+        self.store.update(metadata).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn set_template_builder_for_test(&self, sandbox_id: &SandboxId) -> Result<()> {
+        let Some(mut metadata) = self.store.get(sandbox_id).await? else {
+            return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
+        };
+        metadata.template_builder = true;
         self.store.update(metadata).await?;
         Ok(())
     }

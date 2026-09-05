@@ -119,6 +119,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
         volume_manager: None,
+        template_build_ids: RwLock::new(HashSet::new()),
     })
 }
 
@@ -2712,6 +2713,104 @@ async fn orchestrator_list_empty_returns_empty() -> Result<()> {
         "empty store should return empty filtered sandbox list"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn buildkit_workers_are_hidden_but_keep_scheduler_bindings() -> Result<()> {
+    let orchestrator = make_orchestrator().await;
+    let id = SandboxId::new();
+    orchestrator.register_template_build(id).await;
+    assert_eq!(orchestrator.list_sandbox_ids().await?, vec![id]);
+    let metadata = orchestrator
+        .create_template_builder(id, create_request(Some(60), &[]))
+        .await?;
+    assert!(metadata.template_builder);
+    assert_eq!(orchestrator.list_sandbox_ids().await?, vec![id]);
+    assert!(orchestrator.list_sandboxes().await?.is_empty());
+    assert!(orchestrator
+        .list_sandboxes_filtered(SandboxListFilter::matches_all())
+        .await?
+        .is_empty());
+    orchestrator.delete_sandbox(id).await?;
+    assert_eq!(orchestrator.list_sandbox_ids().await?, vec![id]);
+    orchestrator.unregister_template_build(id).await;
+    assert!(orchestrator.list_sandbox_ids().await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn buildkit_cache_publication_failure_releases_only_internal_workers() -> anyhow::Result<()> {
+    use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::volume::{VolumeMode, VolumeRecord, VolumeStatus};
+
+    for internal in [false, true] {
+        let temp = TempDir::new()?;
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: temp.path().join("repository"),
+            cache_root: Some(temp.path().join("cache")),
+            runtime_cache_root: Some(temp.path().join("runtime")),
+        })?;
+        let repository = backend.repository();
+        let volumes = Arc::new(
+            VolumeManager::open_with_repository(temp.path().join("volumes"), repository.clone())
+                .await?,
+        );
+        let orchestrator = TestOrchestrator::new_inner_with_volumes(
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::new(),
+            DisabledSandboxPersister,
+            test_runtime_image_refs(),
+            Some(volumes.clone()),
+        )
+        .await?;
+        let sandbox = if internal {
+            orchestrator
+                .create_template_builder(SandboxId::new(), create_request(Some(60), &[]))
+                .await?
+        } else {
+            orchestrator
+                .create_sandbox(create_request(Some(60), &[]))
+                .await?
+        };
+        let volume = VolumeRecord {
+            id: "vol_missing_backing".to_owned(),
+            name: "missing-backing".to_owned(),
+            mode: VolumeMode::Exclusive,
+            size_mb: 1024,
+            status: VolumeStatus::Ready,
+            reserved_by_sandbox_id: Some(sandbox.id.to_string()),
+            backing_image_config: None,
+            backing_layers: Vec::new(),
+            read_only_mounts: Vec::new(),
+            deleting: false,
+        };
+        repository.create_volume(volume.clone()).await?;
+        orchestrator
+            .store
+            .update_if_state(&sandbox.id, &[SandboxState::Running], |metadata| {
+                metadata.state = SandboxState::Paused;
+                metadata
+                    .volume_mounts
+                    .insert("/cache".to_owned(), volume.id.clone());
+            })
+            .await?;
+        let deleted = orchestrator.delete_sandbox(sandbox.id).await;
+        let record = volumes.get(&volume.id).await?;
+        assert_eq!(record.status, VolumeStatus::Failed);
+        if internal {
+            deleted?;
+            assert!(orchestrator.store.get(&sandbox.id).await?.is_none());
+            assert!(record.reserved_by_sandbox_id.is_none());
+        } else {
+            assert!(deleted.is_err());
+            assert!(orchestrator.store.get(&sandbox.id).await?.is_some());
+            assert_eq!(
+                record.reserved_by_sandbox_id.as_deref(),
+                Some(sandbox.id.to_string().as_str())
+            );
+        }
+    }
     Ok(())
 }
 

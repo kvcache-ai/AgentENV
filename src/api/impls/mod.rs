@@ -1,6 +1,7 @@
 mod admin;
 mod attached_drives;
 pub(crate) mod auth;
+pub(crate) mod image_build;
 mod pagination;
 mod sandbox;
 mod snapshots;
@@ -38,6 +39,7 @@ pub struct ApiImpl {
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
     api_key: ApiKey,
+    build_sessions: Arc<image_build::BuildSessions>,
 }
 
 impl ApiImpl {
@@ -62,6 +64,7 @@ impl ApiImpl {
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
             api_key,
+            build_sessions: Arc::new(image_build::BuildSessions::default()),
         }
     }
 

@@ -351,6 +351,7 @@ mod tests {
             compression_enabled: false,
             compression_algorithm: OverlaybdCompressionAlgorithm::Lz4,
             compression_workers: 1,
+            ..Default::default()
         };
         assert_eq!(
             OverlaybdCompactOutput::from_template_build_config(&disabled),
@@ -362,6 +363,7 @@ mod tests {
             compression_algorithm: OverlaybdCompressionAlgorithm::Zstd,
             // Zero workers clamps to sequential.
             compression_workers: 0,
+            ..Default::default()
         };
         assert_eq!(
             OverlaybdCompactOutput::from_template_build_config(&zstd),
@@ -375,6 +377,7 @@ mod tests {
             compression_enabled: true,
             compression_algorithm: OverlaybdCompressionAlgorithm::Lz4,
             compression_workers: usize::MAX,
+            ..Default::default()
         };
         assert_eq!(
             OverlaybdCompactOutput::from_template_build_config(&clamped),

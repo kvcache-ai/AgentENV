@@ -694,6 +694,55 @@ impl SnapshotRepository for OssSnapshotRepository {
         })
     }
 
+    async fn get_build_cache_head(&self) -> RepositoryResult<Option<String>> {
+        match self
+            .client
+            .get_bytes("template-build/cache-head.json")
+            .await
+        {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|error| RepositoryError::backend("read build cache head", error)),
+            Err(error) if OssClient::is_not_found_error(&error) => Ok(None),
+            Err(error) => Err(RepositoryError::backend("read build cache head", error)),
+        }
+    }
+
+    async fn replace_build_cache_head(&self, volume_id: &str) -> RepositoryResult<Option<String>> {
+        validate_volume_id(volume_id)?;
+        let key = "template-build/cache-head.json";
+        let bytes = serde_json::to_vec(volume_id)
+            .map_err(|error| RepositoryError::backend("encode build cache head", error))?;
+        for _ in 0..MAX_VOLUME_CAS_ATTEMPTS {
+            let (previous, etag) = match self.client.get_bytes_with_etag(key).await {
+                Ok((bytes, Some(etag))) => (
+                    Some(serde_json::from_slice::<String>(&bytes).map_err(|error| {
+                        RepositoryError::backend("read build cache head", error)
+                    })?),
+                    Some(etag),
+                ),
+                Ok((_, None)) => {
+                    return Err(RepositoryError::InvalidRequest {
+                        reason: "build cache publication requires object storage ETags".to_owned(),
+                    })
+                }
+                Err(error) if OssClient::is_not_found_error(&error) => (None, None),
+                Err(error) => return Err(RepositoryError::backend("read build cache head", error)),
+            };
+            if self
+                .client
+                .put_bytes_conditionally(key, bytes.clone(), etag.as_deref())
+                .await
+                .map_err(|error| RepositoryError::backend("replace build cache head", error))?
+            {
+                return Ok(previous);
+            }
+        }
+        Err(RepositoryError::InvalidRequest {
+            reason: "build cache head changed too often during publication".to_owned(),
+        })
+    }
+
     async fn publish_volume_backing(
         &self,
         _volume_id: &str,

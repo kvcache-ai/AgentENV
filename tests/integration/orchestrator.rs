@@ -278,6 +278,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 start_cmd,
                 ready_cmd,
                 context,
+                shell: None,
             }) if start_cmd == "sleep 1000000"
                 && ready_cmd == "test -f base.txt"
                 && context.workdir == "/workspace"
@@ -334,6 +335,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 start_cmd,
                 ready_cmd,
                 context,
+                shell: None,
             }) if start_cmd == "sleep 1000000"
                 && ready_cmd == "test -f base.txt"
                 && context.workdir == "/workspace"

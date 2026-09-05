@@ -27,6 +27,7 @@ where
     // proxy contract.
     agentenv_http_server::server::new::<I, A, E, C>(api_impl.clone())
         .merge(proxy::router(api_impl.clone()))
+        .merge(super::impls::image_build::router(api_impl.clone()))
         .route("/metrics", get(metrics_handler))
         .layer(middleware::from_fn_with_state(
             api_impl.clone(),

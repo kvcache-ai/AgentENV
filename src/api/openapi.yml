@@ -1011,6 +1011,34 @@ components:
         memoryMB:
           $ref: "#/components/schemas/MemoryMB"
 
+    TemplateBuildSessionRequest:
+      type: object
+      required: [template]
+      properties:
+        template:
+          $ref: "#/components/schemas/TemplateBuildRequestV3"
+        startCmd:
+          type: string
+          description: Override the final image ENTRYPOINT/CMD for template startup. Omit to use the image command; an empty string disables startup.
+        readyCmd:
+          type: string
+          description: Override the final image HEALTHCHECK with a command that must succeed before snapshot capture. Omit to use the image health check.
+        timeout:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 86400
+          description: Builder preparation and Dockerfile build deadline in seconds; defaults to 3600. Worker settings come from the node configuration.
+
+    TemplateBuildImage:
+      type: object
+      required: [digest]
+      properties:
+        digest:
+          type: string
+          pattern: '^sha256:[a-f0-9]{64}$'
+          description: Completed OCI image digest returned by BuildKit.
+
     TemplateBuildStartV2:
       type: object
       properties:
@@ -1602,6 +1630,99 @@ paths:
           $ref: "#/components/responses/401"
         "400":
           $ref: "#/components/responses/400"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /templates/builds:
+    post:
+      summary: Start a managed Dockerfile template build
+      description: >
+        Allocate a template build and prepare an isolated BuildKit worker with
+        a reusable cache. The server owns worker allocation and cleanup. Use the
+        returned template/build IDs to poll builder readiness, connect BuildKit,
+        and submit the completed image. No sandbox APIs are involved.
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateBuildSessionRequest"
+      responses:
+        "202":
+          description: The template build has started
+          headers:
+            x-agentenv-build-id:
+              description: Build identifier used by the gateway for routing.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateRequestResponseV3"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /templates/{templateID}/builds/{buildID}/builder:
+    description: Native BuildKit uses a binary WebSocket GET on this resource with the API key. Poll the existing build status endpoint until building before connecting.
+    parameters:
+      - name: templateID
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: buildID
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      summary: Publish the completed BuildKit image
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateBuildImage"
+      responses:
+        "202":
+          description: Image publication accepted
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+    delete:
+      summary: Cancel a template build and release its worker
+      description: Cancellation before publication stops the build. Once publication is accepted, the server finishes publication and releases the worker independently of the client.
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "204":
+          description: Builder released
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
         "409":
           $ref: "#/components/responses/409"
         "500":

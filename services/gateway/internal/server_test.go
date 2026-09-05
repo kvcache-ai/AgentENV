@@ -20,6 +20,8 @@ import (
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type stubSchedulerClient struct {
@@ -1554,6 +1556,98 @@ func TestInjectForwardedHeadersSetsXForwardedFor(t *testing.T) {
 
 	if got := h.Get("X-Forwarded-For"); got != "192.168.1.10" {
 		t.Fatalf("X-Forwarded-For = %q, want %q", got, "192.168.1.10")
+	}
+}
+
+func TestTemplateBuilderRoutingAndAssignment(t *testing.T) {
+	requests := make(chan string, 4)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- r.URL.Path
+		if r.URL.Path == "/templates/builds" {
+			w.Header().Set("x-agentenv-build-id", "build-123")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"templateID":"build-123","buildID":"build-123"}`))
+		}
+	}))
+	defer upstream.Close()
+	node := &schedulerv1.Node{NodeId: "builder-node", Endpoint: upstream.URL}
+	recorded := make(chan string, 1)
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			return &schedulerv1.ScheduleResponse{Node: node}, nil
+		},
+		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			if req.GetSandboxId() != "build-123" {
+				return nil, fmt.Errorf("unexpected build binding: %s", req.GetSandboxId())
+			}
+			return &schedulerv1.LookupNodeResponse{Node: node}, nil
+		},
+		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			recorded <- req.GetSandboxId()
+			return &schedulerv1.RecordAssignmentResponse{}, nil
+		},
+	}, time.Second, 1024)
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodPost, "/templates/builds"},
+		{http.MethodGet, "/templates/build-123/builds/build-123/builder"},
+		{http.MethodGet, "/templates/build-123/builds/build-123/status"},
+		{http.MethodPost, "/templates/build-123/builds/build-123/builder"},
+		{http.MethodDelete, "/templates/build-123/builds/build-123/builder"},
+	} {
+		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`))
+		req.Header.Set(headerSandboxID, "unrelated-sandbox")
+		req.Header.Set(headerTargetPort, "1234")
+		if server.isSandboxDataPlaneRequest(req) {
+			t.Fatal("template builder must require API authentication")
+		}
+		response := httptest.NewRecorder()
+		authenticatedTestHandler(server).ServeHTTP(response, req)
+		if response.Code >= 400 {
+			t.Fatalf("%s %s: %d %s", tc.method, tc.path, response.Code, response.Body.String())
+		}
+		if got := <-requests; got != tc.path {
+			t.Fatalf("forwarded path %s, want %s", got, tc.path)
+		}
+	}
+	if got := <-recorded; got != "build-123" {
+		t.Fatalf("recorded build %s", got)
+	}
+}
+
+func TestTemplateBuildStatusFallsBackOnlyForMissingBindings(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	for _, tc := range []struct {
+		name         string
+		resource     string
+		lookupCode   codes.Code
+		wantStatus   int
+		wantSchedule bool
+	}{
+		{"finished build", "status", codes.NotFound, http.StatusOK, true},
+		{"scheduler unavailable", "status", codes.Unavailable, http.StatusServiceUnavailable, false},
+		{"missing builder", "builder", codes.NotFound, http.StatusNotFound, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheduled := false
+			server := newTestServer(t, stubSchedulerClient{
+				lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+					return nil, status.Error(tc.lookupCode, "lookup failed")
+				},
+				scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+					scheduled = true
+					return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "repository-node", Endpoint: upstream.URL}}, nil
+				},
+			}, time.Second, 1024)
+			response := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodGet, "/templates/template-123/builds/build-123/"+tc.resource, nil)
+			authenticatedTestHandler(server).ServeHTTP(response, request)
+			if response.Code != tc.wantStatus || scheduled != tc.wantSchedule {
+				t.Fatalf("status=%d scheduled=%t, want status=%d scheduled=%t", response.Code, scheduled, tc.wantStatus, tc.wantSchedule)
+			}
+		})
 	}
 }
 

@@ -7,6 +7,9 @@ CARGO ?= cargo
 DOCKER ?= docker
 DOCKER_COMPOSE ?= docker compose
 DEPLOY_COMPOSE_FILE ?= deploy/docker-compose.yml
+# Guests need upstream DNS, not the host's loopback resolver stub.
+HOST_RESOLV_CONF ?= $(firstword $(wildcard /run/systemd/resolve/resolv.conf /etc/resolv.conf))
+export HOST_RESOLV_CONF
 APT_MIRROR_BASE ?=
 KUBECTL ?= kubectl
 K8S_NAMESPACE ?= agentenv-system
@@ -116,10 +119,12 @@ test: test-agent test-envd test-ublk
 
 test-unit:
 	$(CARGO) test -p agentenv -p envd -p linux-cap --lib
+	$(CARGO) test -p aenv --bin aenv
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --lib -- --ignored
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib
 	bash scripts/tests/verify-capability-runner.sh
 	bash scripts/tests/verify-install-service.sh
+	bash scripts/tests/verify-install-buildctl.sh
 
 test-integration: test-agent-integration test-envd test-ublk
 

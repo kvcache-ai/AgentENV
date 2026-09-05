@@ -3,6 +3,7 @@
 # The server is configured as a systemd service (or prints a manual start
 # command if systemd is unavailable).
 # Downloads: aenv (cli)   -> /usr/local/bin/aenv
+#            buildctl -> /usr/local/bin/buildctl
 #            server -> /usr/local/bin/server
 #            dependencies -> /var/lib/aenv/deps
 #            ublk daemon -> /var/lib/aenv/ublk/uvm-ublk-daemon
@@ -28,6 +29,7 @@ if [[ $EUID -ne 0 ]] && ! sudo -v 2>/dev/null; then
 fi
 
 REPO="kvcache-ai/AgentENV"
+BUILDKIT_VERSION="v0.33.0"
 INSTALL_DIR="/usr/local/bin"
 SKIP_SETUP="${SKIP_SETUP:-0}"
 DATA_DIR="${AENV_HOME_PATH:-/var/lib/aenv}"
@@ -52,8 +54,8 @@ esac
 
 ARCH="$(uname -m)"
 case "$ARCH" in
-    x86_64|amd64) ARCH_TAG="x86_64" ;;
-    aarch64|arm64) ARCH_TAG="aarch64" ;;
+    x86_64|amd64) ARCH_TAG="x86_64"; BUILDKIT_ARCH="amd64" ;;
+    aarch64|arm64) ARCH_TAG="aarch64"; BUILDKIT_ARCH="arm64" ;;
     *)
         echo "error: unsupported architecture: $ARCH (supported: x86_64/amd64, aarch64/arm64)" >&2
         exit 1
@@ -87,6 +89,8 @@ command -v curl >/dev/null 2>&1 || missing_packages+=(curl)
 command -v jq >/dev/null 2>&1 || missing_packages+=(jq)
 command -v sha256sum >/dev/null 2>&1 || missing_packages+=(coreutils)
 command -v realpath >/dev/null 2>&1 || missing_packages+=(coreutils)
+command -v tar >/dev/null 2>&1 || missing_packages+=(tar)
+command -v gzip >/dev/null 2>&1 || missing_packages+=(gzip)
 
 if ((${#missing_packages[@]} > 0)); then
     if command -v apt-get >/dev/null 2>&1; then
@@ -107,7 +111,7 @@ if ((${#missing_packages[@]} > 0)); then
     fi
 fi
 
-for command in curl jq sha256sum realpath; do
+for command in curl jq sha256sum realpath tar gzip; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "error: required command is still unavailable after installation: ${command}" >&2
         exit 1
@@ -161,7 +165,7 @@ download_release_asset() {
         jq -cer --arg name "$asset_name" \
             '[.assets[] | select(.name == $name)] |
              if length == 1 then .[0] else error("release asset not found or not unique") end' \
-            "$release_metadata"
+            "${3:-$release_metadata}"
     )" || {
         echo "error: release asset not found or not unique: ${asset_name}" >&2
         exit 1
@@ -195,7 +199,15 @@ sudo mkdir -p "$INSTALL_DIR"
 # ---------------------------------------------------------------------------
 echo "Downloading aenv CLI ..."
 download_release_asset "aenv-linux-${ARCH_TAG}" "$tmp_cli"
+echo "Downloading buildctl ${BUILDKIT_VERSION} (linux/${BUILDKIT_ARCH}) ..."
+curl_get "${api_headers[@]}" \
+    "https://api.github.com/repos/moby/buildkit/releases/tags/${BUILDKIT_VERSION}" -o "$tmp_dir/buildkit.json"
+download_release_asset "buildkit-${BUILDKIT_VERSION}.linux-${BUILDKIT_ARCH}.tar.gz" \
+    "$tmp_dir/buildkit.tar.gz" "$tmp_dir/buildkit.json"
+tar -xzOf "$tmp_dir/buildkit.tar.gz" bin/buildctl >"$tmp_dir/buildctl"
+test -s "$tmp_dir/buildctl"
 sudo install -m 0755 "$tmp_cli" "${INSTALL_DIR}/aenv"
+sudo install -m 0755 "$tmp_dir/buildctl" "${INSTALL_DIR}/buildctl"
 
 # ---------------------------------------------------------------------------
 # 2. Install the server

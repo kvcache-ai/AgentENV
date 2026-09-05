@@ -16,6 +16,12 @@ x-agentenv-base: &agentenv-base
   volumes:
     - /dev:/dev
     - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
+    - type: bind
+      source: ${HOST_RESOLV_CONF:-/run/systemd/resolve/resolv.conf}
+      target: /run/systemd/resolve/resolv.conf
+      read_only: true
+      bind:
+        create_host_path: false
     # Runtime assets are baked into the image by `server --setup-only`; compose
     # persists committed snapshots and deployment secrets across restarts.
     - agentenv-snapshot-store:/workspace/env/snapshot-store

@@ -458,6 +458,31 @@ impl PosixFsCatalogStore {
         self.write_json(&path, &durable_record)
     }
 
+    pub(crate) fn get_build_cache_head(&self) -> RepositoryResult<Option<String>> {
+        let path = self.root.join("template-build/cache-head.json");
+        match fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|error| RepositoryError::backend("read build cache head", error)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(RepositoryError::backend("read build cache head", error)),
+        }
+    }
+
+    pub(crate) fn replace_build_cache_head(
+        &self,
+        volume_id: &str,
+    ) -> RepositoryResult<Option<String>> {
+        self.ensure_volume_id(volume_id)?;
+        let _guard = self.acquire_volume_alias_lock("aenv-buildkit-cache-head")?;
+        let previous = self.get_build_cache_head()?;
+        self.write_json(
+            &self.root.join("template-build/cache-head.json"),
+            &volume_id,
+        )?;
+        Ok(previous)
+    }
+
     pub(crate) fn delete_volume(&self, volume_id: &str) -> RepositoryResult<()> {
         self.ensure_volume_id(volume_id)?;
         let Some(existing) = self.load_volume_by_id_unlocked(volume_id)? else {
@@ -1118,6 +1143,45 @@ mod tests {
         SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind, TemplateBuildStatus,
     };
     use crate::volume::{VolumeMode, VolumeRecord};
+
+    #[test]
+    fn build_cache_head_updates_are_atomic_across_catalog_instances() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = PosixFsCatalogStore::new(root.clone());
+        assert_eq!(store.get_build_cache_head().unwrap(), None);
+        let ids = (0..16)
+            .map(|i| format!("vol_cache_{i}"))
+            .collect::<Vec<_>>();
+        let mut previous = std::thread::scope(|scope| {
+            let jobs = ids
+                .iter()
+                .map(|id| {
+                    let root = root.clone();
+                    scope.spawn(move || {
+                        PosixFsCatalogStore::new(root)
+                            .replace_build_cache_head(id)
+                            .unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            jobs.into_iter()
+                .map(|job| job.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(previous.iter().filter(|id| id.is_none()).count(), 1);
+        previous.push(
+            PosixFsCatalogStore::new(root)
+                .get_build_cache_head()
+                .unwrap(),
+        );
+        let mut observed = previous.into_iter().flatten().collect::<Vec<_>>();
+        observed.sort();
+        let mut expected = ids;
+        expected.sort();
+        assert_eq!(observed, expected);
+        assert!(store.replace_build_cache_head("../invalid").is_err());
+    }
 
     #[test]
     fn begin_and_commit_make_snapshot_visible() {

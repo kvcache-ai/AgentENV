@@ -250,6 +250,20 @@ pub struct TemplatesGetQueryParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct TemplatesTemplateIdBuildsBuildIdBuilderDeletePathParams {
+    pub template_id: String,
+    pub build_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct TemplatesTemplateIdBuildsBuildIdBuilderPostPathParams {
+    pub template_id: String,
+    pub build_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct TemplatesTemplateIdBuildsBuildIdStatusGetPathParams {
     pub template_id: String,
     pub build_id: String,
@@ -8013,6 +8027,147 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<TemplateBuil
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct TemplateBuildImage {
+    /// Completed OCI image digest returned by BuildKit.
+    #[serde(rename = "digest")]
+    #[validate(
+            regex(path = *RE_TEMPLATEBUILDIMAGE_DIGEST),
+          custom(function = "check_xss_string"),
+    )]
+    pub digest: String,
+}
+
+lazy_static::lazy_static! {
+    static ref RE_TEMPLATEBUILDIMAGE_DIGEST: regex::Regex = regex::Regex::new("^sha256:[a-f0-9]{64}$").unwrap();
+}
+
+impl TemplateBuildImage {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(digest: String) -> TemplateBuildImage {
+        TemplateBuildImage { digest }
+    }
+}
+
+/// Converts the TemplateBuildImage value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for TemplateBuildImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> =
+            vec![Some("digest".to_string()), Some(self.digest.to_string())];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a TemplateBuildImage value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for TemplateBuildImage {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub digest: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing TemplateBuildImage".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "digest" => intermediate_rep.digest.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing TemplateBuildImage".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(TemplateBuildImage {
+            digest: intermediate_rep
+                .digest
+                .into_iter()
+                .next()
+                .ok_or_else(|| "digest missing in TemplateBuildImage".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<TemplateBuildImage> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<TemplateBuildImage>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<TemplateBuildImage>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for TemplateBuildImage - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<TemplateBuildImage> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <TemplateBuildImage as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into TemplateBuildImage - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct TemplateBuildInfo {
     /// Build logs
     #[serde(rename = "logs")]
@@ -8414,6 +8569,191 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<TemplateBuil
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into TemplateBuildRequestV3 - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct TemplateBuildSessionRequest {
+    #[serde(rename = "template")]
+    #[validate(nested)]
+    pub template: models::TemplateBuildRequestV3,
+
+    /// Override the final image ENTRYPOINT/CMD for template startup. Omit to use the image command; an empty string disables startup.
+    #[serde(rename = "startCmd")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_cmd: Option<String>,
+
+    /// Override the final image HEALTHCHECK with a command that must succeed before snapshot capture. Omit to use the image health check.
+    #[serde(rename = "readyCmd")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready_cmd: Option<String>,
+
+    /// Builder preparation and Dockerfile build deadline in seconds; defaults to 3600. Worker settings come from the node configuration.
+    #[serde(rename = "timeout")]
+    #[validate(range(min = 1u32, max = 86400u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+}
+
+impl TemplateBuildSessionRequest {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(template: models::TemplateBuildRequestV3) -> TemplateBuildSessionRequest {
+        TemplateBuildSessionRequest {
+            template,
+            start_cmd: None,
+            ready_cmd: None,
+            timeout: None,
+        }
+    }
+}
+
+/// Converts the TemplateBuildSessionRequest value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for TemplateBuildSessionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping template in query parameter serialization
+            self.start_cmd
+                .as_ref()
+                .map(|start_cmd| ["startCmd".to_string(), start_cmd.to_string()].join(",")),
+            self.ready_cmd
+                .as_ref()
+                .map(|ready_cmd| ["readyCmd".to_string(), ready_cmd.to_string()].join(",")),
+            self.timeout
+                .as_ref()
+                .map(|timeout| ["timeout".to_string(), timeout.to_string()].join(",")),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a TemplateBuildSessionRequest value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for TemplateBuildSessionRequest {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub template: Vec<models::TemplateBuildRequestV3>,
+            pub start_cmd: Vec<String>,
+            pub ready_cmd: Vec<String>,
+            pub timeout: Vec<u32>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing TemplateBuildSessionRequest".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "template" => intermediate_rep.template.push(
+                        <models::TemplateBuildRequestV3 as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "startCmd" => intermediate_rep.start_cmd.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "readyCmd" => intermediate_rep.ready_cmd.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "timeout" => intermediate_rep.timeout.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing TemplateBuildSessionRequest".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(TemplateBuildSessionRequest {
+            template: intermediate_rep
+                .template
+                .into_iter()
+                .next()
+                .ok_or_else(|| "template missing in TemplateBuildSessionRequest".to_string())?,
+            start_cmd: intermediate_rep.start_cmd.into_iter().next(),
+            ready_cmd: intermediate_rep.ready_cmd.into_iter().next(),
+            timeout: intermediate_rep.timeout.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<TemplateBuildSessionRequest> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<TemplateBuildSessionRequest>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<TemplateBuildSessionRequest>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for TemplateBuildSessionRequest - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<TemplateBuildSessionRequest> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <TemplateBuildSessionRequest as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into TemplateBuildSessionRequest - {err}"#
                     )),
                 }
             }

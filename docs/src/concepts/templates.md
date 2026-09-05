@@ -48,24 +48,72 @@ be used anywhere a template ID is accepted.
 
 ### aenv build
 
-> ⚠️ **Experimental** — Not recommended for production use.
-
-Build a template by running Dockerfile instructions inside a temporary sandbox:
+Build a Dockerfile with BuildKit inside a temporary microVM, then convert the
+result to OverlayBD and capture a template. The CLI and full AgentENV installers
+include `buildctl` v0.33.0. Source builds can use `--buildctl` to select a compatible
+client. Docker and a staging registry are not required on the CLI machine.
+On Linux and macOS, the local `buildctl` connection uses a Unix socket in a
+directory accessible only to the current user.
 
 ```bash
-aenv build <dockerfile> --name <name> [options]
+aenv build <context> --name <name> [options]
+# From the repository root:
+aenv build . -f deploy/docker/Dockerfile.agentenv --name aenv
 ```
 
 | Argument or option | Default | Description |
 |---|---|---|
-| `<dockerfile>` | Required | Path to the Dockerfile. |
+| `<context>` | Required | Local context directory, as with `docker build`. |
+| `-f, --file <path>` | `<context>/Dockerfile` | Dockerfile path; explicit relative paths resolve from the current directory. |
 | `--name <name>` | Required | Assign the template name. |
-| `--image <ref>` | First concrete `FROM` image | Override the base image. If the Dockerfile has no usable `FROM`, `[image.resolver].default_image` from your config file is used. Alias: `--user-image`. |
 | `--cpu <count>` | `[machine].vcpu_count` from your config file | Set the template's vCPU count. Alias: `--cpu-count`. |
 | `--memory <MiB>` | `[machine].mem_size_mib` from your config file | Set the template's memory. Aliases: `--memory-mb`, `--mem`. |
+| `--start-cmd <command>` | Image `ENTRYPOINT`/`CMD` | Override template startup; an empty string disables startup. |
+| `--ready-cmd <command>` | Image `HEALTHCHECK`, or the normal startup delay | Override the command that must succeed before snapshot capture. |
+| `--build-arg KEY=VALUE` | None | Build argument; repeatable. |
+| `--secret <spec>` | None | Native BuildKit secret mounts; repeatable. |
+| `--no-cache` | False | Disable instruction cache; cache mounts retain their usual BuildKit semantics. |
+| `--buildctl <path>` | `buildctl` | Local client executable. |
+| `--progress <format>` | `auto` | Three-stage bar on terminals, plain logs when redirected. `plain` selects plain logs; `tty` selects BuildKit's native display. |
+| `--timeout <seconds>` | 3600 | Builder preparation and Dockerfile build deadline; the CLI allows 10 additional minutes for publication. |
 
-`aenv build` and `aenv pull --detach` submit the build and return immediately. Watch it until it
-succeeds or fails by passing the template name or ID:
+`COPY` and `ADD` resolve from the context directory, independently of the
+Dockerfile's location. Local directories are supported; URL and stdin contexts
+are not supported. The final Dockerfile stage is always published. Select base
+images with `FROM` (or `ARG` used by `FROM`) and startup with `ENTRYPOINT`/`CMD`.
+`--start-cmd` and `--ready-cmd` override startup and readiness independently.
+There are no image, stage-selection, SSH, or builder-resource overrides in the
+build CLI.
+
+Managed builder settings belong to the server configuration:
+
+```toml
+[template_build]
+builder_image = "docker.io/moby/buildkit:v0.33.0"
+builder_cpu_count = 16
+builder_memory_mb = 32768
+cache_size_mb = 262144
+```
+
+The 256 GiB disk is the persistent `/var/lib/buildkit` data volume, where image
+layers, build contexts, and cache mounts live. Its capacity applies when creating
+the cache; changing the setting does not resize an existing volume. These
+resources are separate from the resulting template's CPU and memory.
+
+BuildKit handles multi-stage builds, `COPY`, `ADD`, `.dockerignore`, cache mounts,
+and Dockerfile syntax. The CLI remains connected during the build, streams build
+progress, and exits nonzero on failure. The server provisions and releases an
+internal worker for each template build. The first Dockerfile build prepares a
+reusable builder snapshot in a private namespace of the configured snapshot
+repository. Nodes sharing that repository restore the same builder and attach a
+new cache volume before starting BuildKit. Concurrent first requests on a node
+share initialization. Simultaneous first builds on different nodes may both
+prepare a builder; subsequent builds reuse the published snapshot. The CLI uses
+only template and build IDs; workers are absent from public sandbox listings and endpoints. Cancellation
+and deadlines release the worker and discard its incomplete cache child. A hard client failure
+is covered by the build deadline, and server restart recovers unfinished builds
+and cache reservations from a durable journal. A publication already accepted by the
+server may finish after the CLI is interrupted; its status remains available:
 
 ```bash
 aenv template watch my-template
@@ -74,19 +122,73 @@ aenv template watch my-template
 `aenv template watch` has no timeout option. Stop the
 local watch with `Ctrl-C`; the remote build continues.
 
-Supported Dockerfile instructions:
+The node reads the completed image directly from the builder by SHA-256 digest.
+It verifies the transferred bytes and converts only missing layers, reusing the
+same content-addressed OverlayBD cache as registry image imports. The completed
+image never travels through the CLI. Only the final image configuration becomes
+template configuration; intermediate stages and build-time arguments are not
+template environment variables.
 
-| Instruction | Behavior |
-|-------------|----------|
-| `FROM` | Base image (overridable with `--image`) |
-| `RUN` | Shell command executed inside the build sandbox |
-| `ENV` | Set an environment variable |
-| `ARG` | Set a build-time variable |
-| `WORKDIR` | Create the directory if needed and set it as the working directory |
-| `USER` | Set the default user (a missing named account is created at the end of the build) |
-| `ENTRYPOINT` | Becomes the template `startCmd` |
-| `CMD` | Becomes `startCmd` if no `ENTRYPOINT` is present |
-| `EXPOSE` / `VOLUME` / `LABEL` | Accepted but stored as metadata only |
+Publishing also boots the image and runs its startup command. An image
+can compile and convert successfully but fail this step if its entrypoint needs
+devices absent from the guest. For example, `deploy/docker/Dockerfile.agentenv`
+starts the host AgentENV server, which requires `/dev/kvm`; it cannot run as a
+template in a guest without nested KVM support. Use `--start-cmd` to select another
+startup command, or `--start-cmd "" --ready-cmd true` to capture without starting
+the image's application or running its health check.
+
+Numeric Dockerfile `USER` values are resolved to guest account names for envd.
+A missing numeric account gets an entry with the requested UID/GID; existing
+accounts are preserved. The guest image still needs `/bin/sh` for envd process
+execution, including exec-form Dockerfile commands.
+
+Caches are shared across template names and nodes using the configured snapshot
+repository. Each build clones the latest immutable cache seed into its own
+writable volume. Sequential builds inherit the preceding build's accumulated
+instruction cache and `RUN --mount=type=cache` data. Concurrent builds can fork
+the same seed without waiting for each other; the last successfully published
+cache becomes the next seed. Sibling cache additions are not merged.
+
+Cache volumes use normal volume publication, uploading only missing layers.
+Cache publication adds cleanup time, but a failed cache upload does not fail an
+otherwise successful template build or replace the previous seed. Old cache
+volumes are removed after active children release their leases. BuildKit's
+garbage collector manages cache contents. Cache sharing uses the repository's
+existing API-key trust boundary. Builder-template upgrade handling is not automatic.
+Registry credentials come from the local BuildKit session and normal Docker
+credential configuration.
+
+The additive API is template-scoped:
+
+1. `POST /templates/builds` accepts `template` and optional `startCmd`, `readyCmd`,
+   and `timeout`. It returns template/build IDs. Worker settings come from the
+   node configuration.
+2. Poll the existing `GET /templates/{templateID}/builds/{buildID}/status` endpoint:
+   `waiting` means the builder template or worker is preparing; `building`
+   means it can accept a build.
+3. `GET /templates/{templateID}/builds/{buildID}/builder` opens a binary
+   WebSocket carrying native BuildKit traffic.
+4. `POST /templates/{templateID}/builds/{buildID}/builder` accepts the completed
+   image `digest` and starts server-owned import and publication.
+5. `DELETE /templates/{templateID}/builds/{buildID}/builder` cancels an unsubmitted
+   build and waits for worker cleanup. Accepted publication continues server-side.
+
+These endpoints require the API key and route to the owning node through the
+gateway. Status polling uses the active build's node binding; after the binding
+expires, it uses the shared template repository as before. Image import has a
+one-hour deadline; metadata is limited to 4 MiB per
+blob and images to 1024 layers and 64 GiB of compressed data. Existing template
+endpoints retain their current behavior and report final publication status.
+
+By default, image `ENTRYPOINT` and `CMD` are combined for startup through `/bin/sh -c`.
+Dockerfile `HEALTHCHECK` supplies the readiness command before snapshot capture;
+shell checks honor Dockerfile `SHELL`, and `HEALTHCHECK NONE` disables the check.
+It uses AgentENV's readiness polling and deadline, not Docker's health-monitoring
+intervals or restart behavior. Without a check, startup uses the normal template
+readiness delay. `--start-cmd` and `--ready-cmd` (API fields `startCmd` and `readyCmd`)
+override these commands independently without modifying the image configuration.
+Images must satisfy AgentENV's normal guest runtime requirements;
+`EXPOSE` and `VOLUME` are metadata, not Docker runtime services.
 
 ### Runtime Configuration
 

@@ -1,3 +1,4 @@
+pub(crate) mod buildkit;
 pub(crate) mod cache;
 pub(crate) mod commit_index;
 pub(crate) mod local_layer;

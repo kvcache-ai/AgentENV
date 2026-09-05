@@ -18,7 +18,7 @@ use super::template_helpers::{
 use super::ApiImpl;
 use crate::image::ResolvedBlockImage;
 use crate::snapshot::{
-    CommandContext, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
+    SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
     TemplateBuildErrorReason, TemplateBuildStatus,
 };
 use crate::template::{TemplateBuildError, TemplateBuildFailure, TemplatePipelineError};
@@ -173,7 +173,7 @@ fn build_record_envd_version(record: &SnapshotRecord) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn template_build_status(record: &SnapshotRecord) -> TemplateBuildStatus {
+pub(super) fn template_build_status(record: &SnapshotRecord) -> TemplateBuildStatus {
     match &record.source {
         SnapshotSource::Template { build } => build.status,
         SnapshotSource::Sandbox { .. } => TemplateBuildStatus::Ready,
@@ -282,6 +282,74 @@ async fn mark_v2_build_error(
 #[async_trait]
 impl Templates<()> for ApiImpl {
     type Claims = super::Claims;
+
+    async fn templates_builds_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        body: &models::TemplateBuildSessionRequest,
+    ) -> Result<TemplatesBuildsPostResponse, ()> {
+        use TemplatesBuildsPostResponse::*;
+        Ok(match self.start_image_build(body).await {
+            Ok(body) => Status202_TheTemplateBuildHasStarted {
+                x_agentenv_build_id: Some(body.build_id.clone()),
+                body,
+            },
+            Err(err) => match err.code {
+                400 => Status400_BadRequest(err),
+                409 => Status409_Conflict(err),
+                _ => Status500_ServerError(err),
+            },
+        })
+    }
+
+    async fn templates_template_id_builds_build_id_builder_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path: &models::TemplatesTemplateIdBuildsBuildIdBuilderPostPathParams,
+        body: &models::TemplateBuildImage,
+    ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderPostResponse, ()> {
+        use TemplatesTemplateIdBuildsBuildIdBuilderPostResponse::*;
+        Ok(
+            match self.submit_image_build(&path.template_id, &path.build_id, &body.digest) {
+                Ok(()) => Status202_ImagePublicationAccepted,
+                Err(err) => match err.code {
+                    400 => Status400_BadRequest(err),
+                    404 => Status404_NotFound(err),
+                    _ => Status409_Conflict(err),
+                },
+            },
+        )
+    }
+
+    async fn templates_template_id_builds_build_id_builder_delete(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path: &models::TemplatesTemplateIdBuildsBuildIdBuilderDeletePathParams,
+    ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse, ()> {
+        use TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse::*;
+        Ok(
+            match self
+                .cancel_image_build(&path.template_id, &path.build_id)
+                .await
+            {
+                Ok(()) => Status204_BuilderReleased,
+                Err(err) => match err.code {
+                    404 => Status404_NotFound(err),
+                    409 => Status409_Conflict(err),
+                    _ => Status500_ServerError(err),
+                },
+            },
+        )
+    }
 
     async fn templates_aliases_alias_get(
         &self,
@@ -432,25 +500,30 @@ impl Templates<()> for ApiImpl {
             );
         }
 
-        match self
-            .snapshot_manager
-            .get(&path_params.template_id)
-            .await
-        {
+        match self.snapshot_manager.get(&path_params.template_id).await {
             Ok(Some(record)) => {
+                let mut info = models::TemplateBuildInfo::from(record);
+                if info.status == models::TemplateBuildStatus::Ready
+                    && self.build_sessions.is_finishing(&path_params.build_id)
+                {
+                    // A sequential CLI build must observe the newly published cache seed.
+                    info.status = models::TemplateBuildStatus::Building;
+                }
                 Ok(TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status200_SuccessfullyReturnedTheTemplate(
-                    record.into(),
+                    info,
                 ))
             }
-            Ok(None) => Ok(TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status404_NotFound(
-                Self::error(
+            Ok(None) => Ok(
+                TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status404_NotFound(Self::error(
                     404,
                     format!("template {} not found", path_params.template_id),
+                )),
+            ),
+            Err(err) => Ok(
+                TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status500_ServerError(
+                    Self::snapshot_manager_error(&err),
                 ),
-            )),
-            Err(err) => Ok(TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status500_ServerError(
-                Self::snapshot_manager_error(&err),
-            )),
+            ),
         }
     }
 
@@ -693,21 +766,12 @@ impl Templates<()> for ApiImpl {
                     if let Some(config) = &resolved_rootfs.raw_config {
                         image_configs.add(None::<String>, "/", config.clone());
                     }
-                    let base = resolved_rootfs.base_context;
-                    let base_context =
-                        CommandContext::from_env_and_workdir(base.env_vars, base.workdir)
-                            .with_user(base.user)
-                            .with_exposed_ports(base.exposed_ports)
-                            .with_entrypoint(base.entrypoint)
-                            .with_cmd(base.cmd)
-                            .with_volumes(base.volumes)
-                            .with_labels(base.labels);
                     let spec = spec
                         .with_resolved_overlaybd_image(
                             resolved_rootfs.overlaybd_config_path,
                             image_configs,
                         )
-                        .with_base_context(base_context);
+                        .with_base_context(resolved_rootfs.base_context.into());
                     match api
                         .template_builder
                         .build_and_publish_with_id(

@@ -170,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
         config.sandbox_proxy.domains.clone(),
         api_key,
     ));
+    api_impl.recover_image_builds().await?;
     let app = server::new(api_impl);
     let shutdown_orchestrator = Arc::clone(&orchestrator);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
