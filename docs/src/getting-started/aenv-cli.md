@@ -8,6 +8,11 @@
 curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install-cli.sh | bash
 ```
 
+Both `install-cli.sh` and the full `install.sh` install `buildctl` v0.33.0 beside
+`aenv`, after verifying the GitHub release asset checksums. The CLI installer
+supports Linux and macOS on x86_64 and arm64; set `INSTALL_DIR` for a user-local
+installation.
+
 Or build from source (requires Rust):
 
 ```bash
@@ -56,11 +61,14 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 
 ### `aenv build <dockerfile> --name <name>`
 
-Create a template from a local Dockerfile.
+Create a template from a local Dockerfile using BuildKit in an isolated microVM.
+The installers include the required `buildctl` executable. For source builds,
+install BuildKit's `buildctl` v0.33.0 or select an existing executable with `--buildctl`.
 
 ```bash
 aenv build ./Dockerfile --name my-app
 aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
+aenv build ./Dockerfile --name my-app-v2 --context . --cache-volume my-app-cache
 ```
 
 | Flag | Description |
@@ -68,10 +76,25 @@ aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
 | `--name <name>` | Required template name |
 | `--cpu <count>` | CPU cores for the template. Defaults to `[machine].vcpu_count` on the server. Alias: `--cpu-count`. |
 | `--memory <MiB>` | Memory for the template. Defaults to `[machine].mem_size_mib` on the server. Aliases: `--memory-mb`, `--mem`. |
-| `--image <image>` | Override the rootfs base. Defaults to the first concrete `FROM` image, then the server's `[image.resolver].default_image` if none is usable. Alias: `--user-image`. |
+| `--image <image>` | Override the first stage's `FROM` image. Alias: `--user-image`. |
+| `--context <dir>` | Context directory; defaults to the Dockerfile directory. |
+| `--target <stage>` | Publish a particular stage. |
+| `--build-arg KEY=VALUE` | Repeatable build arguments. |
+| `--cache-volume <name>` | Reuse an exclusive BuildKit cache across template names. |
+| `--start-cmd` / `--ready-cmd` | Override image startup and template readiness. |
+| `--timeout <seconds>` | Dockerfile build deadline; defaults to 3600. The CLI allows 10 additional minutes for provisioning and publication. |
 
-`aenv build` submits the build and returns immediately. Use
-`aenv template watch <template>` to wait for completion.
+The command supports multi-stage builds, file updates, and `.dockerignore`, shows
+BuildKit progress, and waits until the template is ready. The server manages the
+internal worker and releases it afterward while retaining the cache volume.
+The CLI uses template/build IDs only. Use separate cache volumes for
+concurrent builds. See [templates](../concepts/templates.md#aenv-build) for the
+complete workflow, cache management, and startup behavior.
+
+Interactive builds show a three-stage bar for builder preparation, image build,
+and template publication, with elapsed time and Dockerfile logs above the bar.
+`--progress plain` keeps plain logs; `--progress tty` selects BuildKit's native
+terminal display. Redirected output has no progress-bar control sequences.
 
 ### `aenv template list`
 
