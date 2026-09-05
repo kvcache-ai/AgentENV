@@ -22,6 +22,95 @@
 set -euo pipefail
 export LC_ALL=C
 
+install_completion_files() {
+    local marker='# managed by aenv completion installer'
+    local binary="${INSTALL_DIR}/aenv" quoted_binary
+    local share_prefix="${AENV_COMPLETION_PREFIX:-/usr/local}"
+    local bash_path="$share_prefix/share/bash-completion/completions/aenv"
+    local zsh_path="$share_prefix/share/zsh/site-functions/_aenv"
+    local fish_path="$share_prefix/share/fish/vendor_completions.d/aenv.fish"
+    case "$binary" in
+        *"'"*|*"\\"*|*$'\n'*|*$'\r'*)
+            echo "warning: completion binary path contains unsupported characters; skipping" >&2
+            return 0
+            ;;
+    esac
+    [[ -x "$binary" ]] || {
+        echo "warning: completion binary is not executable: ${binary}; skipping" >&2
+        return 0
+    }
+    quoted_binary="'$binary'"
+
+    put_loader() (
+        local path="$1" body="$2" dir tmp lock_dir owner acquired
+        dir="${path%/*}"
+        sudo mkdir -p "$dir" || { echo "warning: could not create ${dir}" >&2; return 0; }
+        lock_dir="$dir/.aenv-completion.lock"
+        acquired=0
+        if sudo mkdir "$lock_dir" 2>/dev/null; then
+            acquired=1
+        elif sudo test -f "$lock_dir/pid" &&
+             owner="$(sudo cat "$lock_dir/pid" 2>/dev/null || true)" &&
+             [[ "$owner" =~ ^[0-9]+$ ]] &&
+             ! ps -p "$owner" >/dev/null 2>&1; then
+            sudo rm -rf "$lock_dir" 2>/dev/null || true
+            sudo mkdir "$lock_dir" 2>/dev/null && acquired=1
+        fi
+        if ((acquired == 0)); then
+            echo "warning: completion directory is busy; skipping ${path}" >&2
+            return 0
+        fi
+        trap 'sudo rm -rf "$lock_dir" 2>/dev/null || true' EXIT
+        printf '%s' "$$" | sudo tee "$lock_dir/pid" >/dev/null 2>&1 || true
+        if [[ -L "$path" ]]; then
+            echo "warning: refusing to replace symlink ${path}" >&2
+            return 0
+        fi
+        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
+            echo "warning: leaving unmanaged completion file ${path} untouched" >&2
+            return 0
+        fi
+        tmp="$(sudo mktemp "$dir/.aenv-completion.XXXXXX")" || {
+            echo "warning: could not stage ${path}" >&2
+            return 0
+        }
+        if [[ "$path" == "$zsh_path" ]]; then
+            if ! printf '%s\n%s\n' "$body" "$marker" | sudo tee "$tmp" >/dev/null; then
+                sudo rm -f "$tmp"
+                echo "warning: could not stage ${path}" >&2
+                return 0
+            fi
+        else
+            if ! printf '%s\n%s\n' "$marker" "$body" | sudo tee "$tmp" >/dev/null; then
+                sudo rm -f "$tmp"
+                echo "warning: could not stage ${path}" >&2
+                return 0
+            fi
+        fi
+        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
+            sudo rm -f "$tmp"
+            echo "warning: leaving newly-created unmanaged completion file ${path} untouched" >&2
+            return 0
+        fi
+        if ! sudo chmod 0644 "$tmp" || ! sudo mv -f "$tmp" "$path"; then
+            sudo rm -f "$tmp"
+            echo "warning: could not install ${path}" >&2
+        fi
+    )
+
+    put_loader "$bash_path" "if [[ -x $quoted_binary ]]; then source <($quoted_binary completion bash); fi"
+    zsh_body="#compdef aenv
+if [[ -x $quoted_binary ]]; then eval \"\$($quoted_binary completion zsh)\"; fi"
+    put_loader "$zsh_path" "$zsh_body"
+    put_loader "$fish_path" "if test -x $quoted_binary; $quoted_binary completion fish | source; end"
+}
+
+# Test seam: source with AENV_SOURCE_ONLY=1 to load install_completion_files
+# without requiring root or downloading anything.
+if [[ -n "${AENV_SOURCE_ONLY:-}" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 if [[ $EUID -ne 0 ]] && ! sudo -v 2>/dev/null; then
     echo "error: this script requires root or sudo access" >&2
     exit 1
@@ -196,67 +285,6 @@ sudo mkdir -p "$INSTALL_DIR"
 echo "Downloading aenv CLI ..."
 download_release_asset "aenv-linux-${ARCH_TAG}" "$tmp_cli"
 sudo install -m 0755 "$tmp_cli" "${INSTALL_DIR}/aenv"
-
-install_completion_files() {
-    local marker='# managed by aenv completion installer'
-    local binary="${INSTALL_DIR}/aenv" quoted_binary
-    local bash_path="/usr/local/share/bash-completion/completions/aenv"
-    local zsh_path="/usr/local/share/zsh/site-functions/_aenv"
-    local fish_path="/usr/local/share/fish/vendor_completions.d/aenv.fish"
-    quoted_binary="'$binary'"
-
-    put_loader() (
-        local path="$1" body="$2" dir tmp lock_dir
-        dir="${path%/*}"
-        sudo mkdir -p "$dir" || { echo "warning: could not create ${dir}" >&2; return 0; }
-        lock_dir="$dir/.aenv-completion.lock"
-        if ! sudo mkdir "$lock_dir" 2>/dev/null; then
-            echo "warning: completion directory is busy; skipping ${path}" >&2
-            return 0
-        fi
-        trap 'sudo rmdir "$lock_dir" 2>/dev/null || true' EXIT
-        if [[ -L "$path" ]]; then
-            echo "warning: refusing to replace symlink ${path}" >&2
-            return 0
-        fi
-        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
-            echo "warning: leaving unmanaged completion file ${path} untouched" >&2
-            return 0
-        fi
-        tmp="$(sudo mktemp "$dir/.aenv-completion.XXXXXX")" || {
-            echo "warning: could not stage ${path}" >&2
-            return 0
-        }
-        if [[ "$path" == "$zsh_path" ]]; then
-            if ! printf '%s\n%s\n' "$body" "$marker" | sudo tee "$tmp" >/dev/null; then
-                sudo rm -f "$tmp"
-                echo "warning: could not stage ${path}" >&2
-                return 0
-            fi
-        else
-            if ! printf '%s\n%s\n' "$marker" "$body" | sudo tee "$tmp" >/dev/null; then
-                sudo rm -f "$tmp"
-                echo "warning: could not stage ${path}" >&2
-                return 0
-            fi
-        fi
-        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
-            sudo rm -f "$tmp"
-            echo "warning: leaving newly-created unmanaged completion file ${path} untouched" >&2
-            return 0
-        fi
-        if ! sudo chmod 0644 "$tmp" || ! sudo mv -f "$tmp" "$path"; then
-            sudo rm -f "$tmp"
-            echo "warning: could not install ${path}" >&2
-        fi
-    )
-
-    put_loader "$bash_path" "if [[ -x $quoted_binary ]]; then source <($quoted_binary completion bash); fi"
-    zsh_body="#compdef aenv
-if [[ -x $quoted_binary ]]; then eval \"\$($quoted_binary completion zsh)\"; fi"
-    put_loader "$zsh_path" "$zsh_body"
-    put_loader "$fish_path" "if test -x $quoted_binary; $quoted_binary completion fish | source; end"
-}
 
 install_completion_files
 

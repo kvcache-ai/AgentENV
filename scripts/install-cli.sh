@@ -48,14 +48,6 @@ TMP="$(mktemp)"
 RELEASE_METADATA="$(mktemp)"
 trap 'rm -f "$TMP" "$RELEASE_METADATA"' EXIT
 
-missing_packages=()
-command -v curl >/dev/null 2>&1 || missing_packages+=(curl)
-command -v jq >/dev/null 2>&1 || missing_packages+=(jq)
-if ! command -v sha256sum >/dev/null 2>&1 &&
-   ! command -v shasum >/dev/null 2>&1; then
-    missing_packages+=(coreutils)
-fi
-
 run_privileged() {
     if [[ $EUID -eq 0 ]]; then
         "$@"
@@ -66,6 +58,166 @@ run_privileged() {
         return 1
     fi
 }
+
+install_completion_files() {
+    local marker='# managed by aenv completion installer'
+    local prefix home user_mode=0 quoted_binary
+    local bash_path zsh_path fish_path
+    prefix="$(dirname "$INSTALL_DIR")"
+    home="${HOME:-}"
+    canonical_dir() {
+        local path="$1" parent name
+        [[ "$path" == /* ]] || path="$PWD/$path"
+        if [[ -d "$path" ]]; then
+            (cd "$path" && pwd -P)
+            return
+        fi
+        parent="${path%/*}"
+        name="${path##*/}"
+        [[ "$parent" == "$path" ]] && parent="."
+        parent="$(cd "$parent" 2>/dev/null && pwd -P)" || return 1
+        printf '%s/%s\n' "$parent" "$name"
+    }
+    prefix="$(canonical_dir "$prefix")" || { echo "warning: could not resolve completion prefix; skipping" >&2; return 0; }
+    home_real=""
+    if [[ -n "$home" ]]; then
+        home_real="$(canonical_dir "$home")" || home_real=""
+    fi
+    if [[ -n "$home_real" && ( "$prefix" == "$home_real" || "$prefix" == "$home_real"/* ) ]]; then
+        user_mode=1
+    fi
+    if ((user_mode)); then
+        [[ -n "$home" ]] || { echo "warning: HOME is unset; skipping completion setup" >&2; return 0; }
+        # Shells honor the XDG base directories; write where they actually look.
+        data_home="${XDG_DATA_HOME:-$home/.local/share}"
+        config_home="${XDG_CONFIG_HOME:-$home/.config}"
+        bash_path="$data_home/bash-completion/completions/aenv"
+        zsh_path="$data_home/zsh/site-functions/_aenv"
+        fish_path="$config_home/fish/completions/aenv.fish"
+    else
+        bash_path="$prefix/share/bash-completion/completions/aenv"
+        zsh_path="$prefix/share/zsh/site-functions/_aenv"
+        fish_path="$prefix/share/fish/vendor_completions.d/aenv.fish"
+    fi
+    # Canonicalize first, then validate: $PWD can introduce unsafe characters
+    # when INSTALL_DIR was relative, and the canonical path is what the
+    # loaders embed.
+    dest_dir="${DEST%/*}"
+    [[ "$dest_dir" == "$DEST" ]] && dest_dir="."
+    dest_dir="$(canonical_dir "$dest_dir")" || {
+        echo "warning: could not canonicalize completion binary path; skipping" >&2
+        return 0
+    }
+    DEST="$dest_dir/${DEST##*/}"
+    case "$DEST" in
+        *"'"*|*"\\"*|*$'\n'*|*$'\r'*)
+            echo "warning: completion binary path contains unsupported characters; skipping" >&2
+            return 0
+            ;;
+    esac
+    if [[ ! -x "$DEST" ]]; then
+        echo "warning: completion binary is not executable: ${DEST}; skipping" >&2
+        return 0
+    fi
+    quoted_binary="'$DEST'"
+
+    put_loader() (
+        local path="$1" body="$2" dir tmp lock_dir owner acquired runner=()
+        dir="${path%/*}"
+        # ${runner[@]} expansion of an empty array breaks under bash 3.2 + set -u.
+        runv() {
+            if ((${#runner[@]} > 0)); then
+                "${runner[@]}" "$@"
+            else
+                "$@"
+            fi
+        }
+        if ! (mkdir -p "$dir" 2>/dev/null && [[ -w "$dir" ]]); then
+            runner=(run_privileged)
+        fi
+        runv mkdir -p "$dir" || { echo "warning: could not create ${dir}" >&2; return 0; }
+        lock_dir="$dir/.aenv-completion.lock"
+        # Lock creation and cleanup must use the same privilege as the writes;
+        # otherwise a system-prefix install reports every directory as busy.
+        acquired=0
+        if runv mkdir "$lock_dir" 2>/dev/null; then
+            acquired=1
+        elif runv test -f "$lock_dir/pid" &&
+             owner="$(runv cat "$lock_dir/pid" 2>/dev/null || true)" &&
+             [[ "$owner" =~ ^[0-9]+$ ]] &&
+             ! ps -p "$owner" >/dev/null 2>&1; then
+            # The recorded owner is gone: reclaim the stale lock once.
+            runv rm -rf "$lock_dir" 2>/dev/null || true
+            runv mkdir "$lock_dir" 2>/dev/null && acquired=1
+        fi
+        if ((acquired == 0)); then
+            echo "warning: completion directory is busy; skipping ${path}" >&2
+            return 0
+        fi
+        trap 'runv rm -rf "$lock_dir" 2>/dev/null || true' EXIT
+        printf '%s' "$$" | runv tee "$lock_dir/pid" >/dev/null 2>&1 || true
+        if [[ -L "$path" ]]; then
+            echo "warning: refusing to replace symlink ${path}" >&2
+            return 0
+        fi
+        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
+            echo "warning: leaving unmanaged completion file ${path} untouched" >&2
+            return 0
+        fi
+        tmp="$(runv mktemp "$dir/.aenv-completion.XXXXXX")" || {
+            echo "warning: could not stage ${path}" >&2
+            return 0
+        }
+        if [[ "$path" == "$zsh_path" ]]; then
+            if ! printf '%s\n%s\n' "$body" "$marker" | runv tee "$tmp" >/dev/null; then
+                runv rm -f "$tmp"
+                echo "warning: could not stage ${path}" >&2
+                return 0
+            fi
+        else
+            if ! printf '%s\n%s\n' "$marker" "$body" | runv tee "$tmp" >/dev/null; then
+                runv rm -f "$tmp"
+                echo "warning: could not stage ${path}" >&2
+                return 0
+            fi
+        fi
+        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
+            runv rm -f "$tmp"
+            echo "warning: leaving newly-created unmanaged completion file ${path} untouched" >&2
+            return 0
+        fi
+        if ! runv chmod 0644 "$tmp" || ! runv mv -f "$tmp" "$path"; then
+            runv rm -f "$tmp"
+            echo "warning: could not install ${path}" >&2
+        fi
+    )
+
+    put_loader "$bash_path" "if [[ -x $quoted_binary ]]; then source <($quoted_binary completion bash); fi"
+    zsh_body="#compdef aenv
+if [[ -x $quoted_binary ]]; then eval \"\$($quoted_binary completion zsh)\"; fi"
+    put_loader "$zsh_path" "$zsh_body"
+    put_loader "$fish_path" "if test -x $quoted_binary; $quoted_binary completion fish | source; end"
+    if ((user_mode)); then
+        echo "If Zsh does not find the completion, add this before compinit:"
+        printf '  fpath=(%s/zsh/site-functions $fpath)\n' "$data_home"
+        echo "  autoload -Uz compinit"
+        echo "  compinit"
+    fi
+}
+
+# Test seam: source with AENV_SOURCE_ONLY=1 to load install_completion_files
+# without downloading or installing anything.
+if [[ -n "${AENV_SOURCE_ONLY:-}" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+missing_packages=()
+command -v curl >/dev/null 2>&1 || missing_packages+=(curl)
+command -v jq >/dev/null 2>&1 || missing_packages+=(jq)
+if ! command -v sha256sum >/dev/null 2>&1 &&
+   ! command -v shasum >/dev/null 2>&1; then
+    missing_packages+=(coreutils)
+fi
 
 if ((${#missing_packages[@]} > 0)); then
     echo "Installing required commands: ${missing_packages[*]} ..."
@@ -164,125 +316,6 @@ else
 fi
 
 echo "Installed: ${DEST}"
-
-install_completion_files() {
-    local marker='# managed by aenv completion installer'
-    local prefix home user_mode=0 quoted_binary
-    local bash_path zsh_path fish_path
-    prefix="$(dirname "$INSTALL_DIR")"
-    home="${HOME:-}"
-    canonical_dir() {
-        local path="$1" parent name
-        [[ "$path" == /* ]] || path="$PWD/$path"
-        if [[ -d "$path" ]]; then
-            (cd "$path" && pwd -P)
-            return
-        fi
-        parent="${path%/*}"
-        name="${path##*/}"
-        [[ "$parent" == "$path" ]] && parent="."
-        parent="$(cd "$parent" 2>/dev/null && pwd -P)" || return 1
-        printf '%s/%s\n' "$parent" "$name"
-    }
-    prefix="$(canonical_dir "$prefix")" || { echo "warning: could not resolve completion prefix; skipping" >&2; return 0; }
-    home_real=""
-    if [[ -n "$home" ]]; then
-        home_real="$(canonical_dir "$home")" || home_real=""
-    fi
-    if [[ -n "$home_real" && ( "$prefix" == "$home_real" || "$prefix" == "$home_real"/* ) ]]; then
-        user_mode=1
-    fi
-    if ((user_mode)); then
-        [[ -n "$home" ]] || { echo "warning: HOME is unset; skipping completion setup" >&2; return 0; }
-        bash_path="$home/.local/share/bash-completion/completions/aenv"
-        zsh_path="$home/.local/share/zsh/site-functions/_aenv"
-        fish_path="$home/.config/fish/completions/aenv.fish"
-    else
-        bash_path="$prefix/share/bash-completion/completions/aenv"
-        zsh_path="$prefix/share/zsh/site-functions/_aenv"
-        fish_path="$prefix/share/fish/vendor_completions.d/aenv.fish"
-    fi
-    case "$DEST" in
-        *"'"*|*"\\"*|*$'\n'*|*$'\r'*)
-            echo "warning: completion binary path contains unsupported characters; skipping" >&2
-            return 0
-            ;;
-    esac
-    dest_dir="${DEST%/*}"
-    [[ "$dest_dir" == "$DEST" ]] && dest_dir="."
-    dest_dir="$(canonical_dir "$dest_dir")" || {
-        echo "warning: could not canonicalize completion binary path; skipping" >&2
-        return 0
-    }
-    DEST="$dest_dir/${DEST##*/}"
-    if [[ ! -x "$DEST" ]]; then
-        echo "warning: completion binary is not executable: ${DEST}; skipping" >&2
-        return 0
-    fi
-    quoted_binary="'$DEST'"
-
-    put_loader() (
-        local path="$1" body="$2" dir tmp lock_dir
-        dir="${path%/*}"
-        local runner=()
-        if ! (mkdir -p "$dir" 2>/dev/null && [[ -w "$dir" ]]); then
-            runner=(run_privileged)
-        fi
-        "${runner[@]}" mkdir -p "$dir" || { echo "warning: could not create ${dir}" >&2; return 0; }
-        lock_dir="$dir/.aenv-completion.lock"
-        if ! mkdir "$lock_dir" 2>/dev/null; then
-            echo "warning: completion directory is busy; skipping ${path}" >&2
-            return 0
-        fi
-        trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
-        if [[ -L "$path" ]]; then
-            echo "warning: refusing to replace symlink ${path}" >&2
-            return 0
-        fi
-        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
-            echo "warning: leaving unmanaged completion file ${path} untouched" >&2
-            return 0
-        fi
-        tmp="$("${runner[@]}" mktemp "$dir/.aenv-completion.XXXXXX")" || {
-            echo "warning: could not stage ${path}" >&2
-            return 0
-        }
-        if [[ "$path" == "$zsh_path" ]]; then
-            if ! printf '%s\n%s\n' "$body" "$marker" | "${runner[@]}" tee "$tmp" >/dev/null; then
-                "${runner[@]}" rm -f "$tmp"
-                echo "warning: could not stage ${path}" >&2
-                return 0
-            fi
-        else
-            if ! printf '%s\n%s\n' "$marker" "$body" | "${runner[@]}" tee "$tmp" >/dev/null; then
-                "${runner[@]}" rm -f "$tmp"
-                echo "warning: could not stage ${path}" >&2
-                return 0
-            fi
-        fi
-        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
-            "${runner[@]}" rm -f "$tmp"
-            echo "warning: leaving newly-created unmanaged completion file ${path} untouched" >&2
-            return 0
-        fi
-        if ! "${runner[@]}" chmod 0644 "$tmp" || ! "${runner[@]}" mv -f "$tmp" "$path"; then
-            "${runner[@]}" rm -f "$tmp"
-            echo "warning: could not install ${path}" >&2
-        fi
-    )
-
-    put_loader "$bash_path" "if [[ -x $quoted_binary ]]; then source <($quoted_binary completion bash); fi"
-    zsh_body="#compdef aenv
-if [[ -x $quoted_binary ]]; then eval \"\$($quoted_binary completion zsh)\"; fi"
-    put_loader "$zsh_path" "$zsh_body"
-    put_loader "$fish_path" "if test -x $quoted_binary; $quoted_binary completion fish | source; end"
-    if ((user_mode)); then
-        echo "If Zsh does not find the completion, add this before compinit:"
-        echo "  fpath=(~/.local/share/zsh/site-functions \$fpath)"
-        echo "  autoload -Uz compinit"
-        echo "  compinit"
-    fi
-}
 
 install_completion_files
 

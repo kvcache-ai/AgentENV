@@ -57,28 +57,48 @@ fi
 
 if ((user_mode)); then
     [[ -n "$home" ]] || { printf 'warning: HOME is unset; skipping completion setup\n' >&2; exit 0; }
-    bash_path="$home/.local/share/bash-completion/completions/aenv"
-    zsh_path="$home/.local/share/zsh/site-functions/_aenv"
-    fish_path="$home/.config/fish/completions/aenv.fish"
+    # Shells honor the XDG base directories; write where they actually look.
+    data_home="${XDG_DATA_HOME:-$home/.local/share}"
+    config_home="${XDG_CONFIG_HOME:-$home/.config}"
+    bash_path="$data_home/bash-completion/completions/aenv"
+    zsh_path="$data_home/zsh/site-functions/_aenv"
+    fish_path="$config_home/fish/completions/aenv.fish"
 else
     bash_path="$prefix/share/bash-completion/completions/aenv"
     zsh_path="$prefix/share/zsh/site-functions/_aenv"
     fish_path="$prefix/share/fish/vendor_completions.d/aenv.fish"
 fi
 
-write_loader() (
-    local path="$1" body="$2" dir tmp lock_dir
-    dir="${path%/*}"
-    mkdir -p "$dir" 2>/dev/null || {
-        printf 'warning: could not create completion directory %s\n' "$dir" >&2
-        return 0
-    }
+# Run `fn` under a per-directory lock. A lock left by a killed process is
+# reclaimed when its recorded owner PID no longer exists, so a crash cannot
+# permanently disable future installs. Returns 1 if the directory is busy.
+with_lock() (
+    local dir="$1" fn="$2" lock_dir owner
+    shift 2
     lock_dir="$dir/.aenv-completion.lock"
     if ! mkdir "$lock_dir" 2>/dev/null; then
-        printf 'warning: completion directory is busy; skipping %s\n' "$path" >&2
-        return 0
+        reclaimed=0
+        if [[ -f "$lock_dir/pid" ]]; then
+            owner="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+            if [[ "$owner" =~ ^[0-9]+$ ]] && ! ps -p "$owner" >/dev/null 2>&1; then
+                rm -rf "$lock_dir" 2>/dev/null || true
+                if mkdir "$lock_dir" 2>/dev/null; then
+                    reclaimed=1
+                fi
+            fi
+        fi
+        if ((reclaimed == 0)); then
+            return 1
+        fi
     fi
-    trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
+    trap 'rm -rf "$lock_dir" 2>/dev/null || true' EXIT
+    printf '%s' "$$" >"$lock_dir/pid" 2>/dev/null || true
+    "$fn" "$@"
+)
+
+_write_loader() {
+    local path="$1" body="$2" dir tmp
+    dir="${path%/*}"
     if [[ -L "$path" ]]; then
         printf 'warning: refusing to replace symlink %s\n' "$path" >&2
         return 0
@@ -104,9 +124,8 @@ write_loader() (
             return 0
         fi
     fi
-    # Re-check immediately before replacement. The first check protects normal
-    # races between installers; this check protects a user file created while
-    # the temporary content was being generated.
+    # Re-check immediately before replacement so a user file created while the
+    # temporary content was generated is never clobbered.
     if [[ -e "$path" ]] && ! grep -Fqx "$MARKER" "$path" 2>/dev/null; then
         rm -f "$tmp"
         printf 'warning: leaving newly-created unmanaged completion file %s untouched\n' "$path" >&2
@@ -116,9 +135,20 @@ write_loader() (
         rm -f "$tmp"
         printf 'warning: could not install completion file %s\n' "$path" >&2
     fi
-)
+}
 
-remove_loader() {
+write_loader() {
+    local path="$1" body="$2" dir
+    dir="${path%/*}"
+    mkdir -p "$dir" 2>/dev/null || {
+        printf 'warning: could not create completion directory %s\n' "$dir" >&2
+        return 0
+    }
+    with_lock "$dir" _write_loader "$path" "$body" ||
+        printf 'warning: completion directory is busy; skipping %s\n' "$path" >&2
+}
+
+_remove_loader() {
     local path="$1"
     [[ -e "$path" ]] || return 0
     if [[ -L "$path" ]] || ! grep -Fqx "$MARKER" "$path" 2>/dev/null; then
@@ -128,13 +158,17 @@ remove_loader() {
     rm -f "$path" || printf 'warning: could not remove completion file %s\n' "$path" >&2
 }
 
+remove_loader() {
+    local path="$1" dir
+    [[ -e "$path" ]] || return 0
+    dir="${path%/*}"
+    # Removal takes the same lock as installation so check-and-delete cannot
+    # race with a concurrent install replacing the file between the two steps.
+    with_lock "$dir" _remove_loader "$path" ||
+        printf 'warning: completion directory is busy; skipping %s\n' "$path" >&2
+}
+
 if [[ "$action" == install ]]; then
-    case "$binary" in
-        *"'"*|*"\\"*|*$'\n'*|*$'\r'*)
-            printf 'warning: completion binary path contains unsupported characters; skipping\n' >&2
-            exit 0
-            ;;
-    esac
     [[ -x "$binary" ]] || {
         printf 'warning: completion binary is not executable: %s\n' "$binary" >&2
         exit 0
@@ -142,6 +176,14 @@ if [[ "$action" == install ]]; then
     binary_dir="${binary%/*}"
     [[ "$binary_dir" == "$binary" ]] && binary_dir="."
     binary="$(cd "$binary_dir" && pwd -P)/${binary##*/}"
+    # Validate after canonicalization: the resolved path (via $PWD for a
+    # relative --binary) is what gets embedded in the loaders.
+    case "$binary" in
+        *"'"*|*"\\"*|*$'\n'*|*$'\r'*)
+            printf 'warning: completion binary path contains unsupported characters; skipping\n' >&2
+            exit 0
+            ;;
+    esac
     quoted_binary="'$binary'"
     write_loader "$bash_path" "if [[ -x $quoted_binary ]]; then source <($quoted_binary completion bash); fi"
     zsh_body="#compdef aenv
@@ -150,7 +192,7 @@ if [[ -x $quoted_binary ]]; then eval \"\$($quoted_binary completion zsh)\"; fi"
     write_loader "$fish_path" "if test -x $quoted_binary; $quoted_binary completion fish | source; end"
     if ((user_mode)); then
         printf '\nIf Zsh does not find the completion, add this before compinit:\n'
-        printf "  fpath=(~/.local/share/zsh/site-functions \$fpath)\n"
+        printf '  fpath=(%s/zsh/site-functions $fpath)\n' "$data_home"
         printf '  autoload -Uz compinit\n  compinit\n'
     fi
 else
