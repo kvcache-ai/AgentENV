@@ -64,9 +64,9 @@ if ((user_mode)); then
     zsh_path="$data_home/zsh/site-functions/_aenv"
     fish_path="$config_home/fish/completions/aenv.fish"
 else
-    bash_path="$prefix/share/bash-completion/completions/aenv"
-    zsh_path="$prefix/share/zsh/site-functions/_aenv"
-    fish_path="$prefix/share/fish/vendor_completions.d/aenv.fish"
+    bash_path="$prefix_real/share/bash-completion/completions/aenv"
+    zsh_path="$prefix_real/share/zsh/site-functions/_aenv"
+    fish_path="$prefix_real/share/fish/vendor_completions.d/aenv.fish"
 fi
 
 # Run `fn` under a per-directory lock. A lock left by a killed process is
