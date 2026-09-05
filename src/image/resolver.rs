@@ -90,6 +90,55 @@ impl ImageResolver {
         &self.default_image
     }
 
+    pub(crate) async fn resolve_buildkit(
+        &self,
+        content: &super::buildkit::BuildkitContent,
+        digest: &str,
+    ) -> Result<ResolvedBlockImage> {
+        anyhow::ensure!(
+            self.convert_standard_oci,
+            "standard OCI conversion is disabled"
+        );
+        let (fetched, metadata) =
+            oci_image::fetch_content_manifest(content, digest, &detect_arch()?).await?;
+        let source = self.store.open(&fetched.manifest_digest, None).await?;
+        if let CachedImageConfig::Found {
+            image_config_path, ..
+        } = source.cached_config().await?
+        {
+            return Ok(resolved_from_cached_config(
+                &fetched.manifest_digest,
+                image_config_path,
+                metadata,
+            ));
+        }
+        let mut conversion = source.begin_conversion().await?;
+        let image = oci_image::convert_content_image(
+            content,
+            &fetched,
+            oci_image::OverlaybdConversionEnv {
+                install_root: &self.overlaybd_install_root,
+                global_config: &self.overlaybd_convert_global_config,
+                converter_id: &self.overlaybd_oci_converter_id,
+                regctl_binary: &self.regctl_binary,
+            },
+            &mut *conversion,
+        )
+        .await?;
+        let path = source
+            .publish_config(
+                &overlaybd_image_config_json(&image),
+                metadata.clone(),
+                conversion,
+            )
+            .await?;
+        Ok(resolved_from_cached_config(
+            &fetched.manifest_digest,
+            path,
+            metadata,
+        ))
+    }
+
     pub async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage> {
         let candidates = image_ref_candidates(
             image_ref,

@@ -43,6 +43,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::{Builder, Uuid};
 
+use super::buildkit::{BuildkitContent, MAX_IMAGE_BYTES};
 use super::commit_index::sanitize_filename_component;
 use super::local_layer::LocalLayer;
 use super::{
@@ -430,7 +431,7 @@ async fn convert_standard_oci_layers_pipeline_inner(
     conversion: OverlaybdConversionEnv<'_>,
     sink: &mut dyn ImageConversion,
     converter: &OverlaybdLayerConverter,
-    producer: &mut RegctlImageCopyProducer,
+    producer: &mut dyn LayerBlobSource,
 ) -> Result<Vec<LocalLayer>> {
     let mut lower_paths: Vec<PathBuf> = Vec::with_capacity(manifest.layers.len());
     let mut lowers = Vec::with_capacity(manifest.layers.len());
@@ -496,6 +497,123 @@ struct RegctlImageCopyProducer {
     backoff: Duration,
 }
 
+#[async_trait]
+trait LayerBlobSource: Send {
+    async fn wait_layer_blob(
+        &mut self,
+        idx: usize,
+        layer: &OciLayerDescriptor,
+    ) -> ImageResult<PathBuf>;
+}
+
+struct ContentLayerSource<'a> {
+    content: &'a BuildkitContent,
+    work: &'a Path,
+}
+
+#[async_trait]
+impl LayerBlobSource for ContentLayerSource<'_> {
+    async fn wait_layer_blob(
+        &mut self,
+        idx: usize,
+        layer: &OciLayerDescriptor,
+    ) -> ImageResult<PathBuf> {
+        let path = self.work.join(format!("blob-{idx}"));
+        self.content
+            .download(&layer.digest, layer.size, &path)
+            .await?;
+        Ok(path)
+    }
+}
+
+pub(super) async fn fetch_content_manifest(
+    content: &BuildkitContent,
+    digest: &str,
+    arch: &str,
+) -> Result<(FetchedManifest, ImageResolutionMetadata)> {
+    let arch = host_arch_to_oci(arch)?;
+    let mut digest = digest.to_owned();
+    for _ in 0..MAX_INDEX_RESOLUTION_DEPTH {
+        let bytes = content.metadata(&digest).await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if value.get("manifests").is_some() {
+            let index: OciIndex = serde_json::from_value(value)?;
+            digest = select_manifest_for_platform(&index.manifests, arch, "linux")?
+                .digest
+                .clone();
+            continue;
+        }
+        anyhow::ensure!(
+            value.get("schemaVersion").and_then(|v| v.as_u64()) == Some(2),
+            "expected OCI schema version 2"
+        );
+        let manifest: OciManifest = serde_json::from_value(value)?;
+        anyhow::ensure!(
+            classify_manifest(&manifest)? == ImageFormat::StandardOci,
+            "builder must export standard OCI layers"
+        );
+        anyhow::ensure!(manifest.layers.len() <= 1024, "image exceeds 1024 layers");
+        let size = manifest
+            .layers
+            .iter()
+            .try_fold(0u64, |total, layer| total.checked_add(layer.size));
+        anyhow::ensure!(
+            size.is_some_and(|size| size <= MAX_IMAGE_BYTES),
+            "image exceeds 64 GiB of compressed layers"
+        );
+        for layer in &manifest.layers {
+            super::buildkit::validate_digest(&layer.digest)?;
+        }
+        let config = content.metadata(&manifest.config.digest).await?;
+        let config_value: serde_json::Value = serde_json::from_slice(&config)?;
+        anyhow::ensure!(
+            config_value["os"] == "linux" && config_value["architecture"] == arch,
+            "built image must target linux/{arch}"
+        );
+        let metadata = parse_oci_image_config(std::str::from_utf8(&config)?)?;
+        return Ok((
+            FetchedManifest {
+                manifest_digest: digest.clone(),
+                selected_image_ref: digest,
+                repository_scope: None,
+                format: ImageFormat::StandardOci,
+                manifest,
+            },
+            metadata,
+        ));
+    }
+    bail!("builder image index nesting exceeds {MAX_INDEX_RESOLUTION_DEPTH}")
+}
+
+pub(super) async fn convert_content_image(
+    content: &BuildkitContent,
+    fetched: &FetchedManifest,
+    conversion: OverlaybdConversionEnv<'_>,
+    sink: &mut dyn ImageConversion,
+) -> Result<ResolvedImage> {
+    let work = sink.create_temp_staging_dir()?;
+    let converter = OverlaybdLayerConverter {
+        tools: OverlaybdTools::from_overlaybd_install_root(conversion.install_root),
+        global_config_path: conversion.global_config.to_path_buf(),
+        virtual_size_gib: LAYER_VIRTUAL_SIZE_GIB,
+    };
+    let mut producer = ContentLayerSource {
+        content,
+        work: work.path(),
+    };
+    let layers = convert_standard_oci_layers_pipeline_inner(
+        &fetched.manifest,
+        &fetched.manifest_digest,
+        work.path(),
+        conversion,
+        sink,
+        &converter,
+        &mut producer,
+    )
+    .await?;
+    Ok(ResolvedImage::Local(layers))
+}
+
 impl RegctlImageCopyProducer {
     async fn start(
         regctl_binary: &Path,
@@ -552,7 +670,10 @@ impl RegctlImageCopyProducer {
         self.attempts_started += 1;
         Ok(())
     }
+}
 
+#[async_trait]
+impl LayerBlobSource for RegctlImageCopyProducer {
     async fn wait_layer_blob(
         &mut self,
         idx: usize,
@@ -611,7 +732,9 @@ impl RegctlImageCopyProducer {
             tokio::time::sleep(OCI_LAYER_BLOB_POLL_INTERVAL).await;
         }
     }
+}
 
+impl RegctlImageCopyProducer {
     async fn poll_exit(&mut self) -> Result<Option<std::process::ExitStatus>> {
         if let Some(status) = self.exit_status {
             return Ok(Some(status));
