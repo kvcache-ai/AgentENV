@@ -163,9 +163,6 @@ HOME="$cli_home" INSTALL_DIR="$cli_bin" AENV_SOURCE_ONLY=1 bash -c '
     XDG_DATA_HOME="$2/data" XDG_CONFIG_HOME="$2/config" \
         install_completion_files
 ' _ "$repo_root/scripts/install-cli.sh" "$cli_home"
-    XDG_DATA_HOME='"$cli_home"'/data XDG_CONFIG_HOME='"$cli_home"'/config \
-        install_completion_files
-'
 assert_file "$cli_home/data/bash-completion/completions/aenv"
 assert_file "$cli_home/data/zsh/site-functions/_aenv"
 assert_file "$cli_home/config/fish/completions/aenv.fish"

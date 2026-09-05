@@ -126,27 +126,27 @@ _write_loader() {
     }
     if [[ "$path" == "$zsh_path" ]]; then
         if ! printf '%s\n%s\n' "$body" "$MARKER" >"$tmp"; then
-            rm -f "$tmp"
+            rm -f "$tmp" || true
             printf 'warning: could not stage completion file %s\n' "$path" >&2
             return 0
         fi
     else
         if ! printf '%s\n%s\n' "$MARKER" "$body" >"$tmp"; then
-            rm -f "$tmp"
+            rm -f "$tmp" || true
             printf 'warning: could not stage completion file %s\n' "$path" >&2
             return 0
         fi
     fi
     # The lock serializes cooperating installer processes. A non-cooperating
-    # external writer cannot be made atomic by a portable shell script; the
-    # check below is defensive and preserves the documented installer guarantee.
+    # external writer cannot be made atomic by a portable shell script; this
+    # check is defensive and applies to the documented installer guarantee.
     if [[ -e "$path" ]] && ! grep -Fqx "$MARKER" "$path" 2>/dev/null; then
-        rm -f "$tmp"
+        rm -f "$tmp" || true
         printf 'warning: leaving newly-created unmanaged completion file %s untouched\n' "$path" >&2
         return 0
     fi
     if ! { chmod 0644 "$tmp" && mv -f "$tmp" "$path"; }; then
-        rm -f "$tmp"
+        rm -f "$tmp" || true
         printf 'warning: could not install completion file %s\n' "$path" >&2
     fi
 }

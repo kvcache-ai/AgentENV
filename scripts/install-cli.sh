@@ -122,7 +122,7 @@ install_completion_files() {
     quoted_binary="'$DEST'"
 
     put_loader() (
-        local path="$1" body="$2" dir tmp lock_dir owner acquired runner=()
+        local path="$1" body="$2" dir tmp lock_dir owner staged_owner stale acquired runner=()
         dir="${path%/*}"
         # ${runner[@]} expansion of an empty array breaks under bash 3.2 + set -u.
         runv() {
@@ -146,9 +146,19 @@ install_completion_files() {
              owner="$(runv cat "$lock_dir/pid" 2>/dev/null || true)" &&
              [[ "$owner" =~ ^[0-9]+$ ]] &&
              ! ps -p "$owner" >/dev/null 2>&1; then
-            # The recorded owner is gone: reclaim the stale lock once.
-            runv rm -rf "$lock_dir" 2>/dev/null || true
-            runv mkdir "$lock_dir" 2>/dev/null && acquired=1
+            # Atomically quarantine the observed lock before validating it;
+            # a new owner at the original path cannot be removed by us.
+            stale="$lock_dir.stale.$$.${RANDOM}"
+            if runv mv "$lock_dir" "$stale" 2>/dev/null; then
+                staged_owner="$(runv cat "$stale/pid" 2>/dev/null || true)"
+                if [[ "$staged_owner" == "$owner" ]] &&
+                   ! ps -p "$staged_owner" >/dev/null 2>&1; then
+                    runv rm -rf "$stale" 2>/dev/null || true
+                    runv mkdir "$lock_dir" 2>/dev/null && acquired=1
+                else
+                    runv mv "$stale" "$lock_dir" 2>/dev/null || true
+                fi
+            fi
         fi
         if ((acquired == 0)); then
             echo "warning: completion directory is busy; skipping ${path}" >&2
@@ -156,11 +166,11 @@ install_completion_files() {
         fi
         trap 'runv rm -rf "$lock_dir" 2>/dev/null || true' EXIT
         printf '%s' "$$" | runv tee "$lock_dir/pid" >/dev/null 2>&1 || true
-        if [[ -L "$path" ]]; then
+        if runv test -L "$path"; then
             echo "warning: refusing to replace symlink ${path}" >&2
             return 0
         fi
-        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
+        if runv test -e "$path" && ! runv grep -Fqx "$marker" "$path" 2>/dev/null; then
             echo "warning: leaving unmanaged completion file ${path} untouched" >&2
             return 0
         fi
@@ -170,24 +180,28 @@ install_completion_files() {
         }
         if [[ "$path" == "$zsh_path" ]]; then
             if ! printf '%s\n%s\n' "$body" "$marker" | runv tee "$tmp" >/dev/null; then
-                runv rm -f "$tmp"
+                runv rm -f "$tmp" || true
                 echo "warning: could not stage ${path}" >&2
                 return 0
             fi
         else
             if ! printf '%s\n%s\n' "$marker" "$body" | runv tee "$tmp" >/dev/null; then
-                runv rm -f "$tmp"
+                runv rm -f "$tmp" || true
                 echo "warning: could not stage ${path}" >&2
                 return 0
             fi
         fi
-        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
-            runv rm -f "$tmp"
+        # The lock protects cooperating installers. A non-cooperating external
+        # writer cannot be serialized by a portable shell script; preserve the
+        # documented guarantee for installer processes rather than claiming
+        # protection against arbitrary writers.
+        if runv test -e "$path" && ! runv grep -Fqx "$marker" "$path" 2>/dev/null; then
+            runv rm -f "$tmp" || true
             echo "warning: leaving newly-created unmanaged completion file ${path} untouched" >&2
             return 0
         fi
         if ! runv chmod 0644 "$tmp" || ! runv mv -f "$tmp" "$path"; then
-            runv rm -f "$tmp"
+            runv rm -f "$tmp" || true
             echo "warning: could not install ${path}" >&2
         fi
     )

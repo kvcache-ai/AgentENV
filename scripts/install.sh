@@ -42,7 +42,7 @@ install_completion_files() {
     quoted_binary="'$binary'"
 
     put_loader() (
-        local path="$1" body="$2" dir tmp lock_dir owner acquired
+        local path="$1" body="$2" dir tmp lock_dir owner staged_owner stale acquired
         dir="${path%/*}"
         sudo mkdir -p "$dir" || { echo "warning: could not create ${dir}" >&2; return 0; }
         lock_dir="$dir/.aenv-completion.lock"
@@ -53,8 +53,17 @@ install_completion_files() {
              owner="$(sudo cat "$lock_dir/pid" 2>/dev/null || true)" &&
              [[ "$owner" =~ ^[0-9]+$ ]] &&
              ! ps -p "$owner" >/dev/null 2>&1; then
-            sudo rm -rf "$lock_dir" 2>/dev/null || true
-            sudo mkdir "$lock_dir" 2>/dev/null && acquired=1
+            stale="$lock_dir.stale.$$.${RANDOM}"
+            if sudo mv "$lock_dir" "$stale" 2>/dev/null; then
+                staged_owner="$(sudo cat "$stale/pid" 2>/dev/null || true)"
+                if [[ "$staged_owner" == "$owner" ]] &&
+                   ! ps -p "$staged_owner" >/dev/null 2>&1; then
+                    sudo rm -rf "$stale" 2>/dev/null || true
+                    sudo mkdir "$lock_dir" 2>/dev/null && acquired=1
+                else
+                    sudo mv "$stale" "$lock_dir" 2>/dev/null || true
+                fi
+            fi
         fi
         if ((acquired == 0)); then
             echo "warning: completion directory is busy; skipping ${path}" >&2
@@ -62,11 +71,11 @@ install_completion_files() {
         fi
         trap 'sudo rm -rf "$lock_dir" 2>/dev/null || true' EXIT
         printf '%s' "$$" | sudo tee "$lock_dir/pid" >/dev/null 2>&1 || true
-        if [[ -L "$path" ]]; then
+        if sudo test -L "$path"; then
             echo "warning: refusing to replace symlink ${path}" >&2
             return 0
         fi
-        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
+        if sudo test -e "$path" && ! sudo grep -Fqx "$marker" "$path" 2>/dev/null; then
             echo "warning: leaving unmanaged completion file ${path} untouched" >&2
             return 0
         fi
@@ -76,24 +85,26 @@ install_completion_files() {
         }
         if [[ "$path" == "$zsh_path" ]]; then
             if ! printf '%s\n%s\n' "$body" "$marker" | sudo tee "$tmp" >/dev/null; then
-                sudo rm -f "$tmp"
+                sudo rm -f "$tmp" || true
                 echo "warning: could not stage ${path}" >&2
                 return 0
             fi
         else
             if ! printf '%s\n%s\n' "$marker" "$body" | sudo tee "$tmp" >/dev/null; then
-                sudo rm -f "$tmp"
+                sudo rm -f "$tmp" || true
                 echo "warning: could not stage ${path}" >&2
                 return 0
             fi
         fi
-        if [[ -e "$path" ]] && ! grep -Fqx "$marker" "$path" 2>/dev/null; then
-            sudo rm -f "$tmp"
+        # The lock protects cooperating installers. External writers cannot be
+        # serialized by a portable shell script; do not claim that guarantee.
+        if sudo test -e "$path" && ! sudo grep -Fqx "$marker" "$path" 2>/dev/null; then
+            sudo rm -f "$tmp" || true
             echo "warning: leaving newly-created unmanaged completion file ${path} untouched" >&2
             return 0
         fi
         if ! sudo chmod 0644 "$tmp" || ! sudo mv -f "$tmp" "$path"; then
-            sudo rm -f "$tmp"
+            sudo rm -f "$tmp" || true
             echo "warning: could not install ${path}" >&2
         fi
     )
