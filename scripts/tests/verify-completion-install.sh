@@ -154,7 +154,10 @@ cli_bin="$cli_home/.local/bin"
 mkdir -p "$cli_bin"
 cp "$bin/aenv-v1" "$cli_bin/aenv"
 HOME="$cli_home" INSTALL_DIR="$cli_bin" AENV_SOURCE_ONLY=1 bash -c '
-    source '"$repo_root"'/scripts/install-cli.sh
+    source "$1"
+    XDG_DATA_HOME="$2/data" XDG_CONFIG_HOME="$2/config" \
+        install_completion_files
+' _ "$repo_root/scripts/install-cli.sh" "$cli_home"
     XDG_DATA_HOME='"$cli_home"'/data XDG_CONFIG_HOME='"$cli_home"'/config \
         install_completion_files
 '
