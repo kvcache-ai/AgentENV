@@ -81,13 +81,20 @@ $BB ip link set lo up 2>/dev/null \
     || $BB ifconfig lo up 2>/dev/null \
     || echo "AGENTENV PIVOT INIT WARN: failed to bring up loopback interface" >&2
 
-# /etc/hosts fallback for images that don't ship one. Most base images do,
-# but FROM scratch / distroless-style images may not.
-if [ ! -e /etc/hosts ]; then
-    {
-        echo "127.0.0.1 localhost"
-        echo "::1 localhost"
-    } > /etc/hosts
+# Guarantee `localhost` resolution. Docker and Kubernetes manage /etc/hosts
+# at container start, so OCI images routinely ship it absent, empty, or
+# without loopback entries while still assuming localhost resolves. Check
+# content rather than file existence, keep image-provided entries, and
+# append only the missing loopback mappings (re-runs are no-ops).
+$BB mkdir -p /etc 2>/dev/null
+if [ -s /etc/hosts ] && [ -n "$($BB tail -c 1 /etc/hosts)" ]; then
+    echo >> /etc/hosts
+fi
+if ! $BB grep -qsE '^127\.0\.0\.1[[:space:]]+localhost([[:space:]]|$)' /etc/hosts; then
+    echo "127.0.0.1 localhost" >> /etc/hosts
+fi
+if ! $BB grep -qsE '^::1[[:space:]]+localhost([[:space:]]|$)' /etc/hosts; then
+    echo "::1 localhost" >> /etc/hosts
 fi
 
 # ---- Guest-visible integration points ----
