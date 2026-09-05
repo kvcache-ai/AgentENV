@@ -433,3 +433,18 @@ Dynamic lookup is best-effort: it uses short timeouts (500 ms connect, 1 s
 request) and silently returns no candidates when credentials, the server, or
 the network are unavailable. Static command and flag completion keeps working
 in that case, and no diagnostic output is written to your command line.
+
+### Automatic installation
+
+The release installers can install managed completion loaders without editing
+`.bashrc`, `.zshrc`, or Fish configuration files. The loader calls the installed
+`aenv completion` command at shell completion time, so upgrades automatically
+use the current CLI command tree. Unmanaged completion files are preserved.
+
+```bash
+INSTALL_DIR="$HOME/.local/bin" bash scripts/install-cli.sh
+```
+
+If Zsh does not discover a user-local loader, add its directory to `fpath`
+before `compinit` as shown above. Use the matching uninstall action to remove
+only files managed by AgentENV.
