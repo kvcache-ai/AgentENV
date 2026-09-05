@@ -29,7 +29,7 @@ file_mode() {
 }
 
 echo '==> user install creates standard loaders'
-HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1" >/dev/null
 assert_file "$bash_file"
 assert_file "$zsh_file"
 assert_file "$fish_file"
@@ -65,7 +65,7 @@ echo '==> stale locks are reclaimed'
 lock="$home/.local/share/bash-completion/completions/.aenv-completion.lock"
 mkdir -p "$lock"
 printf '4000000' > "$lock/pid"
-HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1" >/dev/null
 assert_file "$bash_file"
 assert_absent "$lock"
 
@@ -73,26 +73,26 @@ echo '==> unmanaged files are preserved'
 printf '# user completion\n' > "$bash_file"
 printf '# user zsh completion\n' > "$zsh_file"
 printf '# user fish completion\n' > "$fish_file"
-HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v2" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v2" >/dev/null
 assert_contains "$bash_file" '# user completion'
 assert_contains "$zsh_file" '# user zsh completion'
 assert_contains "$fish_file" '# user fish completion'
 
 echo '==> uninstall preserves unmanaged files'
-HOME="$home" bash "$helper" uninstall --prefix="$home/.local" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" uninstall --prefix="$home/.local" >/dev/null
 assert_contains "$bash_file" '# user completion'
 assert_contains "$zsh_file" '# user zsh completion'
 assert_contains "$fish_file" '# user fish completion'
 
 echo '==> managed files are upgraded'
 rm -f "$bash_file" "$zsh_file" "$fish_file"
-HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1" >/dev/null
-HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v2" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v2" >/dev/null
 assert_contains "$bash_file" "$bin/aenv-v2"
 [[ "$(file_mode "$bash_file")" == 644 ]] || fail 'upgraded loader mode must be 0644'
 
 echo '==> uninstall removes only managed files'
-HOME="$home" bash "$helper" uninstall --prefix="$home/.local" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" uninstall --prefix="$home/.local" >/dev/null
 assert_absent "$bash_file"
 assert_absent "$zsh_file"
 assert_absent "$fish_file"
@@ -101,7 +101,7 @@ echo '==> symlink destinations are preserved'
 symlink_target="$tmp_root/user-completion"
 printf '# user target\n' > "$symlink_target"
 ln -s "$symlink_target" "$bash_file"
-HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1" >/dev/null
 [[ -L "$bash_file" ]] || fail 'completion symlink was replaced'
 assert_contains "$symlink_target" '# user target'
 rm -f "$bash_file"
@@ -111,7 +111,7 @@ fake_tools="$tmp_root/fake-tools"
 mkdir -p "$fake_tools"
 printf '#!/usr/bin/env bash\nexit 1\n' > "$fake_tools/mktemp"
 chmod 0755 "$fake_tools/mktemp"
-HOME="$home" PATH="$fake_tools:$PATH" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" PATH="$fake_tools:$PATH" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1" >/dev/null
 shopt -s nullglob
 leftovers=(
     "$home/.local/share/bash-completion/completions"/.aenv-completion.*
@@ -121,26 +121,26 @@ leftovers=(
 [[ "${#leftovers[@]}" -eq 0 ]] || fail 'staging failure left a temporary completion file'
 
 echo '==> system paths use the prefix share directories'
-HOME="$home" bash "$helper" install --prefix="$prefix" --binary="$bin/aenv-v1" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" install --prefix="$prefix" --binary="$bin/aenv-v1" >/dev/null
 assert_file "$prefix/share/bash-completion/completions/aenv"
 assert_file "$prefix/share/zsh/site-functions/_aenv"
 assert_file "$prefix/share/fish/vendor_completions.d/aenv.fish"
-HOME="$home" bash "$helper" uninstall --prefix="$prefix" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" uninstall --prefix="$prefix" >/dev/null
 assert_absent "$prefix/share/bash-completion/completions/aenv"
 
 echo '==> path traversal cannot select user mode'
 outside="$tmp_root/outside"
 mkdir -p "$outside"
-HOME="$home" bash "$helper" install --prefix="$home/../outside" --binary="$bin/aenv-v1" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" install --prefix="$home/../outside" --binary="$bin/aenv-v1" >/dev/null
 assert_file "$outside/share/bash-completion/completions/aenv"
 assert_absent "$home/.local/share/bash-completion/completions/aenv"
-HOME="$home" bash "$helper" uninstall --prefix="$home/../outside" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" uninstall --prefix="$home/../outside" >/dev/null
 assert_absent "$outside/share/bash-completion/completions/aenv"
 
 echo '==> unsupported loader paths are rejected'
-HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1\\tail" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1\\tail" >/dev/null
 assert_absent "$bash_file"
-HOME="$home" bash "$helper" uninstall --prefix="$home/.local" >/dev/null
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" uninstall --prefix="$home/.local" >/dev/null
 
 # ---------------------------------------------------------------------------
 # Behavioral coverage for the duplicated release installers. These source the
