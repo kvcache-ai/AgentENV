@@ -2,7 +2,6 @@ use std::{path::PathBuf, process::Stdio, time::Duration};
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::Args as ClapArgs;
-use parse_dockerfile::Instruction;
 use serde_json::json;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
@@ -19,49 +18,31 @@ use crate::progress::BuildProgress;
 
 #[derive(Clone, ClapArgs)]
 pub struct Args {
-    /// Dockerfile path (or directory containing Dockerfile)
-    dockerfile: PathBuf,
+    /// Local build context directory
+    context: PathBuf,
+    /// Dockerfile path (defaults to CONTEXT/Dockerfile)
+    #[arg(short = 'f', long = "file")]
+    dockerfile: Option<PathBuf>,
     /// Template name
     #[arg(long)]
     name: String,
     #[command(flatten)]
     resources: super::CpuMemoryArgs,
-    /// Override the first FROM image
-    #[arg(long = "image", alias = "user-image")]
-    user_image: Option<String>,
-    /// Build context directory (defaults to the Dockerfile's directory)
+    /// Override image ENTRYPOINT/CMD; an empty value disables startup
     #[arg(long)]
-    context: Option<PathBuf>,
-    /// Dockerfile stage to publish
+    start_cmd: Option<String>,
+    /// Override the image HEALTHCHECK with a command that must succeed before capture
     #[arg(long)]
-    target: Option<String>,
+    ready_cmd: Option<String>,
     /// Build argument, KEY=VALUE; repeatable
     #[arg(long = "build-arg")]
     build_args: Vec<String>,
     /// BuildKit secret, for example id=token,src=./token; repeatable
     #[arg(long)]
     secret: Vec<String>,
-    /// SSH agent forwarding, for example default; repeatable
-    #[arg(long)]
-    ssh: Vec<String>,
     /// Disable instruction cache for this build
     #[arg(long)]
     no_cache: bool,
-    /// Exclusive cache volume name (defaults to a name derived from the template)
-    #[arg(long)]
-    cache_volume: Option<String>,
-    /// Size of a newly created cache volume in MiB
-    #[arg(long, default_value_t = 16384, value_parser = clap::value_parser!(u64).range(1024..))]
-    cache_size: u64,
-    /// OCI image containing buildkitd and buildctl
-    #[arg(long, default_value = "docker.io/moby/buildkit:v0.33.0")]
-    builder_image: String,
-    /// Builder VM CPU cores
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..))]
-    builder_cpu: u32,
-    /// Builder VM memory in MiB
-    #[arg(long, default_value_t = 2048, value_parser = clap::value_parser!(u32).range(256..))]
-    builder_memory: u32,
     /// Path to the local BuildKit client executable
     #[arg(long, default_value = "buildctl")]
     buildctl: PathBuf,
@@ -71,12 +52,6 @@ pub struct Args {
     /// Build deadline in seconds, plus 10 minutes for provisioning and publication
     #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u32).range(1..=86400))]
     timeout: u32,
-    /// Override image ENTRYPOINT/CMD; an empty value disables startup
-    #[arg(long)]
-    start_cmd: Option<String>,
-    /// Command that must succeed before the template is captured
-    #[arg(long)]
-    ready_cmd: Option<String>,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -103,11 +78,6 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
     let mut interrupt = tokio::spawn(interrupted());
     let request = json!({
         "template": CreateTemplateV3 { name: args.name.clone(), tags: vec![], cpu_count: args.resources.cpu_count, memory_mb: args.resources.memory_mb },
-        "builderImage": args.builder_image,
-        "builderCPUCount": args.builder_cpu,
-        "builderMemoryMB": args.builder_memory,
-        "cacheVolume": args.cache_volume,
-        "cacheSizeMB": args.cache_size,
         "timeout": args.timeout,
         "startCmd": args.start_cmd,
         "readyCmd": args.ready_cmd,
@@ -250,17 +220,11 @@ async fn build(
             .arg(&metadata_path)
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        if let Some(target) = &args.target {
-            command.arg("--opt").arg(format!("target={target}"));
-        }
         for arg in &args.build_args {
             command.arg("--opt").arg(format!("build-arg:{arg}"));
         }
         for secret in &args.secret {
             command.arg("--secret").arg(secret);
-        }
-        for ssh in &args.ssh {
-            command.arg("--ssh").arg(ssh);
         }
         if args.no_cache {
             command.args(["--opt", "no-cache"]);
@@ -307,29 +271,28 @@ struct BuildContext {
     context: PathBuf,
     dockerfile_dir: PathBuf,
     filename: String,
-    _override_dir: Option<tempfile::TempDir>,
 }
 
 impl BuildContext {
     fn prepare(args: &Args) -> Result<Self> {
-        let file = if args.dockerfile.is_dir() {
-            args.dockerfile.join("Dockerfile")
-        } else {
-            args.dockerfile.clone()
-        }
-        .canonicalize()
-        .context("locate Dockerfile")?;
+        let context = args
+            .context
+            .canonicalize()
+            .context("locate build context")?;
+        ensure!(
+            context.is_dir(),
+            "build context must be a directory; use -f <Dockerfile> to select a Dockerfile"
+        );
+        let file = args
+            .dockerfile
+            .clone()
+            .unwrap_or_else(|| context.join("Dockerfile"))
+            .canonicalize()
+            .context("locate Dockerfile")?;
         ensure!(file.is_file(), "Dockerfile must be a regular file");
         let dir = file
             .parent()
             .context("Dockerfile has no parent directory")?;
-        let context = args
-            .context
-            .as_deref()
-            .unwrap_or(dir)
-            .canonicalize()
-            .context("locate build context")?;
-        ensure!(context.is_dir(), "build context must be a directory");
         ensure!(
             context.to_str().is_some() && dir.to_str().is_some(),
             "BuildKit requires UTF-8 context paths"
@@ -339,91 +302,121 @@ impl BuildContext {
             .and_then(|s| s.to_str())
             .context("Dockerfile filename must be UTF-8")?
             .to_owned();
-        let mut result = Self {
+        Ok(Self {
             context,
             dockerfile_dir: dir.to_owned(),
             filename,
-            _override_dir: None,
-        };
-        if let Some(image) = &args.user_image {
-            let source = std::fs::read_to_string(&file)?;
-            let overridden = override_first_image(&source, image)?;
-            let work = tempfile::tempdir()?;
-            std::fs::write(work.path().join(&result.filename), overridden)?;
-            let ignore = format!("{}.dockerignore", result.filename);
-            if dir.join(&ignore).is_file() {
-                std::fs::copy(dir.join(&ignore), work.path().join(ignore))?;
-            }
-            result.dockerfile_dir = work.path().to_owned();
-            result._override_dir = Some(work);
-        }
-        Ok(result)
-    }
-}
-
-fn override_first_image(source: &str, image: &str) -> Result<String> {
-    ensure!(
-        !image.is_empty() && !image.chars().any(char::is_whitespace),
-        "--image must be a single image reference"
-    );
-    let parsed =
-        parse_dockerfile::parse(source).context("parse Dockerfile for --image override")?;
-    let from = parsed
-        .instructions
-        .iter()
-        .find_map(|i| match i {
-            Instruction::From(from) => Some(from),
-            _ => None,
         })
-        .context("Dockerfile has no FROM instruction")?;
-    let mut updated = source.to_owned();
-    updated.replace_range(from.image.span.clone(), image);
-    Ok(updated)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::{CommandFactory, Parser};
 
-    #[test]
-    fn image_override_preserves_stages_and_parser_directives() {
-        let source = "# escape=`\nARG BASE=alpine\nFROM --platform=linux/amd64 ${BASE} AS build\nRUN true\nFROM build AS release\n";
-        assert_eq!(
-            override_first_image(source, "ubuntu:24.04").unwrap(),
-            source.replace("${BASE} AS", "ubuntu:24.04 AS")
-        );
-        assert!(override_first_image(source, "alpine\nRUN false").is_err());
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        args: Args,
     }
 
     #[test]
-    fn command_accepts_legacy_flags_and_buildkit_inputs() {
-        use clap::{CommandFactory, Parser};
-        #[derive(Parser)]
-        struct Cli {
-            #[command(flatten)]
-            args: Args,
-        }
+    fn command_uses_docker_context_and_file_arguments() {
         Cli::command().debug_assert();
         let args = Cli::try_parse_from([
             "aenv",
-            "Dockerfile",
+            ".",
+            "-f",
+            "deploy/docker/Dockerfile.agentenv",
             "--name",
             "demo",
-            "--user-image",
-            "alpine",
             "--cpu-count",
             "2",
             "--memory-mb",
             "512",
             "--build-arg",
             "VALUE=a b",
-            "--target",
-            "release",
         ])
         .unwrap()
         .args;
         assert_eq!(args.resources.cpu_count, Some(2));
         assert_eq!(args.build_args, ["VALUE=a b"]);
-        assert_eq!(args.target.as_deref(), Some("release"));
+        assert_eq!(args.context, PathBuf::from("."));
+        assert_eq!(
+            args.dockerfile,
+            Some("deploy/docker/Dockerfile.agentenv".into())
+        );
+        for flag in [
+            "--image",
+            "--user-image",
+            "--context",
+            "--target",
+            "--ssh",
+            "--builder-image",
+            "--builder-cpu",
+            "--builder-memory",
+            "--cache-size",
+            "--cache-volume",
+        ] {
+            assert!(
+                Cli::try_parse_from(["aenv", ".", "--name", "demo", flag, "value"]).is_err(),
+                "{flag} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn command_accepts_startup_overrides_and_explicit_empty_startup() {
+        for start in ["exec /server --port 8080", ""] {
+            let args = Cli::try_parse_from([
+                "aenv",
+                ".",
+                "--name",
+                "demo",
+                "--start-cmd",
+                start,
+                "--ready-cmd",
+                "test -f /ready",
+            ])
+            .unwrap()
+            .args;
+            assert_eq!(args.start_cmd.as_deref(), Some(start));
+            assert_eq!(args.ready_cmd.as_deref(), Some("test -f /ready"));
+        }
+        let args = Cli::try_parse_from(["aenv", ".", "--name", "demo"])
+            .unwrap()
+            .args;
+        assert!(args.start_cmd.is_none());
+        assert!(args.ready_cmd.is_none());
+    }
+
+    #[test]
+    fn dockerfile_location_does_not_change_context_root() -> Result<()> {
+        let work = tempfile::tempdir()?;
+        let context = work.path().join("context");
+        let dockerfiles = work.path().join("dockerfiles");
+        std::fs::create_dir(&context)?;
+        std::fs::create_dir(&dockerfiles)?;
+        let custom = dockerfiles.join("Custom.Dockerfile");
+        std::fs::write(&custom, "FROM scratch\n")?;
+        std::fs::write(context.join("Dockerfile"), "FROM scratch\n")?;
+        let mut args =
+            Cli::try_parse_from(["aenv", context.to_str().unwrap(), "--name", "demo"])?.args;
+        let prepared = BuildContext::prepare(&args)?;
+        assert_eq!(prepared.context, context.canonicalize()?);
+        assert_eq!(prepared.dockerfile_dir, prepared.context);
+        args.dockerfile = Some(custom.clone());
+        let prepared = BuildContext::prepare(&args)?;
+        assert_eq!(prepared.context, context.canonicalize()?);
+        assert_eq!(prepared.dockerfile_dir, dockerfiles.canonicalize()?);
+        assert_eq!(prepared.filename, "Custom.Dockerfile");
+        args.context = custom;
+        assert!(BuildContext::prepare(&args)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("use -f"));
+        Ok(())
     }
 }

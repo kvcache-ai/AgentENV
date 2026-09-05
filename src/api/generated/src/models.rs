@@ -8586,58 +8586,23 @@ pub struct TemplateBuildSessionRequest {
     #[validate(nested)]
     pub template: models::TemplateBuildRequestV3,
 
-    /// BuildKit worker image; defaults to docker.io/moby/buildkit:v0.33.0.
-    #[serde(rename = "builderImage")]
-    #[validate(custom(function = "check_xss_string"))]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub builder_image: Option<String>,
-
-    /// CPU cores for the sandbox
-    #[serde(rename = "builderCPUCount")]
-    #[validate(range(min = 1u32))]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub builder_cpu_count: Option<u32>,
-
-    /// Memory for the sandbox in MiB
-    #[serde(rename = "builderMemoryMB")]
-    #[validate(range(min = 128u32))]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub builder_memory_mb: Option<u32>,
-
-    #[serde(rename = "cacheVolume")]
-    #[validate(
-            regex(path = *RE_TEMPLATEBUILDSESSIONREQUEST_CACHE_VOLUME),
-          custom(function = "check_xss_string"),
-    )]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_volume: Option<String>,
-
-    #[serde(rename = "cacheSizeMB")]
-    #[validate(range(min = 1024u64))]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_size_mb: Option<u64>,
-
-    /// Build deadline in seconds; defaults to 3600.
-    #[serde(rename = "timeout")]
-    #[validate(range(min = 1u32, max = 86400u32))]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<u32>,
-
-    /// Overrides the built image ENTRYPOINT and CMD. Empty disables startup.
+    /// Override the final image ENTRYPOINT/CMD for template startup. Omit to use the image command; an empty string disables startup.
     #[serde(rename = "startCmd")]
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_cmd: Option<String>,
 
-    /// Readiness command for the published template.
+    /// Override the final image HEALTHCHECK with a command that must succeed before snapshot capture. Omit to use the image health check.
     #[serde(rename = "readyCmd")]
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_cmd: Option<String>,
-}
 
-lazy_static::lazy_static! {
-    static ref RE_TEMPLATEBUILDSESSIONREQUEST_CACHE_VOLUME: regex::Regex = regex::Regex::new("^[a-zA-Z0-9_-]+$").unwrap();
+    /// Builder preparation and Dockerfile build deadline in seconds; defaults to 3600. Worker settings come from the node configuration.
+    #[serde(rename = "timeout")]
+    #[validate(range(min = 1u32, max = 86400u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
 }
 
 impl TemplateBuildSessionRequest {
@@ -8645,14 +8610,9 @@ impl TemplateBuildSessionRequest {
     pub fn new(template: models::TemplateBuildRequestV3) -> TemplateBuildSessionRequest {
         TemplateBuildSessionRequest {
             template,
-            builder_image: None,
-            builder_cpu_count: None,
-            builder_memory_mb: None,
-            cache_volume: None,
-            cache_size_mb: None,
-            timeout: None,
             start_cmd: None,
             ready_cmd: None,
+            timeout: None,
         }
     }
 }
@@ -8664,30 +8624,15 @@ impl std::fmt::Display for TemplateBuildSessionRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let params: Vec<Option<String>> = vec![
             // Skipping template in query parameter serialization
-            self.builder_image.as_ref().map(|builder_image| {
-                ["builderImage".to_string(), builder_image.to_string()].join(",")
-            }),
-            self.builder_cpu_count.as_ref().map(|builder_cpu_count| {
-                ["builderCPUCount".to_string(), builder_cpu_count.to_string()].join(",")
-            }),
-            self.builder_memory_mb.as_ref().map(|builder_memory_mb| {
-                ["builderMemoryMB".to_string(), builder_memory_mb.to_string()].join(",")
-            }),
-            self.cache_volume.as_ref().map(|cache_volume| {
-                ["cacheVolume".to_string(), cache_volume.to_string()].join(",")
-            }),
-            self.cache_size_mb.as_ref().map(|cache_size_mb| {
-                ["cacheSizeMB".to_string(), cache_size_mb.to_string()].join(",")
-            }),
-            self.timeout
-                .as_ref()
-                .map(|timeout| ["timeout".to_string(), timeout.to_string()].join(",")),
             self.start_cmd
                 .as_ref()
                 .map(|start_cmd| ["startCmd".to_string(), start_cmd.to_string()].join(",")),
             self.ready_cmd
                 .as_ref()
                 .map(|ready_cmd| ["readyCmd".to_string(), ready_cmd.to_string()].join(",")),
+            self.timeout
+                .as_ref()
+                .map(|timeout| ["timeout".to_string(), timeout.to_string()].join(",")),
         ];
 
         write!(
@@ -8710,14 +8655,9 @@ impl std::str::FromStr for TemplateBuildSessionRequest {
         #[allow(dead_code)]
         struct IntermediateRep {
             pub template: Vec<models::TemplateBuildRequestV3>,
-            pub builder_image: Vec<String>,
-            pub builder_cpu_count: Vec<u32>,
-            pub builder_memory_mb: Vec<u32>,
-            pub cache_volume: Vec<String>,
-            pub cache_size_mb: Vec<u64>,
-            pub timeout: Vec<u32>,
             pub start_cmd: Vec<String>,
             pub ready_cmd: Vec<String>,
+            pub timeout: Vec<u32>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -8745,36 +8685,16 @@ impl std::str::FromStr for TemplateBuildSessionRequest {
                             .map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
-                    "builderImage" => intermediate_rep.builder_image.push(
-                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
-                    ),
-                    #[allow(clippy::redundant_clone)]
-                    "builderCPUCount" => intermediate_rep.builder_cpu_count.push(
-                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
-                    ),
-                    #[allow(clippy::redundant_clone)]
-                    "builderMemoryMB" => intermediate_rep.builder_memory_mb.push(
-                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
-                    ),
-                    #[allow(clippy::redundant_clone)]
-                    "cacheVolume" => intermediate_rep.cache_volume.push(
-                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
-                    ),
-                    #[allow(clippy::redundant_clone)]
-                    "cacheSizeMB" => intermediate_rep.cache_size_mb.push(
-                        <u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
-                    ),
-                    #[allow(clippy::redundant_clone)]
-                    "timeout" => intermediate_rep.timeout.push(
-                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
-                    ),
-                    #[allow(clippy::redundant_clone)]
                     "startCmd" => intermediate_rep.start_cmd.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
                     "readyCmd" => intermediate_rep.ready_cmd.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "timeout" => intermediate_rep.timeout.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
                     _ => {
                         return std::result::Result::Err(
@@ -8795,14 +8715,9 @@ impl std::str::FromStr for TemplateBuildSessionRequest {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "template missing in TemplateBuildSessionRequest".to_string())?,
-            builder_image: intermediate_rep.builder_image.into_iter().next(),
-            builder_cpu_count: intermediate_rep.builder_cpu_count.into_iter().next(),
-            builder_memory_mb: intermediate_rep.builder_memory_mb.into_iter().next(),
-            cache_volume: intermediate_rep.cache_volume.into_iter().next(),
-            cache_size_mb: intermediate_rep.cache_size_mb.into_iter().next(),
-            timeout: intermediate_rep.timeout.into_iter().next(),
             start_cmd: intermediate_rep.start_cmd.into_iter().next(),
             ready_cmd: intermediate_rep.ready_cmd.into_iter().next(),
+            timeout: intermediate_rep.timeout.into_iter().next(),
         })
     }
 }

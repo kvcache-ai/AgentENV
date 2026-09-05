@@ -1017,32 +1017,18 @@ components:
       properties:
         template:
           $ref: "#/components/schemas/TemplateBuildRequestV3"
-        builderImage:
+        startCmd:
           type: string
-          description: BuildKit worker image; defaults to docker.io/moby/buildkit:v0.33.0.
-        builderCPUCount:
-          $ref: "#/components/schemas/CPUCount"
-        builderMemoryMB:
-          $ref: "#/components/schemas/MemoryMB"
-        cacheVolume:
+          description: Override the final image ENTRYPOINT/CMD for template startup. Omit to use the image command; an empty string disables startup.
+        readyCmd:
           type: string
-          pattern: '^[a-zA-Z0-9_-]+$'
-        cacheSizeMB:
-          type: integer
-          format: uint64
-          minimum: 1024
+          description: Override the final image HEALTHCHECK with a command that must succeed before snapshot capture. Omit to use the image health check.
         timeout:
           type: integer
           format: uint32
           minimum: 1
           maximum: 86400
-          description: Build deadline in seconds; defaults to 3600.
-        startCmd:
-          type: string
-          description: Overrides the built image ENTRYPOINT and CMD. Empty disables startup.
-        readyCmd:
-          type: string
-          description: Readiness command for the published template.
+          description: Builder preparation and Dockerfile build deadline in seconds; defaults to 3600. Worker settings come from the node configuration.
 
     TemplateBuildImage:
       type: object

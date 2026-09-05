@@ -500,25 +500,30 @@ impl Templates<()> for ApiImpl {
             );
         }
 
-        match self
-            .snapshot_manager
-            .get(&path_params.template_id)
-            .await
-        {
+        match self.snapshot_manager.get(&path_params.template_id).await {
             Ok(Some(record)) => {
+                let mut info = models::TemplateBuildInfo::from(record);
+                if info.status == models::TemplateBuildStatus::Ready
+                    && self.build_sessions.is_finishing(&path_params.build_id)
+                {
+                    // A sequential CLI build must observe the newly published cache seed.
+                    info.status = models::TemplateBuildStatus::Building;
+                }
                 Ok(TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status200_SuccessfullyReturnedTheTemplate(
-                    record.into(),
+                    info,
                 ))
             }
-            Ok(None) => Ok(TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status404_NotFound(
-                Self::error(
+            Ok(None) => Ok(
+                TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status404_NotFound(Self::error(
                     404,
                     format!("template {} not found", path_params.template_id),
+                )),
+            ),
+            Err(err) => Ok(
+                TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status500_ServerError(
+                    Self::snapshot_manager_error(&err),
                 ),
-            )),
-            Err(err) => Ok(TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status500_ServerError(
-                Self::snapshot_manager_error(&err),
-            )),
+            ),
         }
     }
 

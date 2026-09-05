@@ -2739,6 +2739,81 @@ async fn buildkit_workers_are_hidden_but_keep_scheduler_bindings() -> Result<()>
 }
 
 #[tokio::test]
+async fn buildkit_cache_publication_failure_releases_only_internal_workers() -> anyhow::Result<()> {
+    use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::volume::{VolumeMode, VolumeRecord, VolumeStatus};
+
+    for internal in [false, true] {
+        let temp = TempDir::new()?;
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: temp.path().join("repository"),
+            cache_root: Some(temp.path().join("cache")),
+            runtime_cache_root: Some(temp.path().join("runtime")),
+        })?;
+        let repository = backend.repository();
+        let volumes = Arc::new(
+            VolumeManager::open_with_repository(temp.path().join("volumes"), repository.clone())
+                .await?,
+        );
+        let orchestrator = TestOrchestrator::new_inner_with_volumes(
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::new(),
+            DisabledSandboxPersister,
+            test_runtime_image_refs(),
+            Some(volumes.clone()),
+        )
+        .await?;
+        let sandbox = if internal {
+            orchestrator
+                .create_template_builder(SandboxId::new(), create_request(Some(60), &[]))
+                .await?
+        } else {
+            orchestrator
+                .create_sandbox(create_request(Some(60), &[]))
+                .await?
+        };
+        let volume = VolumeRecord {
+            id: "vol_missing_backing".to_owned(),
+            name: "missing-backing".to_owned(),
+            mode: VolumeMode::Exclusive,
+            size_mb: 1024,
+            status: VolumeStatus::Ready,
+            reserved_by_sandbox_id: Some(sandbox.id.to_string()),
+            backing_image_config: None,
+            backing_layers: Vec::new(),
+            read_only_mounts: Vec::new(),
+            deleting: false,
+        };
+        repository.create_volume(volume.clone()).await?;
+        orchestrator
+            .store
+            .update_if_state(&sandbox.id, &[SandboxState::Running], |metadata| {
+                metadata.state = SandboxState::Paused;
+                metadata
+                    .volume_mounts
+                    .insert("/cache".to_owned(), volume.id.clone());
+            })
+            .await?;
+        let deleted = orchestrator.delete_sandbox(sandbox.id).await;
+        let record = volumes.get(&volume.id).await?;
+        assert_eq!(record.status, VolumeStatus::Failed);
+        if internal {
+            deleted?;
+            assert!(orchestrator.store.get(&sandbox.id).await?.is_none());
+            assert!(record.reserved_by_sandbox_id.is_none());
+        } else {
+            assert!(deleted.is_err());
+            assert!(orchestrator.store.get(&sandbox.id).await?.is_some());
+            assert_eq!(
+                record.reserved_by_sandbox_id.as_deref(),
+                Some(sandbox.id.to_string().as_str())
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn orchestrator_keep_alive_none_sets_default_timeout() -> Result<()> {
     setup();
     let orchestrator = make_orchestrator().await;

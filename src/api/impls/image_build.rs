@@ -18,8 +18,12 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
     sync::{watch, OnceCell},
+    time::Instant,
 };
 use tracing::{debug, info, warn};
+
+mod cache;
+mod worker;
 
 use super::{template_helpers::template_build_record_from_v3_request, ApiImpl};
 use crate::{
@@ -31,17 +35,46 @@ use crate::{
     },
     sandbox::{Executor, ProcessOpts, SandboxNetworkPolicy},
     snapshot::{
-        CommandContext, SnapshotId, SnapshotRecord, TemplateBuildErrorReason, TemplateBuildStatus,
+        CommandContext, RunnableSnapshot, SnapshotId, SnapshotRecord, TemplateBuildErrorReason,
+        TemplateBuildStatus,
     },
     template::TemplateBuildSpec,
-    types::{ImageConfigs, SandboxId, SandboxResources},
-    volume::{VolumeError, VolumeMode},
+    types::{ImageConfigs, SandboxId},
+    volume::VolumeError,
 };
 
 #[derive(Default)]
 pub(crate) struct BuildSessions {
     active: DashMap<String, Arc<BuildSession>>,
     journal: OnceCell<LocalKvStore>,
+    builder_template: OnceCell<RunnableSnapshot>,
+}
+
+impl BuildSessions {
+    pub(super) fn is_finishing(&self, id: &str) -> bool {
+        self.active
+            .get(id)
+            .is_some_and(|session| matches!(*session.state.borrow(), SessionState::Submitted(_)))
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BuildJournal {
+    cache: String,
+    parent: Option<String>,
+}
+
+impl BuildJournal {
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        // Recover journals written by the original shared-writable-cache implementation.
+        if bytes.first() != Some(&b'{') {
+            return Ok(Self {
+                cache: std::str::from_utf8(bytes)?.to_owned(),
+                parent: None,
+            });
+        }
+        Ok(serde_json::from_slice(bytes)?)
+    }
 }
 
 struct BuildSession {
@@ -127,8 +160,9 @@ impl ApiImpl {
         for (key, value) in journal.scan_prefix(b"build/".to_vec()).await? {
             let key_text = std::str::from_utf8(&key)?;
             let id = &key_text[6..];
-            let cache = std::str::from_utf8(&value)?;
-            self.release_builder(id, cache).await?;
+            let entry = BuildJournal::decode(&value)?;
+            self.release_builder(id, &entry.cache).await?;
+            self.cleanup_build_cache(id, &entry).await?;
             if let Some(record) = self.snapshot_manager.get(id).await? {
                 if matches!(
                     super::template::template_build_status(&record),
@@ -169,19 +203,21 @@ impl ApiImpl {
             .ok_or_else(|| Self::error(400, "template name must be provided"))?;
         let id = SnapshotId::generate();
         let record = template_build_record_from_v3_request(&body.template, id.clone(), name)?;
-        let cache = body.cache_volume.clone().unwrap_or_else(|| {
-            format!(
-                "aenv-buildkit-{}",
-                &crate::digest::sha256_hex(name.as_bytes())[..24]
-            )
-        });
+        let cache = format!("aenv-buildkit-work-{id}");
         let journal = self
             .build_journal()
             .await
             .map_err(|err| Self::internal_error(err.as_ref()))?;
         let key = format!("build/{id}");
         journal
-            .put(key.as_bytes().to_vec(), cache.as_bytes().to_vec())
+            .put(
+                key.as_bytes().to_vec(),
+                serde_json::to_vec(&BuildJournal {
+                    cache: cache.clone(),
+                    parent: None,
+                })
+                .map_err(|error| Self::error(500, error.to_string()))?,
+            )
             .await
             .map_err(|err| Self::internal_error(err.as_ref()))?;
         if let Err(err) = self.snapshot_manager.create(record.clone()).await {
@@ -289,16 +325,29 @@ impl ApiImpl {
         session: Arc<BuildSession>,
     ) {
         let id = record.id.to_string();
-        info!(build_id = %id, "template builder starting");
+        let deadline = Instant::now() + Duration::from_secs(body.timeout.unwrap_or(3600).into());
+        info!(build_id = %id, "template build starting");
         let result = async {
-            let (address, executor) = self.prepare_builder(&id, &body, &session.cache).await?;
+            let mut state = session.state.subscribe();
+            let snapshot = tokio::select! {
+                biased;
+                _ = state.wait_for(|state| matches!(state, SessionState::Cancelled)) => {
+                    anyhow::bail!("build cancelled while preparing the builder template");
+                }
+                snapshot = tokio::time::timeout_at(deadline, self.builder_template()) => {
+                    snapshot.context("builder template preparation deadline exceeded")??
+                }
+            };
+            info!(build_id = %id, cache = %session.cache, "template builder starting");
+            let (address, executor) = self.prepare_builder(&id, &body, &session.cache, snapshot).await?;
+            ensure!(!matches!(*state.borrow(), SessionState::Cancelled), "build cancelled");
             worker_command(&executor, START_BUILDKIT, 90).await?;
             ensure!(session.ready(address), "build cancelled");
             // Existing template status becomes Building only when the worker can accept a solve.
             self.snapshot_manager.try_start_build(&record.id).await?;
             let mut receiver = session.state.subscribe();
-            let command = tokio::time::timeout(
-                Duration::from_secs(body.timeout.unwrap_or(3600).into()),
+            let command = tokio::time::timeout_at(
+                deadline,
                 receiver.wait_for(|state| {
                     matches!(state, SessionState::Submitted(_) | SessionState::Cancelled)
                 }),
@@ -317,10 +366,6 @@ impl ApiImpl {
             .await
             .context("image import deadline exceeded")??;
             self.release_builder(&id, &session.cache).await?;
-            let mut configs = ImageConfigs::new();
-            if let Some(config) = resolved.raw_config {
-                configs.add(None::<String>, "/", config);
-            }
             let base = resolved.base_context;
             let context = CommandContext::from_env_and_workdir(base.env_vars, base.workdir)
                 .with_user(base.user)
@@ -329,7 +374,11 @@ impl ApiImpl {
                 .with_cmd(base.cmd)
                 .with_volumes(base.volumes)
                 .with_labels(base.labels);
-            let start = body.start_cmd.or_else(|| context.effective_start_cmd());
+            let (start, ready) = build_startup_commands(&body, &context, resolved.raw_config.as_ref())?;
+            let mut configs = ImageConfigs::new();
+            if let Some(config) = resolved.raw_config {
+                configs.add(None::<String>, "/", config);
+            }
             let mut spec = TemplateBuildSpec::new()
                 .alias(
                     record
@@ -345,12 +394,15 @@ impl ApiImpl {
             if let Some(start) = start {
                 spec = spec.start_cmd(start);
             }
-            if let Some(ready) = body.ready_cmd {
+            if let Some(ready) = ready {
                 spec = spec.ready_cmd(ready);
             }
             self.template_builder
                 .build_and_publish_with_id(self.snapshot_manager.as_ref(), record.id.clone(), spec)
                 .await?;
+            if let Err(error) = self.publish_build_cache(&id, &session.cache).await {
+                warn!(build_id = %id, error = %format_args!("{error:#}"), "cache publication failed; keeping the previous cache seed");
+            }
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -358,6 +410,14 @@ impl ApiImpl {
         let cleanup_ok = cleanup.is_ok();
         if let Err(error) = &cleanup {
             warn!(build_id = %id, %error, "template worker cleanup failed; recovery will retry");
+        }
+        let cache_cleanup = if cleanup_ok {
+            self.cleanup_build_cache_from_journal(&id).await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = &cache_cleanup {
+            warn!(build_id = %id, %error, "cache cleanup failed; recovery will retry");
         }
         let result = result.and(cleanup);
         let mut persisted = true;
@@ -379,7 +439,7 @@ impl ApiImpl {
             }
         }
         // Keep the recovery journal if cleanup failed, so restart can retry it.
-        if cleanup_ok && persisted {
+        if cleanup_ok && cache_cleanup.is_ok() && persisted {
             if let Ok(journal) = self.build_journal().await {
                 let _ = journal.delete(format!("build/{id}").into_bytes()).await;
             }
@@ -398,85 +458,27 @@ impl ApiImpl {
         id: &str,
         body: &models::TemplateBuildSessionRequest,
         cache: &str,
+        snapshot: RunnableSnapshot,
     ) -> Result<(SocketAddr, Executor)> {
-        let volume = match self.volume_manager.get(cache).await {
-            Ok(volume) => volume,
-            Err(VolumeError::NotFound(_)) => match self
-                .volume_manager
-                .create(
-                    cache.to_owned(),
-                    VolumeMode::Exclusive,
-                    None,
-                    None,
-                    body.cache_size_mb.unwrap_or(16384),
-                )
-                .await
-            {
-                Ok(volume) => volume,
-                Err(VolumeError::NameConflict(_)) => self.volume_manager.get(cache).await?,
-                Err(error) => return Err(error.into()),
-            },
-            Err(err) => return Err(err.into()),
-        };
-        ensure!(
-            volume.mode == VolumeMode::Exclusive,
-            "build cache must use exclusive mode"
-        );
-        let resolved = self
-            .image_resolver
-            .resolve(
-                body.builder_image
-                    .as_deref()
-                    .unwrap_or("docker.io/moby/buildkit:v0.33.0"),
-            )
-            .await?;
+        let volume = self.fork_build_cache(id, cache).await?;
         let (drives, mounts) = super::volumes::resolve_volume_mounts(
             &self.volume_manager,
             &HashMap::from([("/var/lib/buildkit".to_owned(), volume.id)]),
             id,
         )
         .await
-        .map_err(|error| {
-            if error.code == 409 {
-                anyhow::anyhow!(
-                    "build cache is reserved or unavailable; select another cache volume"
-                )
-            } else {
-                anyhow::anyhow!("{}", error.message)
-            }
-        })?;
-        let mut image_configs = ImageConfigs::new();
-        if let Some(config) = resolved.raw_config {
-            image_configs.add(None::<String>, "/", config);
-        }
+        .map_err(|error| anyhow::anyhow!("{}", error.message))?;
         let network_policy = SandboxNetworkPolicy {
             allow_public_traffic: false,
             ..Default::default()
         };
-        let context = CommandContext::from_env_and_workdir(
-            resolved.base_context.env_vars,
-            Some("/".to_owned()),
-        )
-        .with_user(Some("root".to_owned()));
         let metadata = self
             .orchestrator
             .create_template_builder(
                 SandboxId::parse_str(id)?,
                 CreateSandboxRequest {
-                    source: SandboxLaunchSource::Image {
-                        image_ref: resolved.image_ref,
-                        overlaybd_config_path: resolved.overlaybd_config_path,
-                        context: Box::new(context),
-                        resources: Some(SandboxResources {
-                            cpu_count: body.builder_cpu_count.unwrap_or(2),
-                            memory_mib: body.builder_memory_mb.unwrap_or(2048),
-                            disk_size_mib: 0,
-                        }),
-                        extra_drives: drives,
-                        extra_boot_args: None,
-                        image_configs: Box::new(image_configs),
-                    },
-                    extra_drives: vec![],
+                    source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
+                    extra_drives: drives,
                     extra_drives_in_snapshot: false,
                     timeout: Some(Duration::from_secs(
                         u64::from(body.timeout.unwrap_or(3600)) + 3900,
@@ -539,6 +541,57 @@ impl ApiImpl {
         }
         Ok(())
     }
+}
+
+fn build_startup_commands(
+    request: &models::TemplateBuildSessionRequest,
+    context: &CommandContext,
+    image_config: Option<&serde_json::Value>,
+) -> Result<(Option<String>, Option<String>)> {
+    let start = request
+        .start_cmd
+        .clone()
+        .or_else(|| context.effective_start_cmd());
+    let ready = match &request.ready_cmd {
+        Some(command) => Some(command.clone()),
+        None => dockerfile_ready_command(image_config)?,
+    };
+    Ok((start, ready))
+}
+
+fn dockerfile_ready_command(config: Option<&serde_json::Value>) -> Result<Option<String>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let Some(test) = config.pointer("/Healthcheck/Test") else {
+        return Ok(None);
+    };
+    let test: Vec<String> =
+        serde_json::from_value(test.clone()).context("parse Dockerfile HEALTHCHECK")?;
+    let command = match test.as_slice() {
+        [] => return Ok(None),
+        [mode] if mode == "NONE" => return Ok(None),
+        [mode, command] if mode == "CMD-SHELL" => {
+            let mut shell: Vec<String> = match config.get("Shell") {
+                Some(value) => {
+                    serde_json::from_value(value.clone()).context("parse Dockerfile SHELL")?
+                }
+                None => vec!["/bin/sh".into(), "-c".into()],
+            };
+            ensure!(!shell.is_empty(), "Dockerfile SHELL must not be empty");
+            shell.push(command.clone());
+            shell
+        }
+        [mode, args @ ..] if mode == "CMD" && !args.is_empty() => args.to_vec(),
+        _ => anyhow::bail!("invalid Dockerfile HEALTHCHECK command"),
+    };
+    Ok(Some(
+        command
+            .iter()
+            .map(|arg| shell_util::shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" "),
+    ))
 }
 
 async fn worker_command(executor: &Executor, script: &str, seconds: u64) -> Result<()> {
@@ -663,6 +716,106 @@ exit 1
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buildkit_status_waits_for_cache_publication() -> Result<()> {
+        let sessions = BuildSessions::default();
+        let session = Arc::new(BuildSession {
+            state: watch::channel(SessionState::Starting).0,
+            cache: "cache".to_owned(),
+        });
+        sessions.active.insert("build".to_owned(), session.clone());
+        assert!(!sessions.is_finishing("build"));
+        assert!(session.ready("127.0.0.1:1234".parse()?));
+        session.submit("sha256:result").unwrap();
+        assert!(sessions.is_finishing("build"));
+        session.state.send_replace(SessionState::Finished);
+        assert!(!sessions.is_finishing("build"));
+        assert!(!sessions.is_finishing("missing"));
+        Ok(())
+    }
+
+    #[test]
+    fn buildkit_recovers_old_and_new_cache_journals() -> Result<()> {
+        assert_eq!(BuildJournal::decode(b"old-cache")?.cache, "old-cache");
+        let entry = BuildJournal {
+            cache: "child".into(),
+            parent: Some("seed".into()),
+        };
+        let recovered = BuildJournal::decode(&serde_json::to_vec(&entry)?)?;
+        assert_eq!(recovered.cache, "child");
+        assert_eq!(recovered.parent.as_deref(), Some("seed"));
+        assert!(BuildJournal::decode(b"{broken").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn buildkit_readiness_comes_from_dockerfile_healthcheck() -> Result<()> {
+        use serde_json::json;
+        assert_eq!(dockerfile_ready_command(None)?, None);
+        assert_eq!(
+            dockerfile_ready_command(Some(&json!({"Healthcheck": {"Test": ["NONE"]}})))?,
+            None
+        );
+        let shell = json!({"Healthcheck": {"Test": ["CMD-SHELL", "test -f /started && test -s /result.txt"]}});
+        assert_eq!(
+            dockerfile_ready_command(Some(&shell))?.unwrap(),
+            "/bin/sh -c 'test -f /started && test -s /result.txt'"
+        );
+        let exec = json!({"Healthcheck": {"Test": ["CMD", "test", "$literal", "=", "$literal"]}});
+        assert_eq!(
+            dockerfile_ready_command(Some(&exec))?.unwrap(),
+            "test '$literal' = '$literal'"
+        );
+        let bash = json!({"Shell": ["/bin/bash", "-c"], "Healthcheck": {"Test": ["CMD-SHELL", "[[ -f /started ]]"]}});
+        assert_eq!(
+            dockerfile_ready_command(Some(&bash))?.unwrap(),
+            "/bin/bash -c '[[ -f /started ]]'"
+        );
+        assert!(
+            dockerfile_ready_command(Some(&json!({"Healthcheck": {"Test": ["CMD"]}}))).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn buildkit_startup_overrides_take_precedence_independently() -> Result<()> {
+        use serde_json::json;
+        let context = CommandContext::default()
+            .with_entrypoint(Some(vec!["/server".into()]))
+            .with_cmd(Some(vec!["--port".into(), "8080".into()]));
+        let image = json!({"Healthcheck": {"Test": ["CMD", "test", "-f", "/ready"]}});
+        for (start, ready) in [
+            (None, None),
+            (Some("exec /other"), None),
+            (None, Some("test -f /other-ready")),
+            (Some(""), Some("")),
+        ] {
+            let request = serde_json::from_value(json!({
+                "template": {"name": "demo"}, "startCmd": start, "readyCmd": ready,
+            }))?;
+            let commands = build_startup_commands(&request, &context, Some(&image))?;
+            assert_eq!(
+                commands.0.as_deref(),
+                Some(start.unwrap_or("/server --port 8080"))
+            );
+            assert_eq!(
+                commands.1.as_deref(),
+                Some(ready.unwrap_or("test -f /ready"))
+            );
+        }
+        // An explicit readiness command also bypasses unusable image health checks.
+        let request =
+            serde_json::from_value(json!({"template": {"name": "demo"}, "readyCmd": "true"}))?;
+        let invalid = json!({"Healthcheck": {"Test": ["CMD"]}});
+        assert_eq!(
+            build_startup_commands(&request, &context, Some(&invalid))?
+                .1
+                .as_deref(),
+            Some("true")
+        );
+        Ok(())
+    }
 
     #[test]
     fn buildkit_submission_and_cancellation_are_mutually_exclusive() {

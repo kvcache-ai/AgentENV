@@ -216,6 +216,16 @@ pub trait SnapshotRepository: Send + Sync {
         unsupported("volume catalog")
     }
 
+    /// Shared immutable cache seed for Dockerfile builds, independent of node and template.
+    async fn get_build_cache_head(&self) -> RepositoryResult<Option<String>> {
+        unsupported("template build cache")
+    }
+
+    /// Atomically replaces the seed and returns its previous volume ID.
+    async fn replace_build_cache_head(&self, _volume_id: &str) -> RepositoryResult<Option<String>> {
+        unsupported("template build cache")
+    }
+
     /// Publishes the current node-local OverlayBD backing and returns logical
     /// layer references suitable for the shared volume catalog.
     async fn publish_volume_backing(

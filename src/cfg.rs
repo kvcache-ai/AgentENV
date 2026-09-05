@@ -479,11 +479,18 @@ pub struct MemorySnapshotConfig {
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }
 
-/// Compression settings applied when a template build captures its snapshot.
-/// Independent of `[memory_snapshot]`: template builds consult only this
-/// section, for both memory layers and the sealed rootfs read-write layer.
+/// Managed image builder resources and template snapshot compression.
 #[derive(Debug, Config, Clone)]
 pub struct TemplateBuildConfig {
+    #[config(default = "docker.io/moby/buildkit:v0.33.0")]
+    pub builder_image: String,
+    #[config(default = 16u32)]
+    pub builder_cpu_count: u32,
+    #[config(default = 32768u32)]
+    pub builder_memory_mb: u32,
+    /// Capacity of each build's writable clone of the repository's shared cache seed.
+    #[config(default = 262144u64)]
+    pub cache_size_mb: u64,
     #[config(default = false)]
     pub compression_enabled: bool,
     #[config(default = "lz4")]
@@ -660,6 +667,7 @@ impl_config_default!(
     UblkTomlConfig,
     UblkOverlaybdTomlConfig,
     MemorySnapshotConfig,
+    TemplateBuildConfig,
     MemorySnapshotBackgroundDownloadConfig,
     ObservabilityConfig,
     ObservabilitySchedulerReportConfig,
@@ -961,6 +969,24 @@ impl AppConfig {
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
         self.validate_volume_limits()?;
+        self.validate_template_builder()?;
+        Ok(())
+    }
+
+    fn validate_template_builder(&self) -> Result<()> {
+        let builder = &self.template_build;
+        if builder.builder_image.trim().is_empty() {
+            bail!("template_build.builder_image must not be empty");
+        }
+        if !(1..=255).contains(&builder.builder_cpu_count) {
+            bail!("template_build.builder_cpu_count must be between 1 and 255");
+        }
+        if builder.builder_memory_mb < 256 {
+            bail!("template_build.builder_memory_mb must be at least 256 MiB");
+        }
+        if builder.cache_size_mb < 1024 || builder.cache_size_mb > self.volume.max_size_mb {
+            bail!("template_build.cache_size_mb must be between 1024 and volume.max_size_mb");
+        }
         Ok(())
     }
 
@@ -1413,6 +1439,28 @@ mod tests {
             access_token_hash_seed: Some("cluster-secret".to_string()),
         };
         assert!(!format!("{config:?}").contains("cluster-secret"));
+    }
+
+    #[test]
+    fn template_builder_defaults_and_validation() {
+        let mut config = AppConfig::default();
+        assert_eq!(config.template_build.builder_cpu_count, 16);
+        assert_eq!(config.template_build.builder_memory_mb, 32768);
+        assert_eq!(config.template_build.cache_size_mb, 262144);
+        config.validate_template_builder().unwrap();
+        config.template_build.builder_cpu_count = 0;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.builder_cpu_count = 16;
+        config.template_build.builder_memory_mb = 255;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.builder_memory_mb = 32768;
+        config.template_build.cache_size_mb = config.volume.max_size_mb + 1;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.cache_size_mb = 1023;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.cache_size_mb = 262144;
+        config.template_build.builder_image = " ".into();
+        assert!(config.validate_template_builder().is_err());
     }
 
     #[test]

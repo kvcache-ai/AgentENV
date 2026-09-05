@@ -282,8 +282,8 @@ impl TemplateBuildRunner {
 /// account at build time aligns template builds with what E2B-compatible
 /// clients assume.
 ///
-/// Numeric USER values are left alone (Docker allows a UID with no passwd
-/// entry). An image with no account-management tooling at all (neither
+/// Numeric USER values are resolved during envd initialization (Docker allows
+/// a UID with no passwd entry). An image without account-management tooling (neither
 /// useradd/groupadd nor adduser/addgroup) keeps building with a warning
 /// rather than failing: such an image worked before this provisioning
 /// existed, and only envd calls that resolve the default user will fail.

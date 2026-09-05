@@ -1189,10 +1189,11 @@ where
         sandbox_id: SandboxId,
         previous_state: SandboxState,
     ) -> Result<()> {
-        let volume_ids = self
-            .store
-            .get(&sandbox_id)
-            .await?
+        let metadata = self.store.get(&sandbox_id).await?;
+        let template_builder = metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.template_builder);
+        let volume_ids = metadata
             .map(|metadata| metadata.volume_mounts.into_values().collect::<Vec<_>>())
             .unwrap_or_default();
         let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
@@ -1225,10 +1226,18 @@ where
                 .publish_sandbox_volume_backings(sandbox_id, &volume_ids)
                 .await
             {
-                self.store
-                    .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
-                    .await?;
-                return Err(err);
+                if template_builder {
+                    warn!(%sandbox_id, error = %err, "builder cache publication failed; discarding cache and releasing worker");
+                } else {
+                    self.store
+                        .update_state_if_state(
+                            &sandbox_id,
+                            previous_state,
+                            &[SandboxState::Killing],
+                        )
+                        .await?;
+                    return Err(err);
+                }
             }
             if let Err(err) = manager
                 .replace_owner_for(&sandbox_id.to_string(), None, &volume_ids)

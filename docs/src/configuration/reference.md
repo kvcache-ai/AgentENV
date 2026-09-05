@@ -568,14 +568,22 @@ and are then re-fetched on demand.
 
 ## `[template_build]`
 
-Compression settings applied when a template build captures its snapshot.
-This section is fully independent of `[memory_snapshot].compression_enabled`:
-template builds consult only these keys, for both memory layers and the
-sealed rootfs read-write layer. Pause/snapshot captures of running sandboxes
-are not affected, and rootfs seals stay raw there.
+Managed builder resources and template snapshot compression. The first Dockerfile
+build on a node prepares a reusable internal builder template. Each build mounts
+a separate clone of the repository's shared cache seed; concurrent builds do not
+queue for cache ownership. The last successfully published cache becomes the next
+seed, with best-effort reuse of concurrent branches.
+Builder resources do not change the resulting template's CPU or memory.
+Compression is independent of `[memory_snapshot].compression_enabled` and
+applies to both memory layers and the sealed rootfs read-write layer. Ordinary
+pause/snapshot captures are not affected.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `builder_image` | string | `"docker.io/moby/buildkit:v0.33.0"` | Image containing the managed BuildKit daemon, client, and OCI runtime. |
+| `builder_cpu_count` | integer | `16` | Builder vCPUs, from 1 to 255. |
+| `builder_memory_mb` | integer | `32768` | Builder memory in MiB, at least 256. |
+| `cache_size_mb` | integer | `262144` | Capacity in MiB for new persistent BuildKit data disks. At least 1024 and at most `volume.max_size_mb`; changing it does not resize existing caches. |
 | `compression_enabled` | bool | `false` | Enable compression for snapshot artifacts captured by template builds. When enabled, both the memory layers and the sealed rootfs read-write layer are written as ZFile-compressed layers. |
 | `compression_algorithm` | string | `"lz4"` | Compression algorithm. Valid values are only `lz4` and `zstd`. Parsed but ignored when compression is disabled. |
 | `compression_workers` | integer | `1` | Number of blocking threads used to compress 4 KiB blocks within a layer. `1` is sequential; higher values run in parallel without changing the output layout. Clamped to 64. |
