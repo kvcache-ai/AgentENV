@@ -40,7 +40,6 @@ use crate::{
     },
     template::TemplateBuildSpec,
     types::{ImageConfigs, SandboxId},
-    volume::VolumeError,
 };
 
 #[derive(Default)]
@@ -298,24 +297,32 @@ impl ApiImpl {
         };
         let mut state = session.state.subscribe();
         session.request_cancel()?;
-        loop {
-            if matches!(*state.borrow(), SessionState::Finished) {
-                self.release_builder(build_id, &session.cache)
-                    .await
-                    .map_err(|err| Self::error(500, format!("builder cleanup failed: {err:#}")))?;
-                self.build_sessions.active.remove(build_id);
-                self.orchestrator
-                    .unregister_template_build(
-                        SandboxId::parse_str(build_id).expect("build ID is a UUID"),
-                    )
-                    .await;
-                return Ok(());
-            }
-            state
-                .changed()
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            state.wait_for(|state| matches!(state, SessionState::Finished)),
+        )
+        .await
+        .map_err(|_| {
+            Self::error(
+                500,
+                "builder cleanup is still running; retry cancellation later",
+            )
+        })?
+        .map_err(|_| Self::error(500, "builder cleanup stopped unexpectedly"))?;
+        // Finished is sent after successful cleanup removes the active entry.
+        // A retained entry means release failed and needs another attempt.
+        if self.build_sessions.active.contains_key(build_id) {
+            self.release_builder(build_id, &session.cache)
                 .await
-                .map_err(|_| Self::error(500, "builder cleanup stopped unexpectedly"))?;
+                .map_err(|err| Self::error(500, format!("builder cleanup failed: {err:#}")))?;
+            self.build_sessions.active.remove(build_id);
+            self.orchestrator
+                .unregister_template_build(
+                    SandboxId::parse_str(build_id).expect("build ID is a UUID"),
+                )
+                .await;
         }
+        Ok(())
     }
 
     async fn run_image_build(
@@ -345,10 +352,9 @@ impl ApiImpl {
             ensure!(session.ready(address), "build cancelled");
             // Existing template status becomes Building only when the worker can accept a solve.
             self.snapshot_manager.try_start_build(&record.id).await?;
-            let mut receiver = session.state.subscribe();
             let command = tokio::time::timeout_at(
                 deadline,
-                receiver.wait_for(|state| {
+                state.wait_for(|state| {
                     matches!(state, SessionState::Submitted(_) | SessionState::Cancelled)
                 }),
             )
@@ -366,14 +372,7 @@ impl ApiImpl {
             .await
             .context("image import deadline exceeded")??;
             self.release_builder(&id, &session.cache).await?;
-            let base = resolved.base_context;
-            let context = CommandContext::from_env_and_workdir(base.env_vars, base.workdir)
-                .with_user(base.user)
-                .with_exposed_ports(base.exposed_ports)
-                .with_entrypoint(base.entrypoint)
-                .with_cmd(base.cmd)
-                .with_volumes(base.volumes)
-                .with_labels(base.labels);
+            let context = CommandContext::from(resolved.base_context);
             let (start, ready) = build_startup_commands(&body, &context, resolved.raw_config.as_ref())?;
             let mut configs = ImageConfigs::new();
             if let Some(config) = resolved.raw_config {
@@ -406,7 +405,23 @@ impl ApiImpl {
             Ok::<_, anyhow::Error>(())
         }
         .await;
-        let cleanup = self.release_builder(&id, &session.cache).await;
+        self.finish_image_build(&record, &session, result).await;
+    }
+
+    async fn finish_image_build(
+        &self,
+        record: &SnapshotRecord,
+        session: &BuildSession,
+        result: Result<()>,
+    ) {
+        let id = record.id.to_string();
+        // Successful publication already released the worker before capturing
+        // the template. Only a failed build needs another release attempt.
+        let cleanup = if result.is_err() {
+            self.release_builder(&id, &session.cache).await
+        } else {
+            Ok(())
+        };
         let cleanup_ok = cleanup.is_ok();
         if let Err(error) = &cleanup {
             warn!(build_id = %id, %error, "template worker cleanup failed; recovery will retry");
@@ -419,7 +434,6 @@ impl ApiImpl {
         if let Err(error) = &cache_cleanup {
             warn!(build_id = %id, %error, "cache cleanup failed; recovery will retry");
         }
-        let result = result.and(cleanup);
         let mut persisted = true;
         match &result {
             Ok(()) => info!(build_id = %id, "template build completed"),
@@ -444,13 +458,13 @@ impl ApiImpl {
                 let _ = journal.delete(format!("build/{id}").into_bytes()).await;
             }
         }
-        session.state.send_replace(SessionState::Finished);
         if cleanup_ok {
             self.build_sessions.active.remove(&id);
             self.orchestrator
                 .unregister_template_build(SandboxId::parse_str(&id).expect("build ID is a UUID"))
                 .await;
         }
+        session.state.send_replace(SessionState::Finished);
     }
 
     async fn prepare_builder(
@@ -530,16 +544,7 @@ impl ApiImpl {
             }
             self.orchestrator.delete_sandbox(sandbox_id).await?;
         }
-        match self.volume_manager.get(cache).await {
-            Ok(volume) => {
-                self.volume_manager
-                    .replace_owner_for(id, None, &[volume.id])
-                    .await?
-            }
-            Err(VolumeError::NotFound(_)) => {}
-            Err(err) => return Err(err.into()),
-        }
-        Ok(())
+        self.release_cache_lease(id, cache).await
     }
 }
 
@@ -716,6 +721,100 @@ exit 1
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn buildkit_cleanup_failure_preserves_success_and_recovery_journal() -> Result<()> {
+        use crate::{
+            api_key::ApiKey,
+            cfg::AppConfig,
+            image::ImageResolver,
+            orchestrator::{FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator},
+            sandbox::FirecrackerSandboxFactory,
+            snapshot::{
+                mock::{write_mock_built_artifacts, MockSnapshotRepository},
+                repository::backends::{PosixFsBackend, PosixFsBackendConfig},
+                SnapshotManager, SnapshotPublishMetadata,
+            },
+            template::TemplateBuilder,
+            volume::VolumeManager,
+        };
+
+        let root = tempfile::tempdir()?;
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: root.path().join("repository"),
+            cache_root: Some(root.path().join("cache")),
+            runtime_cache_root: None,
+        })?;
+        let manager = Arc::new(SnapshotManager::from_parts(
+            backend.repository(),
+            backend.runtime_resolver(),
+            None,
+        ));
+        let (_, _, manifest) = write_mock_built_artifacts(&root.path().join("artifacts"))?;
+        let record = manager
+            .publish(SnapshotPublishMetadata::mock(), manifest)
+            .await?;
+        let orchestrator = Orchestrator::new(
+            InMemoryMetadataStore::new(),
+            FirecrackerSandboxFactory::new(),
+            FileBackedSandboxPersister::new_for_test(root.path().join("sandboxes")),
+        )
+        .await?;
+        // Every volume operation fails, including a redundant worker release.
+        let volumes = VolumeManager::open_with_repository(
+            root.path().join("volumes/catalog.json"),
+            Arc::new(MockSnapshotRepository),
+        )
+        .await?;
+        let api = ApiImpl::new(
+            orchestrator,
+            manager.clone(),
+            Arc::new(TemplateBuilder::new()),
+            Arc::new(ImageResolver::new(&AppConfig::default())),
+            Arc::new(volumes),
+            None,
+            Vec::new(),
+            ApiKey::new("build-cleanup-test-api-key-0123456789")?,
+        );
+        let journal =
+            LocalKvStore::open(root.path().join("journal"), LocalStoreDurability::Memory).await?;
+        api.build_sessions.journal.set(journal).unwrap();
+        let id = record.id.to_string();
+        let key = format!("build/{id}").into_bytes();
+        api.build_journal()
+            .await?
+            .put(
+                key.clone(),
+                serde_json::to_vec(&BuildJournal {
+                    cache: "aenv-buildkit-work-test".into(),
+                    parent: None,
+                })?,
+            )
+            .await?;
+        let session = Arc::new(BuildSession {
+            state: watch::channel(SessionState::Submitted("sha256:result".into())).0,
+            cache: "aenv-buildkit-work-test".into(),
+        });
+        api.build_sessions
+            .active
+            .insert(id.clone(), session.clone());
+        api.orchestrator
+            .register_template_build(SandboxId::parse_str(&id)?)
+            .await;
+
+        api.finish_image_build(&record, &session, Ok(())).await;
+
+        let saved = manager.get(&id).await?.unwrap();
+        assert_eq!(
+            super::super::template::template_build_status(&saved),
+            TemplateBuildStatus::Ready
+        );
+        assert!(api.build_journal().await?.get(key).await?.is_some());
+        assert!(matches!(*session.state.borrow(), SessionState::Finished));
+        assert!(!api.build_sessions.active.contains_key(&id));
+        assert!(api.orchestrator.list_sandbox_ids().await?.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn buildkit_status_waits_for_cache_publication() -> Result<()> {

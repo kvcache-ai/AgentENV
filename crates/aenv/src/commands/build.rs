@@ -5,12 +5,11 @@ use clap::Args as ClapArgs;
 use serde_json::json;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    net::TcpListener,
     process::Command,
 };
 
 use crate::client::{
-    handle_status,
+    buildkit, handle_status,
     templates::{CreateTemplateV3, TemplateV3Response},
     Client,
 };
@@ -186,11 +185,9 @@ async fn build(
     let path = builder_path(session);
     wait_for_status(client, session, "building").await?;
     progress.stage(1, "Building image");
-    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
-    let address = format!("tcp://{}", listener.local_addr()?);
+    let (work, listener, address) = buildkit::bind_local().await?;
     let command = async {
-        let metadata = tempfile::tempdir()?;
-        let metadata_path = metadata.path().join("result.json");
+        let metadata_path = work.path().join("result.json");
         let mut command = Command::new(&args.buildctl);
         command
             .args([

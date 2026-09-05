@@ -848,7 +848,8 @@ where
     /// Lists all sandboxes with their metadata.
     #[tracing::instrument(skip(self))]
     pub async fn list_sandboxes(&self) -> Result<Vec<SandboxMetadata>> {
-        Ok(self.store.list().await?)
+        self.list_sandboxes_filtered(SandboxListFilter::matches_all())
+            .await
     }
 
     /// Lists all sandbox IDs currently tracked by the store.
@@ -2890,6 +2891,15 @@ where
             return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
         };
         metadata.secure = secure;
+        self.store.update(metadata).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn set_template_builder_for_test(&self, sandbox_id: &SandboxId) -> Result<()> {
+        let Some(mut metadata) = self.store.get(sandbox_id).await? else {
+            return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
+        };
+        metadata.template_builder = true;
         self.store.update(metadata).await?;
         Ok(())
     }

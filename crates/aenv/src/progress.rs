@@ -11,7 +11,10 @@ pub struct BuildProgress {
 
 impl BuildProgress {
     pub fn new(enabled: bool) -> Result<Self> {
-        let bar = if enabled && std::env::var_os("TERM").is_none_or(|term| term != "dumb") {
+        let bar = if enabled
+            && std::io::stderr().is_terminal()
+            && std::env::var_os("TERM").is_none_or(|term| term != "dumb")
+        {
             ProgressBar::with_draw_target(Some(3), ProgressDrawTarget::stderr_with_hz(10))
         } else {
             ProgressBar::hidden()

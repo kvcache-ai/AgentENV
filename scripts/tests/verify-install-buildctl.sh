@@ -82,12 +82,17 @@ grep -q 'aenv-server-linux-x86_64.tar.gz' "$work/full.log"
 printf 'corrupt\n' >>"$work/assets/buildkit.tar.gz"
 for installer in install-cli.sh install.sh; do
   dest="$work/corrupt-$installer"
+  if [[ "$installer" == install.sh ]]; then dest="$work/full-install"; fi
+  mkdir -p "$dest"
+  printf 'existing aenv\n' >"$dest/aenv"
+  printf 'existing buildctl\n' >"$dest/buildctl"
   if INSTALL_DIR="$dest" AENV_HOME_PATH="$work/data" SKIP_SETUP=1 \
       bash "$repo_root/scripts/$installer" >"$work/corrupt.log" 2>&1; then
     echo 'Expected a checksum failure' >&2
     exit 1
   fi
   grep -q 'SHA256 mismatch for buildkit' "$work/corrupt.log"
-  [[ ! -e "$dest/aenv" && ! -e "$dest/buildctl" ]]
+  [[ $(cat "$dest/aenv") == 'existing aenv' ]]
+  [[ $(cat "$dest/buildctl") == 'existing buildctl' ]]
 done
 echo 'Installer BuildKit checks passed'

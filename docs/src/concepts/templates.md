@@ -52,6 +52,8 @@ Build a Dockerfile with BuildKit inside a temporary microVM, then convert the
 result to OverlayBD and capture a template. The CLI and full AgentENV installers
 include `buildctl` v0.33.0. Source builds can use `--buildctl` to select a compatible
 client. Docker and a staging registry are not required on the CLI machine.
+On Linux and macOS, the local `buildctl` connection uses a Unix socket in a
+directory accessible only to the current user.
 
 ```bash
 aenv build <context> --name <name> [options]

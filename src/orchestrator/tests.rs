@@ -2727,6 +2727,7 @@ async fn buildkit_workers_are_hidden_but_keep_scheduler_bindings() -> Result<()>
         .await?;
     assert!(metadata.template_builder);
     assert_eq!(orchestrator.list_sandbox_ids().await?, vec![id]);
+    assert!(orchestrator.list_sandboxes().await?.is_empty());
     assert!(orchestrator
         .list_sandboxes_filtered(SandboxListFilter::matches_all())
         .await?

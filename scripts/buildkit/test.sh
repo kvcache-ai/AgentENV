@@ -111,7 +111,9 @@ for _ in $(seq 1 120); do
 done
 grep -q 'RUN sleep 120' "$work/interrupt.log"
 build_id=$(awk '/^Created template / {print $3}' "$work/interrupt.log")
-if "$AENV_BIN" list --output json | grep -q "$build_id"; then
+[[ -n "$build_id" ]]
+sandbox_list=$("$AENV_BIN" list --output json)
+if grep -qF "$build_id" <<<"$sandbox_list"; then
     echo 'Internal builder appeared in the sandbox list' >&2
     exit 1
 fi

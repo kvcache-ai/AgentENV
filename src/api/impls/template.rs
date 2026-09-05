@@ -18,7 +18,7 @@ use super::template_helpers::{
 use super::ApiImpl;
 use crate::image::ResolvedBlockImage;
 use crate::snapshot::{
-    CommandContext, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
+    SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
     TemplateBuildErrorReason, TemplateBuildStatus,
 };
 use crate::template::{TemplateBuildError, TemplateBuildFailure, TemplatePipelineError};
@@ -766,21 +766,12 @@ impl Templates<()> for ApiImpl {
                     if let Some(config) = &resolved_rootfs.raw_config {
                         image_configs.add(None::<String>, "/", config.clone());
                     }
-                    let base = resolved_rootfs.base_context;
-                    let base_context =
-                        CommandContext::from_env_and_workdir(base.env_vars, base.workdir)
-                            .with_user(base.user)
-                            .with_exposed_ports(base.exposed_ports)
-                            .with_entrypoint(base.entrypoint)
-                            .with_cmd(base.cmd)
-                            .with_volumes(base.volumes)
-                            .with_labels(base.labels);
                     let spec = spec
                         .with_resolved_overlaybd_image(
                             resolved_rootfs.overlaybd_config_path,
                             image_configs,
                         )
-                        .with_base_context(base_context);
+                        .with_base_context(resolved_rootfs.base_context.into());
                     match api
                         .template_builder
                         .build_and_publish_with_id(

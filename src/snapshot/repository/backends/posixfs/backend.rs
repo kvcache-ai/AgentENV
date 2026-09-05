@@ -315,18 +315,18 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
     }
 
     async fn get_build_cache_head(&self) -> RepositoryResult<Option<String>> {
-        let store = self.catalog_store.clone();
-        task::spawn_blocking(move || store.get_build_cache_head())
-            .await
-            .map_err(|error| RepositoryError::backend("read build cache head", error))?
+        self.run_catalog("read build cache head", |store| {
+            store.get_build_cache_head()
+        })
+        .await
     }
 
     async fn replace_build_cache_head(&self, volume_id: &str) -> RepositoryResult<Option<String>> {
-        let store = self.catalog_store.clone();
         let volume_id = volume_id.to_owned();
-        task::spawn_blocking(move || store.replace_build_cache_head(&volume_id))
-            .await
-            .map_err(|error| RepositoryError::backend("replace build cache head", error))?
+        self.run_catalog("replace build cache head", move |store| {
+            store.replace_build_cache_head(&volume_id)
+        })
+        .await
     }
 
     async fn get_volume(&self, reference: &str) -> RepositoryResult<Option<VolumeRecord>> {

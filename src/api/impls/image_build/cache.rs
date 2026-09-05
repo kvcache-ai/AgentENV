@@ -104,7 +104,7 @@ impl ApiImpl {
         Ok(())
     }
 
-    async fn release_cache_lease(&self, owner: &str, reference: &str) -> Result<()> {
+    pub(super) async fn release_cache_lease(&self, owner: &str, reference: &str) -> Result<()> {
         match self.volume_manager.get(reference).await {
             Ok(volume) => {
                 self.volume_manager
