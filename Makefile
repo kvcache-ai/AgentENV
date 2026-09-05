@@ -7,6 +7,9 @@ CARGO ?= cargo
 DOCKER ?= docker
 DOCKER_COMPOSE ?= docker compose
 DEPLOY_COMPOSE_FILE ?= deploy/docker-compose.yml
+# Guests need upstream DNS, not the host's loopback resolver stub.
+HOST_RESOLV_CONF ?= $(firstword $(wildcard /run/systemd/resolve/resolv.conf /etc/resolv.conf))
+export HOST_RESOLV_CONF
 APT_MIRROR_BASE ?=
 KUBECTL ?= kubectl
 K8S_NAMESPACE ?= agentenv-system
