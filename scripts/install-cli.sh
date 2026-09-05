@@ -89,8 +89,16 @@ install_completion_files() {
     if ((user_mode)); then
         [[ -n "$home" ]] || { echo "warning: HOME is unset; skipping completion setup" >&2; return 0; }
         # Shells honor the XDG base directories; write where they actually look.
-        data_home="${XDG_DATA_HOME:-$home/.local/share}"
-        config_home="${XDG_CONFIG_HOME:-$home/.config}"
+        if [[ "${XDG_DATA_HOME:-}" == /* ]]; then
+            data_home="$XDG_DATA_HOME"
+        else
+            data_home="$home/.local/share"
+        fi
+        if [[ "${XDG_CONFIG_HOME:-}" == /* ]]; then
+            config_home="$XDG_CONFIG_HOME"
+        else
+            config_home="$home/.config"
+        fi
         bash_path="$data_home/bash-completion/completions/aenv"
         zsh_path="$data_home/zsh/site-functions/_aenv"
         fish_path="$config_home/fish/completions/aenv.fish"
@@ -137,22 +145,31 @@ install_completion_files() {
         fi
         runv mkdir -p "$dir" || { echo "warning: could not create ${dir}" >&2; return 0; }
         lock_dir="$dir/.aenv-completion.lock"
+        lock_is_stale() {
+            local check_dir="$1" pid mtime now
+            pid="$(runv cat "$check_dir/pid" 2>/dev/null || true)"
+            if [[ "$pid" =~ ^[0-9]+$ ]]; then
+                command -v ps >/dev/null 2>&1 && ! ps -p "$pid" >/dev/null 2>&1
+                return
+            fi
+            mtime="$(runv stat -c %Y "$check_dir" 2>/dev/null || runv stat -f %m "$check_dir" 2>/dev/null || true)"
+            now="$(date +%s)"
+            [[ "$mtime" =~ ^[0-9]+$ ]] && ((now - mtime > 300))
+        }
         # Lock creation and cleanup must use the same privilege as the writes;
         # otherwise a system-prefix install reports every directory as busy.
         acquired=0
         if runv mkdir "$lock_dir" 2>/dev/null; then
             acquired=1
-        elif runv test -f "$lock_dir/pid" &&
+        elif runv test -d "$lock_dir" &&
              owner="$(runv cat "$lock_dir/pid" 2>/dev/null || true)" &&
-             [[ "$owner" =~ ^[0-9]+$ ]] &&
-             ! ps -p "$owner" >/dev/null 2>&1; then
+             lock_is_stale "$lock_dir"; then
             # Atomically quarantine the observed lock before validating it;
             # a new owner at the original path cannot be removed by us.
             stale="$lock_dir.stale.$$.${RANDOM}"
             if runv mv "$lock_dir" "$stale" 2>/dev/null; then
                 staged_owner="$(runv cat "$stale/pid" 2>/dev/null || true)"
-                if [[ "$staged_owner" == "$owner" ]] &&
-                   ! ps -p "$staged_owner" >/dev/null 2>&1; then
+                if [[ "$staged_owner" == "$owner" ]] && lock_is_stale "$stale"; then
                     runv rm -rf "$stale" 2>/dev/null || true
                     runv mkdir "$lock_dir" 2>/dev/null && acquired=1
                 else
@@ -213,7 +230,7 @@ if [[ -x $quoted_binary ]]; then eval \"\$($quoted_binary completion zsh)\"; fi"
     put_loader "$fish_path" "if test -x $quoted_binary; $quoted_binary completion fish | source; end"
     if ((user_mode)); then
         echo "If Zsh does not find the completion, add this before compinit:"
-        printf '  fpath=(%s/zsh/site-functions $fpath)\n' "$data_home"
+        printf '  fpath=(%q/zsh/site-functions $fpath)\n' "$data_home"
         echo "  autoload -Uz compinit"
         echo "  compinit"
     fi

@@ -46,18 +46,27 @@ install_completion_files() {
         dir="${path%/*}"
         sudo mkdir -p "$dir" || { echo "warning: could not create ${dir}" >&2; return 0; }
         lock_dir="$dir/.aenv-completion.lock"
+        lock_is_stale() {
+            local check_dir="$1" pid mtime now
+            pid="$(sudo cat "$check_dir/pid" 2>/dev/null || true)"
+            if [[ "$pid" =~ ^[0-9]+$ ]]; then
+                command -v ps >/dev/null 2>&1 && ! ps -p "$pid" >/dev/null 2>&1
+                return
+            fi
+            mtime="$(sudo stat -c %Y "$check_dir" 2>/dev/null || sudo stat -f %m "$check_dir" 2>/dev/null || true)"
+            now="$(date +%s)"
+            [[ "$mtime" =~ ^[0-9]+$ ]] && ((now - mtime > 300))
+        }
         acquired=0
         if sudo mkdir "$lock_dir" 2>/dev/null; then
             acquired=1
-        elif sudo test -f "$lock_dir/pid" &&
+        elif sudo test -d "$lock_dir" &&
              owner="$(sudo cat "$lock_dir/pid" 2>/dev/null || true)" &&
-             [[ "$owner" =~ ^[0-9]+$ ]] &&
-             ! ps -p "$owner" >/dev/null 2>&1; then
+             lock_is_stale "$lock_dir"; then
             stale="$lock_dir.stale.$$.${RANDOM}"
             if sudo mv "$lock_dir" "$stale" 2>/dev/null; then
                 staged_owner="$(sudo cat "$stale/pid" 2>/dev/null || true)"
-                if [[ "$staged_owner" == "$owner" ]] &&
-                   ! ps -p "$staged_owner" >/dev/null 2>&1; then
+                if [[ "$staged_owner" == "$owner" ]] && lock_is_stale "$stale"; then
                     sudo rm -rf "$stale" 2>/dev/null || true
                     sudo mkdir "$lock_dir" 2>/dev/null && acquired=1
                 else
