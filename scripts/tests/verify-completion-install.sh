@@ -60,6 +60,8 @@ assert_file "$xdg_config/fish/completions/aenv.fish"
 HOME="$home" XDG_DATA_HOME="$xdg_data" XDG_CONFIG_HOME="$xdg_config" \
     bash "$helper" uninstall --prefix="$home/.local" >/dev/null
 assert_absent "$xdg_data/bash-completion/completions/aenv"
+assert_absent "$xdg_data/zsh/site-functions/_aenv"
+assert_absent "$xdg_config/fish/completions/aenv.fish"
 
 echo '==> stale locks are reclaimed'
 lock="$home/.local/share/bash-completion/completions/.aenv-completion.lock"
@@ -138,7 +140,10 @@ env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" uninstall --
 assert_absent "$outside/share/bash-completion/completions/aenv"
 
 echo '==> unsupported loader paths are rejected'
-env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bin/aenv-v1\\tail" >/dev/null
+bad_binary="$bin/aenv-v1\\tail"
+cp "$bin/aenv-v1" "$bad_binary"
+chmod 0755 "$bad_binary"
+env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" install --prefix="$home/.local" --binary="$bad_binary" >/dev/null
 assert_absent "$bash_file"
 env -u XDG_DATA_HOME -u XDG_CONFIG_HOME HOME="$home" bash "$helper" uninstall --prefix="$home/.local" >/dev/null
 
@@ -154,7 +159,10 @@ cli_bin="$cli_home/.local/bin"
 mkdir -p "$cli_bin"
 cp "$bin/aenv-v1" "$cli_bin/aenv"
 HOME="$cli_home" INSTALL_DIR="$cli_bin" AENV_SOURCE_ONLY=1 bash -c '
-    source '"$repo_root"'/scripts/install-cli.sh
+    source "$1"
+    XDG_DATA_HOME="$2/data" XDG_CONFIG_HOME="$2/config" \
+        install_completion_files
+' _ "$repo_root/scripts/install-cli.sh" "$cli_home"
     XDG_DATA_HOME='"$cli_home"'/data XDG_CONFIG_HOME='"$cli_home"'/config \
         install_completion_files
 '
