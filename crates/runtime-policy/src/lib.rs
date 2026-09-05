@@ -104,6 +104,25 @@ impl Budget {
             .min(disk_available.saturating_sub(reserved_disk));
         (added > 0).then_some(item.memory_bytes + added)
     }
+
+    /// Increase an existing reservation before writing a checkpoint. Dirty
+    /// history may exceed current RSS, so memory admission is not a disk bound.
+    pub fn reserve_disk(&mut self, id: Uuid, desired: u64, available: u64) -> Result<()> {
+        let previous = self
+            .reservations
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("runtime has no disk reservation"))?
+            .disk_bytes;
+        let reserved = self
+            .reservations
+            .values()
+            .fold(0u64, |total, item| total.saturating_add(item.disk_bytes));
+        if desired.saturating_sub(previous) > available.saturating_sub(reserved) {
+            bail!("node checkpoint disk capacity is exhausted");
+        }
+        self.reservations.get_mut(&id).unwrap().disk_bytes = desired.max(previous);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -128,5 +147,11 @@ mod tests {
         assert_eq!(budget.growth(a, 9, 1, 100), Some(5));
         assert_eq!(budget.growth(a, 9, 100, 10), None);
         assert!(budget.admit(a, request, 100, 100).is_err());
+        budget.reserve_disk(a, 7, 12).unwrap();
+        assert_eq!(budget.reservations[&a].disk_bytes, 7);
+        assert!(budget.reserve_disk(a, 8, 12).is_err());
+        assert_eq!(budget.reservations[&a].disk_bytes, 7);
+        budget.reserve_disk(a, 5, 12).unwrap();
+        assert_eq!(budget.reservations[&a].disk_bytes, 7);
     }
 }
