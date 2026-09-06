@@ -1,0 +1,17 @@
+// Wire-compatible subset of containerd's Apache-2.0 licensed Content API:
+// https://github.com/containerd/containerd/blob/v2.2.0/api/services/content/v1/content.proto
+syntax = "proto3";
+package containerd.services.content.v1;
+
+service Content {
+  rpc Read(ReadContentRequest) returns (stream ReadContentResponse);
+}
+message ReadContentRequest {
+  string digest = 1;
+  int64 offset = 2;
+  int64 size = 3;
+}
+message ReadContentResponse {
+  int64 offset = 1;
+  bytes data = 2;
+}
