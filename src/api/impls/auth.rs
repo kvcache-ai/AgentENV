@@ -4,7 +4,7 @@ use agentenv_http_server::apis;
 use async_trait::async_trait;
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::{rejection::RawPathParamsRejection, RawPathParams, Request, State},
     http::{header::HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -42,6 +42,7 @@ impl ApiImpl {
 
 pub(crate) async fn require_auth<I>(
     State(api_impl): State<I>,
+    params: Result<RawPathParams, RawPathParamsRejection>,
     mut request: Request,
     next: Next,
 ) -> Response<Body>
@@ -57,6 +58,21 @@ where
     let api_impl = api_impl.as_ref();
     if !proxy_request {
         return if api_impl.has_valid_api_key(request.headers()) {
+            if let Some(id) = params
+                .as_ref()
+                .ok()
+                .and_then(|params| params.iter().find(|(key, _)| *key == "sandbox_id"))
+                .map(|(_, value)| value)
+                .and_then(|id| SandboxId::parse_str(id).ok())
+            {
+                match api_impl.orchestrator().get_sandbox(&id).await {
+                    Ok(Some(metadata)) if metadata.template_builder => {
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                    Ok(_) => {}
+                    Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                }
+            }
             next.run(request).await
         } else {
             StatusCode::UNAUTHORIZED.into_response()
@@ -86,6 +102,10 @@ where
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
+
+    if metadata.template_builder {
+        return proxy::sandbox_not_found_response(sandbox_id);
+    }
 
     let envd_request = target_port == proxy::effective_envd_port(&metadata);
     let envd_authorized = envd_request

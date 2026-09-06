@@ -41,6 +41,7 @@ pub enum SandboxOperation {
     UpdateNetwork,
     PatchCustomExtensionParams,
     Stop,
+    Delete,
 }
 
 #[derive(thiserror::Error, Debug)]

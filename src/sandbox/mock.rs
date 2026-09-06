@@ -52,6 +52,7 @@ pub enum MockOperation {
     Resume,
     Snapshot,
     SnapshotVolumes,
+    ThawVolumes,
     Fork,
     ForkChild,
     Stop,
@@ -337,6 +338,14 @@ impl SandboxBackend for MockSandboxBackend {
 
     async fn stop(&mut self) -> Result<()> {
         self.behavior.apply_async(MockOperation::Stop).await
+    }
+
+    async fn freeze_and_snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
+        self.snapshot_volumes().await
+    }
+
+    async fn thaw_volumes(&mut self) -> Result<()> {
+        self.behavior.apply_async(MockOperation::ThawVolumes).await
     }
 
     fn host_interaction_ip(&self) -> Option<std::net::Ipv4Addr> {

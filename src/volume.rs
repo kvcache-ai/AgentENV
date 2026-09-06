@@ -296,6 +296,26 @@ impl VolumeManager {
         .await
     }
 
+    /// Creates a private writable child without publishing its unchanged backing first.
+    /// The caller holds a read lease on the immutable seed until this child is released.
+    pub(crate) async fn create_build_cache(
+        &self,
+        name: String,
+        seed: Option<String>,
+        size_mb: u64,
+        owner: &str,
+    ) -> Result<VolumeRecord, VolumeError> {
+        self.create_with_source_owner(
+            name,
+            VolumeMode::Exclusive,
+            seed.map(|id| (id, None)),
+            None,
+            size_mb,
+            Some(owner),
+        )
+        .await
+    }
+
     async fn create_with_source_owner(
         &self,
         name: String,

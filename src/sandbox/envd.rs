@@ -18,6 +18,8 @@ use envd::http_client::models::InitPostRequest;
 use envd::process::ProcessClient;
 use envd::reqwest::Client;
 
+mod user;
+
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 // Bootstrap addresses can be reused across sandbox runtime generations. Do not
@@ -156,6 +158,30 @@ impl EnvdInstance {
         default_workdir: Option<String>,
         default_user: Option<String>,
     ) -> Result<()> {
+        let default_user = match default_user {
+            Some(user) if user::needs_resolution(&user) => {
+                // Authenticate this runtime first, including after restore.
+                // Account setup runs before the sandbox becomes available.
+                self.post_init(None, Some("/".to_owned()), Some("root".to_owned()))
+                    .await?;
+                Some(
+                    tokio::time::timeout(Duration::from_secs(30), self.resolve_default_user(&user))
+                        .await
+                        .context("timed out resolving Dockerfile USER")??,
+                )
+            }
+            user => user,
+        };
+        self.post_init(env_vars, default_workdir, default_user)
+            .await
+    }
+
+    async fn post_init(
+        &self,
+        env_vars: Option<HashMap<String, String>>,
+        default_workdir: Option<String>,
+        default_user: Option<String>,
+    ) -> Result<()> {
         debug!(has_env_vars = env_vars.is_some(), "initializing envd");
         let now = chrono::Utc::now().fixed_offset();
         let init_post_request = InitPostRequest {
@@ -179,9 +205,9 @@ impl EnvdInstance {
 mod tests {
     use std::time::Instant;
 
-    use axum::extract::State;
+    use axum::extract::{Query, State};
     use axum::http::{HeaderMap, StatusCode};
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use serde_json::Value;
     use tokio::net::TcpListener;
@@ -216,6 +242,42 @@ mod tests {
         let (headers, body) = receiver.recv().await.expect("captured init request");
         assert_eq!(headers["x-access-token"], token.expose());
         assert_eq!(body["accessToken"], token.expose());
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn init_resolves_numeric_default_user_and_preserves_image_environment() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let (sender, mut receiver) = mpsc::channel(2);
+        let token = crate::sandbox::SandboxAccessTokenGenerator::new("numeric-user-test-seed")?
+            .generate(crate::types::SandboxId::new());
+        let file_token = token.clone();
+        let app = Router::new()
+            .route("/init", post(capture_init_request))
+            .route("/files", get(move |headers: HeaderMap, Query(query): Query<HashMap<String, String>>| async move {
+                assert_eq!(headers["x-access-token"], file_token.expose());
+                assert_eq!(query["path"], "/etc/passwd");
+                assert_eq!(query["username"], "root");
+                "root:x:0:0:root:/root:/bin/sh\n"
+            }))
+            .with_state(sender);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let envd = EnvdInstance::new(format!("http://{address}"), Some(token.clone()));
+        envd.init(
+            Some(HashMap::from([("HOME".to_owned(), "/app".to_owned())])),
+            Some("/work".to_owned()),
+            Some("0".to_owned()),
+        )
+        .await?;
+        let (headers, bootstrap) = receiver.recv().await.unwrap();
+        assert_eq!(headers["x-access-token"], token.expose());
+        assert_eq!(bootstrap["accessToken"], token.expose());
+        let (_, body) = receiver.recv().await.unwrap();
+        assert_eq!(body["defaultUser"], "root");
+        assert_eq!(body["defaultWorkdir"], "/work");
+        assert_eq!(body["envVars"]["HOME"], "/app");
         server.abort();
         Ok(())
     }

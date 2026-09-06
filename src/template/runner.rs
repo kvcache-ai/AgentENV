@@ -282,8 +282,8 @@ impl TemplateBuildRunner {
 /// account at build time aligns template builds with what E2B-compatible
 /// clients assume.
 ///
-/// Numeric USER values are left alone (Docker allows a UID with no passwd
-/// entry). An image with no account-management tooling at all (neither
+/// Numeric USER values are resolved during envd initialization (Docker allows
+/// a UID with no passwd entry). An image without account-management tooling (neither
 /// useradd/groupadd nor adduser/addgroup) keeps building with a warning
 /// rather than failing: such an image worked before this provisioning
 /// existed, and only envd calls that resolve the default user will fail.
@@ -483,10 +483,11 @@ async fn run_startup_commands(
         None
     } else {
         debug!(command = %startup.start_cmd, "starting startup command");
+        let (shell, flag) = startup.shell_command();
         let handle = sandbox
             .start_process(
-                "/bin/bash",
-                &["-lc", startup.start_cmd.as_str()],
+                shell,
+                &[flag, startup.start_cmd.as_str()],
                 &ProcessOpts {
                     envs: startup.context.env_vars.clone(),
                     cwd: Some(startup.context.workdir.clone()),
@@ -523,6 +524,7 @@ async fn run_ready_command(
 ) -> Result<()> {
     let deadline = Instant::now() + READY_TIMEOUT;
     let mut attempt = 0_u64;
+    let (shell, flag) = startup.shell_command();
 
     let mut opts = ProcessOpts {
         envs: startup.context.env_vars.clone(),
@@ -554,7 +556,7 @@ async fn run_ready_command(
         }
 
         let output = sandbox
-            .run_command_with_opts("/bin/bash", &["-lc", startup.ready_cmd.as_str()], &opts)
+            .run_command_with_opts(shell, &[flag, startup.ready_cmd.as_str()], &opts)
             .await;
 
         match output {
@@ -678,6 +680,7 @@ mod tests {
         let build_context = CommandContext::new(HashMap::new(), "/work");
         let startup = StartupCommand {
             start_cmd: "python -m http.server".to_string(),
+            shell: None,
             ready_cmd: String::new(),
             context: CommandContext::default(),
         };
@@ -694,6 +697,7 @@ mod tests {
         let startup = StartupCommand {
             start_cmd: String::new(),
             ready_cmd: String::new(),
+            shell: None,
             context: CommandContext::default(),
         };
 
@@ -708,6 +712,7 @@ mod tests {
             CommandContext::new(HashMap::from([("BASE".into(), "2".into())]), "/derived");
         let startup = StartupCommand {
             start_cmd: "echo start".to_string(),
+            shell: None,
             ready_cmd: "echo ready".to_string(),
             context: inherited_context,
         };
@@ -933,6 +938,7 @@ mod tests {
         let startup = StartupCommand {
             start_cmd: String::new(),
             ready_cmd: "echo ready".to_string(),
+            shell: None,
             context: CommandContext::default(),
         };
         let mut start_handle = None;

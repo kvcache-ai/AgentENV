@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tokio::time::Duration;
 use tonic::Request;
 
@@ -14,6 +14,18 @@ use envd::process::{
 use super::envd::EnvdInstance;
 
 const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
+fn guest_request<T>(message: T, root_user: bool) -> Request<T> {
+    let mut request = Request::new(message);
+    if root_user {
+        // envd uses HTTP Basic's username to select the guest account.
+        request.metadata_mut().insert(
+            "authorization",
+            tonic::metadata::MetadataValue::from_static("Basic cm9vdDo="),
+        );
+    }
+    request
+}
 
 /// Options for starting a process inside the sandbox.
 #[derive(Clone, Debug, Default)]
@@ -70,6 +82,7 @@ pub struct ProcessHandle {
     client: ProcessClient,
     stream: tonic::Streaming<StartResponse>,
     timeout: Option<Duration>,
+    root_user: bool,
 }
 
 impl ProcessHandle {
@@ -128,12 +141,15 @@ impl ProcessHandle {
             selector: Some(process_selector::Selector::Pid(self.pid)),
         };
         self.client
-            .send_input(Request::new(SendInputRequest {
-                process: Some(selector),
-                input: Some(ProcessInput {
-                    input: Some(process_input::Input::Stdin(data.to_vec())),
-                }),
-            }))
+            .send_input(guest_request(
+                SendInputRequest {
+                    process: Some(selector),
+                    input: Some(ProcessInput {
+                        input: Some(process_input::Input::Stdin(data.to_vec())),
+                    }),
+                },
+                self.root_user,
+            ))
             .await
             .context("failed to send stdin")?;
         Ok(())
@@ -145,10 +161,14 @@ impl ProcessHandle {
             selector: Some(process_selector::Selector::Pid(self.pid)),
         };
         self.client
-            .send_signal(Request::new(SendSignalRequest {
-                process: Some(selector),
-                signal: signal as i32,
-            }))
+            .send_signal(guest_request(
+                SendSignalRequest {
+                    process: Some(selector),
+                    signal: signal as i32,
+                },
+                self.root_user,
+            ))
+            .boxed()
             .await
             .context("failed to send signal")?;
         Ok(())
@@ -185,11 +205,25 @@ impl ProcessHandle {
 /// Owns a lightweight clone of the sandbox's envd connection settings.
 pub struct Executor {
     envd_instance: EnvdInstance,
+    root_user: bool,
 }
 
 impl Executor {
+    pub(crate) fn for_endpoint(address: String, token: Option<super::EnvdAccessToken>) -> Self {
+        Self::new(EnvdInstance::new(address, token))
+    }
+
     pub(super) fn new(envd_instance: EnvdInstance) -> Self {
-        Self { envd_instance }
+        Self {
+            envd_instance,
+            root_user: false,
+        }
+    }
+
+    /// Select root for internal filesystem maintenance, independently of USER.
+    pub(crate) fn with_root_user(mut self) -> Self {
+        self.root_user = true;
+        self
     }
 
     /// Run a command and wait for it to complete.
@@ -205,8 +239,11 @@ impl Executor {
         args: &[&str],
         opts: &ProcessOpts,
     ) -> Result<ProcessOutput> {
-        let mut handle = self.start_process_inner(cmd, args, opts, false).await?;
-        handle.wait().await
+        let mut handle = self
+            .start_process_inner(cmd, args, opts, false)
+            .boxed()
+            .await?;
+        handle.wait().boxed().await
     }
 
     /// Start a long-running process and return a [`ProcessHandle`].
@@ -226,9 +263,12 @@ impl Executor {
     pub async fn create_dir_all(&self, path: &str) -> Result<()> {
         let mut client = self.envd_instance.filesystem_client().await?;
         match client
-            .make_dir(Request::new(MakeDirRequest {
-                path: path.to_string(),
-            }))
+            .make_dir(guest_request(
+                MakeDirRequest {
+                    path: path.to_string(),
+                },
+                self.root_user,
+            ))
             .await
         {
             Ok(_) => Ok(()),
@@ -247,33 +287,38 @@ impl Executor {
         opts: &ProcessOpts,
         stdin_enabled: bool,
     ) -> Result<ProcessHandle> {
-        let request = Request::new(StartRequest {
-            process: Some(ProcessConfig {
-                cmd: cmd.to_string(),
-                args: args.iter().map(|s| s.to_string()).collect(),
-                envs: opts.envs.clone(),
-                cwd: opts.cwd.clone(),
-            }),
-            pty: None,
-            tag: None,
-            stdin: Some(stdin_enabled),
-        });
+        let request = guest_request(
+            StartRequest {
+                process: Some(ProcessConfig {
+                    cmd: cmd.to_string(),
+                    args: args.iter().map(|s| s.to_string()).collect(),
+                    envs: opts.envs.clone(),
+                    cwd: opts.cwd.clone(),
+                }),
+                pty: None,
+                tag: None,
+                stdin: Some(stdin_enabled),
+            },
+            self.root_user,
+        );
 
-        let mut client = self.envd_instance.process_client().await?;
+        let mut client = self.envd_instance.process_client().boxed().await?;
         let mut stream = client
             .start(request)
+            .boxed()
             .await
             .context("failed to start process via envd")?
             .into_inner();
 
         // Wait for the StartEvent to learn the PID.
-        let pid = Self::wait_for_start_event(&mut stream).await?;
+        let pid = Self::wait_for_start_event(&mut stream).boxed().await?;
 
         Ok(ProcessHandle {
             pid,
             client,
             stream,
             timeout: opts.timeout,
+            root_user: self.root_user,
         })
     }
 

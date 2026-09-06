@@ -20,8 +20,7 @@ use crate::orchestrator::{
 use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
-    CommandContext, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
-    SnapshotVolume,
+    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotVolume,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use crate::volume::{VolumeManager, VolumeMode};
@@ -738,20 +737,11 @@ impl Sandboxes<()> for ApiImpl {
         let mut extra_drives: Vec<_> = resolved_attached.into_iter().map(|r| r.drive).collect();
         extra_drives.extend(volume_drives);
 
-        let base = resolved_rootfs.base_context;
         let request = CreateSandboxRequest {
             source: SandboxLaunchSource::Image {
                 image_ref: resolved_rootfs.image_ref,
                 overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
-                context: Box::new(
-                    CommandContext::from_env_and_workdir(base.env_vars, base.workdir)
-                        .with_user(base.user)
-                        .with_exposed_ports(base.exposed_ports)
-                        .with_entrypoint(base.entrypoint)
-                        .with_cmd(base.cmd)
-                        .with_volumes(base.volumes)
-                        .with_labels(base.labels),
-                ),
+                context: Box::new(resolved_rootfs.base_context.into()),
                 resources: Some(resources),
                 extra_drives,
                 extra_boot_args: body.extra_boot_args.clone(),

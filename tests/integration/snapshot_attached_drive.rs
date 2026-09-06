@@ -195,6 +195,136 @@ async fn publish_sandbox_snapshot_with_attached_drive(
 }
 
 #[tokio::test]
+async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
+    use agentenv::volume::{VolumeManager, VolumeMode};
+
+    common::setup().await;
+    let root = tempdir()?;
+    let (_, _, repository) = common::snapshot_test_parts(root.path());
+    let volumes =
+        VolumeManager::open_with_repository(root.path().join("volumes"), repository).await?;
+    let mut config = common::default_sandbox_config()?;
+    config.vcpu_count = 2;
+    config.mem_size_mib = 512;
+    for name in ["data", "archive"] {
+        let volume = volumes
+            .create(name.to_owned(), VolumeMode::Exclusive, None, None, 1024)
+            .await?;
+        let image_config = volume.backing_image_config.expect("local volume config");
+        config.common.extra_drives.push(ExtraDrive::Overlaybd {
+            drive_id: volume.id,
+            image_config_path: image_config.clone(),
+            read_only: false,
+            mount_path: PathBuf::from(format!("/{name}")),
+            virtual_size: Some(1024 * 1024 * 1024),
+            sub_path: None,
+            snapshot_output_dir: Some(image_config.parent().unwrap().to_path_buf()),
+            volume: true,
+        });
+    }
+    let mut worker = FirecrackerSandbox::new(config.clone())?;
+    worker.start().await?;
+    let output = worker
+        .run_command(
+            "/agentenv/bin/busybox",
+            &[
+                "sh",
+                "-c",
+                r#"
+        set -eu
+        mkdir /archive/nested
+        i=0
+        while [ "$i" -lt 2000 ]; do
+            printf 'marker-%s\n' "$i" > /data/file-$i
+            printf 'marker-%s\n' "$i" > /archive/nested/file-$i
+            i=$((i + 1))
+        done
+        /agentenv/bin/busybox umount /archive
+    "#,
+            ],
+        )
+        .await?;
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    // Failure on the second mount must thaw the first mount, and must never
+    // freeze the root filesystem now visible beneath the unmounted path.
+    let error = worker.freeze_and_snapshot_volumes().await.unwrap_err();
+    assert!(!error.is_terminal(), "{error}");
+    let output = worker
+        .executor()?
+        .run_command_with_opts(
+            "/agentenv/bin/busybox",
+            &[
+                "sh",
+                "-c",
+                "echo recovered > /data/recovered && /agentenv/bin/busybox mount /dev/vdd /archive",
+            ],
+            &agentenv::sandbox::ProcessOpts::default()
+                .with_timeout(std::time::Duration::from_secs(10)),
+        )
+        .await?;
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    worker.freeze_and_snapshot_volumes().await?;
+    worker.thaw_volumes().await?;
+    let output = worker
+        .run_command(
+            "/agentenv/bin/busybox",
+            &["sh", "-c", "echo thawed > /data/thawed"],
+        )
+        .await?;
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    worker.freeze_and_snapshot_volumes().await?;
+    worker.stop().await?;
+
+    let ExtraDrive::Overlaybd { sub_path, .. } = &mut config.common.extra_drives[1];
+    *sub_path = Some(PathBuf::from("nested"));
+    config.common.default_user = Some("nobody".to_owned());
+    config.common.default_workdir = Some("/".to_owned());
+
+    let mut replacement = FirecrackerSandbox::new(config)?;
+    replacement.start().await?;
+    let output = replacement
+        .run_command(
+            "/agentenv/bin/busybox",
+            &[
+                "sh",
+                "-c",
+                r#"
+        set -eu
+        test "$(id -u)" != 0
+        test "$(cat /data/recovered)" = recovered
+        test "$(cat /data/thawed)" = thawed
+        i=0
+        while [ "$i" -lt 2000 ]; do
+            read -r value < /data/file-$i
+            test "$value" = "marker-$i"
+            read -r value < /archive/file-$i
+            test "$value" = "marker-$i"
+            i=$((i + 1))
+        done
+        /agentenv/bin/busybox dmesg
+    "#,
+            ],
+        )
+        .await?;
+    // Freeze and seal through a subPath bind mount as well.
+    replacement.freeze_and_snapshot_volumes().await?;
+    replacement.stop().await?;
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    assert!(
+        !output
+            .stdout
+            .lines()
+            .any(
+                |line| (line.contains("EXT4-fs (vdc)") || line.contains("EXT4-fs (vdd)"))
+                    && line.contains("recovery complete")
+            ),
+        "{}",
+        output.stdout
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn attached_overlaybd_drive_is_visible_on_snapshot_based_build() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;
