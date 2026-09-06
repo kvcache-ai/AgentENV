@@ -419,15 +419,28 @@ filtered to the states each command accepts:
 |---------|--------------------|
 | `pause`, `exec`, `timeout`, `upload`, `download`, `snapshot create` | running |
 | `resume` | paused |
-| `connect`, `delete` | running and paused |
+| `connect`, `delete`, `snapshot list --sandbox-id` | running and paused |
 
 ```bash
 aenv resume <TAB>                # paused sandbox IDs
 aenv exec <TAB>                  # running sandbox IDs
 ```
 
-Where the shell supports it, candidates carry a description with the sandbox's
-template and state.
+Commands that take a template or a snapshot complete their names first, with
+IDs offered as a fallback for resources that have no name:
+
+```bash
+aenv start <TAB>                 # template and snapshot names, then IDs
+aenv template watch <TAB>        # template names, then template IDs
+aenv template delete <TAB>       # template names, then template IDs
+```
+
+`aenv start --cold` takes an external OCI image reference rather than a local
+resource, so it offers no template or snapshot candidates.
+
+Where the shell supports it, candidates carry a description: the template and
+state for a sandbox, the underlying ID and build status for a template, and the
+underlying ID for a snapshot.
 
 Dynamic lookup is best-effort: it uses short timeouts (500 ms connect, 1 s
 request) and silently returns no candidates when credentials, the server, or

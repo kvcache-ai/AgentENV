@@ -18,6 +18,7 @@ const ENVD_READY_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 Resource overrides are only supported with --cold.")]
 pub struct Args {
     /// Template ID, snapshot alias, or external image reference when --cold is set
+    #[arg(add = crate::commands::completion::add_start_target_candidates())]
     target: String,
     /// Start directly from an external OCI image instead of a template/snapshot
     #[arg(long)]
