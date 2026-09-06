@@ -120,6 +120,10 @@ assert_status "${HTTP_STATUS}" "200" "get volume after sandbox deletion"
 assert_json_field "${HTTP_BODY}" '.status' "ready" "deleted sandbox volume is reusable"
 api_post "/sandboxes-cold" "${cold_payload}"
 assert_status "${HTTP_STATUS}" "201" "mount deleted sandbox volume in a new sandbox"
+if [[ "${HTTP_STATUS}" != "201" ]]; then
+    error "replacement sandbox create response: ${HTTP_BODY}"
+    exit 1
+fi
 source_sandbox_id="$(echo "${HTTP_BODY}" | jq -r '.sandboxID // empty')"
 assert_not_empty "${source_sandbox_id}" "replacement sandbox ID is present"
 track_sandbox "${source_sandbox_id}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the aenv CLI from GitHub Releases.
+# Install the aenv CLI and its buildctl client from GitHub Releases.
 #
 # Supported platforms: linux/darwin × x86_64/aarch64 (arm64)
 #
@@ -25,8 +25,8 @@ esac
 
 ARCH="$(uname -m)"
 case "$ARCH" in
-    x86_64)          ARCH_TAG="x86_64" ;;
-    aarch64|arm64)   ARCH_TAG="aarch64" ;;
+    x86_64)          ARCH_TAG="x86_64"; BUILDKIT_ARCH="amd64" ;;
+    aarch64|arm64)   ARCH_TAG="aarch64"; BUILDKIT_ARCH="arm64" ;;
     *)
         echo "error: unsupported architecture: $ARCH (supported: x86_64, aarch64/arm64)" >&2
         exit 1
@@ -44,13 +44,16 @@ fi
 ASSET="aenv-${OS}-${ARCH_TAG}"
 RELEASE_API="https://api.github.com/repos/${REPO}/releases/latest"
 DEST="${INSTALL_DIR}/aenv"
-TMP="$(mktemp)"
-RELEASE_METADATA="$(mktemp)"
-trap 'rm -f "$TMP" "$RELEASE_METADATA"' EXIT
+TMP_DIR="$(mktemp -d)"
+TMP="${TMP_DIR}/aenv"
+RELEASE_METADATA="${TMP_DIR}/release.json"
+trap 'rm -rf "$TMP_DIR"' EXIT
 
 missing_packages=()
 command -v curl >/dev/null 2>&1 || missing_packages+=(curl)
 command -v jq >/dev/null 2>&1 || missing_packages+=(jq)
+command -v tar >/dev/null 2>&1 || missing_packages+=(tar)
+command -v gzip >/dev/null 2>&1 || missing_packages+=(gzip)
 if ! command -v sha256sum >/dev/null 2>&1 &&
    ! command -v shasum >/dev/null 2>&1; then
     missing_packages+=(coreutils)
@@ -92,7 +95,7 @@ if ((${#missing_packages[@]} > 0)); then
     fi
 fi
 
-for command in curl jq; do
+for command in curl jq tar gzip; do
     if ! command -v "$command" >/dev/null 2>&1; then
         echo "error: required command is still unavailable after installation: ${command}" >&2
         exit 1
@@ -117,53 +120,63 @@ api_headers=(
     -H "X-GitHub-Api-Version: 2022-11-28"
 )
 
-echo "Downloading aenv (${OS}/${ARCH_TAG}) ..."
-curl -fsSL --retry 5 --retry-delay 10 --retry-max-time 60 \
-    "${api_headers[@]}" "$RELEASE_API" -o "$RELEASE_METADATA"
-asset_json="$(
-    jq -cer --arg name "$ASSET" \
+curl_get() {
+    curl -fsSL --retry 5 --retry-delay 10 --retry-max-time 60 "$@"
+}
+
+download_release_asset() {
+    local asset_name="$1" destination="$2"
+    local asset_json url digest actual
+    asset_json="$(jq -cer --arg name "$asset_name" \
         '[.assets[] | select(.name == $name)] |
          if length == 1 then .[0] else error("release asset not found or not unique") end' \
-        "$RELEASE_METADATA"
-)" || {
-    echo "error: release asset not found or not unique: ${ASSET}" >&2
-    exit 1
+        "$RELEASE_METADATA")"
+    url="$(jq -r '.browser_download_url // empty' <<< "$asset_json")"
+    digest="$(jq -r '.digest // empty' <<< "$asset_json")"
+    if [[ -z "$url" || ! "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]; then
+        echo "error: missing download URL or SHA256 digest for ${asset_name}" >&2
+        return 1
+    fi
+    curl_get "$url" -o "$destination"
+    actual="$(sha256_file "$destination")"
+    if [[ "${digest#sha256:}" != "$actual" ]]; then
+        echo "error: SHA256 mismatch for ${asset_name}" >&2
+        return 1
+    fi
 }
-url="$(jq -r '.browser_download_url // empty' <<< "$asset_json")"
-digest="$(jq -r '.digest // empty' <<< "$asset_json")"
-if [[ -z "$url" ]]; then
-    echo "error: GitHub did not provide a download URL for ${ASSET}" >&2
-    exit 1
-fi
-if [[ "$digest" != sha256:* ]]; then
-    echo "error: GitHub did not provide a SHA256 digest for ${ASSET}" >&2
-    exit 1
-fi
-curl -fsSL --retry 5 --retry-delay 10 --retry-max-time 60 "$url" -o "$TMP"
 
-expected="${digest#sha256:}"
-actual="$(sha256_file "$TMP")"
-if [[ "$expected" != "$actual" ]]; then
-    echo "error: SHA256 mismatch for ${ASSET}" >&2
-    echo "  expected: ${expected}" >&2
-    echo "  actual:   ${actual}" >&2
-    exit 1
-fi
+echo "Downloading aenv (${OS}/${ARCH_TAG}) ..."
+curl_get "${api_headers[@]}" "$RELEASE_API" -o "$RELEASE_METADATA"
+download_release_asset "$ASSET" "$TMP"
+download_release_asset "buildkit-version" "${TMP_DIR}/buildkit-version"
+BUILDKIT_VERSION="$(<"${TMP_DIR}/buildkit-version")"
+[[ "$BUILDKIT_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'error: invalid BuildKit version' >&2; exit 1; }
 
-chmod 0755 "$TMP"
+echo "Downloading buildctl ${BUILDKIT_VERSION} (${OS}/${BUILDKIT_ARCH}) ..."
+curl_get "${api_headers[@]}" \
+    "https://api.github.com/repos/moby/buildkit/releases/tags/${BUILDKIT_VERSION}" -o "$RELEASE_METADATA"
+download_release_asset "buildkit-${BUILDKIT_VERSION}.${OS}-${BUILDKIT_ARCH}.tar.gz" "${TMP_DIR}/buildkit.tar.gz"
+tar -xzOf "${TMP_DIR}/buildkit.tar.gz" bin/buildctl >"${TMP_DIR}/buildctl"
+test -s "${TMP_DIR}/buildctl"
+chmod 0755 "$TMP" "${TMP_DIR}/buildctl"
 
 if [[ -w "$INSTALL_DIR" ]] || mkdir -p "$INSTALL_DIR"; then
     true
 else
     sudo mkdir -p "$INSTALL_DIR"
 fi
-if [[ -w "$INSTALL_DIR" ]]; then
-    mv "$TMP" "$DEST"
-else
-    sudo mv "$TMP" "$DEST"
-fi
+install_command=()
+[[ -w "$INSTALL_DIR" ]] || install_command=(sudo)
+stage_dir="$("${install_command[@]}" mktemp -d "${INSTALL_DIR}/.aenv-install.XXXXXX")"
+trap 'rm -rf "$TMP_DIR"; "${install_command[@]}" rm -rf "$stage_dir"' EXIT
+"${install_command[@]}" install -m 0755 "${TMP_DIR}/buildctl" "$stage_dir/buildctl"
+"${install_command[@]}" install -m 0755 "$TMP" "$stage_dir/aenv"
+# Keep both renames on the destination filesystem.
+"${install_command[@]}" mv "$stage_dir/buildctl" "${INSTALL_DIR}/aenv-buildctl"
+"${install_command[@]}" mv "$stage_dir/aenv" "$DEST"
 
 echo "Installed: ${DEST}"
+echo "Installed: ${INSTALL_DIR}/aenv-buildctl"
 
 if ! command -v aenv &>/dev/null; then
     echo ""
