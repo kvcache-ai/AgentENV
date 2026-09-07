@@ -119,7 +119,8 @@ pub struct FirecrackerCommonConfig {
     /// When omitted, the system temp directory is used.
     pub firecracker_work_base_dir: Option<PathBuf>,
     /// Base directory for Firecracker serial output.
-    /// The actual serial output files will be created under `{serial_output_base_dir}/{sandbox_id}/`.
+    /// The actual serial output files will be created under
+    /// `{serial_output_base_dir}/{shard}/{sandbox_id}/`; see `serial_shard`.
     ///
     /// Overriden by `stdout_path` and `stderr_path` if they are set.
     pub serial_output_base_dir: Option<PathBuf>,
