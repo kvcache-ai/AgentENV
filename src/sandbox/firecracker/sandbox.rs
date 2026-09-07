@@ -2431,22 +2431,15 @@ async fn copy_cow(src: &Path, dst: &Path) -> Result<()> {
 /// Sharding keeps the feature and removes the scaling: 256 buckets hold the
 /// same directories at a few thousand entries each.
 ///
-/// The last two hex digits, not the first: sandbox ids are UUIDv7, whose
-/// leading bytes are a millisecond timestamp and therefore identical for every
-/// sandbox created in the same period -- head-sharding would put a burst in one
-/// bucket. The trailing bytes are random.
+/// The last byte, not the first: sandbox ids are UUIDv7, whose leading bytes
+/// are a millisecond timestamp and therefore identical for every sandbox
+/// created in the same period -- head-sharding would put a burst in one bucket.
+/// The trailing bytes are random.
 fn serial_shard(id: SandboxId) -> String {
-    let hex: String = id
-        .to_string()
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .collect();
-    // Hex digits are ASCII, so a byte range is also a character boundary.
-    match hex.get(hex.len().saturating_sub(2)..) {
-        Some(tail) if tail.len() == 2 => tail.to_string(),
-        // Unreachable for a parsed UUID; a directory named "00" beats a panic.
-        _ => "00".to_string(),
-    }
+    // A UUID's string form is its 16 bytes in order, so the last two hex
+    // digits are exactly the final byte. Taking it directly avoids formatting
+    // and rescanning all 32.
+    format!("{:02x}", id.into_inner().as_bytes()[15])
 }
 
 #[cfg(test)]
