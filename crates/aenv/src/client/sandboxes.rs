@@ -6,6 +6,12 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 #[derive(Debug, Serialize)]
+pub struct SandboxVolumeMount {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
 pub struct NewSandbox<'a> {
     #[serde(rename = "templateID")]
     pub template_id: &'a str,
@@ -13,7 +19,7 @@ pub struct NewSandbox<'a> {
     pub timeout: Option<u32>,
     pub secure: bool,
     #[serde(skip_serializing_if = "Option::is_none", rename = "volumeMounts")]
-    pub volume_mounts: Option<HashMap<String, String>>,
+    pub volume_mounts: Option<Vec<SandboxVolumeMount>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -29,7 +35,7 @@ pub struct NewColdSandbox<'a> {
     pub disk_size_mb: Option<u32>,
     pub secure: bool,
     #[serde(skip_serializing_if = "Option::is_none", rename = "volumeMounts")]
-    pub volume_mounts: Option<HashMap<String, String>>,
+    pub volume_mounts: Option<Vec<SandboxVolumeMount>>,
 }
 
 #[derive(Deserialize)]
@@ -86,7 +92,7 @@ impl Client {
             template_id,
             timeout,
             secure: true,
-            volume_mounts,
+            volume_mounts: volume_mounts.map(volume_mounts_to_model),
         };
         let resp = handle_status(self.post("/sandboxes").send_json(&body))?;
         let sandbox: Sandbox = resp.into_json()?;
@@ -110,7 +116,7 @@ impl Client {
             memory_mb,
             disk_size_mb,
             secure: true,
-            volume_mounts,
+            volume_mounts: volume_mounts.map(volume_mounts_to_model),
         };
         let resp = handle_status(self.post("/sandboxes-cold").send_json(&body))?;
         let sandbox: Sandbox = resp.into_json()?;
@@ -182,9 +188,20 @@ impl Client {
     }
 }
 
+fn volume_mounts_to_model(mounts: HashMap<String, String>) -> Vec<SandboxVolumeMount> {
+    let mut mounts = mounts
+        .into_iter()
+        .map(|(path, name)| SandboxVolumeMount { name, path })
+        .collect::<Vec<_>>();
+    mounts.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    mounts
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{NewColdSandbox, NewSandbox, RefreshSandbox};
+    use std::collections::HashMap;
+
+    use super::{volume_mounts_to_model, NewColdSandbox, NewSandbox, RefreshSandbox};
 
     #[test]
     fn new_sandbox_serializes_template_start() {
@@ -192,13 +209,23 @@ mod tests {
             template_id: "base-template",
             timeout: Some(300),
             secure: true,
-            volume_mounts: None,
+            volume_mounts: Some(volume_mounts_to_model(HashMap::from([
+                ("/workspace".to_owned(), "source".to_owned()),
+                ("/data".to_owned(), "dataset".to_owned()),
+            ]))),
         };
 
         let value = serde_json::to_value(body).unwrap();
         assert_eq!(value["templateID"], "base-template");
         assert_eq!(value["timeout"], 300);
         assert_eq!(value["secure"], true);
+        assert_eq!(
+            value["volumeMounts"],
+            serde_json::json!([
+                {"name": "dataset", "path": "/data"},
+                {"name": "source", "path": "/workspace"}
+            ])
+        );
         assert!(value.get("cpuCount").is_none());
         assert!(value.get("memoryMB").is_none());
     }

@@ -102,8 +102,37 @@ fn end_at(expires_at: Option<SystemTime>) -> chrono::DateTime<chrono::Utc> {
         ))
 }
 
-fn volume_mounts_model(mounts: &HashMap<String, String>) -> Option<HashMap<String, String>> {
-    (!mounts.is_empty()).then(|| mounts.clone())
+fn volume_mounts_model(
+    mounts: &HashMap<String, String>,
+) -> Option<Vec<models::SandboxVolumeMount>> {
+    if mounts.is_empty() {
+        return None;
+    }
+
+    let mut mounts = mounts
+        .iter()
+        .map(|(path, name)| models::SandboxVolumeMount::new(name.clone(), path.clone()))
+        .collect::<Vec<_>>();
+    mounts.sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    Some(mounts)
+}
+
+fn volume_mounts_from_model(
+    mounts: &[models::SandboxVolumeMount],
+) -> Result<HashMap<String, String>, models::Error> {
+    let mut result = HashMap::with_capacity(mounts.len());
+    for mount in mounts {
+        if result
+            .insert(mount.path.clone(), mount.name.clone())
+            .is_some()
+        {
+            return Err(ApiImpl::error(
+                400,
+                format!("volume mount path is duplicated: {}", mount.path),
+            ));
+        }
+    }
+    Ok(result)
 }
 
 #[derive(Default)]
@@ -718,12 +747,21 @@ impl Sandboxes<()> for ApiImpl {
             ));
         }
 
+        let requested_volume_mounts = match body.volume_mounts.as_deref() {
+            Some(mounts) => match volume_mounts_from_model(mounts) {
+                Ok(mounts) => Some(mounts),
+                Err(error) => {
+                    return Ok(SandboxesColdPostResponse::Status400_BadRequest(error));
+                }
+            },
+            None => None,
+        };
         let PreparedVolumeMounts {
             owner: pending_volume_owner,
             drives: volume_drives,
             mounts: volume_mounts,
             volume_ids: reserved_volume_ids,
-        } = match prepare_volume_mounts(self, body.volume_mounts.as_ref()).await {
+        } = match prepare_volume_mounts(self, requested_volume_mounts.as_ref()).await {
             Ok(prepared) => prepared,
             Err(error) if error.code >= 500 => {
                 return Ok(SandboxesColdPostResponse::Status500_ServerError(error));
@@ -922,8 +960,15 @@ impl Sandboxes<()> for ApiImpl {
 
         let extra_drives_in_snapshot =
             body.volume_mounts.is_none() && !snapshot.committed().volume_snapshots.is_empty();
-        let (requested_volume_mounts, restored_volume_ids) = if body.volume_mounts.is_some() {
-            (body.volume_mounts.clone(), Vec::new())
+        let (requested_volume_mounts, restored_volume_ids) = if let Some(mounts) =
+            body.volume_mounts.as_deref()
+        {
+            match volume_mounts_from_model(mounts) {
+                Ok(mounts) => (Some(mounts), Vec::new()),
+                Err(error) => {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(error));
+                }
+            }
         } else {
             match restore_snapshot_volume_mounts(self, &snapshot).await {
                 Ok((mounts, volume_ids)) => ((!mounts.is_empty()).then_some(mounts), volume_ids),
@@ -1877,6 +1922,18 @@ impl Sandboxes<()> for ApiImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_mount_models_reject_duplicate_paths() {
+        let mounts = vec![
+            models::SandboxVolumeMount::new("first".to_owned(), "/data".to_owned()),
+            models::SandboxVolumeMount::new("second".to_owned(), "/data".to_owned()),
+        ];
+
+        let error = volume_mounts_from_model(&mounts).unwrap_err();
+        assert_eq!(error.code, 400);
+        assert!(error.message.contains("duplicated"));
+    }
 
     #[test]
     fn parse_metadata_filter_with_none_returns_none() {

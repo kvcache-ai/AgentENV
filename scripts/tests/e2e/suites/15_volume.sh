@@ -98,7 +98,7 @@ cold_payload=$(jq -nc \
     image: $image,
     timeout: 300,
     autoPause: false,
-    volumeMounts: {($mount_path): $volume_id}
+    volumeMounts: [{name: $volume_id, path: $mount_path}]
   }')
 api_post "/sandboxes-cold" "${cold_payload}"
 assert_status "${HTTP_STATUS}" "201" "create cold-image sandbox with a volume"
@@ -139,7 +139,7 @@ track_sandbox "${restored_sandbox_id}"
 api_get "/sandboxes/${restored_sandbox_id}"
 assert_status "${HTTP_STATUS}" "200" "get restored cold-image sandbox"
 restored_volume_id="$(echo "${HTTP_BODY}" | jq -r \
-  --arg path "${VOLUME_MOUNT_PATH}" '.volumeMounts[$path] // empty')"
+  --arg path "${VOLUME_MOUNT_PATH}" '.volumeMounts[] | select(.path == $path) | .name')"
 assert_not_empty "${restored_volume_id}" "automatically restored volume ID is present"
 assert_not_eq "${restored_volume_id}" "${source_volume_id}" \
   "volume snapshot restore creates an independent volume"

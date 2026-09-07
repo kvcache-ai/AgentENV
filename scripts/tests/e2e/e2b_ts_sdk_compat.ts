@@ -2,7 +2,7 @@
 /**
  * E2B TypeScript SDK compatibility checks for AgentENV.
  */
-import { Sandbox, Template, type BuildInfo } from "e2b";
+import { Sandbox, Template, Volume, type BuildInfo } from "e2b";
 
 function log(message: string): void {
   console.log(`[e2b-ts-sdk] ${message}`);
@@ -40,6 +40,8 @@ async function main(): Promise<void> {
     process.env.E2B_COMPAT_TEMPLATE_NAME ?? `e2b-ts-sdk-${Date.now()}`;
   const publicTemplate = (process.env.AENV_TEMPLATE_ID ?? "").trim();
   const derivedTemplateName = `${templateName}-from-template`;
+  const volumeName = `${templateName}-volume`;
+  const volumeMountPath = "/volume";
   const baseImage = process.env.E2B_COMPAT_USER_IMAGE ?? "ghcr.io/linuxserver/baseimage-ubuntu:noble";
   const workdir = `/tmp/${templateName}`;
   const derivedWorkdir = `/tmp/${derivedTemplateName}`;
@@ -58,6 +60,7 @@ async function main(): Promise<void> {
   let derivedBuildInfo: BuildInfo | null = null;
   let sandbox: Sandbox | null = null;
   let derivedSandbox: Sandbox | null = null;
+  let volumeId: string | null = null;
 
   try {
     log(`building template ${templateName} from ${baseImage}`);
@@ -88,7 +91,26 @@ async function main(): Promise<void> {
     check(buildInfo.name === templateName, "template build returned the wrong name");
     log(`template ready: templateId=${buildInfo.templateId} buildId=${buildInfo.buildId}`);
 
-    log("creating sandbox from SDK-built template");
+    log(`creating and connecting volume ${volumeName}`);
+    const createdVolume = await Volume.create(volumeName, connOpts);
+    volumeId = createdVolume.volumeId;
+    check(!!volumeId, "volume create returned an empty volumeId");
+    check(createdVolume.name === volumeName, "volume create returned the wrong name");
+
+    const volumeInfo = await Volume.getInfo(volumeId, connOpts);
+    check(volumeInfo.volumeId === volumeId, "volume getInfo returned the wrong volumeId");
+    check(volumeInfo.name === volumeName, "volume getInfo returned the wrong name");
+
+    const connectedVolume = await Volume.connect(volumeId, connOpts);
+    check(connectedVolume.volumeId === volumeId, "volume connect returned the wrong volumeId");
+    const listedVolumes = await Volume.list(connOpts);
+    check(
+      listedVolumes.some((item) => item.volumeId === volumeId),
+      "Volume.list did not include the created volume in the first page",
+    );
+    log(`volume ready: volumeId=${volumeId}`);
+
+    log("creating sandbox from SDK-built template with an SDK volume mount");
     sandbox = await Sandbox.create(templateName, {
       metadata: {
         suite: "e2b-ts-sdk",
@@ -96,6 +118,9 @@ async function main(): Promise<void> {
       },
       timeoutMs: 90_000,
       secure: true,
+      volumeMounts: {
+        [volumeMountPath]: connectedVolume,
+      },
       ...connOpts,
     });
     check(!!sandbox.sandboxId, "sandbox create returned an empty sandboxId");
@@ -114,7 +139,9 @@ async function main(): Promise<void> {
             `printf 'marker=' && cat marker.txt && ` +
             `printf '\\nworkdir=' && cat workdir.txt && ` +
             `printf '\\nstartup=' && cat startup-ready.txt && ` +
-            `printf '\\nprocess=%s' "$pid_line"`,
+            `printf '\\nprocess=%s' "$pid_line" && ` +
+            `printf '${buildMarker}' > ${volumeMountPath}/sdk-volume-marker && ` +
+            `printf '\\nvolume=' && cat ${volumeMountPath}/sdk-volume-marker`,
           {
             cwd: workdir,
             timeoutMs: 30_000,
@@ -132,6 +159,10 @@ async function main(): Promise<void> {
     check(
       result.stdout.includes(`agentenv-startup-${startupMarker}`),
       "startCmd process was not preserved in the template snapshot",
+    );
+    check(
+      result.stdout.includes(`volume=${buildMarker}`),
+      "SDK-mounted volume was not writable from the sandbox",
     );
     log("command execution returned expected build artifacts and startup state");
 
@@ -238,6 +269,14 @@ async function main(): Promise<void> {
         await sandbox.kill();
       } catch (error) {
         log(`cleanup sandbox kill failed: ${error}`);
+      }
+    }
+
+    if (volumeId !== null) {
+      try {
+        await Volume.destroy(volumeId, connOpts);
+      } catch (error) {
+        log(`cleanup volume destroy failed: ${error}`);
       }
     }
 

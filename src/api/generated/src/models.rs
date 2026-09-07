@@ -1887,11 +1887,11 @@ pub struct ListedSandbox {
     #[validate(custom(function = "check_xss_string"))]
     pub envd_version: String,
 
-    /// Map of absolute guest mount paths to volume IDs or names.
+    /// Volumes to mount in the sandbox.
     #[serde(rename = "volumeMounts")]
-    #[validate(custom(function = "check_xss_map_string"))]
+    #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub volume_mounts: Option<std::collections::HashMap<String, String>>,
+    pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
 }
 
 impl ListedSandbox {
@@ -1989,7 +1989,7 @@ impl std::str::FromStr for ListedSandbox {
             pub metadata: Vec<std::collections::HashMap<String, String>>,
             pub state: Vec<models::SandboxState>,
             pub envd_version: Vec<String>,
-            pub volume_mounts: Vec<std::collections::HashMap<String, String>>,
+            pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -2604,11 +2604,11 @@ pub struct NewColdSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<std::collections::HashMap<String, crate::types::Object>>,
 
-    /// Map of absolute guest mount paths to volume IDs or names.
+    /// Volumes to mount in the sandbox.
     #[serde(rename = "volumeMounts")]
-    #[validate(custom(function = "check_xss_map_string"))]
+    #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub volume_mounts: Option<std::collections::HashMap<String, String>>,
+    pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
 
     /// CPU cores for the cold-start sandbox.
     #[serde(rename = "cpuCount")]
@@ -2747,7 +2747,7 @@ impl std::str::FromStr for NewColdSandbox {
             pub env_vars: Vec<std::collections::HashMap<String, String>>,
             pub custom_extension_params:
                 Vec<std::collections::HashMap<String, crate::types::Object>>,
-            pub volume_mounts: Vec<std::collections::HashMap<String, String>>,
+            pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
             pub cpu_count: Vec<u32>,
             pub memory_mb: Vec<u32>,
             pub disk_size_mb: Vec<u32>,
@@ -2992,11 +2992,11 @@ pub struct NewSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<Nullable<std::collections::HashMap<String, crate::types::Object>>>,
 
-    /// Map of absolute guest mount paths to volume IDs or names.
+    /// Volumes to mount in the sandbox.
     #[serde(rename = "volumeMounts")]
-    #[validate(custom(function = "check_xss_map_string"))]
+    #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub volume_mounts: Option<std::collections::HashMap<String, String>>,
+    pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
 }
 
 impl NewSandbox {
@@ -3092,7 +3092,7 @@ impl std::str::FromStr for NewSandbox {
             pub custom_extension_params:
                 Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub mcp: Vec<std::collections::HashMap<String, crate::types::Object>>,
-            pub volume_mounts: Vec<std::collections::HashMap<String, String>>,
+            pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -5227,11 +5227,11 @@ pub struct SandboxDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle: Option<models::SandboxLifecycle>,
 
-    /// Map of absolute guest mount paths to volume IDs or names.
+    /// Volumes to mount in the sandbox.
     #[serde(rename = "volumeMounts")]
-    #[validate(custom(function = "check_xss_map_string"))]
+    #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub volume_mounts: Option<std::collections::HashMap<String, String>>,
+    pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
 }
 
 impl SandboxDetail {
@@ -5367,7 +5367,7 @@ impl std::str::FromStr for SandboxDetail {
             pub state: Vec<models::SandboxState>,
             pub network: Vec<models::SandboxNetworkConfig>,
             pub lifecycle: Vec<models::SandboxLifecycle>,
-            pub volume_mounts: Vec<std::collections::HashMap<String, String>>,
+            pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -6899,6 +6899,159 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxTimeo
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into SandboxTimeoutRequest - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxVolumeMount {
+    /// Volume ID or unique name.
+    #[serde(rename = "name")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub name: String,
+
+    /// Absolute guest mount path.
+    #[serde(rename = "path")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub path: String,
+}
+
+impl SandboxVolumeMount {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(name: String, path: String) -> SandboxVolumeMount {
+        SandboxVolumeMount { name, path }
+    }
+}
+
+/// Converts the SandboxVolumeMount value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxVolumeMount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("name".to_string()),
+            Some(self.name.to_string()),
+            Some("path".to_string()),
+            Some(self.path.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxVolumeMount value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxVolumeMount {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub name: Vec<String>,
+            pub path: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxVolumeMount".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "name" => intermediate_rep.name.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "path" => intermediate_rep.path.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing SandboxVolumeMount".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxVolumeMount {
+            name: intermediate_rep
+                .name
+                .into_iter()
+                .next()
+                .ok_or_else(|| "name missing in SandboxVolumeMount".to_string())?,
+            path: intermediate_rep
+                .path
+                .into_iter()
+                .next()
+                .ok_or_else(|| "path missing in SandboxVolumeMount".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxVolumeMount> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxVolumeMount>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxVolumeMount>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxVolumeMount - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxVolumeMount> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxVolumeMount as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxVolumeMount - {err}"#
                     )),
                 }
             }

@@ -206,11 +206,20 @@ curl -fsS -X POST "$AENV_URL/sandboxes" \
   -H "Content-Type: application/json" \
   -d '{
     "templateID": "ubuntu",
-    "volumeMounts": {
-      "/workspace/data": "job-42-data"
-    }
+    "volumeMounts": [
+      {
+        "name": "job-42-data",
+        "path": "/workspace/data"
+      }
+    ]
   }'
 ```
+
+The official E2B SDK can create, connect, list, and mount AgentENV volumes. Its
+`Volume.list()` method returns the first bounded page because the SDK does not expose
+AgentENV's pagination cursor. AgentENV also does not implement E2B's standalone
+`/volumecontent` file API; read and write volume content through a sandbox where the
+volume is mounted instead.
 
 List and inspect volumes:
 

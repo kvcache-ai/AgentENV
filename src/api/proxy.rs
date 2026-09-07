@@ -1948,22 +1948,22 @@ mod tests {
     }
 
     #[test]
-    fn e2b_volume_mounts_use_a_path_to_volume_map() {
+    fn e2b_volume_mounts_use_the_sdk_array_representation() {
         let request: agentenv_http_server::models::NewSandbox = serde_json::from_value(json!({
-            "templateID": "template",
-            "volumeMounts": {"/mnt/data": "vol_123"}
-        }))
-        .expect("E2B volumeMounts map should deserialize");
-        assert_eq!(
-            request.volume_mounts.unwrap().get("/mnt/data"),
-            Some(&"vol_123".to_string())
-        );
-
-        serde_json::from_value::<agentenv_http_server::models::NewSandbox>(json!({
             "templateID": "template",
             "volumeMounts": [{"name": "vol_123", "path": "/mnt/data"}]
         }))
-        .expect_err("array form is not the issue 211 API");
+        .expect("E2B volumeMounts array should deserialize");
+        let mounts = request.volume_mounts.unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].name, "vol_123");
+        assert_eq!(mounts[0].path, "/mnt/data");
+
+        serde_json::from_value::<agentenv_http_server::models::NewSandbox>(json!({
+            "templateID": "template",
+            "volumeMounts": {"/mnt/data": "vol_123"}
+        }))
+        .expect_err("map form is not the E2B API");
     }
 
     #[tokio::test]

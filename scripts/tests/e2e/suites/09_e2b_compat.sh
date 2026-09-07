@@ -149,8 +149,9 @@ fi
 ts_sdk_script="${SUITE_DIR}/../e2b_ts_sdk_compat.ts"
 tsx_bin="${SUITE_DIR}/../node_modules/.bin/tsx"
 if [[ -f "$ts_sdk_script" ]] && command -v npm >/dev/null 2>&1; then
-  log "Installing TypeScript SDK dependencies"
-  (cd "${SUITE_DIR}/.." && npm install --no-save --package-lock=false e2b@latest 2>&1)
+  e2b_ts_sdk_version="${E2B_COMPAT_TS_SDK_VERSION:-2.38.0}"
+  log "Installing TypeScript SDK dependencies (e2b@${e2b_ts_sdk_version})"
+  (cd "${SUITE_DIR}/.." && npm install --no-save --package-lock=false "e2b@${e2b_ts_sdk_version}" 2>&1)
   if ! "$tsx_bin" --version >/dev/null 2>&1; then
     warn "tsx not available after npm install; skipping TypeScript SDK checks"
     _pass "skipped TypeScript SDK checks (tsx not available)"
@@ -159,13 +160,13 @@ if [[ -f "$ts_sdk_script" ]] && command -v npm >/dev/null 2>&1; then
   log "Running: e2b TypeScript SDK compatibility (${ts_sdk_script})"
   if command -v timeout >/dev/null 2>&1; then
     if sdk_output=$(timeout "${sdk_timeout}" "$tsx_bin" "$ts_sdk_script" 2>&1); then
-      _pass "e2b TypeScript SDK template build, startCmd/readyCmd, sandbox lifecycle, and commands"
+      _pass "e2b TypeScript SDK template, volume mount, sandbox lifecycle, and commands"
     else
       log "e2b TypeScript SDK output: ${sdk_output:0:1200}"
       _fail "e2b TypeScript SDK compatibility" "exit 0" "non-zero"
     fi
   elif sdk_output=$("$tsx_bin" "$ts_sdk_script" 2>&1); then
-    _pass "e2b TypeScript SDK template build, startCmd/readyCmd, sandbox lifecycle, and commands"
+    _pass "e2b TypeScript SDK template, volume mount, sandbox lifecycle, and commands"
   else
     log "e2b TypeScript SDK output: ${sdk_output:0:1200}"
     _fail "e2b TypeScript SDK compatibility" "exit 0" "non-zero"

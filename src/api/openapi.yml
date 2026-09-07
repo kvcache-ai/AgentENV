@@ -301,11 +301,24 @@ components:
           type: string
           description: OCI or OverlayBD image reference for the initial content.
 
-    VolumeMounts:
+    SandboxVolumeMount:
       type: object
-      description: Map of absolute guest mount paths to volume IDs or names.
-      additionalProperties:
-        type: string
+      required:
+        - name
+        - path
+      properties:
+        name:
+          type: string
+          description: Volume ID or unique name.
+        path:
+          type: string
+          description: Absolute guest mount path.
+
+    VolumeMounts:
+      type: array
+      description: Volumes to mount in the sandbox.
+      items:
+        $ref: "#/components/schemas/SandboxVolumeMount"
 
     AttachedDriveSource:
       type: object
