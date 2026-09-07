@@ -34,6 +34,15 @@ make deploy-up
 before starting the stack. The Rust and Go toolchains are installed in the image
 build stages, so they are not required on the host.
 
+Runtime nodes mount the host's upstream DNS configuration read-only for guest
+networks, including template builders. The `make deploy-*` targets select
+`/run/systemd/resolve/resolv.conf` when available, otherwise `/etc/resolv.conf`.
+Override `HOST_RESOLV_CONF` with an absolute path to a resolver file containing
+DNS servers reachable from guests; loopback addresses such as `127.0.0.53` and
+Docker's `127.0.0.11` cannot be used by guests. Direct `docker compose` commands
+default to `/run/systemd/resolve/resolv.conf`; set `HOST_RESOLV_CONF` explicitly
+on hosts without that file. Containers retain Docker DNS for service discovery.
+
 To build without starting, run `make deploy-build`. To start images that are
 already built, run `make deploy-up-no-build`:
 

@@ -25,7 +25,7 @@ enum Cmd {
     /// Waits for the build to complete by default; exits non-zero on failure. Use -d to return immediately.
     Pull(commands::pull::Args),
     /// Build a template from a local Dockerfile
-    Build(commands::build::Args),
+    Build(Box<commands::build::Args>),
     /// Start a sandbox and attach an interactive shell
     Start(commands::start::Args),
     /// Run a command in a sandbox
@@ -68,7 +68,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Auth => commands::auth::run(),
         Cmd::Pull(a) => commands::pull::run(a),
-        Cmd::Build(a) => commands::build::run(a),
+        Cmd::Build(a) => commands::build::run(*a),
         Cmd::Start(a) => commands::start::run(a),
         Cmd::Exec(a) => commands::exec::run(a),
         Cmd::Upload(a) => commands::upload::run(a),

@@ -21,7 +21,9 @@ use crate::snapshot::repository::backends::common::{
     materialize_volume_image_config, write_dense_overlaybd_layer_to_file,
 };
 use crate::snapshot::repository::interfaces::SnapshotRepository;
-use crate::snapshot::repository::{RepositoryError, RepositoryResult, VolumeRecordPage};
+use crate::snapshot::repository::{
+    BuildCacheState, RepositoryError, RepositoryResult, VolumeRecordPage,
+};
 use crate::snapshot::{
     CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
     PersistedDiskImagePublication, SnapshotAlias, SnapshotId, SnapshotListFilter,
@@ -73,6 +75,43 @@ impl OssSnapshotRepository {
             .exists(&OssSnapshotArtifactLayout::record_key(id))
             .await
             .map_err(|e| RepositoryError::backend(format!("check snapshot record '{id}'"), e))
+    }
+
+    async fn update_build_cache<T>(
+        &self,
+        update: impl Fn(&mut BuildCacheState) -> RepositoryResult<T>,
+    ) -> RepositoryResult<T> {
+        let key = "template-build/cache-head.json";
+        for _ in 0..MAX_VOLUME_CAS_ATTEMPTS {
+            let (mut state, etag) = match self.client.get_bytes_with_etag(key).await {
+                Ok((bytes, Some(etag))) => (BuildCacheState::decode(&bytes)?, Some(etag)),
+                Ok((_, None)) => {
+                    return Err(RepositoryError::InvalidRequest {
+                        reason: "build cache publication requires object storage ETags".to_owned(),
+                    })
+                }
+                Err(error) if OssClient::is_not_found_error(&error) => {
+                    (BuildCacheState::default(), None)
+                }
+                Err(error) => {
+                    return Err(RepositoryError::backend("read build cache state", error))
+                }
+            };
+            let result = update(&mut state)?;
+            let bytes = serde_json::to_vec(&state)
+                .map_err(|error| RepositoryError::backend("encode build cache state", error))?;
+            if self
+                .client
+                .put_bytes_conditionally(key, bytes, etag.as_deref())
+                .await
+                .map_err(|error| RepositoryError::backend("update build cache state", error))?
+            {
+                return Ok(result);
+            }
+        }
+        Err(RepositoryError::InvalidRequest {
+            reason: "build cache state changed too often during publication".to_owned(),
+        })
     }
 }
 
@@ -692,6 +731,31 @@ impl SnapshotRepository for OssSnapshotRepository {
             ),
             source: None,
         })
+    }
+
+    async fn get_build_cache_state(&self) -> RepositoryResult<BuildCacheState> {
+        match self
+            .client
+            .get_bytes("template-build/cache-head.json")
+            .await
+        {
+            Ok(bytes) => BuildCacheState::decode(&bytes),
+            Err(error) if OssClient::is_not_found_error(&error) => Ok(BuildCacheState::default()),
+            Err(error) => Err(RepositoryError::backend("read build cache head", error)),
+        }
+    }
+
+    async fn replace_build_cache_head(&self, volume_id: &str) -> RepositoryResult<Option<String>> {
+        self.update_build_cache(|state| state.replace(volume_id))
+            .await
+    }
+
+    async fn forget_retired_build_cache(&self, volume_id: &str) -> RepositoryResult<()> {
+        self.update_build_cache(|state| {
+            state.retired.remove(volume_id);
+            Ok(())
+        })
+        .await
     }
 
     async fn publish_volume_backing(

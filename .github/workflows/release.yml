@@ -243,6 +243,7 @@ jobs:
         with:
           body_path: CHANGES.md
           files: |
+            config/buildkit-version
             dist/aenv-linux-x86_64
             dist/aenv-linux-aarch64
             dist/aenv-darwin-x86_64

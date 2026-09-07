@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use tokio::time::Duration;
 use tonic::Request;
 
@@ -149,6 +149,7 @@ impl ProcessHandle {
                 process: Some(selector),
                 signal: signal as i32,
             }))
+            .boxed()
             .await
             .context("failed to send signal")?;
         Ok(())
@@ -188,6 +189,10 @@ pub struct Executor {
 }
 
 impl Executor {
+    pub(crate) fn for_endpoint(address: String, token: Option<super::EnvdAccessToken>) -> Self {
+        Self::new(EnvdInstance::new(address, token))
+    }
+
     pub(super) fn new(envd_instance: EnvdInstance) -> Self {
         Self { envd_instance }
     }
@@ -205,8 +210,11 @@ impl Executor {
         args: &[&str],
         opts: &ProcessOpts,
     ) -> Result<ProcessOutput> {
-        let mut handle = self.start_process_inner(cmd, args, opts, false).await?;
-        handle.wait().await
+        let mut handle = self
+            .start_process_inner(cmd, args, opts, false)
+            .boxed()
+            .await?;
+        handle.wait().boxed().await
     }
 
     /// Start a long-running process and return a [`ProcessHandle`].
@@ -259,15 +267,16 @@ impl Executor {
             stdin: Some(stdin_enabled),
         });
 
-        let mut client = self.envd_instance.process_client().await?;
+        let mut client = self.envd_instance.process_client().boxed().await?;
         let mut stream = client
             .start(request)
+            .boxed()
             .await
             .context("failed to start process via envd")?
             .into_inner();
 
         // Wait for the StartEvent to learn the PID.
-        let pid = Self::wait_for_start_event(&mut stream).await?;
+        let pid = Self::wait_for_start_event(&mut stream).boxed().await?;
 
         Ok(ProcessHandle {
             pid,

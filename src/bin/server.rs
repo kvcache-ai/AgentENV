@@ -170,7 +170,10 @@ async fn main() -> anyhow::Result<()> {
         config.sandbox_proxy.domains.clone(),
         api_key,
     ));
-    let app = server::new(api_impl);
+    if let Err(error) = api_impl.recover_image_builds().await {
+        warn!(error = %format_args!("{error:#}"), "build recovery unavailable; will retry after startup");
+    }
+    let app = server::new(Arc::clone(&api_impl));
     let shutdown_orchestrator = Arc::clone(&orchestrator);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -183,9 +186,12 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     info!(target: "agentenv", addr = %addr, "API server listening");
+    let build_cleanup = api_impl.start_image_build_cleanup();
 
     let shutdown_cleanup = tokio::spawn(async move {
         if let Ok(()) = shutdown_rx.await {
+            build_cleanup.abort();
+            let _ = build_cleanup.await;
             if let Some(mut handle) = reporter.take() {
                 info!(target: "agentenv", "stopping observability reporter before process exit");
                 if let Err(err) = handle.shutdown().await {

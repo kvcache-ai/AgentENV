@@ -3,6 +3,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=services/api/proto/scheduler.proto");
+    println!("cargo:rerun-if-changed=src/image/content.proto");
     emit_git_rerun_inputs();
 
     tonic_prost_build::configure()
@@ -13,6 +14,11 @@ fn main() {
             &["services/api/proto"],
         )
         .expect("failed to compile scheduler proto for Rust gRPC client");
+
+    tonic_prost_build::configure()
+        .build_server(true)
+        .compile_protos(&["src/image/content.proto"], &["src/image"])
+        .expect("failed to compile content store client");
 
     let commit = resolve_git_commit().unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=AENV_GIT_COMMIT={commit}");

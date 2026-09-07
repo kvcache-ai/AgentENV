@@ -119,6 +119,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
         volume_manager: None,
+        template_build_ids: RwLock::new(HashSet::new()),
     })
 }
 
@@ -2712,6 +2713,222 @@ async fn orchestrator_list_empty_returns_empty() -> Result<()> {
         "empty store should return empty filtered sandbox list"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn buildkit_workers_are_hidden_but_keep_scheduler_bindings() -> Result<()> {
+    let orchestrator = make_orchestrator().await;
+    let id = SandboxId::new();
+    orchestrator.register_template_build(id).await;
+    assert_eq!(orchestrator.list_sandbox_ids().await?, vec![id]);
+    let metadata = orchestrator
+        .create_template_builder(id, create_request(Some(60), &[]))
+        .await?;
+    assert!(metadata.template_builder);
+    assert_eq!(orchestrator.list_sandbox_ids().await?, vec![id]);
+    assert!(orchestrator.list_sandboxes().await?.is_empty());
+    assert!(orchestrator
+        .list_sandboxes_filtered(SandboxListFilter::matches_all())
+        .await?
+        .is_empty());
+    orchestrator.delete_sandbox(id).await?;
+    assert_eq!(orchestrator.list_sandbox_ids().await?, vec![id]);
+    orchestrator.unregister_template_build(id).await;
+    assert!(orchestrator.list_sandbox_ids().await?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn buildkit_worker_shutdown_discards_vm_state() -> Result<()> {
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_on_operation(
+        MockOperation::Pause,
+        Arc::new(|| panic!("disposable workers must not pause")),
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    let mut request = create_request(Some(60), &[]);
+    request
+        .volume_mounts
+        .insert("/var/lib/buildkit".to_owned(), "cache".to_owned());
+    let id = SandboxId::new();
+    orchestrator.create_template_builder(id, request).await?;
+    orchestrator.shutdown().await?;
+    assert!(orchestrator.get_sandbox(&id).await?.is_none());
+    assert_eq!(behavior.stop_calls(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn buildkit_worker_seals_before_stop_without_pause() -> Result<()> {
+    let behavior = Arc::new(MockBehavior::new());
+    let calls = Arc::new(StdMutex::new(Vec::new()));
+    for operation in [
+        MockOperation::Stop,
+        MockOperation::SnapshotVolumes,
+        MockOperation::Pause,
+    ] {
+        let calls = calls.clone();
+        behavior.set_on_operation(
+            operation,
+            Arc::new(move || {
+                calls.lock().unwrap().push(operation);
+            }),
+        );
+    }
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let mut request = create_request(Some(60), &[]);
+    request
+        .volume_mounts
+        .insert("/var/lib/buildkit".to_owned(), "cache".to_owned());
+    let metadata = orchestrator
+        .create_template_builder(SandboxId::new(), request)
+        .await?;
+    let id = metadata.id;
+    assert!(orchestrator.delete_sandbox_with_volume_status(id).await?);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![MockOperation::SnapshotVolumes, MockOperation::Stop]
+    );
+    assert!(orchestrator.get_sandbox(&id).await?.is_none());
+    assert!(orchestrator.sandboxes.read().await.get(&id).is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn buildkit_worker_eviction_skips_vm_snapshot() -> Result<()> {
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_on_operation(
+        MockOperation::Pause,
+        Arc::new(|| panic!("deletion must not capture VM state")),
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    let mut request = create_request(Some(60), &[]);
+    request.timeout_action = SandboxTimeoutAction::Delete;
+    request
+        .volume_mounts
+        .insert("/var/lib/buildkit".to_owned(), "cache".to_owned());
+    let metadata = orchestrator
+        .create_template_builder(SandboxId::new(), request)
+        .await?;
+    let id = metadata.id;
+    orchestrator
+        .store
+        .update_if_state(&id, &[SandboxState::Running], |metadata| {
+            metadata.expires_at = Some(SystemTime::now() - Duration::from_secs(1));
+        })
+        .await?;
+    assert_eq!(orchestrator.evict_expired_sandboxes().await?, vec![id]);
+    assert_eq!(behavior.stop_calls(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn buildkit_worker_capture_failure_discards_optional_cache() -> Result<()> {
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::SnapshotVolumes,
+        MockAction::Fail {
+            message: "freeze or seal failed".to_owned(),
+        },
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone())).await;
+    let mut request = create_request(Some(60), &[]);
+    request
+        .volume_mounts
+        .insert("/data".to_owned(), "volume".to_owned());
+    let sandbox = orchestrator
+        .create_template_builder(SandboxId::new(), request)
+        .await?;
+    let result = orchestrator
+        .delete_sandbox_with_volume_status(sandbox.id)
+        .await;
+    assert!(!result?);
+    assert_eq!(behavior.stop_calls(), 1);
+    assert!(orchestrator.get_sandbox(&sandbox.id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyhow::Result<()> {
+    use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::volume::{VolumeMode, VolumeRecord, VolumeStatus};
+
+    let temp = TempDir::new()?;
+    let backend = PosixFsBackend::new(PosixFsBackendConfig {
+        root: temp.path().join("repository"),
+        cache_root: Some(temp.path().join("cache")),
+        runtime_cache_root: Some(temp.path().join("runtime")),
+    })?;
+    let repository = backend.repository();
+    let volumes = Arc::new(
+        VolumeManager::open_with_repository(temp.path().join("volumes"), repository.clone())
+            .await?,
+    );
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = TestOrchestrator::new_inner_with_volumes(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+        DisabledSandboxPersister,
+        test_runtime_image_refs(),
+        Some(volumes.clone()),
+    )
+    .await?;
+    let sandbox = orchestrator
+        .create_template_builder(SandboxId::new(), create_request(Some(60), &[]))
+        .await?;
+    let volume = VolumeRecord {
+        id: "vol_missing_backing".to_owned(),
+        name: "missing-backing".to_owned(),
+        mode: VolumeMode::Exclusive,
+        size_mb: 1024,
+        status: VolumeStatus::Ready,
+        reserved_by_sandbox_id: Some(sandbox.id.to_string()),
+        backing_image_config: None,
+        backing_layers: Vec::new(),
+        read_only_mounts: Vec::new(),
+        deleting: false,
+    };
+    repository.create_volume(volume.clone()).await?;
+    let record_path = temp
+        .path()
+        .join("repository/volumes/records")
+        .join(format!("{}.json", volume.id));
+    let owner = sandbox.id.to_string();
+    behavior.set_on_operation(
+        MockOperation::Stop,
+        Arc::new(move || {
+            let record: VolumeRecord =
+                serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+            assert_eq!(
+                record.reserved_by_sandbox_id.as_deref(),
+                Some(owner.as_str()),
+                "ownership must remain held until stop completes"
+            );
+        }),
+    );
+    orchestrator
+        .store
+        .update_if_state(&sandbox.id, &[SandboxState::Running], |metadata| {
+            metadata
+                .volume_mounts
+                .insert("/cache".to_owned(), volume.id.clone());
+        })
+        .await?;
+    let deleted = orchestrator.delete_sandbox(sandbox.id).await;
+    let record = volumes.get(&volume.id).await?;
+    assert_eq!(record.status, VolumeStatus::Failed);
+    deleted?;
+    assert!(orchestrator.store.get(&sandbox.id).await?.is_none());
+    assert!(record.reserved_by_sandbox_id.is_none());
     Ok(())
 }
 

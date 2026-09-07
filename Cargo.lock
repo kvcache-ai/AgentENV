@@ -50,7 +50,6 @@ dependencies = [
  "futures",
  "indicatif",
  "openssl-sys",
- "parse-dockerfile",
  "prost",
  "reqwest 0.13.3",
  "rpassword",
@@ -60,6 +59,7 @@ dependencies = [
  "tabled",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "toml",
  "ureq",
@@ -5356,15 +5356,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "parse-dockerfile"
-version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6bf36e89d16b0fcc540dfe420c99d692c703c436f1ea605195bc0a95651d69e"
-dependencies = [
- "smallvec",
-]
-
-[[package]]
 name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7772,7 +7763,11 @@ checksum = "d25a406cddcc431a75d3d9afc6a7c0f7428d4891dd973e4d54c56b46127bf857"
 dependencies = [
  "futures-util",
  "log",
+ "rustls 0.23.37",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls 0.26.4",
  "tungstenite",
 ]
 
@@ -8112,6 +8107,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.5",
+ "rustls 0.23.37",
+ "rustls-pki-types",
  "sha1",
  "thiserror 2.0.18",
  "utf-8",

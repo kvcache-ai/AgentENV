@@ -314,6 +314,31 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         .await
     }
 
+    async fn get_build_cache_state(
+        &self,
+    ) -> RepositoryResult<crate::snapshot::repository::BuildCacheState> {
+        self.run_catalog("read build cache head", |store| {
+            store.get_build_cache_state()
+        })
+        .await
+    }
+
+    async fn replace_build_cache_head(&self, volume_id: &str) -> RepositoryResult<Option<String>> {
+        let volume_id = volume_id.to_owned();
+        self.run_catalog("replace build cache head", move |store| {
+            store.replace_build_cache_head(&volume_id)
+        })
+        .await
+    }
+
+    async fn forget_retired_build_cache(&self, volume_id: &str) -> RepositoryResult<()> {
+        let volume_id = volume_id.to_owned();
+        self.run_catalog("retire build cache seed", move |store| {
+            store.forget_retired_build_cache(&volume_id)
+        })
+        .await
+    }
+
     async fn get_volume(&self, reference: &str) -> RepositoryResult<Option<VolumeRecord>> {
         let reference = reference.to_owned();
         self.run_catalog("get volume", move |store| store.get_volume(&reference))

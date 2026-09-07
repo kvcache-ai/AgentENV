@@ -98,6 +98,7 @@ pub struct Orchestrator<
     factory: F,
     persister: P,
     sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
+    template_build_ids: RwLock<HashSet<SandboxId>>,
     proxy_routes: RwLock<ProxyRouteTable>,
     next_proxy_route_version: AtomicU64,
     counters: OrchestratorCounters,
@@ -214,6 +215,7 @@ where
             factory,
             persister,
             sandboxes: RwLock::new(HashMap::new()),
+            template_build_ids: RwLock::new(HashSet::new()),
             proxy_routes: RwLock::new(ProxyRouteTable::default()),
             next_proxy_route_version: AtomicU64::new(1),
             counters: OrchestratorCounters::default(),
@@ -400,7 +402,19 @@ where
         let sandbox_id = SandboxId::new();
         let this = Arc::clone(self);
         self.run_cancellation_safe("create", sandbox_id, async move {
-            this.create_sandbox_inner(sandbox_id, request).await
+            this.create_sandbox_inner(sandbox_id, request, false).await
+        })
+        .await
+    }
+
+    pub(crate) async fn create_template_builder(
+        self: &Arc<Self>,
+        build_id: SandboxId,
+        request: CreateSandboxRequest,
+    ) -> Result<SandboxMetadata> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("create_builder", build_id, async move {
+            this.create_sandbox_inner(build_id, request, true).await
         })
         .await
     }
@@ -414,6 +428,7 @@ where
         self: Arc<Self>,
         sandbox_id: SandboxId,
         request: CreateSandboxRequest,
+        template_builder: bool,
     ) -> Result<SandboxMetadata> {
         if let Err(err) = self.ensure_accepting_lifecycle_operations() {
             self.counters.record_create_fail(1);
@@ -476,6 +491,7 @@ where
 
                 let transitional_metadata = SandboxMetadata {
                     id: sandbox_id,
+                    template_builder,
                     snapshot_id: record.id.to_string(),
                     snapshot_alias: record.alias.as_ref().map(ToString::to_string),
                     virtualization_mode: committed.virtualization_mode,
@@ -541,6 +557,7 @@ where
 
                 let transitional_metadata = SandboxMetadata {
                     id: sandbox_id,
+                    template_builder,
                     snapshot_id: image_ref,
                     snapshot_alias: None,
                     virtualization_mode: ConfigManager::global_config().virtualization_mode,
@@ -831,12 +848,25 @@ where
     /// Lists all sandboxes with their metadata.
     #[tracing::instrument(skip(self))]
     pub async fn list_sandboxes(&self) -> Result<Vec<SandboxMetadata>> {
-        Ok(self.store.list().await?)
+        self.list_sandboxes_filtered(SandboxListFilter::matches_all())
+            .await
     }
 
     /// Lists all sandbox IDs currently tracked by the store.
     pub async fn list_sandbox_ids(&self) -> Result<Vec<SandboxId>> {
-        Ok(self.store.list_ids().await?)
+        // Reserve builder routing while its image is resolving and while the
+        // final template is publishing, even when no VM is currently running.
+        let mut ids: HashSet<_> = self.store.list_ids().await?.into_iter().collect();
+        ids.extend(self.template_build_ids.read().await.iter().copied());
+        Ok(ids.into_iter().collect())
+    }
+
+    pub(crate) async fn register_template_build(&self, id: SandboxId) {
+        self.template_build_ids.write().await.insert(id);
+    }
+
+    pub(crate) async fn unregister_template_build(&self, id: SandboxId) {
+        self.template_build_ids.write().await.remove(&id);
     }
 
     /// Lists sandboxes that match the provided filter criteria:
@@ -852,7 +882,13 @@ where
         &self,
         filter: SandboxListFilter,
     ) -> Result<Vec<SandboxMetadata>> {
-        Ok(self.store.list_filtered(filter).await?)
+        Ok(self
+            .store
+            .list_filtered(filter)
+            .await?
+            .into_iter()
+            .filter(|metadata| !metadata.template_builder)
+            .collect())
     }
 
     pub fn get_envd_access_token(&self, metadata: &SandboxMetadata) -> Option<EnvdAccessToken> {
@@ -1003,13 +1039,9 @@ where
     /// the in-progress operation to finish before proceeding with deletion, preventing
     /// races where an ongoing operation might overwrite the `Killing` state.
     pub async fn delete_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
-        let this = Arc::clone(self);
-        self.run_cancellation_safe("delete", sandbox_id, async move {
-            this.snapshot_volume_mounts_before_delete(sandbox_id)
-                .await?;
-            this.delete_sandbox_inner(sandbox_id).await
-        })
-        .await
+        self.delete_sandbox_with_volume_status(sandbox_id)
+            .await
+            .map(|_| ())
     }
 
     async fn snapshot_volume_mounts_before_delete(
@@ -1020,7 +1052,9 @@ where
         // current upper layer. Pause first to seal those writes locally before
         // the final volume state is published during deletion.
         let should_snapshot = self.store.get(&sandbox_id).await?.is_some_and(|metadata| {
-            metadata.state == SandboxState::Running && !metadata.volume_mounts.is_empty()
+            metadata.state == SandboxState::Running
+                && !metadata.template_builder
+                && !metadata.volume_mounts.is_empty()
         });
         if should_snapshot {
             self.pause_sandbox_inner(sandbox_id).await?;
@@ -1028,12 +1062,26 @@ where
         Ok(())
     }
 
+    /// The result lets template builds avoid reusing a failed optional cache.
+    pub(crate) async fn delete_sandbox_with_volume_status(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> Result<bool> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("delete", sandbox_id, async move {
+            this.snapshot_volume_mounts_before_delete(sandbox_id)
+                .await?;
+            this.delete_sandbox_inner(sandbox_id).await
+        })
+        .await
+    }
+
     #[tracing::instrument(
         name = "delete_sandbox",
         skip(self),
         fields(sandbox_id = %sandbox_id)
     )]
-    async fn delete_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+    async fn delete_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<bool> {
         info!("deleting sandbox");
 
         // Attempt to transition to Killing, retrying after waiting whenever we
@@ -1064,7 +1112,7 @@ where
                             }
                             Err(OrchestratorError::SandboxNotFound(_)) => {
                                 info!("sandbox was deleted by a concurrent delete");
-                                return Ok(());
+                                return Ok(false);
                             }
                             Err(e) => return Err(e),
                         }
@@ -1090,7 +1138,7 @@ where
                                 // Sandbox was removed while we waited (e.g. by
                                 // another concurrent delete).
                                 info!("sandbox was deleted while waiting for transitional state");
-                                return Ok(());
+                                return Ok(false);
                             }
                             Err(e) => return Err(e),
                         }
@@ -1153,7 +1201,17 @@ where
         self: &Arc<Self>,
         sandbox_id: SandboxId,
         previous_state: SandboxState,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        if self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .is_some_and(|metadata| metadata.template_builder)
+        {
+            return self
+                .delete_template_builder_impl(sandbox_id, previous_state)
+                .await;
+        }
         let volume_ids = self
             .store
             .get(&sandbox_id)
@@ -1210,7 +1268,73 @@ where
             }
         }
 
-        // Now the sandbox is successfully stopped, remove its metadata.
+        self.remove_deleted_sandbox(sandbox_id).await?;
+        Ok(true)
+    }
+
+    async fn delete_template_builder_impl(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        previous_state: SandboxState,
+    ) -> Result<bool> {
+        let metadata = self.store.get(&sandbox_id).await?;
+        let volume_ids = metadata
+            .map(|metadata| metadata.volume_mounts.into_values().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let (handle, _) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
+        let mut volumes_captured = true;
+
+        let delete_result: anyhow::Result<()> = async {
+            if let Some(handle) = handle.as_ref() {
+                if previous_state == SandboxState::Running && !volume_ids.is_empty() {
+                    if let Err(error) = handle.lock().await.snapshot_volumes().await {
+                        volumes_captured = false;
+                        warn!(%sandbox_id, %error, "builder cache capture failed; discarding cache");
+                    }
+                }
+            }
+            // BuildKit has stopped before finalization; only its cache is retained.
+            if volumes_captured {
+                if let Err(error) = self.publish_sandbox_volume_backings(sandbox_id, &volume_ids).await {
+                    volumes_captured = false;
+                    warn!(%sandbox_id, %error, "builder cache publication failed; discarding cache and releasing worker");
+                }
+            }
+            if let Some(handle) = handle.as_ref() {
+                handle.lock().await.stop().await?;
+            }
+            // Stop all guest writes before another sandbox can acquire a volume,
+            // including when an internal builder discarded its failed capture.
+            if let Some(manager) = self.volume_manager.as_ref() {
+                manager.replace_owner_for(&sandbox_id.to_string(), None, &volume_ids)
+                    .await?;
+            }
+            Ok(())
+        }.await;
+
+        if let Err(error) = delete_result {
+            warn!(?error, "failed to delete sandbox");
+            if let Some(handle) = handle.as_ref() {
+                if let Err(stop_error) = handle.lock().await.stop().await {
+                    warn!(%stop_error, "failed to stop builder after terminal cleanup failure");
+                }
+            }
+            if let Some(metadata) = self.store.get(&sandbox_id).await? {
+                self.finalize_terminal_volumes(&metadata).await;
+            }
+            self.remove_deleted_sandbox(sandbox_id).await?;
+            return Err(OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::Stop,
+                source: error,
+            });
+        }
+
+        self.remove_deleted_sandbox(sandbox_id).await?;
+        Ok(volumes_captured)
+    }
+
+    async fn remove_deleted_sandbox(&self, sandbox_id: SandboxId) -> Result<()> {
         let metadata = self.store.remove(&sandbox_id).await?;
         if let Some(metadata) = metadata {
             self.publish_sandbox_event(
@@ -2153,7 +2277,8 @@ where
             }
             let flush_volumes_before_delete =
                 matches!(metadata.timeout_action, SandboxTimeoutAction::Delete)
-                    && !metadata.volume_mounts.is_empty();
+                    && !metadata.volume_mounts.is_empty()
+                    && !metadata.template_builder;
             let claimed_state = match (metadata.timeout_action, flush_volumes_before_delete) {
                 (SandboxTimeoutAction::Pause, _) => SandboxState::Pausing,
                 (SandboxTimeoutAction::Delete, true) => SandboxState::Pausing,
@@ -2168,14 +2293,14 @@ where
                     SandboxTimeoutAction::Delete if flush_volumes_before_delete => {
                         async {
                             self.pause_sandbox_impl(metadata.id).await?;
-                            self.delete_sandbox_inner(metadata.id).await
+                            self.delete_sandbox_inner(metadata.id).await.map(|_| ())
                         }
                         .await
                     }
-                    SandboxTimeoutAction::Delete => {
-                        self.delete_sandbox_impl(metadata.id, SandboxState::Running)
-                            .await
-                    }
+                    SandboxTimeoutAction::Delete => self
+                        .delete_sandbox_impl(metadata.id, SandboxState::Running)
+                        .await
+                        .map(|_| ()),
                 }
                 .map(|_| true),
                 Ok(false) => Ok(false),
@@ -2698,7 +2823,12 @@ where
                         unreachable!("paused sandboxes should have been filtered out")
                     }
                     SandboxState::Running => {
-                        if let Err(err) = self.pause_sandbox_inner(sandbox_id).await {
+                        let result = if metadata.template_builder {
+                            self.delete_sandbox_inner(sandbox_id).await.map(|_| ())
+                        } else {
+                            self.pause_sandbox_inner(sandbox_id).await
+                        };
+                        if let Err(err) = result {
                             last_failures.push(format!("{sandbox_id}: {err}"));
                         }
                     }
@@ -2846,6 +2976,15 @@ where
             return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
         };
         metadata.secure = secure;
+        self.store.update(metadata).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn set_template_builder_for_test(&self, sandbox_id: &SandboxId) -> Result<()> {
+        let Some(mut metadata) = self.store.get(sandbox_id).await? else {
+            return Err(OrchestratorError::SandboxNotFound(*sandbox_id));
+        };
+        metadata.template_builder = true;
         self.store.update(metadata).await?;
         Ok(())
     }

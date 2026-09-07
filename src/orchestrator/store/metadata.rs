@@ -30,6 +30,9 @@ pub enum NewTimeout {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SandboxMetadata {
     pub id: SandboxId,
+    /// Server-owned template builder, excluded from public sandbox APIs.
+    #[serde(default)]
+    pub template_builder: bool,
     pub snapshot_id: String,
     pub snapshot_alias: Option<String>,
     pub state: SandboxState,
@@ -71,6 +74,7 @@ impl Default for SandboxMetadata {
     fn default() -> Self {
         Self {
             id: SandboxId::new(),
+            template_builder: false,
             snapshot_id: "unknown".to_string(),
             snapshot_alias: None,
             state: SandboxState::Creating,
