@@ -430,7 +430,7 @@ impl UblkDeviceManager {
                     .is_some()
                 {
                     return Err(SandboxCaptureError::terminal(anyhow!(format!(
-                        "restack snapshot overlaybd device {} to {} failed after mutating live runtime: {err:#}",
+                        "restack snapshot overlaybd device {} to {} failed; live runtime may have been mutated: {err:#}",
                         device.dev_id,
                         output_layer_path.display()
                     )))

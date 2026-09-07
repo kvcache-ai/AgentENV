@@ -257,7 +257,9 @@ pub fn validate_mount_path(path: &Path) -> Result<()> {
     if path == Path::new("/") {
         anyhow::bail!("attached drive mountPath must not be /");
     }
-    let raw = path.to_string_lossy();
+    let raw = path
+        .to_str()
+        .context("attached drive mountPath must be valid UTF-8")?;
     if raw.chars().any(char::is_whitespace) || raw.contains(',') || raw.contains(':') {
         anyhow::bail!(
             "attached drive mountPath must not contain whitespace, commas, or colons: {}",
@@ -612,6 +614,13 @@ mod tests {
             PathBuf::from("/workspace/data")
         );
         assert!(normalize_mount_path(PathBuf::from("/workspace/data/../logs")).is_err());
+    }
+
+    #[test]
+    fn mount_path_rejects_non_utf8() {
+        use std::os::unix::ffi::OsStringExt;
+        let mount = PathBuf::from(std::ffi::OsString::from_vec(b"/data/\xff".to_vec()));
+        assert!(validate_mount_path(&mount).is_err());
     }
 
     #[test]

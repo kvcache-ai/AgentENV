@@ -459,7 +459,14 @@ impl UblkDaemonClient {
             dev_id,
             output_layer_path: output_layer_path.to_path_buf(),
         };
-        match self.call(request, SNAPSHOT_TIMEOUT).await? {
+        // A lost reply can follow a successful seal. Only an explicit Error
+        // response establishes that the runtime is still safe to resume.
+        let response = self.call(request, SNAPSHOT_TIMEOUT).await.context(
+            RestackSnapshotTerminalFailure::new(format!(
+                "daemon: restack snapshot dev_id={dev_id} outcome unknown"
+            )),
+        )?;
+        match response {
             DaemonResponse::RestackSnapshotCreated {
                 descriptor,
                 data_stat,
@@ -478,7 +485,10 @@ impl UblkDaemonClient {
             DaemonResponse::Error { message } => {
                 bail!("daemon: restack snapshot dev_id={dev_id} failed: {message}")
             }
-            other => bail!("daemon: unexpected response for restack snapshot: {other:?}"),
+            other => Err(RestackSnapshotTerminalFailure::new(format!(
+                "daemon: unexpected response for restack snapshot: {other:?}"
+            ))
+            .into()),
         }
     }
 
@@ -706,6 +716,30 @@ mod tests {
             .create_overlaybd(Path::new("/img.json"), Path::new("/global.json"))
             .await;
         assert!(err.is_err(), "should fail when no server is listening");
+    }
+
+    #[tokio::test]
+    async fn restack_lost_reply_is_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("restack.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let client = UblkDaemonClient::new_for_test(socket, false);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(matches!(
+                recv_message::<DaemonRequest>(&mut stream).await.unwrap(),
+                Some(DaemonRequest::RestackSnapshot { .. })
+            ));
+            // Consume the request, then close without replying: the client
+            // cannot know whether the live upper was already sealed.
+        });
+
+        let error = client
+            .restack_snapshot(0, Path::new("/snapshot.commit"))
+            .await
+            .unwrap_err();
+        server.await.unwrap();
+        assert!(error.is::<RestackSnapshotTerminalFailure>(), "{error:#}");
     }
 
     #[tokio::test]

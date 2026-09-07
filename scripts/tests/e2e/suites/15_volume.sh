@@ -113,6 +113,22 @@ track_sandbox "${source_sandbox_id}"
 write_volume_files "${source_sandbox_id}"
 verify_volume_files "${source_sandbox_id}"
 
+api_delete "/sandboxes/${source_sandbox_id}"
+assert_status "${HTTP_STATUS}" "204" "delete running sandbox and publish its volume"
+api_get "/volumes/${source_volume_id}"
+assert_status "${HTTP_STATUS}" "200" "get volume after sandbox deletion"
+assert_json_field "${HTTP_BODY}" '.status' "ready" "deleted sandbox volume is reusable"
+api_post "/sandboxes-cold" "${cold_payload}"
+assert_status "${HTTP_STATUS}" "201" "mount deleted sandbox volume in a new sandbox"
+if [[ "${HTTP_STATUS}" != "201" ]]; then
+    error "replacement sandbox create response: ${HTTP_BODY}"
+    exit 1
+fi
+source_sandbox_id="$(echo "${HTTP_BODY}" | jq -r '.sandboxID // empty')"
+assert_not_empty "${source_sandbox_id}" "replacement sandbox ID is present"
+track_sandbox "${source_sandbox_id}"
+verify_volume_files "${source_sandbox_id}"
+
 api_post "/sandboxes/${source_sandbox_id}/snapshots" "$(jq -nc \
   --arg name "${run_name}-snapshot" \
   '{name: $name}')"

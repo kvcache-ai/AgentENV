@@ -192,6 +192,7 @@ pub struct FirecrackerSandbox {
     /// waits out the fallback with no notification.
     rootfs_image_config_path: Option<PathBuf>,
     extra_drive_runtimes: Vec<OverlaybdRuntimeHandle>,
+    frozen_volume_mounts: Vec<(PathBuf, String)>,
     /// Drives added to a committed snapshot at launch time are not represented
     /// in its guest mount namespace. Mount only those drives after envd is
     /// ready; paused-state resumes must preserve the captured mount state.
@@ -464,6 +465,74 @@ impl SandboxBackend for FirecrackerSandbox {
 
     async fn stop(&mut self) -> Result<()> {
         FirecrackerSandbox::stop(self).await
+    }
+
+    async fn freeze_and_snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
+        let started = std::time::Instant::now();
+        let result = async {
+            let mounts = self
+                .launch
+                .common()
+                .extra_drives
+                .iter()
+                .filter(|drive| !drive.read_only() && drive.snapshot_output_dir().is_some())
+                .map(|drive| drive.mount_path().to_path_buf())
+                .collect::<Vec<_>>();
+            for mount in mounts {
+                // An RPC failure leaves the ioctl's outcome unknown, so the VM
+                // cannot safely be returned to service in that case.
+                // Record the mount before awaiting so cancellation leaves a
+                // thaw obligation on the owned sandbox handle.
+                self.frozen_volume_mounts
+                    .push((mount.clone(), String::new()));
+                let output = self
+                    .set_volume_freeze(&mount, None)
+                    .await
+                    .map_err(SandboxCaptureError::terminal)?;
+                if output.exit_code != 0 {
+                    self.frozen_volume_mounts.pop();
+                    anyhow::bail!(
+                        "freeze volume {} failed: {}",
+                        mount.display(),
+                        output.stderr.trim()
+                    );
+                }
+                self.frozen_volume_mounts.last_mut().unwrap().1 = output.stdout.trim().to_owned();
+            }
+            self.snapshot_persistent_volume_drives().await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = result {
+            let error = SandboxCaptureError::from(error);
+            if !error.is_terminal() {
+                self.thaw_volumes().await.map_err(|thaw_error| {
+                    SandboxCaptureError::terminal(anyhow::anyhow!(
+                        "volume capture failed: {error}; thaw failed: {thaw_error:#}"
+                    ))
+                })?;
+            }
+            return Err(error);
+        }
+        debug!(
+            elapsed_ms = started.elapsed().as_millis(),
+            "volume filesystems frozen and sealed"
+        );
+        Ok(())
+    }
+
+    async fn thaw_volumes(&mut self) -> Result<()> {
+        while let Some((mount, device)) = self.frozen_volume_mounts.last().cloned() {
+            let output = self.set_volume_freeze(&mount, Some(&device)).await?;
+            anyhow::ensure!(
+                output.exit_code == 0,
+                "thaw volume {} failed: {}",
+                mount.display(),
+                output.stderr.trim()
+            );
+            self.frozen_volume_mounts.pop();
+        }
+        Ok(())
     }
 
     fn host_interaction_ip(&self) -> Option<std::net::Ipv4Addr> {
@@ -842,7 +911,10 @@ impl FirecrackerSandbox {
     }
 
     async fn create_guest_directory(envd: &EnvdInstance, path: &str) -> Result<()> {
-        Executor::new(envd.clone()).create_dir_all(path).await
+        Executor::new(envd.clone())
+            .with_root_user()
+            .create_dir_all(path)
+            .await
     }
 
     async fn run_guest_command(
@@ -851,7 +923,14 @@ impl FirecrackerSandbox {
         args: Vec<String>,
     ) -> Result<crate::sandbox::process::ProcessOutput> {
         let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-        Executor::new(envd).run_command(&command, &args).await
+        Executor::new(envd)
+            .with_root_user()
+            .run_command_with_opts(
+                &command,
+                &args,
+                &crate::sandbox::ProcessOpts::default().with_cwd("/"),
+            )
+            .await
     }
 
     async fn sync_writable_volume_filesystems(envd: EnvdInstance) -> Result<()> {
@@ -871,6 +950,56 @@ impl FirecrackerSandbox {
             output.stderr.trim()
         );
         Ok(())
+    }
+
+    async fn set_volume_freeze(
+        &self,
+        mount: &Path,
+        frozen_device: Option<&str>,
+    ) -> Result<crate::sandbox::process::ProcessOutput> {
+        let envd = self.envd_instance.clone().context("envd is not running")?;
+        let mount = mount
+            .to_str()
+            .context("volume mount path is not valid UTF-8")?;
+        // Keep one opened filesystem across validation and the ioctl, so an
+        // unmount cannot redirect fsfreeze to the root filesystem hosting envd.
+        let script = r#"
+            set -eu
+            exec 3< "$1"
+            device=$(/agentenv/bin/busybox stat -Lc %d /proc/self/fd/3)
+            if [ "$2" = --freeze ]; then
+                test "$device" != "$(/agentenv/bin/busybox stat -c %d /)"
+            else
+                test "$device" = "$3"
+            fi
+            /agentenv/bin/busybox fsfreeze "$2" /proc/self/fd/3
+            printf '%s\n' "$device"
+        "#;
+        let operation = if frozen_device.is_some() {
+            "--unfreeze"
+        } else {
+            "--freeze"
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+            Executor::new(envd)
+                .with_root_user()
+                .run_command_with_opts(
+                    "/agentenv/bin/busybox",
+                    &[
+                        "sh",
+                        "-c",
+                        script,
+                        "freeze-volume",
+                        mount,
+                        operation,
+                        frozen_device.unwrap_or_default(),
+                    ],
+                    &crate::sandbox::ProcessOpts::default().with_cwd("/"),
+                )
+                .await
+        })
+        .await
+        .context("volume filesystem freeze/thaw timed out")?
     }
 
     async fn mount_guest_path_with_options(
@@ -1192,6 +1321,7 @@ impl FirecrackerSandbox {
             envd.invalidate();
         }
         self.envd_instance = None;
+        self.frozen_volume_mounts.clear();
 
         // Cleanup ublk device (must happen after FC stop, before network cleanup)
         if let Some(runtime) = self.rootfs_runtime.take() {
@@ -1501,6 +1631,7 @@ impl FirecrackerSandbox {
             mem_snapshot_image_config_path: None,
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),
+            frozen_volume_mounts: Vec::new(),
             initial_guest_drive_mounts: Vec::new(),
             live_snapshot_root: None,
             snapshot_compression_override: None,

@@ -552,6 +552,23 @@ impl VolumeManager {
         Ok(())
     }
 
+    /// Keep an incomplete capture unavailable after its sandbox is stopped.
+    pub(crate) async fn fail_backings(
+        &self,
+        owner: &str,
+        volume_ids: &[String],
+    ) -> Result<(), VolumeError> {
+        for volume_id in volume_ids {
+            let mut record = self.get(volume_id).await?;
+            if record.reserved_by_sandbox_id.as_deref() == Some(owner) {
+                record.status = VolumeStatus::Failed;
+                self.persist_catalog(&record).await?;
+                self.cache_record(record).await;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn publish_backings(
         &self,
         owner: &str,
