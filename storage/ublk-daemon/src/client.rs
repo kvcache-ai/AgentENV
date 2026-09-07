@@ -121,6 +121,7 @@ pub struct UblkDaemonSpawnConfig<'a> {
     pub log_file: Option<&'a Path>,
     pub metrics_listen_addr: &'a str,
     pub pool_config: Option<&'a PoolConfig>,
+    pub pool_prewarm_high_watermark: Option<usize>,
     pub p2p_publish_url: Option<&'a str>,
     pub runtime_device_timeout: Duration,
 }
@@ -199,13 +200,7 @@ impl UblkDaemonClient {
 
         if let Some(pool_config) = config.pool_config {
             if config.app_config.is_none() {
-                cmd.arg("--enable-pool")
-                    .arg("--pool-low-watermark")
-                    .arg(pool_config.low_watermark.to_string())
-                    .arg("--pool-high-watermark")
-                    .arg(pool_config.high_watermark.to_string())
-                    .arg("--pool-startup-prewarm")
-                    .arg(pool_config.startup_prewarm.to_string());
+                append_pool_cli_args(&mut cmd, pool_config, config.pool_prewarm_high_watermark);
             }
         }
 
@@ -616,6 +611,24 @@ impl UblkDaemonClient {
     }
 }
 
+fn append_pool_cli_args(
+    cmd: &mut tokio::process::Command,
+    pool_config: &PoolConfig,
+    prewarm_high_watermark: Option<usize>,
+) {
+    cmd.arg("--enable-pool")
+        .arg("--pool-low-watermark")
+        .arg(pool_config.low_watermark.to_string())
+        .arg("--pool-high-watermark")
+        .arg(pool_config.high_watermark.to_string())
+        .arg("--pool-startup-prewarm")
+        .arg(pool_config.startup_prewarm.to_string());
+    if let Some(prewarm_high_watermark) = prewarm_high_watermark {
+        cmd.arg("--pool-prewarm-high-watermark")
+            .arg(prewarm_high_watermark.to_string());
+    }
+}
+
 impl std::fmt::Debug for UblkDaemonClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UblkDaemonClient")
@@ -653,6 +666,39 @@ impl UblkDaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_cli_args_include_prewarm_high_watermark() {
+        let pool_config = PoolConfig {
+            low_watermark: 2,
+            high_watermark: 64,
+            maintenance_enabled: false,
+            startup_prewarm: true,
+        };
+        let mut command = tokio::process::Command::new("uvm-ublk-daemon");
+
+        append_pool_cli_args(&mut command, &pool_config, Some(8));
+
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "--enable-pool",
+                "--pool-low-watermark",
+                "2",
+                "--pool-high-watermark",
+                "64",
+                "--pool-startup-prewarm",
+                "true",
+                "--pool-prewarm-high-watermark",
+                "8",
+            ]
+        );
+    }
 
     #[tokio::test]
     async fn daemon_dead_fails_immediately() {

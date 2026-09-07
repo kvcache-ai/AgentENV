@@ -62,6 +62,10 @@ struct Cli {
     #[arg(long)]
     pool_high_watermark: Option<usize>,
 
+    /// Override the proactive block-device refill limit.
+    #[arg(long)]
+    pool_prewarm_high_watermark: Option<usize>,
+
     /// Override whether the overlaybd pool prewarms after first image use.
     #[arg(long)]
     pool_startup_prewarm: Option<bool>,
@@ -99,6 +103,7 @@ struct DaemonPoolTomlConfig {
 #[derive(Debug, Deserialize, Default)]
 struct DaemonPoolComponentConfig {
     enabled: Option<bool>,
+    prewarm_high_watermark: Option<usize>,
     startup_prewarm: Option<bool>,
 }
 
@@ -106,42 +111,65 @@ struct DaemonPoolComponentConfig {
 struct PoolConfigOverrides {
     low_watermark: Option<usize>,
     high_watermark: Option<usize>,
+    prewarm_high_watermark: Option<usize>,
     startup_prewarm: Option<bool>,
+}
+
+#[derive(Debug)]
+struct LoadedPoolConfig {
+    config: warm_pool::PoolConfig,
+    prewarm_high_watermark: usize,
 }
 
 fn load_pool_config(
     config: Option<&DaemonTomlConfig>,
     force_enable: bool,
     overrides: &PoolConfigOverrides,
-) -> Result<Option<warm_pool::PoolConfig>> {
-    let Some(config) = config else {
-        return Ok(force_enable.then(|| apply_pool_overrides(default_pool_config(), overrides)));
-    };
-
-    let common = config.pool.as_ref();
+) -> Result<Option<LoadedPoolConfig>> {
+    let common = config.and_then(|config| config.pool.as_ref());
     let pool = common.and_then(|pool| pool.block.as_ref());
     let enabled = pool.and_then(|pool| pool.enabled).unwrap_or(force_enable);
     if !enabled {
         return Ok(None);
     }
-    Ok(Some(warm_pool::PoolConfig {
-        low_watermark: overrides
-            .low_watermark
-            .or_else(|| common.and_then(|pool| pool.low_watermark))
-            .unwrap_or(2),
-        high_watermark: overrides
-            .high_watermark
-            .or_else(|| common.and_then(|pool| pool.high_watermark))
-            .unwrap_or(64),
-        // ublk-daemon refills overlaybd devices inline from acquire/release
-        // requests because prewarming needs an async ublk control path and the
-        // request's current overlaybd image. Do not enable the generic
-        // synchronous background worker semantics for this pool.
-        maintenance_enabled: false,
-        startup_prewarm: overrides
-            .startup_prewarm
-            .or_else(|| pool.and_then(|pool| pool.startup_prewarm))
-            .unwrap_or(true),
+
+    let low_watermark = overrides
+        .low_watermark
+        .or_else(|| common.and_then(|pool| pool.low_watermark))
+        .unwrap_or(2);
+    let high_watermark = overrides
+        .high_watermark
+        .or_else(|| common.and_then(|pool| pool.high_watermark))
+        .unwrap_or(64);
+    let prewarm_high_watermark = overrides
+        .prewarm_high_watermark
+        .or_else(|| pool.and_then(|pool| pool.prewarm_high_watermark))
+        .unwrap_or(high_watermark);
+
+    anyhow::ensure!(
+        low_watermark <= high_watermark,
+        "invalid block pool config: low_watermark ({low_watermark}) must be <= high_watermark ({high_watermark})"
+    );
+    anyhow::ensure!(
+        prewarm_high_watermark <= high_watermark,
+        "invalid block pool config: prewarm_high_watermark ({prewarm_high_watermark}) must be <= high_watermark ({high_watermark})"
+    );
+
+    Ok(Some(LoadedPoolConfig {
+        config: warm_pool::PoolConfig {
+            low_watermark,
+            high_watermark,
+            // ublk-daemon refills overlaybd devices inline from acquire/release
+            // requests because prewarming needs an async ublk control path and the
+            // request's current overlaybd image. Do not enable the generic
+            // synchronous background worker semantics for this pool.
+            maintenance_enabled: false,
+            startup_prewarm: overrides
+                .startup_prewarm
+                .or_else(|| pool.and_then(|pool| pool.startup_prewarm))
+                .unwrap_or(true),
+        },
+        prewarm_high_watermark,
     }))
 }
 
@@ -227,31 +255,6 @@ fn resolve_relative_to(base_dir: &Path, path: &Path) -> PathBuf {
     }
 }
 
-fn default_pool_config() -> warm_pool::PoolConfig {
-    warm_pool::PoolConfig {
-        low_watermark: 2,
-        high_watermark: 64,
-        maintenance_enabled: false,
-        startup_prewarm: true,
-    }
-}
-
-fn apply_pool_overrides(
-    mut config: warm_pool::PoolConfig,
-    overrides: &PoolConfigOverrides,
-) -> warm_pool::PoolConfig {
-    if let Some(value) = overrides.low_watermark {
-        config.low_watermark = value;
-    }
-    if let Some(value) = overrides.high_watermark {
-        config.high_watermark = value;
-    }
-    if let Some(value) = overrides.startup_prewarm {
-        config.startup_prewarm = value;
-    }
-    config
-}
-
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -315,6 +318,7 @@ fn main() -> Result<()> {
         let pool_overrides = PoolConfigOverrides {
             low_watermark: cli.pool_low_watermark,
             high_watermark: cli.pool_high_watermark,
+            prewarm_high_watermark: cli.pool_prewarm_high_watermark,
             startup_prewarm: cli.pool_startup_prewarm,
         };
         let startup_prewarm = pool_overrides.startup_prewarm.or_else(|| {
@@ -324,19 +328,24 @@ fn main() -> Result<()> {
                 .and_then(|pool| pool.block.as_ref())
                 .and_then(|block| block.startup_prewarm)
         });
-        if let Some(mut pool_config) =
+        if let Some(mut loaded_pool_config) =
             load_pool_config(daemon_config.as_ref(), cli.enable_pool, &pool_overrides)
                 .context("load warm pool config")?
         {
             let features = server.detect_ublk_features().await?;
             let update_size_supported = features & ublk_caps::UBLK_F_UPDATE_SIZE != 0;
-            pool_config.startup_prewarm = startup_prewarm.unwrap_or(update_size_supported);
+            loaded_pool_config.config.startup_prewarm =
+                startup_prewarm.unwrap_or(update_size_supported);
             tracing::info!(
                 features = format!("{:#x}", features),
                 update_size_supported,
                 "detected ublk features"
             );
-            server.enable_pool(pool_config, features);
+            server.enable_pool(
+                loaded_pool_config.config,
+                loaded_pool_config.prewarm_high_watermark,
+                features,
+            );
         }
 
         // Open a pidfd for the parent process. When the parent process
@@ -410,4 +419,67 @@ fn pidfd_open(pid: nix::unistd::Pid) -> Result<OwnedFd> {
         return Err(err).context("pidfd_open");
     }
     Ok(unsafe { OwnedFd::from_raw_fd(ret as i32) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load_config(input: &str) -> LoadedPoolConfig {
+        let config: DaemonTomlConfig = toml::from_str(input).expect("parse config");
+        load_pool_config(Some(&config), false, &PoolConfigOverrides::default())
+            .expect("load pool config")
+            .expect("pool enabled")
+    }
+
+    #[test]
+    fn prewarm_high_watermark_defaults_to_cache_capacity() {
+        let loaded = load_config(
+            r#"
+                [pool]
+                low_watermark = 2
+                high_watermark = 64
+                [pool.block]
+                enabled = true
+            "#,
+        );
+
+        assert_eq!(loaded.prewarm_high_watermark, 64);
+        assert_eq!(loaded.config.high_watermark, 64);
+    }
+
+    #[test]
+    fn prewarm_high_watermark_is_independent_from_cache_capacity() {
+        let loaded = load_config(
+            r#"
+                [pool]
+                low_watermark = 2
+                high_watermark = 64
+                [pool.block]
+                enabled = true
+                prewarm_high_watermark = 8
+            "#,
+        );
+
+        assert_eq!(loaded.prewarm_high_watermark, 8);
+        assert_eq!(loaded.config.high_watermark, 64);
+    }
+
+    #[test]
+    fn prewarm_high_watermark_rejects_values_above_cache_capacity() {
+        let config: DaemonTomlConfig = toml::from_str(
+            r#"
+                [pool]
+                high_watermark = 8
+                [pool.block]
+                enabled = true
+                prewarm_high_watermark = 9
+            "#,
+        )
+        .expect("parse config");
+
+        let err = load_pool_config(Some(&config), false, &PoolConfigOverrides::default())
+            .expect_err("prewarm limit above cache capacity must fail");
+        assert!(err.to_string().contains("prewarm_high_watermark"));
+    }
 }

@@ -106,6 +106,8 @@ pub struct UblkDaemonConfig {
     pub metrics_listen_addr: String,
     /// Pool configuration. If `Some`, the daemon will enable warm pooling.
     pub pool_config: Option<uvm_ublk_daemon::PoolConfig>,
+    /// Maximum idle count reached by proactive block-device refill.
+    pub pool_prewarm_high_watermark: Option<usize>,
     /// Local HTTP endpoint used by the daemon to notify P2P layer publication.
     pub p2p_publish_url: Option<String>,
     /// Client-side timeout for runtime-device RPCs.
@@ -130,6 +132,13 @@ impl UblkDaemonConfig {
             })?;
 
         let pool_config = config.block_pool_config();
+        let pool_prewarm_high_watermark = pool_config.as_ref().map(|pool| {
+            config
+                .pool
+                .block
+                .prewarm_high_watermark
+                .unwrap_or(pool.high_watermark)
+        });
         let runtime_device_timeout =
             runtime_device_timeout(config.ublk.overlaybd.resize_timeout_secs);
 
@@ -144,6 +153,7 @@ impl UblkDaemonConfig {
             log_file: ublk.daemon_log_path.clone(),
             metrics_listen_addr: ublk.daemon_metrics_listen_addr.clone(),
             pool_config,
+            pool_prewarm_high_watermark,
             p2p_publish_url: None,
             runtime_device_timeout,
         })
@@ -215,6 +225,7 @@ impl UblkDeviceManager {
                             log_file: cfg.log_file.as_deref(),
                             metrics_listen_addr: &cfg.metrics_listen_addr,
                             pool_config: cfg.pool_config.as_ref(),
+                            pool_prewarm_high_watermark: cfg.pool_prewarm_high_watermark,
                             p2p_publish_url: cfg.p2p_publish_url.as_deref(),
                             runtime_device_timeout: cfg.runtime_device_timeout,
                         })
@@ -739,6 +750,17 @@ fn record_restack_usage_stats(dev_id: u32, kind: &'static str, stats: &RestackSn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_config_propagates_block_prewarm_high_watermark() {
+        let mut config = crate::cfg::AppConfig::default();
+        config.ublk.daemon_binary_path = Some(PathBuf::from("uvm-ublk-daemon"));
+        config.pool.block.prewarm_high_watermark = Some(8);
+
+        let daemon_config = UblkDaemonConfig::from_app_config(&config).unwrap();
+
+        assert_eq!(daemon_config.pool_prewarm_high_watermark, Some(8));
+    }
 
     #[test]
     fn rejects_persisted_cow_backend_with_migration_guidance() {

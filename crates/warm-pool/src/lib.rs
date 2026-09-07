@@ -247,9 +247,19 @@ impl<T: Send> WarmPool<T> {
     /// This is intended for maintenance refill paths that have just created a
     /// resource and need a final bounded insert before publishing it as idle.
     pub fn try_push_bounded(&self, resource: T) -> Result<(), T> {
+        self.try_push_bounded_to(resource, self.config.high_watermark)
+    }
+
+    /// Try to enqueue an idle resource below a caller-specific limit.
+    ///
+    /// The effective limit is capped at `high_watermark`. Checking the current
+    /// length and inserting the resource happen under the same lock, so the
+    /// caller's decision is linearizable with concurrent pool operations.
+    pub fn try_push_bounded_to(&self, resource: T, limit: usize) -> Result<(), T> {
+        let limit = limit.min(self.config.high_watermark);
         if !self.is_shutting_down() {
             let mut pool = self.pool.lock().unwrap();
-            if !self.is_shutting_down() && pool.len() < self.config.high_watermark {
+            if !self.is_shutting_down() && pool.len() < limit {
                 pool.push_back(resource);
                 return Ok(());
             }
@@ -549,6 +559,61 @@ mod tests {
         assert!(pool.release(1).is_ok());
         assert!(pool.release(2).is_ok());
         assert_eq!(pool.release(3), Err(3));
+    }
+
+    #[test]
+    fn bounded_push_rejects_after_release_fills_stricter_limit() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 0,
+            high_watermark: 64,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+        });
+
+        for value in 0..7 {
+            pool.release(value).unwrap();
+        }
+
+        // Model the refill path observing len == 7 before a concurrent release
+        // wins the race and fills the proactive limit.
+        assert!(pool.len() < 8);
+        pool.release(7).unwrap();
+
+        assert_eq!(pool.try_push_bounded_to(8, 8), Err(8));
+        assert_eq!(pool.len(), 8);
+    }
+
+    #[test]
+    fn concurrent_bounded_pushes_atomically_respect_stricter_limit() {
+        use std::sync::{Arc, Barrier};
+
+        let pool = Arc::new(WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 0,
+            high_watermark: 64,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+        }));
+        let start = Arc::new(Barrier::new(33));
+        let mut workers = Vec::new();
+
+        for value in 0..32 {
+            let pool = Arc::clone(&pool);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                pool.try_push_bounded_to(value, 8).is_ok()
+            }));
+        }
+
+        start.wait();
+        let inserted = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|inserted| *inserted)
+            .count();
+
+        assert_eq!(inserted, 8);
+        assert_eq!(pool.len(), 8);
     }
 
     #[test]

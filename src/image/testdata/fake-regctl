@@ -1,0 +1,6 @@
+#!/bin/sh
+dir="$(cd "$(dirname "$0")" && pwd)"
+printf '%s\n' "$@" > "$dir/argv"
+cat "$dir/stdout"
+cat "$dir/stderr" >&2
+exit "$(cat "$dir/exit_code")"
