@@ -122,18 +122,26 @@ async fn resolve_volume_mounts_inner(
     Ok((drives, normalized_mounts))
 }
 
-fn to_model(record: VolumeRecord) -> models::Volume {
-    let status = match record.status {
-        VolumeStatus::Ready => "ready",
-        VolumeStatus::Uploading => "uploading",
-        VolumeStatus::Failed => "failed",
-    };
-    let mut model = models::Volume::new(record.id, record.name, record.size_mb, status.to_owned());
-    model.mode = Some(match record.mode {
-        VolumeMode::ReadOnly => "ro".to_owned(),
-        VolumeMode::Exclusive => "exclusive".to_owned(),
-    });
-    model
+impl From<VolumeRecord> for models::Volume {
+    fn from(record: VolumeRecord) -> Self {
+        let status = match record.status {
+            VolumeStatus::Ready => "ready",
+            VolumeStatus::Uploading => "uploading",
+            VolumeStatus::Failed => "failed",
+        }
+        .to_string();
+        let mode = match record.mode {
+            VolumeMode::ReadOnly => "ro".to_owned(),
+            VolumeMode::Exclusive => "exclusive".to_owned(),
+        };
+        models::Volume {
+            volume_id: record.id,
+            name: record.name,
+            mode,
+            size_mb: record.size_mb,
+            status,
+        }
+    }
 }
 
 pub(super) fn error_response(error: VolumeError) -> (i32, models::Error) {
@@ -180,10 +188,12 @@ impl Volumes<()> for ApiImpl {
             )
             .await
         {
-            Ok(page) => Ok(VolumesGetResponse::Status200_VolumesReturnedSuccessfully {
-                body: page.records.into_iter().map(to_model).collect(),
-                x_next_token: page.next_token,
-            }),
+            Ok(page) => Ok(
+                VolumesGetResponse::Status200_SuccessfullyListedTeamVolumes {
+                    body: page.records.into_iter().map(Into::into).collect(),
+                    x_next_token: page.next_token,
+                },
+            ),
             Err(error @ (VolumeError::InvalidNextToken | VolumeError::InvalidPageLimit)) => Ok(
                 VolumesGetResponse::Status400_BadRequest(error_response(error).1),
             ),
@@ -243,9 +253,9 @@ impl Volumes<()> for ApiImpl {
             )
             .await
         {
-            Ok(record) => Ok(VolumesPostResponse::Status201_VolumeCreatedSuccessfully(
-                to_model(record),
-            )),
+            Ok(record) => {
+                Ok(VolumesPostResponse::Status201_SuccessfullyCreatedANewTeamVolume(record.into()))
+            }
             Err(error) => {
                 let (code, error) = error_response(error);
                 match code {
@@ -266,7 +276,7 @@ impl Volumes<()> for ApiImpl {
         path_params: &models::VolumesVolumeIdDeletePathParams,
     ) -> Result<VolumesVolumeIdDeleteResponse, ()> {
         match self.volume_manager.delete(&path_params.volume_id).await {
-            Ok(()) => Ok(VolumesVolumeIdDeleteResponse::Status204_VolumeDeletedSuccessfully),
+            Ok(()) => Ok(VolumesVolumeIdDeleteResponse::Status204_SuccessfullyDeletedATeamVolume),
             Err(error) => {
                 let (code, error) = error_response(error);
                 match code {
@@ -288,7 +298,9 @@ impl Volumes<()> for ApiImpl {
     ) -> Result<VolumesVolumeIdGetResponse, ()> {
         match self.volume_manager.get(&path_params.volume_id).await {
             Ok(record) => Ok(
-                VolumesVolumeIdGetResponse::Status200_VolumeReturnedSuccessfully(to_model(record)),
+                VolumesVolumeIdGetResponse::Status200_SuccessfullyRetrievedATeamVolume(
+                    record.into(),
+                ),
             ),
             Err(error) => {
                 let (code, error) = error_response(error);

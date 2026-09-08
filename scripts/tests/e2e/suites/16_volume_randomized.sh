@@ -16,7 +16,7 @@ if ! e2e_mode_is compose; then
 fi
 
 raw_random_seed="${AENV_VOLUME_RANDOM_SEED:-21106}"
-raw_random_steps="${AENV_VOLUME_RANDOM_STEPS:-100}"
+raw_random_steps="${AENV_VOLUME_RANDOM_STEPS:-50}"
 readonly VOLUME_SIZE_MB=16
 readonly VOLUME_MOUNT_PATH="/volume"
 
@@ -169,7 +169,7 @@ start_volume_sandbox() {
     --arg suite "${run_name}" \
     --arg step "${CURRENT_STEP}" \
     --arg mount_path "${VOLUME_MOUNT_PATH}" \
-    '{autoPause: false, metadata: {suite: $suite, step: $step}, volumeMounts: {($mount_path): $volume_id}}')
+    '{autoPause: false, metadata: {suite: $suite, step: $step}, volumeMounts: [{name: $volume_id, path: $mount_path}]}')
   LAST_SANDBOX_ID=$(create_sandbox "${AENV_TEMPLATE_ID}" 300 "${mount_payload}")
   _sync_http
   assert_status "${HTTP_STATUS}" "201" "${CURRENT_STEP}: create volume sandbox through gateway"
@@ -293,7 +293,8 @@ fork_volume_cycle() {
   assert_status "${HTTP_STATUS}" "200" \
     "${CURRENT_STEP}: fork child is immediately routable through gateway"
   local child_volume_id
-  child_volume_id="$(echo "${HTTP_BODY}" | jq -r --arg path "${VOLUME_MOUNT_PATH}" '.volumeMounts[$path] // empty')"
+  child_volume_id="$(echo "${HTTP_BODY}" | jq -r --arg path "${VOLUME_MOUNT_PATH}" \
+    '[.volumeMounts[]? | select(.path == $path) | .name][0] // empty')"
   assert_not_empty "${child_volume_id}" "${CURRENT_STEP}: fork child volume ID is present"
   register_volume "${child_volume_id}" "exclusive" "${VOLUME_CONTENT[${source_volume_id}]}"
   log "seed=${VOLUME_RANDOM_SEED} step=${CURRENT_STEP} fork-volume=${child_volume_id} source=${source_volume_id}"

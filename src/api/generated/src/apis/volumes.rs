@@ -12,15 +12,15 @@ use crate::{models, types::*};
 #[must_use]
 #[allow(clippy::large_enum_variant)]
 pub enum VolumesGetResponse {
-    /// Volumes returned successfully
-    Status200_VolumesReturnedSuccessfully {
+    /// Successfully listed team volumes
+    Status200_SuccessfullyListedTeamVolumes {
         body: Vec<models::Volume>,
         x_next_token: Option<String>,
     },
-    /// Authentication error
-    Status401_AuthenticationError(models::Error),
     /// Bad request
     Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -29,10 +29,12 @@ pub enum VolumesGetResponse {
 #[must_use]
 #[allow(clippy::large_enum_variant)]
 pub enum VolumesPostResponse {
-    /// Volume created successfully
-    Status201_VolumeCreatedSuccessfully(models::Volume),
+    /// Successfully created a new team volume
+    Status201_SuccessfullyCreatedANewTeamVolume(models::Volume),
     /// Bad request
     Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
     /// Conflict
     Status409_Conflict(models::Error),
     /// Server error
@@ -43,8 +45,10 @@ pub enum VolumesPostResponse {
 #[must_use]
 #[allow(clippy::large_enum_variant)]
 pub enum VolumesVolumeIdDeleteResponse {
-    /// Volume deleted successfully
-    Status204_VolumeDeletedSuccessfully,
+    /// Successfully deleted a team volume
+    Status204_SuccessfullyDeletedATeamVolume,
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
     /// Not found
     Status404_NotFound(models::Error),
     /// Conflict
@@ -57,8 +61,10 @@ pub enum VolumesVolumeIdDeleteResponse {
 #[must_use]
 #[allow(clippy::large_enum_variant)]
 pub enum VolumesVolumeIdGetResponse {
-    /// Volume returned successfully
-    Status200_VolumeReturnedSuccessfully(models::Volume),
+    /// Successfully retrieved a team volume
+    Status200_SuccessfullyRetrievedATeamVolume(models::Volume),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
     /// Not found
     Status404_NotFound(models::Error),
     /// Server error
@@ -71,7 +77,7 @@ pub enum VolumesVolumeIdGetResponse {
 pub trait Volumes<E: std::fmt::Debug + Send + Sync + 'static = ()>: super::ErrorHandler<E> {
     type Claims;
 
-    /// List volumes.
+    /// List team volumes.
     ///
     /// VolumesGet - GET /volumes
     async fn volumes_get(
@@ -84,7 +90,7 @@ pub trait Volumes<E: std::fmt::Debug + Send + Sync + 'static = ()>: super::Error
         query_params: &models::VolumesGetQueryParams,
     ) -> Result<VolumesGetResponse, E>;
 
-    /// Create a volume.
+    /// Create team volume.
     ///
     /// VolumesPost - POST /volumes
     async fn volumes_post(
@@ -97,7 +103,7 @@ pub trait Volumes<E: std::fmt::Debug + Send + Sync + 'static = ()>: super::Error
         body: &models::NewVolume,
     ) -> Result<VolumesPostResponse, E>;
 
-    /// Delete a volume.
+    /// Delete team volume.
     ///
     /// VolumesVolumeIdDelete - DELETE /volumes/{volumeID}
     async fn volumes_volume_id_delete(
@@ -110,7 +116,7 @@ pub trait Volumes<E: std::fmt::Debug + Send + Sync + 'static = ()>: super::Error
         path_params: &models::VolumesVolumeIdDeletePathParams,
     ) -> Result<VolumesVolumeIdDeleteResponse, E>;
 
-    /// Get a volume.
+    /// Team volume.
     ///
     /// VolumesVolumeIdGet - GET /volumes/{volumeID}
     async fn volumes_volume_id_get(

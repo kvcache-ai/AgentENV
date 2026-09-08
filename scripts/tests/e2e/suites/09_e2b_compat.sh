@@ -159,13 +159,13 @@ if [[ -f "$ts_sdk_script" ]] && command -v npm >/dev/null 2>&1; then
   log "Running: e2b TypeScript SDK compatibility (${ts_sdk_script})"
   if command -v timeout >/dev/null 2>&1; then
     if sdk_output=$(timeout "${sdk_timeout}" "$tsx_bin" "$ts_sdk_script" 2>&1); then
-      _pass "e2b TypeScript SDK template build, startCmd/readyCmd, sandbox lifecycle, and commands"
+      _pass "e2b TypeScript SDK template build, volume mount persistence, sandbox lifecycle, and commands"
     else
       log "e2b TypeScript SDK output: ${sdk_output:0:1200}"
       _fail "e2b TypeScript SDK compatibility" "exit 0" "non-zero"
     fi
   elif sdk_output=$("$tsx_bin" "$ts_sdk_script" 2>&1); then
-    _pass "e2b TypeScript SDK template build, startCmd/readyCmd, sandbox lifecycle, and commands"
+    _pass "e2b TypeScript SDK template build, volume mount persistence, sandbox lifecycle, and commands"
   else
     log "e2b TypeScript SDK output: ${sdk_output:0:1200}"
     _fail "e2b TypeScript SDK compatibility" "exit 0" "non-zero"

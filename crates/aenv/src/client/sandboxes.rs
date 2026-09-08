@@ -6,6 +6,23 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 #[derive(Debug, Serialize)]
+pub struct SandboxVolumeMount {
+    pub name: String,
+    pub path: String,
+}
+
+fn volume_mounts_request(
+    mounts: Option<HashMap<String, String>>,
+) -> Option<Vec<SandboxVolumeMount>> {
+    mounts.map(|mounts| {
+        mounts
+            .into_iter()
+            .map(|(path, name)| SandboxVolumeMount { name, path })
+            .collect()
+    })
+}
+
+#[derive(Debug, Serialize)]
 pub struct NewSandbox<'a> {
     #[serde(rename = "templateID")]
     pub template_id: &'a str,
@@ -13,7 +30,7 @@ pub struct NewSandbox<'a> {
     pub timeout: Option<u32>,
     pub secure: bool,
     #[serde(skip_serializing_if = "Option::is_none", rename = "volumeMounts")]
-    pub volume_mounts: Option<HashMap<String, String>>,
+    pub volume_mounts: Option<Vec<SandboxVolumeMount>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -29,7 +46,7 @@ pub struct NewColdSandbox<'a> {
     pub disk_size_mb: Option<u32>,
     pub secure: bool,
     #[serde(skip_serializing_if = "Option::is_none", rename = "volumeMounts")]
-    pub volume_mounts: Option<HashMap<String, String>>,
+    pub volume_mounts: Option<Vec<SandboxVolumeMount>>,
 }
 
 #[derive(Deserialize)]
@@ -86,7 +103,7 @@ impl Client {
             template_id,
             timeout,
             secure: true,
-            volume_mounts,
+            volume_mounts: volume_mounts_request(volume_mounts),
         };
         let resp = handle_status(self.post("/sandboxes").send_json(&body))?;
         let sandbox: Sandbox = resp.into_json()?;
@@ -110,7 +127,7 @@ impl Client {
             memory_mb,
             disk_size_mb,
             secure: true,
-            volume_mounts,
+            volume_mounts: volume_mounts_request(volume_mounts),
         };
         let resp = handle_status(self.post("/sandboxes-cold").send_json(&body))?;
         let sandbox: Sandbox = resp.into_json()?;

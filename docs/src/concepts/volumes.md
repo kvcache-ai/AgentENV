@@ -206,9 +206,12 @@ curl -fsS -X POST "$AENV_URL/sandboxes" \
   -H "Content-Type: application/json" \
   -d '{
     "templateID": "ubuntu",
-    "volumeMounts": {
-      "/workspace/data": "job-42-data"
-    }
+    "volumeMounts": [
+      {
+        "name": "job-42-data",
+        "path": "/workspace/data"
+      }
+    ]
   }'
 ```
 

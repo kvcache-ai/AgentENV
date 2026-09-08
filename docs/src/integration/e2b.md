@@ -64,6 +64,38 @@ await sandbox.kill();
 
 Replace `<template-id>` with a template that exists in your local template store. Use `e2b template list` or `GET /v2/templates` to see available templates.
 
+### Volume mounts
+
+The TypeScript SDK can create a volume and pass it directly when creating a
+sandbox:
+
+```typescript
+import { Sandbox, Volume } from "e2b";
+
+const volume = await Volume.create("workspace-volume", {
+  apiKey: process.env.E2B_API_KEY,
+});
+const sandbox = await Sandbox.create("<template-id>", {
+  apiKey: process.env.E2B_API_KEY,
+  volumeMounts: {
+    "/workspace": volume,
+  },
+});
+```
+
+For the Python SDK, create the volume with `aenv volume create` or
+`POST /volumes`, then pass its name when creating a sandbox:
+
+```python
+sandbox = Sandbox.create(
+    "<template-id>",
+    volume_mounts={"/workspace": "workspace-volume"},
+)
+```
+
+AgentENV supports the TypeScript SDK's volume create, list, and delete operations, and accessing the mounted filesystem through the sandbox.
+The E2B SDK's direct volume content API is not supported.
+
 ### Python SDK
 
 #### Setup
