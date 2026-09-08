@@ -7,7 +7,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::process::Command;
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::snapshot::repository::{RepositoryError, SnapshotRepository};
@@ -267,11 +267,21 @@ impl VolumeManager {
             return Ok(record);
         }
         let destination = self.data_dir(&record.id).join("image.json");
+        debug!(
+            volume_id = %record.id,
+            layer_count = record.backing_layers.len(),
+            "materializing volume backing"
+        );
         let path = self
             .repository
             .materialize_volume_backing(&record.id, &record.backing_layers, &destination)
             .await
             .map_err(repository_error)?;
+        debug!(
+            volume_id = %record.id,
+            path = %path.display(),
+            "volume backing materialized"
+        );
         record.backing_image_config = Some(path);
         self.cache_record(record.clone()).await;
         Ok(record)
@@ -324,6 +334,12 @@ impl VolumeManager {
         }
 
         let id = format!("vol_{}", Uuid::now_v7().simple());
+        debug!(
+            volume_id = %id,
+            mode = ?mode,
+            size_mb,
+            "creating volume"
+        );
         let mut backing_layers = Vec::new();
         let backing_image_config = if let Some((reference, source_owner)) = from_volume {
             let mut parent = match self.get(&reference).await {
@@ -400,6 +416,12 @@ impl VolumeManager {
             }
             return Err(error);
         }
+        info!(
+            volume_id = %record.id,
+            mode = ?record.mode,
+            size_mb = record.size_mb,
+            "volume created"
+        );
         Ok(record)
     }
 
@@ -411,6 +433,7 @@ impl VolumeManager {
         if let Some(owner) = record.read_only_mounts.first() {
             return Err(VolumeError::Reserved(owner.clone()));
         }
+        debug!(volume_id = %record.id, "deleting volume");
         self.repository
             .delete_volume(&record.id)
             .await
@@ -427,6 +450,7 @@ impl VolumeManager {
                 );
             }
         }
+        info!(volume_id = %record.id, "volume deleted");
         Ok(())
     }
 
@@ -484,11 +508,23 @@ impl VolumeManager {
             read_only_mounts: Vec::new(),
             deleting: false,
         };
+        debug!(
+            volume_id = %record.id,
+            mode = ?record.mode,
+            size_mb = record.size_mb,
+            "creating volume from snapshot"
+        );
         self.repository
             .create_volume(record.clone())
             .await
             .map_err(repository_error)?;
         self.cache_record(record.clone()).await;
+        info!(
+            volume_id = %record.id,
+            mode = ?record.mode,
+            size_mb = record.size_mb,
+            "volume created from snapshot"
+        );
         Ok(record)
     }
 
@@ -528,6 +564,7 @@ impl VolumeManager {
             if !record.read_only_mounts.iter().any(|entry| entry == owner) {
                 record.read_only_mounts.push(owner.to_owned());
             }
+            debug!(volume_id = %record.id, "read-only volume reserved");
             self.cache_record(record).await;
             return Ok(());
         }
@@ -540,6 +577,7 @@ impl VolumeManager {
             return Err(VolumeError::Reserved(existing));
         }
         record.reserved_by_sandbox_id = Some(owner.to_owned());
+        debug!(volume_id = %record.id, "exclusive volume reserved");
         self.cache_record(record).await;
         Ok(())
     }
@@ -557,6 +595,15 @@ impl VolumeManager {
                 .map_err(repository_error)?;
             if let Some(record) = self.records.write().await.get_mut(volume_id) {
                 record.replace_owner(owner, new_owner);
+            }
+            match new_owner {
+                Some(new_owner) => debug!(
+                    volume_id = %volume_id,
+                    previous_owner = %owner,
+                    new_owner = %new_owner,
+                    "volume reservation owner replaced"
+                ),
+                None => debug!(volume_id = %volume_id, %owner, "volume reservation released"),
             }
         }
         Ok(())
@@ -592,14 +639,26 @@ impl VolumeManager {
                 let path = self.data_dir(&record.id).join("image.json");
                 if !path.exists() {
                     record.status = VolumeStatus::Failed;
-                    let _ = self.persist_catalog(&record).await;
+                    if let Err(error) = self.persist_catalog(&record).await {
+                        warn!(
+                            volume_id = %record.id,
+                            %error,
+                            "failed to persist volume failure status"
+                        );
+                    }
                     self.cache_record(record.clone()).await;
+                    warn!(
+                        volume_id = %record.id,
+                        path = %path.display(),
+                        "reserved volume backing is missing"
+                    );
                     return Err(VolumeError::Storage(format!(
                         "local backing for reserved volume '{}' is missing",
                         record.id
                     )));
                 }
                 record.backing_image_config = Some(path);
+                debug!(volume_id = %record.id, %owner, "volume backing recovered");
                 self.cache_record(record).await;
             }
         }
@@ -628,28 +687,54 @@ impl VolumeManager {
             // upper layer so other nodes cannot mount stale content.
             record.status = VolumeStatus::Uploading;
             if let Err(error) = self.persist_catalog(&record).await {
-                record.status = VolumeStatus::Failed;
-                let _ = self.persist_catalog(&record).await;
-                self.cache_record(record).await;
+                self.mark_publication_failed(record, "mark_uploading", &error)
+                    .await;
                 return Err(error);
             }
             self.cache_record(record.clone()).await;
+            debug!(volume_id = %record.id, "publishing volume backing");
             if let Err(error) = self.publish_backing(&mut record).await {
-                record.status = VolumeStatus::Failed;
-                let _ = self.persist_catalog(&record).await;
-                self.cache_record(record).await;
+                self.mark_publication_failed(record, "publish_backing", &error)
+                    .await;
                 return Err(error);
             }
             record.status = VolumeStatus::Ready;
             if let Err(error) = self.persist_catalog(&record).await {
-                record.status = VolumeStatus::Failed;
-                let _ = self.persist_catalog(&record).await;
-                self.cache_record(record).await;
+                self.mark_publication_failed(record, "mark_ready", &error)
+                    .await;
                 return Err(error);
             }
+            info!(
+                volume_id = %record.id,
+                layer_count = record.backing_layers.len(),
+                "volume backing published"
+            );
             self.cache_record(record).await;
         }
         Ok(())
+    }
+
+    async fn mark_publication_failed(
+        &self,
+        mut record: VolumeRecord,
+        stage: &'static str,
+        error: &VolumeError,
+    ) {
+        record.status = VolumeStatus::Failed;
+        if let Err(status_error) = self.persist_catalog(&record).await {
+            warn!(
+                volume_id = %record.id,
+                error = %status_error,
+                "failed to persist volume failure status"
+            );
+        }
+        warn!(
+            volume_id = %record.id,
+            stage,
+            %error,
+            "volume backing publication failed"
+        );
+        self.cache_record(record).await;
     }
 
     async fn cache_record(&self, record: VolumeRecord) {
