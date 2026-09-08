@@ -94,6 +94,12 @@ pub struct NodesNodeIdGetQueryParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxesSandboxIdCpuAffinityPostPathParams {
+    pub sandbox_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxesGetQueryParams {
     /// Metadata query used to filter the sandboxes (e.g. \"user=abc&app=prod\"). Each key and values must be URL encoded.
     #[serde(rename = "metadata")]
@@ -5133,6 +5139,372 @@ impl std::ops::Deref for SandboxAutoResumeEnabled {
 impl std::ops::DerefMut for SandboxAutoResumeEnabled {
     fn deref_mut(&mut self) -> &mut bool {
         &mut self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxCpuAffinity {
+    #[serde(rename = "sandboxID")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub sandbox_id: String,
+
+    #[serde(rename = "vcpu")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub vcpu: String,
+
+    /// Normalized online host CPUs that were applied.
+    #[serde(rename = "cores")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub cores: String,
+
+    /// Normalized requested CPUs that were offline, or an empty string.
+    #[serde(rename = "ignoredOfflineCores")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub ignored_offline_cores: String,
+
+    #[serde(rename = "boundThreadCount")]
+    #[validate(range(min = 1u32))]
+    pub bound_thread_count: u32,
+}
+
+impl SandboxCpuAffinity {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        sandbox_id: String,
+        vcpu: String,
+        cores: String,
+        ignored_offline_cores: String,
+        bound_thread_count: u32,
+    ) -> SandboxCpuAffinity {
+        SandboxCpuAffinity {
+            sandbox_id,
+            vcpu,
+            cores,
+            ignored_offline_cores,
+            bound_thread_count,
+        }
+    }
+}
+
+/// Converts the SandboxCpuAffinity value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxCpuAffinity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("sandboxID".to_string()),
+            Some(self.sandbox_id.to_string()),
+            Some("vcpu".to_string()),
+            Some(self.vcpu.to_string()),
+            Some("cores".to_string()),
+            Some(self.cores.to_string()),
+            Some("ignoredOfflineCores".to_string()),
+            Some(self.ignored_offline_cores.to_string()),
+            Some("boundThreadCount".to_string()),
+            Some(self.bound_thread_count.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxCpuAffinity value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxCpuAffinity {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub sandbox_id: Vec<String>,
+            pub vcpu: Vec<String>,
+            pub cores: Vec<String>,
+            pub ignored_offline_cores: Vec<String>,
+            pub bound_thread_count: Vec<u32>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxCpuAffinity".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "sandboxID" => intermediate_rep.sandbox_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "vcpu" => intermediate_rep.vcpu.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "cores" => intermediate_rep.cores.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "ignoredOfflineCores" => intermediate_rep.ignored_offline_cores.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "boundThreadCount" => intermediate_rep.bound_thread_count.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing SandboxCpuAffinity".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxCpuAffinity {
+            sandbox_id: intermediate_rep
+                .sandbox_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "sandboxID missing in SandboxCpuAffinity".to_string())?,
+            vcpu: intermediate_rep
+                .vcpu
+                .into_iter()
+                .next()
+                .ok_or_else(|| "vcpu missing in SandboxCpuAffinity".to_string())?,
+            cores: intermediate_rep
+                .cores
+                .into_iter()
+                .next()
+                .ok_or_else(|| "cores missing in SandboxCpuAffinity".to_string())?,
+            ignored_offline_cores: intermediate_rep
+                .ignored_offline_cores
+                .into_iter()
+                .next()
+                .ok_or_else(|| "ignoredOfflineCores missing in SandboxCpuAffinity".to_string())?,
+            bound_thread_count: intermediate_rep
+                .bound_thread_count
+                .into_iter()
+                .next()
+                .ok_or_else(|| "boundThreadCount missing in SandboxCpuAffinity".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxCpuAffinity> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxCpuAffinity>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxCpuAffinity>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxCpuAffinity - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxCpuAffinity> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxCpuAffinity as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxCpuAffinity - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxCpuAffinityRequest {
+    /// Firecracker vCPU list, or '*' to select every current Firecracker thread.
+    #[serde(rename = "vcpu")]
+    #[validate(length(max = 16384), custom(function = "check_xss_string"))]
+    pub vcpu: String,
+
+    /// Host CPU list with optional range strides such as 0-10:2. Supported CPU IDs are 0-1023. Offline CPUs are ignored unless the online intersection is empty.
+    #[serde(rename = "core")]
+    #[validate(length(max = 16384), custom(function = "check_xss_string"))]
+    pub core: String,
+}
+
+impl SandboxCpuAffinityRequest {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(vcpu: String, core: String) -> SandboxCpuAffinityRequest {
+        SandboxCpuAffinityRequest { vcpu, core }
+    }
+}
+
+/// Converts the SandboxCpuAffinityRequest value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxCpuAffinityRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("vcpu".to_string()),
+            Some(self.vcpu.to_string()),
+            Some("core".to_string()),
+            Some(self.core.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxCpuAffinityRequest value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxCpuAffinityRequest {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub vcpu: Vec<String>,
+            pub core: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxCpuAffinityRequest".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "vcpu" => intermediate_rep.vcpu.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "core" => intermediate_rep.core.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing SandboxCpuAffinityRequest".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxCpuAffinityRequest {
+            vcpu: intermediate_rep
+                .vcpu
+                .into_iter()
+                .next()
+                .ok_or_else(|| "vcpu missing in SandboxCpuAffinityRequest".to_string())?,
+            core: intermediate_rep
+                .core
+                .into_iter()
+                .next()
+                .ok_or_else(|| "core missing in SandboxCpuAffinityRequest".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxCpuAffinityRequest> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxCpuAffinityRequest>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxCpuAffinityRequest>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxCpuAffinityRequest - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxCpuAffinityRequest> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxCpuAffinityRequest as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxCpuAffinityRequest - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
     }
 }
 

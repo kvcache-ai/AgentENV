@@ -61,6 +61,21 @@ impl FirecrackerInstance {
         Ok(Pid::from_raw(raw_pid))
     }
 
+    /// Return the PID only if the owned Firecracker child has not exited.
+    pub fn running_pid(&mut self) -> Result<Pid> {
+        let child = self
+            .process
+            .as_mut()
+            .context("firecracker process is not running")?;
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to check Firecracker process status")?
+        {
+            bail!("firecracker process exited with status {status}");
+        }
+        self.pid()
+    }
+
     pub async fn spawn_with_netns(
         &mut self,
         firecracker_binary: &Path,
@@ -683,6 +698,27 @@ mod tests {
 
         assert!(err.to_string().contains("already started"));
         instance.stop(Duration::from_millis(10)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pid_rejects_an_exited_process() -> Result<()> {
+        let temp = tempdir()?;
+        let mut instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        instance.process = Some(Command::new("/bin/true").spawn()?);
+
+        let error = time::timeout(Duration::from_secs(2), async {
+            loop {
+                match instance.running_pid() {
+                    Ok(_) => time::sleep(Duration::from_millis(10)).await,
+                    Err(error) => break error,
+                }
+            }
+        })
+        .await
+        .context("Firecracker test process did not exit")?;
+
+        assert!(error.to_string().contains("exited with status"));
         Ok(())
     }
 

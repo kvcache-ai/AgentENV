@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{sync::Mutex, thread};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use tokio::time::sleep;
 
@@ -72,6 +72,7 @@ pub struct MockBehavior {
     actions: Mutex<HashMap<MockOperation, VecDeque<MockAction>>>,
     on_operation: Mutex<HashMap<MockOperation, Arc<dyn Fn() + Send + Sync>>>,
     runtime_info: Mutex<SandboxRuntimeInfo>,
+    runtime_process_id: Mutex<Option<i32>>,
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
@@ -106,6 +107,20 @@ impl MockBehavior {
             .lock()
             .expect("runtime_info mutex poisoned")
             .clone()
+    }
+
+    pub fn set_runtime_process_id(&self, pid: i32) {
+        *self
+            .runtime_process_id
+            .lock()
+            .expect("runtime_process_id mutex poisoned") = Some(pid);
+    }
+
+    fn runtime_process_id(&self) -> Option<i32> {
+        *self
+            .runtime_process_id
+            .lock()
+            .expect("runtime_process_id mutex poisoned")
     }
 
     pub fn set_source_config_paths(&self, paths: Vec<std::path::PathBuf>) {
@@ -345,6 +360,12 @@ impl SandboxBackend for MockSandboxBackend {
 
     fn runtime_info(&self) -> SandboxRuntimeInfo {
         self.behavior.runtime_info()
+    }
+
+    fn runtime_process_id(&mut self) -> Result<i32> {
+        self.behavior
+            .runtime_process_id()
+            .context("mock sandbox backend has no runtime process")
     }
 
     fn startup_artifacts(&self) -> RuntimeArtifactSet {

@@ -449,6 +449,8 @@ func TestIsSandboxControlPlaneRequest(t *testing.T) {
 		{name: "sandbox delete", method: http.MethodDelete, path: "/sandboxes/sbx-123", want: true},
 		{name: "sandbox pause", method: http.MethodPost, path: "/sandboxes/sbx-123/pause", want: true},
 		{name: "sandbox fork", method: http.MethodPost, path: "/sandboxes/sbx-123/fork", want: true},
+		{name: "sandbox CPU affinity", method: http.MethodPost, path: "/sandboxes/sbx-123/cpu-affinity", want: true},
+		{name: "sandbox CPU affinity wrong method", method: http.MethodGet, path: "/sandboxes/sbx-123/cpu-affinity", want: false},
 		{name: "sandbox network update", method: http.MethodPut, path: "/sandboxes/sbx-123/network", want: true},
 		{name: "network update wrong method", method: http.MethodPost, path: "/sandboxes/sbx-123/network", want: false},
 		{name: "sandbox custom extension params get", method: http.MethodGet, path: "/sandboxes/sbx-123/custom-extension-params", want: true},
@@ -744,6 +746,51 @@ func TestSandboxControlPlaneRequestWithE2BHeadersUsesPathRoute(t *testing.T) {
 	}
 	if upstreamReq.sandboxID != "sbx-path" {
 		t.Fatalf("forwarded e2b sandbox id = %q, want %q", upstreamReq.sandboxID, "sbx-path")
+	}
+}
+
+func TestCPUControlPlaneRequestUsesSandboxLookupAndPreservesUpstreamRequest(t *testing.T) {
+	type upstreamRequest struct {
+		method string
+		path   string
+		body   string
+	}
+	requests := make(chan upstreamRequest, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests <- upstreamRequest{
+			method: r.Method,
+			path:   r.URL.Path,
+			body:   string(body),
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(t, stubSchedulerClient{
+		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			if req.GetSandboxId() != "sbx-cpu" {
+				return nil, fmt.Errorf("lookup sandbox id = %q, want sbx-cpu", req.GetSandboxId())
+			}
+			return &schedulerv1.LookupNodeResponse{Node: &schedulerv1.Node{
+				NodeId:   "node-cpu",
+				Endpoint: upstream.URL,
+			}}, nil
+		},
+	}, time.Second, 1024)
+
+	const body = `{"vcpu":"*","core":"2-3"}`
+	request := httptest.NewRequest(http.MethodPost, "http://gateway.test/sandboxes/sbx-cpu/cpu-affinity", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+	snapshot := <-requests
+	if snapshot.method != http.MethodPost || snapshot.path != "/sandboxes/sbx-cpu/cpu-affinity" || snapshot.body != body {
+		t.Fatalf("unexpected upstream request: %#v", snapshot)
 	}
 }
 

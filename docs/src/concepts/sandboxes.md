@@ -227,6 +227,37 @@ By default, the sandbox automatically pauses when it reaches its TTL. See
 [Auto-Eviction](#auto-eviction) for how the deadline is set and how to delete
 instead of pause.
 
+### Runtime CPU Affinity
+
+Administrators can restrict a running sandbox's Firecracker threads to a set
+of host logical CPUs without restarting the sandbox:
+
+```bash
+aenv cpu-bind <sandbox-id> --vcpu 0-1 --core 4-7
+aenv cpu-bind <sandbox-id> --vcpu '*' --core 0-10:2
+```
+
+This changes scheduler eligibility, not sandbox resources: it does not change
+the sandbox vCPU count, reserve host CPUs, or prevent other processes from
+using the same CPUs. For a numeric `--vcpu` list, indices select threads named
+`fc_vcpu N`. The special value `*` selects every Firecracker thread present at
+the time of the request, including non-vCPU threads. Every selected thread is
+assigned the same `--core` set rather than a one-to-one vCPU-to-CPU mapping.
+
+Host CPU lists accept individual IDs, inclusive ranges, and range strides such
+as `0-10:2`. IDs are logical CPU numbers and are limited to 0-1023 by the
+platform affinity mask. Offline requested CPUs are ignored; if the remaining
+online set is empty, the request fails before making changes.
+
+Affinity applies to the current Firecracker process and its current threads.
+To prevent a thread ID from being reused during the update, AgentENV briefly
+stops the complete Firecracker process and resumes it as soon as the update
+finishes or fails.
+Reapply it after a pause and resume, which replaces the runtime process. The
+operation is exposed through the admin API because incorrect placement can
+affect other workloads on the node. It uses the deployment API key and has no
+separate feature flag.
+
 ### Persistent Snapshots
 
 A snapshot is a durable, reusable checkpoint of a running sandbox. Creating one
