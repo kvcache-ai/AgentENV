@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3ec94f5d.js";
+            window.path_to_searchindex_js = "../searchindex-24f8d7bd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-a02e686b.js"></script>
@@ -309,6 +309,7 @@ pub trait P2pTransport: Send + Sync {
 </li>
 <li>Overlaybd layers referenced by the snapshot’s rootfs, memory, and attached-drive image configs. These are not published under a snapshot-specific key. They reuse the overlaybd layer artifact protocol owned by <code>src/overlaybd/p2p/artifact.rs</code>, with keys like <code>overlaybd-layer/v1/sha256:&lt;digest&gt;</code> and <code>LayerMetadata</code> understood by the overlaybd HTTP facade.</li>
 </ul>
+<p>Digest-keyed layer publication is guarded against the committed record: a local layer is only advertised under <code>overlaybd-layer/v1/sha256:&lt;digest&gt;</code> when that digest is one the committed record references for the same subject (memory, rootfs, or the matching attached drive). When <code>[snapshot.publish_compression]</code> recontainerizes a raw local layer as ZFile during upload, the record names the compressed bytes, so the raw layer’s digest key is skipped rather than advertised under a key no consumer will look up. ZFile layers also carry no LSMT uuid (<code>uuid = None</code> in the committed record), so uuid-keyed acceleration never applies to recontainerized layers.</p>
 <p>That split is important. Snapshot fixed artifacts are scoped to one snapshot ID and are only consumed by snapshot runtime resolvers. Overlaybd commit layers are content-addressed and may be consumed by any overlaybd runtime path, including foreground range reads through <code>/p2p-http/{origin}</code>. Do not add a second snapshot-specific key format for overlaybd layers; doing so publishes bytes that overlaybd cannot discover.</p>
 <p>OSS snapshot resolution consumes fixed artifacts through P2P first:</p>
 <ul>
