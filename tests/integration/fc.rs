@@ -410,6 +410,77 @@ async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<(
     Ok(())
 }
 
+#[tokio::test]
+async fn consecutive_captures_keep_memory_baseline_and_release_generations() -> Result<()> {
+    const MEMORY_REQUEST: &str = "printf '%s\\n' \"$1\" > /tmp/memory-commands; \
+        read -r state < /tmp/memory-replies; printf '%s' \"$state\"";
+    common::setup().await;
+    let mut sandbox = FirecrackerSandbox::new(common::default_sandbox_config()?)?;
+    sandbox.start().await?;
+    let output = sandbox
+        .run_command(
+            "sh",
+            &[
+                "-c",
+                "mkfifo /tmp/memory-commands /tmp/memory-replies; \
+                 (first=base; second=base; exec 3<>/tmp/memory-commands; \
+                 exec 4<>/tmp/memory-replies; while read -r command <&3; do \
+                 case $command in first) first=changed;; second) second=changed;; esac; \
+                 printf '%s:%s\\n' \"$first\" \"$second\" >&4; done) \
+                 </dev/null >/dev/null 2>&1 &",
+            ],
+        )
+        .await?;
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    let baseline = sandbox.pause().await?;
+    sandbox.stop().await?;
+    drop(sandbox);
+    let baseline_dir = baseline.vm_state_path.parent().unwrap().to_path_buf();
+    let baseline_layers =
+        lower_file_paths_from_image_config(&baseline.mem_overlaybd_config.image_config_path)?;
+    let mut running = FirecrackerSandbox::resume_from_snapshot_config(&baseline).await?;
+    drop(baseline);
+
+    for (command, expected) in [
+        ("first", "changed:base"),
+        ("second", "changed:changed"),
+        ("report", "changed:changed"),
+    ] {
+        let output = running
+            .run_command("sh", &["-c", MEMORY_REQUEST, "memory-request", command])
+            .await?;
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        assert_eq!(output.stdout, expected);
+        let captured = SandboxBackend::snapshot(&mut running).await?;
+        let manifest = captured.manifest();
+        let generation_dir = manifest.vm_state.path.parent().unwrap().to_path_buf();
+        let memory_layers = lower_file_paths_from_image_config(&manifest.memory.image_config_path)?;
+        assert_eq!(memory_layers.len(), baseline_layers.len() + 1);
+        drop(captured);
+        assert!(!generation_dir.exists(), "unused capture must be reclaimed");
+        assert!(
+            baseline_dir.exists(),
+            "running memory still needs its baseline"
+        );
+    }
+
+    let paused = running.pause().await?;
+    running.stop().await?;
+    drop(running);
+    assert!(
+        !baseline_dir.exists(),
+        "stopped baseline has no remaining owner"
+    );
+    let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&paused).await?;
+    let output = resumed
+        .run_command("sh", &["-c", MEMORY_REQUEST, "memory-request", "report"])
+        .await?;
+    assert_eq!(output.exit_code, 0, "{}", output.stderr);
+    assert_eq!(output.stdout, "changed:changed");
+    resumed.stop().await?;
+    Ok(())
+}
+
 /// Verify multi-level snapshot chains: first → second → resume from second after
 /// dropping the first snapshot handle.
 #[tokio::test]
@@ -423,6 +494,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     let first_snapshot = sandbox.pause().await?;
     assert_memory_layer_is_raw(&first_snapshot).await?;
     sandbox.stop().await?;
+    drop(sandbox);
     let first_snapshot_dir = fs::canonicalize(first_snapshot.vm_state_path.parent().unwrap())?;
     let first_persistent_generation = fs::canonicalize(
         first_snapshot
@@ -454,6 +526,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     let second_snapshot = resumed.pause().await?;
     assert_memory_layer_is_raw(&second_snapshot).await?;
     resumed.stop().await?;
+    drop(resumed);
     let second_snapshot_dir = fs::canonicalize(second_snapshot.vm_state_path.parent().unwrap())?;
     let second_mem_lowers = lower_file_paths_from_image_config(
         &second_snapshot.mem_overlaybd_config.image_config_path,
@@ -514,6 +587,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
 
     // Drop first snapshot handle — second snapshot's layers should still be valid.
     drop(first_snapshot);
+    assert!(!first_snapshot_dir.exists());
 
     let mut resumed_again =
         FirecrackerSandbox::resume_from_snapshot_config(&second_snapshot).await?;
@@ -525,6 +599,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
         .pause_to_dir(expected_snapshot_dir.path())
         .await?;
     resumed_again.stop().await?;
+    drop(resumed_again);
     let managed_snapshot_base_root = ConfigManager::global_config()
         .firecracker
         .work_dir
