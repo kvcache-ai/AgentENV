@@ -118,8 +118,27 @@ fn volume_mounts_model(
 }
 
 fn volume_mounts_from_model(
-    mounts: &[models::SandboxVolumeMount],
+    mounts: &models::VolumeMountsRequest,
 ) -> Result<HashMap<String, String>, models::Error> {
+    // OpenAPI Generator's oneOf validation is shallow, so validate both aliases here.
+    let mounts = match mounts {
+        models::VolumeMountsRequest::VecOfSandboxVolumeMount(mounts) => {
+            if mounts.iter().any(|mount| {
+                models::check_xss_string(&mount.name).is_err()
+                    || models::check_xss_string(&mount.path).is_err()
+            }) {
+                return Err(ApiImpl::error(400, "volume mounts contain invalid text"));
+            }
+            mounts
+        }
+        models::VolumeMountsRequest::HashMapOfStringString(mounts) => {
+            if models::check_xss_map_string(mounts).is_err() {
+                return Err(ApiImpl::error(400, "volume mounts contain invalid text"));
+            }
+            return Ok(mounts.clone());
+        }
+    };
+
     let mut result = HashMap::with_capacity(mounts.len());
     for mount in mounts {
         if result
@@ -747,7 +766,7 @@ impl Sandboxes<()> for ApiImpl {
             ));
         }
 
-        let requested_volume_mounts = match body.volume_mounts.as_deref() {
+        let requested_volume_mounts = match body.volume_mounts.as_ref() {
             Some(mounts) => match volume_mounts_from_model(mounts) {
                 Ok(mounts) => Some(mounts),
                 Err(error) => {
@@ -961,7 +980,7 @@ impl Sandboxes<()> for ApiImpl {
         let extra_drives_in_snapshot =
             body.volume_mounts.is_none() && !snapshot.committed().volume_snapshots.is_empty();
         let (requested_volume_mounts, restored_volume_ids) = if let Some(mounts) =
-            body.volume_mounts.as_deref()
+            body.volume_mounts.as_ref()
         {
             match volume_mounts_from_model(mounts) {
                 Ok(mounts) => (Some(mounts), Vec::new()),
@@ -1924,15 +1943,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn volume_mount_models_reject_duplicate_paths() {
-        let mounts = vec![
+    fn volume_mount_models_accept_legacy_maps_and_validate_both_forms() {
+        let mounts = models::VolumeMountsRequest::VecOfSandboxVolumeMount(vec![
             models::SandboxVolumeMount::new("first".to_owned(), "/data".to_owned()),
             models::SandboxVolumeMount::new("second".to_owned(), "/data".to_owned()),
-        ];
+        ]);
 
         let error = volume_mounts_from_model(&mounts).unwrap_err();
         assert_eq!(error.code, 400);
         assert!(error.message.contains("duplicated"));
+
+        let legacy_mounts = HashMap::from([("/data".to_owned(), "volume".to_owned())]);
+        let mounts = models::VolumeMountsRequest::HashMapOfStringString(legacy_mounts.clone());
+        assert_eq!(volume_mounts_from_model(&mounts).unwrap(), legacy_mounts);
+
+        let mounts = models::VolumeMountsRequest::VecOfSandboxVolumeMount(vec![
+            models::SandboxVolumeMount::new("<script>bad</script>".to_owned(), "/data".to_owned()),
+        ]);
+        assert_eq!(volume_mounts_from_model(&mounts).unwrap_err().code, 400);
+
+        let mounts = models::VolumeMountsRequest::HashMapOfStringString(HashMap::from([(
+            "/data".to_owned(),
+            "<script>bad</script>".to_owned(),
+        )]));
+        assert_eq!(volume_mounts_from_model(&mounts).unwrap_err().code, 400);
     }
 
     #[test]

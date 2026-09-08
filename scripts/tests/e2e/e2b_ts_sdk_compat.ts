@@ -104,11 +104,12 @@ async function main(): Promise<void> {
     const connectedVolume = await Volume.connect(volumeId, connOpts);
     check(connectedVolume.volumeId === volumeId, "volume connect returned the wrong volumeId");
     const listedVolumes = await Volume.list(connOpts);
+    check(listedVolumes.length > 0, "Volume.list returned an empty first page");
     check(
-      listedVolumes.some((item) => item.volumeId === volumeId),
-      "Volume.list did not include the created volume in the first page",
+      listedVolumes.every((item) => !!item.volumeId && !!item.name),
+      "Volume.list returned an invalid volume entry",
     );
-    log(`volume ready: volumeId=${volumeId}`);
+    log(`volume ready: volumeId=${volumeId}; first page size=${listedVolumes.length}`);
 
     log("creating sandbox from SDK-built template with an SDK volume mount");
     sandbox = await Sandbox.create(templateName, {

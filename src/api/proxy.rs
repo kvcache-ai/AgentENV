@@ -1948,22 +1948,32 @@ mod tests {
     }
 
     #[test]
-    fn e2b_volume_mounts_use_the_sdk_array_representation() {
+    fn volume_mounts_accept_e2b_arrays_and_legacy_maps() {
         let request: agentenv_http_server::models::NewSandbox = serde_json::from_value(json!({
             "templateID": "template",
             "volumeMounts": [{"name": "vol_123", "path": "/mnt/data"}]
         }))
         .expect("E2B volumeMounts array should deserialize");
-        let mounts = request.volume_mounts.unwrap();
+        let agentenv_http_server::models::VolumeMountsRequest::VecOfSandboxVolumeMount(mounts) =
+            request.volume_mounts.unwrap()
+        else {
+            panic!("E2B volumeMounts should use the array variant");
+        };
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].name, "vol_123");
         assert_eq!(mounts[0].path, "/mnt/data");
 
-        serde_json::from_value::<agentenv_http_server::models::NewSandbox>(json!({
+        let request: agentenv_http_server::models::NewSandbox = serde_json::from_value(json!({
             "templateID": "template",
             "volumeMounts": {"/mnt/data": "vol_123"}
         }))
-        .expect_err("map form is not the E2B API");
+        .expect("legacy volumeMounts map should deserialize");
+        let agentenv_http_server::models::VolumeMountsRequest::HashMapOfStringString(mounts) =
+            request.volume_mounts.unwrap()
+        else {
+            panic!("legacy volumeMounts should use the map variant");
+        };
+        assert_eq!(mounts.get("/mnt/data"), Some(&"vol_123".to_owned()));
     }
 
     #[tokio::test]

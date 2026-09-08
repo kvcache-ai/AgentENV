@@ -320,6 +320,20 @@ components:
       items:
         $ref: "#/components/schemas/SandboxVolumeMount"
 
+    LegacyVolumeMounts:
+      type: object
+      description: >-
+        Legacy map of absolute guest mount paths to volume IDs or names. New
+        clients should use the SandboxVolumeMount array representation.
+      additionalProperties:
+        type: string
+
+    VolumeMountsRequest:
+      description: Volumes to mount in the sandbox.
+      oneOf:
+        - $ref: "#/components/schemas/VolumeMounts"
+        - $ref: "#/components/schemas/LegacyVolumeMounts"
+
     AttachedDriveSource:
       type: object
       description: >
@@ -651,7 +665,7 @@ components:
         mcp:
           $ref: "#/components/schemas/Mcp"
         volumeMounts:
-          $ref: "#/components/schemas/VolumeMounts"
+          $ref: "#/components/schemas/VolumeMountsRequest"
 
     ResumedSandbox:
       properties:
@@ -701,7 +715,7 @@ components:
         customExtensionParams:
           $ref: "#/components/schemas/CustomExtensionParams"
         volumeMounts:
-          $ref: "#/components/schemas/VolumeMounts"
+          $ref: "#/components/schemas/VolumeMountsRequest"
         cpuCount:
           allOf:
             - $ref: "#/components/schemas/CPUCount"

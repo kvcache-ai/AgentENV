@@ -221,6 +221,9 @@ AgentENV's pagination cursor. AgentENV also does not implement E2B's standalone
 `/volumecontent` file API; read and write volume content through a sandbox where the
 volume is mounted instead.
 
+Sandbox responses and new clients use the array representation shown above. For
+backward compatibility, sandbox creation also accepts the legacy path-to-volume map.
+
 List and inspect volumes:
 
 ```bash

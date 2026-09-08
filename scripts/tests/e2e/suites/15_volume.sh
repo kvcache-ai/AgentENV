@@ -90,6 +90,7 @@ source_volume_id="$(echo "${HTTP_BODY}" | jq -r '.volumeID // empty')"
 assert_not_empty "${source_volume_id}" "cold-image source volume ID is present"
 CREATED_VOLUME_IDS+=("${source_volume_id}")
 
+# Keep one E2E request on the legacy map representation for compatibility coverage.
 cold_payload=$(jq -nc \
   --arg image "${E2E_DEFAULT_USER_IMAGE}" \
   --arg volume_id "${source_volume_id}" \
@@ -98,7 +99,7 @@ cold_payload=$(jq -nc \
     image: $image,
     timeout: 300,
     autoPause: false,
-    volumeMounts: [{name: $volume_id, path: $mount_path}]
+    volumeMounts: {($mount_path): $volume_id}
   }')
 api_post "/sandboxes-cold" "${cold_payload}"
 assert_status "${HTTP_STATUS}" "201" "create cold-image sandbox with a volume"

@@ -2604,11 +2604,10 @@ pub struct NewColdSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<std::collections::HashMap<String, crate::types::Object>>,
 
-    /// Volumes to mount in the sandbox.
     #[serde(rename = "volumeMounts")]
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
+    pub volume_mounts: Option<models::VolumeMountsRequest>,
 
     /// CPU cores for the cold-start sandbox.
     #[serde(rename = "cpuCount")]
@@ -2747,7 +2746,7 @@ impl std::str::FromStr for NewColdSandbox {
             pub env_vars: Vec<std::collections::HashMap<String, String>>,
             pub custom_extension_params:
                 Vec<std::collections::HashMap<String, crate::types::Object>>,
-            pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
+            pub volume_mounts: Vec<models::VolumeMountsRequest>,
             pub cpu_count: Vec<u32>,
             pub memory_mb: Vec<u32>,
             pub disk_size_mb: Vec<u32>,
@@ -2822,12 +2821,11 @@ impl std::str::FromStr for NewColdSandbox {
                                 .to_string(),
                         );
                     }
-                    "volumeMounts" => {
-                        return std::result::Result::Err(
-                            "Parsing a container in this style is not supported in NewColdSandbox"
-                                .to_string(),
-                        );
-                    }
+                    #[allow(clippy::redundant_clone)]
+                    "volumeMounts" => intermediate_rep.volume_mounts.push(
+                        <models::VolumeMountsRequest as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
                     #[allow(clippy::redundant_clone)]
                     "cpuCount" => intermediate_rep.cpu_count.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
@@ -2992,11 +2990,10 @@ pub struct NewSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<Nullable<std::collections::HashMap<String, crate::types::Object>>>,
 
-    /// Volumes to mount in the sandbox.
     #[serde(rename = "volumeMounts")]
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
+    pub volume_mounts: Option<models::VolumeMountsRequest>,
 }
 
 impl NewSandbox {
@@ -3092,7 +3089,7 @@ impl std::str::FromStr for NewSandbox {
             pub custom_extension_params:
                 Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub mcp: Vec<std::collections::HashMap<String, crate::types::Object>>,
-            pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
+            pub volume_mounts: Vec<models::VolumeMountsRequest>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -3168,12 +3165,11 @@ impl std::str::FromStr for NewSandbox {
                                 .to_string(),
                         );
                     }
-                    "volumeMounts" => {
-                        return std::result::Result::Err(
-                            "Parsing a container in this style is not supported in NewSandbox"
-                                .to_string(),
-                        );
-                    }
+                    #[allow(clippy::redundant_clone)]
+                    "volumeMounts" => intermediate_rep.volume_mounts.push(
+                        <models::VolumeMountsRequest as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewSandbox".to_string(),
@@ -9712,5 +9708,45 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<Volume> {
                 r#"Unable to convert header: {hdr_value:?} to string: {e}"#
             )),
         }
+    }
+}
+
+/// Volumes to mount in the sandbox.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+#[allow(non_camel_case_types, clippy::large_enum_variant)]
+pub enum VolumeMountsRequest {
+    VecOfSandboxVolumeMount(Vec<models::SandboxVolumeMount>),
+    HashMapOfStringString(std::collections::HashMap<String, String>),
+}
+
+impl validator::Validate for VolumeMountsRequest {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        match self {
+            Self::VecOfSandboxVolumeMount(_) => std::result::Result::Ok(()),
+            Self::HashMapOfStringString(_) => std::result::Result::Ok(()),
+        }
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a VolumeMountsRequest value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for VolumeMountsRequest {
+    type Err = serde_json::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        serde_json::from_str(s)
+    }
+}
+
+impl From<Vec<models::SandboxVolumeMount>> for VolumeMountsRequest {
+    fn from(value: Vec<models::SandboxVolumeMount>) -> Self {
+        Self::VecOfSandboxVolumeMount(value)
+    }
+}
+impl From<std::collections::HashMap<String, String>> for VolumeMountsRequest {
+    fn from(value: std::collections::HashMap<String, String>) -> Self {
+        Self::HashMapOfStringString(value)
     }
 }
