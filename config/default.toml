@@ -45,6 +45,10 @@ socket_poll_ms = 1
 # work_dir = "$AENV_HOME/firecracker-work"
 # serial_dir = "$AENV_HOME/logs/serial"
 
+# Retain inactive nonempty serial logs for seven days. Zero disables expiry.
+# Cleanup requires confirmed process exit; legacy and abnormal-drop logs are kept.
+serial_log_retention_secs = 604800
+
 # Enable Firecracker's own firecracker.log beside the serial log. Supported
 # levels are Error, Warning, Info, Debug, and Trace; unset disables it.
 # log_level = "Info"

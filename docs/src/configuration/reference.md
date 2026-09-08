@@ -47,7 +47,30 @@ Firecracker VM binary and boot configuration.
 | `socket_poll_ms` | integer | `1` | Poll interval (ms) for checking socket availability |
 | `work_dir` | string | `"$AENV_HOME/firecracker-work"` | Parent directory for per-sandbox Firecracker work directories. These dirs contain runtime sockets, symlinks, local logs, and writable OverlayBD upper layer data such as `overlaybd/upper.data` and `overlaybd/upper.index` |
 | `serial_dir` | string | `"$AENV_HOME/logs/serial"` | Directory for persistent Firecracker serial output (per-sandbox subdirectories) |
+| `serial_log_retention_secs` | integer | `604800` (7 days) | Retention for inactive nonempty stdout, stderr, and `firecracker.log`. `0` disables expiry. Empty logs are still removed after process exit. A background sweep starts with the server and repeats 60 seconds after each pass |
 | `log_level` | string | unset (disabled) | Optional Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`, case-insensitive). When set to a non-empty value, Firecracker's own logging is enabled and written to a `firecracker.log` file in each sandbox's log directory (alongside the serial output). Empty/unset disables it |
+
+Serial log paths remain `{serial_dir}/{sandbox_id}/`. Cleanup protects live
+writers, removes empty files after Firecracker exits, and removes a sandbox's
+directory only when it is empty. Nonempty logs remain available after deletion,
+failed startup, or pause. Their retention period starts when stop confirms process
+exit, or at the newest log modification time, whichever is later.
+An in-place pause keeps the process and its logs protected. Resuming an ID with
+retained stdout/stderr spawns a new Firecracker process instead of consuming a
+warm process, so the existing files can be appended to.
+
+After confirmed process exit, stop creates an `.inactive` marker under the
+directory lock. Resuming that ID removes the marker before opening logs. The
+sweep only collects marked directories, so legacy logs and logs left by server
+crashes or abnormal sandbox drops are preserved. Remove those logs manually only
+after stopping all servers and Firecracker processes using the serial root.
+Do not share this root with older servers that do not honor the marker protocol.
+
+Cleanup only considers known log filenames in sandbox-ID directories, preserves
+custom entries, and does not follow symlink entries. Explicit stdout/stderr
+overrides outside this tree are not managed. The serial root must be local to
+the node and writable only by the trusted runtime user. Collection uses advisory
+directory locks and does not scan host process descriptors.
 
 ## `[kernel]`
 

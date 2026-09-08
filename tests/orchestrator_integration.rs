@@ -1,6 +1,5 @@
 mod common;
 
-// Orchestrator shutdown permanently stops process-global runtime managers, so
-// this suite must not share a test process with sandboxes started by other suites.
+// Exercise persisted sandbox recovery across orchestrator restarts in one process.
 #[path = "integration/orchestrator.rs"]
 mod orchestrator;

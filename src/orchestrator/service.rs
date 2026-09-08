@@ -2743,13 +2743,6 @@ where
             )));
         }
 
-        // Clean up remaining network resources.
-        if let Some(manager) = crate::sandbox::NetworkManager::global_if_initialized() {
-            if let Err(err) = manager.shutdown() {
-                warn!(error = ?err, "failed to clean up network resources during orchestrator shutdown");
-            }
-        }
-
         info!("orchestrator shutdown completed");
         Ok(())
     }

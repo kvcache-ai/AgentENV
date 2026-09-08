@@ -22,6 +22,15 @@ pub(crate) const MAX_SLOTS: usize = crate::cfg::network::NETWORK_MAX_SLOTS;
 const NETNS_PREFIX: &str = "agentenv-ns-";
 const HOST_VETH_PREFIX: &str = "veth-";
 
+/// Permanently stop process-wide networking after sandboxes and warm Firecracker
+/// processes have stopped. Does not initialize networking if it was never used.
+pub fn shutdown_runtime() -> anyhow::Result<()> {
+    if let Some(manager) = NetworkManager::global_if_initialized() {
+        manager.shutdown()?;
+    }
+    Ok(())
+}
+
 pub(crate) fn prepare_runtime(runtime_path: &Path) -> anyhow::Result<()> {
     let directory = runtime_path.join("netns");
     std::fs::create_dir_all(&directory)?;

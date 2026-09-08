@@ -177,6 +177,13 @@ pub struct FirecrackerConfig {
     /// Files are grouped under `{serial_dir}/{sandbox_id}/`.
     #[config(env = "AENV_FIRECRACKER_SERIAL_DIR", parse_env = parse_required_path)]
     pub serial_dir: Option<PathBuf>,
+    /// Retain inactive nonempty serial logs for this many seconds. Zero disables
+    /// expiry; empty logs are still removed after Firecracker exits.
+    #[config(
+        default = 604800u64,
+        env = "AENV_FIRECRACKER_SERIAL_LOG_RETENTION_SECS"
+    )]
+    pub serial_log_retention_secs: u64,
     /// Optional Firecracker log level (e.g. "Error", "Warning", "Info", "Debug", "Trace").
     /// When set (non-empty), Firecracker logging is enabled and written to a
     /// `firecracker.log` file in the same directory as the Firecracker stdout log.

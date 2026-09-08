@@ -33,11 +33,12 @@ pub use firecracker::{
     FirecrackerCapturedSnapshot, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
     FirecrackerSandboxFactory, FirecrackerSnapshotConfig, FirecrackerSnapshotManifest,
+    SerialLogCleanup,
 };
-pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
+pub(crate) use network::prepare_runtime as prepare_network_runtime;
 pub use network::{
-    BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
-    ALL_INTERNET_TRAFFIC_CIDR,
+    shutdown_runtime as shutdown_network_runtime, BaseSandboxNetworkPolicy,
+    SandboxNetworkEgressPolicy, SandboxNetworkPolicy, ALL_INTERNET_TRAFFIC_CIDR,
 };
 pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
 pub(crate) use ublk::{compact_layers, OverlaybdCompactOutput};

@@ -7,7 +7,10 @@ use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::Orchestrator;
 use agentenv::overlaybd::OverlaybdP2pRuntime;
-use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
+use agentenv::sandbox::{
+    shutdown_network_runtime, FirecrackerPool, FirecrackerSandboxFactory, SerialLogCleanup,
+    UblkDeviceManager,
+};
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
 use agentenv::volume::{VolumeLimits, VolumeManager};
@@ -92,6 +95,8 @@ async fn main() -> anyhow::Result<()> {
         OverlaybdP2pRuntime::start_from_app_config(config, Arc::clone(&p2p_transport)).await;
 
     agentenv::setup::ensure_environment(config, overlaybd_p2p.read_facade_address()).await?;
+
+    let serial_log_cleanup = SerialLogCleanup::start(&config.firecracker);
 
     // Initialize the global ublk device manager (spawns daemon if configured).
     UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
@@ -202,6 +207,11 @@ async fn main() -> anyhow::Result<()> {
                     warn!(target: "agentenv", error = %err, "error occurred while shutting down firecracker pool");
                 }
             }
+            info!(target: "agentenv", "shutting down network runtime");
+            if let Err(err) = shutdown_network_runtime() {
+                warn!(target: "agentenv", error = %err, "error occurred while shutting down network runtime");
+            }
+            serial_log_cleanup.shutdown().await;
             info!(target: "agentenv", "shutting down ublk daemon");
             if let Err(err) = UblkDeviceManager::global().shutdown_daemon().await {
                 warn!(target: "agentenv", error = %err, "error occurred while shutting down ublk daemon");

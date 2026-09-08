@@ -23,6 +23,7 @@ use super::overlaybd_snapshot::{
     restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
 };
 use super::pool::{warm_stderr_path, warm_stdout_path, FirecrackerPool};
+use super::serial_logs::SerialLogDir;
 use super::FirecrackerInstance;
 use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
@@ -174,6 +175,7 @@ pub struct FirecrackerSandbox {
     launch: LaunchMode,
     work_dir: TempDir,
     fc_instance: FirecrackerInstance,
+    serial_log_dir: Option<SerialLogDir>,
     runtime_policy: FirecrackerRuntimePolicy,
     network_slot: Option<Slot>,
     current_network_policy: Option<SandboxNetworkPolicy>,
@@ -729,6 +731,7 @@ impl FirecrackerSandbox {
     pub(crate) async fn start_nowait(&mut self) -> Result<()> {
         self.launch.validate()?;
         trace!("launch config validated");
+        self.prepare_serial_logs().await?;
         match &self.launch {
             LaunchMode::Fresh(config) => self.start_fresh(config.clone()).await,
             LaunchMode::Resume(config) => self.start_resume(config.clone()).await,
@@ -1168,6 +1171,14 @@ impl FirecrackerSandbox {
             .stop(self.runtime_policy.socket_timeout)
             .await?;
 
+        // The process has exited and closed its log descriptors. Preserve all
+        // output, but remove empty managed logs before releasing other resources.
+        if let Some(logs) = self.serial_log_dir.take() {
+            if let Err(err) = logs.finish() {
+                warn!(error = %err, "failed to clean up stopped sandbox serial logs");
+            }
+        }
+
         // Clear envd instance
         if let Some(envd) = self.envd_instance.as_ref() {
             envd.invalidate();
@@ -1269,6 +1280,27 @@ impl FirecrackerSandbox {
             .clone()
             .map(|p| p.join(self.id.to_string()))
             .unwrap_or_else(|| self.work_dir.path().join("logs"))
+    }
+
+    async fn prepare_serial_logs(&mut self) -> Result<()> {
+        let common = self.launch.common();
+        let uses_default_logs = common.stdout_path.is_none()
+            || common.stderr_path.is_none()
+            || common
+                .firecracker_log_level
+                .as_ref()
+                .is_some_and(|level| !level.trim().is_empty());
+        if self.serial_log_dir.is_none()
+            && common.serial_output_base_dir.is_some()
+            && uses_default_logs
+        {
+            self.serial_log_dir = Some(
+                SerialLogDir::acquire(self.default_log_dir())
+                    .await
+                    .context("protect managed Firecracker serial logs")?,
+            );
+        }
+        Ok(())
     }
 
     fn uses_overlaybd_ublk(&self) -> bool {
@@ -1473,6 +1505,7 @@ impl FirecrackerSandbox {
             launch,
             work_dir,
             fc_instance,
+            serial_log_dir: None,
             network_slot: None,
             current_network_policy,
             current_custom_extension_params,
@@ -1697,7 +1730,13 @@ impl FirecrackerSandbox {
             .context("snapshot rootfs image config is missing")?;
         self.current_rootfs_virtual_size = Some(rootfs_virtual_size);
 
-        if config.common.stdout_path.is_none() && config.common.stderr_path.is_none() {
+        // A warm process already has open stdio descriptors. Relocating those
+        // files would replace retained history; spawn normally to append to it.
+        if config.common.stdout_path.is_none()
+            && config.common.stderr_path.is_none()
+            && !self.firecracker_stdout_path().exists()
+            && !self.firecracker_stderr_path().exists()
+        {
             if let Some(warm) = FirecrackerPool::global().and_then(|pool| pool.try_acquire()) {
                 let warm_dir = warm.work_dir.path();
                 let warm_stdout = warm_stdout_path(warm_dir);
@@ -2722,6 +2761,120 @@ mod tests {
         sandbox.stop().await?;
 
         assert!(sandbox.envd_instance.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_serial_logs_are_removed_after_stop_and_can_be_reopened() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut config = fresh_config();
+        config.common.serial_output_base_dir = Some(root.path().to_path_buf());
+        let mut sandbox = FirecrackerSandbox::new(config)?;
+        for _ in 0..2 {
+            sandbox.prepare_serial_logs().await?;
+            sandbox
+                .fc_instance
+                .spawn_with_netns(
+                    Path::new("/bin/true"),
+                    Some(&sandbox.firecracker_stdout_path()),
+                    Some(&sandbox.firecracker_stderr_path()),
+                    None,
+                )
+                .await?;
+            assert!(sandbox.firecracker_stderr_path().exists());
+            sandbox.stop().await?;
+            assert!(!sandbox.default_log_dir().exists());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_start_serial_diagnostics_survive_stop_and_append_on_reuse() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir()?;
+        let binary = root.path().join("failing-firecracker");
+        fs::write(
+            &binary,
+            "#!/bin/sh\nprintf 'startup failed\\n' >&2\nexit 1\n",
+        )?;
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))?;
+        let mut config = fresh_config();
+        config.common.serial_output_base_dir = Some(root.path().join("serial"));
+        let mut sandbox = FirecrackerSandbox::new(config)?;
+        for _ in 0..2 {
+            sandbox.prepare_serial_logs().await?;
+            sandbox
+                .fc_instance
+                .spawn_with_netns(
+                    &binary,
+                    Some(&sandbox.firecracker_stdout_path()),
+                    Some(&sandbox.firecracker_stderr_path()),
+                    None,
+                )
+                .await?;
+            let error = sandbox
+                .fc_instance
+                .wait_for_ready(
+                    std::time::Duration::from_secs(5),
+                    std::time::Duration::from_millis(1),
+                )
+                .await
+                .expect_err("fake Firecracker must exit before readiness");
+            assert!(error.to_string().contains("startup failed"));
+            sandbox.stop().await?;
+            assert!(!sandbox.firecracker_stdout_path().exists());
+        }
+        assert_eq!(
+            fs::read_to_string(sandbox.firecracker_stderr_path())?,
+            "startup failed\nstartup failed\n"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn relocated_warm_serial_logs_are_cleaned_after_stop() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut config = fresh_config();
+        config.common.serial_output_base_dir = Some(root.path().to_path_buf());
+        let mut sandbox = FirecrackerSandbox::new(config)?;
+        let stdout = warm_stdout_path(sandbox.work_dir.path());
+        let stderr = warm_stderr_path(sandbox.work_dir.path());
+        sandbox
+            .fc_instance
+            .spawn_with_netns(Path::new("/bin/true"), Some(&stdout), Some(&stderr), None)
+            .await?;
+        sandbox.prepare_serial_logs().await?;
+        relocate_warm_log(&stdout, &sandbox.firecracker_stdout_path())?;
+        relocate_warm_log(&stderr, &sandbox.firecracker_stderr_path())?;
+        assert!(sandbox.firecracker_stderr_path().exists());
+        sandbox.stop().await?;
+        assert!(!sandbox.default_log_dir().exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_serial_output_overrides_are_not_cleaned() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let mut config = fresh_config();
+        config.common.serial_output_base_dir = Some(root.path().join("managed"));
+        config.common.stdout_path = Some(root.path().join("custom-stdout"));
+        config.common.stderr_path = Some(root.path().join("custom-stderr"));
+        let mut sandbox = FirecrackerSandbox::new(config)?;
+        sandbox.prepare_serial_logs().await?;
+        sandbox
+            .fc_instance
+            .spawn_with_netns(
+                Path::new("/bin/true"),
+                Some(&sandbox.firecracker_stdout_path()),
+                Some(&sandbox.firecracker_stderr_path()),
+                None,
+            )
+            .await?;
+        sandbox.stop().await?;
+        assert!(sandbox.firecracker_stdout_path().exists());
+        assert!(sandbox.firecracker_stderr_path().exists());
+        assert!(!sandbox.default_log_dir().exists());
         Ok(())
     }
 

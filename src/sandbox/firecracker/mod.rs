@@ -14,6 +14,7 @@ mod overlaybd_snapshot;
 mod pool;
 mod process_vm_reader;
 mod sandbox;
+mod serial_logs;
 mod socket;
 
 pub use config::{
@@ -25,3 +26,4 @@ pub(super) use instance::FirecrackerInstance;
 pub use manifest::FirecrackerSnapshotManifest;
 pub use pool::FirecrackerPool;
 pub use sandbox::{FirecrackerCapturedSnapshot, FirecrackerPausedState, FirecrackerSandbox};
+pub use serial_logs::SerialLogCleanup;

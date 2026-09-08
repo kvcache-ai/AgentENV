@@ -161,6 +161,19 @@ async fn orchestrator_lifecycle() -> Result<()> {
             ProxyLookupResult::Paused { auto_resume: false }
         );
 
+        // Retained output forces resume to start a fresh Firecracker process,
+        // so restart must allocate networking through the process-wide manager.
+        let serial_dir = ConfigManager::global_config()
+            .firecracker
+            .serial_dir
+            .as_ref()
+            .expect("managed serial directory")
+            .join(sandbox_id.to_string());
+        std::fs::create_dir_all(&serial_dir)?;
+        let stderr_path = serial_dir.join("firecracker-stderr.log");
+        let retained_output = "output retained across orchestrator restart\n";
+        std::fs::write(&stderr_path, retained_output)?;
+
         orchestrator.shutdown().await?;
         drop(orchestrator);
 
@@ -185,6 +198,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
             .await?;
         assert_eq!(resumed.state, SandboxState::Running);
         assert_eq!(resumed.timeout, Some(Duration::from_secs(120)));
+        assert!(std::fs::read_to_string(&stderr_path)?.starts_with(retained_output));
         let lookup = restarted.proxy_lookup_for(&sandbox_id).await?;
         assert!(
             matches!(lookup, ProxyLookupResult::Ready(_)),

@@ -37,6 +37,7 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_FORCE_SYSCTL_TUNING` | unset | Set to `1` to force sysctl tuning in a privileged container with writable host sysctls. Normally skipped automatically inside containers. |
 | `AENV_FIRECRACKER_WORK_DIR` | `$AENV_HOME/firecracker-work` | Override the parent directory for per-sandbox Firecracker work directories. |
 | `AENV_FIRECRACKER_SERIAL_DIR` | `$AENV_HOME/logs/serial` | Override the directory for persistent Firecracker serial output. Files are grouped under `{serial_dir}/{sandbox_id}/`. |
+| `AENV_FIRECRACKER_SERIAL_LOG_RETENTION_SECS` | `604800` | Retention in seconds for inactive nonempty Firecracker logs. `0` disables expiry; empty logs are still cleaned after process exit. |
 | `AENV_PERSISTED_SANDBOX_STORE_PATH` | `$AENV_HOME/persisted-sandboxes` | Override the directory where paused sandbox state is persisted across server restarts. |
 
 ## E2B SDK / CLI

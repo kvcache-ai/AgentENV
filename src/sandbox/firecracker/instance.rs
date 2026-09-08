@@ -219,7 +219,7 @@ impl FirecrackerInstance {
             "stopping firecracker process"
         );
 
-        if let Some(mut child) = self.process.take() {
+        if let Some(child) = self.process.as_mut() {
             // First try a graceful stop with SIGTERM
             if let Some(pid) = child.id() {
                 trace!(pid, "sending SIGTERM to firecracker");
@@ -227,11 +227,16 @@ impl FirecrackerInstance {
             }
 
             // Wait for the process to exit, but if it doesn't within the timeout, force kill it with SIGKILL
-            if time::timeout(timeout, child.wait()).await.is_err() {
-                warn!("firecracker stop timed out; sending SIGKILL");
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+            match time::timeout(timeout, child.wait()).await {
+                Ok(status) => {
+                    status.context("wait for firecracker exit")?;
+                }
+                Err(_) => {
+                    warn!("firecracker stop timed out; sending SIGKILL");
+                    child.kill().await.context("kill and reap firecracker")?;
+                }
             }
+            self.process.take();
         }
 
         if self.socket_path.exists() {

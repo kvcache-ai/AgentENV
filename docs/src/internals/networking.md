@@ -193,4 +193,4 @@ The process-global registry is keyed by `host_interaction_ip`, but listeners are
 
 On stop, a slot may return to the warm pool. The namespace and baseline networking remain available for reuse; `user_egress_rules_present` tracks whether the next tenant needs a user-chain replacement. The next policy application clears or replaces stale user rules and removes stale proxy policy as appropriate. Slots drained from the pool are fully cleaned up.
 
-On shutdown, the manager stops pool maintenance, drains warm slots, stops all proxy listeners, removes global host rules, and removes namespace/veth state. An `atexit` hook and `Drop` path provide best-effort cleanup for abnormal exits.
+On server shutdown, after sandboxes and the Firecracker warm pool have stopped, the manager stops pool maintenance, drains warm slots, stops all proxy listeners, removes global host rules, and removes namespace/veth state. Shutting down an individual orchestrator leaves this process-wide manager available so another orchestrator can resume persisted sandboxes. An `atexit` hook and `Drop` path provide best-effort cleanup for abnormal exits.
