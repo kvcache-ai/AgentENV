@@ -21,18 +21,37 @@ import (
 const maxCursorSandboxID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
 
 type listedSandbox struct {
-	TemplateID  string            `json:"templateID"`
-	Alias       *string           `json:"alias,omitempty"`
-	SandboxID   string            `json:"sandboxID"`
-	ClientID    string            `json:"clientID"`
-	StartedAt   time.Time         `json:"startedAt"`
-	EndAt       time.Time         `json:"endAt"`
-	CPUCount    uint32            `json:"cpuCount"`
-	MemoryMB    uint32            `json:"memoryMB"`
-	DiskSizeMB  uint32            `json:"diskSizeMB"`
-	Metadata    map[string]string `json:"metadata,omitempty"`
-	State       string            `json:"state"`
-	EnvdVersion string            `json:"envdVersion"`
+	payload   json.RawMessage
+	sandboxID string
+	startedAt time.Time
+	state     string
+}
+
+type listedSandboxIndex struct {
+	SandboxID string    `json:"sandboxID"`
+	StartedAt time.Time `json:"startedAt"`
+	State     string    `json:"state"`
+}
+
+func (s *listedSandbox) UnmarshalJSON(data []byte) error {
+	var index listedSandboxIndex
+	if err := json.Unmarshal(data, &index); err != nil {
+		return err
+	}
+
+	// Keep the node response opaque so additive API fields survive aggregation.
+	s.payload = append(s.payload[:0], data...)
+	s.sandboxID = index.SandboxID
+	s.startedAt = index.StartedAt
+	s.state = index.State
+	return nil
+}
+
+func (s listedSandbox) MarshalJSON() ([]byte, error) {
+	if len(s.payload) == 0 {
+		return nil, errors.New("listed sandbox payload is empty")
+	}
+	return s.payload, nil
 }
 
 type clusterListResult struct {
@@ -263,7 +282,7 @@ func clusterListIncludesRunning(r *http.Request) bool {
 func runningSandboxCount(items []listedSandbox) int {
 	count := 0
 	for _, item := range items {
-		if item.State == "running" {
+		if item.state == "running" {
 			count++
 		}
 	}
@@ -272,16 +291,16 @@ func runningSandboxCount(items []listedSandbox) int {
 
 func sortListedSandboxes(items []listedSandbox, descending bool) {
 	sort.Slice(items, func(i, j int) bool {
-		if items[i].StartedAt.Equal(items[j].StartedAt) {
+		if items[i].startedAt.Equal(items[j].startedAt) {
 			if descending {
-				return items[i].SandboxID < items[j].SandboxID
+				return items[i].sandboxID < items[j].sandboxID
 			}
-			return items[i].SandboxID > items[j].SandboxID
+			return items[i].sandboxID > items[j].sandboxID
 		}
 		if descending {
-			return items[i].StartedAt.After(items[j].StartedAt)
+			return items[i].startedAt.After(items[j].startedAt)
 		}
-		return items[i].StartedAt.Before(items[j].StartedAt)
+		return items[i].startedAt.Before(items[j].startedAt)
 	})
 }
 
@@ -295,10 +314,10 @@ func dedupListedSandboxes(items []listedSandbox) []listedSandbox {
 	seen := make(map[string]struct{}, len(items))
 	deduped := make([]listedSandbox, 0, len(items))
 	for _, item := range items {
-		if _, ok := seen[item.SandboxID]; ok {
+		if _, ok := seen[item.sandboxID]; ok {
 			continue
 		}
-		seen[item.SandboxID] = struct{}{}
+		seen[item.sandboxID] = struct{}{}
 		deduped = append(deduped, item)
 	}
 	return deduped
@@ -312,13 +331,13 @@ func paginateListedSandboxes(items []listedSandbox, nextToken string, limit *int
 
 	page := make([]listedSandbox, 0, len(items))
 	for _, item := range items {
-		pastCursor := item.StartedAt.Before(cursorTime)
-		pastID := item.SandboxID > cursorID
+		pastCursor := item.startedAt.Before(cursorTime)
+		pastID := item.sandboxID > cursorID
 		if !descending {
-			pastCursor = item.StartedAt.After(cursorTime)
-			pastID = item.SandboxID < cursorID
+			pastCursor = item.startedAt.After(cursorTime)
+			pastID = item.sandboxID < cursorID
 		}
-		if pastCursor || (item.StartedAt.Equal(cursorTime) && pastID) {
+		if pastCursor || (item.startedAt.Equal(cursorTime) && pastID) {
 			page = append(page, item)
 		}
 	}
@@ -379,7 +398,7 @@ func nextClusterListToken(items []listedSandbox, limit *int, descending bool) st
 		return ""
 	}
 	last := items[len(items)-1]
-	raw := fmt.Sprintf("%s__%s", last.StartedAt.UTC().Format(time.RFC3339Nano), last.SandboxID)
+	raw := fmt.Sprintf("%s__%s", last.startedAt.UTC().Format(time.RFC3339Nano), last.sandboxID)
 	if !descending {
 		raw += "__asc"
 	}
