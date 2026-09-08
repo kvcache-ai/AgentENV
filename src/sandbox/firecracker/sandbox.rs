@@ -194,7 +194,6 @@ pub struct FirecrackerSandbox {
     /// paused-state resumes must preserve the captured mount state.
     initial_guest_drive_mounts: Vec<(usize, ExtraDrive)>,
     current_rootfs_virtual_size: Option<u64>,
-    live_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
@@ -359,12 +358,11 @@ impl SandboxBackend for FirecrackerSandbox {
     }
 
     async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
-        let live_snapshot_root = self
-            .live_snapshot_root()
+        let snapshot_generation = self
+            .new_snapshot_generation()
             .await
             .map_err(SandboxCaptureError::from)?;
-        let snapshot_dir = live_snapshot_root.path().join(Uuid::now_v7().to_string());
-
+        let snapshot_dir = snapshot_generation.path().to_path_buf();
         let (snapshot_config, manifest) = match self.pause_to_dir(&snapshot_dir).await {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -379,7 +377,7 @@ impl SandboxBackend for FirecrackerSandbox {
 
         Ok(CapturedSandboxSnapshot::new(
             manifest,
-            FirecrackerCaptureArtifacts::new(snapshot_config, snapshot_dir, live_snapshot_root),
+            FirecrackerCaptureArtifacts::new(snapshot_config, snapshot_dir, snapshot_generation),
         ))
     }
 
@@ -980,12 +978,10 @@ impl FirecrackerSandbox {
     ///   `<system-temp>/aenv/managed-snapshots` when `work_dir` is unset.
     /// - `<sandbox_id>` is the [`SandboxID`](crate::types::SandboxId), used to group snapshots by sandbox and improve readability.
     pub async fn pause(&mut self) -> Result<FirecrackerSnapshotConfig> {
-        let snapshot_root = self.live_snapshot_root().await?;
-        snapshot_root.prepare().await?;
-        let snapshot_dir = snapshot_root.path().join(Uuid::now_v7().to_string());
+        let snapshot_generation = self.new_snapshot_generation().await?;
 
-        let (mut snapshot, _) = self.pause_to_dir(&snapshot_dir).await?;
-        snapshot.managed_snapshot_root = Some(snapshot_root);
+        let (mut snapshot, _) = self.pause_to_dir(snapshot_generation.path()).await?;
+        snapshot.managed_snapshot_root = Some(snapshot_generation);
 
         Ok(snapshot)
     }
@@ -1010,12 +1006,19 @@ impl FirecrackerSandbox {
             .await
             .with_context(|| format!("create snapshot dir {}", snapshot_dir.display()))?;
 
-        let snapshot_result = self.snapshot_to_dir(snapshot_dir).await;
+        let mut live_runtime_mutated = false;
+        let snapshot_result = self
+            .snapshot_to_dir(snapshot_dir, &mut live_runtime_mutated)
+            .await;
         match snapshot_result {
             Ok(snapshot) => Ok(snapshot),
             Err(err) => {
                 Self::cleanup_failed_snapshot_dir(snapshot_dir).await;
-                Err(err)
+                if live_runtime_mutated {
+                    Err(SandboxCaptureError::terminal(err).into())
+                } else {
+                    Err(err)
+                }
             }
         }
     }
@@ -1023,6 +1026,7 @@ impl FirecrackerSandbox {
     async fn snapshot_to_dir(
         &self,
         snapshot_dir: &Path,
+        live_runtime_mutated: &mut bool,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
         // Local layers are always captured raw; when enabled, compression
@@ -1031,9 +1035,8 @@ impl FirecrackerSandbox {
             .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, OverlaybdCompactOutput::Raw)
             .await?;
 
-        // Build the memory image config: collect parent layers, make runtime
-        // lowers local to this snapshot dir, and compact only if the layer
-        // count exceeds the configured maximum.
+        // Firecracker preserves dirty bits across state-only captures. Each
+        // memory delta is cumulative relative to this instance's launch image.
         let resume_mem_image_config_path = match &self.launch {
             LaunchMode::Resume(config) => {
                 Some(config.mem_overlaybd_config.image_config_path.as_path())
@@ -1087,6 +1090,7 @@ impl FirecrackerSandbox {
                 overlaybd_source.read_only,
                 &rootfs_runtime.image_config_path,
                 snapshot_dir,
+                live_runtime_mutated,
             )
             .await
             .context("snapshot overlaybd runtime state to persistent dir")?;
@@ -1105,7 +1109,7 @@ impl FirecrackerSandbox {
             (rootfs_path, size)
         };
         let snapshot_extra_drives = self
-            .snapshot_extra_drives(snapshot_dir)
+            .snapshot_extra_drives(snapshot_dir, live_runtime_mutated)
             .await
             .context("snapshot extra drives to persistent dir")?;
         let manifest_extra_drives = snapshot_extra_drives
@@ -1314,23 +1318,19 @@ impl FirecrackerSandbox {
         self.work_dir.path().join(USER_ROOTFS_DRIVE_PATH)
     }
 
-    fn new_managed_persistent_snapshot_root(&self) -> Arc<PersistentSnapshotRootGuard> {
-        let sandbox_dir = self.id.to_string();
-        let root = managed_snapshot_base().join(sandbox_dir);
-        Arc::new(PersistentSnapshotRootGuard::new(root))
-    }
-
-    async fn live_snapshot_root(&mut self) -> Result<Arc<PersistentSnapshotRootGuard>> {
-        if let Some(root) = &self.live_snapshot_root {
-            return Ok(Arc::clone(root));
-        }
-        let root = self
-            .launch
-            .managed_snapshot_root()
-            .unwrap_or_else(|| self.new_managed_persistent_snapshot_root());
-        root.prepare().await?;
-        self.live_snapshot_root = Some(Arc::clone(&root));
-        Ok(root)
+    async fn new_snapshot_generation(&self) -> Result<Arc<PersistentSnapshotRootGuard>> {
+        let launch_generation = match &self.launch {
+            LaunchMode::Fresh(_) => None,
+            LaunchMode::Resume(config) => config.managed_snapshot_root.as_ref(),
+        };
+        let root = launch_generation
+            .and_then(|generation| generation.path().parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| managed_snapshot_base().join(self.id.to_string()));
+        let generation = Arc::new(PersistentSnapshotRootGuard::new(
+            root.join(Uuid::now_v7().to_string()),
+        ));
+        generation.prepare().await?;
+        Ok(generation)
     }
 
     /// Best-effort cleanup of a caller-managed snapshot directory after a failed pause.
@@ -1503,7 +1503,6 @@ impl FirecrackerSandbox {
             envd_instance: None,
             frozen_volume_mounts: Vec::new(),
             initial_guest_drive_mounts: Vec::new(),
-            live_snapshot_root: None,
         })
     }
 
@@ -2380,7 +2379,11 @@ impl FirecrackerSandbox {
         Ok(attachments)
     }
 
-    async fn snapshot_extra_drives(&self, snapshot_dir: &Path) -> Result<Vec<ExtraDrive>> {
+    async fn snapshot_extra_drives(
+        &self,
+        snapshot_dir: &Path,
+        live_runtime_mutated: &mut bool,
+    ) -> Result<Vec<ExtraDrive>> {
         let extra_drives = &self.launch.common().extra_drives;
         if extra_drives.is_empty() {
             return Ok(Vec::new());
@@ -2417,6 +2420,7 @@ impl FirecrackerSandbox {
                 &output_dir,
                 &snapshot_layer_file_name,
                 "drive",
+                live_runtime_mutated,
             )
             .await
             .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
@@ -2448,6 +2452,7 @@ impl FirecrackerSandbox {
             self.resources.extra_drive_runtimes.len()
         );
 
+        let mut live_runtime_mutated = false;
         for (drive, runtime) in extra_drives
             .iter()
             .zip(&self.resources.extra_drive_runtimes)
@@ -2466,8 +2471,16 @@ impl FirecrackerSandbox {
                 output_dir,
                 &snapshot_layer_file_name,
                 "volume",
+                &mut live_runtime_mutated,
             )
             .await
+            .map_err(|error| {
+                if live_runtime_mutated {
+                    SandboxCaptureError::terminal(error).into()
+                } else {
+                    error
+                }
+            })
             .with_context(|| format!("snapshot persistent volume '{}'", drive.drive_id()))?;
         }
         Ok(())
@@ -2573,13 +2586,6 @@ impl LaunchMode {
         match self {
             LaunchMode::Fresh(config) => &config.common,
             LaunchMode::Resume(config) => &config.common,
-        }
-    }
-
-    fn managed_snapshot_root(&self) -> Option<Arc<PersistentSnapshotRootGuard>> {
-        match self {
-            LaunchMode::Fresh(_) => None,
-            LaunchMode::Resume(config) => config.managed_snapshot_root.clone(),
         }
     }
 
