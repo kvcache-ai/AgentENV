@@ -3,7 +3,8 @@ use std::pin::Pin;
 
 use super::error::{Error, Result};
 use super::types::{
-    P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProviderHint, P2pEndpoint, P2pPublishRequest,
+    P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProviderHint, P2pEndpoint, P2pFetchOptions,
+    P2pPublishRequest,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -26,14 +27,38 @@ pub trait P2pTransport: Send + Sync {
         hints: &[P2pArtifactProviderHint],
     ) -> Result<Option<P2pArtifactDescriptor>>;
 
-    /// Download the artifact described by `descriptor` into `destination` and return its size in bytes.
-    async fn fetch(&self, descriptor: &P2pArtifactDescriptor, destination: &Path) -> Result<u64>;
+    /// Download the artifact described by `descriptor` into `destination` using default options and return its size in bytes.
+    async fn fetch(&self, descriptor: &P2pArtifactDescriptor, destination: &Path) -> Result<u64> {
+        self.fetch_with_options(descriptor, destination, P2pFetchOptions::default())
+            .await
+    }
 
-    /// Download the full artifact described by `descriptor` into memory.
+    /// Download the artifact described by `descriptor` into `destination` and return its size in bytes.
+    async fn fetch_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        destination: &Path,
+        options: P2pFetchOptions,
+    ) -> Result<u64>;
+
+    /// Download the full artifact described by `descriptor` into memory using default options.
     ///
     /// Callers should prefer [`Self::fetch`] for large artifacts to avoid buffering
     /// the full artifact in the process.
-    async fn fetch_bytes(&self, descriptor: &P2pArtifactDescriptor) -> Result<Bytes>;
+    async fn fetch_bytes(&self, descriptor: &P2pArtifactDescriptor) -> Result<Bytes> {
+        self.fetch_bytes_with_options(descriptor, P2pFetchOptions::default())
+            .await
+    }
+
+    /// Download the full artifact described by `descriptor` into memory.
+    ///
+    /// Callers should prefer [`Self::fetch_with_options`] for large artifacts to avoid buffering
+    /// the full artifact in the process.
+    async fn fetch_bytes_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        options: P2pFetchOptions,
+    ) -> Result<Bytes>;
 
     /// Stream an exact byte range from the artifact described by `descriptor`.
     ///
@@ -82,11 +107,20 @@ impl P2pTransport for DisabledP2pTransport {
         Ok(None)
     }
 
-    async fn fetch(&self, _descriptor: &P2pArtifactDescriptor, _destination: &Path) -> Result<u64> {
+    async fn fetch_with_options(
+        &self,
+        _descriptor: &P2pArtifactDescriptor,
+        _destination: &Path,
+        _options: P2pFetchOptions,
+    ) -> Result<u64> {
         Err(Error::TransportDisabled)
     }
 
-    async fn fetch_bytes(&self, _descriptor: &P2pArtifactDescriptor) -> Result<Bytes> {
+    async fn fetch_bytes_with_options(
+        &self,
+        _descriptor: &P2pArtifactDescriptor,
+        _options: P2pFetchOptions,
+    ) -> Result<Bytes> {
         Err(Error::TransportDisabled)
     }
 

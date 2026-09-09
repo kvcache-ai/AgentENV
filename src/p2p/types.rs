@@ -148,3 +148,16 @@ pub struct P2pArtifactProviderHint {
     /// Transport endpoint if the producer endpoint is known.
     pub endpoint: Option<P2pEndpoint>,
 }
+
+/// Options to fetch an artifact from a transport backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct P2pFetchOptions {
+    /// The transport backend should automatically advertise the fetched artifact.
+    pub advertise: bool,
+}
+
+impl Default for P2pFetchOptions {
+    fn default() -> Self {
+        Self { advertise: true }
+    }
+}

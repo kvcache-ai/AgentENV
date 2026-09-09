@@ -36,7 +36,7 @@ use crate::p2p::error::{Error, Result};
 use crate::p2p::transport::P2pTransport;
 use crate::p2p::types::{
     P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProvider, P2pArtifactProviderHint,
-    P2pEndpoint, P2pPeer, P2pPublishMode, P2pPublishRequest, P2pPublishSource,
+    P2pEndpoint, P2pFetchOptions, P2pPeer, P2pPublishMode, P2pPublishRequest, P2pPublishSource,
 };
 use crate::p2p::P2pByteStream;
 
@@ -484,10 +484,15 @@ impl P2pTransport for IrohBlobsP2pTransport {
     }
 
     #[instrument(
-        skip(self, descriptor),
+        skip(self, descriptor, options),
         fields(key = %descriptor.key, destination = %destination.display())
     )]
-    async fn fetch(&self, descriptor: &P2pArtifactDescriptor, destination: &Path) -> Result<u64> {
+    async fn fetch_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        destination: &Path,
+        options: P2pFetchOptions,
+    ) -> Result<u64> {
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await.with_context(|| {
                 format!("create P2P fetch destination dir {}", parent.display())
@@ -512,14 +517,20 @@ impl P2pTransport for IrohBlobsP2pTransport {
         // Download into the local FsStore first, then export to the caller's destination.
         self.download_blob(GetRequest::blob(blob_hash), providers)
             .await?;
-        self.try_advertise_fetched_blob(descriptor, blob_hash).await;
+        if options.advertise {
+            self.try_advertise_fetched_blob(descriptor, blob_hash).await;
+        }
         let size = self.export_local_blob(blob_hash, destination).await?;
         debug!(providers_count, size, "fetched artifact from P2P provider");
         Ok(size)
     }
 
-    #[instrument(skip(self, descriptor), fields(key = %descriptor.key))]
-    async fn fetch_bytes(&self, descriptor: &P2pArtifactDescriptor) -> Result<Bytes> {
+    #[instrument(skip(self, descriptor, options), fields(key = %descriptor.key))]
+    async fn fetch_bytes_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        options: P2pFetchOptions,
+    ) -> Result<Bytes> {
         let (blob_hash, providers) = match self.resolve_fetch_source(descriptor)? {
             BlobFetchSource::Local { blob_hash } => {
                 let bytes = self.read_local_blob_bytes(blob_hash).await?;
@@ -541,7 +552,9 @@ impl P2pTransport for IrohBlobsP2pTransport {
         // the artifact to later peers.
         self.download_blob(GetRequest::blob(blob_hash), providers)
             .await?;
-        self.try_advertise_fetched_blob(descriptor, blob_hash).await;
+        if options.advertise {
+            self.try_advertise_fetched_blob(descriptor, blob_hash).await;
+        }
         let bytes = self.read_local_blob_bytes(blob_hash).await?;
         debug!(
             providers_count,
@@ -1222,6 +1235,26 @@ mod tests {
 
         consumer.shutdown().await.context("shutdown consumer P2P")?;
         provider.shutdown().await.context("shutdown provider P2P")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transport_fetch_bytes_can_skip_advertising() -> Result<()> {
+        let temp = tempfile::tempdir().context("create temp test dir")?;
+        let (provider, consumer) = test_provider_consumer(&temp).await?;
+        let key = "test/p2p/iroh/bytes-fetch-no-advertise".to_string();
+        let bytes = Bytes::from_static(b"fetched without catalog publication");
+        provider
+            .publish(&P2pPublishRequest::bytes(key.clone(), bytes.clone()))
+            .await?;
+        let descriptor = consumer.lookup(&key).await?.context("descriptor")?;
+        let fetched = consumer
+            .fetch_bytes_with_options(&descriptor, P2pFetchOptions { advertise: false })
+            .await?;
+        assert_eq!(fetched, bytes);
+        assert!(consumer.get_local(&key).await.is_none());
+        consumer.shutdown().await?;
+        provider.shutdown().await?;
         Ok(())
     }
 
