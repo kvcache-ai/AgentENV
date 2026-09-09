@@ -129,6 +129,8 @@ struct UblkDaemonClientInner {
     socket_path: PathBuf,
     /// Set to `true` when the daemon process exits (expected or unexpected).
     daemon_dead: AtomicBool,
+    /// Retains completion so shutdown callers cannot miss the watchdog's exit.
+    daemon_exited: tokio::sync::watch::Sender<bool>,
     /// Set to `true` when `shutdown()` is called, so the watchdog task
     /// doesn't log the expected exit as an error.
     shutting_down: AtomicBool,
@@ -224,6 +226,7 @@ impl UblkDaemonClient {
             inner: Arc::new(UblkDaemonClientInner {
                 socket_path: config.socket_path,
                 daemon_dead: AtomicBool::new(false),
+                daemon_exited: tokio::sync::watch::channel(false).0,
                 shutting_down: AtomicBool::new(false),
                 death_reason: Mutex::new(None),
                 runtime_device_timeout: config.runtime_device_timeout,
@@ -323,6 +326,7 @@ impl UblkDaemonClient {
 
             *inner.death_reason.lock().unwrap() = Some(reason);
             inner.daemon_dead.store(true, Ordering::Release);
+            inner.daemon_exited.send_replace(true);
         });
     }
 
@@ -492,6 +496,12 @@ impl UblkDaemonClient {
         let _ = self
             .call(DaemonRequest::Shutdown, Duration::from_secs(5))
             .await;
+        self.inner
+            .daemon_exited
+            .subscribe()
+            .wait_for(|exited| *exited)
+            .await
+            .context("wait for ublk daemon exit")?;
         Ok(())
     }
 
@@ -638,6 +648,7 @@ impl UblkDaemonClient {
             inner: Arc::new(UblkDaemonClientInner {
                 socket_path,
                 daemon_dead: AtomicBool::new(daemon_dead),
+                daemon_exited: tokio::sync::watch::channel(true).0,
                 shutting_down: AtomicBool::new(false),
                 death_reason: Mutex::new(if daemon_dead {
                     Some("test: daemon marked dead".into())
@@ -653,6 +664,57 @@ impl UblkDaemonClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_waits_for_child_exit_after_rpc_ack() {
+        use tokio::io::AsyncWriteExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("shutdown.sock");
+        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
+        let client = UblkDaemonClient::new_for_test(sock_path, false);
+        // The child cannot exit until the test releases its stdin gate.
+        client.inner.daemon_exited.send_replace(false);
+        let mut child = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "read line"])
+            .stdin(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut gate = child.stdin.take().unwrap();
+        UblkDaemonClient::spawn_watchdog(client.inner.clone(), child);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: DaemonRequest = recv_message(&mut stream).await.unwrap().unwrap();
+            assert!(matches!(request, DaemonRequest::Shutdown));
+            send_message(&mut stream, &DaemonResponse::Ok)
+                .await
+                .unwrap();
+            ack_tx.send(()).unwrap();
+        });
+        let shutdown_client = client.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_client.shutdown().await });
+        ack_rx.await.unwrap();
+        let returned_early = tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_ok();
+        gate.write_all(b"exit\n").await.unwrap();
+        if !returned_early {
+            tokio::time::timeout(Duration::from_secs(3), shutdown)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            !returned_early,
+            "shutdown returned before daemon cleanup/exit"
+        );
+        assert!(client.inner.daemon_dead.load(Ordering::Acquire));
+        // Repeated shutdown must also observe the already-completed exit.
+        client.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn daemon_dead_fails_immediately() {
