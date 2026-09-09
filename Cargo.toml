@@ -108,7 +108,7 @@ storage-util = { path = "storage/util" }
 dashmap = "6.1.0"
 io-uring = "0.7.9"
 tokio-tungstenite = "0.28"
-sha2 = "0.10"
+sha2 = { version = "0.10", features = ["asm"] }
 hmac = "0.12"
 subtle = "2.6"
 hex = "0.4"
