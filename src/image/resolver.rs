@@ -919,9 +919,6 @@ mod tests {
         stderr: &str,
         exit_code: i32,
     ) -> std::path::PathBuf {
-        use std::io::Write;
-        use std::os::unix::fs::PermissionsExt;
-
         let stdout_path = dir.join("stdout");
         let stderr_path = dir.join("stderr");
         std::fs::write(&stdout_path, stdout).expect("write stdout fixture");
@@ -930,25 +927,23 @@ mod tests {
         // The script locates its fixtures relative to `$0` rather than
         // embedding absolute paths, so a TMPDIR containing shell
         // metacharacters cannot break or inject into the generated script.
-        //
-        // Staged write + rename so the binary is never observed half-written or
-        // non-executable, matching how the real dependency installer stages
-        // downloads.
+        let script = format!(
+            "#!/bin/sh\ndir=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nprintf '%s\\n' \"$@\" > \"$dir/argv\"\ncat \"$dir/stdout\"\ncat \"$dir/stderr\" >&2\nexit {exit_code}\n",
+        );
+
+        // Write in a child and wait for it to exit. Writing in this test process
+        // lets concurrent forks inherit the writable fd and cause ETXTBSY even
+        // after we close it and rename the file; CLOEXEC only closes it at exec.
         let binary = dir.join("regctl");
-        let staged = dir.join("regctl.staged");
-        {
-            let mut file = std::fs::File::create(&staged).expect("create fake regctl");
-            write!(
-                file,
-                "#!/bin/sh\ndir=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nprintf '%s\\n' \"$@\" > \"$dir/argv\"\ncat \"$dir/stdout\"\ncat \"$dir/stderr\" >&2\nexit {exit_code}\n",
-            )
-            .expect("write fake regctl");
-            file.sync_all().expect("sync fake regctl");
-        }
-        let mut permissions = std::fs::metadata(&staged).expect("stat").permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&staged, permissions).expect("chmod fake regctl");
-        std::fs::rename(&staged, &binary).expect("publish fake regctl");
+        let status = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$2\" > \"$1\" && chmod 755 \"$1\"")
+            .arg("install-fake-regctl")
+            .arg(&binary)
+            .arg(script)
+            .status()
+            .expect("install fake regctl");
+        assert!(status.success(), "install fake regctl: {status}");
         binary
     }
 
