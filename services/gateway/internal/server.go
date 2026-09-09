@@ -59,6 +59,7 @@ type Server struct {
 	queryOnlyScheduler schedulerv1.SchedulerClient
 	httpClient         *http.Client
 	apiKey             []byte
+	proxyTransport     *http.Transport
 	requestTimeout     time.Duration
 	maxRespSize        int64
 	// debugMode, when true, enables debug-only behaviors such as exposing
@@ -87,12 +88,30 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		scheduler:           schedulerClient,
 		queryOnlyScheduler:  queryOnlyScheduler,
 		httpClient:          &http.Client{},
+		proxyTransport:      newProxyTransport(),
 		requestTimeout:      options.RequestTimeout,
 		maxRespSize:         options.MaxResponseSize,
 		apiKey:              []byte(options.APIKey),
 		debugMode:           options.DebugMode,
 		sandboxProxyDomains: sandboxProxyDomains,
 	}, nil
+}
+
+// newProxyTransport builds the transport shared by all reverse proxies
+// created by proxyRequest. The net/http defaults (MaxIdleConns: 100,
+// MaxIdleConnsPerHost: 2) are sized for a single application talking to a
+// handful of hosts; a gateway fans out to many nodes with high per-node
+// concurrency, so undersized idle pools cause constant connection churn and
+// can surface spurious "http: putIdleConn: too many idle connections"
+// failures on unrelated in-flight requests (see golang/go#13801 and
+// golang/go#6785).
+func newProxyTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Unbounded globally; per-host usage is bounded by MaxIdleConnsPerHost
+	// and IdleConnTimeout (90s by default).
+	transport.MaxIdleConns = 0
+	transport.MaxIdleConnsPerHost = 128
+	return transport
 }
 
 func (s *Server) SandboxProxyDomains() []string {
@@ -351,6 +370,7 @@ func (s *Server) proxyRequest(
 	}
 
 	proxy := &httputil.ReverseProxy{
+		Transport: s.proxyTransport,
 		Rewrite: func(req *httputil.ProxyRequest) {
 			req.Out.URL.Scheme = upstreamURL.Scheme
 			req.Out.URL.Host = upstreamURL.Host
