@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-24f8d7bd.js";
+            window.path_to_searchindex_js = "searchindex-4f70bd06.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a02e686b.js"></script>
@@ -2741,9 +2741,12 @@ export AENV_API_KEY=&lt;api-key&gt;
   -H "Content-Type: application/json" \
   -d '{
     "templateID": "ubuntu",
-    "volumeMounts": {
-      "/workspace/data": "job-42-data"
-    }
+    "volumeMounts": [
+      {
+        "name": "job-42-data",
+        "path": "/workspace/data"
+      }
+    ]
   }'
 </code></pre>
 <p>List and inspect volumes:</p>
@@ -3030,6 +3033,30 @@ await Sandbox.Pause(sandbox.sandboxId, {
 await sandbox.kill();
 </code></pre>
 <p>Replace <code>&lt;template-id&gt;</code> with a template that exists in your local template store. Use <code>e2b template list</code> or <code>GET /v2/templates</code> to see available templates.</p>
+<h3 id="volume-mounts"><a class="header" href="#volume-mounts">Volume mounts</a></h3>
+<p>The TypeScript SDK can create a volume and pass it directly when creating a
+sandbox:</p>
+<pre><code class="language-typescript">import { Sandbox, Volume } from "e2b";
+
+const volume = await Volume.create("workspace-volume", {
+  apiKey: process.env.E2B_API_KEY,
+});
+const sandbox = await Sandbox.create("&lt;template-id&gt;", {
+  apiKey: process.env.E2B_API_KEY,
+  volumeMounts: {
+    "/workspace": volume,
+  },
+});
+</code></pre>
+<p>For the Python SDK, create the volume with <code>aenv volume create</code> or
+<code>POST /volumes</code>, then pass its name when creating a sandbox:</p>
+<pre><code class="language-python">sandbox = Sandbox.create(
+    "&lt;template-id&gt;",
+    volume_mounts={"/workspace": "workspace-volume"},
+)
+</code></pre>
+<p>AgentENV supports the TypeScript SDK’s volume create, list, and delete operations, and accessing the mounted filesystem through the sandbox.
+The E2B SDK’s direct volume content API is not supported.</p>
 <h3 id="python-sdk"><a class="header" href="#python-sdk">Python SDK</a></h3>
 <h4 id="setup-1-1"><a class="header" href="#setup-1-1">Setup</a></h4>
 <p>Install the SDK:</p>

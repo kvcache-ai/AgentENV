@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-24f8d7bd.js";
+            window.path_to_searchindex_js = "../searchindex-4f70bd06.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-a02e686b.js"></script>
@@ -343,9 +343,12 @@ export AENV_API_KEY=&lt;api-key&gt;
   -H "Content-Type: application/json" \
   -d '{
     "templateID": "ubuntu",
-    "volumeMounts": {
-      "/workspace/data": "job-42-data"
-    }
+    "volumeMounts": [
+      {
+        "name": "job-42-data",
+        "path": "/workspace/data"
+      }
+    ]
   }'
 </code></pre>
 <p>List and inspect volumes:</p>
