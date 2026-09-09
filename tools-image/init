@@ -29,7 +29,6 @@ $BB mkdir -p \
     /mnt/user/sys \
     /mnt/user/run \
     /mnt/user/tmp \
-    /mnt/user/var/run \
     /mnt/user/var/log/agentenv \
     /mnt/user/agentenv
 $BB chmod 1777 /mnt/user/tmp 2>/dev/null || true

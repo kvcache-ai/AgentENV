@@ -30,7 +30,7 @@
 ARG BUSYBOX_IMAGE=busybox:1.37.0-musl
 ARG DEBIAN_VERSION=bookworm
 ARG GO_VERSION=1.25.9
-ARG TOOLS_VERSION=0.1.0
+ARG TOOLS_VERSION=0.1.1
 
 # ---------------------------------------------------------------------------
 # Stage 1: compile envd from upstream source.

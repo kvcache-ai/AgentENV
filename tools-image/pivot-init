@@ -83,7 +83,7 @@ $BB ip link set lo up 2>/dev/null \
 
 # /etc/hosts fallback for images that don't ship one. Most base images do,
 # but FROM scratch / distroless-style images may not.
-if [ ! -e /etc/hosts ]; then
+if [ ! -s /etc/hosts ]; then
     {
         echo "127.0.0.1 localhost"
         echo "::1 localhost"
@@ -101,6 +101,12 @@ $BB ln -sf /agentenv/envd /usr/local/bin/envd
 $BB mkdir -p /usr/bin
 if [ ! -x /usr/bin/nice ]; then
     $BB ln -sf /agentenv/bin/busybox /usr/bin/nice
+fi
+
+# For images without /bin/sh, fall back to BusyBox.
+$BB mkdir -p /bin
+if [ ! -x /bin/sh ]; then
+    $BB ln -sf /agentenv/bin/busybox /bin/sh
 fi
 
 # Prepare remaining runtime directories envd and the guest init commonly
