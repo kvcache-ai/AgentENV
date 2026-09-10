@@ -12,9 +12,9 @@ use uuid::Uuid;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
 use super::config::{
-    create_firecracker_work_dir, FirecrackerCommonConfig, FirecrackerRuntimePolicy,
-    FirecrackerSandboxConfig, FirecrackerSnapshotConfig, PersistentSnapshotRootGuard,
-    MAX_EXTRA_DRIVES,
+    create_firecracker_work_dir, logging_enabled, FirecrackerCommonConfig,
+    FirecrackerRuntimePolicy, FirecrackerSandboxConfig, FirecrackerSnapshotConfig,
+    PersistentSnapshotRootGuard, MAX_EXTRA_DRIVES,
 };
 use super::manifest::FirecrackerSnapshotManifest;
 use super::mmds::MmdsMetadata;
@@ -22,7 +22,7 @@ use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
     restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
 };
-use super::pool::{warm_stderr_path, warm_stdout_path, FirecrackerPool};
+use super::pool::{warm_stdio_paths, FirecrackerPool};
 use super::FirecrackerInstance;
 use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
@@ -1364,7 +1364,7 @@ impl FirecrackerSandbox {
         &self.launch.common().tools_drive_version
     }
 
-    /// Resolve the Firecracker stdout log path for this sandbox.
+    /// Resolve the Firecracker stdout log path (created only when capture is enabled).
     pub fn firecracker_stdout_path(&self) -> PathBuf {
         self.launch
             .common()
@@ -1374,7 +1374,7 @@ impl FirecrackerSandbox {
             .join("firecracker-stdout.log")
     }
 
-    /// Resolve the Firecracker stderr log path for this sandbox.
+    /// Resolve the Firecracker stderr log path (created only when capture is enabled).
     pub fn firecracker_stderr_path(&self) -> PathBuf {
         self.launch
             .common()
@@ -1382,6 +1382,17 @@ impl FirecrackerSandbox {
             .clone()
             .unwrap_or_else(|| self.default_log_dir())
             .join("firecracker-stderr.log")
+    }
+
+    fn firecracker_stdio_paths(&self) -> (Option<PathBuf>, Option<PathBuf>) {
+        let common = self.launch.common();
+        let capture_output = logging_enabled(common.firecracker_log_level.as_deref());
+        (
+            (capture_output || common.stdout_path.is_some())
+                .then(|| self.firecracker_stdout_path()),
+            (capture_output || common.stderr_path.is_some())
+                .then(|| self.firecracker_stderr_path()),
+        )
     }
 
     /// Resolve the Firecracker logger output path for this sandbox.
@@ -1505,7 +1516,10 @@ fn build_drives_boot_arg(extra_drives: &[ExtraDrive]) -> Option<String> {
     Some(format!("agentenv_drives={}", entries.join(",")))
 }
 
-fn relocate_warm_log(src: &Path, target: &Path) -> Result<()> {
+fn relocate_warm_log(src: Option<&Path>, target: &Path) -> Result<()> {
+    let Some(src) = src else {
+        return Ok(());
+    };
     if src == target || !src.exists() {
         return Ok(());
     }
@@ -1764,14 +1778,13 @@ impl FirecrackerSandbox {
 
         // ── Spawn Firecracker inside the network namespace so it can access tap0 ──
         let firecracker_binary = config.common.firecracker_binary.clone();
-        let stdout_path = self.firecracker_stdout_path();
-        let stderr_path = self.firecracker_stderr_path();
+        let (stdout_path, stderr_path) = self.firecracker_stdio_paths();
 
         self.fc_instance
             .spawn_with_netns(
                 &firecracker_binary,
-                Some(&stdout_path),
-                Some(&stderr_path),
+                stdout_path.as_deref(),
+                stderr_path.as_deref(),
                 Some(&netns),
             )
             .await?;
@@ -1828,11 +1841,13 @@ impl FirecrackerSandbox {
             .context("snapshot rootfs image config is missing")?;
         self.current_rootfs_virtual_size = Some(rootfs_virtual_size);
 
+        let capture_output = logging_enabled(config.common.firecracker_log_level.as_deref());
         if config.common.stdout_path.is_none() && config.common.stderr_path.is_none() {
-            if let Some(warm) = FirecrackerPool::global().and_then(|pool| pool.try_acquire()) {
+            if let Some(warm) =
+                FirecrackerPool::global().and_then(|pool| pool.try_acquire(capture_output))
+            {
                 let warm_dir = warm.work_dir.path();
-                let warm_stdout = warm_stdout_path(warm_dir);
-                let warm_stderr = warm_stderr_path(warm_dir);
+                let (warm_stdout, warm_stderr) = warm_stdio_paths(warm_dir, capture_output);
                 debug!(
                     slot = warm.slot.idx,
                     pool_work_dir = %warm_dir.display(),
@@ -1842,10 +1857,14 @@ impl FirecrackerSandbox {
                 self.network_slot = Some(warm.slot);
                 self.work_dir = warm.work_dir; // Update self.work_dir before relocating logs since the fallback log paths are relative to the work_dir.
                 let _cold = std::mem::replace(&mut self.fc_instance, warm.fc_instance);
-                if let Err(err) = relocate_warm_log(&warm_stdout, &self.firecracker_stdout_path()) {
+                if let Err(err) =
+                    relocate_warm_log(warm_stdout.as_deref(), &self.firecracker_stdout_path())
+                {
                     warn!(error = %err, "failed to relocate warm firecracker stdout log");
                 }
-                if let Err(err) = relocate_warm_log(&warm_stderr, &self.firecracker_stderr_path()) {
+                if let Err(err) =
+                    relocate_warm_log(warm_stderr.as_deref(), &self.firecracker_stderr_path())
+                {
                     warn!(error = %err, "failed to relocate warm firecracker stderr log");
                 }
             }
@@ -1956,14 +1975,13 @@ impl FirecrackerSandbox {
             self.network_slot = Some(slot);
 
             let firecracker_binary = config.common.firecracker_binary.clone();
-            let stdout_path = self.firecracker_stdout_path();
-            let stderr_path = self.firecracker_stderr_path();
+            let (stdout_path, stderr_path) = self.firecracker_stdio_paths();
 
             self.fc_instance
                 .spawn_with_netns(
                     &firecracker_binary,
-                    Some(&stdout_path),
-                    Some(&stderr_path),
+                    stdout_path.as_deref(),
+                    stderr_path.as_deref(),
                     Some(&netns),
                 )
                 .await?;
@@ -2533,6 +2551,129 @@ mod tests {
             "0.1.0".to_string(),
             "user-image.json".into(),
         )
+    }
+
+    #[tokio::test]
+    async fn disabled_firecracker_logging_creates_no_serial_files() -> Result<()> {
+        for level in [None, Some(""), Some(" \t ")] {
+            for persistent in [false, true] {
+                let root = TempDir::new()?;
+                let serial_root = root.path().join("serial");
+                let mut config = fresh_config();
+                config.common.firecracker_work_base_dir = Some(root.path().join("work"));
+                config.common.serial_output_base_dir = persistent.then(|| serial_root.clone());
+                config.common.firecracker_log_level = level.map(str::to_owned);
+                let mut sandbox = FirecrackerSandbox::new(config)?;
+                sandbox.configure_logger(sandbox.launch.common()).await?;
+                for (stdout, stderr) in [
+                    sandbox.firecracker_stdio_paths(),
+                    warm_stdio_paths(sandbox.work_dir.path(), logging_enabled(level)),
+                ] {
+                    sandbox
+                        .fc_instance
+                        .spawn_with_netns(
+                            Path::new("/bin/true"),
+                            stdout.as_deref(),
+                            stderr.as_deref(),
+                            None,
+                        )
+                        .await?;
+                    sandbox
+                        .fc_instance
+                        .stop(std::time::Duration::from_secs(1))
+                        .await?;
+                    relocate_warm_log(stdout.as_deref(), &sandbox.firecracker_stdout_path())?;
+                    relocate_warm_log(stderr.as_deref(), &sandbox.firecracker_stderr_path())?;
+                }
+
+                assert!(!sandbox
+                    .work_dir
+                    .path()
+                    .join("firecracker-stdout.log")
+                    .exists());
+                assert!(!sandbox
+                    .work_dir
+                    .path()
+                    .join("firecracker-stderr.log")
+                    .exists());
+                assert!(
+                    !serial_root.exists(),
+                    "disabled logging created a serial root"
+                );
+                assert!(!sandbox.default_log_dir().exists());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enabled_firecracker_logging_captures_cold_and_warm_output() -> Result<()> {
+        for warm in [false, true] {
+            let root = TempDir::new()?;
+            let mut config = fresh_config();
+            config.common.firecracker_work_base_dir = Some(root.path().join("work"));
+            config.common.serial_output_base_dir = Some(root.path().join("serial"));
+            config.common.firecracker_log_level = Some(" Info ".to_owned());
+            let mut sandbox = FirecrackerSandbox::new(config)?;
+            let (stdout, stderr) = if warm {
+                warm_stdio_paths(sandbox.work_dir.path(), true)
+            } else {
+                sandbox.firecracker_stdio_paths()
+            };
+
+            // echo accepts the Firecracker arguments and writes them to stdout.
+            sandbox
+                .fc_instance
+                .spawn_with_netns(
+                    Path::new("/bin/echo"),
+                    stdout.as_deref(),
+                    stderr.as_deref(),
+                    None,
+                )
+                .await?;
+            let err = sandbox
+                .fc_instance
+                .wait_for_ready(
+                    std::time::Duration::from_secs(1),
+                    std::time::Duration::from_millis(1),
+                )
+                .await
+                .expect_err("echo exits without creating an API socket");
+            assert!(err.to_string().contains("exited before its API socket"));
+            sandbox
+                .fc_instance
+                .stop(std::time::Duration::from_secs(1))
+                .await?;
+
+            relocate_warm_log(stdout.as_deref(), &sandbox.firecracker_stdout_path())?;
+            relocate_warm_log(stderr.as_deref(), &sandbox.firecracker_stderr_path())?;
+            assert!(fs::read_to_string(sandbox.firecracker_stdout_path())?.contains("--api-sock"));
+            assert!(sandbox.firecracker_stderr_path().is_file());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_firecracker_stdio_enables_only_the_requested_stream() -> Result<()> {
+        for capture_stdout in [false, true] {
+            let root = TempDir::new()?;
+            let destination = root.path().join("capture");
+            let mut config = fresh_config();
+            config.common.firecracker_work_base_dir = Some(root.path().join("work"));
+            config.common.stdout_path = capture_stdout.then(|| destination.clone());
+            config.common.stderr_path = (!capture_stdout).then(|| destination.clone());
+            let sandbox = FirecrackerSandbox::new(config)?;
+            let (stdout, stderr) = sandbox.firecracker_stdio_paths();
+            assert_eq!(
+                stdout,
+                capture_stdout.then(|| destination.join("firecracker-stdout.log"))
+            );
+            assert_eq!(
+                stderr,
+                (!capture_stdout).then(|| destination.join("firecracker-stderr.log"))
+            );
+        }
+        Ok(())
     }
 
     #[test]

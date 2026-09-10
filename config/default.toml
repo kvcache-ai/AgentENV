@@ -41,12 +41,13 @@ socket_timeout_secs = 3
 socket_poll_ms = 1
 
 # Per-sandbox work directories contain sockets, local logs, and writable
-# OverlayBD upper layers. Serial logs persist separately by sandbox ID.
+# OverlayBD upper layers. When enabled, serial logs persist separately by sandbox ID.
 # work_dir = "$AENV_HOME/firecracker-work"
 # serial_dir = "$AENV_HOME/logs/serial"
 
-# Enable Firecracker's own firecracker.log beside the serial log. Supported
-# levels are Error, Warning, Info, Debug, and Trace; unset disables it.
+# Enable stdout/stderr capture and firecracker.log. Supported levels are Error,
+# Warning, Info, Debug, and Trace; unset or empty disables all Firecracker logs.
+# Setting serial_dir alone does not enable logging.
 # log_level = "Info"
 
 [kernel]

@@ -121,12 +121,15 @@ pub struct FirecrackerCommonConfig {
     /// Base directory for Firecracker serial output.
     /// The actual serial output files will be created under `{serial_output_base_dir}/{sandbox_id}/`.
     ///
-    /// Overriden by `stdout_path` and `stderr_path` if they are set.
+    /// Used only when logging is enabled. Overridden by explicit stdout/stderr destinations.
     pub serial_output_base_dir: Option<PathBuf>,
+    /// Explicit stdout directory; enables capture even without a log level.
     pub stdout_path: Option<PathBuf>,
+    /// Explicit stderr directory; enables capture even without a log level.
     pub stderr_path: Option<PathBuf>,
-    /// Optional Firecracker log level. When set (non-empty), Firecracker logging
-    /// is enabled and written to a `firecracker.log` file alongside the stdout log.
+    /// Optional Firecracker log level. A non-empty value enables stdout/stderr
+    /// capture and Firecracker logging to `firecracker.log`. Unset/empty disables both
+    /// unless an explicit stdout/stderr destination is provided.
     pub firecracker_log_level: Option<String>,
     pub runtime_policy: FirecrackerRuntimePolicy,
     /// Enable Firecracker KVM dirty-page tracking for memory snapshot capture.
@@ -319,6 +322,10 @@ impl FirecrackerCommonConfig {
 
         Ok(Some(output_dir))
     }
+}
+
+pub(super) fn logging_enabled(log_level: Option<&str>) -> bool {
+    log_level.is_some_and(|level| !level.trim().is_empty())
 }
 
 pub(crate) fn create_firecracker_work_dir(work_dir: Option<&Path>) -> Result<TempDir> {

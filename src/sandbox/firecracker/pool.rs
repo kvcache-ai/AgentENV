@@ -16,7 +16,7 @@ use tokio::runtime::{Builder, Runtime};
 use tracing::{debug, info, warn};
 use warm_pool::{PoolMaintenanceAction, WarmPool};
 
-use super::config::create_firecracker_work_dir;
+use super::config::{create_firecracker_work_dir, logging_enabled};
 use super::FirecrackerInstance;
 use crate::cfg::{ConfigManager, ResolvedFirecrackerPoolConfig};
 use crate::sandbox::network::{NetworkManager, Slot};
@@ -55,6 +55,7 @@ pub struct FirecrackerPool {
     socket_poll_interval: Duration,
     fill_concurrency: usize,
     firecracker_work_base_dir: Option<PathBuf>,
+    capture_output: bool,
     runtime: Runtime,
 }
 
@@ -123,6 +124,7 @@ impl FirecrackerPool {
             socket_poll_interval,
             fill_concurrency: pool_config.fill_concurrency,
             firecracker_work_base_dir,
+            capture_output: logging_enabled(app_config.firecracker.log_level.as_deref()),
             runtime,
         }
     }
@@ -135,7 +137,11 @@ impl FirecrackerPool {
         });
     }
 
-    pub(crate) fn try_acquire(&self) -> Option<WarmFirecracker> {
+    pub(crate) fn try_acquire(&self, capture_output: bool) -> Option<WarmFirecracker> {
+        // Stdio destinations are fixed when the warm process is spawned.
+        if capture_output != self.capture_output {
+            return None;
+        }
         let warm = self.pool.try_acquire()?;
         if self.pool.len() < self.pool.config().low_watermark {
             self.pool.request_maintenance();
@@ -304,14 +310,13 @@ impl FirecrackerPool {
         };
 
         let mut fc_instance = FirecrackerInstance::new(work_dir.path().to_path_buf());
-        let stdout_path = warm_stdout_path(work_dir.path());
-        let stderr_path = warm_stderr_path(work_dir.path());
+        let (stdout_path, stderr_path) = warm_stdio_paths(work_dir.path(), self.capture_output);
         let spawn_result: Result<()> = async {
             fc_instance
                 .spawn_with_netns(
                     &self.binary,
-                    Some(&stdout_path),
-                    Some(&stderr_path),
+                    stdout_path.as_deref(),
+                    stderr_path.as_deref(),
                     Some(&slot.namespace_path()),
                 )
                 .await
@@ -413,10 +418,12 @@ fn firecracker_pool_cleanup_result(failures: Vec<String>) -> Result<()> {
     }
 }
 
-pub(crate) fn warm_stdout_path(work_dir: &Path) -> PathBuf {
-    work_dir.join("firecracker-stdout.log")
-}
-
-pub(crate) fn warm_stderr_path(work_dir: &Path) -> PathBuf {
-    work_dir.join("firecracker-stderr.log")
+pub(crate) fn warm_stdio_paths(
+    work_dir: &Path,
+    capture_output: bool,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    (
+        capture_output.then(|| work_dir.join("firecracker-stdout.log")),
+        capture_output.then(|| work_dir.join("firecracker-stderr.log")),
+    )
 }

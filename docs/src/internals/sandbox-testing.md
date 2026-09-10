@@ -20,9 +20,9 @@ This document describes the public sandbox API, the global `ConfigManager` under
     - `boot_args`: kernel boot args (e.g. `console=ttyS0 ... init=/init`).
     - `vcpu_count`, `mem_size_mib`: VM size.
     - `runtime_policy`: socket/envd timeouts and poll intervals.
-    - `firecracker_stdout_path`, `firecracker_stderr_path`: capture FC logs.
-      If unset, logs default to `work_dir/logs/firecracker-stdout.log` and
-      `work_dir/logs/firecracker-stderr.log`.
+    - `common.stdout_path`, `common.stderr_path`: explicit capture directories.
+      Otherwise stdout/stderr capture is enabled only when `common.firecracker_log_level`
+      is non-empty, using the serial directory or `work_dir/logs` fallback.
     - `envd_version`: expected envd version for the guest image.
     - `env_vars`: optional default environment variables injected after envd init.
     - `ublk_config`: optional ublk-backed rootfs configuration.
@@ -133,7 +133,9 @@ This document describes the public sandbox API, the global `ConfigManager` under
   writable uppers from the committed layer stack.
 - Rootfs copies use copy-on-write helpers where available.
 - Firecracker runs with `current_dir = work_dir`, so relative paths work.
-- Firecracker logs default to `work_dir/logs/*` unless explicit log paths are configured.
+- Firecracker logging is disabled by default. Set `firecracker.log_level` to enable
+  stdout/stderr capture and `firecracker.log` under the configured serial directory.
+  Direct Rust callers can also opt individual streams in using explicit destinations.
 - `start()` waits for both the API socket and envd readiness.
 - Although the Firecracker process will be killed on drop, explicit `stop()` is recommended.
 
@@ -190,7 +192,7 @@ socket_poll_ms = 20
 # work_dir = "/path/to/firecracker-work"
 # Optional override; defaults to $AENV_HOME/logs/serial.
 # serial_dir = "/path/to/serial"
-# Optional; enables Firecracker's own logging when set to a non-empty level.
+# Optional; enables stdout/stderr capture and firecracker.log when non-empty.
 # log_level = "Info"
 
 [kernel]
@@ -237,13 +239,14 @@ enabled = false
     logs, and writable OverlayBD upper layer data (`overlaybd/upper.data` and
     `overlaybd/upper.index`). Defaults to `$AENV_HOME/firecracker-work`.
   - `serial_dir`: Optional override for the persistent output directory.
-    Serial output is written under a per-sandbox subdirectory and not removed
-    by the sandbox. Defaults to `$AENV_HOME/logs/serial`.
+    When logging is enabled, serial output is written under a per-sandbox subdirectory
+    and not removed by the sandbox. Defaults to `$AENV_HOME/logs/serial`.
+    Setting this path alone does not enable logging.
   - `log_level`: Optional Firecracker log level (`Error`, `Warning`, `Info`,
     `Debug`, `Trace`, case-insensitive). When set to a non-empty value,
-    Firecracker's own logging is enabled and written to a `firecracker.log`
-    file in the sandbox's log directory (the same directory used for serial
-    output). If omitted or empty, Firecracker logging is disabled.
+    stdout/stderr capture and `firecracker.log` are enabled in the sandbox's
+    log directory. If omitted or empty, stdout/stderr are discarded and no log
+    directories are created, unless explicit Rust capture destinations are set.
 
 - `[kernel]`
   - `image_path`: Optional local kernel image path (`vmlinux.bin`). If omitted,

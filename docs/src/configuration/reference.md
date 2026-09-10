@@ -46,8 +46,8 @@ Firecracker VM binary and boot configuration.
 | `socket_timeout_secs` | integer | `3` | Max seconds to wait for the Firecracker API socket |
 | `socket_poll_ms` | integer | `1` | Poll interval (ms) for checking socket availability |
 | `work_dir` | string | `"$AENV_HOME/firecracker-work"` | Parent directory for per-sandbox Firecracker work directories. These dirs contain runtime sockets, symlinks, local logs, and writable OverlayBD upper layer data such as `overlaybd/upper.data` and `overlaybd/upper.index` |
-| `serial_dir` | string | `"$AENV_HOME/logs/serial"` | Directory for persistent Firecracker serial output (per-sandbox subdirectories) |
-| `log_level` | string | unset (disabled) | Optional Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`, case-insensitive). When set to a non-empty value, Firecracker's own logging is enabled and written to a `firecracker.log` file in each sandbox's log directory (alongside the serial output). Empty/unset disables it |
+| `serial_dir` | string | `"$AENV_HOME/logs/serial"` | Directory for persistent Firecracker logs when enabled (per-sandbox subdirectories). Setting this path alone does not enable logging |
+| `log_level` | string | unset (disabled) | Optional Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`, case-insensitive). A non-empty value enables `firecracker.log` and stdout/stderr capture in each sandbox's log directory. Empty/unset discards stdout/stderr and creates no log files or per-sandbox log directories. Explicit Rust stdout/stderr destinations still enable the requested stream |
 
 ## `[kernel]`
 

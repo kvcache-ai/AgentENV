@@ -307,6 +307,7 @@ async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
         .find(|drive| drive.mount_path() == Path::new("/archive"))
         .ok_or_else(|| anyhow!("archive drive missing"))?;
     *sub_path = Some(PathBuf::from("nested"));
+    config.common.stdout_path = Some(root.path().join("replacement-serial"));
     config.common.default_user = Some("nobody".to_owned());
     config.common.default_workdir = Some("/".to_owned());
 
