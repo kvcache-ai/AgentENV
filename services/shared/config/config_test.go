@@ -40,6 +40,48 @@ func TestDefaultSchedulerDiscoveryModeIsStatic(t *testing.T) {
 	}
 }
 
+func TestLoadParsesHeartbeatDiscoveryAndFleetPolicy(t *testing.T) {
+	t.Setenv("SCHEDULER_HEARTBEAT_REGISTRATION_TOKEN", "registration-secret")
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"scheduler": {
+			"discovery": {"mode": "heartbeat"},
+			"fleet": {
+				"enabled": true,
+				"min_nodes": 1,
+				"max_nodes": 250,
+				"warm_nodes": 1,
+				"max_sandboxes_per_node": 24,
+				"max_memory_used_percent": 85,
+				"empty_grace": "15m",
+				"drain_grace": "15m",
+				"demand_ttl": "2m"
+			}
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	cfg, err := Load(path, "scheduler")
+	if err != nil {
+		t.Fatalf("load heartbeat scheduler config failed: %v", err)
+	}
+	if cfg.Scheduler.Discovery.Mode != "heartbeat" {
+		t.Fatalf("discovery mode = %q, want heartbeat", cfg.Scheduler.Discovery.Mode)
+	}
+	if cfg.Scheduler.HeartbeatRegistrationToken != "registration-secret" {
+		t.Fatal("heartbeat registration token was not loaded from the environment")
+	}
+	if !cfg.Scheduler.Fleet.Enabled || cfg.Scheduler.Fleet.MaxNodes != 250 || cfg.Scheduler.Fleet.WarmNodes != 1 {
+		t.Fatalf("unexpected fleet policy: %#v", cfg.Scheduler.Fleet)
+	}
+	if cfg.Scheduler.Fleet.EmptyGrace != 15*time.Minute || cfg.Scheduler.Fleet.DrainGrace != 15*time.Minute || cfg.Scheduler.Fleet.DemandTTL != 2*time.Minute {
+		t.Fatalf("unexpected fleet durations: %#v", cfg.Scheduler.Fleet)
+	}
+}
+
 func TestLoadSchedulerAllowsQueryOnlyWithRedisWithoutNodes(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "config.json")

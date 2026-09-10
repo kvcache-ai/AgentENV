@@ -54,13 +54,14 @@ type ServerOptions struct {
 }
 
 type Server struct {
-	logger             *zap.Logger
-	scheduler          schedulerv1.SchedulerClient
-	queryOnlyScheduler schedulerv1.SchedulerClient
-	httpClient         *http.Client
-	apiKey             []byte
-	requestTimeout     time.Duration
-	maxRespSize        int64
+	logger                *zap.Logger
+	scheduler             schedulerv1.SchedulerClient
+	queryOnlyScheduler    schedulerv1.SchedulerClient
+	httpClient            *http.Client
+	apiKey                []byte
+	requestTimeout        time.Duration
+	maxRespSize           int64
+	scheduleRetryInterval time.Duration
 	// debugMode, when true, enables debug-only behaviors such as exposing
 	// the backend node id on proxied responses via the x-agentenv-node-id
 	// header. Off by default; toggled via GatewayConfig.DebugMode.
@@ -83,15 +84,16 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 	}
 
 	return &Server{
-		logger:              logger,
-		scheduler:           schedulerClient,
-		queryOnlyScheduler:  queryOnlyScheduler,
-		httpClient:          &http.Client{},
-		requestTimeout:      options.RequestTimeout,
-		maxRespSize:         options.MaxResponseSize,
-		apiKey:              []byte(options.APIKey),
-		debugMode:           options.DebugMode,
-		sandboxProxyDomains: sandboxProxyDomains,
+		logger:                logger,
+		scheduler:             schedulerClient,
+		queryOnlyScheduler:    queryOnlyScheduler,
+		httpClient:            &http.Client{},
+		requestTimeout:        options.RequestTimeout,
+		maxRespSize:           options.MaxResponseSize,
+		scheduleRetryInterval: time.Second,
+		apiKey:                []byte(options.APIKey),
+		debugMode:             options.DebugMode,
+		sandboxProxyDomains:   sandboxProxyDomains,
 	}, nil
 }
 
@@ -104,6 +106,10 @@ func (s *Server) Handler() http.Handler {
 	// decoding %2F → / and issuing 301 redirects), which breaks proxy
 	// forwarding of percent-encoded path segments such as /files/%2F.
 	core := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/fleet/") {
+			s.handleFleetAdmin(w, r)
+			return
+		}
 		if isExplicitProxyPath(r.URL.Path) && !hasCompleteProxyRouteHeaders(r.Header) {
 			setGatewayRouteSource(w, routeSourceHeader)
 			if _, hasSandbox := sandboxIDFromHeaders(r.Header); !hasSandbox {
@@ -241,7 +247,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rpcStart := time.Now()
-		resp, err := s.scheduler.Schedule(routingCtx, &schedulerv1.ScheduleRequest{
+		resp, err := s.scheduleWithCapacityWait(routingCtx, &schedulerv1.ScheduleRequest{
 			Hint: hint,
 		})
 		recordGatewaySchedulerRPC("Schedule", rpcStart, err)
@@ -284,6 +290,28 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			flushImmediately: longLived,
 		},
 	)
+}
+
+func (s *Server) scheduleWithCapacityWait(ctx context.Context, request *schedulerv1.ScheduleRequest) (*schedulerv1.ScheduleResponse, error) {
+	interval := s.scheduleRetryInterval
+	if interval <= 0 {
+		interval = time.Second
+	}
+	for {
+		response, err := s.scheduler.Schedule(ctx, request)
+		if status.Code(err) != codes.Unavailable {
+			return response, err
+		}
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return nil, status.FromContextError(ctx.Err()).Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
