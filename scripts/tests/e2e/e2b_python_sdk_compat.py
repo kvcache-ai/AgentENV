@@ -152,6 +152,25 @@ def main() -> int:
         )
         log("command execution returned expected build artifacts and startup state")
 
+        # OCI images routinely ship /etc/hosts absent or empty and rely on the
+        # container runtime for localhost resolution; the guest bootstrap
+        # (pivot-init) must provide the same guarantee. Assert the hosts file
+        # carries a loopback -> localhost mapping.
+        resolution = retry(
+            lambda: sandbox.commands.run(
+                r"/agentenv/bin/busybox grep -E "
+                r"'^(127\.0\.0\.1|::1)[[:space:]]+localhost([[:space:]]|$)' /etc/hosts",
+                timeout=30,
+                request_timeout=60,
+            ),
+            "localhost resolution check",
+        )
+        require(
+            resolution.exit_code == 0,
+            f"/etc/hosts lacks a loopback localhost entry: {resolution.stdout!r}",
+        )
+        log("guest localhost resolution verified")
+
         if os.environ.get("E2B_COMPAT_TEST_PAUSE", "1") != "0":
             log("pausing and reconnecting sandbox through SDK lifecycle APIs")
             sandbox.beta_pause(api_url=api_url, api_key=api_key, request_timeout=60)
