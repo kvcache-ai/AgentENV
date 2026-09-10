@@ -75,6 +75,9 @@ build: check-buildx check-tools-version
 		--build-arg "TOOLS_VERSION=$(TOOLS_VERSION)" \
 		--build-arg "ENVD_REF=$(ENVD_REF)" \
 		--build-arg "ENVD_UPSTREAM_REPO=$(ENVD_UPSTREAM_REPO)" \
+		--build-arg "GOPROXY=$(GOPROXY)" \
+		--build-arg HTTP_PROXY --build-arg HTTPS_PROXY \
+		--build-arg http_proxy --build-arg https_proxy \
 		--output "type=local,dest=$(OUTPUT_DIR)" \
 		.
 	mv "$(OUTPUT_DIR)/tools.ext4" "$(OUTPUT_PATH)"
@@ -86,6 +89,9 @@ publish: check-buildx check-tools-version check-publish-image
 		--build-arg "TOOLS_VERSION=$(TOOLS_VERSION)" \
 		--build-arg "ENVD_REF=$(ENVD_REF)" \
 		--build-arg "ENVD_UPSTREAM_REPO=$(ENVD_UPSTREAM_REPO)" \
+		--build-arg "GOPROXY=$(GOPROXY)" \
+		--build-arg HTTP_PROXY --build-arg HTTPS_PROXY \
+		--build-arg http_proxy --build-arg https_proxy \
 		-t "$(IMAGE)" \
 		--push \
 		.

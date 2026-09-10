@@ -55,6 +55,17 @@ pub enum DaemonRequest {
     NotifySandboxReady {
         device_key: String,
     },
+    /// Bulk-prefetch ranges of a snapshot's memory image into the local
+    /// remote-block cache before the guest resumes. Best-effort: the daemon
+    /// acknowledges immediately and prefetches in the background.
+    Prefetch {
+        /// Path to the memory overlaybd image config (image.json).
+        image_config: PathBuf,
+        /// Path to the overlaybd global config JSON for the memory image.
+        global_config: PathBuf,
+        /// (offset, len) ranges in the image's virtual address space.
+        ranges: Vec<(u64, u64)>,
+    },
     /// Acquire a warm overlaybd device from the pool.
     AcquireOverlaybd {
         image_config: PathBuf,

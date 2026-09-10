@@ -370,6 +370,33 @@ impl UblkDaemonClient {
         }
     }
 
+    /// Ask the daemon to bulk-prefetch ranges of a snapshot's memory image
+    /// into the local remote-block cache before the guest resumes.
+    /// Best-effort; the daemon acknowledges immediately and prefetches in the
+    /// background.
+    pub async fn prefetch(
+        &self,
+        image_config: &Path,
+        global_config: &Path,
+        ranges: Vec<(u64, u64)>,
+    ) -> Result<()> {
+        let request = DaemonRequest::Prefetch {
+            image_config: image_config.to_path_buf(),
+            global_config: global_config.to_path_buf(),
+            ranges,
+        };
+        match self.call(request, DEFAULT_TIMEOUT).await? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::TerminalError { message } => {
+                bail!("daemon: prefetch failed terminally: {message}")
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: prefetch failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for prefetch: {other:?}"),
+        }
+    }
+
     /// Report that the sandbox owning `device_key` (the image.json path its
     /// memory device was opened with) finished booting, releasing any held
     /// background downloads. Best-effort: a failed notification only means the

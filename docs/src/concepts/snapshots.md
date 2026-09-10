@@ -44,6 +44,25 @@ curl -H 'X-API-Key: test-key' \
   http://127.0.0.1:8000/snapshots/<snapshot-id-or-alias>
 ```
 
+## Resume-Time Memory Prefetch
+
+When a snapshot is created, AgentENV also records which guest-physical memory
+pages the sandbox's init process (envd) had resident, and stores the list as a
+small `memory-prefetch.json` artifact next to `vm_state.bin` in the snapshot
+repository. When a sandbox is later started from that snapshot, AgentENV
+bulk-prefetches those pages into the node's local remote-block cache before the
+VM resumes, so the init process and early startup path no longer wait on
+one-at-a-time remote reads.
+
+The prefetch is strictly best-effort:
+
+- Snapshots created before this feature (or from guests where the init process
+  cannot be inspected) simply resume through the normal on-demand path.
+- A missing, unreadable, or oversized manifest is ignored; resume never fails
+  because of it.
+
+No configuration is required.
+
 ## Use a Snapshot Rootfs as an OCI Image
 
 Starting with `aenv start <snapshot>` restores the complete snapshot state. If

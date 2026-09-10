@@ -30,7 +30,7 @@ use crate::snapshot::{
     PersistedDiskImagePublication, SnapshotAlias, SnapshotId, SnapshotListFilter,
     SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
     SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
-    SNAPSHOT_ARTIFACT_LAYOUT,
+    MEMORY_PREFETCH_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord, VolumeStatus};
 
@@ -323,6 +323,61 @@ impl SnapshotRepository for OssSnapshotRepository {
                 )
                 .await
                 .map_err(|e| RepositoryError::backend("write firecracker manifest to oss", e))?;
+
+            // Best-effort: upload the memory prefetch manifest produced at
+            // capture time (sits next to vm_state.bin in the artifact dir).
+            // Missing/invalid files are skipped silently — resume must never
+            // depend on this artifact existing.
+            if let Some(prefetch_path) = manifest
+                .vm_state
+                .path
+                .parent()
+                .map(|dir| dir.join(MEMORY_PREFETCH_ARTIFACT))
+            {
+                match tokio::fs::read(&prefetch_path).await {
+                    Ok(bytes) => {
+                        if let Err(error) = self
+                            .client
+                            .put_bytes(
+                                &layout.artifact_key(MEMORY_PREFETCH_ARTIFACT),
+                                bytes,
+                                OssUploadArtifact::MemoryPrefetch,
+                            )
+                            .await
+                        {
+                            warn!(
+                                %error,
+                                snapshot_id = %id,
+                                "upload memory prefetch artifact failed (best-effort)"
+                            );
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        debug!(snapshot_id = %id, "no memory prefetch manifest captured");
+                        // A publication retry after a crash may leave a stale
+                        // manifest from an earlier attempt; drop it so the new
+                        // memory image is not associated with old ranges.
+                        if let Err(error) = self
+                            .client
+                            .delete(&layout.artifact_key(MEMORY_PREFETCH_ARTIFACT))
+                            .await
+                        {
+                            debug!(
+                                %error,
+                                snapshot_id = %id,
+                                "delete stale memory prefetch artifact failed (best-effort)"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        debug!(
+                            %error,
+                            snapshot_id = %id,
+                            "read memory prefetch manifest failed; keeping existing artifact"
+                        );
+                    }
+                }
+            }
 
             // 3. Export attached-drive disk images and derive their committed metadata.
             let attached_drives = self

@@ -21,7 +21,8 @@ use crate::snapshot::runtime_support::{
 use crate::snapshot::types::RuntimeArtifactLease;
 use crate::snapshot::{
     CommittedAttachedDrive, OverlaybdLayerRef, RepositoryError, RepositoryResult,
-    ResolvedAttachedDrive, RunnableSnapshot, SnapshotId, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT,
+    ResolvedAttachedDrive, RunnableSnapshot, SnapshotId, SnapshotRecord, MEMORY_PREFETCH_ARTIFACT,
+    SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 const MANAGED_LAYER_EXISTS_CONCURRENCY: usize = 16;
@@ -149,6 +150,25 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
             .load_committed_firecracker_manifest(&layout, &id)
             .await?;
 
+        // ── memory prefetch manifest (best-effort; older snapshots lack it) ──
+        let prefetch_key = layout.artifact_key(MEMORY_PREFETCH_ARTIFACT);
+        let prefetch_path = match self
+            .cache
+            .ensure_cached(&prefetch_key, |dest| {
+                let client = Arc::clone(&self.client);
+                let key = prefetch_key.clone();
+                async move { client.get_to_file(&key, &dest).await }
+            })
+            .await
+        {
+            Ok(handle) => {
+                let path = handle.path().to_path_buf();
+                handles.push(handle);
+                Some(path)
+            }
+            Err(_) => None,
+        };
+
         // ── memory image config ────────────────────────────────────
         let memory_layers: Vec<OverlaybdLayerRef> = committed
             .memory_layers
@@ -204,6 +224,8 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
             rootfs_image_config_path,
             &attached_drives,
         )?;
+        let mut runtime_manifest = runtime_manifest;
+        runtime_manifest.memory_prefetch_path = prefetch_path;
 
         let runnable = RunnableSnapshot::new((*snapshot).clone(), runtime_manifest, cache_lease);
         debug!(snapshot_id = %id, "resolved oss snapshot to local runnable paths");

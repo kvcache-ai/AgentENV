@@ -92,6 +92,13 @@ implementation rather than after mistakes.
   to memory, rootfs, attached-drive, and volume layers. Capture leaves the source
   running; launching it creates a new sandbox. Pause/resume retains the existing
   ID through separate paused-sandbox persistence. Template builds commit snapshots.
+  At capture, the guest init daemon's (envd) resident guest-physical memory
+  ranges are also exported and published as a `memory-prefetch.json` artifact
+  next to `vm_state.bin`; at resume, AgentENV bulk-prefetches those pages into
+  the node's remote-block cache via the ublk daemon so the init path does not
+  stall on one-at-a-time remote reads. The prefetch is strictly best-effort:
+  missing, unreadable, or oversized manifests are ignored and resume always
+  falls back to the on-demand path.
 - **Volume:** An independently managed block filesystem that survives sandbox
   deletion. `exclusive` permits one writable mount; `ro` permits shared read-only
   mounts. `volumeMounts` references managed volumes; cold-start `attachedDrives`

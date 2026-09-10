@@ -16,7 +16,7 @@ use crate::snapshot::types::RuntimeArtifactLease;
 use crate::snapshot::{
     CommittedAttachedDrive, CommittedSnapshot, OverlaybdLayerRef, RepositoryError,
     RepositoryResult, ResolvedAttachedDrive, RunnableSnapshot, SnapshotId, SnapshotRecord,
-    SNAPSHOT_ARTIFACT_LAYOUT,
+    MEMORY_PREFETCH_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 /// Resolves committed snapshot artifacts into node-local runnable paths on a POSIX filesystem.
@@ -95,11 +95,17 @@ impl SnapshotRuntimeResolver for PosixFsRuntimeResolver {
             .await?;
         let runtime_manifest = hydrate_runtime_manifest(
             committed_manifest,
-            vm_state_path,
+            vm_state_path.clone(),
             mem_image_config_path,
             rootfs_image_config_path,
             &attached_drives,
         )?;
+        let mut runtime_manifest = runtime_manifest;
+        // Best-effort: the memory prefetch manifest sits next to vm_state.bin
+        // when the capture produced one (older snapshots lack it). Async
+        // existence check so a slow shared repository filesystem cannot stall
+        // the executor.
+        runtime_manifest.memory_prefetch_path = self.memory_prefetch_path(&vm_state_path).await;
         // Runtime artifacts are protected by the sandbox start-window lease (over
         // local-only commits) + the orchestrator running set; the resolved-handle
         // needs no separate local image ref pin.
@@ -113,6 +119,18 @@ impl SnapshotRuntimeResolver for PosixFsRuntimeResolver {
 impl PosixFsRuntimeResolver {
     fn snapshot_layout(&self, snapshot_id: &SnapshotId) -> PosixFsSnapshotArtifactLayout {
         PosixFsSnapshotArtifactLayout::new(&self.repository_root, snapshot_id)
+    }
+
+    /// Returns the local path of the optional memory prefetch manifest that
+    /// sits next to `vm_state.bin` (when the capture produced one).
+    async fn memory_prefetch_path(&self, vm_state_path: &Path) -> Option<PathBuf> {
+        let candidate = vm_state_path
+            .parent()
+            .map(|dir| dir.join(MEMORY_PREFETCH_ARTIFACT))?;
+        match tokio::fs::try_exists(&candidate).await {
+            Ok(true) => Some(candidate),
+            Ok(false) | Err(_) => None,
+        }
     }
 
     fn snapshot_vm_state_path(&self, snapshot_id: &SnapshotId) -> RepositoryResult<PathBuf> {
@@ -333,7 +351,7 @@ mod tests {
     use super::{MaterializeSpec, PosixFsRuntimeResolver};
     use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
     use crate::snapshot::artifact_cache::LocalArtifactCache;
-    use crate::snapshot::{OverlaybdLayerRef, RepositoryError};
+    use crate::snapshot::{OverlaybdLayerRef, RepositoryError, MEMORY_PREFETCH_ARTIFACT};
     use tempfile::TempDir;
 
     #[derive(Debug)]
@@ -351,6 +369,28 @@ mod tests {
 
     fn test_overlaybd_layer_store() -> Arc<dyn OverlaybdLayerStore> {
         Arc::new(TestOverlaybdLayerStore)
+    }
+
+    #[tokio::test]
+    async fn memory_prefetch_path_detects_artifact_presence() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let resolver = PosixFsRuntimeResolver::new(
+            tempdir.path().join("repository"),
+            tempdir.path().join("runtime-cache"),
+            test_overlaybd_layer_store(),
+            LocalArtifactCache::new(tempdir.path().join("cache"), None).unwrap(),
+        );
+        let vm_state = tempdir.path().join("vm_state.bin");
+        std::fs::write(&vm_state, b"vm").expect("write vm_state");
+
+        assert!(resolver.memory_prefetch_path(&vm_state).await.is_none());
+
+        let prefetch = tempdir.path().join(MEMORY_PREFETCH_ARTIFACT);
+        std::fs::write(&prefetch, b"{}").expect("write prefetch");
+        assert_eq!(
+            resolver.memory_prefetch_path(&vm_state).await,
+            Some(prefetch)
+        );
     }
 
     #[tokio::test]

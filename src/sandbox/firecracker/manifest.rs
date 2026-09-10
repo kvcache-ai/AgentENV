@@ -30,6 +30,11 @@ pub struct FirecrackerSnapshotManifest {
     /// Launch-time volumes use the reserved slots that follow these drives.
     #[serde(default)]
     pub physical_extra_drive_count: usize,
+    /// Local path of the optional memory prefetch manifest
+    /// (`memory-prefetch.json`), resolved at snapshot-resolve time.
+    /// Runtime-only: never persisted into the repository.
+    #[serde(skip)]
+    pub memory_prefetch_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +99,7 @@ impl FirecrackerSnapshotManifest {
             attached_drives: Vec::new(),
             volume_drive_slots: 0,
             physical_extra_drive_count: attached_drives.len(),
+            memory_prefetch_path: None,
         }
         .with_extra_drives(attached_drives)
     }
@@ -223,6 +229,7 @@ mod tests {
             attached_drives: vec![known],
             volume_drive_slots: 0,
             physical_extra_drive_count: 1,
+            memory_prefetch_path: None,
         };
 
         let drives = manifest.extra_drives();

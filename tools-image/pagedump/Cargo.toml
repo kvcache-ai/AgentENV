@@ -1,0 +1,17 @@
+[package]
+name = "aenv-pagedump"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone crate used only by the tools-image Docker build; keep it out of
+# the agentenv workspace so `cargo build` in this directory works too.
+[workspace]
+
+[[bin]]
+name = "aenv-pagedump"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 2
+lto = true
+strip = true

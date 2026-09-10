@@ -11,6 +11,7 @@ mod instance;
 mod manifest;
 mod mmds;
 mod overlaybd_snapshot;
+mod pagedump;
 mod pool;
 mod process_vm_reader;
 mod sandbox;

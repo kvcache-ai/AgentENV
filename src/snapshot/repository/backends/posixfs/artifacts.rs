@@ -12,8 +12,9 @@ use crate::digest::{self, FileDigest};
 use crate::sandbox::FirecrackerSnapshotManifest;
 use crate::snapshot::{
     CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, RepositoryError, RepositoryResult,
-    SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
+    SnapshotId, MEMORY_PREFETCH_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
 };
+use tracing::{debug, warn};
 
 /// Artifact store backed by files in a POSIX-compatible shared filesystem.
 pub struct PosixFsArtifactStore {
@@ -63,6 +64,38 @@ impl PosixFsArtifactStore {
             committed_layout.path(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
             &manifest.vm_state.path,
         )?;
+        // Best-effort: import the memory prefetch manifest produced at
+        // capture time (next to vm_state.bin). Absence is normal for older
+        // snapshots and must not fail the import.
+        if let Some(prefetch_src) = manifest
+            .vm_state
+            .path
+            .parent()
+            .map(|dir| dir.join(MEMORY_PREFETCH_ARTIFACT))
+        {
+            match prefetch_src.exists() {
+                true => {
+                    if let Err(error) = self.copy_local_artifact(
+                        committed_layout.path(MEMORY_PREFETCH_ARTIFACT),
+                        &prefetch_src,
+                    ) {
+                        warn!(%error, "import memory prefetch artifact failed (best-effort)");
+                    }
+                }
+                false => {
+                    debug!("no memory prefetch manifest captured");
+                    // A publication retry after a crash/failed cleanup reuses
+                    // the snapshot directory; a stale manifest from an earlier
+                    // attempt must not be associated with the new memory image.
+                    let stale = committed_layout.path(MEMORY_PREFETCH_ARTIFACT);
+                    if stale.exists() {
+                        if let Err(error) = fs::remove_file(&stale) {
+                            warn!(%error, path = %stale.display(), "remove stale memory prefetch artifact failed (best-effort)");
+                        }
+                    }
+                }
+            }
+        }
         self.persist_firecracker_manifest(
             committed_layout.path(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest),
             manifest,
@@ -735,7 +768,7 @@ mod tests {
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::{
         CommittedAttachedDrive, ExternalLayer, OverlaybdLayerRef, SnapshotId,
-        SNAPSHOT_ARTIFACT_LAYOUT,
+        MEMORY_PREFETCH_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
     };
 
     fn test_store(root: &std::path::Path) -> PosixFsArtifactStore {
@@ -872,6 +905,48 @@ mod tests {
         };
         assert!(path.contains("managed-layers"));
         assert!(tempdir.path().join(&path).exists());
+    }
+
+    #[test]
+    fn import_built_artifacts_copies_memory_prefetch_when_present_and_skips_when_absent() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let store = test_store(tempdir.path());
+        let snapshot_id = SnapshotId::generate();
+        let local_dir = tempdir.path().join("local");
+        let (_, _, manifest) = write_mock_built_artifacts(local_dir.as_path())
+            .expect("mock built artifacts should write");
+
+        // 有 prefetch 清单 → 复制到 committed 布局且内容一致
+        fs::write(
+            local_dir.join(MEMORY_PREFETCH_ARTIFACT),
+            br#"{"version":1,"ranges":[[4096,8192]]}"#,
+        )
+        .expect("write prefetch manifest");
+        store
+            .import_built_artifacts(&snapshot_id, &manifest)
+            .expect("import with prefetch");
+        let committed = tempdir
+            .path()
+            .join("snapshots")
+            .join(snapshot_id.to_string())
+            .join(MEMORY_PREFETCH_ARTIFACT);
+        assert_eq!(
+            fs::read(&committed).expect("committed prefetch manifest"),
+            br#"{"version":1,"ranges":[[4096,8192]]}"#.to_vec()
+        );
+
+        // 无 prefetch 清单 → 正常导入且不产生该文件
+        let snapshot_id2 = SnapshotId::generate();
+        fs::remove_file(local_dir.join(MEMORY_PREFETCH_ARTIFACT)).expect("remove prefetch");
+        store
+            .import_built_artifacts(&snapshot_id2, &manifest)
+            .expect("import without prefetch");
+        assert!(!tempdir
+            .path()
+            .join("snapshots")
+            .join(snapshot_id2.to_string())
+            .join(MEMORY_PREFETCH_ARTIFACT)
+            .exists());
     }
 
     #[test]

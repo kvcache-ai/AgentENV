@@ -1,6 +1,8 @@
-# syntax=docker/dockerfile:1.7
-
 # AgentENV envd tools drive.
+#
+# (Intentionally no `# syntax=` line: the default buildkit frontend avoids an
+# external docker/dockerfile image pull, which fails on builders without
+# direct registry access.)
 #
 # This image is a reproducible build recipe for the small ext4 tools drive that
 # AgentENV attaches to each Firecracker guest as /dev/vda. The guest boots from
@@ -42,6 +44,7 @@ FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-${DEBIAN_VERSION} AS envd-bu
 
 ARG ENVD_REF=2026.17
 ARG ENVD_UPSTREAM_REPO=https://github.com/e2b-dev/infra.git
+ARG GOPROXY
 ARG TARGETARCH
 
 RUN apt-get update \
@@ -82,6 +85,33 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     fi
 
 # ---------------------------------------------------------------------------
+# Stage 1b: compile aenv-pagedump from the vendored source.
+#
+# Static musl binary that exports a process's present GPA ranges as JSON for
+# the snapshot memory-prefetch path. std-only, no network crates.
+# ---------------------------------------------------------------------------
+FROM --platform=$BUILDPLATFORM rust:1.93.0-${DEBIAN_VERSION} AS pagedump-builder
+
+ARG TARGETARCH
+
+RUN rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+
+WORKDIR /src
+COPY pagedump/Cargo.toml pagedump/Cargo.toml
+COPY pagedump/src/main.rs pagedump/src/main.rs
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    set -eux; \
+    case "$TARGETARCH" in \
+      amd64) target=x86_64-unknown-linux-musl ;; \
+      arm64) target=aarch64-unknown-linux-musl ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    cd pagedump; \
+    cargo build --release --target "$target"; \
+    install -Dm0755 "target/$target/release/aenv-pagedump" /out/aenv-pagedump
+
+# ---------------------------------------------------------------------------
 # Stage 2: assemble the guest-visible tools rootfs.
 #
 # This is not a normal Linux distribution rootfs. It only contains the minimal
@@ -90,6 +120,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 #   /agentenv/pivot-init          post-pivot bootstrap
 #   /agentenv/envd                compiled control-plane daemon
 #   /agentenv/bin/busybox         stable helper binary for init scripts
+#   /agentenv/bin/aenv-pagedump   GPA range exporter for memory prefetch
 # ---------------------------------------------------------------------------
 FROM --platform=${TARGETPLATFORM} ${BUSYBOX_IMAGE} AS rootfs
 
@@ -98,6 +129,7 @@ ARG TOOLS_VERSION
 COPY --chmod=0755 init /tools-rootfs/init
 COPY --chmod=0755 pivot-init /tools-rootfs/agentenv/pivot-init
 COPY --chmod=0755 --from=envd-builder /out/envd /tools-rootfs/agentenv/envd
+COPY --chmod=0755 --from=pagedump-builder /out/aenv-pagedump /tools-rootfs/agentenv/bin/aenv-pagedump
 
 RUN set -eux; \
     mkdir -p \

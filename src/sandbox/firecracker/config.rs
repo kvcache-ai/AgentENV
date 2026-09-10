@@ -473,6 +473,10 @@ pub struct FirecrackerSnapshotConfig {
     /// `Some` is used for keeping the snapshot directory alive across multiple pause/resume cycles.
     #[serde(skip)]
     pub(super) managed_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
+    /// Local path of the optional memory prefetch manifest, resolved at
+    /// snapshot-resolve time. Runtime-only: not persisted across pause/resume.
+    #[serde(skip)]
+    pub memory_prefetch_path: Option<PathBuf>,
 }
 
 impl FirecrackerSnapshotConfig {
@@ -550,6 +554,7 @@ impl FirecrackerSnapshotConfig {
             mem_overlaybd_config,
             mem_virtual_size: manifest.memory.virtual_size,
             managed_snapshot_root: None,
+            memory_prefetch_path: manifest.memory_prefetch_path.clone(),
         })
     }
 
@@ -663,6 +668,7 @@ fn validate_overlaybd_extra_drive(
 mod tests {
     use super::*;
     use crate::cfg::{UblkOverlaybdTomlConfig, UblkTomlConfig};
+    use crate::sandbox::FirecrackerSnapshotManifest;
     use crate::snapshot::{CommittedSnapshot, ResolvedAttachedDrive, SnapshotRecord};
     use std::fs;
     use std::sync::{Mutex, OnceLock};
@@ -877,6 +883,7 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            memory_prefetch_path: None,
         };
 
         let err = snapshot
@@ -906,6 +913,23 @@ mod tests {
 
         fs::write(&rootfs_path, b"rootfs")?;
         snapshot.validate_persisted()?;
+        Ok(())
+    }
+
+    #[test]
+    fn runnable_snapshot_carries_memory_prefetch_path() -> Result<()> {
+        struct TestLease;
+        impl crate::snapshot::RuntimeArtifactLease for TestLease {}
+
+        let prefetch_path = PathBuf::from("/tmp/memory-prefetch.json");
+        let mut manifest = FirecrackerSnapshotManifest::for_test(32768, &[]);
+        manifest.memory_prefetch_path = Some(prefetch_path.clone());
+        let record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let snapshot = RunnableSnapshot::new(record, manifest, Arc::new(TestLease));
+
+        let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
+
+        assert_eq!(config.memory_prefetch_path, Some(prefetch_path));
         Ok(())
     }
 

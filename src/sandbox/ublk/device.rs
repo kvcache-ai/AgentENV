@@ -295,6 +295,26 @@ impl UblkDeviceManager {
         }
     }
 
+    /// Ask the daemon to bulk-prefetch ranges of a snapshot's memory image
+    /// into the local remote-block cache before the guest resumes.
+    /// Best-effort: failures only skip the prefetch optimization.
+    pub(crate) async fn prefetch(
+        &self,
+        image_config: &Path,
+        global_config: &Path,
+        ranges: Vec<(u64, u64)>,
+    ) {
+        let Ok(client) = self.require_client() else {
+            return;
+        };
+        if let Err(error) = client.prefetch(image_config, global_config, ranges).await {
+            tracing::warn!(
+                %error,
+                "memory prefetch RPC failed; continuing without prefetch"
+            );
+        }
+    }
+
     // ── Device lifecycle ────────────────────────────────────────────────
 
     /// Release a ublk device back to the warm pool (if enabled) or delete it.
