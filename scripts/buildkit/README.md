@@ -9,6 +9,8 @@ BUILDCTL_BIN=/path/to/aenv-buildctl make test-buildkit
 The suite uses the CLI's credentials (`aenv auth`, or an isolated
 `XDG_CONFIG_HOME`) and requires Python 3.11+, BuildKit's client, and working VM
 prerequisites. Observability must be enabled so it can check worker counts.
+Before each test, the suite waits for every node to report no running, starting,
+or paused sandboxes so stale gateway heartbeats cannot enter the cleanup baseline.
 Builds create unique template names; cleanup deletes their templates and
 sandboxes, retaining the managed cache. Logs remain in the printed temporary
 directory when a check fails.

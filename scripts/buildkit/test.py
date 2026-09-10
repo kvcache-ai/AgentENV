@@ -37,7 +37,13 @@ class BuildKitTests(unittest.TestCase):
         self.credentials = tomllib.loads((config / "aenv/credentials").read_text())
         self.addCleanup(self.cleanup_sandboxes)
         print(f"\nBuildKit logs: {self.work}", flush=True)
-        self.baseline = self.node_counts()
+
+        def idle():
+            # The gateway may still report a heartbeat from the preceding suite.
+            self.baseline = self.node_counts()
+            return all(counts == (0, 0, 0) for counts in self.baseline.values())
+
+        self.wait_for(idle, "idle nodes before capturing the worker baseline")
 
     def cli(self, *args):
         result = subprocess.run(
