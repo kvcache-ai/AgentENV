@@ -33,7 +33,7 @@ on:
 
 jobs:
   fmt:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/rust-ci-setup
@@ -44,7 +44,7 @@ jobs:
         run: make fmt
 
   clippy:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/rust-ci-setup
@@ -54,8 +54,7 @@ jobs:
         run: make clippy
 
   unit-tests:
-    # Ubuntu 24.04's Linux 6.17 kernel can crash in ublk ADD_DEV.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/rust-ci-setup

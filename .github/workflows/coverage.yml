@@ -24,8 +24,7 @@ jobs:
   coverage:
     outputs:
       coverage_outcome: ${{ steps.coverage.outcome }}
-    # Ubuntu 24.04's Linux 6.17 kernel can crash in ublk ADD_DEV.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/rust-ci-setup
@@ -65,7 +64,7 @@ jobs:
   publish-coverage-data:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.coverage.outputs.coverage_outcome == 'success'
     needs: coverage
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:

@@ -34,8 +34,7 @@ permissions:
 
 jobs:
   agentenv-tests:
-    # Ubuntu 24.04's Linux 6.17 kernel can crash in ublk ADD_DEV.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/rust-ci-setup
@@ -52,8 +51,7 @@ jobs:
 
   e2e-tests:
     name: e2e-tests (${{ matrix.e2e_name }})
-    # Ubuntu 24.04's Linux 6.17 kernel can crash in ublk ADD_DEV.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:

@@ -15,7 +15,7 @@ on:
 
 jobs:
   go-services:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: services
