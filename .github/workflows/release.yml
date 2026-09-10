@@ -55,18 +55,22 @@ jobs:
             target: ''
             features: --features vendored-openssl
             asset_name: aenv-linux-x86_64
+            buildkit_platform: linux-amd64
           - os: ubuntu-22.04-arm
             target: ''
             features: --features vendored-openssl
             asset_name: aenv-linux-aarch64
+            buildkit_platform: linux-arm64
           - os: macos-15
             target: x86_64-apple-darwin
             features: ''
             asset_name: aenv-darwin-x86_64
+            buildkit_platform: darwin-amd64
           - os: macos-15
             target: aarch64-apple-darwin
             features: ''
             asset_name: aenv-darwin-aarch64
+            buildkit_platform: darwin-arm64
     steps:
       - uses: actions/checkout@v6
 
@@ -92,17 +96,22 @@ jobs:
           OPENSSL_STATIC: ${{ runner.os == 'Linux' && '1' || '' }}
         run: cargo build --release --locked -p aenv ${{ matrix.features }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
-      - name: Stage artifact
+      - name: Package CLI and BuildKit client
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
         run: |
-          mkdir -p dist
           BIN=${{ matrix.target && format('target/{0}/release/aenv', matrix.target) || 'target/release/aenv' }}
-          cp "$BIN" dist/${{ matrix.asset_name }}
-          strip dist/${{ matrix.asset_name }} || true
+          strip "$BIN" || true
+          scripts/release/package-cli.sh \
+            "$BIN" \
+            "dist/${{ matrix.asset_name }}.tar.gz" \
+            "${RELEASE_VERSION#v}" \
+            "${{ matrix.buildkit_platform }}"
 
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset_name }}
-          path: dist/${{ matrix.asset_name }}
+          path: dist/${{ matrix.asset_name }}.tar.gz
 
   build-server:
     name: Build server (linux-${{ matrix.arch }})
@@ -214,6 +223,10 @@ jobs:
           path: dist/
           merge-multiple: true
 
+      - name: Generate bundle checksums
+        working-directory: dist
+        run: sha256sum -- *.tar.gz > SHA256SUMS
+
       - name: Generate release notes
         id: git-cliff
         uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5  # v4.8.0
@@ -243,11 +256,13 @@ jobs:
         with:
           body_path: CHANGES.md
           files: |
-            config/buildkit-version
-            dist/aenv-linux-x86_64
-            dist/aenv-linux-aarch64
-            dist/aenv-darwin-x86_64
-            dist/aenv-darwin-aarch64
+            scripts/install-cli.sh
+            scripts/install.sh
+            dist/SHA256SUMS
+            dist/aenv-linux-x86_64.tar.gz
+            dist/aenv-linux-aarch64.tar.gz
+            dist/aenv-darwin-x86_64.tar.gz
+            dist/aenv-darwin-aarch64.tar.gz
             dist/aenv-server-linux-x86_64-pvm.tar.gz
             dist/aenv-server-linux-x86_64.tar.gz
             dist/aenv-server-linux-aarch64.tar.gz

@@ -53,8 +53,8 @@ esac
 
 ARCH="$(uname -m)"
 case "$ARCH" in
-    x86_64|amd64) ARCH_TAG="x86_64"; BUILDKIT_ARCH="amd64" ;;
-    aarch64|arm64) ARCH_TAG="aarch64"; BUILDKIT_ARCH="arm64" ;;
+    x86_64|amd64) ARCH_TAG="x86_64" ;;
+    aarch64|arm64) ARCH_TAG="aarch64" ;;
     *)
         echo "error: unsupported architecture: $ARCH (supported: x86_64/amd64, aarch64/arm64)" >&2
         exit 1
@@ -165,7 +165,7 @@ download_release_asset() {
         jq -cer --arg name "$asset_name" \
             '[.assets[] | select(.name == $name)] |
              if length == 1 then .[0] else error("release asset not found or not unique") end' \
-            "${3:-$release_metadata}"
+            "$release_metadata"
     )" || {
         echo "error: release asset not found or not unique: ${asset_name}" >&2
         exit 1
@@ -197,21 +197,15 @@ sudo mkdir -p "$INSTALL_DIR"
 # ---------------------------------------------------------------------------
 # 1. Install the aenv CLI
 # ---------------------------------------------------------------------------
-echo "Downloading aenv CLI ..."
-download_release_asset "aenv-linux-${ARCH_TAG}" "$tmp_cli"
-download_release_asset "buildkit-version" "$tmp_dir/buildkit-version"
-BUILDKIT_VERSION="$(<"$tmp_dir/buildkit-version")"
-[[ "$BUILDKIT_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'error: invalid BuildKit version' >&2; exit 1; }
-echo "Downloading buildctl ${BUILDKIT_VERSION} (linux/${BUILDKIT_ARCH}) ..."
-curl_get "${api_headers[@]}" \
-    "https://api.github.com/repos/moby/buildkit/releases/tags/${BUILDKIT_VERSION}" -o "$tmp_dir/buildkit.json"
-download_release_asset "buildkit-${BUILDKIT_VERSION}.linux-${BUILDKIT_ARCH}.tar.gz" \
-    "$tmp_dir/buildkit.tar.gz" "$tmp_dir/buildkit.json"
-tar -xzOf "$tmp_dir/buildkit.tar.gz" bin/buildctl >"$tmp_dir/buildctl"
-test -s "$tmp_dir/buildctl"
+echo "Downloading aenv CLI and buildctl ..."
+download_release_asset "aenv-linux-${ARCH_TAG}.tar.gz" "$tmp_cli"
+mkdir -p "$tmp_dir/cli"
+tar -xzf "$tmp_cli" -C "$tmp_dir/cli" aenv aenv-buildctl manifest.json
+test -s "$tmp_dir/cli/aenv"
+test -s "$tmp_dir/cli/aenv-buildctl"
 stage_dir="$(sudo mktemp -d "${INSTALL_DIR}/.aenv-install.XXXXXX")"
-sudo install -m 0755 "$tmp_dir/buildctl" "$stage_dir/buildctl"
-sudo install -m 0755 "$tmp_cli" "$stage_dir/aenv"
+sudo install -m 0755 "$tmp_dir/cli/aenv-buildctl" "$stage_dir/buildctl"
+sudo install -m 0755 "$tmp_dir/cli/aenv" "$stage_dir/aenv"
 sudo mv "$stage_dir/buildctl" "${INSTALL_DIR}/aenv-buildctl"
 sudo mv "$stage_dir/aenv" "${INSTALL_DIR}/aenv"
 

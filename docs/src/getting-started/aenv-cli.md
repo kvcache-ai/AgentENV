@@ -8,11 +8,25 @@
 curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install-cli.sh | bash
 ```
 
-Both `install-cli.sh` and the full `install.sh` install `aenv-buildctl` beside
-`aenv`, after verifying the GitHub release asset checksums. The CLI installer
-supports Linux and macOS on x86_64 and arm64; set `INSTALL_DIR` for a user-local
-installation. The bundled client version comes from the same AgentENV release;
-an existing system `buildctl` is preserved.
+Each release publishes `aenv-<os>-<arch>.tar.gz` for Linux and macOS on x86_64
+and aarch64 (arm64). The archive contains:
+
+```text
+aenv
+aenv-buildctl
+manifest.json
+```
+
+The manifest records the AgentENV version, BuildKit version, and platform.
+`SHA256SUMS` accompanies the release archives. The release workflow verifies the
+pinned upstream BuildKit download before packaging its client with `aenv`.
+
+Both `install-cli.sh` and the full `install.sh` download this single CLI archive
+and verify its GitHub release asset checksum before installing both executables.
+Installation does not contact the upstream BuildKit release. The private
+`aenv-buildctl` lives beside `aenv`, preserving an existing system `buildctl`.
+Set `INSTALL_DIR` for a user-local CLI installation. For manual installation,
+extract the archive and keep both executables in the same directory.
 
 Or build from source (requires Rust):
 

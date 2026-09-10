@@ -39,8 +39,15 @@ The single-node and Docker Compose E2E jobs both run the full suite, including
 build traffic through the gateway in Compose. They use
 [`test-config.toml`](test-config.toml), with 2-vCPU, 2048-MiB builders and 8192-MiB
 cache disks. [`install-buildctl.sh`](install-buildctl.sh) downloads the pinned
-client and verifies its release digest; CI setup does not rewrite production
-configuration.
+client and verifies its release digest. It defaults to the host platform and
+accepts an explicit platform for cross-platform release packaging.
+
+[`package-cli.sh`](../release/package-cli.sh) uses the same downloader to produce
+a CLI archive containing `aenv`, its private `aenv-buildctl`, and `manifest.json`.
+The release workflow publishes one archive per supported platform plus
+`SHA256SUMS`. Both installers consume those archives without downloading BuildKit
+separately. `make test-unit` exercises the packager and installers with fixture
+release assets, including checksum failures and incomplete bundles.
 
 Builder settings are under `[template_build]`; they do not change the resulting
 template's resources. Worker deletion uses the orchestrator's normal volume

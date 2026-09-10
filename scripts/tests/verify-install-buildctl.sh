@@ -7,23 +7,21 @@ trap 'rm -rf "$work"' EXIT
 export INSTALL_TEST_ROOT="$work"
 INSTALL_TEST_MV="$(command -v mv)"
 export INSTALL_TEST_MV
-mkdir -p "$work/bin" "$work/assets/bin"
+version="$(<"$repo_root/config/buildkit-version")"
+export INSTALL_TEST_BUILDKIT_VERSION="$version"
+mkdir -p "$work/bin" "$work/assets" "$work/upstream/bin"
 printf '#!/bin/sh\necho aenv-test\n' >"$work/assets/aenv"
-printf '#!/bin/sh\necho buildctl-v0.33.0\n' >"$work/assets/bin/buildctl"
-printf 'not installed\n' >"$work/assets/bin/buildkitd"
-cp "$repo_root/config/buildkit-version" "$work/assets/buildkit-version"
-version_digest="sha256:$(sha256sum "$work/assets/buildkit-version" | cut -d' ' -f1)"
-tar -czf "$work/assets/buildkit.tar.gz" -C "$work/assets" bin
-cli_digest="sha256:$(sha256sum "$work/assets/aenv" | cut -d' ' -f1)"
-buildkit_digest="sha256:$(sha256sum "$work/assets/buildkit.tar.gz" | cut -d' ' -f1)"
-jq -n --arg cli "$cli_digest" --arg version "$version_digest" '{assets: ([
-  ["linux", "darwin"][] as $os | ["x86_64", "aarch64"][] as $arch |
-  {name: ("aenv-" + $os + "-" + $arch), digest: $cli, browser_download_url: "https://test.invalid/aenv"}
-] + [{name: "buildkit-version", digest: $version, browser_download_url: "https://test.invalid/buildkit-version"}])}' >"$work/release.json"
-jq -n --arg digest "$buildkit_digest" '{assets: [
-  ["linux", "darwin"][] as $os | ["amd64", "arm64"][] as $arch |
-  {name: ("buildkit-v0.33.0." + $os + "-" + $arch + ".tar.gz"), digest: $digest, browser_download_url: "https://test.invalid/buildkit.tar.gz"}
-]}' >"$work/buildkit.json"
+chmod +x "$work/assets/aenv"
+printf 'not bundled\n' >"$work/upstream/bin/buildkitd"
+for platform in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+  printf '#!/bin/sh\necho buildctl-%s-%s\n' "$version" "$platform" >"$work/upstream/bin/buildctl"
+  tar -czf "$work/assets/buildkit-${version}.${platform}.tar.gz" -C "$work/upstream" bin
+done
+for archive in "$work/assets"/buildkit-*.tar.gz; do
+  digest="sha256:$(sha256sum "$archive" | cut -d' ' -f1)"
+  jq -n --arg name "${archive##*/}" --arg digest "$digest" \
+    '{name: $name, digest: $digest, browser_download_url: ("https://test.invalid/" + $name)}'
+done | jq -s '{assets: .}' >"$work/buildkit.json"
 
 cat >"$work/bin/stub" <<'STUB'
 #!/usr/bin/env bash
@@ -55,7 +53,12 @@ case "${0##*/}" in
     done
     case "$url" in
       */AgentENV/releases/latest) source="$INSTALL_TEST_ROOT/release.json";;
-      */buildkit/releases/tags/v0.33.0) source="$INSTALL_TEST_ROOT/buildkit.json";;
+      */buildkit/releases/tags/"$INSTALL_TEST_BUILDKIT_VERSION")
+        [[ "${INSTALL_TEST_PHASE:-}" == package ]] || { echo 'Installer must not query BuildKit releases' >&2; exit 1; }
+        source="$INSTALL_TEST_ROOT/buildkit.json";;
+      https://test.invalid/buildkit-*)
+        [[ "${INSTALL_TEST_PHASE:-}" == package ]] || { echo 'Installer must not download BuildKit separately' >&2; exit 1; }
+        source="$INSTALL_TEST_ROOT/assets/${url##*/}";;
       https://test.invalid/*) source="$INSTALL_TEST_ROOT/assets/${url##*/}";;
       *) echo "Unexpected download: $url" >&2; exit 1;;
     esac
@@ -66,6 +69,53 @@ chmod +x "$work/bin/stub"
 for command in curl uname sudo getent id systemctl mv; do ln -s stub "$work/bin/$command"; done
 export PATH="$work/bin:$PATH"
 
+# Run the release packager for every target, including targets unlike the host.
+for platform in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+  os=${platform%-*}
+  arch=x86_64
+  [[ "$platform" == *-arm64 ]] && arch=aarch64
+  archive="$work/assets/aenv-${os}-${arch}.tar.gz"
+  INSTALL_TEST_PHASE=package bash "$repo_root/scripts/release/package-cli.sh" \
+    "$work/assets/aenv" "$archive" 1.2.3-rc.1 "$platform"
+  [[ $(tar -tzf "$archive" | sort) == $'aenv\naenv-buildctl\nmanifest.json' ]]
+  mkdir -p "$work/unpacked"
+  tar -xzf "$archive" -C "$work/unpacked"
+  [[ $("$work/unpacked/aenv") == aenv-test ]]
+  [[ $("$work/unpacked/aenv-buildctl") == "buildctl-${version}-${platform}" ]]
+  jq -e --arg version "$version" --arg platform "$platform" \
+    '. == {aenvVersion: "1.2.3-rc.1", buildkitVersion: $version, platform: $platform}' \
+    "$work/unpacked/manifest.json" >/dev/null
+
+  # CI and source builds can omit the platform and use the host's client.
+  host_os=Linux
+  [[ "$os" == darwin ]] && host_os=Darwin
+  host_arch=x86_64
+  [[ "$arch" == aarch64 ]] && host_arch=arm64
+  INSTALL_TEST_PHASE=package INSTALL_TEST_OS="$host_os" INSTALL_TEST_ARCH="$host_arch" \
+    bash "$repo_root/scripts/buildkit/install-buildctl.sh" "$work/host-client"
+  [[ $("$work/host-client/buildctl") == "buildctl-${version}-${platform}" ]]
+done
+
+# A bad upstream checksum must fail before replacing a release archive.
+printf 'corrupt\n' >>"$work/assets/buildkit-${version}.linux-amd64.tar.gz"
+printf 'existing archive\n' >"$work/existing.tar.gz"
+if INSTALL_TEST_PHASE=package bash "$repo_root/scripts/release/package-cli.sh" \
+    "$work/assets/aenv" "$work/existing.tar.gz" 1.2.3 linux-amd64 >"$work/package-failure.log" 2>&1; then
+  echo 'Expected upstream checksum failure' >&2
+  exit 1
+fi
+grep -q 'SHA256 mismatch for buildkit' "$work/package-failure.log"
+[[ $(cat "$work/existing.tar.gz") == 'existing archive' ]]
+
+write_release_metadata() {
+  for archive in "$work/assets"/aenv-*.tar.gz; do
+    digest="sha256:$(sha256sum "$archive" | cut -d' ' -f1)"
+    jq -n --arg name "${archive##*/}" --arg digest "$digest" \
+      '{name: $name, digest: $digest, browser_download_url: ("https://test.invalid/" + $name)}'
+  done | jq -s '{assets: .}' >"$work/release.json"
+}
+write_release_metadata
+
 for INSTALL_TEST_OS in Linux Darwin; do
   for INSTALL_TEST_ARCH in x86_64 arm64; do
     export INSTALL_TEST_OS INSTALL_TEST_ARCH
@@ -74,7 +124,10 @@ for INSTALL_TEST_OS in Linux Darwin; do
     printf 'system buildctl\n' >"$dest/buildctl"
     INSTALL_DIR="$dest" bash "$repo_root/scripts/install-cli.sh"
     [[ $("$dest/aenv") == aenv-test ]]
-    [[ $("$dest/aenv-buildctl") == buildctl-v0.33.0 ]]
+    arch=amd64
+    [[ "$INSTALL_TEST_ARCH" == arm64 ]] && arch=arm64
+    os=$(tr '[:upper:]' '[:lower:]' <<<"$INSTALL_TEST_OS")
+    [[ $("$dest/aenv-buildctl") == "buildctl-${version}-${os}-${arch}" ]]
     [[ $(cat "$dest/buildctl") == 'system buildctl' ]]
     [[ ! -e "$dest/buildkitd" ]]
   done
@@ -91,7 +144,7 @@ if AENV_HOME_PATH="$work/data" SKIP_SETUP=1 bash "$repo_root/scripts/install.sh"
 fi
 grep -q 'aenv-server-linux-x86_64.tar.gz' "$work/full.log"
 [[ $("$work/full-install/aenv") == aenv-test ]]
-[[ $("$work/full-install/aenv-buildctl") == buildctl-v0.33.0 ]]
+[[ $("$work/full-install/aenv-buildctl") == "buildctl-${version}-linux-amd64" ]]
 [[ $(cat "$work/full-install/buildctl") == 'system buildctl' ]]
 [[ ! -e "$work/full-install/server" ]]
 
@@ -111,7 +164,28 @@ for installer in install-cli.sh install.sh; do
   [[ $(cat "$dest/buildctl") == 'system buildctl' ]]
 done
 
-printf 'corrupt\n' >>"$work/assets/buildkit.tar.gz"
+# Valid checksums do not make an incomplete bundle installable.
+cp "$work/assets/aenv-linux-x86_64.tar.gz" "$work/complete.tar.gz"
+tar -czf "$work/assets/aenv-linux-x86_64.tar.gz" -C "$work/assets" aenv
+write_release_metadata
+for installer in install-cli.sh install.sh; do
+  dest="$work/incomplete-$installer"
+  if [[ "$installer" == install.sh ]]; then dest="$work/full-install"; fi
+  mkdir -p "$dest"
+  printf 'existing aenv\n' >"$dest/aenv"
+  printf 'existing private client\n' >"$dest/aenv-buildctl"
+  if INSTALL_DIR="$dest" AENV_HOME_PATH="$work/data" SKIP_SETUP=1 \
+      bash "$repo_root/scripts/$installer" >"$work/incomplete.log" 2>&1; then
+    echo 'Expected incomplete bundle failure' >&2
+    exit 1
+  fi
+  grep -q 'aenv-buildctl' "$work/incomplete.log"
+  [[ $(cat "$dest/aenv") == 'existing aenv' ]]
+  [[ $(cat "$dest/aenv-buildctl") == 'existing private client' ]]
+done
+cp "$work/complete.tar.gz" "$work/assets/aenv-linux-x86_64.tar.gz"
+write_release_metadata
+printf 'corrupt\n' >>"$work/assets/aenv-linux-x86_64.tar.gz"
 for installer in install-cli.sh install.sh; do
   dest="$work/corrupt-$installer"
   if [[ "$installer" == install.sh ]]; then dest="$work/full-install"; fi
@@ -123,8 +197,8 @@ for installer in install-cli.sh install.sh; do
     echo 'Expected a checksum failure' >&2
     exit 1
   fi
-  grep -q 'SHA256 mismatch for buildkit' "$work/corrupt.log"
+  grep -q 'SHA256 mismatch for aenv-linux-x86_64.tar.gz' "$work/corrupt.log"
   [[ $(cat "$dest/aenv") == 'existing aenv' ]]
   [[ $(cat "$dest/buildctl") == 'existing buildctl' ]]
 done
-echo 'Installer BuildKit checks passed'
+echo 'CLI bundle packaging and installer checks passed'

@@ -25,8 +25,8 @@ esac
 
 ARCH="$(uname -m)"
 case "$ARCH" in
-    x86_64)          ARCH_TAG="x86_64"; BUILDKIT_ARCH="amd64" ;;
-    aarch64|arm64)   ARCH_TAG="aarch64"; BUILDKIT_ARCH="arm64" ;;
+    x86_64)          ARCH_TAG="x86_64" ;;
+    aarch64|arm64)   ARCH_TAG="aarch64" ;;
     *)
         echo "error: unsupported architecture: $ARCH (supported: x86_64, aarch64/arm64)" >&2
         exit 1
@@ -41,11 +41,12 @@ if [[ -z "$INSTALL_DIR" ]]; then
     fi
 fi
 
-ASSET="aenv-${OS}-${ARCH_TAG}"
+ASSET="aenv-${OS}-${ARCH_TAG}.tar.gz"
 RELEASE_API="https://api.github.com/repos/${REPO}/releases/latest"
 DEST="${INSTALL_DIR}/aenv"
 TMP_DIR="$(mktemp -d)"
-TMP="${TMP_DIR}/aenv"
+TMP="${TMP_DIR}/bundle.tar.gz"
+BUNDLE_DIR="${TMP_DIR}/bundle"
 RELEASE_METADATA="${TMP_DIR}/release.json"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -145,20 +146,14 @@ download_release_asset() {
     fi
 }
 
-echo "Downloading aenv (${OS}/${ARCH_TAG}) ..."
+echo "Downloading aenv and buildctl (${OS}/${ARCH_TAG}) ..."
 curl_get "${api_headers[@]}" "$RELEASE_API" -o "$RELEASE_METADATA"
 download_release_asset "$ASSET" "$TMP"
-download_release_asset "buildkit-version" "${TMP_DIR}/buildkit-version"
-BUILDKIT_VERSION="$(<"${TMP_DIR}/buildkit-version")"
-[[ "$BUILDKIT_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'error: invalid BuildKit version' >&2; exit 1; }
-
-echo "Downloading buildctl ${BUILDKIT_VERSION} (${OS}/${BUILDKIT_ARCH}) ..."
-curl_get "${api_headers[@]}" \
-    "https://api.github.com/repos/moby/buildkit/releases/tags/${BUILDKIT_VERSION}" -o "$RELEASE_METADATA"
-download_release_asset "buildkit-${BUILDKIT_VERSION}.${OS}-${BUILDKIT_ARCH}.tar.gz" "${TMP_DIR}/buildkit.tar.gz"
-tar -xzOf "${TMP_DIR}/buildkit.tar.gz" bin/buildctl >"${TMP_DIR}/buildctl"
-test -s "${TMP_DIR}/buildctl"
-chmod 0755 "$TMP" "${TMP_DIR}/buildctl"
+mkdir -p "$BUNDLE_DIR"
+tar -xzf "$TMP" -C "$BUNDLE_DIR" aenv aenv-buildctl manifest.json
+test -s "$BUNDLE_DIR/aenv"
+test -s "$BUNDLE_DIR/aenv-buildctl"
+chmod 0755 "$BUNDLE_DIR/aenv" "$BUNDLE_DIR/aenv-buildctl"
 
 if [[ -w "$INSTALL_DIR" ]] || mkdir -p "$INSTALL_DIR"; then
     true
@@ -169,8 +164,8 @@ install_command=()
 [[ -w "$INSTALL_DIR" ]] || install_command=(sudo)
 stage_dir="$("${install_command[@]}" mktemp -d "${INSTALL_DIR}/.aenv-install.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"; "${install_command[@]}" rm -rf "$stage_dir"' EXIT
-"${install_command[@]}" install -m 0755 "${TMP_DIR}/buildctl" "$stage_dir/buildctl"
-"${install_command[@]}" install -m 0755 "$TMP" "$stage_dir/aenv"
+"${install_command[@]}" install -m 0755 "$BUNDLE_DIR/aenv-buildctl" "$stage_dir/buildctl"
+"${install_command[@]}" install -m 0755 "$BUNDLE_DIR/aenv" "$stage_dir/aenv"
 # Keep both renames on the destination filesystem.
 "${install_command[@]}" mv "$stage_dir/buildctl" "${INSTALL_DIR}/aenv-buildctl"
 "${install_command[@]}" mv "$stage_dir/aenv" "$DEST"
