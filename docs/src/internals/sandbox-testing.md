@@ -237,8 +237,9 @@ enabled = false
     logs, and writable OverlayBD upper layer data (`overlaybd/upper.data` and
     `overlaybd/upper.index`). Defaults to `$AENV_HOME/firecracker-work`.
   - `serial_dir`: Optional override for the persistent output directory.
-    Serial output is written under a per-sandbox subdirectory and not removed
-    by the sandbox. Defaults to `$AENV_HOME/logs/serial`.
+    Serial output is written under `{shard}/{sandbox_id}/`, where the shard is
+    the last two hex digits of the sandbox ID, and is not removed by the
+    sandbox. Defaults to `$AENV_HOME/logs/serial`.
   - `log_level`: Optional Firecracker log level (`Error`, `Warning`, `Info`,
     `Debug`, `Trace`, case-insensitive). When set to a non-empty value,
     Firecracker's own logging is enabled and written to a `firecracker.log`

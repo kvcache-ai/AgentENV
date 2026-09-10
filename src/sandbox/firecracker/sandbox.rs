@@ -1397,7 +1397,7 @@ impl FirecrackerSandbox {
             .common()
             .serial_output_base_dir
             .clone()
-            .map(|p| p.join(self.id.to_string()))
+            .map(|p| p.join(serial_shard(self.id)).join(self.id.to_string()))
             .unwrap_or_else(|| self.work_dir.path().join("logs"))
     }
 
@@ -2518,6 +2518,37 @@ async fn copy_cow(src: &Path, dst: &Path) -> Result<()> {
     .context("copy_cow task failed")?
 }
 
+/// One directory level between the serial root and a sandbox's own log
+/// directory, so the root does not accumulate one child per sandbox ever
+/// created.
+///
+/// Serial output is deliberately persistent: the directory outlives the sandbox
+/// so a boot log can be read after the fact. Nothing prunes it, so on a busy
+/// node the root grows without bound -- roughly 470 entries/sec under sustained
+/// create load, nearly all of them holding a single zero-byte
+/// `firecracker-stderr.log`, because a guest resumed from a snapshot writes
+/// nothing to the console.
+///
+/// The cost lands on every create rather than on whoever reads a log: each
+/// create links a new entry into the root, under an exclusive lock on the
+/// parent inode. At ~594k entries a node sustained 197-280 creates/sec; with
+/// the root emptied and nothing else changed, the same node sustained 460-475
+/// creates/sec at 76-78% CPU -- about 1.9x.
+///
+/// Sharding keeps the feature and removes the scaling: 256 buckets hold the
+/// same directories at a few thousand entries each.
+///
+/// The last byte, not the first: sandbox ids are UUIDv7, whose leading bytes
+/// are a millisecond timestamp and therefore identical for every sandbox
+/// created in the same period -- head-sharding would put a burst in one bucket.
+/// The trailing bytes are random.
+fn serial_shard(id: SandboxId) -> String {
+    // A UUID's string form is its 16 bytes in order, so the last two hex
+    // digits are exactly the final byte. Taking it directly avoids formatting
+    // and rescanning all 32.
+    format!("{:02x}", id.into_inner().as_bytes()[15])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3023,5 +3054,30 @@ mod tests {
             .to_string()
             .contains("ensure start() was called before pause() or snapshot"));
         Ok(())
+    }
+
+    #[test]
+    fn serial_shard_is_the_id_tail() {
+        let id = SandboxId::parse_str("0192f2c4-1b2e-7a3f-8c1d-000000000abc").expect("valid uuid");
+        assert_eq!(serial_shard(id), "bc");
+    }
+
+    #[test]
+    fn serial_shard_spreads_ids_created_together() {
+        // UUIDv7 ids minted in the same millisecond share a prefix, so this is
+        // the case head-sharding would collapse into one bucket.
+        let shards: std::collections::HashSet<String> =
+            (0..512).map(|_| serial_shard(SandboxId::new())).collect();
+        assert!(
+            shards.len() > 128,
+            "512 ids produced only {} shards",
+            shards.len()
+        );
+        assert!(shards.iter().all(|s| s.len() == 2));
+    }
+
+    #[test]
+    fn serial_shard_handles_the_nil_id() {
+        assert_eq!(serial_shard(SandboxId::min()), "00");
     }
 }

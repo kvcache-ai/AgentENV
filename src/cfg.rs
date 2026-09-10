@@ -174,7 +174,8 @@ pub struct FirecrackerConfig {
     pub work_dir: Option<PathBuf>,
     /// Optional override for the persistent Firecracker serial output directory.
     /// Defaults to `$AENV_HOME/logs/serial` after normalization.
-    /// Files are grouped under `{serial_dir}/{sandbox_id}/`.
+    /// Files are grouped under `{serial_dir}/{shard}/{sandbox_id}/`, where the
+    /// shard is the last two hex digits of the sandbox id.
     #[config(env = "AENV_FIRECRACKER_SERIAL_DIR", parse_env = parse_required_path)]
     pub serial_dir: Option<PathBuf>,
     /// Optional Firecracker log level (e.g. "Error", "Warning", "Info", "Debug", "Trace").
