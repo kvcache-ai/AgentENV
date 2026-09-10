@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e6173399.js";
+            window.path_to_searchindex_js = "../searchindex-18a222cd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-a02e686b.js"></script>
@@ -203,9 +203,9 @@
 <li><code>boot_args</code>: kernel boot args (e.g. <code>console=ttyS0 ... init=/init</code>).</li>
 <li><code>vcpu_count</code>, <code>mem_size_mib</code>: VM size.</li>
 <li><code>runtime_policy</code>: socket/envd timeouts and poll intervals.</li>
-<li><code>firecracker_stdout_path</code>, <code>firecracker_stderr_path</code>: capture FC logs.
-If unset, logs default to <code>work_dir/logs/firecracker-stdout.log</code> and
-<code>work_dir/logs/firecracker-stderr.log</code>.</li>
+<li><code>common.stdout_path</code>, <code>common.stderr_path</code>: explicit capture directories.
+Otherwise stdout/stderr capture is enabled only when <code>common.firecracker_log_level</code>
+is non-empty, using the serial directory or <code>work_dir/logs</code> fallback.</li>
 <li><code>envd_version</code>: expected envd version for the guest image.</li>
 <li><code>env_vars</code>: optional default environment variables injected after envd init.</li>
 <li><code>ublk_config</code>: optional ublk-backed rootfs configuration.</li>
@@ -395,7 +395,9 @@ snapshot-backed template launches, this means recreating runtime image configs a
 writable uppers from the committed layer stack.</li>
 <li>Rootfs copies use copy-on-write helpers where available.</li>
 <li>Firecracker runs with <code>current_dir = work_dir</code>, so relative paths work.</li>
-<li>Firecracker logs default to <code>work_dir/logs/*</code> unless explicit log paths are configured.</li>
+<li>Firecracker logging is disabled by default. Set <code>firecracker.log_level</code> to enable
+stdout/stderr capture and <code>firecracker.log</code> under the configured serial directory.
+Direct Rust callers can also opt individual streams in using explicit destinations.</li>
 <li><code>start()</code> waits for both the API socket and envd readiness.</li>
 <li>Although the Firecracker process will be killed on drop, explicit <code>stop()</code> is recommended.</li>
 </ul>
@@ -446,7 +448,7 @@ socket_poll_ms = 20
 # work_dir = "/path/to/firecracker-work"
 # Optional override; defaults to $AENV_HOME/logs/serial.
 # serial_dir = "/path/to/serial"
-# Optional; enables Firecracker's own logging when set to a non-empty level.
+# Optional; enables stdout/stderr capture and firecracker.log when non-empty.
 # log_level = "Info"
 
 [kernel]
@@ -494,13 +496,14 @@ directories. These directories include runtime sockets, symlinks, local
 logs, and writable OverlayBD upper layer data (<code>overlaybd/upper.data</code> and
 <code>overlaybd/upper.index</code>). Defaults to <code>$AENV_HOME/firecracker-work</code>.</li>
 <li><code>serial_dir</code>: Optional override for the persistent output directory.
-Serial output is written under a per-sandbox subdirectory and not removed
-by the sandbox. Defaults to <code>$AENV_HOME/logs/serial</code>.</li>
+When logging is enabled, serial output is written under a per-sandbox subdirectory
+and not removed by the sandbox. Defaults to <code>$AENV_HOME/logs/serial</code>.
+Setting this path alone does not enable logging.</li>
 <li><code>log_level</code>: Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>,
 <code>Debug</code>, <code>Trace</code>, case-insensitive). When set to a non-empty value,
-Firecracker’s own logging is enabled and written to a <code>firecracker.log</code>
-file in the sandbox’s log directory (the same directory used for serial
-output). If omitted or empty, Firecracker logging is disabled.</li>
+stdout/stderr capture and <code>firecracker.log</code> are enabled in the sandbox’s
+log directory. If omitted or empty, stdout/stderr are discarded and no log
+directories are created, unless explicit Rust capture destinations are set.</li>
 </ul>
 </li>
 <li>

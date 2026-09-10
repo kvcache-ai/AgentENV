@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e6173399.js";
+            window.path_to_searchindex_js = "../searchindex-18a222cd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-a02e686b.js"></script>
@@ -247,7 +247,7 @@
 <tr><td>Inherited runtime layers</td><td>snapshot artifact dir <code>rootfs/inherited-layers/{index}/{source-file}</code></td><td>Snapshot-owned hard links or copies of inherited runtime-created lower suffixes</td><td>Removes dependence on previous managed snapshot or persisted sandbox artifact roots</td><td>Created during pause when inherited lowers come from the managed snapshot root or another sandbox/generation under the same persisted <code>artifacts</code> root.</td><td>No.</td></tr>
 <tr><td>Attached-drive snapshot dirs</td><td>snapshot artifact dir <code>drives/{drive_id}/...</code></td><td>Per-drive image config and snapshot layer</td><td>Captures writable attached-drive state</td><td>Created alongside rootfs snapshot for each drive.</td><td>No.</td></tr>
 <tr><td>Firecracker work dir</td><td>configured work root, or consumed pool tempfile dir</td><td>API socket, symlinks, runtime dirs, local logs</td><td>Firecracker CWD for a sandbox</td><td>Created when sandbox handle is built, or moved from a warm pool entry; removed by owning <code>TempDir</code>.</td><td>Yes, except live state.</td></tr>
-<tr><td>Firecracker serial logs</td><td><code>firecracker.serial_dir/{sandbox_id}/*</code>, or warm pool work dir logs</td><td>Firecracker stdout/stderr</td><td>Debugging</td><td>Opened on spawn and appended. Warm logs are relocated when a warm process is consumed. Configured serial output is not automatically GC’d.</td><td>No, but disposable.</td></tr>
+<tr><td>Firecracker serial logs</td><td><code>firecracker.serial_dir/{sandbox_id}/*</code>, or warm pool work dir logs</td><td>Firecracker stdout/stderr</td><td>Debugging</td><td>Opened on spawn and appended only when <code>firecracker.log_level</code> is non-empty or an explicit Rust capture destination is set. Enabled warm logs are relocated when a warm process is consumed. Configured serial output is not automatically GC’d.</td><td>No, but disposable.</td></tr>
 <tr><td>Firecracker logger output</td><td><code>firecracker.log</code> in the same per-sandbox log directory as the serial logs</td><td>Firecracker internal logger (<code>PUT /logger</code>)</td><td>Debugging</td><td>Only created when <code>firecracker.log_level</code> is set to a non-empty level. Written by Firecracker itself; not automatically GC’d.</td><td>No, but disposable.</td></tr>
 </tbody>
 </table>
@@ -261,7 +261,7 @@
 </thead>
 <tbody>
 <tr><td>Warm pool work dir</td><td>system tempfile dir</td><td>Firecracker socket and warm process logs</td><td>Pre-spawned Firecracker process CWD</td><td>Created by pool maintenance as a <code>TempDir</code>. Removed when warm entry is cleaned up, or moved into the consuming sandbox and later dropped there.</td></tr>
-<tr><td>Warm pool logs</td><td>warm pool work dir <code>firecracker-stdout.log</code>, <code>firecracker-stderr.log</code></td><td>Firecracker output before the warm process is consumed</td><td>Debugging warm startup</td><td>Created on warm spawn. Relocated into sandbox log path when consumed if no explicit stdout/stderr override.</td></tr>
+<tr><td>Warm pool logs</td><td>warm pool work dir <code>firecracker-stdout.log</code>, <code>firecracker-stderr.log</code></td><td>Firecracker output before the warm process is consumed</td><td>Debugging warm startup</td><td>Created on warm spawn only when <code>firecracker.log_level</code> is non-empty. Relocated into sandbox log path when consumed if no explicit stdout/stderr override.</td></tr>
 </tbody>
 </table>
 </div>

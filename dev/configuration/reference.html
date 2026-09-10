@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-e6173399.js";
+            window.path_to_searchindex_js = "../searchindex-18a222cd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-a02e686b.js"></script>
@@ -229,8 +229,8 @@ local path overrides, not the default dependency catalog.</p>
 <tr><td><code>socket_timeout_secs</code></td><td>integer</td><td><code>3</code></td><td>Max seconds to wait for the Firecracker API socket</td></tr>
 <tr><td><code>socket_poll_ms</code></td><td>integer</td><td><code>1</code></td><td>Poll interval (ms) for checking socket availability</td></tr>
 <tr><td><code>work_dir</code></td><td>string</td><td><code>"$AENV_HOME/firecracker-work"</code></td><td>Parent directory for per-sandbox Firecracker work directories. These dirs contain runtime sockets, symlinks, local logs, and writable OverlayBD upper layer data such as <code>overlaybd/upper.data</code> and <code>overlaybd/upper.index</code></td></tr>
-<tr><td><code>serial_dir</code></td><td>string</td><td><code>"$AENV_HOME/logs/serial"</code></td><td>Directory for persistent Firecracker serial output (per-sandbox subdirectories)</td></tr>
-<tr><td><code>log_level</code></td><td>string</td><td>unset (disabled)</td><td>Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>, <code>Debug</code>, <code>Trace</code>, case-insensitive). When set to a non-empty value, Firecracker’s own logging is enabled and written to a <code>firecracker.log</code> file in each sandbox’s log directory (alongside the serial output). Empty/unset disables it</td></tr>
+<tr><td><code>serial_dir</code></td><td>string</td><td><code>"$AENV_HOME/logs/serial"</code></td><td>Directory for persistent Firecracker logs when enabled (per-sandbox subdirectories). Setting this path alone does not enable logging</td></tr>
+<tr><td><code>log_level</code></td><td>string</td><td>unset (disabled)</td><td>Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>, <code>Debug</code>, <code>Trace</code>, case-insensitive). A non-empty value enables <code>firecracker.log</code> and stdout/stderr capture in each sandbox’s log directory. Empty/unset discards stdout/stderr and creates no log files or per-sandbox log directories. Explicit Rust stdout/stderr destinations still enable the requested stream</td></tr>
 </tbody>
 </table>
 </div>

@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-e6173399.js";
+            window.path_to_searchindex_js = "searchindex-18a222cd.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-a02e686b.js"></script>
@@ -3206,8 +3206,8 @@ local path overrides, not the default dependency catalog.</p>
 <tr><td><code>socket_timeout_secs</code></td><td>integer</td><td><code>3</code></td><td>Max seconds to wait for the Firecracker API socket</td></tr>
 <tr><td><code>socket_poll_ms</code></td><td>integer</td><td><code>1</code></td><td>Poll interval (ms) for checking socket availability</td></tr>
 <tr><td><code>work_dir</code></td><td>string</td><td><code>"$AENV_HOME/firecracker-work"</code></td><td>Parent directory for per-sandbox Firecracker work directories. These dirs contain runtime sockets, symlinks, local logs, and writable OverlayBD upper layer data such as <code>overlaybd/upper.data</code> and <code>overlaybd/upper.index</code></td></tr>
-<tr><td><code>serial_dir</code></td><td>string</td><td><code>"$AENV_HOME/logs/serial"</code></td><td>Directory for persistent Firecracker serial output (per-sandbox subdirectories)</td></tr>
-<tr><td><code>log_level</code></td><td>string</td><td>unset (disabled)</td><td>Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>, <code>Debug</code>, <code>Trace</code>, case-insensitive). When set to a non-empty value, Firecracker’s own logging is enabled and written to a <code>firecracker.log</code> file in each sandbox’s log directory (alongside the serial output). Empty/unset disables it</td></tr>
+<tr><td><code>serial_dir</code></td><td>string</td><td><code>"$AENV_HOME/logs/serial"</code></td><td>Directory for persistent Firecracker logs when enabled (per-sandbox subdirectories). Setting this path alone does not enable logging</td></tr>
+<tr><td><code>log_level</code></td><td>string</td><td>unset (disabled)</td><td>Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>, <code>Debug</code>, <code>Trace</code>, case-insensitive). A non-empty value enables <code>firecracker.log</code> and stdout/stderr capture in each sandbox’s log directory. Empty/unset discards stdout/stderr and creates no log files or per-sandbox log directories. Explicit Rust stdout/stderr destinations still enable the requested stream</td></tr>
 </tbody>
 </table>
 </div>
@@ -4458,9 +4458,9 @@ POSTROUTING -s &lt;host_interaction_cidr&gt; -j MASQUERADE
 <li><code>boot_args</code>: kernel boot args (e.g. <code>console=ttyS0 ... init=/init</code>).</li>
 <li><code>vcpu_count</code>, <code>mem_size_mib</code>: VM size.</li>
 <li><code>runtime_policy</code>: socket/envd timeouts and poll intervals.</li>
-<li><code>firecracker_stdout_path</code>, <code>firecracker_stderr_path</code>: capture FC logs.
-If unset, logs default to <code>work_dir/logs/firecracker-stdout.log</code> and
-<code>work_dir/logs/firecracker-stderr.log</code>.</li>
+<li><code>common.stdout_path</code>, <code>common.stderr_path</code>: explicit capture directories.
+Otherwise stdout/stderr capture is enabled only when <code>common.firecracker_log_level</code>
+is non-empty, using the serial directory or <code>work_dir/logs</code> fallback.</li>
 <li><code>envd_version</code>: expected envd version for the guest image.</li>
 <li><code>env_vars</code>: optional default environment variables injected after envd init.</li>
 <li><code>ublk_config</code>: optional ublk-backed rootfs configuration.</li>
@@ -4650,7 +4650,9 @@ snapshot-backed template launches, this means recreating runtime image configs a
 writable uppers from the committed layer stack.</li>
 <li>Rootfs copies use copy-on-write helpers where available.</li>
 <li>Firecracker runs with <code>current_dir = work_dir</code>, so relative paths work.</li>
-<li>Firecracker logs default to <code>work_dir/logs/*</code> unless explicit log paths are configured.</li>
+<li>Firecracker logging is disabled by default. Set <code>firecracker.log_level</code> to enable
+stdout/stderr capture and <code>firecracker.log</code> under the configured serial directory.
+Direct Rust callers can also opt individual streams in using explicit destinations.</li>
 <li><code>start()</code> waits for both the API socket and envd readiness.</li>
 <li>Although the Firecracker process will be killed on drop, explicit <code>stop()</code> is recommended.</li>
 </ul>
@@ -4701,7 +4703,7 @@ socket_poll_ms = 20
 # work_dir = "/path/to/firecracker-work"
 # Optional override; defaults to $AENV_HOME/logs/serial.
 # serial_dir = "/path/to/serial"
-# Optional; enables Firecracker's own logging when set to a non-empty level.
+# Optional; enables stdout/stderr capture and firecracker.log when non-empty.
 # log_level = "Info"
 
 [kernel]
@@ -4749,13 +4751,14 @@ directories. These directories include runtime sockets, symlinks, local
 logs, and writable OverlayBD upper layer data (<code>overlaybd/upper.data</code> and
 <code>overlaybd/upper.index</code>). Defaults to <code>$AENV_HOME/firecracker-work</code>.</li>
 <li><code>serial_dir</code>: Optional override for the persistent output directory.
-Serial output is written under a per-sandbox subdirectory and not removed
-by the sandbox. Defaults to <code>$AENV_HOME/logs/serial</code>.</li>
+When logging is enabled, serial output is written under a per-sandbox subdirectory
+and not removed by the sandbox. Defaults to <code>$AENV_HOME/logs/serial</code>.
+Setting this path alone does not enable logging.</li>
 <li><code>log_level</code>: Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>,
 <code>Debug</code>, <code>Trace</code>, case-insensitive). When set to a non-empty value,
-Firecracker’s own logging is enabled and written to a <code>firecracker.log</code>
-file in the sandbox’s log directory (the same directory used for serial
-output). If omitted or empty, Firecracker logging is disabled.</li>
+stdout/stderr capture and <code>firecracker.log</code> are enabled in the sandbox’s
+log directory. If omitted or empty, stdout/stderr are discarded and no log
+directories are created, unless explicit Rust capture destinations are set.</li>
 </ul>
 </li>
 <li>
@@ -5523,7 +5526,7 @@ network namespaces are missing</li>
 <tr><td>Inherited runtime layers</td><td>snapshot artifact dir <code>rootfs/inherited-layers/{index}/{source-file}</code></td><td>Snapshot-owned hard links or copies of inherited runtime-created lower suffixes</td><td>Removes dependence on previous managed snapshot or persisted sandbox artifact roots</td><td>Created during pause when inherited lowers come from the managed snapshot root or another sandbox/generation under the same persisted <code>artifacts</code> root.</td><td>No.</td></tr>
 <tr><td>Attached-drive snapshot dirs</td><td>snapshot artifact dir <code>drives/{drive_id}/...</code></td><td>Per-drive image config and snapshot layer</td><td>Captures writable attached-drive state</td><td>Created alongside rootfs snapshot for each drive.</td><td>No.</td></tr>
 <tr><td>Firecracker work dir</td><td>configured work root, or consumed pool tempfile dir</td><td>API socket, symlinks, runtime dirs, local logs</td><td>Firecracker CWD for a sandbox</td><td>Created when sandbox handle is built, or moved from a warm pool entry; removed by owning <code>TempDir</code>.</td><td>Yes, except live state.</td></tr>
-<tr><td>Firecracker serial logs</td><td><code>firecracker.serial_dir/{sandbox_id}/*</code>, or warm pool work dir logs</td><td>Firecracker stdout/stderr</td><td>Debugging</td><td>Opened on spawn and appended. Warm logs are relocated when a warm process is consumed. Configured serial output is not automatically GC’d.</td><td>No, but disposable.</td></tr>
+<tr><td>Firecracker serial logs</td><td><code>firecracker.serial_dir/{sandbox_id}/*</code>, or warm pool work dir logs</td><td>Firecracker stdout/stderr</td><td>Debugging</td><td>Opened on spawn and appended only when <code>firecracker.log_level</code> is non-empty or an explicit Rust capture destination is set. Enabled warm logs are relocated when a warm process is consumed. Configured serial output is not automatically GC’d.</td><td>No, but disposable.</td></tr>
 <tr><td>Firecracker logger output</td><td><code>firecracker.log</code> in the same per-sandbox log directory as the serial logs</td><td>Firecracker internal logger (<code>PUT /logger</code>)</td><td>Debugging</td><td>Only created when <code>firecracker.log_level</code> is set to a non-empty level. Written by Firecracker itself; not automatically GC’d.</td><td>No, but disposable.</td></tr>
 </tbody>
 </table>
@@ -5537,7 +5540,7 @@ network namespaces are missing</li>
 </thead>
 <tbody>
 <tr><td>Warm pool work dir</td><td>system tempfile dir</td><td>Firecracker socket and warm process logs</td><td>Pre-spawned Firecracker process CWD</td><td>Created by pool maintenance as a <code>TempDir</code>. Removed when warm entry is cleaned up, or moved into the consuming sandbox and later dropped there.</td></tr>
-<tr><td>Warm pool logs</td><td>warm pool work dir <code>firecracker-stdout.log</code>, <code>firecracker-stderr.log</code></td><td>Firecracker output before the warm process is consumed</td><td>Debugging warm startup</td><td>Created on warm spawn. Relocated into sandbox log path when consumed if no explicit stdout/stderr override.</td></tr>
+<tr><td>Warm pool logs</td><td>warm pool work dir <code>firecracker-stdout.log</code>, <code>firecracker-stderr.log</code></td><td>Firecracker output before the warm process is consumed</td><td>Debugging warm startup</td><td>Created on warm spawn only when <code>firecracker.log_level</code> is non-empty. Relocated into sandbox log path when consumed if no explicit stdout/stderr override.</td></tr>
 </tbody>
 </table>
 </div>
