@@ -12,7 +12,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use super::device::UblkDevice;
-use crate::cfg::{MemorySnapshotConfig, OverlaybdCompressionAlgorithm, TemplateBuildConfig};
+use crate::cfg::{OverlaybdCompressionAlgorithm, SnapshotPublishCompressionConfig};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OverlaybdCompactOutput {
@@ -25,34 +25,19 @@ pub(crate) enum OverlaybdCompactOutput {
 
 impl OverlaybdCompactOutput {
     /// Maximum persistent compression threads. Prevents absurd config values
-    /// from spawning thousands of OS threads during a production pause.
+    /// from spawning thousands of OS threads during layer upload.
     const MAX_COMPRESSION_WORKERS: usize = 64;
 
-    pub(crate) fn from_memory_snapshot_config(config: &MemorySnapshotConfig) -> Self {
-        Self::from_compression_parts(
-            config.compression_enabled,
-            config.compression_algorithm,
-            config.compression_workers,
-        )
-    }
-
-    pub(crate) fn from_template_build_config(config: &TemplateBuildConfig) -> Self {
-        Self::from_compression_parts(
-            config.compression_enabled,
-            config.compression_algorithm,
-            config.compression_workers,
-        )
-    }
-
-    fn from_compression_parts(
-        enabled: bool,
-        algorithm: OverlaybdCompressionAlgorithm,
-        workers: usize,
+    /// Resolve the `[snapshot.publish_compression]` switch into the layer
+    /// output mode applied when recontainerizing local raw layers for upload.
+    /// Capture paths never consult this: local layers always stay raw.
+    pub(crate) fn from_publish_compression_config(
+        config: &SnapshotPublishCompressionConfig,
     ) -> Self {
-        if enabled {
+        if config.enabled {
             Self::ZFile {
-                algorithm,
-                workers: workers.clamp(1, Self::MAX_COMPRESSION_WORKERS),
+                algorithm: config.algorithm,
+                workers: config.workers.clamp(1, Self::MAX_COMPRESSION_WORKERS),
             }
         } else {
             Self::Raw
@@ -346,41 +331,38 @@ mod tests {
     }
 
     #[test]
-    fn compact_output_from_template_build_config() {
-        let disabled = TemplateBuildConfig {
-            compression_enabled: false,
-            compression_algorithm: OverlaybdCompressionAlgorithm::Lz4,
-            compression_workers: 1,
-            ..Default::default()
+    fn compact_output_from_publish_compression_config() {
+        let disabled = SnapshotPublishCompressionConfig {
+            enabled: false,
+            algorithm: OverlaybdCompressionAlgorithm::Lz4,
+            workers: 1,
         };
         assert_eq!(
-            OverlaybdCompactOutput::from_template_build_config(&disabled),
+            OverlaybdCompactOutput::from_publish_compression_config(&disabled),
             OverlaybdCompactOutput::Raw
         );
 
-        let zstd = TemplateBuildConfig {
-            compression_enabled: true,
-            compression_algorithm: OverlaybdCompressionAlgorithm::Zstd,
+        let zstd = SnapshotPublishCompressionConfig {
+            enabled: true,
+            algorithm: OverlaybdCompressionAlgorithm::Zstd,
             // Zero workers clamps to sequential.
-            compression_workers: 0,
-            ..Default::default()
+            workers: 0,
         };
         assert_eq!(
-            OverlaybdCompactOutput::from_template_build_config(&zstd),
+            OverlaybdCompactOutput::from_publish_compression_config(&zstd),
             OverlaybdCompactOutput::ZFile {
                 algorithm: OverlaybdCompressionAlgorithm::Zstd,
                 workers: 1,
             }
         );
 
-        let clamped = TemplateBuildConfig {
-            compression_enabled: true,
-            compression_algorithm: OverlaybdCompressionAlgorithm::Lz4,
-            compression_workers: usize::MAX,
-            ..Default::default()
+        let clamped = SnapshotPublishCompressionConfig {
+            enabled: true,
+            algorithm: OverlaybdCompressionAlgorithm::Lz4,
+            workers: usize::MAX,
         };
         assert_eq!(
-            OverlaybdCompactOutput::from_template_build_config(&clamped),
+            OverlaybdCompactOutput::from_publish_compression_config(&clamped),
             OverlaybdCompactOutput::ZFile {
                 algorithm: OverlaybdCompressionAlgorithm::Lz4,
                 workers: OverlaybdCompactOutput::MAX_COMPRESSION_WORKERS,

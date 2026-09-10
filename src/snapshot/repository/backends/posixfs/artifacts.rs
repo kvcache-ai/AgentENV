@@ -1021,8 +1021,9 @@ mod tests {
         );
     }
 
-    /// Write a real ZFile-compressed sealed LSMT layer, mirroring the memory
-    /// snapshot output when `[memory_snapshot].compression_enabled = true`.
+    /// Write a real ZFile-compressed sealed LSMT layer, mirroring a compressed
+    /// memory lower as found in repositories published while capture-time
+    /// compression existed (or produced by publish-time compression).
     async fn write_zfile_lsmt_layer(path: &std::path::Path) {
         let data =
             Arc::new(LocalFile::new(path.with_extension("data")).expect("create layer data file"));

@@ -1,4 +1,5 @@
 pub(crate) mod acr;
+pub(crate) mod recontainerize;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

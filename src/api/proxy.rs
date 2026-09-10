@@ -2042,22 +2042,15 @@ mod tests {
     }
 
     #[test]
-    fn e2b_volume_mounts_use_a_path_to_volume_map() {
+    fn volume_mounts_use_name_and_path_entries() {
         let request: agentenv_http_server::models::NewSandbox = serde_json::from_value(json!({
-            "templateID": "template",
-            "volumeMounts": {"/mnt/data": "vol_123"}
-        }))
-        .expect("E2B volumeMounts map should deserialize");
-        assert_eq!(
-            request.volume_mounts.unwrap().get("/mnt/data"),
-            Some(&"vol_123".to_string())
-        );
-
-        serde_json::from_value::<agentenv_http_server::models::NewSandbox>(json!({
             "templateID": "template",
             "volumeMounts": [{"name": "vol_123", "path": "/mnt/data"}]
         }))
-        .expect_err("array form is not the issue 211 API");
+        .expect("volumeMounts array should deserialize");
+        let mount = &request.volume_mounts.unwrap()[0];
+        assert_eq!(mount.name, "vol_123");
+        assert_eq!(mount.path, "/mnt/data");
     }
 
     #[tokio::test]

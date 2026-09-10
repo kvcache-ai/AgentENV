@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -929,19 +930,21 @@ func mustListedSandbox(id string, startedAt string, state string, envdVersion st
 	if err != nil {
 		panic(err)
 	}
-	return listedSandbox{
-		TemplateID:  "template",
-		SandboxID:   id,
-		ClientID:    "client",
-		StartedAt:   parsed.UTC(),
-		EndAt:       parsed.UTC().Add(time.Hour),
-		CPUCount:    1,
-		MemoryMB:    128,
-		DiskSizeMB:  0,
-		Metadata:    map[string]string{"team": "alpha"},
-		State:       state,
-		EnvdVersion: envdVersion,
+	payload, err := json.Marshal(map[string]any{
+		"sandboxID":   id,
+		"startedAt":   parsed.UTC(),
+		"state":       state,
+		"envdVersion": envdVersion,
+	})
+	if err != nil {
+		panic(err)
 	}
+
+	var item listedSandbox
+	if err := json.Unmarshal(payload, &item); err != nil {
+		panic(err)
+	}
+	return item
 }
 
 func decodeListedSandboxResponse(t *testing.T, body io.Reader) []listedSandbox {
@@ -956,7 +959,7 @@ func decodeListedSandboxResponse(t *testing.T, body io.Reader) []listedSandbox {
 func sandboxIDs(items []listedSandbox) []string {
 	ids := make([]string, 0, len(items))
 	for _, item := range items {
-		ids = append(ids, item.SandboxID)
+		ids = append(ids, item.sandboxID)
 	}
 	return ids
 }
@@ -1046,6 +1049,54 @@ func TestHandleProxyAggregatesSandboxListAcrossNodes(t *testing.T) {
 		if upstreamReq.forwardedURI != "/sandboxes?metadata=team%3Dalpha" {
 			t.Fatalf("X-Forwarded-URI = %q, want %q", upstreamReq.forwardedURI, "/sandboxes?metadata=team%3Dalpha")
 		}
+	}
+}
+
+func TestHandleProxyClusterListPreservesNodeFields(t *testing.T) {
+	const upstreamBody = `[{"templateID":"template","sandboxID":"00000000-0000-0000-0000-000000000001","startedAt":"2026-01-01T00:00:01Z","state":"running","volumeMounts":[{"name":"workspace","path":"/mnt/data"}],"futureField":{"nested":[1,true,"value"]}}]`
+
+	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer node.Close()
+
+	server := newTestServer(t, stubSchedulerClient{
+		listNodesFunc: func(_ context.Context, _ *schedulerv1.ListNodesRequest, _ ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
+			return &schedulerv1.ListNodesResponse{
+				Nodes: []*schedulerv1.Node{{NodeId: "node-a", Endpoint: node.URL}},
+			}, nil
+		},
+	}, time.Second, 1024)
+
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
+	defer gatewayServer.Close()
+
+	var want any
+	if err := json.Unmarshal([]byte(upstreamBody), &want); err != nil {
+		t.Fatalf("decode expected response failed: %v", err)
+	}
+
+	for _, path := range []string{"/sandboxes", "/v2/sandboxes?limit=10"} {
+		t.Run(path, func(t *testing.T) {
+			resp, err := http.Get(gatewayServer.URL + path)
+			if err != nil {
+				t.Fatalf("cluster list request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusOK)
+			}
+
+			var got any
+			if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+				t.Fatalf("decode cluster list response failed: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("cluster list response = %#v, want %#v", got, want)
+			}
+		})
 	}
 }
 
@@ -1304,8 +1355,14 @@ func TestHandleProxyAggregatesSandboxListDedupsDuplicateSandboxIDs(t *testing.T)
 	if len(items) != 1 {
 		t.Fatalf("expected 1 sandbox after dedupe, got %d", len(items))
 	}
-	if items[0].EnvdVersion != "envd-new" {
-		t.Fatalf("deduped sandbox envdVersion = %q, want %q", items[0].EnvdVersion, "envd-new")
+	var payload struct {
+		EnvdVersion string `json:"envdVersion"`
+	}
+	if err := json.Unmarshal(items[0].payload, &payload); err != nil {
+		t.Fatalf("decode deduped sandbox failed: %v", err)
+	}
+	if payload.EnvdVersion != "envd-new" {
+		t.Fatalf("deduped sandbox envdVersion = %q, want %q", payload.EnvdVersion, "envd-new")
 	}
 }
 

@@ -4,6 +4,10 @@ use uuid::Uuid;
 use zerocopy::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
+/// A zero mapping without physical backing. Physical offsets are stored in
+/// sectors using 55 bits; reserve the all-ones value in memory and on disk.
+pub const NO_PHYSICAL_OFFSET: u64 = DiskSegmentMapping::MOFFSET_MASK;
+
 #[repr(C, packed)]
 #[derive(Clone, Copy, IntoBytes, FromBytes, Immutable, KnownLayout, Unaligned, Default)]
 pub struct DiskSegmentMapping {
@@ -250,6 +254,20 @@ impl fmt::Debug for HeaderTrailer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_mapping_physical_offset_roundtrip() {
+        assert_eq!(std::mem::size_of::<DiskSegmentMapping>(), 16);
+        for mapping in [
+            SegmentMapping::new(2048, 8, 16384, false, 7),
+            SegmentMapping::new(2048, 8, 16384, true, 7),
+            SegmentMapping::new(2048, 8, NO_PHYSICAL_OFFSET, true, 7),
+            SegmentMapping::new(0, 1, NO_PHYSICAL_OFFSET - 1, false, 0),
+        ] {
+            let disk = DiskSegmentMapping::from_memory(&mapping);
+            assert_eq!(disk.to_memory(), mapping);
+        }
+    }
 
     #[test]
     fn test_header_layout() {

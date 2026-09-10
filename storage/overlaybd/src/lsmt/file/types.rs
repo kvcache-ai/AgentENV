@@ -172,6 +172,14 @@ pub(super) enum WriteFragment {
         len: usize,
         phys_offset: u64,
     },
+    // Writing retained space must also publish a non-zero mapping. InPlace
+    // alone would leave this range reading as zero, including after reopen.
+    ReuseZero {
+        logical_offset: u64,
+        data_offset: usize,
+        len: usize,
+        phys_offset: u64,
+    },
     Append {
         logical_offset: u64,
         data_offset: usize,

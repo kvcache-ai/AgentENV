@@ -1088,7 +1088,7 @@ pub(super) mod tests {
     #[derive(Default)]
     pub(crate) struct FakeState {
         token_scopes: Vec<String>,
-        uploads: Vec<Vec<u8>>,
+        pub(crate) uploads: Vec<Vec<u8>>,
         upload_completes: usize,
         pub(crate) manifest_puts: Vec<Vec<u8>>,
         deletes: Vec<String>,

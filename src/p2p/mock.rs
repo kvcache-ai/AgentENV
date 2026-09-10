@@ -13,8 +13,8 @@ use tracing::{debug, warn};
 
 use super::{
     P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProvider, P2pArtifactProviderHint,
-    P2pByteStream, P2pEndpoint, P2pError, P2pPublishRequest, P2pPublishSource, P2pResult,
-    P2pTransport,
+    P2pByteStream, P2pEndpoint, P2pError, P2pFetchOptions, P2pPublishRequest, P2pPublishSource,
+    P2pResult, P2pTransport,
 };
 
 #[derive(Clone, Default)]
@@ -57,10 +57,11 @@ impl P2pTransport for MockTransport {
         Ok(result)
     }
 
-    async fn fetch(
+    async fn fetch_with_options(
         &self,
         descriptor: &P2pArtifactDescriptor,
         destination: &Path,
+        _options: P2pFetchOptions,
     ) -> P2pResult<u64> {
         debug!(key = ?descriptor.key, dest = %destination.display(), "fetching");
         self.fetch_count.fetch_add(1, Ordering::Relaxed);
@@ -77,7 +78,11 @@ impl P2pTransport for MockTransport {
         Ok(bytes.len() as u64)
     }
 
-    async fn fetch_bytes(&self, descriptor: &P2pArtifactDescriptor) -> P2pResult<Bytes> {
+    async fn fetch_bytes_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        _options: P2pFetchOptions,
+    ) -> P2pResult<Bytes> {
         debug!(key = ?descriptor.key, "fetch bytes");
         self.fetch_bytes_count.fetch_add(1, Ordering::Relaxed);
         let blobs = self.blobs.read().await;

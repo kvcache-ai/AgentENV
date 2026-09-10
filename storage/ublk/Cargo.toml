@@ -30,5 +30,5 @@ tracing-bunyan-formatter = "0.3.10"
 [dev-dependencies]
 tempfile = "3"
 axum = "0.8.6"
-sha2 = "0.10.9"
+sha2 = { version = "0.10.9", features = ["asm"] }
 storage-util = { path = "../util", features = ["io-uring"] }

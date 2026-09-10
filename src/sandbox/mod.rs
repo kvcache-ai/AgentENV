@@ -40,7 +40,7 @@ pub use network::{
     ALL_INTERNET_TRAFFIC_CIDR,
 };
 pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
-pub(crate) use ublk::OverlaybdCompactOutput;
+pub(crate) use ublk::{compact_layers, OverlaybdCompactOutput};
 pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
 
 #[derive(Clone, Debug)]

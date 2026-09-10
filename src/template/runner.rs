@@ -13,9 +13,8 @@ use super::build_spec::TemplateBuildStep;
 use super::errors::{command_output_suffix, TemplateBuildFailure};
 use super::step_executor::TemplateStepExecutor;
 use crate::sandbox::{
-    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotManifest,
-    OverlaybdCompactOutput, ProcessHandle, ProcessOpts, SandboxExecutor, SandboxLaunchConfig,
-    UblkConfig,
+    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotManifest, ProcessHandle,
+    ProcessOpts, SandboxExecutor, SandboxLaunchConfig, UblkConfig,
 };
 use crate::snapshot::{
     CommandContext, RunnableSnapshot, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions,
@@ -70,10 +69,6 @@ pub(crate) struct TemplateBuildContext {
     pub base: TemplateBuildBase,
     pub cpu_config_json: Option<String>,
     pub virtualization_mode: VirtualizationMode,
-    /// Compression applied to the snapshot artifacts captured by this build,
-    /// resolved from `[template_build]`; isolates template builds from
-    /// `[memory_snapshot]`.
-    pub snapshot_compression: OverlaybdCompactOutput,
 }
 
 impl TemplateBuildContext {
@@ -209,7 +204,6 @@ impl TemplateBuildRunner {
         let initial_context = context.initial_context.clone();
         let startup = context.startup.clone();
         let override_startup = context.override_startup;
-        let snapshot_compression = context.snapshot_compression;
 
         let handle =
             spawn_with_trace_context(worker_span, move || -> Result<TemplateBuildExecution> {
@@ -219,7 +213,6 @@ impl TemplateBuildRunner {
                     .context("create tokio runtime")?;
                 rt.block_on(async move {
                     let mut sandbox = create_sandbox()?;
-                    sandbox.set_snapshot_compression_override(snapshot_compression);
                     let run_result = async {
                         debug!(
                             cpu_count = resources.cpu_count,
@@ -282,8 +275,8 @@ impl TemplateBuildRunner {
 /// account at build time aligns template builds with what E2B-compatible
 /// clients assume.
 ///
-/// Numeric USER values are left alone (Docker allows a UID with no passwd
-/// entry). An image with no account-management tooling at all (neither
+/// Numeric USER values are resolved during envd initialization (Docker allows
+/// a UID with no passwd entry). An image without account-management tooling (neither
 /// useradd/groupadd nor adduser/addgroup) keeps building with a warning
 /// rather than failing: such an image worked before this provisioning
 /// existed, and only envd calls that resolve the default user will fail.

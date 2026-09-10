@@ -81,8 +81,23 @@ impl SnapshotP2pArtifact {
         }
     }
 
+    /// Collect the local overlaybd layers referenced by a snapshot image
+    /// config into publishable P2P artifacts.
+    ///
+    /// `committed_digests` holds every layer digest the committed record
+    /// carries for this image config's subject (memory, rootfs, or one
+    /// attached drive). A local layer is only published under its
+    /// descriptor digest when that digest is what the committed record
+    /// references: publish-time compression recontainerizes raw local layers
+    /// as zfile before upload, so the record names the compressed bytes and a
+    /// raw-digest key would never be looked up by consumers.
+    ///
+    /// `committed_uuids` gates uuid-keyed publication as before; zfile layers
+    /// record `uuid = None`, so recontainerized layers are filtered out of it
+    /// naturally.
     pub(crate) fn local_overlaybd_layers(
         image_config_path: &Path,
+        committed_digests: &HashSet<String>,
         committed_uuids: &HashSet<String>,
     ) -> Vec<Self> {
         let image_config = match load_overlaybd_image_config(image_config_path) {
@@ -107,11 +122,31 @@ impl SnapshotP2pArtifact {
 
                 let mut artifacts = Vec::new();
                 if !layer.digest.is_empty() && layer.size > 0 {
-                    artifacts.push(Self::content_addressed_overlaybd_layer(
-                        layer.file.clone(),
-                        layer.digest,
-                        layer.size,
-                    ));
+                    if committed_digests.contains(&layer.digest) {
+                        artifacts.push(Self::content_addressed_overlaybd_layer(
+                            layer.file.clone(),
+                            layer.digest,
+                            layer.size,
+                        ));
+                    } else {
+                        // The committed record references different bytes for
+                        // this layer, which means publish-time compression
+                        // recontainerized the local raw layer as zfile during
+                        // upload. Publishing the raw file under its raw digest
+                        // would create a key no consumer ever looks up.
+                        // TODO: propagate the uploaded (compressed) layer
+                        // paths out of repository publish so digest-keyed P2P
+                        // publication can advertise the same bytes the
+                        // committed manifest records.
+                        debug!(
+                            path = %layer.file,
+                            digest = %layer.digest,
+                            "skipping digest-keyed snapshot P2P layer publication: \
+                             layer digest is absent from the committed record, so the \
+                             layer was recontainerized during upload and the raw-digest \
+                             key would not match the manifest"
+                        );
+                    }
                 }
                 if committed_uuids.is_empty() {
                     return artifacts;
@@ -256,6 +291,8 @@ mod tests {
         write_sealed_layer(&descriptorless, uuid).await;
         std::fs::write(&described, b"described").expect("write described layer");
 
+        let described_digest =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
         let image_config = ImageConfig {
             lowers: vec![
                 LayerConfig {
@@ -264,9 +301,7 @@ mod tests {
                 },
                 LayerConfig {
                     file: described.display().to_string(),
-                    digest:
-                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                            .to_string(),
+                    digest: described_digest.clone(),
                     size: 9,
                     ..Default::default()
                 },
@@ -280,8 +315,11 @@ mod tests {
         )
         .expect("write image config");
 
-        let artifacts =
-            SnapshotP2pArtifact::local_overlaybd_layers(&image_config_path, &HashSet::new());
+        let artifacts = SnapshotP2pArtifact::local_overlaybd_layers(
+            &image_config_path,
+            &HashSet::from([described_digest]),
+            &HashSet::new(),
+        );
 
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].publish_mode, P2pPublishMode::Copy);
@@ -289,6 +327,58 @@ mod tests {
             artifacts[0].key,
             "overlaybd-layer/v1/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
+    }
+
+    /// Publish-time compression recontainerizes a raw local layer before
+    /// upload, so the committed record names the compressed digest and the
+    /// raw descriptor digest must not be published: no consumer ever looks
+    /// the raw key up. The uuid-keyed publication is unaffected by the
+    /// digest guard.
+    #[tokio::test]
+    async fn local_overlaybd_layers_skips_digest_absent_from_committed_record() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let layer_path = temp.path().join("snapshot.commit");
+        let uuid = Uuid::parse_str("44444444-5555-6666-7777-888888888888").unwrap();
+        write_sealed_layer(&layer_path, uuid).await;
+        let raw_descriptor = crate::digest::FileDigest::describe(&layer_path)
+            .await
+            .expect("describe raw layer");
+        let image_config = ImageConfig {
+            lowers: vec![LayerConfig {
+                file: layer_path.display().to_string(),
+                digest: raw_descriptor.sha256.clone(),
+                size: raw_descriptor.size,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let image_config_path = temp.path().join("image.json");
+        std::fs::write(
+            &image_config_path,
+            serde_json::to_vec(&image_config).expect("serialize image config"),
+        )
+        .expect("write image config");
+        // The committed record references the recontainerized (compressed)
+        // bytes, not the raw local file.
+        let committed_digests = HashSet::from([
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+        ]);
+        let committed_uuids = HashSet::from([uuid.to_string()]);
+
+        let artifacts = SnapshotP2pArtifact::local_overlaybd_layers(
+            &image_config_path,
+            &committed_digests,
+            &committed_uuids,
+        );
+
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            artifacts[0].key,
+            "overlaybd-layer/v1/uuid/44444444-5555-6666-7777-888888888888"
+        );
+        assert!(!artifacts
+            .iter()
+            .any(|artifact| artifact.key == layer_key_from_digest(&raw_descriptor.sha256)));
     }
 
     #[tokio::test]
@@ -324,10 +414,14 @@ mod tests {
             serde_json::to_vec(&image_config).expect("serialize image config"),
         )
         .expect("write image config");
+        let committed_digests = HashSet::from([committed_descriptor.sha256.clone()]);
         let committed_uuids = HashSet::from([committed_uuid.to_string()]);
 
-        let artifacts =
-            SnapshotP2pArtifact::local_overlaybd_layers(&image_config_path, &committed_uuids);
+        let artifacts = SnapshotP2pArtifact::local_overlaybd_layers(
+            &image_config_path,
+            &committed_digests,
+            &committed_uuids,
+        );
 
         assert_eq!(artifacts.len(), 2);
         assert!(artifacts

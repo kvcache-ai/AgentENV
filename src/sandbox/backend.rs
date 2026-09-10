@@ -256,6 +256,18 @@ pub trait SandboxBackend: Send + 'static {
     /// Idempotent: calling `stop` more than once must not return an error.
     async fn stop(&mut self) -> Result<()>;
 
+    /// Freeze writable persistent filesystems and seal their volume layers,
+    /// without capturing memory, rootfs, or VM state. On success, writes remain
+    /// frozen until `stop` or `thaw_volumes`. Recoverable errors guarantee that
+    /// writes have resumed; terminal errors require runtime teardown.
+    /// Callers must keep ownership through completion and thaw/stop; dropping
+    /// this future does not cancel guest I/O. The orchestrator shields deletion
+    /// from request cancellation with an owned task.
+    async fn freeze_and_snapshot_volumes(&mut self) -> SandboxCaptureResult<()>;
+
+    /// Resume writes after abandoning a deletion that froze the volumes.
+    async fn thaw_volumes(&mut self) -> Result<()>;
+
     /// Obtain the IP address that the sandbox can use to interact with the host.
     fn host_interaction_ip(&self) -> Option<std::net::Ipv4Addr>;
 

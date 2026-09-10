@@ -57,15 +57,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - e2e_name: single-node
-            make_target: test-e2e
-          - e2e_name: docker-compose
-            make_target: test-e2e-compose
+        e2e_name: [single-node, docker-compose]
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/rust-ci-setup
-        if: ${{ matrix.e2e_name == 'single-node' }}
         with:
           ci_deps_target: ci-deps
       - uses: ./.github/actions/sandbox-ci-setup
@@ -121,33 +116,24 @@ jobs:
           python-version: "3.12"
       - name: Install e2b Python SDK
         run: python3 -m pip install --upgrade e2b e2b-code-interpreter
-      - name: E2E tests (${{ matrix.e2e_name }})
-        env:
-          RUN_BUILDKIT_TESTS: ${{ matrix.e2e_name == 'single-node' && '1' || '0' }}
-          BUILDCTL_BIN: ${{ runner.temp }}/buildkit/bin/buildctl
+      - name: Prepare BuildKit test client
         run: |
-          if [[ "${{ matrix.e2e_name }}" == "single-node" ]]; then
-            version="$(<config/buildkit-version)"
-            asset="buildkit-${version}.linux-amd64.tar.gz"
-            mkdir -p "$RUNNER_TEMP/buildkit"
-            curl -fsSL --retry 5 "https://api.github.com/repos/moby/buildkit/releases/tags/$version" >"$RUNNER_TEMP/buildkit/release.json"
-            url=$(jq -er --arg asset "$asset" '.assets[] | select(.name == $asset) | .browser_download_url' "$RUNNER_TEMP/buildkit/release.json")
-            digest=$(jq -er --arg asset "$asset" '.assets[] | select(.name == $asset) | .digest' "$RUNNER_TEMP/buildkit/release.json")
-            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
-            curl -fsSL --retry 5 "$url" -o "$RUNNER_TEMP/buildkit/client.tar.gz"
-            echo "${digest#sha256:}  $RUNNER_TEMP/buildkit/client.tar.gz" | sha256sum -c -
-            tar -xzf "$RUNNER_TEMP/buildkit/client.tar.gz" -C "$RUNNER_TEMP/buildkit" bin/buildctl
-            python3 -m pip install tomli-w
-            python3 - <<'PY'
-          import pathlib, tomllib, tomli_w
-          path = pathlib.Path("config/default.toml")
-          config = tomllib.loads(path.read_text())
-          config["template_build"].update(builder_cpu_count=2, builder_memory_mb=2048, cache_size_mb=8192)
-          path.write_text(tomli_w.dumps(config))
-          PY
-            sg kvm -c "make ${{ matrix.make_target }} PROFILE=debug"
-          else
-            SKIP_BUILD=1 make ${{ matrix.make_target }} PROFILE=debug
-          fi
+          make build-aenv
+          bash scripts/buildkit/install-buildctl.sh "$RUNNER_TEMP/buildkit"
+      - name: Single-node E2E tests
+        if: ${{ matrix.e2e_name == 'single-node' }}
+        env:
+          BUILDCTL_BIN: ${{ runner.temp }}/buildkit/buildctl
+          CONFIG_PATH: ${{ github.workspace }}/scripts/buildkit/test-config.toml
+          AENV_HOME_PATH: ${{ runner.temp }}/aenv-e2e/home
+          AENV_RUNTIME_PATH: ${{ runner.temp }}/aenv-e2e/run
+        run: sg kvm -c "make test-e2e PROFILE=debug"
+      - name: Docker Compose E2E tests
+        if: ${{ matrix.e2e_name == 'docker-compose' }}
+        env:
+          BUILDCTL_BIN: ${{ runner.temp }}/buildkit/buildctl
+          CONFIG_PATH: ${{ github.workspace }}/scripts/buildkit/test-config.toml
+          SKIP_BUILD: "1"
+        run: make test-e2e-compose PROFILE=debug
       - uses: ./.github/actions/sandbox-artifacts-cleanup
         if: always()

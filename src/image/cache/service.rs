@@ -37,7 +37,9 @@ use crate::image::local_layer::LocalLayer;
 use crate::image::oci_image::{ConvertedLayerP2pMetadata, ImageConversion, LayerConversionKey};
 use crate::image::ImageResolutionMetadata;
 use crate::local_store::LocalStoreDurability;
-use crate::p2p::{P2pArtifactKey, P2pPublishMode, P2pPublishRequest, P2pTransport};
+use crate::p2p::{
+    P2pArtifactKey, P2pFetchOptions, P2pPublishMode, P2pPublishRequest, P2pTransport,
+};
 
 const IMAGE_CACHE_CONFIG_DIR: &str = "configs";
 const IMAGE_CACHE_INDEX_DIR: &str = "indexes";
@@ -1301,7 +1303,14 @@ impl ImageCacheOperationHold {
 
         let staging = self.create_temp_staging_dir()?;
         let destination = staging.path().join("overlaybd.commit");
-        if let Err(error) = transport.fetch(&descriptor, &destination).await {
+        if let Err(error) = transport
+            .fetch_with_options(
+                &descriptor,
+                &destination,
+                P2pFetchOptions { advertise: false },
+            )
+            .await
+        {
             debug!(key = %p2p_key, error = %error, "P2P converted image layer fetch failed; falling back to registry conversion");
             return Ok(None);
         }
@@ -1309,8 +1318,6 @@ impl ImageCacheOperationHold {
             Ok(described) => described,
             Err(error) => {
                 debug!(key = %p2p_key, error = %error, "P2P converted image layer digest failed; falling back to registry conversion");
-                // A successful fetch automatically republishes the P2P artifact, so if the file is invalid, we must unpublish it.
-                let _ = transport.unpublish(&p2p_key).await;
                 return Ok(None);
             }
         };
@@ -1323,36 +1330,31 @@ impl ImageCacheOperationHold {
                 actual_size = described.size,
                 "P2P converted image layer failed digest or size validation"
             );
-            let _ = transport.unpublish(&p2p_key).await;
             return Ok(None);
         }
         match read_overlaybd_layer_uuid(&destination) {
             Ok(uuid) if uuid == key.expected_layer_uuid => {}
             Ok(uuid) => {
                 debug!(key = %p2p_key, found_uuid = %uuid, expected_uuid = %key.expected_layer_uuid, "P2P converted image layer UUID mismatch");
-                let _ = transport.unpublish(&p2p_key).await;
                 return Ok(None);
             }
             Err(error) => {
                 debug!(key = %p2p_key, error = %error, "P2P converted image layer is not a sealed OverlayBD layer");
-                let _ = transport.unpublish(&p2p_key).await;
                 return Ok(None);
             }
         }
 
         let stored = self
-            .persist_overlaybd_commit(
-                &destination,
-                &metadata.commit_digest,
-                metadata.size,
-                std::slice::from_ref(&p2p_key),
-            )
+            .persist_overlaybd_commit(&destination, &metadata.commit_digest, metadata.size, &[])
             .await?;
         let layer = LocalLayer {
             path: stored,
             digest: metadata.commit_digest,
             size: metadata.size,
         };
+        if let Err(error) = self.image_cache.publish_converted_layer(key, &layer).await {
+            debug!(key = %p2p_key, error = %error, "failed to publish reused converted image layer to P2P");
+        }
         self.write_conversion_index(key, &layer).await?;
         info!(key = %p2p_key, digest = %layer.digest, "reused converted user image layer from P2P");
         Ok(Some(layer))

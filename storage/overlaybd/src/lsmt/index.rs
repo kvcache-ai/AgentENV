@@ -4,6 +4,8 @@ use std::collections::BTreeSet;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use super::format::NO_PHYSICAL_OFFSET;
+
 /// Represents a range in the virtual file
 /// The unit of `offset` and `length` are sector/block (i.e., 512B)
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -54,7 +56,8 @@ impl Segment {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub struct SegmentMapping {
     pub segment: Segment,
-    /// in units of ALIGNMENT
+    /// Physical offset in sectors, or NO_PHYSICAL_OFFSET for an unbacked zero.
+    /// A backed zero retains this range but still reads as zero.
     pub moffset: u64,
     pub zeroed: bool,
     pub tag: u8,
@@ -85,24 +88,40 @@ impl SegmentMapping {
         self.segment.end()
     }
 
+    /// Whether this mapping retains a physical range. This does not imply
+    /// that the range is readable data: `zeroed` controls read visibility.
+    pub fn has_physical_range(&self) -> bool {
+        self.moffset != NO_PHYSICAL_OFFSET
+    }
+
+    /// Physical end, or NO_PHYSICAL_OFFSET for an unbacked zero.
     pub fn mend(&self) -> u64 {
-        if self.zeroed {
-            self.moffset
-        } else {
+        if self.has_physical_range() {
             self.moffset + self.segment.length as u64
+        } else {
+            NO_PHYSICAL_OFFSET
         }
     }
 
     pub fn forward_offset_to(&mut self, x: u64) {
         let delta = self.segment.forward_offset_to(x);
 
-        if !self.zeroed && delta > 0 {
+        if self.has_physical_range() && delta > 0 {
             self.moffset += delta;
         }
     }
 
     pub fn backward_end_to(&mut self, x: u64) {
         self.segment.backward_end_to(x);
+    }
+
+    fn can_merge_with(&self, next: &Self) -> bool {
+        self.end() == next.offset()
+            && self.zeroed == next.zeroed
+            && self.tag == next.tag
+            && self.has_physical_range() == next.has_physical_range()
+            && self.mend() == next.moffset
+            && u64::from(self.length()) + u64::from(next.length()) <= u64::from(Segment::MAX_LENGTH)
     }
 }
 
@@ -129,13 +148,7 @@ pub fn compress_raw_index(mapping: &mut Vec<SegmentMapping>) -> usize {
         let m_i = mapping[i];
         let m_j = mapping[j];
 
-        let can_merge = m_i.end() == m_j.offset()
-            && m_i.mend() == m_j.moffset
-            && m_i.zeroed == m_j.zeroed
-            && m_i.tag == m_j.tag
-            && (m_i.length() as u64 + m_j.length() as u64) <= Segment::MAX_LENGTH as u64;
-
-        if can_merge {
+        if m_i.can_merge_with(&m_j) {
             mapping[i].segment.length += m_j.length();
         } else {
             i += 1;
@@ -158,13 +171,7 @@ pub fn compress_raw_index_predict(mapping: &[SegmentMapping]) -> usize {
     let mut m = mapping[0];
 
     for item in mapping.iter().take(n).skip(1) {
-        let can_merge = m.end() == item.offset()
-            && m.mend() == item.moffset
-            && m.tag == item.tag
-            && m.zeroed == item.zeroed
-            && (m.length() as u64 + item.length() as u64) <= Segment::MAX_LENGTH as u64;
-
-        if can_merge {
+        if m.can_merge_with(item) {
             m.segment.length += item.length();
         } else {
             m = *item;
@@ -185,7 +192,17 @@ pub struct ReadOnlyIndex {
 }
 
 impl ReadOnlyIndex {
-    pub fn new(mappings: Vec<SegmentMapping>) -> Self {
+    pub fn new(mut mappings: Vec<SegmentMapping>) -> Self {
+        // Lower layers never lend physical space to a writable upper. Legacy
+        // zero offsets are arbitrary placeholders; normalize before lookup or
+        // merge can interpret them as backed zeros. This constructor is also
+        // used when loading a premerged index artifact. RW replay must not do
+        // this, since it must preserve backed-zero offsets across reopen.
+        for mapping in &mut mappings {
+            if mapping.zeroed {
+                mapping.moffset = NO_PHYSICAL_OFFSET;
+            }
+        }
         Self { mappings }
     }
 
@@ -1043,11 +1060,68 @@ mod tests {
         assert_eq!(m.length(), 15);
         assert_eq!(m.moffset, 105);
 
-        // Test zeroed segment
+        // A backed zero clips its physical range just like ordinary data.
         let mut m2 = SegmentMapping::new(10, 20, 100, true, 0);
-        assert_eq!(m2.mend(), 100);
+        assert!(m2.has_physical_range());
+        assert_eq!(m2.mend(), 120);
         m2.forward_offset_to(15);
-        assert_eq!(m2.moffset, 100);
+        assert_eq!(m2.moffset, 105);
+        m2.backward_end_to(20);
+        assert_eq!(m2.length(), 5);
+        assert_eq!(m2.mend(), 110);
+
+        // An unbacked zero never does arithmetic on the marker.
+        let mut m3 = SegmentMapping::new(10, 20, NO_PHYSICAL_OFFSET, true, 0);
+        assert!(!m3.has_physical_range());
+        m3.forward_offset_to(15);
+        m3.backward_end_to(20);
+        assert_eq!(m3.length(), 5);
+        assert_eq!(m3.moffset, NO_PHYSICAL_OFFSET);
+        assert_eq!(m3.mend(), NO_PHYSICAL_OFFSET);
+        m3.forward_offset_to(u64::MAX);
+        assert_eq!(m3.length(), 0);
+        assert_eq!(m3.moffset, NO_PHYSICAL_OFFSET);
+    }
+
+    #[test]
+    fn test_mutable_index_splits_backed_and_unbacked_zeros() {
+        for physical_offset in [100, NO_PHYSICAL_OFFSET] {
+            let mut idx = MutableIndex::new();
+            idx.insert(SegmentMapping::new(10, 20, physical_offset, true, 0));
+            idx.insert(sm(15, 5, 500));
+            let right_offset = if physical_offset == NO_PHYSICAL_OFFSET {
+                NO_PHYSICAL_OFFSET
+            } else {
+                physical_offset + 10
+            };
+            assert_eq!(
+                idx.dump(),
+                vec![
+                    SegmentMapping::new(10, 5, physical_offset, true, 0),
+                    sm(15, 5, 500),
+                    SegmentMapping::new(20, 10, right_offset, true, 0),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn test_readonly_index_normalizes_zeros_before_merge_and_lookup() {
+        let old_zero = SegmentMapping::new(10, 20, 100, true, 0);
+        let lower = ReadOnlyIndex::new(vec![old_zero]);
+        let top = ReadOnlyIndex::new(vec![sm(15, 5, 500)]);
+        let merged = ReadOnlyIndex::merge(&[&top, &lower]);
+        let mut out = Vec::new();
+        merged.lookup(Segment::new(12, 12), &mut out);
+        assert_eq!(
+            out,
+            vec![
+                SegmentMapping::new(12, 3, NO_PHYSICAL_OFFSET, true, 1),
+                sm(15, 5, 500),
+                SegmentMapping::new(20, 4, NO_PHYSICAL_OFFSET, true, 1),
+            ]
+        );
+        assert_eq!(old_zero.moffset, 100);
     }
 
     #[test]
@@ -1129,12 +1203,64 @@ mod tests {
     #[test]
     fn test_compress_with_zeroed_segments() {
         let mut mappings = vec![
-            SegmentMapping::new(0, 10, 0, true, 0),
-            SegmentMapping::new(10, 10, 0, true, 0),
+            SegmentMapping::new(0, 10, NO_PHYSICAL_OFFSET, true, 0),
+            SegmentMapping::new(10, 10, NO_PHYSICAL_OFFSET, true, 0),
         ];
+        assert_eq!(compress_raw_index_predict(&mappings), 1);
         let n = compress_raw_index(&mut mappings);
         assert_eq!(n, 1);
-        assert_eq!(mappings[0], SegmentMapping::new(0, 20, 0, true, 0));
+        assert_eq!(
+            mappings[0],
+            SegmentMapping::new(0, 20, NO_PHYSICAL_OFFSET, true, 0)
+        );
+    }
+
+    #[test]
+    fn test_compress_backed_zeros_requires_contiguous_physical_ranges() {
+        let first = SegmentMapping::new(0, 10, 100, true, 0);
+        let cases = [
+            (SegmentMapping::new(10, 10, 110, true, 0), 1),
+            (SegmentMapping::new(10, 10, 100, true, 0), 2),
+            (SegmentMapping::new(10, 10, 200, true, 0), 2),
+            (SegmentMapping::new(10, 10, 110, false, 0), 2),
+            (SegmentMapping::new(10, 10, 110, true, 1), 2),
+            (SegmentMapping::new(10, 10, NO_PHYSICAL_OFFSET, true, 0), 2),
+        ];
+        for (second, expected_len) in cases {
+            let mut mappings = vec![first, second];
+            assert_eq!(compress_raw_index_predict(&mappings), expected_len);
+            assert_eq!(compress_raw_index(&mut mappings), expected_len);
+        }
+        // A physical end equal to the sentinel must not make a backed zero
+        // merge with an adjacent unbacked zero.
+        let mut mappings = vec![
+            SegmentMapping::new(0, 1, NO_PHYSICAL_OFFSET - 1, true, 0),
+            SegmentMapping::new(1, 1, NO_PHYSICAL_OFFSET, true, 0),
+        ];
+        assert_eq!(compress_raw_index_predict(&mappings), 2);
+        assert_eq!(compress_raw_index(&mut mappings), 2);
+        mappings.reverse();
+        mappings[0].segment.offset = 0;
+        mappings[1].segment.offset = 1;
+        assert_eq!(compress_raw_index(&mut mappings), 2);
+    }
+
+    #[test]
+    fn test_compress_zero_max_length_boundary() {
+        let max_len = Segment::MAX_LENGTH;
+        for physical_offset in [100, NO_PHYSICAL_OFFSET] {
+            let next_offset = if physical_offset == NO_PHYSICAL_OFFSET {
+                NO_PHYSICAL_OFFSET
+            } else {
+                physical_offset + u64::from(max_len)
+            };
+            let mut mappings = vec![
+                SegmentMapping::new(0, max_len, physical_offset, true, 0),
+                SegmentMapping::new(u64::from(max_len), 1, next_offset, true, 0),
+            ];
+            assert_eq!(compress_raw_index_predict(&mappings), 2);
+            assert_eq!(compress_raw_index(&mut mappings), 2);
+        }
     }
 
     #[test]

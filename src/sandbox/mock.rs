@@ -52,6 +52,7 @@ pub enum MockOperation {
     Resume,
     Snapshot,
     SnapshotVolumes,
+    ThawVolumes,
     Fork,
     ForkChild,
     Stop,
@@ -245,6 +246,7 @@ impl MockBehavior {
 pub struct MockSandboxBackend {
     behavior: Arc<MockBehavior>,
     host_ip: Option<std::net::Ipv4Addr>,
+    volumes_frozen: bool,
 }
 
 impl MockSandboxBackend {
@@ -256,7 +258,11 @@ impl MockSandboxBackend {
         behavior: Arc<MockBehavior>,
         host_ip: Option<std::net::Ipv4Addr>,
     ) -> Self {
-        Self { behavior, host_ip }
+        Self {
+            behavior,
+            host_ip,
+            volumes_frozen: false,
+        }
     }
 }
 
@@ -336,7 +342,28 @@ impl SandboxBackend for MockSandboxBackend {
     }
 
     async fn stop(&mut self) -> Result<()> {
-        self.behavior.apply_async(MockOperation::Stop).await
+        self.behavior.apply_async(MockOperation::Stop).await?;
+        self.volumes_frozen = false;
+        Ok(())
+    }
+
+    async fn freeze_and_snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
+        assert!(!self.volumes_frozen, "volumes already frozen");
+        let result = self.snapshot_volumes().await;
+        self.volumes_frozen = result
+            .as_ref()
+            .err()
+            .is_none_or(|error| error.is_terminal());
+        result
+    }
+
+    async fn thaw_volumes(&mut self) -> Result<()> {
+        anyhow::ensure!(self.volumes_frozen, "volumes are not frozen");
+        self.behavior
+            .apply_async(MockOperation::ThawVolumes)
+            .await?;
+        self.volumes_frozen = false;
+        Ok(())
     }
 
     fn host_interaction_ip(&self) -> Option<std::net::Ipv4Addr> {

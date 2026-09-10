@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "${RUN_BUILDKIT_TESTS:-0}" != 1 ]]; then
-    echo 'BuildKit suite requires RUN_BUILDKIT_TESTS=1 and BUILDCTL_BIN'
-    exit 0
-fi
-
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

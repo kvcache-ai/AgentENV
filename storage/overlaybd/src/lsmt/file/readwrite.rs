@@ -19,7 +19,7 @@ use crate::io::vfile_io::{CtxRead, CtxWrite};
 use crate::io::virtual_file::VirtualFile;
 #[cfg(feature = "io-uring")]
 use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
-use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer};
+use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer, NO_PHYSICAL_OFFSET};
 use crate::lsmt::index::{
     ComboIndex, LogIndex, MutableIndex, ReadOnlyIndex, Segment, SegmentMapping,
 };
@@ -612,7 +612,9 @@ impl LSMTFile {
             let fragment_blocks = fragment_end - current_blk;
             let data_offset = ((current_blk - start_blk) * ALIGNMENT) as usize;
             let len = (fragment_blocks * ALIGNMENT) as usize;
-            if m.zeroed {
+            if m.zeroed && !m.has_physical_range() {
+                // meet a zeroed segment without physical allocation, overwrite data
+                // can only be appended
                 fragments.push(WriteFragment::Append {
                     logical_offset: current_blk * ALIGNMENT,
                     data_offset,
@@ -624,11 +626,21 @@ impl LSMTFile {
                     .checked_add(current_blk - m.offset())
                     .context("hybrid write physical offset overflow")?
                     * ALIGNMENT;
-                fragments.push(WriteFragment::InPlace {
-                    data_offset,
-                    len,
-                    phys_offset,
-                });
+                if m.zeroed {
+                    // meet a zeroed segment with physical allocation, reuse its physical range
+                    fragments.push(WriteFragment::ReuseZero {
+                        logical_offset: current_blk * ALIGNMENT,
+                        data_offset,
+                        len,
+                        phys_offset,
+                    });
+                } else {
+                    fragments.push(WriteFragment::InPlace {
+                        data_offset,
+                        len,
+                        phys_offset,
+                    });
+                }
             }
             current_blk = fragment_end;
         }
@@ -643,6 +655,55 @@ impl LSMTFile {
         }
 
         Ok(fragments)
+    }
+
+    /// Discard one Hybrid chunk, retaining physical ranges and marking gaps.
+    /// Offset and length are in bytes, aligned and chunked by discard_range.
+    async fn discard_hybrid_range(&self, offset: u64, len: u64) -> Result<()> {
+        let segment = Segment::new(offset / ALIGNMENT, (len / ALIGNMENT) as u32);
+        let mut idx = self.index.write().await;
+        let mut mappings = Vec::new();
+        idx.upper.lookup(segment, &mut mappings);
+
+        // Keep each existing mapping's clipped physical range. Only
+        // upper gaps need marker zeros, regardless of the lower data.
+        let mut zeros = Vec::new();
+        let mut current = segment.offset;
+        for mut mapping in mappings {
+            if current < mapping.offset() {
+                zeros.push(SegmentMapping::new(
+                    current,
+                    (mapping.offset() - current) as u32,
+                    NO_PHYSICAL_OFFSET,
+                    true,
+                    self.rw_tag as u8,
+                ));
+            }
+            current = mapping.end();
+            mapping.zeroed = true;
+            zeros.push(mapping);
+        }
+        if current < segment.end() {
+            zeros.push(SegmentMapping::new(
+                current,
+                (segment.end() - current) as u32,
+                NO_PHYSICAL_OFFSET,
+                true,
+                self.rw_tag as u8,
+            ));
+        }
+        for mapping in zeros {
+            let mut disk_mapping = mapping;
+            disk_mapping.tag = 0;
+            self.append_index_mapping_generic(
+                &idx,
+                &DirectWrite,
+                DiskSegmentMapping::from_memory(&disk_mapping),
+            )
+            .await?;
+            idx.insert(mapping);
+        }
+        Ok(())
     }
 
     pub async fn discard_range(&self, offset: u64, len: u64) -> Result<()> {
@@ -666,29 +727,27 @@ impl LSMTFile {
             let step_bytes = remaining.min(max_discard_bytes);
             let step_blocks = (step_bytes / ALIGNMENT) as u32;
 
-            let m_mem = if self.file_type == LSMTFileType::SparseReadWrite {
+            if self.file_type == LSMTFileType::HybridReadWrite {
+                self.discard_hybrid_range(current_offset, step_bytes)
+                    .await?;
+                current_offset += step_bytes;
+                remaining -= step_bytes;
+                continue;
+            }
+
+            if self.file_type == LSMTFileType::SparseReadWrite {
                 let phys_offset = HEADER_SIZE + current_offset;
                 self.rw_data_file.discard(phys_offset, step_bytes).await?;
-                SegmentMapping::new(
-                    current_offset / ALIGNMENT,
-                    step_blocks,
-                    phys_offset / ALIGNMENT,
-                    true,
-                    self.rw_tag as u8,
-                )
-            } else {
-                // Match upstream append-only OverlayBD: discard appends only a
-                // zeroed index entry at current EOF. Zeroed mappings never read
-                // from `moffset`, so no data block is materialized here.
-                let phys_offset = self.data_append_offset()?;
-                SegmentMapping::new(
-                    current_offset / ALIGNMENT,
-                    step_blocks,
-                    phys_offset / ALIGNMENT,
-                    true,
-                    self.rw_tag as u8,
-                )
-            };
+            }
+            // No physical range is retained by this discard path. Log-backed
+            // layouts append only an index entry; Sparse has punched a hole.
+            let m_mem = SegmentMapping::new(
+                current_offset / ALIGNMENT,
+                step_blocks,
+                NO_PHYSICAL_OFFSET,
+                true,
+                self.rw_tag as u8,
+            );
 
             let mut idx = self.index.write().await;
             idx.insert(m_mem);
@@ -755,6 +814,39 @@ impl LSMTFile {
                                     &chunk[data_offset..data_offset + len],
                                 )
                                 .await?;
+                        }
+                        WriteFragment::ReuseZero {
+                            logical_offset,
+                            data_offset,
+                            len,
+                            phys_offset,
+                        } => {
+                            writer
+                                .write(
+                                    self.rw_data_file.as_ref(),
+                                    phys_offset,
+                                    &chunk[data_offset..data_offset + len],
+                                )
+                                .await?;
+
+                            // The data is written in place, but the zero -> data
+                            // transition must also survive index replay.
+                            let m_mem = SegmentMapping::new(
+                                logical_offset / ALIGNMENT,
+                                (len / ALIGNMENT_USIZE) as u32,
+                                phys_offset / ALIGNMENT,
+                                false,
+                                self.rw_tag as u8,
+                            );
+                            let mut m_disk = m_mem;
+                            m_disk.tag = 0;
+                            self.append_index_mapping_generic(
+                                &idx,
+                                writer,
+                                DiskSegmentMapping::from_memory(&m_disk),
+                            )
+                            .await?;
+                            inserted_mappings.push(m_mem);
                         }
                         WriteFragment::Append {
                             logical_offset,
@@ -907,6 +999,9 @@ impl LSMTFile {
             if m.tag as usize == self.rw_tag {
                 let mut cm = m;
                 cm.tag = 0;
+                if cm.zeroed {
+                    cm.moffset = NO_PHYSICAL_OFFSET;
+                }
                 compact_index.push(cm);
             }
         }

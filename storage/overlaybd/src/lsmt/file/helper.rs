@@ -17,7 +17,7 @@ use zerocopy::little_endian::{U32, U64};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::io::virtual_file::VirtualFile;
-use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer};
+use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer, NO_PHYSICAL_OFFSET};
 use crate::lsmt::index::{compress_raw_index, ReadOnlyIndex, Segment, SegmentMapping};
 use storage_util::{AlignedBuffer, CompactWriter};
 
@@ -403,6 +403,10 @@ pub(super) fn deserialize_premerged_mappings(
         ensure!(
             mapping.length() > 0,
             "premerged artifact contains empty mapping"
+        );
+        ensure!(
+            mapping.zeroed || mapping.has_physical_range(),
+            "data mapping has no physical offset"
         );
         ensure!(
             usize::from(mapping.tag) < layer_count,
@@ -1083,6 +1087,10 @@ async fn load_index(
         if m.length() == 0 || m.offset() == u64::MAX {
             continue;
         }
+        ensure!(
+            m.zeroed || m.has_physical_range(),
+            "data mapping has no physical offset"
+        );
         if reset_tag {
             m.tag = 0;
         }
@@ -1121,6 +1129,9 @@ fn compact_is_zero_block(_buf: &[u8]) -> bool {
     COMPACT_ZERO_DETECTION_ENABLED
 }
 
+/// Emit a contiguous run of blocks with the same zero/non-zero properties
+/// as one index segment, into `index`. Append non-zero blocks to the output
+/// data buffer, then prepare `segment` to accumulate the next run.
 fn push_compact_segment(
     chunk: &[u8],
     data: &mut Vec<u8>,
@@ -1129,8 +1140,18 @@ fn push_compact_segment(
     segment: &mut SegmentMapping,
     index: &mut Vec<SegmentMapping>,
 ) {
+    // A zero record occupies no physical range in the destination, so it must
+    // not advance the data cursor. Save `next_moffset` before replacing the
+    // record's offset with the marker: it is the physical destination offset
+    // used for the next segment's data write.
+    let next_moffset = if zero_detected {
+        segment.moffset
+    } else {
+        segment.mend()
+    };
     if zero_detected {
         segment.zeroed = true;
+        segment.moffset = NO_PHYSICAL_OFFSET;
     } else {
         let begin = *prev_end_blocks * ALIGNMENT_USIZE;
         let len = segment.length() as usize * ALIGNMENT_USIZE;
@@ -1140,7 +1161,6 @@ fn push_compact_segment(
     *prev_end_blocks += segment.length() as usize;
     index.push(*segment);
 
-    let next_moffset = segment.mend();
     let next_offset = segment.end();
     segment.zeroed = false;
     segment.segment.offset = next_offset;
@@ -1434,7 +1454,7 @@ pub async fn compact_to(
         for m in mappings {
             if m.zeroed {
                 let mut zero = *m;
-                zero.moffset = dest_moffset;
+                zero.moffset = NO_PHYSICAL_OFFSET;
                 compact_index.push(zero);
                 continue;
             }
@@ -1469,7 +1489,7 @@ pub async fn compact_to(
         for m in mappings {
             if m.zeroed {
                 let mut zero = *m;
-                zero.moffset = dest_moffset;
+                zero.moffset = NO_PHYSICAL_OFFSET;
                 compact_index.push(zero);
                 // NOTE: no need to advance dest_moffset, as this is a zero segement,
                 // does not occupy space in dset file.
@@ -1611,4 +1631,45 @@ pub async fn compact_to(
     writer.finalize().await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detected_zero_does_not_advance_compact_data_cursor() {
+        let chunk = [0xAB; 2 * ALIGNMENT_USIZE];
+        let mut data = Vec::new();
+        let mut prev_end_blocks = 0;
+        let mut segment = SegmentMapping::new(0, 1, 8, false, 0);
+        let mut index = Vec::new();
+        push_compact_segment(
+            &chunk,
+            &mut data,
+            &mut prev_end_blocks,
+            true,
+            &mut segment,
+            &mut index,
+        );
+        assert!(data.is_empty());
+        assert_eq!(
+            index[0],
+            SegmentMapping::new(0, 1, NO_PHYSICAL_OFFSET, true, 0)
+        );
+        assert_eq!(segment, SegmentMapping::new(1, 0, 8, false, 0));
+
+        segment.segment.length = 1;
+        push_compact_segment(
+            &chunk,
+            &mut data,
+            &mut prev_end_blocks,
+            false,
+            &mut segment,
+            &mut index,
+        );
+        assert_eq!(data.as_slice(), &[0xAB; ALIGNMENT_USIZE]);
+        assert_eq!(index[1], SegmentMapping::new(1, 1, 8, false, 0));
+        assert_eq!(segment, SegmentMapping::new(2, 0, 9, false, 0));
+    }
 }

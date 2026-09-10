@@ -10,7 +10,7 @@ use crate::backend::local::LocalFile;
 #[cfg(feature = "io-uring")]
 use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
 use crate::io::virtual_file::{VirtualFile, VirtualFileWriter};
-use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer};
+use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer, NO_PHYSICAL_OFFSET};
 use crate::lsmt::index::Segment;
 use crate::lsmt::index::{ReadOnlyIndex, SegmentMapping};
 use anyhow::{bail, ensure, Result};
@@ -35,6 +35,76 @@ fn assert_err_contains(err: &anyhow::Error, needle: &str) {
         message.contains(needle),
         "expected error containing `{needle}`, got `{message}`"
     );
+}
+
+struct WriteProbeFile {
+    inner: Arc<dyn VirtualFile>,
+    writes: AtomicUsize,
+    discards: AtomicUsize,
+    fail_write_at: AtomicUsize,
+}
+
+impl WriteProbeFile {
+    fn new(inner: Arc<dyn VirtualFile>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            writes: AtomicUsize::new(0),
+            discards: AtomicUsize::new(0),
+            fail_write_at: AtomicUsize::new(usize::MAX),
+        })
+    }
+
+    fn writes(&self) -> usize {
+        self.writes.load(AtomicOrdering::SeqCst)
+    }
+
+    fn fail_next_write(&self) {
+        self.fail_write_at
+            .store(self.writes() + 1, AtomicOrdering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl VirtualFile for WriteProbeFile {
+    async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
+        self.inner.read_at(offset, len).await
+    }
+
+    async fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
+        let call = self.writes.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+        if call == self.fail_write_at.load(AtomicOrdering::SeqCst) {
+            bail!("injected write failure");
+        }
+        self.inner.write_at(offset, data).await
+    }
+
+    async fn size(&self) -> Result<u64> {
+        self.inner.size().await
+    }
+
+    async fn sync(&self) -> Result<()> {
+        self.inner.sync().await
+    }
+
+    async fn discard(&self, offset: u64, len: u64) -> Result<()> {
+        self.discards.fetch_add(1, AtomicOrdering::SeqCst);
+        self.inner.discard(offset, len).await
+    }
+}
+
+async fn create_probed_hybrid(
+    dir: &TempDir,
+) -> (Arc<WriteProbeFile>, Arc<WriteProbeFile>, LSMTFile) {
+    let data = WriteProbeFile::new(Arc::new(
+        LocalFile::new(dir.path().join("probe.data")).unwrap(),
+    ));
+    let index = WriteProbeFile::new(Arc::new(
+        LocalFile::new(dir.path().join("probe.index")).unwrap(),
+    ));
+    let mut args = LayerInfo::new(data.clone(), Some(index.clone()), 1024 * 1024);
+    args.rw_layout = RwLayout::HybridLogStructured;
+    let upper = create_file_rw(args).await.unwrap();
+    (data, index, upper)
 }
 
 struct CountingSizeFile {
@@ -1020,6 +1090,109 @@ async fn test_hybrid_reopen_detects_file_type() {
 }
 
 #[tokio::test]
+async fn test_backed_zero_survives_rw_reopen_but_not_readonly_export() {
+    let temp_dir = TempDir::new().unwrap();
+    let (data, index, upper) = create_hybrid_lsmt_env(&temp_dir, 1024 * 1024).await;
+    upper.write_at(0, &[0xAB; 4096]).await.unwrap();
+    upper.sync().await.unwrap();
+    drop(upper);
+
+    // Seed a backed-zero record without relying on discard retaining space
+    // yet. RW replay must preserve it, unlike readonly index construction.
+    let zero = SegmentMapping::new(1, 2, HEADER_SIZE / ALIGNMENT + 1, true, 0);
+    index
+        .write_at(
+            index.size().await.unwrap(),
+            DiskSegmentMapping::from_memory(&zero).as_bytes(),
+        )
+        .await
+        .unwrap();
+    index.sync().await.unwrap();
+    let upper = open_hybrid_lsmt_env(data.clone(), index, None, vec![])
+        .await
+        .unwrap();
+    assert_eq!(upper.index.read().await.upper.dump()[1], zero);
+    assert_eq!(upper.read_at(512, 1024).await.unwrap().as_ref(), &[0; 1024]);
+    assert_eq!(upper.read_at(0, 512).await.unwrap().as_ref(), &[0xAB; 512]);
+    assert_eq!(
+        upper.read_at(1536, 512).await.unwrap().as_ref(),
+        &[0xAB; 512]
+    );
+
+    let exported: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(temp_dir.path().join("zero-export.lsmt")).unwrap());
+    upper
+        .export_upper_as_sealed(CommitArgs::new(exported.clone()))
+        .await
+        .unwrap();
+    assert_eq!(upper.index.read().await.upper.dump()[1], zero);
+    upper.close_seal().await.unwrap();
+
+    for sealed in [exported, data as Arc<dyn VirtualFile>] {
+        let trailer = verify_ht(&sealed, true, sealed.size().await.unwrap())
+            .await
+            .unwrap();
+        let raw = load_index_and_reset_tags(
+            &sealed,
+            trailer.index_offset.get(),
+            trailer.index_size.get() as usize,
+        )
+        .await
+        .unwrap();
+        assert_eq!(raw.iter().filter(|m| m.zeroed).count(), 1);
+        assert!(raw
+            .iter()
+            .filter(|m| m.zeroed)
+            .all(|m| m.moffset == NO_PHYSICAL_OFFSET));
+        let lower = open_file_ro(sealed).await.unwrap();
+        assert_eq!(lower.read_at(512, 1024).await.unwrap().as_ref(), &[0; 1024]);
+    }
+}
+
+#[tokio::test]
+async fn test_readonly_load_normalizes_legacy_zero_offsets() {
+    let temp_dir = TempDir::new().unwrap();
+    let base = create_sealed_layer(&temp_dir, "zero-base", 8192, &[(0, 0xAA)]).await;
+    let top: Arc<dyn VirtualFile> =
+        create_sealed_layer(&temp_dir, "zero-top", 8192, &[(0, 0xBB)]).await;
+    let trailer = verify_ht(&top, true, top.size().await.unwrap())
+        .await
+        .unwrap();
+    // Legacy lower zero offsets have no meaning, even when they look like a
+    // physical address. Replace the sole data record with a legacy zero.
+    let legacy_zero = SegmentMapping::new(0, 8, 12345, true, 0);
+    top.write_at(
+        trailer.index_offset.get(),
+        DiskSegmentMapping::from_memory(&legacy_zero).as_bytes(),
+    )
+    .await
+    .unwrap();
+    let disk_before = top
+        .read_at(0, top.size().await.unwrap() as usize)
+        .await
+        .unwrap();
+    for lower in [
+        open_file_ro(top.clone()).await.unwrap(),
+        open_files_ro(&[base as Arc<dyn VirtualFile>, top.clone()])
+            .await
+            .unwrap(),
+    ] {
+        let view = lower.index_view().unwrap();
+        assert!(view
+            .mappings()
+            .iter()
+            .filter(|m| m.zeroed)
+            .all(|m| m.moffset == NO_PHYSICAL_OFFSET));
+        assert_eq!(lower.read_at(512, 1024).await.unwrap().as_ref(), &[0; 1024]);
+    }
+    assert_eq!(
+        top.read_at(0, disk_before.len()).await.unwrap(),
+        disk_before,
+        "normalizing a lower index must not modify its file"
+    );
+}
+
+#[tokio::test]
 async fn test_open_rejects_sparse_and_hybrid_header() {
     let temp_dir = TempDir::new().unwrap();
     let data = Arc::new(LocalFile::new(temp_dir.path().join("invalid-rw.data")).unwrap());
@@ -1139,13 +1312,13 @@ async fn test_hybrid_complex_write_fragments_and_reopen() {
 
     assert_eq!(
         f_data.size().await.unwrap(),
-        data_size_before + 4 * 4096,
-        "lower-only, zeroed, and gap fragments append; existing upper fragment is in-place"
+        data_size_before + 3 * 4096,
+        "lower-only and gap fragments append; existing data and backed zeros reuse space"
     );
     assert_eq!(
         f_index.size().await.unwrap(),
         index_size_before + 3 * size_of::<DiskSegmentMapping>() as u64,
-        "only appended fragments add index mappings"
+        "appended and reactivated zero fragments add index mappings"
     );
     let got = stacked.read_at(0, 5 * 4096).await.unwrap();
     assert_eq!(got.as_ref(), update.as_slice());
@@ -1342,6 +1515,41 @@ async fn test_hybrid_lower_cow_first_write_appends() {
 }
 
 #[tokio::test]
+async fn test_hybrid_reuse_serializes_read_and_discard() {
+    let temp_dir = TempDir::new().unwrap();
+    let (data, _, upper) = create_blocking_hybrid_lsmt_env(&temp_dir, 1024 * 1024, 3).await;
+    upper.write_at(0, &[0xAA; 4096]).await.unwrap();
+    upper.discard_range(0, 4096).await.unwrap();
+    let size = data.size().await.unwrap();
+    let upper = Arc::new(upper);
+    let writer = upper.clone();
+    let write_task = tokio::spawn(async move { writer.write_at(0, &[0xBB; 4096]).await });
+    data.wait_for_blocked_write().await;
+    let reader = upper.clone();
+    let mut read_task = tokio::spawn(async move { reader.read_at(0, 4096).await });
+    let discarder = upper.clone();
+    let mut discard_task = tokio::spawn(async move { discarder.discard_range(0, 4096).await });
+    let timeout = std::time::Duration::from_millis(20);
+    assert!(tokio::time::timeout(timeout, &mut read_task).await.is_err());
+    assert!(tokio::time::timeout(timeout, &mut discard_task)
+        .await
+        .is_err());
+    data.release_blocked_write();
+    write_task.await.unwrap().unwrap();
+    let read = read_task.await.unwrap().unwrap();
+    assert!(read.iter().all(|&b| b == 0xBB) || read.iter().all(|&b| b == 0));
+    discard_task.await.unwrap().unwrap();
+    assert!(upper
+        .read_at(0, 4096)
+        .await
+        .unwrap()
+        .iter()
+        .all(|&b| b == 0));
+    upper.write_at(0, &[0xCC; 4096]).await.unwrap();
+    assert_eq!(data.size().await.unwrap(), size);
+}
+
+#[tokio::test]
 async fn test_hybrid_lower_cow_write_survives_reopen() {
     let temp_dir = TempDir::new().unwrap();
     let vsize = 1024 * 1024;
@@ -1372,31 +1580,173 @@ async fn test_hybrid_lower_cow_write_survives_reopen() {
 }
 
 #[tokio::test]
-async fn test_hybrid_discard_then_rewrite_appends() {
-    let temp_dir = TempDir::new().unwrap();
-    let (f_data, _f_index, lsmt) = create_hybrid_lsmt_env(&temp_dir, 1024 * 1024).await;
+async fn test_hybrid_discard_rewrite_reuses_space_across_reopen() {
+    for group_size in [0, 4 * size_of::<DiskSegmentMapping>()] {
+        let temp_dir = TempDir::new().unwrap();
+        let (data, index, mut upper) = create_probed_hybrid(&temp_dir).await;
+        let len = 64 * 1024;
+        let mut payload = vec![0x88; len];
+        upper.write_at(0, &payload).await.unwrap();
+        upper.sync().await.unwrap();
+        let data_size = data.size().await.unwrap();
+        let initial_writes = data.writes();
+        upper.set_index_group_commit(group_size).unwrap();
+        for value in 0..100u8 {
+            upper.discard_range(0, len as u64).await.unwrap();
+            assert_eq!(data.writes(), initial_writes + usize::from(value));
+            assert_eq!(data.discards.load(AtomicOrdering::SeqCst), 0);
+            assert_eq!(
+                data.read_at(HEADER_SIZE, len).await.unwrap().as_ref(),
+                payload.as_slice()
+            );
+            upper.sync().await.unwrap();
+            drop(upper);
+            upper = LSMTFile::open(data.clone(), Some(index.clone()), None, vec![])
+                .await
+                .unwrap();
+            upper.set_index_group_commit(group_size).unwrap();
+            assert!(upper.read_at(0, len).await.unwrap().iter().all(|&b| b == 0));
+            assert_eq!(
+                upper.index.read().await.upper.dump()[0].moffset,
+                HEADER_SIZE / ALIGNMENT
+            );
+            payload.fill(value);
+            upper.write_at(0, &payload).await.unwrap();
+            upper.sync().await.unwrap();
+            drop(upper);
+            upper = LSMTFile::open(data.clone(), Some(index.clone()), None, vec![])
+                .await
+                .unwrap();
+            upper.set_index_group_commit(group_size).unwrap();
+            assert_eq!(
+                upper.read_at(0, len).await.unwrap().as_ref(),
+                payload.as_slice()
+            );
+            assert_eq!(data.size().await.unwrap(), data_size);
+        }
+        assert_eq!(
+            index.size().await.unwrap(),
+            HEADER_SIZE + 201 * size_of::<DiskSegmentMapping>() as u64
+        );
+    }
+}
 
-    let first = vec![0x88; 4096];
-    let second = vec![0x99; 4096];
-    lsmt.write_at(0, &first).await.unwrap();
-    lsmt.sync().await.unwrap();
-    let size_after_first = f_data.size().await.unwrap();
+/// Run explicitly on a host that permits io_uring_setup. Merely enabling the
+/// feature does not exercise CtxWrite: ordinary VirtualFile writes use pwrite.
+#[cfg(feature = "io-uring")]
+#[test]
+#[ignore = "requires a host with io-uring enabled; run explicitly with --ignored"]
+fn test_hybrid_io_uring_discard_rewrite_and_reopen() {
+    use storage_util::io_ring::{AsyncIoRing, AsyncIoRingBuilder, URING};
 
-    <LSMTFile as VirtualFile>::discard(&lsmt, 0, 4096)
-        .await
+    let ring: AsyncIoRing = AsyncIoRingBuilder::new().build().expect("create io-uring");
+    assert!(URING.with(|slot| slot.set(ring.clone())).is_ok());
+    let submitted = Arc::new(AtomicUsize::new(0));
+    let counter = submitted.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .on_thread_park(move || {
+            URING.with(|slot| {
+                let count = slot
+                    .get()
+                    .unwrap()
+                    .borrow()
+                    .submit()
+                    .expect("submit io-uring");
+                counter.fetch_add(count, AtomicOrdering::SeqCst);
+            });
+        })
+        .build()
         .unwrap();
-    let zero = lsmt.read_at(0, 4096).await.unwrap();
-    assert!(zero.iter().all(|&b| b == 0));
+    let local = tokio::task::LocalSet::new();
+    local.block_on(&runtime, async {
+        let run = async {
+            let ctx = IoCtx::new(&ring);
+            for direct in [false, true] {
+                // 257 records exceed the buffered-pwrite threshold. The odd
+                // record count makes the first full batch flush on a CtxWrite
+                // (initial write, then alternating discard/rewrite records).
+                for group_size in [0, 257 * size_of::<DiskSegmentMapping>()] {
+                    let dir = TempDir::new().unwrap();
+                    let data = Arc::new(LocalFile::builder().direct_io(direct)
+                        .open(dir.path().join("uring.data")).unwrap());
+                    let index = Arc::new(LocalFile::new(dir.path().join("uring.index")).unwrap());
+                    let mut args = LayerInfo::new(data.clone(), Some(index.clone()), 1024 * 1024);
+                    args.rw_layout = RwLayout::HybridLogStructured;
+                    let upper = create_file_rw(args).await.unwrap();
+                    upper.set_index_group_commit(group_size).unwrap();
+                    let start_submitted = submitted.load(AtomicOrdering::SeqCst);
+                    let len = 64 * 1024;
+                    let mut payload = vec![0xAA; len];
+                    assert_eq!(upper.write_at_with_ctx(ctx, 0, &payload).await.unwrap(), len);
+                    let allocated_size = data.size().await.unwrap();
+                    let mut read = vec![0; len];
+                    let mut saw_ctx_index_flush = false;
+                    for value in 0..130u8 {
+                        upper.discard_range(0, len as u64).await.unwrap();
+                        assert_eq!(upper.read_at_into_with_ctx(ctx, 0, &mut read).await.unwrap(), len);
+                        assert!(read.iter().all(|&b| b == 0));
+                        // Discard must not alter the retained physical data.
+                        assert_eq!(data.read_at_with_ctx(ctx, HEADER_SIZE, len).await.unwrap().as_ref(), payload.as_slice());
+                        payload.fill(value);
+                        let before_write = submitted.load(AtomicOrdering::SeqCst);
+                        assert_eq!(upper.write_at_with_ctx(ctx, 0, &payload).await.unwrap(), len);
+                        let writes = submitted.load(AtomicOrdering::SeqCst) - before_write;
+                        assert!(writes >= 1, "64 KiB CtxWrite must submit real kernel I/O");
+                        saw_ctx_index_flush |= writes >= 2;
+                        assert_eq!(upper.read_at_into_with_ctx(ctx, 0, &mut read).await.unwrap(), len);
+                        assert_eq!(read, payload);
+                        assert_eq!(data.size().await.unwrap(), allocated_size);
+                    }
+                    if group_size != 0 {
+                        assert!(saw_ctx_index_flush, "exercise a large index batch through CtxWrite");
+                    }
 
-    lsmt.write_at(0, &second).await.unwrap();
-    lsmt.sync().await.unwrap();
-    assert_eq!(
-        f_data.size().await.unwrap(),
-        size_after_first + 4096,
-        "rewrite after zeroed mapping should append a fresh block"
-    );
-    let got = lsmt.read_at(0, 4096).await.unwrap();
-    assert_eq!(got.as_ref(), second.as_slice());
+                    // Partial backed-zero reactivation includes sector-sized
+                    // edges and uses the O_DIRECT bounce-buffer path too.
+                    upper.discard_range(512, (len - 1024) as u64).await.unwrap();
+                    upper.write_at_with_ctx(ctx, 1024, &[0xCC; 4096]).await.unwrap();
+                    payload[512..len - 512].fill(0);
+                    payload[1024..5120].fill(0xCC);
+                    upper.read_at_into_with_ctx(ctx, 0, &mut read).await.unwrap();
+                    assert_eq!(read, payload);
+                    assert_eq!(data.size().await.unwrap(), allocated_size);
+
+                    // One write mixes ordinary overwrite, backed-zero reuse,
+                    // and a previously unallocated suffix.
+                    let payload = vec![0xDD; len + 8192];
+                    upper.write_at_with_ctx(ctx, 0, &payload).await.unwrap();
+                    upper.sync().await.unwrap();
+                    assert_eq!(data.size().await.unwrap(), allocated_size + 8192);
+                    drop(upper);
+                    let upper = LSMTFile::open(data.clone(), Some(index), None, vec![]).await.unwrap();
+                    assert_eq!(upper.read_at_with_ctx(ctx, 0, payload.len()).await.unwrap().as_ref(), payload.as_slice());
+
+                    // Concurrent futures stay on the ring's owning thread;
+                    // discard waits for the in-flight CtxWrite's index lock.
+                    let (written, discarded) = tokio::join!(
+                        upper.write_at_with_ctx(ctx, 0, &payload),
+                        upper.discard_range(0, payload.len() as u64),
+                    );
+                    assert_eq!(written.unwrap(), payload.len());
+                    discarded.unwrap();
+                    assert!(upper.read_at_with_ctx(ctx, 0, payload.len()).await.unwrap().iter().all(|&b| b == 0));
+                    upper.write_at_with_ctx(ctx, 0, &payload).await.unwrap();
+                    upper.sync().await.unwrap();
+                    assert_eq!(data.size().await.unwrap(), allocated_size + 8192);
+                    assert_eq!(ring.inflight_req(), 0);
+                    eprintln!("io-uring direct={direct}, group_size={group_size}: {} SQEs submitted",
+                        submitted.load(AtomicOrdering::SeqCst) - start_submitted);
+                }
+            }
+        };
+        tokio::select! {
+            result = tokio::time::timeout(std::time::Duration::from_secs(60), run) => {
+                result.expect("io-uring test timed out");
+            }
+            result = ring.handle_completion() => panic!("io-uring completion loop exited: {result:?}"),
+        }
+    });
 }
 
 #[tokio::test]
@@ -1427,6 +1777,215 @@ async fn test_hybrid_discard_and_rewrite_survive_reopen() {
         .unwrap();
     let got = reopened_data.read_at(0, 4096).await.unwrap();
     assert_eq!(got.as_ref(), second.as_slice());
+}
+
+#[tokio::test]
+async fn test_hybrid_discard_mixed_ranges_preserves_physical_offsets() {
+    let temp_dir = TempDir::new().unwrap();
+    let (data, _index, upper) = create_probed_hybrid(&temp_dir).await;
+    // Logical order differs from physical order; an intervening gap must not
+    // borrow either neighbor's retained range.
+    for logical in [0, 5, 2] {
+        upper.write_at(logical * 4096, &[0xAA; 4096]).await.unwrap();
+    }
+    upper.discard_range(2 * 4096, 4096).await.unwrap();
+    upper.discard_range(3 * 4096, 4096).await.unwrap();
+    let writes = data.writes();
+    upper.discard_range(0, 6 * 4096).await.unwrap();
+    assert_eq!(data.writes(), writes);
+    assert_eq!(data.size().await.unwrap(), HEADER_SIZE + 3 * 4096);
+    let mappings = upper.index.read().await.upper.dump();
+    for (logical, physical) in [(0, 8), (16, 24), (40, 16)] {
+        let m = mappings.iter().find(|m| m.offset() == logical).unwrap();
+        assert!(m.zeroed);
+        assert_eq!(m.moffset, physical);
+    }
+    for logical in [8, 24, 32] {
+        let m = mappings.iter().find(|m| m.offset() == logical).unwrap();
+        assert!(m.zeroed);
+        assert_eq!(m.moffset, NO_PHYSICAL_OFFSET);
+    }
+    upper.write_at(0, &[0xBB; 6 * 4096]).await.unwrap();
+    assert_eq!(data.size().await.unwrap(), HEADER_SIZE + 6 * 4096);
+    assert_eq!(
+        upper.read_at(0, 6 * 4096).await.unwrap().as_ref(),
+        &[0xBB; 6 * 4096]
+    );
+    let mappings = upper.index.read().await.upper.dump();
+    for (logical, physical) in [(0, 8), (16, 24), (40, 16)] {
+        let m = mappings.iter().find(|m| m.offset() == logical).unwrap();
+        assert!(!m.zeroed);
+        assert_eq!(m.moffset, physical);
+    }
+}
+
+#[tokio::test]
+async fn test_hybrid_random_partial_discard_rewrite_and_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let blocks = 128usize;
+    let vsize = blocks * ALIGNMENT_USIZE;
+    let writes: Vec<_> = (0..vsize).step_by(4096).map(|o| (o as u64, 0xAA)).collect();
+    let base = create_sealed_layer(&temp_dir, "churn-base", vsize as u64, &writes).await;
+    let lower = open_file_ro(base.clone()).await.unwrap();
+    let lower_index = lower.index_view().unwrap();
+    let (data, index, upper) = create_hybrid_lsmt_env(&temp_dir, vsize as u64).await;
+    drop(upper);
+    let mut upper = LSMTFile::open(
+        data.clone(),
+        Some(index.clone()),
+        Some(lower_index.clone()),
+        vec![base.clone()],
+    )
+    .await
+    .unwrap();
+    let mut expected = vec![0xAA; vsize];
+    let mut allocated = vec![false; blocks];
+    upper.discard_range(0, 512).await.unwrap();
+    expected[..512].fill(0);
+    assert_eq!(data.size().await.unwrap(), HEADER_SIZE);
+    assert_eq!(upper.read_at(0, 512).await.unwrap().as_ref(), &[0; 512]);
+    let mut rng = StdRng::seed_from_u64(20260907);
+    for step in 0..500 {
+        let start = rng.random_range(0..blocks);
+        let len = rng.random_range(1..=16.min(blocks - start));
+        let bytes = start * ALIGNMENT_USIZE..(start + len) * ALIGNMENT_USIZE;
+        if rng.random_range(0..3) == 0 {
+            upper
+                .discard_range(bytes.start as u64, bytes.len() as u64)
+                .await
+                .unwrap();
+            expected[bytes.clone()].fill(0);
+        } else {
+            let payload = vec![(step % 255 + 1) as u8; bytes.len()];
+            upper.write_at(bytes.start as u64, &payload).await.unwrap();
+            expected[bytes.clone()].copy_from_slice(&payload);
+            allocated[start..start + len].fill(true);
+        }
+        assert_eq!(
+            upper.read_at(0, vsize).await.unwrap().as_ref(),
+            expected.as_slice(),
+            "step {step}"
+        );
+        assert_eq!(
+            data.size().await.unwrap(),
+            HEADER_SIZE + allocated.iter().filter(|&&v| v).count() as u64 * ALIGNMENT
+        );
+        if step % 25 == 0 {
+            upper.sync().await.unwrap();
+            drop(upper);
+            upper = LSMTFile::open(
+                data.clone(),
+                Some(index.clone()),
+                Some(lower_index.clone()),
+                vec![base.clone()],
+            )
+            .await
+            .unwrap();
+        }
+    }
+    assert!(lower
+        .read_at(0, vsize)
+        .await
+        .unwrap()
+        .iter()
+        .all(|&b| b == 0xAA));
+}
+
+#[tokio::test]
+async fn test_hybrid_large_discard_rewrite_uses_default_chunking() {
+    let temp_dir = TempDir::new().unwrap();
+    let len = 9 * 1024 * 1024;
+    let (data, index, upper) = create_hybrid_lsmt_env(&temp_dir, len as u64).await;
+    // Keep the existing 4 MiB write chunk size. The request still crosses
+    // multiple write chunks and the discard segment-length boundary.
+    upper.write_at(0, &vec![0xAA; len]).await.unwrap();
+    let allocated_size = data.size().await.unwrap();
+    upper.discard_range(512, (len - 1024) as u64).await.unwrap();
+    assert_eq!(upper.read_at(0, 512).await.unwrap().as_ref(), &[0xAA; 512]);
+    assert!(upper
+        .read_at(512, len - 1024)
+        .await
+        .unwrap()
+        .iter()
+        .all(|&b| b == 0));
+    upper.write_at(512, &vec![0xBB; len - 1024]).await.unwrap();
+    assert_eq!(data.size().await.unwrap(), allocated_size);
+    upper.sync().await.unwrap();
+    drop(upper);
+    let upper = open_hybrid_lsmt_env(data, index, None, vec![])
+        .await
+        .unwrap();
+    assert!(upper
+        .read_at(512, len - 1024)
+        .await
+        .unwrap()
+        .iter()
+        .all(|&b| b == 0xBB));
+    assert_eq!(
+        upper
+            .read_at((len - 512) as u64, 512)
+            .await
+            .unwrap()
+            .as_ref(),
+        &[0xAA; 512]
+    );
+}
+
+#[tokio::test]
+async fn test_hybrid_reuse_failure_does_not_publish() {
+    for fail_data in [true, false] {
+        let temp_dir = TempDir::new().unwrap();
+        let (data, index, upper) = create_probed_hybrid(&temp_dir).await;
+        upper.write_at(0, &[0xAA; 4096]).await.unwrap();
+        upper.discard_range(0, 4096).await.unwrap();
+        upper.sync().await.unwrap();
+        let before = upper.index.read().await.upper.dump();
+        let target = if fail_data { &data } else { &index };
+        target.fail_next_write();
+        let err = upper.write_at(0, &[0xBB; 4096]).await.unwrap_err();
+        assert_err_contains(&err, "injected write failure");
+        assert_eq!(upper.index.read().await.upper.dump(), before);
+        assert!(upper
+            .read_at(0, 4096)
+            .await
+            .unwrap()
+            .iter()
+            .all(|&b| b == 0));
+        drop(upper);
+        let reopened = LSMTFile::open(data, Some(index), None, vec![])
+            .await
+            .unwrap();
+        assert!(reopened
+            .read_at(0, 4096)
+            .await
+            .unwrap()
+            .iter()
+            .all(|&b| b == 0));
+    }
+}
+
+#[tokio::test]
+async fn test_hybrid_discard_index_failure_preserves_visible_mapping() {
+    let temp_dir = TempDir::new().unwrap();
+    let (data, index, upper) = create_probed_hybrid(&temp_dir).await;
+    upper.write_at(0, &[0xAA; 4096]).await.unwrap();
+    upper.sync().await.unwrap();
+    let before = upper.index.read().await.upper.dump();
+    index.fail_next_write();
+    assert!(upper.discard_range(0, 4096).await.is_err());
+    assert_eq!(upper.index.read().await.upper.dump(), before);
+    assert_eq!(
+        upper.read_at(0, 4096).await.unwrap().as_ref(),
+        &[0xAA; 4096]
+    );
+    drop(upper);
+    let upper = LSMTFile::open(data, Some(index), None, vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        upper.read_at(0, 4096).await.unwrap().as_ref(),
+        &[0xAA; 4096]
+    );
 }
 
 #[tokio::test]
@@ -1752,6 +2311,10 @@ async fn test_log_discard_range_persists_via_index() {
     let reopened = open_lsmt_env(f_data, f_index, vec![]).await.unwrap();
     let reopened_got = reopened.read_at(0, payload.len()).await.unwrap();
     assert!(reopened_got.iter().all(|&b| b == 0));
+    assert_eq!(
+        reopened.index.read().await.upper.dump(),
+        vec![SegmentMapping::new(0, 8, NO_PHYSICAL_OFFSET, true, 0)]
+    );
 }
 
 async fn create_counting_log_lsmt_env(
@@ -1842,6 +2405,19 @@ async fn test_hybrid_mixed_write_hot_path_avoids_size_calls() {
     index.reset_size_calls();
     lsmt.write_at(0, &[0xD8; 8192]).await.unwrap();
 
+    assert_no_size_calls(&data, &index);
+}
+
+#[tokio::test]
+async fn test_hybrid_discard_reuse_hot_path_avoids_size_calls() {
+    let temp_dir = TempDir::new().unwrap();
+    let (data, index, upper) = create_counting_hybrid_lsmt_env(&temp_dir, 1024 * 1024).await;
+    upper.write_at(0, &[0xAA; 4096]).await.unwrap();
+    data.reset_size_calls();
+    index.reset_size_calls();
+    upper.discard_range(0, 4096).await.unwrap();
+    upper.write_at(0, &[0xBB; 4096]).await.unwrap();
+    upper.sync().await.unwrap();
     assert_no_size_calls(&data, &index);
 }
 
@@ -2445,6 +3021,36 @@ fn test_premerged_artifact_rejects_invalid_mapping_order_and_tag() {
     let body = serialize_premerged_mappings(&[SegmentMapping::new(0, 1, 20, false, 1)]);
     let err = deserialize_premerged_mappings(&body, 1, 1).unwrap_err();
     assert_err_contains(&err, "tag out of range");
+}
+
+#[test]
+fn test_premerged_artifact_normalizes_legacy_zero_offsets() {
+    let metadata = vec![test_layer_metadata(Uuid::new_v4(), 2)];
+    let key = PremergedIndexCacheKey::from_metadata(&metadata).unwrap();
+    let ordinary = SegmentMapping::new(8, 8, 200, false, 0);
+    let body = serialize_premerged_mappings(&[SegmentMapping::new(0, 8, 12345, true, 0), ordinary]);
+    let mut artifact =
+        build_premerged_artifact_header(&key, 2, body.len() as u64, Sha256::digest(&body).into());
+    artifact.extend_from_slice(&body);
+    let decoded = decode_premerged_index_artifact(&artifact, &key).unwrap();
+    assert_eq!(
+        decoded.mappings(),
+        &[
+            SegmentMapping::new(0, 8, NO_PHYSICAL_OFFSET, true, 0),
+            ordinary,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn test_index_load_rejects_data_with_no_physical_offset() {
+    let body =
+        serialize_premerged_mappings(&[SegmentMapping::new(0, 1, NO_PHYSICAL_OFFSET, false, 0)]);
+    let err = deserialize_premerged_mappings(&body, 1, 1).unwrap_err();
+    assert_err_contains(&err, "data mapping has no physical offset");
+    let file: Arc<dyn VirtualFile> = Arc::new(ShortReadFile::new(body, 0));
+    let err = load_index_and_reset_tags(&file, 0, 1).await.unwrap_err();
+    assert_err_contains(&err, "data mapping has no physical offset");
 }
 
 #[tokio::test]

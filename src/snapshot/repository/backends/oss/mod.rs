@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy};
+use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
 use crate::p2p::P2pTransport;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
@@ -35,12 +35,30 @@ impl OssBackend {
     ///
     /// This convenience constructor remains available for tests and direct
     /// callers. The main backend factory constructs a shared cache once and
-    /// uses [`OssBackend::from_parts`] instead.
+    /// uses [`OssBackend::from_parts`] instead. Publish compression stays
+    /// disabled here; use [`OssBackend::new_with_publish_compression`] to
+    /// exercise `[snapshot.publish_compression]`.
     pub fn new(config: &OssBackendConfig, cache_root: PathBuf) -> Result<Self> {
+        Self::new_with_publish_compression(
+            config,
+            cache_root,
+            &SnapshotPublishCompressionConfig::default(),
+        )
+    }
+
+    /// Build the OSS backend from config with explicit publish-compression
+    /// settings, for tests and direct callers that cannot go through the
+    /// global config.
+    pub fn new_with_publish_compression(
+        config: &OssBackendConfig,
+        cache_root: PathBuf,
+        publish_compression: &SnapshotPublishCompressionConfig,
+    ) -> Result<Self> {
         let cache = LocalArtifactCache::new(cache_root.clone(), config.cache_max_size_gb)?;
         Self::from_parts(
             config,
             SnapshotImageStoragePolicy::default(),
+            publish_compression,
             cache,
             cache_root.join("runtime"),
             local_image_services_from_global_config().overlaybd_layers,
@@ -52,6 +70,7 @@ impl OssBackend {
     pub(crate) fn from_parts(
         config: &OssBackendConfig,
         snapshot_image_storage: SnapshotImageStoragePolicy,
+        publish_compression: &SnapshotPublishCompressionConfig,
         cache: Arc<LocalArtifactCache>,
         runtime_root: PathBuf,
         store: Arc<dyn OverlaybdLayerStore>,
@@ -71,6 +90,7 @@ impl OssBackend {
         let repository: Arc<dyn SnapshotRepository> = Arc::new(OssSnapshotRepository::new(
             Arc::clone(&client),
             config.snapshot_image_storage(),
+            publish_compression,
         ));
 
         std::fs::create_dir_all(&runtime_root)

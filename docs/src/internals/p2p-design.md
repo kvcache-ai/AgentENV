@@ -138,6 +138,8 @@ Snapshot publication advertises:
   - `firecracker-manifest.json` is serialized from the committed manifest and published as bytes.
 - Overlaybd layers referenced by the snapshot's rootfs, memory, and attached-drive image configs. These are not published under a snapshot-specific key. They reuse the overlaybd layer artifact protocol owned by `src/overlaybd/p2p/artifact.rs`, with keys like `overlaybd-layer/v1/sha256:<digest>` and `LayerMetadata` understood by the overlaybd HTTP facade.
 
+Digest-keyed layer publication is guarded against the committed record: a local layer is only advertised under `overlaybd-layer/v1/sha256:<digest>` when that digest is one the committed record references for the same subject (memory, rootfs, or the matching attached drive). When `[snapshot.publish_compression]` recontainerizes a raw local layer as ZFile during upload, the record names the compressed bytes, so the raw layer's digest key is skipped rather than advertised under a key no consumer will look up. ZFile layers also carry no LSMT uuid (`uuid = None` in the committed record), so uuid-keyed acceleration never applies to recontainerized layers.
+
 That split is important. Snapshot fixed artifacts are scoped to one snapshot ID and are only consumed by snapshot runtime resolvers. Overlaybd commit layers are content-addressed and may be consumed by any overlaybd runtime path, including foreground range reads through `/p2p-http/{origin}`. Do not add a second snapshot-specific key format for overlaybd layers; doing so publishes bytes that overlaybd cannot discover.
 
 OSS snapshot resolution consumes fixed artifacts through P2P first:

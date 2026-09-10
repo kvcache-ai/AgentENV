@@ -98,7 +98,7 @@ cold_payload=$(jq -nc \
     image: $image,
     timeout: 300,
     autoPause: false,
-    volumeMounts: {($mount_path): $volume_id}
+    volumeMounts: [{name: $volume_id, path: $mount_path}]
   }')
 api_post "/sandboxes-cold" "${cold_payload}"
 assert_status "${HTTP_STATUS}" "201" "create cold-image sandbox with a volume"
@@ -111,6 +111,22 @@ assert_not_empty "${source_sandbox_id}" "cold-image sandbox ID is present"
 track_sandbox "${source_sandbox_id}"
 
 write_volume_files "${source_sandbox_id}"
+verify_volume_files "${source_sandbox_id}"
+
+api_delete "/sandboxes/${source_sandbox_id}"
+assert_status "${HTTP_STATUS}" "204" "delete running sandbox and publish its volume"
+api_get "/volumes/${source_volume_id}"
+assert_status "${HTTP_STATUS}" "200" "get volume after sandbox deletion"
+assert_json_field "${HTTP_BODY}" '.status' "ready" "deleted sandbox volume is reusable"
+api_post "/sandboxes-cold" "${cold_payload}"
+assert_status "${HTTP_STATUS}" "201" "mount deleted sandbox volume in a new sandbox"
+if [[ "${HTTP_STATUS}" != "201" ]]; then
+    error "replacement sandbox create response: ${HTTP_BODY}"
+    exit 1
+fi
+source_sandbox_id="$(echo "${HTTP_BODY}" | jq -r '.sandboxID // empty')"
+assert_not_empty "${source_sandbox_id}" "replacement sandbox ID is present"
+track_sandbox "${source_sandbox_id}"
 verify_volume_files "${source_sandbox_id}"
 
 api_post "/sandboxes/${source_sandbox_id}/snapshots" "$(jq -nc \
@@ -139,7 +155,8 @@ track_sandbox "${restored_sandbox_id}"
 api_get "/sandboxes/${restored_sandbox_id}"
 assert_status "${HTTP_STATUS}" "200" "get restored cold-image sandbox"
 restored_volume_id="$(echo "${HTTP_BODY}" | jq -r \
-  --arg path "${VOLUME_MOUNT_PATH}" '.volumeMounts[$path] // empty')"
+  --arg path "${VOLUME_MOUNT_PATH}" \
+  '[.volumeMounts[]? | select(.path == $path) | .name][0] // empty')"
 assert_not_empty "${restored_volume_id}" "automatically restored volume ID is present"
 assert_not_eq "${restored_volume_id}" "${source_volume_id}" \
   "volume snapshot restore creates an independent volume"

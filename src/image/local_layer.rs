@@ -4,8 +4,10 @@ use overlaybd::config::LayerConfig;
 
 const SNAPSHOT_DELTA_LAYER_FILE: &str = "snapshot.commit";
 const SELF_CONTAINED_BASE_LAYER_FILE: &str = "managed-base.commit";
-/// ZFile-recontainerized variant of [`SNAPSHOT_DELTA_LAYER_FILE`], produced
-/// when a template build requests compressed seal output.
+/// ZFile-recontainerized variant of [`SNAPSHOT_DELTA_LAYER_FILE`]. No longer
+/// produced: capture-time compression was removed and local layers always
+/// stay raw. Kept in the delta allowlist so layers in repositories published
+/// while the old capture-time switches existed are still recognized.
 pub(crate) const SNAPSHOT_ZFILE_DELTA_LAYER_FILE: &str = "snapshot.zfile.commit";
 
 #[derive(Debug, Clone, PartialEq, Eq)]

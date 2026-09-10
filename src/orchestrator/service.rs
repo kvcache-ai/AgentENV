@@ -39,6 +39,19 @@ use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
 type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
 
+#[derive(Default)]
+enum DeleteProgress {
+    #[default]
+    Capture,
+    Stop {
+        capture_failed: bool,
+    },
+    Release {
+        capture_failed: bool,
+    },
+    Done,
+}
+
 /// Maximum time to wait for a sandbox to leave a transitional state.
 /// Guards against indefinite blocking when a sandbox's in-progress operation
 /// never completes (e.g. the task holding the state panics without rolling back).
@@ -99,6 +112,7 @@ pub struct Orchestrator<
     persister: P,
     sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
     template_build_ids: RwLock<HashSet<SandboxId>>,
+    deletions: Mutex<HashMap<SandboxId, Arc<Mutex<DeleteProgress>>>>,
     proxy_routes: RwLock<ProxyRouteTable>,
     next_proxy_route_version: AtomicU64,
     counters: OrchestratorCounters,
@@ -216,6 +230,7 @@ where
             persister,
             sandboxes: RwLock::new(HashMap::new()),
             template_build_ids: RwLock::new(HashSet::new()),
+            deletions: Mutex::new(HashMap::new()),
             proxy_routes: RwLock::new(ProxyRouteTable::default()),
             next_proxy_route_version: AtomicU64::new(1),
             counters: OrchestratorCounters::default(),
@@ -1039,41 +1054,20 @@ where
     /// the in-progress operation to finish before proceeding with deletion, preventing
     /// races where an ongoing operation might overwrite the `Killing` state.
     pub async fn delete_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
-        self.delete_sandbox_with_volume_status(sandbox_id)
-            .await
-            .map(|_| ())
-    }
-
-    async fn snapshot_volume_mounts_before_delete(
-        self: &Arc<Self>,
-        sandbox_id: SandboxId,
-    ) -> Result<()> {
-        // A running volume mount may contain writes that only exist in the VM's
-        // current upper layer. Pause first to seal those writes locally before
-        // the final volume state is published during deletion.
-        let should_snapshot = self.store.get(&sandbox_id).await?.is_some_and(|metadata| {
-            metadata.state == SandboxState::Running
-                && !metadata.template_builder
-                && !metadata.volume_mounts.is_empty()
-        });
-        if should_snapshot {
-            self.pause_sandbox_inner(sandbox_id).await?;
-        }
-        Ok(())
-    }
-
-    /// The result lets template builds avoid reusing a failed optional cache.
-    pub(crate) async fn delete_sandbox_with_volume_status(
-        self: &Arc<Self>,
-        sandbox_id: SandboxId,
-    ) -> Result<bool> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("delete", sandbox_id, async move {
-            this.snapshot_volume_mounts_before_delete(sandbox_id)
-                .await?;
             this.delete_sandbox_inner(sandbox_id).await
         })
         .await
+    }
+
+    async fn deletion_progress(&self, sandbox_id: SandboxId) -> Arc<Mutex<DeleteProgress>> {
+        self.deletions
+            .lock()
+            .await
+            .entry(sandbox_id)
+            .or_default()
+            .clone()
     }
 
     #[tracing::instrument(
@@ -1081,8 +1075,19 @@ where
         skip(self),
         fields(sandbox_id = %sandbox_id)
     )]
-    async fn delete_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<bool> {
+    async fn delete_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("deleting sandbox");
+        let deletion = self.deletion_progress(sandbox_id).await;
+        let mut progress = deletion.lock().await;
+        match *progress {
+            DeleteProgress::Done => return Ok(()),
+            DeleteProgress::Capture => {}
+            _ => {
+                return self
+                    .delete_sandbox_impl(sandbox_id, SandboxState::Killing, &mut progress)
+                    .await
+            }
+        }
 
         // Attempt to transition to Killing, retrying after waiting whenever we
         // find the sandbox in a transitional state.
@@ -1112,7 +1117,7 @@ where
                             }
                             Err(OrchestratorError::SandboxNotFound(_)) => {
                                 info!("sandbox was deleted by a concurrent delete");
-                                return Ok(false);
+                                return Ok(());
                             }
                             Err(e) => return Err(e),
                         }
@@ -1138,7 +1143,7 @@ where
                                 // Sandbox was removed while we waited (e.g. by
                                 // another concurrent delete).
                                 info!("sandbox was deleted while waiting for transitional state");
-                                return Ok(false);
+                                return Ok(());
                             }
                             Err(e) => return Err(e),
                         }
@@ -1151,11 +1156,17 @@ where
                         }));
                     }
                 },
-                Err(err) => return Err(OrchestratorError::from(err)),
+                Err(err) => {
+                    if matches!(err, StoreError::SandboxNotFound { .. }) {
+                        self.deletions.lock().await.remove(&sandbox_id);
+                    }
+                    return Err(OrchestratorError::from(err));
+                }
             }
         };
 
-        self.delete_sandbox_impl(sandbox_id, previous_state).await
+        self.delete_sandbox_impl(sandbox_id, previous_state, &mut progress)
+            .await
     }
 
     async fn claim_expired_running_sandbox(
@@ -1201,137 +1212,116 @@ where
         self: &Arc<Self>,
         sandbox_id: SandboxId,
         previous_state: SandboxState,
-    ) -> Result<bool> {
-        if self
-            .store
-            .get(&sandbox_id)
-            .await?
-            .is_some_and(|metadata| metadata.template_builder)
-        {
-            return self
-                .delete_template_builder_impl(sandbox_id, previous_state)
-                .await;
-        }
-        let volume_ids = self
-            .store
-            .get(&sandbox_id)
-            .await?
-            .map(|metadata| metadata.volume_mounts.into_values().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
-
-        // If the sandbox is still in memory, attempt to stop it.
-        if let Some(handle) = handle {
-            let stop_result = {
-                let mut sandbox = handle.lock().await;
-                sandbox.stop().await
-            };
-
-            if let Err(err) = stop_result {
-                warn!(error = ?err, "failed to stop sandbox during delete");
-                self.sandboxes.write().await.insert(sandbox_id, handle);
-                self.restore_proxy_route(sandbox_id, removed_route).await;
-                self.store
-                    .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
-                    .await?;
-
-                return Err(OrchestratorError::SandboxOperationFailed {
-                    sandbox_id,
-                    operation: SandboxOperation::Stop,
-                    source: err,
-                });
-            }
-        }
-
-        if let Some(manager) = self.volume_manager.as_ref() {
-            if let Err(err) = self
-                .publish_sandbox_volume_backings(sandbox_id, &volume_ids)
-                .await
-            {
-                self.store
-                    .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
-                    .await?;
-                return Err(err);
-            }
-            if let Err(err) = manager
-                .replace_owner_for(&sandbox_id.to_string(), None, &volume_ids)
-                .await
-            {
-                self.store
-                    .update_state_if_state(&sandbox_id, previous_state, &[SandboxState::Killing])
-                    .await?;
-                return Err(OrchestratorError::SandboxOperationFailed {
-                    sandbox_id,
-                    operation: SandboxOperation::Stop,
-                    source: err.into(),
-                });
-            }
-        }
-
-        self.remove_deleted_sandbox(sandbox_id).await?;
-        Ok(true)
-    }
-
-    async fn delete_template_builder_impl(
-        self: &Arc<Self>,
-        sandbox_id: SandboxId,
-        previous_state: SandboxState,
-    ) -> Result<bool> {
+        progress: &mut DeleteProgress,
+    ) -> Result<()> {
         let metadata = self.store.get(&sandbox_id).await?;
+        let optional_cache = metadata
+            .as_ref()
+            .is_some_and(|record| record.template_builder);
         let volume_ids = metadata
             .map(|metadata| metadata.volume_mounts.into_values().collect::<Vec<_>>())
             .unwrap_or_default();
-        let (handle, _) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
-        let mut volumes_captured = true;
+        let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
+        let mut capture_error = None;
 
-        let delete_result: anyhow::Result<()> = async {
-            if let Some(handle) = handle.as_ref() {
-                if previous_state == SandboxState::Running && !volume_ids.is_empty() {
-                    if let Err(error) = handle.lock().await.snapshot_volumes().await {
-                        volumes_captured = false;
-                        warn!(%sandbox_id, %error, "builder cache capture failed; discarding cache");
+        if matches!(progress, DeleteProgress::Capture) {
+            let mut volumes_frozen = false;
+            let capture_result: std::result::Result<(), SandboxCaptureError> = async {
+                if let Some(handle) = handle.as_ref() {
+                    if previous_state == SandboxState::Running && !volume_ids.is_empty() {
+                        handle.lock().await.freeze_and_snapshot_volumes().await?;
+                        volumes_frozen = true;
                     }
                 }
+                self.publish_sandbox_volume_backings(sandbox_id, &volume_ids)
+                    .await
+                    .map_err(|error| SandboxCaptureError::recoverable(error.into()))
             }
-            // BuildKit has stopped before finalization; only its cache is retained.
-            if volumes_captured {
-                if let Err(error) = self.publish_sandbox_volume_backings(sandbox_id, &volume_ids).await {
-                    volumes_captured = false;
-                    warn!(%sandbox_id, %error, "builder cache publication failed; discarding cache and releasing worker");
+            .await;
+            if let Err(mut error) = capture_result {
+                if volumes_frozen && !error.is_terminal() && !optional_cache {
+                    if let Some(handle) = handle.as_ref() {
+                        if let Err(thaw_error) = handle.lock().await.thaw_volumes().await {
+                            error = SandboxCaptureError::terminal(anyhow::anyhow!(
+                                "delete failed: {error}; thaw failed: {thaw_error:#}"
+                            ));
+                        }
+                    }
                 }
+                // Builder caches are optional; still stop and release the worker on capture failure.
+                if !error.is_terminal() && !optional_cache {
+                    if let Some(handle) = handle {
+                        self.sandboxes.write().await.insert(sandbox_id, handle);
+                    }
+                    self.restore_proxy_route(sandbox_id, removed_route).await;
+                    self.store
+                        .update_state_if_state(
+                            &sandbox_id,
+                            previous_state,
+                            &[SandboxState::Killing],
+                        )
+                        .await?;
+                    return Err(OrchestratorError::SandboxOperationFailed {
+                        sandbox_id,
+                        operation: SandboxOperation::Stop,
+                        source: error.into(),
+                    });
+                }
+                warn!(
+                    ?error,
+                    "volume capture failed; stopping sandbox and failing its volumes"
+                );
+                capture_error = Some(error);
             }
-            if let Some(handle) = handle.as_ref() {
-                handle.lock().await.stop().await?;
+            *progress = DeleteProgress::Stop {
+                capture_failed: capture_error.is_some(),
+            };
+        }
+
+        let cleanup: anyhow::Result<()> = async {
+            if let DeleteProgress::Stop { capture_failed } = *progress {
+                if let Some(handle) = handle.as_ref() {
+                    handle.lock().await.stop().await?;
+                }
+                *progress = DeleteProgress::Release { capture_failed };
             }
-            // Stop all guest writes before another sandbox can acquire a volume,
-            // including when an internal builder discarded its failed capture.
-            if let Some(manager) = self.volume_manager.as_ref() {
-                manager.replace_owner_for(&sandbox_id.to_string(), None, &volume_ids)
-                    .await?;
+            if let DeleteProgress::Release { capture_failed } = *progress {
+                if let Some(manager) = self.volume_manager.as_ref() {
+                    let owner = sandbox_id.to_string();
+                    // An incomplete restack may leave image.json pointing at old
+                    // layers. Never publish that backing as a successful capture.
+                    if capture_failed {
+                        manager.fail_backings(&owner, &volume_ids).await?;
+                    }
+                    manager.replace_owner_for(&owner, None, &volume_ids).await?;
+                }
+                self.remove_deleted_sandbox(sandbox_id).await?;
+                *progress = DeleteProgress::Done;
             }
             Ok(())
-        }.await;
-
-        if let Err(error) = delete_result {
-            warn!(?error, "failed to delete sandbox");
-            if let Some(handle) = handle.as_ref() {
-                if let Err(stop_error) = handle.lock().await.stop().await {
-                    warn!(%stop_error, "failed to stop builder after terminal cleanup failure");
+        }
+        .await;
+        if let Err(error) = cleanup {
+            if matches!(progress, DeleteProgress::Stop { .. }) {
+                if let Some(handle) = handle {
+                    self.sandboxes.write().await.insert(sandbox_id, handle);
                 }
             }
-            if let Some(metadata) = self.store.get(&sandbox_id).await? {
-                self.finalize_terminal_volumes(&metadata).await;
-            }
-            self.remove_deleted_sandbox(sandbox_id).await?;
+            warn!(?error, "sandbox deletion needs a cleanup retry");
             return Err(OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
                 operation: SandboxOperation::Stop,
                 source: error,
             });
         }
-
-        self.remove_deleted_sandbox(sandbox_id).await?;
-        Ok(volumes_captured)
+        if let Some(error) = capture_error.filter(|_| !optional_cache) {
+            return Err(OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: SandboxOperation::Stop,
+                source: error.into(),
+            });
+        }
+        Ok(())
     }
 
     async fn remove_deleted_sandbox(&self, sandbox_id: SandboxId) -> Result<()> {
@@ -1352,6 +1342,7 @@ where
         }
         self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
             .await;
+        self.deletions.lock().await.remove(&sandbox_id);
         info!("sandbox deleted");
 
         Ok(())
@@ -2275,32 +2266,23 @@ where
             if metadata.state != SandboxState::Running {
                 continue;
             }
-            let flush_volumes_before_delete =
-                matches!(metadata.timeout_action, SandboxTimeoutAction::Delete)
-                    && !metadata.volume_mounts.is_empty()
-                    && !metadata.template_builder;
-            let claimed_state = match (metadata.timeout_action, flush_volumes_before_delete) {
-                (SandboxTimeoutAction::Pause, _) => SandboxState::Pausing,
-                (SandboxTimeoutAction::Delete, true) => SandboxState::Pausing,
-                (SandboxTimeoutAction::Delete, false) => SandboxState::Killing,
+            let claimed_state = match metadata.timeout_action {
+                SandboxTimeoutAction::Pause => SandboxState::Pausing,
+                SandboxTimeoutAction::Delete => SandboxState::Killing,
             };
+            // Use the same operation lock as explicit deletion before claiming Killing.
+            let deletion = self.deletion_progress(metadata.id).await;
+            let mut progress = deletion.lock().await;
             let result = match self
                 .claim_expired_running_sandbox(metadata.id, eviction_cutoff, claimed_state)
                 .await
             {
                 Ok(true) => match metadata.timeout_action {
                     SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
-                    SandboxTimeoutAction::Delete if flush_volumes_before_delete => {
-                        async {
-                            self.pause_sandbox_impl(metadata.id).await?;
-                            self.delete_sandbox_inner(metadata.id).await.map(|_| ())
-                        }
-                        .await
+                    SandboxTimeoutAction::Delete => {
+                        self.delete_sandbox_impl(metadata.id, SandboxState::Running, &mut progress)
+                            .await
                     }
-                    SandboxTimeoutAction::Delete => self
-                        .delete_sandbox_impl(metadata.id, SandboxState::Running)
-                        .await
-                        .map(|_| ()),
                 }
                 .map(|_| true),
                 Ok(false) => Ok(false),
@@ -2824,7 +2806,7 @@ where
                     }
                     SandboxState::Running => {
                         let result = if metadata.template_builder {
-                            self.delete_sandbox_inner(sandbox_id).await.map(|_| ())
+                            self.delete_sandbox_inner(sandbox_id).await
                         } else {
                             self.pause_sandbox_inner(sandbox_id).await
                         };

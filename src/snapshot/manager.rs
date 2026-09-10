@@ -39,6 +39,22 @@ fn managed_layer_uuids_from_managed(layers: &[ManagedLayer]) -> HashSet<String> 
         .collect()
 }
 
+/// Every layer digest the committed record references for one snapshot
+/// subject (rootfs or one attached drive), managed and external alike.
+fn committed_layer_digests(layers: &[OverlaybdLayerRef]) -> HashSet<String> {
+    layers
+        .iter()
+        .map(|layer| match layer {
+            OverlaybdLayerRef::Managed(managed) => managed.digest.clone(),
+            OverlaybdLayerRef::External(external) => external.digest.clone(),
+        })
+        .collect()
+}
+
+fn committed_memory_layer_digests(layers: &[ManagedLayer]) -> HashSet<String> {
+    layers.iter().map(|layer| layer.digest.clone()).collect()
+}
+
 #[derive(Clone)]
 /// Coordinates committed snapshot lifecycle operations over repository-backed state.
 ///
@@ -157,28 +173,35 @@ impl SnapshotManager {
 
         // Collect any overlaybd layers referenced by this snapshot's runtime images.
         let rootfs_uuids = managed_layer_uuids(&committed.rootfs_layers);
+        let rootfs_digests = committed_layer_digests(&committed.rootfs_layers);
         artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
             &manifest.rootfs.image_config_path,
+            &rootfs_digests,
             &rootfs_uuids,
         ));
         let memory_uuids = managed_layer_uuids_from_managed(&committed.memory_layers);
+        let memory_digests = committed_memory_layer_digests(&committed.memory_layers);
         artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
             &manifest.memory.image_config_path,
+            &memory_digests,
             &memory_uuids,
         ));
         for drive in &manifest.attached_drives {
-            let drive_uuids = committed
+            let (drive_digests, drive_uuids) = committed
                 .attached_drives
                 .iter()
                 .find_map(|committed_drive| match committed_drive {
                     crate::snapshot::CommittedAttachedDrive::Overlaybd {
                         drive_id, layers, ..
-                    } if drive_id == &drive.drive_id => Some(managed_layer_uuids(layers)),
+                    } if drive_id == &drive.drive_id => {
+                        Some((committed_layer_digests(layers), managed_layer_uuids(layers)))
+                    }
                     _ => None,
                 })
                 .unwrap_or_default();
             artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
                 &drive.image_config_path,
+                &drive_digests,
                 &drive_uuids,
             ));
         }

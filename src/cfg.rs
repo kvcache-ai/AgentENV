@@ -126,9 +126,9 @@ pub struct AppConfig {
     #[config(nested)]
     pub node_identity: NodeIdentityConfig,
     #[config(nested)]
-    pub memory_snapshot: MemorySnapshotConfig,
-    #[config(nested)]
     pub template_build: TemplateBuildConfig,
+    #[config(nested)]
+    pub memory_snapshot: MemorySnapshotConfig,
     #[config(nested)]
     pub pool: PoolTomlConfig,
     #[config(nested)]
@@ -354,12 +354,30 @@ pub struct SnapshotConfig {
     pub p2p_enabled: bool,
     #[config(nested)]
     pub image_publish: SnapshotImagePublishConfig,
+    #[config(nested)]
+    pub publish_compression: SnapshotPublishCompressionConfig,
 }
 
 #[derive(Debug, Config, Clone)]
 pub struct SnapshotImagePublishConfig {
     #[config(default = false)]
     pub enabled: bool,
+}
+
+/// Publish-time compression for snapshot layers uploaded to OSS/ACR. Local
+/// layers always stay raw so local resume pays no decompression cost; when
+/// enabled, memory layers and incremental read-write layers are compressed
+/// once as they are uploaded, cutting network bytes for cross-node resume.
+#[derive(Debug, Config, Clone)]
+pub struct SnapshotPublishCompressionConfig {
+    #[config(default = true)]
+    pub enabled: bool,
+    #[config(default = "lz4")]
+    pub algorithm: OverlaybdCompressionAlgorithm,
+    /// Number of blocking threads used to compress 4KiB blocks within a
+    /// layer. 1 = sequential (identical output layout at any value).
+    #[config(default = 1)]
+    pub workers: usize,
 }
 
 /// Bucket addressing style for the S3-compatible snapshot backend.
@@ -467,19 +485,11 @@ pub struct MemorySnapshotConfig {
     /// Default: true; set the environment variable to false to use mincore.
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = true)]
     pub track_dirty_pages: bool,
-    #[config(default = false)]
-    pub compression_enabled: bool,
-    #[config(default = "lz4")]
-    pub compression_algorithm: OverlaybdCompressionAlgorithm,
-    /// Number of blocking threads used to compress 4KiB blocks within a
-    /// memory layer. 1 = sequential (identical output layout at any value).
-    #[config(default = 1)]
-    pub compression_workers: usize,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }
 
-/// Managed image builder resources and template snapshot compression.
+/// Resources for managed Dockerfile build workers.
 #[derive(Debug, Config, Clone)]
 pub struct TemplateBuildConfig {
     #[config(default = "docker.io/moby/buildkit:v0.33.0")]
@@ -491,14 +501,6 @@ pub struct TemplateBuildConfig {
     /// Capacity of each build's writable clone of the repository's shared cache seed.
     #[config(default = 262144u64)]
     pub cache_size_mb: u64,
-    #[config(default = false)]
-    pub compression_enabled: bool,
-    #[config(default = "lz4")]
-    pub compression_algorithm: OverlaybdCompressionAlgorithm,
-    /// Number of blocking threads used to compress 4KiB blocks within a
-    /// layer. 1 = sequential (identical output layout at any value).
-    #[config(default = 1)]
-    pub compression_workers: usize,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -664,6 +666,7 @@ impl_config_default!(
     MachineConfig,
     SnapshotConfig,
     SnapshotImagePublishConfig,
+    SnapshotPublishCompressionConfig,
     UblkTomlConfig,
     UblkOverlaybdTomlConfig,
     MemorySnapshotConfig,

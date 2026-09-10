@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agentenv::cfg::{ConfigManager, OverlaybdCompressionAlgorithm};
+use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{
     BaseSandboxNetworkPolicy, FirecrackerSandbox, FirecrackerSnapshotConfig, SandboxBackend,
     SandboxExecutor, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::ImageConfig;
 use overlaybd::virtual_file::VirtualFile;
-use overlaybd::zfile::{is_zfile, zfile_open_ro, CompressOptions};
+use overlaybd::zfile::is_zfile;
 
 use crate::common;
 
@@ -94,16 +94,15 @@ async fn verify_disk_marker(sandbox: &mut FirecrackerSandbox) -> Result<()> {
     Ok(())
 }
 
-/// Assert that the newest local memory lower of `snapshot` matches the global
-/// `[memory_snapshot]` compression policy:
-/// - `compression_enabled = false` -> raw LSMT layer (no ZFile wrapper)
-/// - `compression_enabled = true` -> ZFile layer with the configured algorithm
-///   and 4096-byte compression blocks
+/// Assert that the newest local memory lower of `snapshot` is a raw LSMT
+/// layer (no ZFile wrapper). Capture-time compression was removed: local
+/// layers always stay raw, so local resume pays no decompression cost.
+/// Compression, when enabled via `[snapshot.publish_compression]`, happens
+/// once at publish time on the repository upload path.
 ///
 /// Image config lowers are ordered bottom-to-top (oldest base layer first), so
 /// the newest local lower is the last entry with a `file` path.
-async fn assert_memory_layer_matches_config(snapshot: &FirecrackerSnapshotConfig) -> Result<()> {
-    let memory_config = &ConfigManager::global().config().memory_snapshot;
+async fn assert_memory_layer_is_raw(snapshot: &FirecrackerSnapshotConfig) -> Result<()> {
     let image_config_path = &snapshot.mem_overlaybd_config.image_config_path;
     let image_config: ImageConfig = serde_json::from_slice(
         &fs::read(image_config_path)
@@ -130,44 +129,13 @@ async fn assert_memory_layer_matches_config(snapshot: &FirecrackerSnapshotConfig
         LocalFile::open_ro(&lower_path)
             .with_context(|| format!("open memory lower {}", lower_path.display()))?,
     );
-    let zfile_flag = is_zfile(file.clone())
+    let zfile_flag = is_zfile(file)
         .await
         .with_context(|| format!("probe zfile header of {}", lower_path.display()))?;
-    if !memory_config.compression_enabled {
-        assert_eq!(
-            zfile_flag,
-            0,
-            "compression disabled: memory lower {} should be a raw LSMT layer",
-            lower_path.display()
-        );
-        return Ok(());
-    }
-
-    let expected_algo = match memory_config.compression_algorithm {
-        OverlaybdCompressionAlgorithm::Lz4 => CompressOptions::LZ4,
-        OverlaybdCompressionAlgorithm::Zstd => CompressOptions::ZSTD,
-    };
     assert_eq!(
         zfile_flag,
-        1,
-        "compression {:?}: memory lower {} should be a ZFile layer",
-        memory_config.compression_algorithm,
-        lower_path.display()
-    );
-    let zfile = zfile_open_ro(file, false)
-        .await
-        .with_context(|| format!("open zfile memory lower {}", lower_path.display()))?;
-    assert_eq!(
-        zfile.options().algo,
-        expected_algo,
-        "memory lower {} should use the configured compression algorithm",
-        lower_path.display()
-    );
-    // The memory snapshot format contract pins 4 KiB compression blocks.
-    assert_eq!(
-        zfile.options().block_size,
-        4096,
-        "memory lower {} should use 4096-byte compression blocks",
+        0,
+        "memory lower {} should be a raw LSMT layer",
         lower_path.display()
     );
     Ok(())
@@ -199,8 +167,8 @@ async fn microvm_lifecycle_and_snapshot_preserve_disk_state() -> Result<()> {
 
 /// Shared body of the memory snapshot format test: pause a marked sandbox into
 /// a temp dir, assert the direct OverlayBD snapshot artifact layout, validate
-/// the newest memory lower against the configured compression policy, and
-/// verify that a resume round-trip preserves guest disk state.
+/// that the newest memory lower is a raw LSMT layer, and verify that a resume
+/// round-trip preserves guest disk state.
 async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
     let sandbox_config = common::default_sandbox_config()?;
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
@@ -222,7 +190,7 @@ async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
         !snapshot_dir.path().join("mem.bin").exists(),
         "direct OverlayBD snapshot should not create mem.bin"
     );
-    assert_memory_layer_matches_config(&snapshot).await?;
+    assert_memory_layer_is_raw(&snapshot).await?;
 
     let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
     verify_disk_marker(&mut resumed).await?;
@@ -231,8 +199,7 @@ async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
 }
 
 /// Direct OverlayBD memory layers are built from Firecracker memory ranges
-/// without an intermediate raw memory file. This test is run by three
-/// independent processes (raw/lz4/zstd temp configs) to cover all modes.
+/// without an intermediate raw memory file, and are always written raw.
 #[tokio::test]
 async fn memory_snapshot_format_matches_config_and_resumes() -> Result<()> {
     common::setup().await;
@@ -275,7 +242,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
 
     write_disk_marker(&mut sandbox).await?;
     let first_snapshot = sandbox.pause().await?;
-    assert_memory_layer_matches_config(&first_snapshot).await?;
+    assert_memory_layer_is_raw(&first_snapshot).await?;
     sandbox.stop().await?;
     let first_snapshot_dir = fs::canonicalize(first_snapshot.vm_state_path.parent().unwrap())?;
     let first_persistent_generation = fs::canonicalize(
@@ -306,7 +273,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&first_snapshot).await?;
     verify_disk_marker(&mut resumed).await?;
     let second_snapshot = resumed.pause().await?;
-    assert_memory_layer_matches_config(&second_snapshot).await?;
+    assert_memory_layer_is_raw(&second_snapshot).await?;
     resumed.stop().await?;
     let second_snapshot_dir = fs::canonicalize(second_snapshot.vm_state_path.parent().unwrap())?;
     let second_mem_lowers = lower_file_paths_from_image_config(

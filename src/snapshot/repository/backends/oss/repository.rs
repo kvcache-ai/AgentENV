@@ -12,10 +12,13 @@ use tracing::{debug, info, warn};
 
 use super::client::{OssClient, OssUploadArtifact};
 use super::layout::OssSnapshotArtifactLayout;
-use crate::cfg::SnapshotImageStoragePolicy;
-use crate::sandbox::FirecrackerSnapshotManifest;
+use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
+use crate::sandbox::{FirecrackerSnapshotManifest, OverlaybdCompactOutput};
 use crate::snapshot::repository::backends::common::acr::{
     AcrDiskImageExporter, DiskImageExportOutcome, DiskImageSubject, SnapshotOciConfigInput,
+};
+use crate::snapshot::repository::backends::common::recontainerize::{
+    prepare_layer_upload, PreparedLayerUpload,
 };
 use crate::snapshot::repository::backends::common::{
     materialize_volume_image_config, write_dense_overlaybd_layer_to_file,
@@ -49,6 +52,7 @@ pub(crate) struct OssSnapshotRepository {
     client: Arc<OssClient>,
     snapshot_image_storage: SnapshotImageStoragePolicy,
     acr_exporter: AcrDiskImageExporter,
+    publish_compression: OverlaybdCompactOutput,
 }
 
 const MAX_ALIAS_BIND_ATTEMPTS: usize = 5;
@@ -58,11 +62,15 @@ impl OssSnapshotRepository {
     pub(crate) fn new(
         client: Arc<OssClient>,
         snapshot_image_storage: SnapshotImageStoragePolicy,
+        publish_compression: &SnapshotPublishCompressionConfig,
     ) -> Self {
+        let publish_compression =
+            OverlaybdCompactOutput::from_publish_compression_config(publish_compression);
         Self {
             client,
             snapshot_image_storage,
-            acr_exporter: AcrDiskImageExporter::new(),
+            acr_exporter: AcrDiskImageExporter::new(publish_compression),
+            publish_compression,
         }
     }
 
@@ -1647,14 +1655,14 @@ impl OssSnapshotRepository {
                     e,
                 )
             })?;
-        let oss_key = OssSnapshotArtifactLayout::managed_layer_key(&descriptor.digest);
-        upload_managed_layer_if_missing(&self.client, &oss_key, &dense_path, artifact).await?;
-
-        Ok(ManagedLayer {
-            digest: descriptor.digest,
-            size: descriptor.size,
-            uuid: None,
-        })
+        let upload = prepare_layer_upload(
+            &dense_path,
+            self.publish_compression,
+            Some((&descriptor.digest, descriptor.size)),
+        )
+        .await?;
+        // Dense-exported layers never carry a layer uuid, recontainerized or not.
+        self.upload_prepared_layer(upload, None, artifact).await
     }
 
     async fn import_managed_layer_by_hash(
@@ -1668,22 +1676,9 @@ impl OssSnapshotRepository {
                 e,
             )
         })?;
-        let descriptor = crate::digest::FileDigest::describe(&canonical)
-            .await
-            .map_err(|e| {
-                RepositoryError::backend(
-                    format!("describe managed layer '{}'", canonical.display()),
-                    e,
-                )
-            })?;
-        let oss_key = OssSnapshotArtifactLayout::managed_layer_key(&descriptor.sha256);
-        upload_managed_layer_if_missing(&self.client, &oss_key, &canonical, artifact).await?;
-
-        Ok(ManagedLayer {
-            digest: descriptor.sha256,
-            size: descriptor.size,
-            uuid: overlaybd_layer_uuid(&canonical),
-        })
+        let upload = prepare_layer_upload(&canonical, self.publish_compression, None).await?;
+        let uuid = overlaybd_layer_uuid(upload.path());
+        self.upload_prepared_layer(upload, uuid, artifact).await
     }
 
     async fn import_managed_layer_with_descriptor(
@@ -1721,13 +1716,31 @@ impl OssSnapshotRepository {
 
         // Descriptor-backed imports intentionally trust internally generated
         // content digests and only validate the cheap size invariant here.
-        let oss_key = OssSnapshotArtifactLayout::managed_layer_key(digest);
-        upload_managed_layer_if_missing(&self.client, &oss_key, &canonical, artifact).await?;
+        // Publish compression recontainerizes raw layers as zfile, which
+        // changes the physical bytes, so `prepare_layer_upload` re-hashes the
+        // compressed output instead of trusting this descriptor.
+        let upload =
+            prepare_layer_upload(&canonical, self.publish_compression, Some((digest, size)))
+                .await?;
+        let uuid = overlaybd_layer_uuid(upload.path());
+        self.upload_prepared_layer(upload, uuid, artifact).await
+    }
 
+    /// Upload a prepared layer under its content-addressed key and build the
+    /// committed managed-layer reference. The object key, digest, and size all
+    /// describe exactly the prepared (possibly recontainerized) bytes.
+    async fn upload_prepared_layer(
+        &self,
+        upload: PreparedLayerUpload,
+        uuid: Option<String>,
+        artifact: OssUploadArtifact,
+    ) -> RepositoryResult<ManagedLayer> {
+        let oss_key = OssSnapshotArtifactLayout::managed_layer_key(upload.digest());
+        upload_managed_layer_if_missing(&self.client, &oss_key, upload.path(), artifact).await?;
         Ok(ManagedLayer {
-            digest: digest.to_string(),
-            size,
-            uuid: overlaybd_layer_uuid(&canonical),
+            digest: upload.digest().to_string(),
+            size: upload.size(),
+            uuid,
         })
     }
 }
@@ -1832,7 +1845,58 @@ mod tests {
             None,
         )
         .expect("oss client");
-        OssSnapshotRepository::new(Arc::new(client), SnapshotImageStoragePolicy::ObjectStorage)
+        OssSnapshotRepository::new(
+            Arc::new(client),
+            SnapshotImageStoragePolicy::ObjectStorage,
+            &SnapshotPublishCompressionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn publish_compression_config_resolves_into_compact_output() {
+        let client = || {
+            Arc::new(
+                OssClient::new(
+                    "bucket".to_string(),
+                    "https://oss.example.com".to_string(),
+                    "region".to_string(),
+                    "prefix".to_string(),
+                    CredentialSource::Anonymous,
+                    None,
+                )
+                .expect("oss client"),
+            )
+        };
+
+        let disabled = OssSnapshotRepository::new(
+            client(),
+            SnapshotImageStoragePolicy::ObjectStorage,
+            &SnapshotPublishCompressionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(disabled.publish_compression, OverlaybdCompactOutput::Raw);
+
+        let enabled = OssSnapshotRepository::new(
+            client(),
+            SnapshotImageStoragePolicy::ObjectStorage,
+            &SnapshotPublishCompressionConfig {
+                enabled: true,
+                algorithm: crate::cfg::OverlaybdCompressionAlgorithm::Zstd,
+                workers: 4,
+            },
+        );
+        assert_eq!(
+            enabled.publish_compression,
+            OverlaybdCompactOutput::ZFile {
+                algorithm: crate::cfg::OverlaybdCompressionAlgorithm::Zstd,
+                workers: 4,
+            }
+        );
     }
 
     #[test]

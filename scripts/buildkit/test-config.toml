@@ -1,0 +1,10 @@
+# Small builders for the single-node and Docker Compose E2E jobs.
+# Other settings use AppConfig defaults.
+[template_build]
+builder_cpu_count = 2
+builder_memory_mb = 2048
+cache_size_mb = 8192
+
+# Snapshot restore uses shared memory devices from the block pool.
+[pool.block]
+enabled = true

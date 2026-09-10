@@ -1,42 +1,51 @@
-# BuildKit Integration Check
+# BuildKit integration tests
 
-`aenv build` runs BuildKit in a temporary AgentENV microVM. Context travels over
-an authenticated WebSocket connection; the node imports the resulting image
-directly from BuildKit's content store into its existing OverlayBD cache.
-
-Run the integration check against one authenticated, configured AgentENV runtime
-node (not a gateway distributing builds between nodes):
+Run the suite against an authenticated, otherwise idle AgentENV node or gateway:
 
 ```bash
 BUILDCTL_BIN=/path/to/aenv-buildctl make test-buildkit
 ```
 
-The test creates uniquely named templates and uses the shared managed cache. It
-checks multi-stage builds, ignored files, changed files, cache persistence across
-template names and replacement builders, unchanged rebuilds, failed builds,
-concurrent builds and cancellation, and Dockerfile HEALTHCHECK readiness.
-On Linux with `script` installed, it also checks the interactive progress bar.
-Its trap removes its templates and sandboxes, retaining the managed cache. It requires `buildctl` (included
-by the AgentENV installers) and an AgentENV host with working VM prerequisites.
-The CLI reads its ordinary
-credentials, including an alternate `XDG_CONFIG_HOME` when configured.
-The single-node E2E CI job runs the fixture with a 2-vCPU, 2048-MiB builder
-and an 8192-MiB cache.
+The suite uses the CLI's credentials (`aenv auth`, or an isolated
+`XDG_CONFIG_HOME`) and requires Python 3.11+, BuildKit's client, and working VM
+prerequisites. Observability must be enabled so it can check worker counts.
+Builds create unique template names; cleanup deletes their templates and
+sandboxes, retaining the managed cache. Logs remain in the printed temporary
+directory when a check fails.
 
-After the separate OCI startup fix is installed, `make test-buildkit-users`
-checks numeric root, an existing non-root UID, a UID without an account, and an
-explicit UID/GID pair during template startup and after restore.
+`test.py` contains named tests for:
 
-Builder image, CPU, memory, and disk size come from `[template_build]` on the
-server. Defaults are 16 vCPUs, 32768 MiB memory, and 262144 MiB cache disk; smaller
-test hosts can override these in their server config. The fixture uses a unique
-cache-mount ID per test run, seeds it before `COPY`, and requires its marker after
-a file update. This checks both instruction cache and mutable-cache reuse.
+- Multi-stage output, `.dockerignore`, changed context files, and startup readiness.
+- Instruction-cache hits and invalidation, plus persistent cache mounts across
+  workers. Random markers in the output distinguish cache reuse from reexecution;
+  `--no-cache` must rerun instructions and reset the affected cache mounts,
+  following the pinned BuildKit version.
+- Concurrent workers producing independent runnable templates from the same seed.
+- Failed solves, cancellation, deadlines, terminal API status, and subsequent
+  cache reuse. Node counts must return to their initial values, and only one ready
+  read-only cache seed may remain after workers and retired volumes are released.
+- Worker isolation, authentication, startup overrides, numeric users, external
+  Dockerfiles, secret mounts, and terminal/nonterminal progress.
 
-After stopping BuildKit, worker deletion checkpoints its cache with the existing
-volume-only snapshot API. The separate volume-deletion optimization provides
-filesystem freezing and sealing for ordinary sandboxes.
+The numeric-user cases also run alone with `make test-buildkit-users`. To run one
+other case, invoke the Python test directly with the built CLI:
+
+```bash
+AENV_BIN=target/debug/aenv BUILDCTL_BIN=/path/to/aenv-buildctl \
+  python3 scripts/buildkit/test.py BuildKitTests.test_concurrent_builds
+```
+
+The single-node and Docker Compose E2E jobs both run the full suite, including
+build traffic through the gateway in Compose. They use
+[`test-config.toml`](test-config.toml), with 2-vCPU, 2048-MiB builders and 8192-MiB
+cache disks. [`install-buildctl.sh`](install-buildctl.sh) downloads the pinned
+client and verifies its release digest; CI setup does not rewrite production
+configuration.
+
+Builder settings are under `[template_build]`; they do not change the resulting
+template's resources. Worker deletion uses the orchestrator's normal volume
+freeze, capture, stop, and release path. Cache capture is optional, while failed
+stops retain ownership for cleanup to retry.
 
 See [template builds](../../docs/src/concepts/templates.md#aenv-build) for CLI
-flags and the additive API. BuildKit's protocol and Dockerfile implementation
-are provided by [upstream BuildKit](https://github.com/moby/buildkit).
+flags, cache ownership, and the API.

@@ -553,6 +553,7 @@ mod client_tests {
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("snapshot failed"), "error: {msg}");
+        assert!(!err.is::<RestackSnapshotTerminalFailure>(), "{err:#}");
     }
 
     #[tokio::test]
@@ -585,6 +586,7 @@ mod client_tests {
             .unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("unexpected"), "error: {msg}");
+        assert!(err.is::<RestackSnapshotTerminalFailure>(), "{err:#}");
     }
 
     // ── shutdown ────────────────────────────────────────────────────────

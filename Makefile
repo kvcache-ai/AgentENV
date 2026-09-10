@@ -206,10 +206,10 @@ test-e2e:
 	bash $(TEST_SCRIPTS_DIR)/e2e/run_e2e.sh
 
 test-buildkit: build-aenv
-	AENV_BIN="$${CARGO_TARGET_DIR:-$$(pwd)/target}/debug/aenv" bash scripts/buildkit/test.sh
+	AENV_BIN="$${CARGO_TARGET_DIR:-$$(pwd)/target}/debug/aenv" python3 scripts/buildkit/test.py
 
 test-buildkit-users: build-aenv
-	AENV_BIN="$${CARGO_TARGET_DIR:-$$(pwd)/target}/debug/aenv" bash scripts/buildkit/test-users.sh
+	AENV_BIN="$${CARGO_TARGET_DIR:-$$(pwd)/target}/debug/aenv" python3 scripts/buildkit/test.py BuildKitTests.test_numeric_users
 
 test-e2e-compose:
 	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" E2E_MODE=compose bash $(TEST_SCRIPTS_DIR)/e2e/run_e2e.sh

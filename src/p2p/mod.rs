@@ -19,7 +19,7 @@ pub use error::{Error as P2pError, Result as P2pResult};
 pub use transport::{DisabledP2pTransport, P2pByteStream, P2pTransport};
 pub use types::{
     P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProvider, P2pArtifactProviderHint,
-    P2pEndpoint, P2pPeer, P2pPublishMode, P2pPublishRequest, P2pPublishSource,
+    P2pEndpoint, P2pFetchOptions, P2pPeer, P2pPublishMode, P2pPublishRequest, P2pPublishSource,
 };
 
 /// Construct an artifact transport from the app config, returning an error if the configured transport is invalid or fails to initialize.

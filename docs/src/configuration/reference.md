@@ -403,6 +403,28 @@ Source-registry image publication. Only takes effect when `snapshot.repository_b
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | When enabled, publishing a snapshot also pushes its rootfs as an OverlayBD-native OCI image tag `agentenv-snapshot-{snapshot_id}` to the original source registry. Requires source images to be OverlayBD-native in that registry and push credentials in the Docker config (`~/.docker/config.json`). Existing remote layers are referenced by digest; only new delta layers are uploaded. The published reference is exposed as `imageRef` in snapshot APIs. Memory and VM-state artifacts always remain in the snapshot repository. |
 
+## `[snapshot.publish_compression]`
+
+Publish-time compression for snapshot layers uploaded to OSS/ACR. Local layers
+always stay raw, so local resume pays no decompression cost; enabled by default,
+memory layers and incremental read-write layers are compressed once as they
+are uploaded, cutting network bytes for cross-node resume. This is the only
+compression switch; the legacy capture-time knobs under `[memory_snapshot]`
+and `[template_build]` were removed from the configuration schema.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `true` | Compress memory layers and incremental read-write layers when uploading them to OSS/ACR. |
+| `algorithm` | string | `"lz4"` | Compression algorithm. Valid values are only `lz4` and `zstd`. |
+| `workers` | integer | `1` | Number of blocking threads used to compress 4 KiB blocks within a layer. `1` is sequential; higher values run in parallel without changing the output layout. Clamped to 64. |
+
+Known impact: compressed layers are recorded without a layer uuid (ZFile
+layers carry no LSMT uuid), so P2P uuid-keyed acceleration does not apply to
+them. Snapshot P2P publication also skips digest-keyed advertisements for
+local raw layers whose digest is absent from the committed record — the
+record names the compressed bytes, so the raw digest key would never be
+looked up by consumers.
+
 ## `[backend.posix_fs]`
 
 POSIX filesystem-backed snapshot repository configuration. This section is used when `snapshot.repository_backend = "posix_fs"`.
@@ -524,8 +546,6 @@ the default path on every startup.
 |-----|------|---------|-------------|
 | `overlaybd_global_config_path` | string | `"$AENV_HOME/overlaybd/mem-overlaybd-global.json"` | Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file. |
 | `track_dirty_pages` | bool | `true` | Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false` to disable it. |
-| `compression_enabled` | bool | `false` | Enable compression for memory snapshot layers. When disabled, `compression_algorithm` is still parsed but has no effect. This setting affects only memory layers; the physical file name remains `overlaybd.commit`. |
-| `compression_algorithm` | string | `"lz4"` | Compression algorithm for memory snapshot layers. Valid values are only `lz4` and `zstd`. |
 
 ## `[memory_snapshot.background_download]`
 
@@ -568,15 +588,12 @@ and are then re-fetched on demand.
 
 ## `[template_build]`
 
-Managed builder resources and template snapshot compression. The first Dockerfile
+Managed Dockerfile builder resources. The first Dockerfile
 build on a node prepares a reusable internal builder template. Each build mounts
 a separate clone of the repository's shared cache seed; concurrent builds do not
 queue for cache ownership. The last successfully published cache becomes the next
 seed, with best-effort reuse of concurrent branches.
 Builder resources do not change the resulting template's CPU or memory.
-Compression is independent of `[memory_snapshot].compression_enabled` and
-applies to both memory layers and the sealed rootfs read-write layer. Ordinary
-pause/snapshot captures are not affected.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -584,6 +601,3 @@ pause/snapshot captures are not affected.
 | `builder_cpu_count` | integer | `16` | Builder vCPUs, from 1 to 255. |
 | `builder_memory_mb` | integer | `32768` | Builder memory in MiB, from 256 to 2147483647. |
 | `cache_size_mb` | integer | `262144` | Capacity in MiB for new persistent BuildKit data disks. At least 1024 and at most `volume.max_size_mb`; changing it does not resize existing caches. |
-| `compression_enabled` | bool | `false` | Enable compression for snapshot artifacts captured by template builds. When enabled, both the memory layers and the sealed rootfs read-write layer are written as ZFile-compressed layers. |
-| `compression_algorithm` | string | `"lz4"` | Compression algorithm. Valid values are only `lz4` and `zstd`. Parsed but ignored when compression is disabled. |
-| `compression_workers` | integer | `1` | Number of blocking threads used to compress 4 KiB blocks within a layer. `1` is sequential; higher values run in parallel without changing the output layout. Clamped to 64. |

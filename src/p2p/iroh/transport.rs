@@ -18,6 +18,7 @@ use iroh::{Endpoint, EndpointAddr, Watcher};
 use iroh_blobs::api::blobs::{AddPathOptions, ImportMode};
 use iroh_blobs::api::downloader::Downloader;
 use iroh_blobs::api::proto::ExportRangesItem;
+use iroh_blobs::api::TempTag;
 use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, GetRequest};
 use iroh_blobs::store::fs::{options::Options as FsStoreOptions, FsStore};
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
@@ -36,7 +37,7 @@ use crate::p2p::error::{Error, Result};
 use crate::p2p::transport::P2pTransport;
 use crate::p2p::types::{
     P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProvider, P2pArtifactProviderHint,
-    P2pEndpoint, P2pPeer, P2pPublishMode, P2pPublishRequest, P2pPublishSource,
+    P2pEndpoint, P2pFetchOptions, P2pPeer, P2pPublishMode, P2pPublishRequest, P2pPublishSource,
 };
 use crate::p2p::P2pByteStream;
 
@@ -253,6 +254,14 @@ impl IrohBlobsP2pTransport {
         self.published_catalog.descriptor_for(key).await
     }
 
+    async fn pin_blob(&self, blob_hash: iroh_blobs::Hash) -> Result<TempTag> {
+        self.store
+            .tags()
+            .temp_tag(HashAndFormat::raw(blob_hash))
+            .await
+            .map_err(|err| Error::internal_message("protect P2P fetch from GC", err))
+    }
+
     /// Export a local blob to a caller-requested destination path and return its size in bytes.
     async fn export_local_blob(
         &self,
@@ -269,6 +278,7 @@ impl IrohBlobsP2pTransport {
         &self,
         blob_hash: iroh_blobs::Hash,
         range: Range<u64>,
+        tag: TempTag,
     ) -> Result<P2pByteStream> {
         let expected_len =
             range
@@ -280,9 +290,10 @@ impl IrohBlobsP2pTransport {
         let range_start = range.start;
         let range_end = range.end;
         let inner = Box::pin(self.store.export_ranges(blob_hash, range).stream());
+        // Keep the tag in the lazy stream until EOF or caller cancellation.
         let stream = stream::unfold(
-            (inner, expected_len, false),
-            move |(mut inner, mut remaining, done_after_error)| async move {
+            (inner, expected_len, false, tag),
+            move |(mut inner, mut remaining, done_after_error, tag)| async move {
                 if done_after_error || remaining == 0 {
                     return None;
                 }
@@ -296,7 +307,7 @@ impl IrohBlobsP2pTransport {
                                         reason: "exported range chunk length does not fit u64"
                                             .to_string(),
                                     }),
-                                    (inner, 0, true),
+                                    (inner, 0, true, tag),
                                 ));
                             };
                             let Some(leaf_end) = leaf.offset.checked_add(data_len) else {
@@ -304,7 +315,7 @@ impl IrohBlobsP2pTransport {
                                     Err(Error::InvalidDescriptor {
                                         reason: "exported range chunk end overflow".to_string(),
                                     }),
-                                    (inner, 0, true),
+                                    (inner, 0, true, tag),
                                 ));
                             };
                             let overlap_start = leaf.offset.max(range_start);
@@ -316,12 +327,12 @@ impl IrohBlobsP2pTransport {
                             let end = (overlap_end - leaf.offset) as usize;
                             let bytes = leaf.data.slice(start..end);
                             remaining = remaining.saturating_sub(bytes.len() as u64);
-                            return Some((Ok(bytes), (inner, remaining, false)));
+                            return Some((Ok(bytes), (inner, remaining, false, tag)));
                         }
                         ExportRangesItem::Error(err) => {
                             return Some((
                                 Err(Error::internal_message("export local P2P blob range", err)),
-                                (inner, 0, true),
+                                (inner, 0, true, tag),
                             ));
                         }
                     }
@@ -333,7 +344,7 @@ impl IrohBlobsP2pTransport {
                         Err(Error::InvalidDescriptor {
                             reason: format!("exported range ended {remaining} bytes short"),
                         }),
-                        (inner, 0, true),
+                        (inner, 0, true, tag),
                     ))
                 }
             },
@@ -391,18 +402,21 @@ impl IrohBlobsP2pTransport {
         }
     }
 
+    // The caller must retain this tag through export/read, or transfer it to
+    // the returned stream. Download completion alone does not retain the blob.
     async fn download_blob(
         &self,
         request: GetRequest,
         providers: Vec<iroh::EndpointId>,
-    ) -> Result<()> {
+    ) -> Result<TempTag> {
+        let tag = self.pin_blob(request.hash).await?;
         let operation = "download P2P artifact blob";
         let download = self.downloader.download(request, providers);
         tokio::time::timeout(self.fetch_timeout, download)
             .await
             .map_err(|_| Error::Timeout { operation })?
             .map_err(|err| Error::internal_message(operation, err))?;
-        Ok(())
+        Ok(tag)
     }
 
     fn resolve_fetch_source(&self, descriptor: &P2pArtifactDescriptor) -> Result<BlobFetchSource> {
@@ -484,10 +498,15 @@ impl P2pTransport for IrohBlobsP2pTransport {
     }
 
     #[instrument(
-        skip(self, descriptor),
+        skip(self, descriptor, options),
         fields(key = %descriptor.key, destination = %destination.display())
     )]
-    async fn fetch(&self, descriptor: &P2pArtifactDescriptor, destination: &Path) -> Result<u64> {
+    async fn fetch_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        destination: &Path,
+        options: P2pFetchOptions,
+    ) -> Result<u64> {
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await.with_context(|| {
                 format!("create P2P fetch destination dir {}", parent.display())
@@ -496,6 +515,7 @@ impl P2pTransport for IrohBlobsP2pTransport {
 
         let (blob_hash, providers) = match self.resolve_fetch_source(descriptor)? {
             BlobFetchSource::Local { blob_hash } => {
+                let _tag = self.pin_blob(blob_hash).await?;
                 // A local lookup hit still goes through export so callers get the
                 // artifact at the requested destination rather than a store path.
                 let size = self.export_local_blob(blob_hash, destination).await?;
@@ -510,18 +530,26 @@ impl P2pTransport for IrohBlobsP2pTransport {
         let providers_count = providers.len();
 
         // Download into the local FsStore first, then export to the caller's destination.
-        self.download_blob(GetRequest::blob(blob_hash), providers)
+        let _tag = self
+            .download_blob(GetRequest::blob(blob_hash), providers)
             .await?;
-        self.try_advertise_fetched_blob(descriptor, blob_hash).await;
+        if options.advertise {
+            self.try_advertise_fetched_blob(descriptor, blob_hash).await;
+        }
         let size = self.export_local_blob(blob_hash, destination).await?;
         debug!(providers_count, size, "fetched artifact from P2P provider");
         Ok(size)
     }
 
-    #[instrument(skip(self, descriptor), fields(key = %descriptor.key))]
-    async fn fetch_bytes(&self, descriptor: &P2pArtifactDescriptor) -> Result<Bytes> {
+    #[instrument(skip(self, descriptor, options), fields(key = %descriptor.key))]
+    async fn fetch_bytes_with_options(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        options: P2pFetchOptions,
+    ) -> Result<Bytes> {
         let (blob_hash, providers) = match self.resolve_fetch_source(descriptor)? {
             BlobFetchSource::Local { blob_hash } => {
+                let _tag = self.pin_blob(blob_hash).await?;
                 let bytes = self.read_local_blob_bytes(blob_hash).await?;
                 debug!(
                     size = bytes.len(),
@@ -539,9 +567,12 @@ impl P2pTransport for IrohBlobsP2pTransport {
         // Full in-memory fetches download the complete blob into the local store
         // first, matching file fetch semantics and allowing this node to serve
         // the artifact to later peers.
-        self.download_blob(GetRequest::blob(blob_hash), providers)
+        let _tag = self
+            .download_blob(GetRequest::blob(blob_hash), providers)
             .await?;
-        self.try_advertise_fetched_blob(descriptor, blob_hash).await;
+        if options.advertise {
+            self.try_advertise_fetched_blob(descriptor, blob_hash).await;
+        }
         let bytes = self.read_local_blob_bytes(blob_hash).await?;
         debug!(
             providers_count,
@@ -575,7 +606,8 @@ impl P2pTransport for IrohBlobsP2pTransport {
 
         let (blob_hash, providers) = match self.resolve_fetch_source(descriptor)? {
             BlobFetchSource::Local { blob_hash } => {
-                let stream = self.export_local_blob_range(blob_hash, range).await?;
+                let tag = self.pin_blob(blob_hash).await?;
+                let stream = self.export_local_blob_range(blob_hash, range, tag).await?;
                 debug!("fetched artifact range from local P2P store");
                 return Ok(stream);
             }
@@ -586,14 +618,13 @@ impl P2pTransport for IrohBlobsP2pTransport {
         };
         let providers_count = providers.len();
 
-        // Range reads are foreground acceleration only: the downloaded bytes
-        // land in the iroh store but are not retention-tagged here, so GC may
-        // reclaim them unless the full layer is later published by background
-        // download.
+        // A temporary tag protects downloaded bytes until the stream finishes or is dropped.
+        // After that, GC may reclaim them unless background publication retains the full layer.
         let ranges = ChunkRanges::bytes(range.clone());
-        self.download_blob(GetRequest::blob_ranges(blob_hash, ranges), providers)
+        let tag = self
+            .download_blob(GetRequest::blob_ranges(blob_hash, ranges), providers)
             .await?;
-        let stream = self.export_local_blob_range(blob_hash, range).await?;
+        let stream = self.export_local_blob_range(blob_hash, range, tag).await?;
         debug!(providers_count, "fetched artifact range from P2P provider");
         Ok(stream)
     }
@@ -947,6 +978,13 @@ mod tests {
     async fn test_provider_consumer(
         temp: &tempfile::TempDir,
     ) -> Result<(IrohBlobsP2pTransport, IrohBlobsP2pTransport)> {
+        test_provider_consumer_with_gc_interval(temp, DEFAULT_STORE_GC_INTERVAL).await
+    }
+
+    async fn test_provider_consumer_with_gc_interval(
+        temp: &tempfile::TempDir,
+        gc_interval: Duration,
+    ) -> Result<(IrohBlobsP2pTransport, IrohBlobsP2pTransport)> {
         let provider = test_transport(
             &p2p_config(temp.path().join("provider-store")),
             "provider-node",
@@ -957,17 +995,40 @@ mod tests {
         let provider_endpoint = provider
             .local_endpoint()
             .context("provider transport should expose a local endpoint")?;
-        let consumer = test_transport(
+        let consumer = test_transport_with_gc_interval(
             &p2p_config(temp.path().join("consumer-store")),
             "consumer-node",
             Arc::new(StaticP2pPeerDiscovery::new(vec![P2pPeer {
                 node_id: "provider-node".to_string(),
                 endpoint: provider_endpoint,
             }])),
+            gc_interval,
         )
         .await
         .context("start consumer P2P transport")?;
         Ok((provider, consumer))
+    }
+
+    // Deletion of an untagged sentinel confirms that a real GC sweep has run,
+    // rather than assuming completion after an arbitrary delay.
+    async fn run_gc_and_wait(transport: &IrohBlobsP2pTransport) -> anyhow::Result<()> {
+        let sentinel = transport
+            .store
+            .add_bytes(Bytes::from_static(b"GC sweep sentinel"))
+            .temp_tag()
+            .await?;
+        let hash = sentinel.hash();
+        drop(sentinel);
+        transport.pending_gc.store(true, Ordering::Release);
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while transport.store.blobs().has(hash).await? {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            anyhow::Ok(())
+        })
+        .await
+        .context("wait for GC sweep")??;
+        Ok(())
     }
 
     fn invalid_endpoint() -> P2pEndpoint {
@@ -1152,10 +1213,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transport_fetch_range_reads_exact_bytes_without_advertising_partial_blob() -> Result<()>
-    {
+    async fn transport_fetch_range_reads_exact_bytes_without_advertising_partial_blob(
+    ) -> anyhow::Result<()> {
         let temp = tempfile::tempdir().context("create temp test dir")?;
-        let (provider, consumer) = test_provider_consumer(&temp).await?;
+        let (provider, consumer) =
+            test_provider_consumer_with_gc_interval(&temp, Duration::from_millis(10)).await?;
 
         let key = "test/p2p/iroh/range-fetch".to_string();
         let bytes: Vec<u8> = (0..(128 * 1024)).map(|idx| (idx % 251) as u8).collect();
@@ -1174,6 +1236,9 @@ mod tests {
             .fetch_byte_range(&descriptor, offset, len)
             .await
             .context("fetch range from provider")?;
+        // The stream has not been polled yet: its guard must protect even
+        // partial data from a new GC pass before any export reader opens it.
+        run_gc_and_wait(&consumer).await?;
         let fetched = collect_range_stream(fetched).await?;
         assert_eq!(
             fetched.as_slice(),
@@ -1183,9 +1248,104 @@ mod tests {
             consumer.get_local(&key).await.is_none(),
             "range-only fetch must not advertise this node as a full artifact provider"
         );
+        run_gc_and_wait(&consumer).await?;
+        assert!(consumer.store.blobs().list().hashes().await?.is_empty());
+
+        // Dropping an unconsumed stream must release protection as well.
+        let stream = consumer.fetch_byte_range(&descriptor, offset, len).await?;
+        drop(stream);
+        run_gc_and_wait(&consumer).await?;
+        assert!(consumer.store.blobs().list().hashes().await?.is_empty());
 
         consumer.shutdown().await.context("shutdown consumer P2P")?;
         provider.shutdown().await.context("shutdown provider P2P")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn downloaded_blob_survives_gc_until_export_and_read_finish() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (provider, consumer) =
+            test_provider_consumer_with_gc_interval(&temp, Duration::from_millis(10)).await?;
+        let key = "test/p2p/iroh/download-gc".to_string();
+        let bytes = vec![0x5a; 256 * 1024];
+        provider
+            .publish(&P2pPublishRequest::bytes(key.clone(), bytes.clone()))
+            .await?;
+        let descriptor = consumer.lookup(&key).await?.context("descriptor")?;
+        let BlobFetchSource::Remote {
+            blob_hash,
+            providers,
+        } = consumer.resolve_fetch_source(&descriptor)?
+        else {
+            anyhow::bail!("expected remote provider");
+        };
+
+        let tag = consumer
+            .download_blob(GetRequest::blob(blob_hash), providers)
+            .await?;
+        // Force the precise gap between download completion and export/read.
+        // A fresh GC pass clears iroh's protection from previous writes.
+        run_gc_and_wait(&consumer).await?;
+        let destination = temp.path().join("downloaded.bin");
+        assert_eq!(
+            consumer.export_local_blob(blob_hash, &destination).await?,
+            bytes.len() as u64
+        );
+        assert_eq!(tokio::fs::read(&destination).await?, bytes);
+        assert_eq!(
+            consumer.read_local_blob_bytes(blob_hash).await?.as_ref(),
+            bytes
+        );
+        assert!(consumer.get_local(&key).await.is_none());
+        assert!(consumer
+            .store
+            .tags()
+            .get(publish_tag_name(&key))
+            .await?
+            .is_none());
+
+        drop(tag);
+        run_gc_and_wait(&consumer).await?;
+        assert!(!consumer.store.blobs().has(blob_hash).await?);
+        consumer.shutdown().await?;
+        provider.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_file_export_releases_fetch_tag() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (provider, consumer) =
+            test_provider_consumer_with_gc_interval(&temp, Duration::from_millis(10)).await?;
+        let key = "test/p2p/iroh/export-error-gc".to_string();
+        provider
+            .publish(&P2pPublishRequest::bytes(
+                key.clone(),
+                vec![0x5a; 256 * 1024],
+            ))
+            .await?;
+        let descriptor = consumer.lookup(&key).await?.context("descriptor")?;
+        // Exporting to an existing directory fails after a successful download.
+        assert!(consumer
+            .fetch_with_options(
+                &descriptor,
+                temp.path(),
+                P2pFetchOptions { advertise: false }
+            )
+            .await
+            .is_err());
+        assert!(consumer.get_local(&key).await.is_none());
+        run_gc_and_wait(&consumer).await?;
+        assert!(
+            !consumer
+                .store
+                .blobs()
+                .has(blob_hash_from_descriptor(&descriptor)?)
+                .await?
+        );
+        consumer.shutdown().await?;
+        provider.shutdown().await?;
         Ok(())
     }
 
@@ -1222,6 +1382,26 @@ mod tests {
 
         consumer.shutdown().await.context("shutdown consumer P2P")?;
         provider.shutdown().await.context("shutdown provider P2P")?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transport_fetch_bytes_can_skip_advertising() -> Result<()> {
+        let temp = tempfile::tempdir().context("create temp test dir")?;
+        let (provider, consumer) = test_provider_consumer(&temp).await?;
+        let key = "test/p2p/iroh/bytes-fetch-no-advertise".to_string();
+        let bytes = Bytes::from_static(b"fetched without catalog publication");
+        provider
+            .publish(&P2pPublishRequest::bytes(key.clone(), bytes.clone()))
+            .await?;
+        let descriptor = consumer.lookup(&key).await?.context("descriptor")?;
+        let fetched = consumer
+            .fetch_bytes_with_options(&descriptor, P2pFetchOptions { advertise: false })
+            .await?;
+        assert_eq!(fetched, bytes);
+        assert!(consumer.get_local(&key).await.is_none());
+        consumer.shutdown().await?;
+        provider.shutdown().await?;
         Ok(())
     }
 

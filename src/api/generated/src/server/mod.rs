@@ -5594,7 +5594,7 @@ where
 
     let resp = match result {
         Ok(rsp) => match rsp {
-            apis::volumes::VolumesGetResponse::Status200_VolumesReturnedSuccessfully {
+            apis::volumes::VolumesGetResponse::Status200_SuccessfullyListedTeamVolumes {
                 body,
                 x_next_token,
             } => {
@@ -5631,8 +5631,8 @@ where
                 .unwrap()?;
                 response.body(Body::from(body_content))
             }
-            apis::volumes::VolumesGetResponse::Status401_AuthenticationError(body) => {
-                let mut response = response.status(401);
+            apis::volumes::VolumesGetResponse::Status400_BadRequest(body) => {
+                let mut response = response.status(400);
                 {
                     let mut response_headers = response.headers_mut().unwrap();
                     response_headers
@@ -5649,8 +5649,8 @@ where
                 .unwrap()?;
                 response.body(Body::from(body_content))
             }
-            apis::volumes::VolumesGetResponse::Status400_BadRequest(body) => {
-                let mut response = response.status(400);
+            apis::volumes::VolumesGetResponse::Status401_AuthenticationError(body) => {
+                let mut response = response.status(401);
                 {
                     let mut response_headers = response.headers_mut().unwrap();
                     response_headers
@@ -5772,7 +5772,9 @@ where
 
     let resp = match result {
         Ok(rsp) => match rsp {
-            apis::volumes::VolumesPostResponse::Status201_VolumeCreatedSuccessfully(body) => {
+            apis::volumes::VolumesPostResponse::Status201_SuccessfullyCreatedANewTeamVolume(
+                body,
+            ) => {
                 let mut response = response.status(201);
                 {
                     let mut response_headers = response.headers_mut().unwrap();
@@ -5792,6 +5794,24 @@ where
             }
             apis::volumes::VolumesPostResponse::Status400_BadRequest(body) => {
                 let mut response = response.status(400);
+                {
+                    let mut response_headers = response.headers_mut().unwrap();
+                    response_headers
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                }
+
+                let body_content = tokio::task::spawn_blocking(move || {
+                    serde_json::to_vec(&body).map_err(|e| {
+                        error!(error = ?e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })
+                })
+                .await
+                .unwrap()?;
+                response.body(Body::from(body_content))
+            }
+            apis::volumes::VolumesPostResponse::Status401_AuthenticationError(body) => {
+                let mut response = response.status(401);
                 {
                     let mut response_headers = response.headers_mut().unwrap();
                     response_headers
@@ -5923,75 +5943,91 @@ where
     let mut response = Response::builder();
 
     let resp = match result {
-        Ok(rsp) => match rsp {
-            apis::volumes::VolumesVolumeIdDeleteResponse::Status204_VolumeDeletedSuccessfully => {
-                let mut response = response.status(204);
-                response.body(Body::empty())
-            }
-            apis::volumes::VolumesVolumeIdDeleteResponse::Status404_NotFound(body) => {
-                let mut response = response.status(404);
-                {
-                    let mut response_headers = response.headers_mut().unwrap();
-                    response_headers
-                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                }
+                                            Ok(rsp) => match rsp {
+                                                apis::volumes::VolumesVolumeIdDeleteResponse::Status204_SuccessfullyDeletedATeamVolume
+                                                => {
+                                                  let mut response = response.status(204);
+                                                  response.body(Body::empty())
+                                                },
+                                                apis::volumes::VolumesVolumeIdDeleteResponse::Status401_AuthenticationError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(401);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
 
-                let body_content = tokio::task::spawn_blocking(move || {
-                    serde_json::to_vec(&body).map_err(|e| {
-                        error!(error = ?e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })
-                })
-                .await
-                .unwrap()?;
-                response.body(Body::from(body_content))
-            }
-            apis::volumes::VolumesVolumeIdDeleteResponse::Status409_Conflict(body) => {
-                let mut response = response.status(409);
-                {
-                    let mut response_headers = response.headers_mut().unwrap();
-                    response_headers
-                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                }
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::volumes::VolumesVolumeIdDeleteResponse::Status404_NotFound
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(404);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
 
-                let body_content = tokio::task::spawn_blocking(move || {
-                    serde_json::to_vec(&body).map_err(|e| {
-                        error!(error = ?e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })
-                })
-                .await
-                .unwrap()?;
-                response.body(Body::from(body_content))
-            }
-            apis::volumes::VolumesVolumeIdDeleteResponse::Status500_ServerError(body) => {
-                let mut response = response.status(500);
-                {
-                    let mut response_headers = response.headers_mut().unwrap();
-                    response_headers
-                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                }
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::volumes::VolumesVolumeIdDeleteResponse::Status409_Conflict
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(409);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
 
-                let body_content = tokio::task::spawn_blocking(move || {
-                    serde_json::to_vec(&body).map_err(|e| {
-                        error!(error = ?e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })
-                })
-                .await
-                .unwrap()?;
-                response.body(Body::from(body_content))
-            }
-        },
-        Err(why) => {
-            // Application code returned an error. This should not happen, as the implementation should
-            // return a valid response.
-            return api_impl
-                .as_ref()
-                .handle_error(&method, &host, &cookies, why)
-                .await;
-        }
-    };
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::volumes::VolumesVolumeIdDeleteResponse::Status500_ServerError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(500);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                            },
+                                            Err(why) => {
+                                                    // Application code returned an error. This should not happen, as the implementation should
+                                                    // return a valid response.
+                                                    return api_impl.as_ref().handle_error(&method, &host, &cookies, why).await;
+                                            },
+                                        };
 
     resp.map_err(|e| {
         error!(error = ?e);
@@ -6061,73 +6097,86 @@ where
     let mut response = Response::builder();
 
     let resp = match result {
-        Ok(rsp) => match rsp {
-            apis::volumes::VolumesVolumeIdGetResponse::Status200_VolumeReturnedSuccessfully(
-                body,
-            ) => {
-                let mut response = response.status(200);
-                {
-                    let mut response_headers = response.headers_mut().unwrap();
-                    response_headers
-                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                }
+                                            Ok(rsp) => match rsp {
+                                                apis::volumes::VolumesVolumeIdGetResponse::Status200_SuccessfullyRetrievedATeamVolume
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(200);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
 
-                let body_content = tokio::task::spawn_blocking(move || {
-                    serde_json::to_vec(&body).map_err(|e| {
-                        error!(error = ?e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })
-                })
-                .await
-                .unwrap()?;
-                response.body(Body::from(body_content))
-            }
-            apis::volumes::VolumesVolumeIdGetResponse::Status404_NotFound(body) => {
-                let mut response = response.status(404);
-                {
-                    let mut response_headers = response.headers_mut().unwrap();
-                    response_headers
-                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                }
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::volumes::VolumesVolumeIdGetResponse::Status401_AuthenticationError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(401);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
 
-                let body_content = tokio::task::spawn_blocking(move || {
-                    serde_json::to_vec(&body).map_err(|e| {
-                        error!(error = ?e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })
-                })
-                .await
-                .unwrap()?;
-                response.body(Body::from(body_content))
-            }
-            apis::volumes::VolumesVolumeIdGetResponse::Status500_ServerError(body) => {
-                let mut response = response.status(500);
-                {
-                    let mut response_headers = response.headers_mut().unwrap();
-                    response_headers
-                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                }
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::volumes::VolumesVolumeIdGetResponse::Status404_NotFound
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(404);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
 
-                let body_content = tokio::task::spawn_blocking(move || {
-                    serde_json::to_vec(&body).map_err(|e| {
-                        error!(error = ?e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })
-                })
-                .await
-                .unwrap()?;
-                response.body(Body::from(body_content))
-            }
-        },
-        Err(why) => {
-            // Application code returned an error. This should not happen, as the implementation should
-            // return a valid response.
-            return api_impl
-                .as_ref()
-                .handle_error(&method, &host, &cookies, why)
-                .await;
-        }
-    };
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::volumes::VolumesVolumeIdGetResponse::Status500_ServerError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(500);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                            },
+                                            Err(why) => {
+                                                    // Application code returned an error. This should not happen, as the implementation should
+                                                    // return a valid response.
+                                                    return api_impl.as_ref().handle_error(&method, &host, &cookies, why).await;
+                                            },
+                                        };
 
     resp.map_err(|e| {
         error!(error = ?e);

@@ -5,10 +5,9 @@
 //! `close_seal + restack` the live upper before writing the persisted
 //! snapshot config.
 //!
-//! Sealed layers stay raw by default. Callers (template builds) may request
-//! compressed seal output, in which case only the staged snapshot artifact
-//! is recontainerized as ZFile — the live runtime keeps referencing the raw
-//! sealed layer written by the daemon.
+//! Sealed layers always stay raw locally: compression, when enabled via
+//! `[snapshot.publish_compression]`, happens once at publish time when the
+//! snapshot repository uploads layers to OSS/ACR.
 //!
 use std::ffi::OsStr;
 use std::fs;
@@ -30,7 +29,6 @@ use tracing::{debug, warn};
 use super::process_vm_reader::ProcessVmReader;
 use super::sandbox::managed_snapshot_base;
 use crate::cfg::ConfigManager;
-use crate::image::local_layer::SNAPSHOT_ZFILE_DELTA_LAYER_FILE;
 use crate::sandbox::ublk::UblkDevice;
 use crate::sandbox::ublk::{
     compact_layers, create_commit_args, OverlaybdCompactOutput, UblkDeviceManager,
@@ -342,7 +340,6 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
     snapshot_layer_path: Option<&Path>,
-    seal_output: OverlaybdCompactOutput,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -377,30 +374,14 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         None
     };
 
-    // Compress the freshly sealed layer when the caller requested compressed
-    // seal output. The live runtime config was already rewritten to reference
-    // the raw sealed layer; only the staged snapshot artifact is
-    // recontainerized as ZFile.
-    let appended_layer = match (appended_layer, seal_output) {
-        (Some(layer), OverlaybdCompactOutput::ZFile { .. }) => {
-            let compressed_path = output_dir.join(SNAPSHOT_ZFILE_DELTA_LAYER_FILE);
-            compact_layers(std::slice::from_ref(&layer), &compressed_path, seal_output)
-                .await
-                .context("compress sealed snapshot layer")?
-                .context("compress sealed snapshot layer produced no output")?;
-            Some(local_layer_config(&compressed_path))
-        }
-        (layer, _) => layer,
-    };
-
     let rewritten_lowers = rewrite_lowers_with_owned_runtime_suffix(
         image_config.lowers,
         output_dir,
         appended_layer,
         MANAGED_BASE_LAYER_FILE,
-        // Rootfs seals stay raw unless the caller (template builds) requested
-        // compressed seal output; memory snapshots have their own switch.
-        seal_output,
+        // Sealed rootfs layers always stay raw; compression happens once at
+        // publish time under `[snapshot.publish_compression]`.
+        OverlaybdCompactOutput::Raw,
     )
     .await?;
     image_config.lowers = rewritten_lowers;
@@ -563,16 +544,18 @@ async fn capture_live_overlaybd_snapshot(
                     "read restack snapshot layer metadata {}",
                     snapshot_layer_path.display()
                 )
-            })?
+            })
+            .map_err(into_terminal_snapshot_failure)?
             .len();
         if copied_size != descriptor.size {
-            let _ = fs::remove_file(&snapshot_layer_path);
-            anyhow::bail!(
+            // Keep the sealed layer: the live device may still reference it,
+            // and terminal deletion marks the volume failed for recovery.
+            return Err(into_terminal_snapshot_failure(anyhow::anyhow!(
                 "restack snapshot descriptor size mismatch for {}: descriptor says {}, file has {}",
                 snapshot_layer_path.display(),
                 descriptor.size,
                 copied_size
-            );
+            )));
         }
     }
 
@@ -617,9 +600,8 @@ pub(super) async fn build_mem_snapshot_image_config(
 ///
 /// Writable runtimes are first restacked in-place so the sealed old upper
 /// becomes the newest lower. Read-only runtimes skip the restack phase and
-/// only stage the persisted snapshot image config. `seal_output` controls
-/// whether the staged sealed layer is recontainerized as ZFile; the live
-/// runtime always keeps the raw sealed layer.
+/// only stage the persisted snapshot image config. The sealed layer always
+/// stays raw; compression, when enabled, happens once at publish time.
 pub(super) async fn restack_snapshot_overlaybd_device(
     ublk_device: &UblkDevice,
     read_only: bool,
@@ -627,7 +609,6 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     output_dir: &Path,
     snapshot_layer_file_name: &str,
     kind: &'static str,
-    seal_output: OverlaybdCompactOutput,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -647,7 +628,6 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         live_runtime_image_config_path,
         output_dir,
         live_snapshot.snapshot_layer_path(),
-        seal_output,
     )
     .await;
 
@@ -659,7 +639,6 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
     read_only: bool,
     live_runtime_image_config_path: &Path,
     snapshot_root: &Path,
-    seal_output: OverlaybdCompactOutput,
 ) -> Result<PathBuf> {
     restack_snapshot_overlaybd_device(
         ublk_device,
@@ -668,7 +647,6 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
         &snapshot_root.join("rootfs"),
         "snapshot.commit",
         "rootfs",
-        seal_output,
     )
     .await
 }
@@ -1195,7 +1173,6 @@ mod tests {
             &live_runtime_image_config_path,
             &output_dir,
             Some(&snapshot_lower),
-            OverlaybdCompactOutput::Raw,
         )
         .await
         .expect("stage snapshot");
@@ -1206,97 +1183,6 @@ mod tests {
         assert_eq!(PathBuf::from(&latest.file), snapshot_lower);
         assert_eq!(latest.digest, "sha256:descriptor");
         assert_eq!(latest.size, 8);
-    }
-
-    async fn read_sealed_layer_bytes(path: &Path, len: usize) -> Vec<u8> {
-        use overlaybd::backend::switch::new_switch_file;
-        use overlaybd::backend::tar::new_tar_file_adaptor;
-        use overlaybd::index_file::LSMTReadOnlyFile;
-
-        let local: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::open_ro(path).expect("open sealed layer"));
-        let display = path.display().to_string();
-        let tar_adapted = new_tar_file_adaptor(local).await.expect("tar adaptor");
-        let switched = new_switch_file(tar_adapted, true, Some(&display))
-            .await
-            .expect("switch file");
-        let layer = LSMTReadOnlyFile::open(switched)
-            .await
-            .expect("open sealed layer as LSMT");
-        layer
-            .read_at(0, len)
-            .await
-            .expect("read sealed layer")
-            .to_vec()
-    }
-
-    #[tokio::test]
-    async fn stage_recontainerizes_sealed_layer_as_zfile_when_requested() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let live_dir = temp.path().join("live");
-        let output_dir = temp.path().join("out");
-        std::fs::create_dir_all(&live_dir).expect("create live dir");
-        std::fs::create_dir_all(&output_dir).expect("create output dir");
-
-        let vsize = 3 * 4096u64;
-        let sealed_path =
-            seal_raw_test_layer(&output_dir, "snapshot", vsize, &[(0, 0xAB), (4096, 0xCD)]).await;
-        let live_runtime_image_config_path = live_dir.join("image.json");
-        std::fs::write(
-            &live_runtime_image_config_path,
-            serde_json::to_vec_pretty(&json!({
-                "repoBlobUrl": "s3://bucket/prefix",
-                "lowers": [
-                    {
-                        "digest": "sha256:base",
-                        "size": 10
-                    },
-                    {
-                        "file": sealed_path,
-                    }
-                ],
-                "upper": {},
-                "resultFile": live_dir.join("result.txt"),
-                "download": {}
-            }))
-            .expect("serialize live image config"),
-        )
-        .expect("write live image config");
-
-        let output_path = stage_overlaybd_snapshot_from_live_runtime(
-            &live_runtime_image_config_path,
-            &output_dir,
-            Some(&sealed_path),
-            OverlaybdCompactOutput::ZFile {
-                algorithm: crate::cfg::OverlaybdCompressionAlgorithm::Lz4,
-                workers: 1,
-            },
-        )
-        .await
-        .expect("stage snapshot with compressed seal");
-
-        let staged =
-            overlaybd::config::load_image_config(&output_path).expect("load staged image config");
-        assert_eq!(staged.lowers.len(), 2);
-        assert_eq!(staged.lowers[0].digest, "sha256:base");
-
-        let staged_layer = PathBuf::from(&staged.lowers[1].file);
-        assert!(staged_layer.ends_with(SNAPSHOT_ZFILE_DELTA_LAYER_FILE));
-        let staged_file: Arc<dyn VirtualFile> =
-            Arc::new(LocalFile::open_ro(&staged_layer).expect("open staged zfile layer"));
-        assert_eq!(
-            overlaybd::zfile::is_zfile(staged_file)
-                .await
-                .expect("probe staged layer"),
-            1
-        );
-
-        // The live runtime's raw sealed layer is untouched, and the staged
-        // ZFile layer carries identical logical content.
-        assert_eq!(
-            read_sealed_layer_bytes(&staged_layer, vsize as usize).await,
-            read_sealed_layer_bytes(&sealed_path, vsize as usize).await
-        );
     }
 
     #[tokio::test]

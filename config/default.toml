@@ -231,6 +231,18 @@ p2p_enabled = true
 # [snapshot.image_publish]
 # enabled = true
 
+# Compress memory layers and incremental read-write layers once, when they are
+# uploaded to OSS/ACR. Local layers always stay raw, so local resume pays no
+# decompression cost; enabled by default to cut network bytes for cross-node
+# resume. Disable when upload CPU matters more than transfer bytes.
+[snapshot.publish_compression]
+enabled = true
+# Supported algorithms are "lz4" and "zstd".
+algorithm = "lz4"
+# Workers compressing 4 KiB blocks. One is sequential; higher values run in
+# parallel without changing the output layout.
+workers = 1
+
 # POSIX storage defaults under AENV_HOME. Set this for a shared or independent
 # snapshot filesystem.
 # [backend.posix_fs]
@@ -239,8 +251,8 @@ p2p_enabled = true
 # OSS requires an endpoint, bucket, region, and either credential_process or
 # static credentials. credential_process takes precedence over static values.
 # [backend.oss]
-# endpoint = "https://oss-cn-beijing-internal.aliyuncs.com"
-# bucket = "agentenv-snapshots"
+# endpoint = "https://<your-oss-endpoint>"
+# bucket = "your-snapshot-bucket"
 # region = "cn-beijing"
 # Bucket addressing style: "virtual" or "path". Leave unset to use
 # endpoint-based auto-detection.
@@ -317,15 +329,6 @@ fill_concurrency = 4
 # OverlayBD path. Disable with AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false.
 track_dirty_pages = true
 
-# Compress memory snapshot layers. The algorithm is parsed but ignored when
-# compression is disabled.
-compression_enabled = false
-# Supported algorithms are "lz4" and "zstd".
-compression_algorithm = "lz4"
-# Workers compressing 4 KiB blocks. One is sequential; higher values run in
-# parallel without changing the output layout.
-compression_workers = 1
-
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd
 # becomes ready.
@@ -355,17 +358,6 @@ builder_cpu_count = 16
 builder_memory_mb = 32768
 # Persistent /var/lib/buildkit disk in MiB (256 GiB). Applies to new caches.
 cache_size_mb = 262144
-# Compress snapshot artifacts captured by template builds, independent of
-# [memory_snapshot].compression_enabled (template builds consult only this
-# section). When enabled, both memory layers and the sealed rootfs read-write
-# layer are compressed. Pause/snapshot captures of running sandboxes are not
-# affected.
-compression_enabled = false
-# Supported algorithms are "lz4" and "zstd".
-compression_algorithm = "lz4"
-# Workers compressing 4 KiB blocks. One is sequential; higher values run in
-# parallel without changing the output layout.
-compression_workers = 1
 
 [observability]
 # Expose node identity, host metrics, and orchestrator runtime metrics.

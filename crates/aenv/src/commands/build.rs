@@ -40,7 +40,7 @@ pub struct Args {
     /// BuildKit secret, for example id=token,src=./token; repeatable
     #[arg(long)]
     secret: Vec<String>,
-    /// Disable instruction cache for this build
+    /// Rebuild without cached instructions or their cache mounts
     #[arg(long)]
     no_cache: bool,
     /// Path to the local BuildKit client executable
@@ -246,7 +246,7 @@ async fn build(
             command.arg("--secret").arg(secret);
         }
         if args.no_cache {
-            command.args(["--opt", "no-cache"]);
+            command.arg("--no-cache");
         }
         if progress.visible() {
             command.stderr(Stdio::piped());

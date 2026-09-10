@@ -44,8 +44,8 @@ func TestClusterListIncludesRunning(t *testing.T) {
 
 func TestParseClusterListNextTokenRejectsOrderMismatch(t *testing.T) {
 	items := []listedSandbox{{
-		SandboxID: "00000000-0000-0000-0000-000000000001",
-		StartedAt: time.Unix(1, 0).UTC(),
+		sandboxID: "00000000-0000-0000-0000-000000000001",
+		startedAt: time.Unix(1, 0).UTC(),
 	}}
 	limit := 1
 

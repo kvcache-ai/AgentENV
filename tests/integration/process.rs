@@ -18,6 +18,77 @@ async fn start_sandbox() -> Result<FirecrackerSandbox> {
 }
 
 #[tokio::test]
+async fn numeric_image_users_preserve_identity_after_start_and_resume() -> Result<()> {
+    common::setup().await;
+    // Discover named-account IDs from the fixture instead of coupling this
+    // regression test to a particular distro's nobody/nogroup assignments.
+    let mut probe = start_sandbox().await?;
+    let nobody_uid = probe
+        .run_command("id", &["-u", "nobody"])
+        .await?
+        .stdout
+        .trim()
+        .to_owned();
+    let nobody_gid = probe
+        .run_command("id", &["-g", "nobody"])
+        .await?
+        .stdout
+        .trim()
+        .to_owned();
+    let root_gid = probe
+        .run_command("id", &["-g", "root"])
+        .await?
+        .stdout
+        .trim()
+        .to_owned();
+    probe.stop().await?;
+
+    for (identity, uid, gid) in [
+        ("0", "0", root_gid.as_str()),
+        (
+            nobody_uid.as_str(),
+            nobody_uid.as_str(),
+            nobody_gid.as_str(),
+        ),
+        ("12345", "12345", "0"),
+        ("12345:23456", "12345", "23456"),
+        ("nobody:0", nobody_uid.as_str(), "0"),
+        ("12345:root", "12345", root_gid.as_str()),
+    ] {
+        let mut config = common::default_sandbox_config()?;
+        config.vcpu_count = 2;
+        config.mem_size_mib = 512;
+        config.common.default_user = Some(identity.to_owned());
+        config.common.default_workdir = Some("/tmp".to_owned());
+        let mut sandbox = FirecrackerSandbox::new(config)?;
+        sandbox.start().await?;
+
+        for restored in [false, true] {
+            if restored {
+                let snapshot = sandbox.pause().await?;
+                sandbox.stop().await?;
+                sandbox = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
+            }
+            let output = sandbox
+                .run_command_with_opts(
+                    "/agentenv/bin/busybox",
+                    &["sh", "-c", "id -u; id -g; pwd"],
+                    &ProcessOpts::default().with_timeout(Duration::from_secs(10)),
+                )
+                .await?;
+            assert_eq!(output.exit_code, 0, "{identity}: {}", output.stderr);
+            assert_eq!(
+                output.stdout.trim(),
+                format!("{uid}\n{gid}\n/tmp"),
+                "{identity}"
+            );
+        }
+        sandbox.stop().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn run_command_basic_contracts() -> Result<()> {
     common::setup().await;
     tokio::time::timeout(TEST_TIMEOUT, async {

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::process::Command;
 use tokio::sync::RwLock;
-use tracing::warn;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::snapshot::repository::{RepositoryError, SnapshotRepository};
@@ -267,11 +267,21 @@ impl VolumeManager {
             return Ok(record);
         }
         let destination = self.data_dir(&record.id).join("image.json");
+        debug!(
+            volume_id = %record.id,
+            layer_count = record.backing_layers.len(),
+            "materializing volume backing"
+        );
         let path = self
             .repository
             .materialize_volume_backing(&record.id, &record.backing_layers, &destination)
             .await
             .map_err(repository_error)?;
+        debug!(
+            volume_id = %record.id,
+            path = %path.display(),
+            "volume backing materialized"
+        );
         record.backing_image_config = Some(path);
         self.cache_record(record.clone()).await;
         Ok(record)
@@ -344,6 +354,13 @@ impl VolumeManager {
         }
 
         let id = format!("vol_{}", Uuid::now_v7().simple());
+        debug!(
+            volume_id = %id,
+            mode = ?mode,
+            size_mb,
+            "creating volume"
+        );
+        let mut backing_layers = Vec::new();
         let backing_image_config = if let Some((reference, source_owner)) = from_volume {
             let mut parent = match self.get(&reference).await {
                 Ok(parent) => parent,
@@ -365,12 +382,21 @@ impl VolumeManager {
             if parent.size_mb != size_mb {
                 return Err(VolumeError::SizeMismatch);
             }
-            if parent.backing_image_config.is_none() && !parent.backing_layers.is_empty() {
-                parent = self.materialize_backing(&parent.id).await?;
-            }
-            match parent.backing_image_config.as_ref() {
-                Some(path) => Some(self.create_child_backing(&id, path).await?),
-                None => None,
+            if parent.reserved_by_sandbox_id.is_none() && !parent.backing_layers.is_empty() {
+                // Committed layers are immutable and repository-owned. Materializing
+                // the child on mount preserves their descriptors without copying or
+                // republishing the parent's local files. Reserved parents may have
+                // newer local writes, so they still need the local clone below.
+                backing_layers = parent.backing_layers;
+                None
+            } else {
+                if parent.backing_image_config.is_none() && !parent.backing_layers.is_empty() {
+                    parent = self.materialize_backing(&parent.id).await?;
+                }
+                match parent.backing_image_config.as_ref() {
+                    Some(path) => Some(self.create_child_backing(&id, path).await?),
+                    None => None,
+                }
             }
         } else if let Some(source_config) = source_config {
             Some(self.create_child_backing(&id, &source_config).await?)
@@ -386,7 +412,7 @@ impl VolumeManager {
             status: VolumeStatus::Ready,
             reserved_by_sandbox_id: reserved_owner.map(str::to_owned),
             backing_image_config,
-            backing_layers: Vec::new(),
+            backing_layers,
             read_only_mounts: Vec::new(),
             deleting: false,
         };
@@ -410,6 +436,12 @@ impl VolumeManager {
             }
             return Err(error);
         }
+        info!(
+            volume_id = %record.id,
+            mode = ?record.mode,
+            size_mb = record.size_mb,
+            "volume created"
+        );
         Ok(record)
     }
 
@@ -421,6 +453,7 @@ impl VolumeManager {
         if let Some(owner) = record.read_only_mounts.first() {
             return Err(VolumeError::Reserved(owner.clone()));
         }
+        debug!(volume_id = %record.id, "deleting volume");
         self.repository
             .delete_volume(&record.id)
             .await
@@ -437,6 +470,7 @@ impl VolumeManager {
                 );
             }
         }
+        info!(volume_id = %record.id, "volume deleted");
         Ok(())
     }
 
@@ -494,11 +528,23 @@ impl VolumeManager {
             read_only_mounts: Vec::new(),
             deleting: false,
         };
+        debug!(
+            volume_id = %record.id,
+            mode = ?record.mode,
+            size_mb = record.size_mb,
+            "creating volume from snapshot"
+        );
         self.repository
             .create_volume(record.clone())
             .await
             .map_err(repository_error)?;
         self.cache_record(record.clone()).await;
+        info!(
+            volume_id = %record.id,
+            mode = ?record.mode,
+            size_mb = record.size_mb,
+            "volume created from snapshot"
+        );
         Ok(record)
     }
 
@@ -538,6 +584,7 @@ impl VolumeManager {
             if !record.read_only_mounts.iter().any(|entry| entry == owner) {
                 record.read_only_mounts.push(owner.to_owned());
             }
+            debug!(volume_id = %record.id, "read-only volume reserved");
             self.cache_record(record).await;
             return Ok(());
         }
@@ -550,6 +597,7 @@ impl VolumeManager {
             return Err(VolumeError::Reserved(existing));
         }
         record.reserved_by_sandbox_id = Some(owner.to_owned());
+        debug!(volume_id = %record.id, "exclusive volume reserved");
         self.cache_record(record).await;
         Ok(())
     }
@@ -567,6 +615,32 @@ impl VolumeManager {
                 .map_err(repository_error)?;
             if let Some(record) = self.records.write().await.get_mut(volume_id) {
                 record.replace_owner(owner, new_owner);
+            }
+            match new_owner {
+                Some(new_owner) => debug!(
+                    volume_id = %volume_id,
+                    previous_owner = %owner,
+                    new_owner = %new_owner,
+                    "volume reservation owner replaced"
+                ),
+                None => debug!(volume_id = %volume_id, %owner, "volume reservation released"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep an incomplete capture unavailable after its sandbox is stopped.
+    pub(crate) async fn fail_backings(
+        &self,
+        owner: &str,
+        volume_ids: &[String],
+    ) -> Result<(), VolumeError> {
+        for volume_id in volume_ids {
+            let mut record = self.get(volume_id).await?;
+            if record.reserved_by_sandbox_id.as_deref() == Some(owner) {
+                record.status = VolumeStatus::Failed;
+                self.persist_catalog(&record).await?;
+                self.cache_record(record).await;
             }
         }
         Ok(())
@@ -602,14 +676,26 @@ impl VolumeManager {
                 let path = self.data_dir(&record.id).join("image.json");
                 if !path.exists() {
                     record.status = VolumeStatus::Failed;
-                    let _ = self.persist_catalog(&record).await;
+                    if let Err(error) = self.persist_catalog(&record).await {
+                        warn!(
+                            volume_id = %record.id,
+                            %error,
+                            "failed to persist volume failure status"
+                        );
+                    }
                     self.cache_record(record.clone()).await;
+                    warn!(
+                        volume_id = %record.id,
+                        path = %path.display(),
+                        "reserved volume backing is missing"
+                    );
                     return Err(VolumeError::Storage(format!(
                         "local backing for reserved volume '{}' is missing",
                         record.id
                     )));
                 }
                 record.backing_image_config = Some(path);
+                debug!(volume_id = %record.id, %owner, "volume backing recovered");
                 self.cache_record(record).await;
             }
         }
@@ -638,28 +724,54 @@ impl VolumeManager {
             // upper layer so other nodes cannot mount stale content.
             record.status = VolumeStatus::Uploading;
             if let Err(error) = self.persist_catalog(&record).await {
-                record.status = VolumeStatus::Failed;
-                let _ = self.persist_catalog(&record).await;
-                self.cache_record(record).await;
+                self.mark_publication_failed(record, "mark_uploading", &error)
+                    .await;
                 return Err(error);
             }
             self.cache_record(record.clone()).await;
+            debug!(volume_id = %record.id, "publishing volume backing");
             if let Err(error) = self.publish_backing(&mut record).await {
-                record.status = VolumeStatus::Failed;
-                let _ = self.persist_catalog(&record).await;
-                self.cache_record(record).await;
+                self.mark_publication_failed(record, "publish_backing", &error)
+                    .await;
                 return Err(error);
             }
             record.status = VolumeStatus::Ready;
             if let Err(error) = self.persist_catalog(&record).await {
-                record.status = VolumeStatus::Failed;
-                let _ = self.persist_catalog(&record).await;
-                self.cache_record(record).await;
+                self.mark_publication_failed(record, "mark_ready", &error)
+                    .await;
                 return Err(error);
             }
+            info!(
+                volume_id = %record.id,
+                layer_count = record.backing_layers.len(),
+                "volume backing published"
+            );
             self.cache_record(record).await;
         }
         Ok(())
+    }
+
+    async fn mark_publication_failed(
+        &self,
+        mut record: VolumeRecord,
+        stage: &'static str,
+        error: &VolumeError,
+    ) {
+        record.status = VolumeStatus::Failed;
+        if let Err(status_error) = self.persist_catalog(&record).await {
+            warn!(
+                volume_id = %record.id,
+                error = %status_error,
+                "failed to persist volume failure status"
+            );
+        }
+        warn!(
+            volume_id = %record.id,
+            stage,
+            %error,
+            "volume backing publication failed"
+        );
+        self.cache_record(record).await;
     }
 
     async fn cache_record(&self, record: VolumeRecord) {
@@ -837,25 +949,308 @@ fn validate_volume_id(id: &str) -> Result<(), VolumeError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{VolumeManager, VolumeMode};
+    use std::path::Path;
+
+    use overlaybd::config::{ImageConfig, LayerConfig};
+
+    use super::{VolumeError, VolumeManager, VolumeMode, VolumeRecord, VolumeStatus};
+    use crate::digest::sha256_digest;
     use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{ManagedLayer, OverlaybdLayerRef};
+
+    async fn manager_at(root: &Path) -> VolumeManager {
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: root.join("repository"),
+            cache_root: Some(root.join("cache")),
+            runtime_cache_root: Some(root.join("runtime")),
+        })
+        .expect("POSIX snapshot backend");
+        VolumeManager::open_with_repository(root.join("volumes/catalog"), backend.repository())
+            .await
+            .expect("volume manager")
+    }
+
+    async fn published_volume(root: &Path, manager: &VolumeManager) -> VolumeRecord {
+        let layer = root.join("base.commit");
+        std::fs::write(&layer, b"published volume layer").unwrap();
+        let config = ImageConfig {
+            lowers: vec![
+                LayerConfig {
+                    file: layer.to_string_lossy().into_owned(),
+                    ..LayerConfig::default()
+                },
+                LayerConfig {
+                    repo_blob_url: "https://registry.example.test/v2/cache/blobs".to_owned(),
+                    digest: sha256_digest(b"external volume layer"),
+                    size: 21,
+                    ..LayerConfig::default()
+                },
+            ],
+            ..ImageConfig::default()
+        };
+        let path = root.join("source.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        manager
+            .create(
+                "parent".to_owned(),
+                VolumeMode::Exclusive,
+                None,
+                Some(path),
+                1024,
+            )
+            .await
+            .expect("publish initial volume")
+    }
+
+    fn append_local_layer(record: &VolumeRecord) {
+        let path = record.backing_image_config.as_ref().unwrap();
+        let layer = path.parent().unwrap().join("unpublished.commit");
+        std::fs::write(&layer, b"new volume writes").unwrap();
+        let mut config = overlaybd::config::load_image_config(path).unwrap();
+        config.lowers.push(LayerConfig {
+            file: layer.to_string_lossy().into_owned(),
+            ..LayerConfig::default()
+        });
+        std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn published_volume_clones_survive_parent_deletion_without_local_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager_at(temp.path()).await;
+        let parent = published_volume(temp.path(), &manager).await;
+        // A stale local config must not override the committed backing, even
+        // when the manager still has the config path in its in-memory cache.
+        std::fs::write(
+            parent.backing_image_config.as_ref().unwrap(),
+            b"stale config",
+        )
+        .unwrap();
+        let cold_manager = manager_at(temp.path()).await;
+        let mut children = Vec::new();
+        for (index, (manager, mode)) in [
+            (&manager, VolumeMode::ReadOnly),
+            (&cold_manager, VolumeMode::Exclusive),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let child = manager
+                .create(
+                    format!("child-{index}"),
+                    mode,
+                    Some(parent.id.clone()),
+                    None,
+                    1024,
+                )
+                .await
+                .expect("clone committed volume without reading local files");
+            assert_eq!(child.backing_layers, parent.backing_layers);
+            assert_eq!(child.mode, mode);
+            assert!(child.backing_image_config.is_none());
+            assert!(!manager.data_dir(&child.id).exists());
+            children.push(child);
+        }
+        manager.delete(&parent.id).await.unwrap();
+        let restarted = manager_at(temp.path()).await;
+        for child in children {
+            let child = restarted.materialize_backing(&child.id).await.unwrap();
+            let config =
+                overlaybd::config::load_image_config(child.backing_image_config.unwrap()).unwrap();
+            assert_eq!(
+                std::fs::read(&config.lowers[0].file).unwrap(),
+                b"published volume layer"
+            );
+            assert_eq!(
+                config.lowers[0].digest,
+                sha256_digest(b"published volume layer")
+            );
+            assert_eq!(config.lowers[0].size, 22);
+            assert!(config.lowers[1].file.is_empty());
+            assert_eq!(
+                config.lowers[1].repo_blob_url,
+                "https://registry.example.test/v2/cache/blobs"
+            );
+            assert_eq!(
+                config.lowers[1].digest,
+                sha256_digest(b"external volume layer")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn volume_generations_preserve_inherited_descriptors_and_new_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager_at(temp.path()).await;
+        let parent = published_volume(temp.path(), &manager).await;
+        let seed = manager
+            .create(
+                "seed".to_owned(),
+                VolumeMode::ReadOnly,
+                Some(parent.id.clone()),
+                None,
+                1024,
+            )
+            .await
+            .unwrap();
+        manager.reserve(&seed.id, "builder").await.unwrap();
+        let child = manager
+            .create_child_for_owner(
+                &seed.id,
+                "work".to_owned(),
+                VolumeMode::Exclusive,
+                1024,
+                "builder",
+                "builder",
+            )
+            .await
+            .unwrap();
+        assert_eq!(child.backing_layers, parent.backing_layers);
+        let child = manager.materialize_backing(&child.id).await.unwrap();
+        let config =
+            overlaybd::config::load_image_config(child.backing_image_config.as_ref().unwrap())
+                .unwrap();
+        assert_eq!(
+            config.lowers[0].digest,
+            sha256_digest(b"published volume layer")
+        );
+        assert_eq!(config.lowers[0].size, 22);
+        append_local_layer(&child);
+        manager
+            .recover_and_publish_backings("builder", std::slice::from_ref(&child.id))
+            .await
+            .unwrap();
+        manager
+            .replace_owner_for("builder", None, &[seed.id, child.id.clone()])
+            .await
+            .unwrap();
+        let published = manager.get(&child.id).await.unwrap();
+        assert_eq!(
+            &published.backing_layers[..2],
+            parent.backing_layers.as_slice()
+        );
+        assert_eq!(
+            published.backing_layers[2],
+            OverlaybdLayerRef::Managed(ManagedLayer {
+                digest: sha256_digest(b"new volume writes"),
+                size: 17,
+                uuid: None,
+            })
+        );
+        let next_seed = manager
+            .create(
+                "next-seed".to_owned(),
+                VolumeMode::ReadOnly,
+                Some(child.id),
+                None,
+                1024,
+            )
+            .await
+            .unwrap();
+        assert_eq!(next_seed.backing_layers, published.backing_layers);
+        assert!(next_seed.backing_image_config.is_none());
+    }
+
+    #[tokio::test]
+    async fn reserved_volume_clone_retains_unpublished_local_layers() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager_at(temp.path()).await;
+        let parent = published_volume(temp.path(), &manager).await;
+        manager.reserve(&parent.id, "source").await.unwrap();
+        append_local_layer(&parent);
+        let child = manager
+            .create_child_for_owner(
+                &parent.id,
+                "fork".to_owned(),
+                VolumeMode::Exclusive,
+                1024,
+                "source",
+                "child",
+            )
+            .await
+            .unwrap();
+        assert!(child.backing_layers.is_empty());
+        manager
+            .replace_owner_for("source", None, std::slice::from_ref(&parent.id))
+            .await
+            .unwrap();
+        manager.delete(&parent.id).await.unwrap();
+        manager
+            .recover_and_publish_backings("child", std::slice::from_ref(&child.id))
+            .await
+            .unwrap();
+        let child = manager.get(&child.id).await.unwrap();
+        assert_eq!(child.backing_layers.len(), 3);
+        assert_eq!(
+            child.backing_layers[2],
+            OverlaybdLayerRef::Managed(ManagedLayer {
+                digest: sha256_digest(b"new volume writes"),
+                size: 17,
+                uuid: None,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn published_volume_clone_validates_source_state_and_size() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = manager_at(temp.path()).await;
+        let mut parent = published_volume(temp.path(), &manager).await;
+        assert_eq!(
+            manager
+                .create(
+                    "wrong-size".to_owned(),
+                    VolumeMode::ReadOnly,
+                    Some(parent.id.clone()),
+                    None,
+                    2048
+                )
+                .await
+                .unwrap_err(),
+            VolumeError::SizeMismatch
+        );
+        manager.reserve(&parent.id, "owner").await.unwrap();
+        assert_eq!(
+            manager
+                .create(
+                    "reserved".to_owned(),
+                    VolumeMode::ReadOnly,
+                    Some(parent.id.clone()),
+                    None,
+                    1024
+                )
+                .await
+                .unwrap_err(),
+            VolumeError::Reserved("owner".to_owned())
+        );
+        for status in [VolumeStatus::Uploading, VolumeStatus::Failed] {
+            parent.status = status;
+            manager.persist_catalog(&parent).await.unwrap();
+            let error = manager
+                .create(
+                    "unready".to_owned(),
+                    VolumeMode::ReadOnly,
+                    Some(parent.id.clone()),
+                    None,
+                    1024,
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error,
+                match status {
+                    VolumeStatus::Uploading => VolumeError::Uploading(parent.id.clone()),
+                    VolumeStatus::Failed => VolumeError::Failed(parent.id.clone()),
+                    VolumeStatus::Ready => unreachable!(),
+                }
+            );
+        }
+    }
 
     #[tokio::test]
     async fn create_from_snapshot_preserves_read_only_mode() {
         let temp = tempfile::tempdir().expect("temporary volume repository");
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: temp.path().join("repository"),
-            cache_root: Some(temp.path().join("cache")),
-            runtime_cache_root: Some(temp.path().join("runtime")),
-        })
-        .expect("POSIX snapshot backend");
-        let manager = VolumeManager::open_with_repository(
-            temp.path().join("volumes/catalog"),
-            backend.repository(),
-        )
-        .await
-        .expect("volume manager");
+        let manager = manager_at(temp.path()).await;
 
         let restored = manager
             .create_from_snapshot(

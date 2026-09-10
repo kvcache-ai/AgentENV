@@ -7,6 +7,8 @@ use tempfile::NamedTempFile;
 use tracing::warn;
 
 use crate::digest;
+use crate::sandbox::OverlaybdCompactOutput;
+use crate::snapshot::repository::backends::common::recontainerize::prepare_layer_upload;
 use crate::snapshot::repository::backends::common::write_dense_overlaybd_layer_to_file;
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::rootfs_snapshot_image_tag;
@@ -52,21 +54,27 @@ pub(crate) struct AcrDiskImageExporter {
     // an await point; client construction happens outside the lock as well.
     clients: Mutex<HashMap<String, AcrClient>>,
     client_builder: Arc<AcrClientBuilder>,
+    publish_compression: OverlaybdCompactOutput,
 }
 
 impl AcrDiskImageExporter {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(publish_compression: OverlaybdCompactOutput) -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
             client_builder: Arc::new(AcrClient::from_docker_config),
+            publish_compression,
         }
     }
 
     #[cfg(test)]
-    fn new_with_client_builder(client_builder: Arc<AcrClientBuilder>) -> Self {
+    fn new_with_client_builder(
+        client_builder: Arc<AcrClientBuilder>,
+        publish_compression: OverlaybdCompactOutput,
+    ) -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
             client_builder,
+            publish_compression,
         }
     }
 
@@ -222,17 +230,32 @@ impl AcrDiskImageExporter {
         local: &LocalSnapshotDelta,
     ) -> RepositoryResult<(String, u64)> {
         match &local.descriptor {
-            LocalSnapshotDeltaDescriptor::Raw { digest, size } => client
-                .upload_blob_with_descriptor(
-                    upload_url,
-                    repo_blob_url,
-                    repository,
+            LocalSnapshotDeltaDescriptor::Raw { digest, size } => {
+                // Publish compression recontainerizes raw deltas as zfile,
+                // which changes the physical bytes; the returned blob digest
+                // and size (and thus the manifest's overlaybd blob
+                // annotations) always describe the uploaded bytes. ZFile
+                // inputs are uploaded unchanged, so their descriptor stays
+                // valid — the same handling pre-existing zfile deltas
+                // received.
+                let upload = prepare_layer_upload(
                     &local.path,
-                    digest,
-                    *size,
+                    self.publish_compression,
+                    Some((digest.as_str(), *size)),
                 )
-                .await
-                .map_err(RepositoryError::from),
+                .await?;
+                client
+                    .upload_blob_with_descriptor(
+                        upload_url,
+                        repo_blob_url,
+                        repository,
+                        upload.path(),
+                        upload.digest(),
+                        upload.size(),
+                    )
+                    .await
+                    .map_err(RepositoryError::from)
+            }
             LocalSnapshotDeltaDescriptor::DenseOverlaybd => {
                 let dense_temp = NamedTempFile::new().map_err(|e| {
                     RepositoryError::backend(
@@ -252,18 +275,23 @@ impl AcrDiskImageExporter {
                             e,
                         )
                     })?;
-                let uploaded = client
+                let upload = prepare_layer_upload(
+                    &dense_path,
+                    self.publish_compression,
+                    Some((&descriptor.digest, descriptor.size)),
+                )
+                .await?;
+                client
                     .upload_blob_with_descriptor(
                         upload_url,
                         repo_blob_url,
                         repository,
-                        &dense_path,
-                        &descriptor.digest,
-                        descriptor.size,
+                        upload.path(),
+                        upload.digest(),
+                        upload.size(),
                     )
                     .await
-                    .map_err(RepositoryError::from)?;
-                Ok(uploaded)
+                    .map_err(RepositoryError::from)
             }
         }
     }
@@ -324,12 +352,20 @@ fn is_tag_char(ch: char) -> bool {
 mod tests {
     use std::collections::HashMap;
     use std::fs;
+    use std::path::PathBuf;
 
+    use overlaybd::backend::local::LocalFile;
+    use overlaybd::backend::switch::new_switch_file;
+    use overlaybd::backend::tar::new_tar_file_adaptor;
+    use overlaybd::index_file::{CommitArgs, LSMTFile, LSMTReadOnlyFile};
+    use overlaybd::virtual_file::VirtualFile;
+    use overlaybd::zfile::{is_zfile, CompressArgs, CompressOptions, ZFileCompactWriter};
     use serde_json::json;
     use tempfile::TempDir;
 
     use super::super::client::tests::{client as test_client, fake_server, FakeState};
     use super::*;
+    use crate::digest::FileDigest;
     use crate::snapshot::CommandContext;
 
     #[test]
@@ -376,11 +412,14 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let publisher = AcrDiskImageExporter::new_with_client_builder(Arc::new(|registry| {
-            Err(AcrClientError::MissingCredentials {
-                registry: registry.to_string(),
-            })
-        }));
+        let publisher = AcrDiskImageExporter::new_with_client_builder(
+            Arc::new(|registry| {
+                Err(AcrClientError::MissingCredentials {
+                    registry: registry.to_string(),
+                })
+            }),
+            OverlaybdCompactOutput::Raw,
+        );
 
         let err = publisher
             .export(
@@ -425,8 +464,10 @@ mod tests {
         )
         .unwrap();
         let client = test_client();
-        let publisher =
-            AcrDiskImageExporter::new_with_client_builder(Arc::new(move |_| Ok(client.clone())));
+        let publisher = AcrDiskImageExporter::new_with_client_builder(
+            Arc::new(move |_| Ok(client.clone())),
+            OverlaybdCompactOutput::Raw,
+        );
         let snapshot_id = crate::snapshot::SnapshotId::generate();
         let context = CommandContext::new(
             HashMap::from([("APP_ENV".to_string(), "snapshot".to_string())]),
@@ -485,5 +526,255 @@ mod tests {
             manifest["annotations"]["io.agentenv.snapshot.tag"],
             expected_tag
         );
+    }
+
+    const DELTA_VSIZE: u64 = 3 * 4096;
+    const SPARSE_VSIZE: u64 = 64 * 1024;
+
+    fn zfile_mode() -> OverlaybdCompactOutput {
+        OverlaybdCompactOutput::ZFile {
+            algorithm: crate::cfg::OverlaybdCompressionAlgorithm::Lz4,
+            workers: 1,
+        }
+    }
+
+    /// Write a sealed commit-style LSMT layer at `path`, raw or zfile, with
+    /// one distinct byte pattern per 4KiB page.
+    async fn write_sealed_delta(path: &Path, zfile: bool) {
+        let data = Arc::new(LocalFile::new(path.with_extension("data")).unwrap());
+        let index = Arc::new(LocalFile::new(path.with_extension("index")).unwrap());
+        let layer = LSMTFile::create(data, Some(index), DELTA_VSIZE, false)
+            .await
+            .unwrap();
+        for (page, byte) in [(0u64, 0x11u8), (4096, 0x22), (8192, 0x33)] {
+            layer.write_at(page, &[byte; 4096]).await.unwrap();
+        }
+        let output: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path).unwrap());
+        if zfile {
+            let compress_args = CompressArgs::new(CompressOptions::new(
+                CompressOptions::LZ4,
+                CompressOptions::DEFAULT_BLOCK_SIZE,
+                0,
+            ));
+            let writer = Arc::new(
+                ZFileCompactWriter::new(output, &compress_args)
+                    .await
+                    .unwrap(),
+            );
+            layer
+                .commit_with_args(CommitArgs::from_writer(writer))
+                .await
+                .unwrap();
+        } else {
+            layer
+                .commit_with_args(CommitArgs::new(output))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Write a sparse read-write LSMT layer sealed in place, the shape that
+    /// routes through the dense-export branch.
+    async fn write_sparse_delta(path: &Path) {
+        let data: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path).unwrap());
+        let lsmt = LSMTFile::create(data, None, SPARSE_VSIZE, true)
+            .await
+            .unwrap();
+        lsmt.write_at(0, &[0xAB; 4096]).await.unwrap();
+        lsmt.close_seal().await.unwrap();
+    }
+
+    fn expected_delta_contents() -> Vec<u8> {
+        let mut expected = vec![0u8; DELTA_VSIZE as usize];
+        expected[..4096].fill(0x11);
+        expected[4096..8192].fill(0x22);
+        expected[8192..].fill(0x33);
+        expected
+    }
+
+    fn expected_sparse_contents() -> Vec<u8> {
+        let mut expected = vec![0u8; SPARSE_VSIZE as usize];
+        expected[..4096].fill(0xAB);
+        expected
+    }
+
+    /// Read a sealed layer's logical contents through the same tar + switch
+    /// chain the runtime uses, transparently handling raw and zfile.
+    async fn read_layer_contents(path: &Path, len: usize) -> Vec<u8> {
+        let local: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_ro(path).unwrap());
+        let display = path.display().to_string();
+        let tar_adapted = new_tar_file_adaptor(local).await.unwrap();
+        let switched = new_switch_file(tar_adapted, true, Some(&display))
+            .await
+            .unwrap();
+        let layer = LSMTReadOnlyFile::open(switched).await.unwrap();
+        layer.read_at(0, len).await.unwrap().to_vec()
+    }
+
+    /// Export an image whose only local lower is `dir/snapshot.commit`
+    /// against the fake registry and return the outcome plus recorded state.
+    async fn export_with_local_delta(
+        dir: &TempDir,
+        mode: OverlaybdCompactOutput,
+    ) -> (DiskImageExportOutcome, Arc<Mutex<FakeState>>, String) {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let base = fake_server(Arc::clone(&state)).await;
+        let image = dir.path().join("image.json");
+        fs::write(
+            &image,
+            serde_json::to_vec_pretty(&json!({
+                "repoBlobUrl": format!("{base}/v2/ns/repo/blobs"),
+                "lowers": [
+                    {"digest": "sha256:base", "size": 123},
+                    {"file": dir.path().join("snapshot.commit")}
+                ],
+                "upper": {},
+                "resultFile": ""
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let client = test_client();
+        let publisher = AcrDiskImageExporter::new_with_client_builder(
+            Arc::new(move |_| Ok(client.clone())),
+            mode,
+        );
+        let outcome = publisher
+            .export(
+                &crate::snapshot::SnapshotId::generate(),
+                DiskImageSubject::Rootfs,
+                &image,
+                None,
+            )
+            .await
+            .unwrap();
+        (outcome, state, base)
+    }
+
+    /// Reassemble the uploaded layer blob from the PATCH chunks recorded by
+    /// the fake registry (the config blob goes through a one-shot PUT, so
+    /// only layer bytes land in `uploads`).
+    fn uploaded_blob(state: &FakeState, dir: &TempDir) -> PathBuf {
+        let path = dir.path().join("uploaded.blob");
+        fs::write(&path, state.uploads.concat()).unwrap();
+        path
+    }
+
+    /// The committed layer ref, the blob digest/size annotations in the
+    /// manifest, and the actual uploaded bytes must all agree.
+    fn assert_uploaded_layer_identity(
+        outcome: &DiskImageExportOutcome,
+        state: &FakeState,
+        base: &str,
+        blob: &Path,
+    ) {
+        let descriptor = FileDigest::describe_blocking(blob).unwrap();
+        assert_eq!(
+            outcome.layers,
+            vec![
+                OverlaybdLayerRef::External(ExternalLayer {
+                    digest: "sha256:base".to_string(),
+                    repo_blob_url: format!("{base}/v2/ns/repo/blobs"),
+                    size: 123,
+                }),
+                OverlaybdLayerRef::External(ExternalLayer {
+                    digest: descriptor.sha256.clone(),
+                    repo_blob_url: format!("{base}/v2/ns/repo/blobs"),
+                    size: descriptor.size,
+                }),
+            ]
+        );
+        assert_eq!(state.manifest_puts.len(), 1);
+        let manifest: serde_json::Value = serde_json::from_slice(&state.manifest_puts[0]).unwrap();
+        assert_eq!(manifest["layers"][1]["digest"], descriptor.sha256);
+        assert_eq!(manifest["layers"][1]["size"], descriptor.size);
+        assert_eq!(
+            manifest["layers"][1]["annotations"]["containerd.io/snapshot/overlaybd/blob-digest"],
+            descriptor.sha256
+        );
+        assert_eq!(
+            manifest["layers"][1]["annotations"]["containerd.io/snapshot/overlaybd/blob-size"],
+            descriptor.size.to_string()
+        );
+    }
+
+    async fn assert_zfile_with_contents(blob: &Path, expected: &[u8]) {
+        let file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_ro(blob).unwrap());
+        assert_eq!(is_zfile(file).await.unwrap(), 1);
+        assert_eq!(read_layer_contents(blob, expected.len()).await, expected);
+    }
+
+    #[tokio::test]
+    async fn publish_compression_uploads_zfile_delta_with_matching_manifest_annotations() {
+        let dir = TempDir::new().unwrap();
+        let delta = dir.path().join("snapshot.commit");
+        write_sealed_delta(&delta, false).await;
+
+        let (outcome, state, base) = export_with_local_delta(&dir, zfile_mode()).await;
+
+        let blob = {
+            let state = state.lock().unwrap();
+            let blob = uploaded_blob(&state, &dir);
+            assert_uploaded_layer_identity(&outcome, &state, &base, &blob);
+            blob
+        };
+        // The uploaded blob is the recontainerized zfile, decodes to the raw
+        // delta's contents, and differs from the raw bytes.
+        assert_zfile_with_contents(&blob, &expected_delta_contents()).await;
+        assert_ne!(fs::read(&blob).unwrap(), fs::read(&delta).unwrap());
+    }
+
+    #[tokio::test]
+    async fn publish_compression_skips_already_zfile_delta() {
+        let dir = TempDir::new().unwrap();
+        let delta = dir.path().join("snapshot.commit");
+        write_sealed_delta(&delta, true).await;
+
+        let (outcome, state, base) = export_with_local_delta(&dir, zfile_mode()).await;
+
+        let state = state.lock().unwrap();
+        let blob = uploaded_blob(&state, &dir);
+        assert_uploaded_layer_identity(&outcome, &state, &base, &blob);
+        // Idempotent: the pre-compressed input is uploaded byte for byte.
+        assert_eq!(fs::read(&blob).unwrap(), fs::read(&delta).unwrap());
+    }
+
+    #[tokio::test]
+    async fn publish_compression_disabled_uploads_raw_delta() {
+        let dir = TempDir::new().unwrap();
+        let delta = dir.path().join("snapshot.commit");
+        write_sealed_delta(&delta, false).await;
+
+        let (outcome, state, base) =
+            export_with_local_delta(&dir, OverlaybdCompactOutput::Raw).await;
+
+        let blob = {
+            let state = state.lock().unwrap();
+            let blob = uploaded_blob(&state, &dir);
+            assert_uploaded_layer_identity(&outcome, &state, &base, &blob);
+            blob
+        };
+        // Disabled: the raw layer is uploaded byte for byte.
+        assert_eq!(fs::read(&blob).unwrap(), fs::read(&delta).unwrap());
+        let file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_ro(&blob).unwrap());
+        assert_eq!(is_zfile(file).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn publish_compression_uploads_recontainerized_dense_sparse_delta() {
+        let dir = TempDir::new().unwrap();
+        write_sparse_delta(&dir.path().join("snapshot.commit")).await;
+
+        let (outcome, state, base) = export_with_local_delta(&dir, zfile_mode()).await;
+
+        let blob = {
+            let state = state.lock().unwrap();
+            let blob = uploaded_blob(&state, &dir);
+            assert_uploaded_layer_identity(&outcome, &state, &base, &blob);
+            blob
+        };
+        // Sparse deltas are dense-exported first; the recontainerized blob
+        // decodes to the dense logical view.
+        assert_zfile_with_contents(&blob, &expected_sparse_contents()).await;
     }
 }

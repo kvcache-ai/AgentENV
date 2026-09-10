@@ -72,7 +72,7 @@ aenv build . -f deploy/docker/Dockerfile.agentenv --name aenv
 | `--ready-cmd <command>` | Image `HEALTHCHECK`, or the normal startup delay | Override the command that must succeed before snapshot capture. |
 | `--build-arg KEY=VALUE` | None | Build argument; repeatable. |
 | `--secret <spec>` | None | Native BuildKit secret mounts; repeatable. |
-| `--no-cache` | False | Disable instruction cache; cache mounts retain their usual BuildKit semantics. |
+| `--no-cache` | False | Rebuild without cached instructions. BuildKit also resets cache mounts used by those instructions. |
 | `--buildctl <path>` | `aenv-buildctl` beside `aenv` | Local client executable. |
 | `--progress <format>` | `auto` | Three-stage bar on terminals, plain logs when redirected. `plain` selects plain logs; `tty` selects BuildKit's native display. |
 | `--timeout <seconds>` | 3600 | Builder preparation and Dockerfile build deadline; the CLI allows 10 additional minutes for publication. |
@@ -146,8 +146,8 @@ startup command, or `--start-cmd "" --ready-cmd true` to capture without startin
 the image's application or running its health check.
 
 The guest image needs `/bin/sh` for envd process execution, including exec-form
-Dockerfile commands. Numeric `USER` and explicit user/group support are provided
-by the separate OCI startup fix.
+Dockerfile commands. Numeric `USER` values, including UIDs without an account
+and explicit UID/GID pairs, are preserved during startup and restore.
 
 Caches are shared across template names and nodes using the configured snapshot
 repository. Each build clones the latest immutable cache seed into its own
@@ -157,7 +157,7 @@ the same seed without waiting for each other; the last successfully published
 cache becomes the next seed. Sibling cache additions are not merged.
 
 After image import, the node stops BuildKit, checkpoints and publishes its cache
-volume through the existing volume-only snapshot path, and stops the VM without
+volume through the normal volume freeze and capture path, and stops the VM without
 saving its memory, rootfs, or device state. A failed shutdown or cache capture
 keeps the previous shared seed. Volume ownership remains held until the VM stops.
 
