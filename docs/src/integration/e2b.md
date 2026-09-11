@@ -138,4 +138,4 @@ sandbox.kill()
 ## E2B CLI
 
 AgentENV is compatible with the E2B CLI, but we recommend using the
-[aenv CLI](../getting-started/aenv-cli.md) for AgentENV workflows.
+[aenv CLI](../getting-started/aenv-cli/index.md) for AgentENV workflows.

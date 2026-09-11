@@ -73,5 +73,5 @@ flowchart TD
    routing headers, or configured sandbox proxy domains), which forwards HTTP
    and WebSocket traffic to services inside the VM.
 
-Continue with [Templates](./templates.md), [Sandboxes](./sandboxes.md), and
-[Snapshots](./snapshots.md) for the commands and options for each workflow.
+Continue with [Templates](./templates/index.md), [Sandboxes](./sandboxes/index.md), and
+[Snapshots](./snapshots/index.md) for the commands and options for each workflow.

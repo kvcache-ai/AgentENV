@@ -44,3 +44,9 @@ body:has(.version-preview-banner) .sidebar .sidebar-scrollbox {
 body:has(.version-preview-banner) .page #mdbook-menu-bar.bordered {
   top: var(--menu-bar-height) !important;
 }
+
+pre.mermaid > svg {
+  display: block;
+  margin-right: auto;
+  margin-left: auto;
+}

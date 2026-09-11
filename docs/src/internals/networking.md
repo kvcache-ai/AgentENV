@@ -3,7 +3,7 @@
 This document describes the network data plane for one AgentENV node. It covers the Linux network namespaces used by Firecracker sandboxes, host and namespace iptables, runtime egress policy updates, and the namespace-local egress proxy.
 
 The user-facing policy contract is documented in the public
-[Sandboxes documentation](https://github.com/kvcache-ai/AgentENV/blob/main/docs/src/concepts/sandboxes.md#network-access).
+[Sandboxes networking documentation](../concepts/sandboxes/networking.md).
 This page explains how that contract is implemented.
 
 ## Topology

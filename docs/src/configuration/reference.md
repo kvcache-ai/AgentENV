@@ -374,7 +374,7 @@ snapshot publication/runtime resolution as an optional acceleration path.
 
 ## `[custom_extension]`
 
-Custom extension service configuration. When `url` is unset, the integration is fully disabled. See [Custom Extension](../concepts/custom-extension.md).
+Custom extension service configuration. When `url` is unset, the integration is fully disabled. See [Custom Extension](../concepts/custom-extension/index.md).
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

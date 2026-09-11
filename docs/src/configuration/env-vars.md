@@ -71,7 +71,7 @@ export E2B_API_KEY=${AENV_API_KEY}
 > `E2B_SANDBOX_URL=${E2B_API_URL}`. The explicit `/proxy` prefix
 > (`${E2B_API_URL}/proxy`) is still accepted for back-compat.
 
-See [Authentication](../concepts/authentication.md) for key generation and storage.
+See [API Authentication](../concepts/authentication/api-authentication.md) for key generation and storage.
 
 ## Gateway and Scheduler
 

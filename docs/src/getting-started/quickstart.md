@@ -87,6 +87,11 @@ Supports Linux and macOS on x86_64 and arm64:
 curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install-cli.sh | bash
 ```
 
+The installation script downloads and verifies the platform release archive
+containing `aenv` and `aenv-buildctl`. Set `INSTALL_DIR` for a user-local
+installation. For manual installation, extract the archive and keep `aenv` and
+`aenv-buildctl` in the same directory.
+
 ### 3. Authenticate
 
 The server generates the key on its first normal startup. Native installations
