@@ -98,13 +98,19 @@ mod imp {
         if stat.stx_mask & libc::STATX_DIOALIGN == 0 {
             return Ok(Default::default());
         }
-        if stat.stx_dio_mem_align == 0 {
+        if stat.stx_dio_mem_align == 0 || stat.stx_dio_offset_align == 0 {
             return Err(SysError::Unsupported("direct_io on this file"));
         }
-        Ok(super::DirectIoAlignment {
-            memory: stat.stx_dio_mem_align as usize,
-            offset: stat.stx_dio_offset_align as usize,
-        })
+        let memory = usize::try_from(stat.stx_dio_mem_align)
+            .map_err(|_| SysError::Unsupported("direct_io alignment does not fit usize"))?;
+        let offset = usize::try_from(stat.stx_dio_offset_align)
+            .map_err(|_| SysError::Unsupported("direct_io alignment does not fit usize"))?;
+        if !memory.is_power_of_two() || !offset.is_power_of_two() {
+            return Err(SysError::Unsupported(
+                "direct_io alignment is not a power of two",
+            ));
+        }
+        Ok(super::DirectIoAlignment { memory, offset })
     }
 
     /// `O_DIRECT` was set at open time, so there is nothing left to do.
