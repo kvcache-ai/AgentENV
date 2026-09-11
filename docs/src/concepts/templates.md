@@ -120,8 +120,8 @@ and cache reservations from a durable journal. Failed cleanup is retained and
 retried every 30 seconds while the server runs, and cancellation retries use the
 same cleanup path. Active builds reject template deletion until cancellation or
 completion. An unreadable entry does not block recovery of other builds
-or prevent server startup. A publication already accepted by the
-server may finish after the CLI is interrupted; its status remains available:
+or prevent server startup. Once BuildKit succeeds, publication proceeds even if the
+CLI is interrupted; its status remains available:
 
 ```bash
 aenv template watch my-template
@@ -171,27 +171,35 @@ manages cache contents. Cache sharing uses the repository's existing API-key tru
 Registry credentials come from the local BuildKit session and normal Docker
 credential configuration.
 
-The additive API is template-scoped:
+The BuildKit API extends the existing template/build lifecycle:
 
-1. `POST /templates/builds` accepts `template` and optional `startCmd`, `readyCmd`,
-   and `timeout`. It returns template/build IDs. Worker settings come from the
-   node configuration.
-2. Poll the existing `GET /templates/{templateID}/builds/{buildID}/status` endpoint:
-   `waiting` means the builder template or worker is preparing; `building`
-   means it can accept a build.
-3. `GET /templates/{templateID}/builds/{buildID}/builder` opens a binary
-   WebSocket carrying native BuildKit traffic.
-4. `POST /templates/{templateID}/builds/{buildID}/builder` accepts the completed
-   image `digest` and starts server-owned import and publication.
-5. `DELETE /templates/{templateID}/builds/{buildID}/builder` cancels an unsubmitted
-   build and waits for worker cleanup. Accepted publication continues server-side.
+1. `POST /v3/templates` allocates template/build IDs using the existing request.
+2. `PUT /templates/{templateID}/builds/{buildID}/builder` prepares the worker.
+   It accepts optional `startCmd`, `readyCmd`, and `timeout`, and returns
+   `imageName`. A build that has already started returns `409`.
+3. Poll `GET /templates/{templateID}/builds/{buildID}/status` until `building`;
+   `waiting` means the worker is still preparing.
+4. `GET /templates/{templateID}/builds/{buildID}/builder` opens the authenticated
+   binary WebSocket for BuildKit. Use the returned name in
+   `--output type=image,name=<imageName>,oci-mediatypes=true`.
+5. The server observes successful BuildKit completion, verifies the image digest,
+   and automatically imports and publishes the template. No client submission
+   request is needed. Continue polling status until `ready` or `error`.
+6. `DELETE /templates/{templateID}/builds/{buildID}/builder` cancels the build
+   before publication. Once publication starts, cancellation returns `409` and
+   the server finishes publication and releases the worker.
 
-These endpoints require the API key and route to the owning node through the
-gateway. Status polling uses the active build's node binding; after the binding
-expires, it uses the shared template repository as before. Image import has a
-one-hour deadline; metadata is limited to 4 MiB per
-blob and images to 1024 layers and 64 GiB of compressed data. Existing template
-endpoints retain their current behavior and report final publication status.
+These endpoints require the API key. The gateway schedules worker preparation
+and binds subsequent requests to that node. Status polling falls back to the
+shared repository after the binding expires. The unique image name identifies
+this build among cached BuildKit history; a dropped connection is never treated
+as successful completion. Failed solves become `error`. Existing statuses are
+unchanged; `building` includes image import and publication.
+
+Image import has a one-hour deadline; metadata is limited to 4 MiB per blob and
+images to 1024 layers and 64 GiB of compressed data. Worker connections can drain
+for up to ten seconds after image import before the worker is stopped. Existing
+declarative template endpoints retain their behavior.
 
 By default, image `ENTRYPOINT` and `CMD` are combined for startup through `/bin/sh -c`.
 Dockerfile `HEALTHCHECK` supplies the readiness command before snapshot capture;
@@ -202,6 +210,28 @@ readiness delay. `--start-cmd` and `--ready-cmd` (API fields `startCmd` and `rea
 override these commands independently without modifying the image configuration.
 Images must satisfy AgentENV's normal guest runtime requirements;
 `EXPOSE` and `VOLUME` are metadata, not Docker runtime services.
+
+### API and repository compatibility
+
+Existing template creation, declarative build, status, listing, and deletion
+endpoints remain available. BuildKit adds `PUT`, `GET`, and `DELETE` on the
+`builder` resource beneath an existing build. It adds no competing template
+creation endpoint or image submission endpoint. Upgrade the gateway and all
+nodes serving build requests before using BuildKit.
+
+Existing remote snapshots and volumes need no migration. Their catalog keys,
+artifact paths, and layer formats are unchanged. Builder snapshots use the
+separate `template-build/builder` namespace; the new cache head and retirement
+record uses `template-build/cache-head.json`. Cache volumes retain the normal
+volume format.
+
+Startup metadata adds an optional `shell` field. Older records omit it, retain
+`/bin/bash -lc` behavior, and are written back without adding the field. New
+BuildKit templates use `/bin/sh -c`. Older servers can deserialize these records,
+but ignore the shell field and drop it when rewriting the record. Building a
+derived template on an older server therefore uses Bash and can fail for images
+without Bash or change shell behavior. Keep builds derived from BuildKit templates
+on upgraded nodes; rolling back does not provide full BuildKit template support.
 
 ### Runtime Configuration
 

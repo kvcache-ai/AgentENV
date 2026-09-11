@@ -93,7 +93,7 @@ class BuildKitTests(unittest.TestCase):
             time.sleep(1)
         self.fail(f"Timed out waiting for {description}; logs: {self.work}")
 
-    def launch_build(self, name, *args, context=None, timeout=180, tty=False):
+    def launch_build(self, name, *args, context=None, timeout=180, tty=False, buildctl=None):
         log = self.work / f"{name}.log"
         command = [
             AENV,
@@ -102,7 +102,7 @@ class BuildKitTests(unittest.TestCase):
             "--name",
             f"{self.prefix}-{name}",
             "--buildctl",
-            BUILDCTL,
+            buildctl or BUILDCTL,
             "--timeout",
             str(timeout),
             "--build-arg",
@@ -270,6 +270,31 @@ class BuildKitTests(unittest.TestCase):
         self.assertNotEqual(
             last_execution, next_execution, "--no-cache did not rerun RUN"
         )
+        self.assert_released()
+
+    def test_publication_survives_client_exit_after_solve(self):
+        wrapper = self.work / "buildctl-exit-client"
+        wrapper.write_text(
+            f"#!{sys.executable}\n"
+            "import os, signal, subprocess, sys\n"
+            f"result = subprocess.run([{BUILDCTL!r}, *sys.argv[1:]])\n"
+            "if '--version' not in sys.argv and result.returncode == 0:\n"
+            "    os.kill(os.getppid(), signal.SIGKILL)\n"
+            "sys.exit(result.returncode)\n"
+        )
+        wrapper.chmod(0o700)
+        build = self.launch_build("client-exit", buildctl=str(wrapper))
+        self.assertEqual(build[0].wait(timeout=360), -signal.SIGKILL, build[1].read_text())
+        build_id = self.build_id(build)
+
+        def ready():
+            status, info = self.api("GET", f"/templates/{build_id}/builds/{build_id}/status")
+            self.assertEqual(status, 200, info)
+            self.assertNotEqual(info["status"], "error", info)
+            return info["status"] == "ready"
+
+        self.wait_for(ready, "server publication after the client exits")
+        self.result(build, (self.context / "input.txt").read_text().strip())
         self.assert_released()
 
     def test_startup_overrides(self):

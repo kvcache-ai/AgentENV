@@ -283,45 +283,30 @@ async fn mark_v2_build_error(
 impl Templates<()> for ApiImpl {
     type Claims = super::Claims;
 
-    async fn templates_builds_post(
+    async fn templates_template_id_builds_build_id_builder_put(
         &self,
         _method: &Method,
         _host: &Host,
         _cookies: &CookieJar,
         _claims: &Self::Claims,
-        body: &models::TemplateBuildSessionRequest,
-    ) -> Result<TemplatesBuildsPostResponse, ()> {
-        use TemplatesBuildsPostResponse::*;
-        Ok(match self.start_image_build(body).await {
-            Ok(body) => Status202_TheTemplateBuildHasStarted {
-                x_agentenv_build_id: Some(body.build_id.clone()),
-                body,
-            },
-            Err(err) => match err.code {
-                400 => Status400_BadRequest(err),
-                409 => Status409_Conflict(err),
-                _ => Status500_ServerError(err),
-            },
-        })
-    }
-
-    async fn templates_template_id_builds_build_id_builder_post(
-        &self,
-        _method: &Method,
-        _host: &Host,
-        _cookies: &CookieJar,
-        _claims: &Self::Claims,
-        path: &models::TemplatesTemplateIdBuildsBuildIdBuilderPostPathParams,
-        body: &models::TemplateBuildImage,
-    ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderPostResponse, ()> {
-        use TemplatesTemplateIdBuildsBuildIdBuilderPostResponse::*;
+        path: &models::TemplatesTemplateIdBuildsBuildIdBuilderPutPathParams,
+        body: &models::TemplateBuilderRequest,
+    ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderPutResponse, ()> {
+        use TemplatesTemplateIdBuildsBuildIdBuilderPutResponse::*;
         Ok(
-            match self.submit_image_build(&path.template_id, &path.build_id, &body.digest) {
-                Ok(()) => Status202_ImagePublicationAccepted,
+            match self
+                .start_image_build(&path.template_id, &path.build_id, body)
+                .await
+            {
+                Ok(body) => Status202_BuilderPreparationAccepted {
+                    x_agentenv_build_id: Some(path.build_id.clone()),
+                    body,
+                },
                 Err(err) => match err.code {
                     400 => Status400_BadRequest(err),
                     404 => Status404_NotFound(err),
-                    _ => Status409_Conflict(err),
+                    409 => Status409_Conflict(err),
+                    _ => Status500_ServerError(err),
                 },
             },
         )
@@ -503,7 +488,9 @@ impl Templates<()> for ApiImpl {
         match self.snapshot_manager.get(&path_params.template_id).await {
             Ok(Some(record)) => {
                 let mut info = models::TemplateBuildInfo::from(record);
-                if info.status == models::TemplateBuildStatus::Ready
+                if self.build_sessions.is_starting(&path_params.build_id) {
+                    info.status = models::TemplateBuildStatus::Waiting;
+                } else if info.status == models::TemplateBuildStatus::Ready
                     && self.build_sessions.is_finishing(&path_params.build_id)
                 {
                     // A sequential CLI build must observe the newly published cache seed.

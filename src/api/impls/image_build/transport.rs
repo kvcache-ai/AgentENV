@@ -35,6 +35,7 @@ async fn connect<I: AsRef<ApiImpl>>(
 ) -> Response {
     let result = async {
         let session = state.as_ref().session(&template_id, &build_id)?;
+        let connection = session.connections.clone().read_owned().await;
         let SessionState::Ready(address) = *session.state.borrow() else {
             return Err(ApiImpl::error(409, "builder is not ready"));
         };
@@ -42,14 +43,15 @@ async fn connect<I: AsRef<ApiImpl>>(
             .await
             .map_err(|_| ApiImpl::error(504, "builder connection timed out"))?
             .map_err(|error| ApiImpl::error(502, format!("builder connection failed: {error}")))?;
-        Ok((stream, session.state.subscribe()))
+        Ok((stream, session.state.subscribe(), connection))
     }
     .await;
     match result {
-        Ok((stream, state)) => ws
+        Ok((stream, state, connection)) => ws
             .max_message_size(1024 * 1024)
             .max_frame_size(1024 * 1024)
             .on_upgrade(move |socket| async move {
+                let _connection = connection;
                 if let Err(error) = bridge(socket, stream, state).await {
                     debug!(%build_id, %error, "BuildKit connection closed");
                 }
@@ -102,14 +104,15 @@ async fn bridge(
         result = upstream => result,
         result = downstream => result,
         // Stopping a VM need not close its host TCP sockets. End the tunnel
-        // explicitly when the session stops accepting a solve.
-        _ = state.wait_for(|state| !matches!(state, SessionState::Ready(_))) => Ok(()),
+        // explicitly on cancellation/finalization. Publication lets the Solve response drain.
+        _ = state.wait_for(|state| matches!(state, SessionState::Cancelled | SessionState::Finished(_))) => Ok(()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context;
     use tokio::net::TcpListener;
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 
@@ -142,6 +145,22 @@ mod tests {
             let mut data = [0; 5];
             stream.read_exact(&mut data).await?;
             assert_eq!(&data, b"solve");
+            state.send_replace(SessionState::Publishing);
+            stream.write_all(b"final Solve response").await?;
+            loop {
+                match socket
+                    .next()
+                    .await
+                    .context("tunnel closed during publication")??
+                {
+                    ClientMessage::Ping(_) => continue,
+                    ClientMessage::Binary(bytes) => {
+                        assert_eq!(bytes.as_ref(), b"final Solve response");
+                        break;
+                    }
+                    other => panic!("unexpected message during publication: {other:?}"),
+                }
+            }
             state.send_replace(SessionState::Finished(None));
             // Ignore a queued keepalive. TCP deliberately remains open here.
             while let Some(message) = socket.next().await {

@@ -8,7 +8,7 @@ use tracing::{info, warn};
 use super::{ApiImpl, BuildJournal, BuildSession, SessionState};
 use crate::{
     cfg::ConfigManager,
-    image::buildkit::BUILDKIT_PORT,
+    image::buildkit::{BuildkitHistory, BUILDKIT_PORT},
     orchestrator::{
         CreateSandboxRequest, ProxyLookupResult, SandboxLaunchSource, SandboxTimeoutAction,
     },
@@ -29,7 +29,7 @@ impl ApiImpl {
     pub(super) async fn wait_for_image_build(
         &self,
         record: &SnapshotRecord,
-        body: &models::TemplateBuildSessionRequest,
+        body: &models::TemplateBuilderRequest,
         session: &BuildSession,
         entry: &BuildJournal,
         deadline: Instant,
@@ -50,18 +50,12 @@ impl ApiImpl {
             })
             .await??;
             worker_command(&executor, START_BUILDKIT, 90).await?;
+            let history = BuildkitHistory::connect(address).await?;
             ensure!(session.ready(address), "build cancelled");
-            self.snapshot_manager.try_start_build(&record.id).await?;
-            let mut state = session.state.subscribe();
-            let command = state
-                .wait_for(|state| {
-                    matches!(state, SessionState::Submitted(_) | SessionState::Cancelled)
-                })
-                .await?
-                .clone();
-            let SessionState::Submitted(digest) = command else {
-                anyhow::bail!("build cancelled");
-            };
+            let digest = history.wait_for_image(&record.id.to_string()).await?;
+            session
+                .publish()
+                .map_err(|error| anyhow::anyhow!(error.message))?;
             Ok((address, digest))
         };
         tokio::select! {
@@ -150,7 +144,7 @@ impl ApiImpl {
     async fn prepare_builder(
         &self,
         id: &str,
-        body: &models::TemplateBuildSessionRequest,
+        body: &models::TemplateBuilderRequest,
         entry: &mut BuildJournal,
         snapshot: RunnableSnapshot,
     ) -> Result<(SocketAddr, Executor)> {

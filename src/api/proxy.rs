@@ -1615,9 +1615,8 @@ mod tests {
     #[tokio::test]
     async fn buildkit_control_endpoints_require_api_auth_and_validate_input() {
         let api = build_api().await;
-        let id = SandboxId::new();
         let app = server::new(api);
-        let tunnel = format!("/templates/{id}/builds/{id}/builder");
+        let tunnel = "/templates/invalid/builds/invalid/builder".to_string();
         assert_eq!(
             get_status(&app, &tunnel, &[]).await,
             StatusCode::UNAUTHORIZED
@@ -1626,14 +1625,14 @@ mod tests {
             get_status(&app, &tunnel, &[(TRAFFIC_ACCESS_TOKEN_HEADER, "invalid")]).await,
             StatusCode::UNAUTHORIZED
         );
-        let body = json!({"digest": format!("sha256:{}", "a".repeat(64))});
+        let body = json!({});
         for (key, expected) in [
             (None, StatusCode::UNAUTHORIZED),
             (Some("incorrect"), StatusCode::UNAUTHORIZED),
             (Some(TEST_API_KEY), StatusCode::NOT_FOUND),
         ] {
             let mut request = http::Request::builder()
-                .method("POST")
+                .method("PUT")
                 .uri(&tunnel)
                 .header("host", "localhost")
                 .header("content-type", "application/json");
@@ -1647,11 +1646,11 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), expected);
         }
-        let body = json!({"digest": "sha256:../file"});
+        let body = json!({"timeout": 0});
         let response = app
             .oneshot(
                 http::Request::builder()
-                    .method("POST")
+                    .method("PUT")
                     .uri(tunnel)
                     .header("host", "localhost")
                     .header("content-type", "application/json")

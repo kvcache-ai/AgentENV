@@ -87,7 +87,6 @@ pub fn run(mut args: Args) -> Result<()> {
 
 async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<()> {
     let request = json!({
-        "template": CreateTemplateV3 { name: args.name.clone(), tags: vec![], cpu_count: args.resources.cpu_count, memory_mb: args.resources.memory_mb },
         "timeout": args.timeout,
         "startCmd": args.start_cmd,
         "readyCmd": args.ready_cmd,
@@ -97,7 +96,16 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
     let operation = async {
         let allocated: TemplateV3Response = serde_json::from_slice(
             &client
-                .build_request(Method::POST, "/templates/builds", Some(request))
+                .build_request(
+                    Method::POST,
+                    "/v3/templates",
+                    Some(serde_json::to_value(CreateTemplateV3 {
+                        name: args.name.clone(),
+                        tags: vec![],
+                        cpu_count: args.resources.cpu_count,
+                        memory_mb: args.resources.memory_mb,
+                    })?),
+                )
                 .await?,
         )?;
         println!(
@@ -106,7 +114,20 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
         );
         let allocated = session.insert(allocated);
         progress.stage(0, "Preparing template builder");
-        build(&client, allocated, &args, &context, &progress).await
+        let builder: Builder = serde_json::from_slice(
+            &client
+                .build_request(Method::PUT, &builder_path(allocated), Some(request))
+                .await?,
+        )?;
+        build(
+            &client,
+            allocated,
+            &args,
+            &context,
+            &progress,
+            &builder.image_name,
+        )
+        .await
     };
     let result = tokio::select! {
         biased;
@@ -141,6 +162,12 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
         session.context("missing build session")?.template_id
     );
     Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct Builder {
+    #[serde(rename = "imageName")]
+    image_name: String,
 }
 
 fn builder_path(session: &TemplateV3Response) -> String {
@@ -199,13 +226,13 @@ async fn build(
     args: &Args,
     context: &BuildContext,
     progress: &BuildProgress,
+    image_name: &str,
 ) -> Result<()> {
     let path = builder_path(session);
     wait_for_status(client, session, "building").await?;
     progress.stage(1, "Building image");
-    let (work, listener, address) = buildkit::bind_local().await?;
+    let (_work, listener, address) = buildkit::bind_local().await?;
     let command = async {
-        let metadata_path = work.path().join("result.json");
         let mut command = Command::new(
             args.buildctl
                 .as_ref()
@@ -231,12 +258,8 @@ async fn build(
             .arg(format!("dockerfile={}", context.dockerfile_dir.display()))
             .arg("--opt")
             .arg(format!("filename={}", context.filename))
-            .args([
-                "--output",
-                "type=image,name=aenv-build,oci-mediatypes=true",
-                "--metadata-file",
-            ])
-            .arg(&metadata_path)
+            .arg("--output")
+            .arg(format!("type=image,name={image_name},oci-mediatypes=true"))
             .stdin(Stdio::null())
             .kill_on_drop(true);
         for arg in &args.build_args {
@@ -260,22 +283,13 @@ async fn build(
         }
         let status = child.wait().await?;
         ensure!(status.success(), "BuildKit build failed ({status})");
-        let metadata: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(metadata_path).await?)?;
-        let digest = metadata["containerimage.digest"]
-            .as_str()
-            .context("BuildKit did not return an image digest")?
-            .to_owned();
-        Ok::<_, anyhow::Error>(digest)
+        Ok::<_, anyhow::Error>(())
     };
-    let digest = tokio::select! {
+    tokio::select! {
         result = command => result?,
         result = client.buildkit_tunnel(&path, listener) => { result?; bail!("BuildKit tunnel closed"); }
-    };
+    }
     progress.stage(2, "Converting image and publishing template");
-    client
-        .build_request(Method::POST, &path, Some(json!({"digest": digest})))
-        .await?;
     wait_for_status(client, session, "ready").await
 }
 

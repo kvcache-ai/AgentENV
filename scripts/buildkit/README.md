@@ -23,6 +23,7 @@ directory when a check fails.
   `--no-cache` must rerun instructions and reset the affected cache mounts,
   following the pinned BuildKit version.
 - Concurrent workers producing independent runnable templates from the same seed.
+- Automatic publication after the client is killed immediately following a successful solve.
 - Failed solves, cancellation, deadlines, terminal API status, and subsequent
   cache reuse. Node counts must return to their initial values, and only one ready
   read-only cache seed may remain after workers and retired volumes are released.

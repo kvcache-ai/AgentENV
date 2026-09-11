@@ -27,27 +27,6 @@ pub enum TemplatesAliasesAliasGetResponse {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
-pub enum TemplatesBuildsPostResponse {
-    /// The template build has started
-    Status202_TheTemplateBuildHasStarted {
-        body: models::TemplateRequestResponseV3,
-        x_agentenv_build_id: Option<String>,
-    },
-    /// Bad request
-    Status400_BadRequest(models::Error),
-    /// Authentication error
-    Status401_AuthenticationError(models::Error),
-    /// Not found
-    Status404_NotFound(models::Error),
-    /// Conflict
-    Status409_Conflict(models::Error),
-    /// Server error
-    Status500_ServerError(models::Error),
-}
-
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-#[must_use]
-#[allow(clippy::large_enum_variant)]
 pub enum TemplatesGetResponse {
     /// Successfully returned all templates
     Status200_SuccessfullyReturnedAllTemplates(Vec<models::Template>),
@@ -76,9 +55,12 @@ pub enum TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
-pub enum TemplatesTemplateIdBuildsBuildIdBuilderPostResponse {
-    /// Image publication accepted
-    Status202_ImagePublicationAccepted,
+pub enum TemplatesTemplateIdBuildsBuildIdBuilderPutResponse {
+    /// Builder preparation accepted
+    Status202_BuilderPreparationAccepted {
+        body: models::TemplateBuilder,
+        x_agentenv_build_id: Option<String>,
+    },
     /// Bad request
     Status400_BadRequest(models::Error),
     /// Authentication error
@@ -87,6 +69,8 @@ pub enum TemplatesTemplateIdBuildsBuildIdBuilderPostResponse {
     Status404_NotFound(models::Error),
     /// Conflict
     Status409_Conflict(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -206,19 +190,6 @@ pub trait Templates<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         path_params: &models::TemplatesAliasesAliasGetPathParams,
     ) -> Result<TemplatesAliasesAliasGetResponse, E>;
 
-    /// Start a managed Dockerfile template build.
-    ///
-    /// TemplatesBuildsPost - POST /templates/builds
-    async fn templates_builds_post(
-        &self,
-
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
-        body: &models::TemplateBuildSessionRequest,
-    ) -> Result<TemplatesBuildsPostResponse, E>;
-
     /// List templates.
     ///
     /// TemplatesGet - GET /templates
@@ -245,19 +216,19 @@ pub trait Templates<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         path_params: &models::TemplatesTemplateIdBuildsBuildIdBuilderDeletePathParams,
     ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse, E>;
 
-    /// Publish the completed BuildKit image.
+    /// Prepare the BuildKit worker for a template build.
     ///
-    /// TemplatesTemplateIdBuildsBuildIdBuilderPost - POST /templates/{templateID}/builds/{buildID}/builder
-    async fn templates_template_id_builds_build_id_builder_post(
+    /// TemplatesTemplateIdBuildsBuildIdBuilderPut - PUT /templates/{templateID}/builds/{buildID}/builder
+    async fn templates_template_id_builds_build_id_builder_put(
         &self,
 
         method: &Method,
         host: &Host,
         cookies: &CookieJar,
         claims: &Self::Claims,
-        path_params: &models::TemplatesTemplateIdBuildsBuildIdBuilderPostPathParams,
-        body: &models::TemplateBuildImage,
-    ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderPostResponse, E>;
+        path_params: &models::TemplatesTemplateIdBuildsBuildIdBuilderPutPathParams,
+        body: &models::TemplateBuilderRequest,
+    ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderPutResponse, E>;
 
     /// Template build status.
     ///

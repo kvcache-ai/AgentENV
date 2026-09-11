@@ -211,12 +211,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	} else if isSandboxControlPlaneRequest(r) {
 		sandboxID, hasSandbox = sandboxIDFromPath(r.URL.Path)
 		routeSource = routeSourcePath
+	} else if isTemplateBuilderAllocation(r) {
+		routeSource = routeSourceSchedule
 	} else if buildID, ok := templateBuildIDFromPath(r.URL.Path); ok {
 		sandboxID, hasSandbox = buildID, true
 		buildStatusRequest = r.Method == http.MethodGet && strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/status")
 		routeSource = routeSourcePath
-	} else if strings.TrimRight(r.URL.Path, "/") == "/templates/builds" {
-		routeSource = routeSourceSchedule
 	} else {
 		sandboxID, hasSandbox = sandboxIDFromHeaders(r.Header)
 	}
@@ -436,10 +436,13 @@ func (e *proxyResponseError) Error() string {
 func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestPath string) error {
 	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
 	defer cancelRecord()
-	if strings.TrimRight(requestPath, "/") == "/templates/builds" {
+	if expectedID, ok := templateBuildIDFromPath(requestPath); ok && strings.HasSuffix(strings.TrimRight(requestPath, "/"), "/builder") {
 		buildID := strings.TrimSpace(resp.Header.Get("x-agentenv-build-id"))
 		if buildID == "" {
 			return &proxyResponseError{statusCode: http.StatusBadGateway, message: "upstream build response is missing its build ID"}
+		}
+		if buildID != expectedID {
+			return &proxyResponseError{statusCode: http.StatusBadGateway, message: "upstream build response ID does not match the request"}
 		}
 		if err := s.recordAssignment(recordCtx, buildID, node, "template_build"); err != nil {
 			return &proxyResponseError{statusCode: http.StatusServiceUnavailable, message: "failed to route allocated build", cause: err}
@@ -540,12 +543,15 @@ func flushInterval(flushImmediately bool) time.Duration {
 }
 
 func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox bool) bool {
+	if isTemplateBuilderAllocation(r) {
+		return true
+	}
 	if r.Method != http.MethodPost {
 		return false
 	}
 	path := strings.TrimRight(r.URL.Path, "/")
 	if !hasSandbox {
-		return path == "/sandboxes" || path == "/sandboxes-cold" || path == "/templates/builds"
+		return path == "/sandboxes" || path == "/sandboxes-cold"
 	}
 	if routeSource != routeSourcePath {
 		return false
@@ -646,6 +652,11 @@ func isSandboxControlPlaneRequest(r *http.Request) bool {
 	default:
 		return false
 	}
+}
+
+func isTemplateBuilderAllocation(r *http.Request) bool {
+	_, ok := templateBuildIDFromPath(r.URL.Path)
+	return ok && r.Method == http.MethodPut && strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/builder")
 }
 
 // Build sessions use scheduler bindings internally without exposing worker IDs.
@@ -937,8 +948,7 @@ func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
 	}
 
 	_, builderRequest := templateBuildIDFromPath(r.URL.Path)
-	return !isSandboxControlPlaneRequest(r) && !builderRequest &&
-		strings.TrimRight(r.URL.Path, "/") != "/templates/builds" && hasCompleteProxyRouteHeaders(r.Header)
+	return !isSandboxControlPlaneRequest(r) && !builderRequest && hasCompleteProxyRouteHeaders(r.Header)
 }
 
 func isExplicitProxyPath(path string) bool {

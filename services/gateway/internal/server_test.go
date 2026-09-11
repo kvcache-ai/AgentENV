@@ -1617,12 +1617,10 @@ func TestInjectForwardedHeadersSetsXForwardedFor(t *testing.T) {
 }
 
 func TestTemplateBuildAllocationRequiresRoutingBinding(t *testing.T) {
-	for _, missingID := range []bool{false, true} {
-		t.Run(fmt.Sprintf("missing ID %t", missingID), func(t *testing.T) {
+	for _, buildID := range []string{"build-123", "", "other-build"} {
+		t.Run(fmt.Sprintf("build ID %q", buildID), func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if !missingID {
-					w.Header().Set("x-agentenv-build-id", "build-123")
-				}
+				w.Header().Set("x-agentenv-build-id", buildID)
 				w.WriteHeader(http.StatusAccepted)
 			}))
 			defer upstream.Close()
@@ -1631,16 +1629,16 @@ func TestTemplateBuildAllocationRequiresRoutingBinding(t *testing.T) {
 					return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "builder", Endpoint: upstream.URL}}, nil
 				},
 				recordAssignmentFunc: func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
-					if missingID {
-						t.Error("attempted to bind an absent build ID")
+					if buildID != "build-123" {
+						t.Error("attempted to bind an absent or mismatched build ID")
 					}
 					return nil, status.Error(codes.Unavailable, "scheduler unavailable")
 				},
 			}, time.Second, 1024)
 			response := httptest.NewRecorder()
-			authenticatedTestHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/templates/builds", strings.NewReader(`{}`)))
+			authenticatedTestHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodPut, "/templates/build-123/builds/build-123/builder", strings.NewReader(`{}`)))
 			want := http.StatusServiceUnavailable
-			if missingID {
+			if buildID != "build-123" {
 				want = http.StatusBadGateway
 			}
 			if response.Code != want {
@@ -1654,10 +1652,10 @@ func TestTemplateBuilderRoutingAndAssignment(t *testing.T) {
 	requests := make(chan string, 4)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests <- r.URL.Path
-		if r.URL.Path == "/templates/builds" {
+		if r.Method == http.MethodPut {
 			w.Header().Set("x-agentenv-build-id", "build-123")
 			w.WriteHeader(http.StatusAccepted)
-			_, _ = w.Write([]byte(`{"templateID":"build-123","buildID":"build-123"}`))
+			_, _ = w.Write([]byte(`{"imageName":"aenv-build:build-123"}`))
 		}
 	}))
 	defer upstream.Close()
@@ -1679,10 +1677,9 @@ func TestTemplateBuilderRoutingAndAssignment(t *testing.T) {
 		},
 	}, time.Second, 1024)
 	for _, tc := range []struct{ method, path string }{
-		{http.MethodPost, "/templates/builds"},
+		{http.MethodPut, "/templates/build-123/builds/build-123/builder"},
 		{http.MethodGet, "/templates/build-123/builds/build-123/builder"},
 		{http.MethodGet, "/templates/build-123/builds/build-123/status"},
-		{http.MethodPost, "/templates/build-123/builds/build-123/builder"},
 		{http.MethodDelete, "/templates/build-123/builds/build-123/builder"},
 	} {
 		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`))

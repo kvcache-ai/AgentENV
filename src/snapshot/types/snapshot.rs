@@ -837,6 +837,33 @@ mod tests {
     }
 
     #[test]
+    fn legacy_snapshot_startup_roundtrips_without_format_changes() {
+        let mut legacy =
+            serde_json::to_value(SnapshotRecord::mock_ready(CommittedSnapshot::mock())).unwrap();
+        legacy["committed"]["startup"] = serde_json::json!({
+            "start_cmd": "[[ -n $HOME ]] && exec /app/server",
+            "ready_cmd": "test -f /app/ready",
+            "context": CommandContext::new(
+                HashMap::from([("HOME".into(), "/app".into())]),
+                "/app",
+            ),
+        });
+        let record: SnapshotRecord = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            record
+                .committed
+                .as_ref()
+                .unwrap()
+                .startup
+                .as_ref()
+                .unwrap()
+                .shell_command(),
+            ("/bin/bash", "-lc"),
+        );
+        assert_eq!(serde_json::to_value(record).unwrap(), legacy);
+    }
+
+    #[test]
     fn effective_start_cmd_empty_vecs_return_none() {
         let ctx = CommandContext::default()
             .with_entrypoint(Some(vec![]))

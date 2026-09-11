@@ -1,4 +1,5 @@
 use super::*;
+use crate::api::impls::template_helpers::template_build_record_from_v3_request;
 use crate::snapshot::{SnapshotSource, TemplateBuildStatus};
 use crate::volume::{VolumeLimits, VolumeMode, VolumeRecord, VolumeStatus};
 
@@ -102,9 +103,7 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
         };
         entry.persist(api.build_journal().await?, &id).await?;
         let session = BuildSession::new();
-        session
-            .state
-            .send_replace(SessionState::Submitted("sha256:result".into()));
+        session.state.send_replace(SessionState::Publishing);
         api.build_sessions
             .active
             .insert(id.clone(), session.clone());
@@ -296,6 +295,93 @@ async fn buildkit_worker_panic_releases_journal_and_scheduler_binding() -> Resul
 }
 
 #[tokio::test]
+async fn build_session_route_preserves_template_named_builds() -> Result<()> {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let (_root, api, record) = test_api(VolumeLimits::default()).await?;
+    let record = SnapshotRecord::template_waiting(
+        SnapshotId::generate(),
+        Some(crate::snapshot::SnapshotAlias::parse("builds")?),
+        record.resources,
+    );
+    api.snapshot_manager.create(record.clone()).await?;
+    let app = crate::api::server::new(Arc::new(api.clone()));
+    for (method, expected) in [
+        (http::Method::GET, http::StatusCode::OK),
+        (http::Method::DELETE, http::StatusCode::NO_CONTENT),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/templates/builds")
+                    .header("host", "localhost")
+                    .header("x-api-key", "build-cleanup-test-api-key-0123456789")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), expected);
+    }
+    assert!(api
+        .snapshot_manager
+        .get(record.id.to_string())
+        .await?
+        .is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn builder_allocation_requires_an_existing_waiting_build() -> Result<()> {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+
+    let (_root, api, record) = test_api(VolumeLimits::default()).await?;
+    let waiting = SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.resources);
+    api.snapshot_manager.create(waiting.clone()).await?;
+    // A claim by another node or the existing build API must exclude builder allocation.
+    api.snapshot_manager.try_start_build(&waiting.id).await?;
+    let app = crate::api::server::new(Arc::new(api.clone()));
+    for (id, expected) in [
+        (SnapshotId::generate(), http::StatusCode::NOT_FOUND),
+        (record.id.clone(), http::StatusCode::CONFLICT),
+        (waiting.id.clone(), http::StatusCode::CONFLICT),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(http::Method::PUT)
+                    .uri(format!("/templates/{id}/builds/{id}/builder"))
+                    .header("host", "localhost")
+                    .header("content-type", "application/json")
+                    .header("x-api-key", "build-cleanup-test-api-key-0123456789")
+                    .body(Body::from("{}"))?,
+            )
+            .await?;
+        assert_eq!(response.status(), expected);
+    }
+    assert!(api.build_sessions.active.is_empty());
+    assert!(api
+        .build_journal()
+        .await?
+        .scan_prefix(b"build/".to_vec())
+        .await?
+        .is_empty());
+    assert_eq!(
+        super::super::template::template_build_status(
+            &api.snapshot_manager
+                .get(waiting.id.to_string())
+                .await?
+                .unwrap()
+        ),
+        TemplateBuildStatus::Building
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn active_build_rejects_template_deletion_by_id_and_alias() -> Result<()> {
     use agentenv_http_server::apis::templates::{Templates, TemplatesTemplateIdDeleteResponse};
     use axum_extra::extract::CookieJar;
@@ -354,8 +440,11 @@ async fn buildkit_cache_limit_is_checked_before_allocating_build() -> Result<()>
         ..VolumeLimits::default()
     })
     .await?;
-    let request = serde_json::from_value(serde_json::json!({"template": {"name": "too-large"}}))?;
-    let error = api.allocate_image_build(request).await.unwrap_err();
+    let request = serde_json::from_value(serde_json::json!({}))?;
+    let error = api
+        .allocate_image_build(SnapshotId::generate(), request)
+        .await
+        .unwrap_err();
     assert_eq!(error.code, 400);
     assert!(error.message.contains("volume.max_size_mb"));
     assert!(api.build_sessions.active.is_empty());
@@ -376,7 +465,7 @@ fn buildkit_status_waits_for_cache_publication() -> Result<()> {
     sessions.active.insert("build".to_owned(), session.clone());
     assert!(!sessions.is_finishing("build"));
     assert!(session.ready("127.0.0.1:1234".parse()?));
-    session.submit("sha256:result").unwrap();
+    session.publish().unwrap();
     assert!(sessions.is_finishing("build"));
     session.state.send_replace(SessionState::Finished(None));
     assert!(!sessions.is_finishing("build"));
@@ -426,7 +515,7 @@ fn buildkit_startup_overrides_take_precedence_independently() -> Result<()> {
         (Some(""), Some("")),
     ] {
         let request = serde_json::from_value(json!({
-            "template": {"name": "demo"}, "startCmd": start, "readyCmd": ready,
+            "startCmd": start, "readyCmd": ready,
         }))?;
         let commands = build_startup_commands(&request, &context, Some(&image))?;
         assert_eq!(
@@ -439,8 +528,7 @@ fn buildkit_startup_overrides_take_precedence_independently() -> Result<()> {
         );
     }
     // An explicit readiness command also bypasses unusable image health checks.
-    let request =
-        serde_json::from_value(json!({"template": {"name": "demo"}, "readyCmd": "true"}))?;
+    let request = serde_json::from_value(json!({"readyCmd": "true"}))?;
     let invalid = json!({"Healthcheck": {"Test": ["CMD"]}});
     assert_eq!(
         build_startup_commands(&request, &context, Some(&invalid))?
@@ -452,24 +540,21 @@ fn buildkit_startup_overrides_take_precedence_independently() -> Result<()> {
 }
 
 #[test]
-fn buildkit_submission_and_cancellation_are_mutually_exclusive() {
-    let digest = crate::digest::sha256_digest(b"image");
+fn buildkit_publication_and_cancellation_are_mutually_exclusive() {
     for cancel_first in [false, true] {
         let session = BuildSession::new();
-        assert_eq!(session.submit(&digest).unwrap_err().code, 409);
+        assert_eq!(session.publish().unwrap_err().code, 409);
         assert!(session.ready("127.0.0.1:1234".parse().unwrap()));
         if cancel_first {
             session.request_cancel().unwrap();
-            assert_eq!(session.submit(&digest).unwrap_err().code, 409);
+            assert_eq!(session.publish().unwrap_err().code, 409);
             assert!(matches!(*session.state.borrow(), SessionState::Cancelled));
             assert!(!session.ready("127.0.0.1:1234".parse().unwrap()));
             session.request_cancel().unwrap();
         } else {
-            session.submit(&digest).unwrap();
-            assert!(
-                matches!(&*session.state.borrow(), SessionState::Submitted(value) if value == &digest)
-            );
-            assert_eq!(session.submit(&digest).unwrap_err().code, 409);
+            session.publish().unwrap();
+            assert!(matches!(&*session.state.borrow(), SessionState::Publishing));
+            assert_eq!(session.publish().unwrap_err().code, 409);
             assert_eq!(session.request_cancel().unwrap_err().code, 409);
         }
     }

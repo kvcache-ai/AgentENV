@@ -1,5 +1,5 @@
 //! Read-only access to BuildKit's content store. Image data stays on the node;
-//! the build client supplies only the digest returned by the image exporter.
+//! build completion and the image digest are read directly from BuildKit.
 
 use std::{net::SocketAddr, path::Path, time::Duration};
 
@@ -7,6 +7,9 @@ use anyhow::{ensure, Context, Result};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tonic::transport::{Channel, Endpoint};
+
+mod history;
+pub(crate) use history::{build_image_name, BuildkitHistory};
 
 mod proto {
     tonic::include_proto!("containerd.services.content.v1");

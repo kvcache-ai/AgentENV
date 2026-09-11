@@ -1,0 +1,38 @@
+// Wire-compatible subset of BuildKit's Apache-2.0 licensed Control API:
+// https://github.com/moby/buildkit/blob/v0.33.0/api/services/control/control.proto
+syntax = "proto3";
+package moby.buildkit.v1;
+
+service Control {
+  rpc ListenBuildHistory(BuildHistoryRequest) returns (stream BuildHistoryEvent);
+}
+message BuildHistoryRequest {
+  bool ActiveOnly = 1;
+  string Ref = 2;
+  bool EarlyExit = 3;
+}
+message BuildHistoryEvent {
+  int32 type = 1; // STARTED = 0, COMPLETE = 1, DELETED = 2
+  BuildHistoryRecord record = 2;
+}
+message BuildHistoryRecord {
+  string Ref = 1;
+  repeated Exporter Exporters = 4;
+  BuildError error = 5;
+  BuildResultInfo Result = 10;
+}
+// Wire-compatible subset of google.rpc.Status.
+message BuildError {
+  int32 code = 1;
+  string message = 2;
+}
+message Exporter {
+  string Type = 1;
+  map<string, string> Attrs = 2;
+}
+message BuildResultInfo {
+  map<int64, Descriptor> Results = 3;
+}
+message Descriptor {
+  string digest = 2;
+}

@@ -5,7 +5,7 @@ use anyhow::{ensure, Context, Result};
 use dashmap::DashMap;
 use futures::FutureExt;
 use tokio::{
-    sync::{oneshot, watch, Mutex, OnceCell},
+    sync::{oneshot, watch, Mutex, OnceCell, RwLock},
     time::Instant,
 };
 use tracing::{info, warn};
@@ -16,10 +16,10 @@ mod transport;
 mod worker;
 pub(crate) use transport::router;
 
-use super::{template_helpers::template_build_record_from_v3_request, ApiImpl};
+use super::ApiImpl;
 use crate::{
     cfg::ConfigManager,
-    image::buildkit::{validate_digest, BuildkitContent},
+    image::buildkit::{build_image_name, BuildkitContent},
     local_store::{LocalKvStore, LocalStoreDurability},
     snapshot::{
         CommandContext, RunnableSnapshot, SnapshotId, SnapshotRecord, TemplateBuildErrorReason,
@@ -40,10 +40,16 @@ impl BuildSessions {
         self.active.contains_key(id)
     }
 
+    pub(super) fn is_starting(&self, id: &str) -> bool {
+        self.active
+            .get(id)
+            .is_some_and(|session| matches!(*session.state.borrow(), SessionState::Starting))
+    }
+
     pub(super) fn is_finishing(&self, id: &str) -> bool {
         self.active
             .get(id)
-            .is_some_and(|session| matches!(*session.state.borrow(), SessionState::Submitted(_)))
+            .is_some_and(|session| matches!(*session.state.borrow(), SessionState::Publishing))
     }
 }
 
@@ -65,13 +71,14 @@ impl BuildJournal {
 struct BuildSession {
     state: watch::Sender<SessionState>,
     cleanup: Arc<Mutex<()>>,
+    connections: Arc<RwLock<()>>,
 }
 
 #[derive(Clone)]
 enum SessionState {
     Starting,
     Ready(SocketAddr),
-    Submitted(String),
+    Publishing,
     Cancelled,
     Finished(Option<TemplateBuildErrorReason>),
 }
@@ -81,6 +88,7 @@ impl BuildSession {
         Self {
             state: watch::channel(SessionState::Starting).0,
             cleanup: Arc::new(Mutex::new(())),
+            connections: Arc::new(RwLock::new(())),
         }
     }
 
@@ -94,34 +102,34 @@ impl BuildSession {
         })
     }
 
-    fn submit(&self, digest: &str) -> Result<(), models::Error> {
+    fn publish(&self) -> Result<(), models::Error> {
         let accepted = self.state.send_if_modified(|state| {
             if !matches!(state, SessionState::Ready(_)) {
                 return false;
             }
-            *state = SessionState::Submitted(digest.to_owned());
+            *state = SessionState::Publishing;
             true
         });
         if !accepted {
             return Err(ApiImpl::error(
                 409,
-                "builder is not ready or build was already submitted or cancelled",
+                "builder is not ready or build is already publishing or cancelled",
             ));
         }
         Ok(())
     }
 
     fn request_cancel(&self) -> Result<(), models::Error> {
-        let mut submitted = false;
+        let mut publishing = false;
         self.state.send_if_modified(|state| {
-            submitted = matches!(state, SessionState::Submitted(_));
+            publishing = matches!(state, SessionState::Publishing);
             if !matches!(state, SessionState::Starting | SessionState::Ready(_)) {
                 return false;
             }
             *state = SessionState::Cancelled;
             true
         });
-        if submitted {
+        if publishing {
             return Err(ApiImpl::error(
                 409,
                 "publication already started; the server will finish it and release the builder",
@@ -148,20 +156,25 @@ impl ApiImpl {
 
     pub(super) async fn start_image_build(
         &self,
-        body: &models::TemplateBuildSessionRequest,
-    ) -> Result<models::TemplateRequestResponseV3, models::Error> {
+        template_id: &str,
+        build_id: &str,
+        body: &models::TemplateBuilderRequest,
+    ) -> Result<models::TemplateBuilder, models::Error> {
+        if template_id != build_id {
+            return Err(Self::error(404, "template build not found"));
+        }
+        let id = SnapshotId::parse(build_id)
+            .map_err(|_| Self::error(404, "template build not found"))?;
         let api = self.clone();
         let body = body.clone();
         let (sender, receiver) = oneshot::channel();
         tokio::spawn(async move {
-            let result = api.allocate_image_build(body).await;
-            // Complete allocation durably, then cancel if its request disappeared.
-            if let Err(Ok(response)) = sender.send(result) {
-                if let Err(error) = api
-                    .cancel_image_build(&response.template_id, &response.build_id)
-                    .await
-                {
-                    warn!(build_id = %response.build_id, error = %error.message, "disconnected build cleanup will be retried");
+            let result = api.allocate_image_build(id.clone(), body).await;
+            // Finish allocation even if the request disappears, then release its worker.
+            if let Err(Ok(_)) = sender.send(result) {
+                let id = id.to_string();
+                if let Err(error) = api.cancel_image_build(&id, &id).await {
+                    warn!(build_id = %id, error = %error.message, "disconnected build cleanup will be retried");
                 }
             }
         });
@@ -172,14 +185,9 @@ impl ApiImpl {
 
     async fn allocate_image_build(
         &self,
-        body: models::TemplateBuildSessionRequest,
-    ) -> Result<models::TemplateRequestResponseV3, models::Error> {
-        let name = body
-            .template
-            .name
-            .as_deref()
-            .ok_or_else(|| Self::error(400, "template name must be provided"))?
-            .to_owned();
+        id: SnapshotId,
+        body: models::TemplateBuilderRequest,
+    ) -> Result<models::TemplateBuilder, models::Error> {
         if ConfigManager::global_config().template_build.cache_size_mb
             > self.volume_manager.limits().max_size_mb
         {
@@ -188,30 +196,60 @@ impl ApiImpl {
                 "template_build.cache_size_mb exceeds volume.max_size_mb",
             ));
         }
-        let id = SnapshotId::generate();
-        let record = template_build_record_from_v3_request(&body.template, id.clone(), &name)?;
-        let entry = BuildJournal {
-            cache: format!("aenv-buildkit-work-{id}"),
-            parent: None,
-        };
+        let record = self
+            .snapshot_manager
+            .get(id.to_string())
+            .await
+            .map_err(|err| Self::snapshot_manager_error(&err))?
+            .ok_or_else(|| Self::error(404, "template build not found"))?;
+        if super::template::template_build_status(&record)
+            != crate::snapshot::TemplateBuildStatus::Waiting
+        {
+            return Err(Self::error(409, "build has already started"));
+        }
         let journal = self
             .build_journal()
             .await
             .map_err(|err| Self::internal_error(err.as_ref()))?;
-        let key = format!("build/{id}");
-        // Recovery must see the live session before its journal entry becomes durable.
         let session = BuildSession::new();
-        self.build_sessions
-            .active
-            .insert(id.to_string(), session.clone());
+        match self.build_sessions.active.entry(id.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(_) => {
+                return Err(Self::error(409, "build has already started"))
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                entry.insert(session.clone());
+            }
+        }
+        // The repository CAS also excludes starts on another node or through the legacy API.
+        let record = match self.snapshot_manager.try_start_build(&id).await {
+            Ok(record) => record,
+            Err(err) => {
+                self.build_sessions.active.remove(&id.to_string());
+                return Err(match err {
+                    crate::snapshot::RepositoryError::SnapshotNotFound { .. } => {
+                        Self::error(404, "template build not found")
+                    }
+                    crate::snapshot::RepositoryError::InvalidRequest { .. } => {
+                        Self::error(409, "build has already started")
+                    }
+                    _ => Self::repository_error(&err),
+                });
+            }
+        };
+        let entry = BuildJournal {
+            cache: format!("aenv-buildkit-work-{id}"),
+            parent: None,
+        };
         if let Err(err) = entry.persist(journal, &id.to_string()).await {
+            let _ = self
+                .snapshot_manager
+                .mark_build_error(
+                    &id,
+                    TemplateBuildErrorReason::new("failed to persist builder allocation"),
+                )
+                .await;
             self.build_sessions.active.remove(&id.to_string());
             return Err(Self::internal_error(err.as_ref()));
-        }
-        if let Err(err) = self.snapshot_manager.create(record.clone()).await {
-            let _ = journal.delete(key.into_bytes()).await;
-            self.build_sessions.active.remove(&id.to_string());
-            return Err(Self::repository_error(&err));
         }
         self.orchestrator
             .register_template_build(
@@ -222,14 +260,9 @@ impl ApiImpl {
         tokio::spawn(async move {
             api.run_image_build(record, body, session, entry).await;
         });
-        Ok(models::TemplateRequestResponseV3::new(
-            id.to_string(),
-            id.to_string(),
-            true,
-            vec![name.clone()],
-            vec![name],
-            vec![],
-        ))
+        Ok(models::TemplateBuilder::new(build_image_name(
+            &id.to_string(),
+        )))
     }
 
     fn session(&self, template_id: &str, build_id: &str) -> Result<BuildSession, models::Error> {
@@ -241,17 +274,6 @@ impl ApiImpl {
             .get(build_id)
             .map(|entry| entry.value().clone())
             .ok_or_else(|| Self::error(404, "active template build not found"))
-    }
-
-    pub(super) fn submit_image_build(
-        &self,
-        template_id: &str,
-        build_id: &str,
-        digest: &str,
-    ) -> Result<(), models::Error> {
-        validate_digest(digest).map_err(|err| Self::error(400, err.to_string()))?;
-        let session = self.session(template_id, build_id)?;
-        session.submit(digest)
     }
 
     pub(super) async fn cancel_image_build(
@@ -299,7 +321,7 @@ impl ApiImpl {
     async fn run_image_build(
         &self,
         record: SnapshotRecord,
-        body: models::TemplateBuildSessionRequest,
+        body: models::TemplateBuilderRequest,
         session: BuildSession,
         entry: BuildJournal,
     ) {
@@ -317,6 +339,10 @@ impl ApiImpl {
             )
             .await
             .context("image import deadline exceeded")??;
+            // Let buildctl receive its final Solve response before stopping BuildKit.
+            // A client that keeps sockets open must not indefinitely delay publication.
+            let _connections =
+                tokio::time::timeout(Duration::from_secs(10), session.connections.write()).await;
             let cache_ready = self.release_builder(&id, &entry.cache).await?;
             let context = CommandContext::from(resolved.base_context);
             let (start, ready) =
@@ -394,7 +420,7 @@ impl ApiImpl {
 }
 
 fn build_startup_commands(
-    request: &models::TemplateBuildSessionRequest,
+    request: &models::TemplateBuilderRequest,
     context: &CommandContext,
     image_config: Option<&serde_json::Value>,
 ) -> Result<(Option<String>, Option<String>)> {

@@ -4,6 +4,7 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=services/api/proto/scheduler.proto");
     println!("cargo:rerun-if-changed=src/image/content.proto");
+    println!("cargo:rerun-if-changed=src/image/build_history.proto");
     emit_git_rerun_inputs();
 
     tonic_prost_build::configure()
@@ -17,7 +18,10 @@ fn main() {
 
     tonic_prost_build::configure()
         .build_server(true)
-        .compile_protos(&["src/image/content.proto"], &["src/image"])
+        .compile_protos(
+            &["src/image/content.proto", "src/image/build_history.proto"],
+            &["src/image"],
+        )
         .expect("failed to compile content store client");
 
     let commit = resolve_git_commit().unwrap_or_else(|| "unknown".to_string());

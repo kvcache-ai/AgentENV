@@ -104,10 +104,6 @@ where
             get(templates_aliases_alias_get::<I, A, E, C>),
         )
         .route(
-            "/templates/builds",
-            post(templates_builds_post::<I, A, E, C>),
-        )
-        .route(
             "/templates/{template_id}",
             delete(templates_template_id_delete::<I, A, E, C>)
                 .get(templates_template_id_get::<I, A, E, C>),
@@ -115,7 +111,7 @@ where
         .route(
             "/templates/{template_id}/builds/{build_id}/builder",
             delete(templates_template_id_builds_build_id_builder_delete::<I, A, E, C>)
-                .post(templates_template_id_builds_build_id_builder_post::<I, A, E, C>),
+                .put(templates_template_id_builds_build_id_builder_put::<I, A, E, C>),
         )
         .route(
             "/templates/{template_id}/builds/{build_id}/status",
@@ -3840,212 +3836,6 @@ where
     })
 }
 
-#[derive(validator::Validate)]
-#[allow(dead_code)]
-struct TemplatesBuildsPostBodyValidator<'a> {
-    #[validate(nested)]
-    body: &'a models::TemplateBuildSessionRequest,
-}
-
-#[tracing::instrument(skip_all)]
-fn templates_builds_post_validation(
-    body: models::TemplateBuildSessionRequest,
-) -> std::result::Result<(models::TemplateBuildSessionRequest,), ValidationErrors> {
-    let b = TemplatesBuildsPostBodyValidator { body: &body };
-    b.validate()?;
-
-    Ok((body,))
-}
-/// TemplatesBuildsPost - POST /templates/builds
-#[tracing::instrument(skip_all)]
-async fn templates_builds_post<I, A, E, C>(
-    method: Method,
-    TypedHeader(host): TypedHeader<Host>,
-    cookies: CookieJar,
-    headers: HeaderMap,
-    State(api_impl): State<I>,
-    Json(body): Json<models::TemplateBuildSessionRequest>,
-) -> Result<Response, StatusCode>
-where
-    I: AsRef<A> + Send + Sync,
-    A: apis::templates::Templates<E, Claims = C> + apis::ApiKeyAuthHeader<Claims = C> + Send + Sync,
-    E: std::fmt::Debug + Send + Sync + 'static,
-{
-    // Authentication
-    let claims_in_header = api_impl
-        .as_ref()
-        .extract_claims_from_header(&headers, "X-API-Key")
-        .await;
-    let claims = None.or(claims_in_header);
-    let Some(claims) = claims else {
-        return response_with_status_code_only(StatusCode::UNAUTHORIZED);
-    };
-
-    #[allow(clippy::redundant_closure)]
-    let validation = tokio::task::spawn_blocking(move || templates_builds_post_validation(body))
-        .await
-        .unwrap();
-
-    let Ok((body,)) = validation else {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::from(validation.unwrap_err().to_string()))
-            .map_err(|_| StatusCode::BAD_REQUEST);
-    };
-
-    let result = api_impl
-        .as_ref()
-        .templates_builds_post(&method, &host, &cookies, &claims, &body)
-        .await;
-
-    let mut response = Response::builder();
-
-    let resp = match result {
-                                            Ok(rsp) => match rsp {
-                                                apis::templates::TemplatesBuildsPostResponse::Status202_TheTemplateBuildHasStarted
-                                                    {
-                                                        body,
-                                                        x_agentenv_build_id
-                                                    }
-                                                => {
-                                                    if let Some(x_agentenv_build_id) = x_agentenv_build_id {
-                                                    let x_agentenv_build_id = match header::IntoHeaderValue(x_agentenv_build_id).try_into() {
-                                                        Ok(val) => val,
-                                                        Err(e) => {
-                                                            return Response::builder()
-                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_build_id header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
-                                                        }
-                                                    };
-
-
-                                                    {
-                                                      let mut response_headers = response.headers_mut().unwrap();
-                                                      response_headers.insert(
-                                                          HeaderName::from_static("x-agentenv-build-id"),
-                                                          x_agentenv_build_id
-                                                      );
-                                                    }
-                                                    }
-                                                  let mut response = response.status(202);
-                                                  {
-                                                    let mut response_headers = response.headers_mut().unwrap();
-                                                    response_headers.insert(
-                                                        CONTENT_TYPE,
-                                                        HeaderValue::from_static("application/json"));
-                                                  }
-
-                                                  let body_content =  tokio::task::spawn_blocking(move ||
-                                                      serde_json::to_vec(&body).map_err(|e| {
-                                                        error!(error = ?e);
-                                                        StatusCode::INTERNAL_SERVER_ERROR
-                                                      })).await.unwrap()?;
-                                                  response.body(Body::from(body_content))
-                                                },
-                                                apis::templates::TemplatesBuildsPostResponse::Status400_BadRequest
-                                                    (body)
-                                                => {
-                                                  let mut response = response.status(400);
-                                                  {
-                                                    let mut response_headers = response.headers_mut().unwrap();
-                                                    response_headers.insert(
-                                                        CONTENT_TYPE,
-                                                        HeaderValue::from_static("application/json"));
-                                                  }
-
-                                                  let body_content =  tokio::task::spawn_blocking(move ||
-                                                      serde_json::to_vec(&body).map_err(|e| {
-                                                        error!(error = ?e);
-                                                        StatusCode::INTERNAL_SERVER_ERROR
-                                                      })).await.unwrap()?;
-                                                  response.body(Body::from(body_content))
-                                                },
-                                                apis::templates::TemplatesBuildsPostResponse::Status401_AuthenticationError
-                                                    (body)
-                                                => {
-                                                  let mut response = response.status(401);
-                                                  {
-                                                    let mut response_headers = response.headers_mut().unwrap();
-                                                    response_headers.insert(
-                                                        CONTENT_TYPE,
-                                                        HeaderValue::from_static("application/json"));
-                                                  }
-
-                                                  let body_content =  tokio::task::spawn_blocking(move ||
-                                                      serde_json::to_vec(&body).map_err(|e| {
-                                                        error!(error = ?e);
-                                                        StatusCode::INTERNAL_SERVER_ERROR
-                                                      })).await.unwrap()?;
-                                                  response.body(Body::from(body_content))
-                                                },
-                                                apis::templates::TemplatesBuildsPostResponse::Status404_NotFound
-                                                    (body)
-                                                => {
-                                                  let mut response = response.status(404);
-                                                  {
-                                                    let mut response_headers = response.headers_mut().unwrap();
-                                                    response_headers.insert(
-                                                        CONTENT_TYPE,
-                                                        HeaderValue::from_static("application/json"));
-                                                  }
-
-                                                  let body_content =  tokio::task::spawn_blocking(move ||
-                                                      serde_json::to_vec(&body).map_err(|e| {
-                                                        error!(error = ?e);
-                                                        StatusCode::INTERNAL_SERVER_ERROR
-                                                      })).await.unwrap()?;
-                                                  response.body(Body::from(body_content))
-                                                },
-                                                apis::templates::TemplatesBuildsPostResponse::Status409_Conflict
-                                                    (body)
-                                                => {
-                                                  let mut response = response.status(409);
-                                                  {
-                                                    let mut response_headers = response.headers_mut().unwrap();
-                                                    response_headers.insert(
-                                                        CONTENT_TYPE,
-                                                        HeaderValue::from_static("application/json"));
-                                                  }
-
-                                                  let body_content =  tokio::task::spawn_blocking(move ||
-                                                      serde_json::to_vec(&body).map_err(|e| {
-                                                        error!(error = ?e);
-                                                        StatusCode::INTERNAL_SERVER_ERROR
-                                                      })).await.unwrap()?;
-                                                  response.body(Body::from(body_content))
-                                                },
-                                                apis::templates::TemplatesBuildsPostResponse::Status500_ServerError
-                                                    (body)
-                                                => {
-                                                  let mut response = response.status(500);
-                                                  {
-                                                    let mut response_headers = response.headers_mut().unwrap();
-                                                    response_headers.insert(
-                                                        CONTENT_TYPE,
-                                                        HeaderValue::from_static("application/json"));
-                                                  }
-
-                                                  let body_content =  tokio::task::spawn_blocking(move ||
-                                                      serde_json::to_vec(&body).map_err(|e| {
-                                                        error!(error = ?e);
-                                                        StatusCode::INTERNAL_SERVER_ERROR
-                                                      })).await.unwrap()?;
-                                                  response.body(Body::from(body_content))
-                                                },
-                                            },
-                                            Err(why) => {
-                                                    // Application code returned an error. This should not happen, as the implementation should
-                                                    // return a valid response.
-                                                    return api_impl.as_ref().handle_error(&method, &host, &cookies, why).await;
-                                            },
-                                        };
-
-    resp.map_err(|e| {
-        error!(error = ?e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })
-}
-
 #[tracing::instrument(skip_all)]
 fn templates_get_validation(
     query_params: models::TemplatesGetQueryParams,
@@ -4339,38 +4129,38 @@ where
 
 #[derive(validator::Validate)]
 #[allow(dead_code)]
-struct TemplatesTemplateIdBuildsBuildIdBuilderPostBodyValidator<'a> {
+struct TemplatesTemplateIdBuildsBuildIdBuilderPutBodyValidator<'a> {
     #[validate(nested)]
-    body: &'a models::TemplateBuildImage,
+    body: &'a models::TemplateBuilderRequest,
 }
 
 #[tracing::instrument(skip_all)]
-fn templates_template_id_builds_build_id_builder_post_validation(
-    path_params: models::TemplatesTemplateIdBuildsBuildIdBuilderPostPathParams,
-    body: models::TemplateBuildImage,
+fn templates_template_id_builds_build_id_builder_put_validation(
+    path_params: models::TemplatesTemplateIdBuildsBuildIdBuilderPutPathParams,
+    body: models::TemplateBuilderRequest,
 ) -> std::result::Result<
     (
-        models::TemplatesTemplateIdBuildsBuildIdBuilderPostPathParams,
-        models::TemplateBuildImage,
+        models::TemplatesTemplateIdBuildsBuildIdBuilderPutPathParams,
+        models::TemplateBuilderRequest,
     ),
     ValidationErrors,
 > {
     path_params.validate()?;
-    let b = TemplatesTemplateIdBuildsBuildIdBuilderPostBodyValidator { body: &body };
+    let b = TemplatesTemplateIdBuildsBuildIdBuilderPutBodyValidator { body: &body };
     b.validate()?;
 
     Ok((path_params, body))
 }
-/// TemplatesTemplateIdBuildsBuildIdBuilderPost - POST /templates/{templateID}/builds/{buildID}/builder
+/// TemplatesTemplateIdBuildsBuildIdBuilderPut - PUT /templates/{templateID}/builds/{buildID}/builder
 #[tracing::instrument(skip_all)]
-async fn templates_template_id_builds_build_id_builder_post<I, A, E, C>(
+async fn templates_template_id_builds_build_id_builder_put<I, A, E, C>(
     method: Method,
     TypedHeader(host): TypedHeader<Host>,
     cookies: CookieJar,
     headers: HeaderMap,
-    Path(path_params): Path<models::TemplatesTemplateIdBuildsBuildIdBuilderPostPathParams>,
+    Path(path_params): Path<models::TemplatesTemplateIdBuildsBuildIdBuilderPutPathParams>,
     State(api_impl): State<I>,
-    Json(body): Json<models::TemplateBuildImage>,
+    Json(body): Json<models::TemplateBuilderRequest>,
 ) -> Result<Response, StatusCode>
 where
     I: AsRef<A> + Send + Sync,
@@ -4389,7 +4179,7 @@ where
 
     #[allow(clippy::redundant_closure)]
     let validation = tokio::task::spawn_blocking(move || {
-        templates_template_id_builds_build_id_builder_post_validation(path_params, body)
+        templates_template_id_builds_build_id_builder_put_validation(path_params, body)
     })
     .await
     .unwrap();
@@ -4403,7 +4193,7 @@ where
 
     let result = api_impl
         .as_ref()
-        .templates_template_id_builds_build_id_builder_post(
+        .templates_template_id_builds_build_id_builder_put(
             &method,
             &host,
             &cookies,
@@ -4417,12 +4207,47 @@ where
 
     let resp = match result {
                                             Ok(rsp) => match rsp {
-                                                apis::templates::TemplatesTemplateIdBuildsBuildIdBuilderPostResponse::Status202_ImagePublicationAccepted
+                                                apis::templates::TemplatesTemplateIdBuildsBuildIdBuilderPutResponse::Status202_BuilderPreparationAccepted
+                                                    {
+                                                        body,
+                                                        x_agentenv_build_id
+                                                    }
                                                 => {
+                                                    if let Some(x_agentenv_build_id) = x_agentenv_build_id {
+                                                    let x_agentenv_build_id = match header::IntoHeaderValue(x_agentenv_build_id).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_build_id header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-build-id"),
+                                                          x_agentenv_build_id
+                                                      );
+                                                    }
+                                                    }
                                                   let mut response = response.status(202);
-                                                  response.body(Body::empty())
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
                                                 },
-                                                apis::templates::TemplatesTemplateIdBuildsBuildIdBuilderPostResponse::Status400_BadRequest
+                                                apis::templates::TemplatesTemplateIdBuildsBuildIdBuilderPutResponse::Status400_BadRequest
                                                     (body)
                                                 => {
                                                   let mut response = response.status(400);
@@ -4440,7 +4265,7 @@ where
                                                       })).await.unwrap()?;
                                                   response.body(Body::from(body_content))
                                                 },
-                                                apis::templates::TemplatesTemplateIdBuildsBuildIdBuilderPostResponse::Status401_AuthenticationError
+                                                apis::templates::TemplatesTemplateIdBuildsBuildIdBuilderPutResponse::Status401_AuthenticationError
                                                     (body)
                                                 => {
                                                   let mut response = response.status(401);
@@ -4458,7 +4283,7 @@ where
                                                       })).await.unwrap()?;
                                                   response.body(Body::from(body_content))
                                                 },
-                                                apis::templates::TemplatesTemplateIdBuildsBuildIdBuilderPostResponse::Status404_NotFound
+                                                apis::templates::TemplatesTemplateIdBuildsBuildIdBuilderPutResponse::Status404_NotFound
                                                     (body)
                                                 => {
                                                   let mut response = response.status(404);
@@ -4476,10 +4301,28 @@ where
                                                       })).await.unwrap()?;
                                                   response.body(Body::from(body_content))
                                                 },
-                                                apis::templates::TemplatesTemplateIdBuildsBuildIdBuilderPostResponse::Status409_Conflict
+                                                apis::templates::TemplatesTemplateIdBuildsBuildIdBuilderPutResponse::Status409_Conflict
                                                     (body)
                                                 => {
                                                   let mut response = response.status(409);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::templates::TemplatesTemplateIdBuildsBuildIdBuilderPutResponse::Status500_ServerError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(500);
                                                   {
                                                     let mut response_headers = response.headers_mut().unwrap();
                                                     response_headers.insert(
