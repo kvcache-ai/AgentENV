@@ -19,7 +19,7 @@ use futures_util::stream::{self, StreamExt};
 use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -32,6 +32,39 @@ const IO_ENGINE_LIBAIO: u32 = 2;
 struct OpenedLowerLayer {
     file: Arc<dyn VirtualFile>,
     download: Option<CacheDownloadRequest>,
+}
+
+struct FailoverFile {
+    primary: Arc<dyn VirtualFile>,
+    fallback: Arc<dyn VirtualFile>,
+    primary_failed: AtomicBool,
+}
+
+#[async_trait]
+impl VirtualFile for FailoverFile {
+    async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
+        if !self.primary_failed.load(Ordering::Acquire) {
+            match self.primary.read_at(offset, len).await {
+                Ok(data) => return Ok(data),
+                Err(error) => {
+                    warn!(error = ?error, "p2p layer read failed; falling back to origin");
+                    self.primary_failed.store(true, Ordering::Release);
+                }
+            }
+        }
+        self.fallback.read_at(offset, len).await
+    }
+
+    async fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
+        self.primary.write_at(offset, data).await
+    }
+
+    async fn size(&self) -> Result<u64> {
+        match self.primary.size().await {
+            Ok(size) => Ok(size),
+            Err(_) => self.fallback.size().await,
+        }
+    }
 }
 
 struct OpenedLowerFiles {
@@ -564,7 +597,7 @@ impl ImageFile {
                     download: None,
                 },
                 Err(err) if is_not_found(&err) && !layer.uuid.is_empty() => {
-                    Self::open_ro_p2p_uuid(image_service, &layer).await?
+                    Self::open_ro_p2p_uuid(image_service, &layer, None).await?
                 }
                 Err(err) => return Err(err),
             }
@@ -661,6 +694,7 @@ impl ImageFile {
     async fn open_ro_p2p_uuid(
         image_service: &ImageService,
         layer: &LayerConfig,
+        fallback_url: Option<&str>,
     ) -> Result<OpenedLowerLayer> {
         let uuid = Uuid::parse_str(&layer.uuid)
             .with_context(|| format!("invalid overlaybd layer uuid '{}'", layer.uuid))?;
@@ -668,21 +702,43 @@ impl ImageFile {
             .p2p_uuid_address()
             .context("lower layer local file is missing and p2p uuid facade is not configured")?;
         let url = format!("{}/{}", p2p_uuid_address.trim_end_matches('/'), uuid);
-        Self::open_ro_p2p_layer(image_service, layer, &url).await
+        Self::open_ro_p2p_layer(image_service, layer, &url, fallback_url).await
     }
 
     async fn open_ro_p2p_layer(
         image_service: &ImageService,
         layer: &LayerConfig,
         url: &str,
+        fallback_url: Option<&str>,
     ) -> Result<OpenedLowerLayer> {
         let remote_file = image_service
             .open_source_blob_with_size(url, (layer.size != 0).then_some(layer.size))
             .await?;
         let tar_file = new_tar_file_adaptor(remote_file).await?;
         let switch_file = new_switch_file(tar_file, false, Some(url)).await?;
+        let file: Arc<dyn VirtualFile> = if let Some(fallback_url) = fallback_url {
+            match image_service
+                .open_source_blob_with_size(fallback_url, (layer.size != 0).then_some(layer.size))
+                .await
+            {
+                Ok(origin) => match new_tar_file_adaptor(origin).await {
+                    Ok(origin) => match new_switch_file(origin, false, Some(fallback_url)).await {
+                        Ok(origin) => Arc::new(FailoverFile {
+                            primary: switch_file,
+                            fallback: origin,
+                            primary_failed: AtomicBool::new(false),
+                        }),
+                        Err(_) => switch_file,
+                    },
+                    Err(_) => switch_file,
+                },
+                Err(_) => switch_file,
+            }
+        } else {
+            switch_file
+        };
         Ok(OpenedLowerLayer {
-            file: switch_file,
+            file,
             download: None,
         })
     }
@@ -722,8 +778,9 @@ impl ImageFile {
             bail!("repoBlobUrl is empty for remote lower layer");
         }
 
+        let origin_url = format!("{}/{}", repo_blob_url.trim_end_matches('/'), layer.digest);
         if !layer.uuid.is_empty() && image_service.p2p_uuid_address().is_some() {
-            match Self::open_ro_p2p_uuid(image_service, layer).await {
+            match Self::open_ro_p2p_uuid(image_service, layer, Some(&origin_url)).await {
                 Ok(opened) => return Ok(opened),
                 Err(error) => {
                     warn!(
@@ -738,7 +795,7 @@ impl ImageFile {
 
         if let Some(address) = image_service.p2p_digest_address() {
             let url = format!("{address}/{}", layer.digest);
-            match Self::open_ro_p2p_layer(image_service, layer, &url).await {
+            match Self::open_ro_p2p_layer(image_service, layer, &url, Some(&origin_url)).await {
                 Ok(opened) => return Ok(opened),
                 Err(error) => {
                     warn!(
@@ -751,7 +808,7 @@ impl ImageFile {
             }
         }
 
-        let url = format!("{}/{}", repo_blob_url.trim_end_matches('/'), layer.digest);
+        let url = origin_url;
         let source_size = (layer.size != 0).then_some(layer.size);
         let (remote_file, download) = if collect_download_requests {
             match image_service
