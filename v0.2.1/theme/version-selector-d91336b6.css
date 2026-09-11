@@ -1,0 +1,46 @@
+/* Styles for the version switcher injected by theme/version-selector.js */
+
+.version-selector {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 0.5rem;
+}
+
+.version-preview-banner {
+  display: flex;
+  z-index: 1000;
+  position: sticky;
+  top: 0;
+  height: var(--menu-bar-height);
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.6em 1em;
+  border-bottom: 1px solid #f0c36d;
+  background: #fff7e6;
+  color: #6b4c00;
+  box-sizing: border-box;
+}
+
+.version-preview-banner a {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* Keep the banner readable on mdbook's dark themes */
+.navy .version-preview-banner,
+.coal .version-preview-banner,
+.ayu .version-preview-banner {
+  background: #3a2f10;
+  color: #f0dca0;
+  border-color: #a3801e;
+}
+
+body:has(.version-preview-banner) .sidebar .sidebar-scrollbox {
+  top: var(--menu-bar-height);
+}
+
+body:has(.version-preview-banner) .page #mdbook-menu-bar.bordered {
+  top: var(--menu-bar-height) !important;
+}
