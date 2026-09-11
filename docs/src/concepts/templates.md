@@ -89,13 +89,20 @@ Managed builder settings belong to the server configuration:
 
 ```toml
 [template_build]
+max_concurrent_builds = 4
 builder_image = "docker.io/moby/buildkit:v0.33.0"
 builder_cpu_count = 16
 builder_memory_mb = 32768
-cache_size_mb = 262144
+cache_size_mb = 65536
 ```
 
-The 256 GiB disk is the persistent `/var/lib/buildkit` data volume, where image
+Each node admits at most `max_concurrent_builds` managed builds, including
+preparation, image publication, and cleanup. Excess builder PUT requests return
+HTTP 429 without changing the waiting build; retry once capacity is available.
+Each build permits up to 8 simultaneous WebSocket tunnels, including pending
+connections and upgrades. Excess tunnel connections also return HTTP 429.
+
+The 64 GiB disk is the persistent `/var/lib/buildkit` data volume, where image
 layers, build contexts, and cache mounts live. Its capacity applies when creating
 the cache; changing the setting does not resize an existing volume. These
 resources are separate from the resulting template's CPU and memory. Dockerfile

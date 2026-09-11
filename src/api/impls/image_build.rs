@@ -1,8 +1,12 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
 
 use agentenv_http_server::models;
 use anyhow::{ensure, Context, Result};
-use dashmap::DashMap;
 use futures::FutureExt;
 use tokio::{
     sync::{oneshot, watch, Mutex, OnceCell, RwLock},
@@ -30,24 +34,48 @@ use crate::{
 
 #[derive(Default)]
 pub(crate) struct BuildSessions {
-    active: DashMap<String, BuildSession>,
+    active: StdMutex<HashMap<String, BuildSession>>,
     journal: OnceCell<LocalKvStore>,
     builder_template: OnceCell<RunnableSnapshot>,
 }
 
 impl BuildSessions {
+    fn reserve(&self, id: &str) -> Result<BuildSession, models::Error> {
+        let mut active = self.active.lock().unwrap();
+        if active.contains_key(id) {
+            return Err(ApiImpl::error(409, "build has already started"));
+        }
+        if active.len()
+            >= ConfigManager::global_config()
+                .template_build
+                .max_concurrent_builds
+        {
+            return Err(ApiImpl::error(
+                429,
+                "node concurrent build limit reached; retry later",
+            ));
+        }
+        let session = BuildSession::new();
+        active.insert(id.to_owned(), session.clone());
+        Ok(session)
+    }
+
     pub(super) fn contains(&self, id: &str) -> bool {
-        self.active.contains_key(id)
+        self.active.lock().unwrap().contains_key(id)
     }
 
     pub(super) fn is_starting(&self, id: &str) -> bool {
         self.active
+            .lock()
+            .unwrap()
             .get(id)
             .is_some_and(|session| matches!(*session.state.borrow(), SessionState::Starting))
     }
 
     pub(super) fn is_finishing(&self, id: &str) -> bool {
         self.active
+            .lock()
+            .unwrap()
             .get(id)
             .is_some_and(|session| matches!(*session.state.borrow(), SessionState::Publishing))
     }
@@ -88,7 +116,10 @@ impl BuildSession {
         Self {
             state: watch::channel(SessionState::Starting).0,
             cleanup: Arc::new(Mutex::new(())),
-            connections: Arc::new(RwLock::new(())),
+            connections: Arc::new(RwLock::with_max_readers(
+                (),
+                transport::MAX_TUNNEL_CONNECTIONS,
+            )),
         }
     }
 
@@ -165,11 +196,21 @@ impl ApiImpl {
         }
         let id = SnapshotId::parse(build_id)
             .map_err(|_| Self::error(404, "template build not found"))?;
+        // Reserve synchronously before spawning or touching durable state. Failed starts
+        // release the slot; admitted builds hold it through publication and cleanup.
+        let session = self.build_sessions.reserve(&id.to_string())?;
         let api = self.clone();
         let body = body.clone();
         let (sender, receiver) = oneshot::channel();
         tokio::spawn(async move {
-            let result = api.allocate_image_build(id.clone(), body).await;
+            let result = api.allocate_image_build(id.clone(), body, session).await;
+            if result.is_err() {
+                api.build_sessions
+                    .active
+                    .lock()
+                    .unwrap()
+                    .remove(&id.to_string());
+            }
             // Finish allocation even if the request disappears, then release its worker.
             if let Err(Ok(_)) = sender.send(result) {
                 let id = id.to_string();
@@ -187,6 +228,7 @@ impl ApiImpl {
         &self,
         id: SnapshotId,
         body: models::TemplateBuilderRequest,
+        session: BuildSession,
     ) -> Result<models::TemplateBuilder, models::Error> {
         if ConfigManager::global_config().template_build.cache_size_mb
             > self.volume_manager.limits().max_size_mb
@@ -211,20 +253,10 @@ impl ApiImpl {
             .build_journal()
             .await
             .map_err(|err| Self::internal_error(err.as_ref()))?;
-        let session = BuildSession::new();
-        match self.build_sessions.active.entry(id.to_string()) {
-            dashmap::mapref::entry::Entry::Occupied(_) => {
-                return Err(Self::error(409, "build has already started"))
-            }
-            dashmap::mapref::entry::Entry::Vacant(entry) => {
-                entry.insert(session.clone());
-            }
-        }
         // The repository CAS also excludes starts on another node or through the legacy API.
         let record = match self.snapshot_manager.try_start_build(&id).await {
             Ok(record) => record,
             Err(err) => {
-                self.build_sessions.active.remove(&id.to_string());
                 return Err(match err {
                     crate::snapshot::RepositoryError::SnapshotNotFound { .. } => {
                         Self::error(404, "template build not found")
@@ -248,7 +280,6 @@ impl ApiImpl {
                     TemplateBuildErrorReason::new("failed to persist builder allocation"),
                 )
                 .await;
-            self.build_sessions.active.remove(&id.to_string());
             return Err(Self::internal_error(err.as_ref()));
         }
         self.orchestrator
@@ -271,8 +302,10 @@ impl ApiImpl {
         }
         self.build_sessions
             .active
+            .lock()
+            .unwrap()
             .get(build_id)
-            .map(|entry| entry.value().clone())
+            .cloned()
             .ok_or_else(|| Self::error(404, "active template build not found"))
     }
 

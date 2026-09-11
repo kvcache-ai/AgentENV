@@ -597,7 +597,8 @@ Builder resources do not change the resulting template's CPU or memory.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `max_concurrent_builds` | integer | `4` | Per-node limit for managed builds, including preparation, publication, and cleanup. Must be greater than zero. Excess builder PUT requests return HTTP 429 and leave the build waiting for retry. |
 | `builder_image` | string | `"docker.io/moby/buildkit:v0.33.0"` | Image containing the managed BuildKit daemon, client, and OCI runtime. |
 | `builder_cpu_count` | integer | `16` | Builder vCPUs, from 1 to 255. |
 | `builder_memory_mb` | integer | `32768` | Builder memory in MiB, from 256 to 2147483647. |
-| `cache_size_mb` | integer | `262144` | Capacity in MiB for new persistent BuildKit data disks. At least 1024 and at most `volume.max_size_mb`; changing it does not resize existing caches. |
+| `cache_size_mb` | integer | `65536` | Capacity in MiB for new persistent BuildKit data disks. At least 1024 and at most `volume.max_size_mb`; changing it does not resize existing caches. |

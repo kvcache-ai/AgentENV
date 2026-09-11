@@ -69,6 +69,8 @@ pub enum TemplatesTemplateIdBuildsBuildIdBuilderPutResponse {
     Status404_NotFound(models::Error),
     /// Conflict
     Status409_Conflict(models::Error),
+    /// Concurrent build limit reached
+    Status429_ConcurrentBuildLimitReached(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }

@@ -306,6 +306,7 @@ impl Templates<()> for ApiImpl {
                     400 => Status400_BadRequest(err),
                     404 => Status404_NotFound(err),
                     409 => Status409_Conflict(err),
+                    429 => Status429_ConcurrentBuildLimitReached(err),
                     _ => Status500_ServerError(err),
                 },
             },

@@ -103,7 +103,7 @@ internal worker and releases it afterward. The first Dockerfile build prepares a
 reusable builder template. Each build clones a shared cache seed, allowing
 concurrent builds and cache reuse across template names and nodes. Builder image and sizing
 are configured in `[template_build]` on the server, with defaults of 16 vCPUs,
-32 GiB memory, and 256 GiB cache disk. `FROM`, `ENTRYPOINT`, `CMD`, and
+32 GiB memory, and 64 GiB cache disk. `FROM`, `ENTRYPOINT`, `CMD`, and
 `HEALTHCHECK` in the final image determine the template's image, startup, and
 readiness. The final Dockerfile stage is always published.
 See [templates](../concepts/templates.md#aenv-build) for the

@@ -1538,7 +1538,7 @@ paths:
           $ref: "#/components/responses/500"
 
   /templates/{templateID}/builds/{buildID}/builder:
-    description: BuildKit worker for an existing template build. Create the template with POST /v3/templates first. GET opens an authenticated binary WebSocket carrying native BuildKit traffic.
+    description: BuildKit worker for an existing template build. Create the template with POST /v3/templates first. GET opens an authenticated binary WebSocket carrying native BuildKit traffic; at most 8 tunnels per build are allowed, with excess connections rejected with HTTP 429.
     parameters:
       - name: templateID
         in: path
@@ -1557,6 +1557,8 @@ paths:
         endpoint until building before connecting. Export one OCI image using
         the returned imageName. Successful completion automatically starts image
         import and template publication. A build that has already started returns 409.
+        Returns 429 when the node's configured concurrent build limit is reached;
+        the build remains waiting and the request can be retried.
       tags: [templates]
       security:
         - ApiKeyAuth: []
@@ -1586,6 +1588,12 @@ paths:
           $ref: "#/components/responses/404"
         "409":
           $ref: "#/components/responses/409"
+        "429":
+          description: Concurrent build limit reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/500"
     delete:

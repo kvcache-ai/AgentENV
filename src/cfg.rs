@@ -492,6 +492,9 @@ pub struct MemorySnapshotConfig {
 /// Resources for managed Dockerfile build workers.
 #[derive(Debug, Config, Clone)]
 pub struct TemplateBuildConfig {
+    /// Maximum managed builds admitted per node, including publication and cleanup.
+    #[config(default = 4usize)]
+    pub max_concurrent_builds: usize,
     #[config(default = "docker.io/moby/buildkit:v0.33.0")]
     pub builder_image: String,
     #[config(default = 16u32)]
@@ -499,7 +502,7 @@ pub struct TemplateBuildConfig {
     #[config(default = 32768u32)]
     pub builder_memory_mb: u32,
     /// Capacity of each build's writable clone of the repository's shared cache seed.
-    #[config(default = 262144u64)]
+    #[config(default = 65536u64)]
     pub cache_size_mb: u64,
 }
 
@@ -978,6 +981,9 @@ impl AppConfig {
 
     fn validate_template_builder(&self) -> Result<()> {
         let builder = &self.template_build;
+        if builder.max_concurrent_builds == 0 {
+            bail!("template_build.max_concurrent_builds must be greater than 0");
+        }
         if builder.builder_image.trim().is_empty() {
             bail!("template_build.builder_image must not be empty");
         }
@@ -1452,7 +1458,8 @@ mod tests {
         let mut config = AppConfig::default();
         assert_eq!(config.template_build.builder_cpu_count, 16);
         assert_eq!(config.template_build.builder_memory_mb, 32768);
-        assert_eq!(config.template_build.cache_size_mb, 262144);
+        assert_eq!(config.template_build.max_concurrent_builds, 4);
+        assert_eq!(config.template_build.cache_size_mb, 65536);
         assert_eq!(
             config.template_build.builder_image,
             format!(
@@ -1460,6 +1467,10 @@ mod tests {
                 include_str!("../config/buildkit-version").trim()
             )
         );
+        config.validate_template_builder().unwrap();
+        config.template_build.max_concurrent_builds = 0;
+        assert!(config.validate_template_builder().is_err());
+        config.template_build.max_concurrent_builds = 1;
         config.validate_template_builder().unwrap();
         config.template_build.builder_cpu_count = 0;
         assert!(config.validate_template_builder().is_err());
@@ -1475,7 +1486,7 @@ mod tests {
         config.validate().unwrap();
         config.template_build.cache_size_mb = 1023;
         assert!(config.validate_template_builder().is_err());
-        config.template_build.cache_size_mb = 262144;
+        config.template_build.cache_size_mb = 65536;
         config.template_build.builder_image = " ".into();
         assert!(config.validate_template_builder().is_err());
     }
