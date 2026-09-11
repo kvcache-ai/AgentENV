@@ -3,7 +3,13 @@
 ARG AENV_VIRTUALIZATION_MODE=kvm
 
 FROM rust:1-bookworm AS chef
-
+# HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY are predefined BuildKit build args:
+# passing them with `--build-arg` makes them available to every stage's `RUN`
+# without an `ARG` declaration, and keeps them out of the image environment,
+# `docker history`, and the layer cache key. `make k8s-build` forwards whatever
+# is exported in the caller's shell. Declaring them here instead would scope
+# them to this stage only, leaving the `--setup-only` dependency downloads in
+# `deps-stage` on a direct connection.
 WORKDIR /build
 ENV CARGO_TARGET_DIR=/build/target
 ENV RUSTUP_TOOLCHAIN=${RUST_VERSION}
