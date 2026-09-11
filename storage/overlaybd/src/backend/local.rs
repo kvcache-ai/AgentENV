@@ -433,7 +433,14 @@ impl LocalFileInner {
         // For O_DIRECT, we must use aligned memory.  io_uring still requires
         // aligned buffers for O_DIRECT files, so we submit the aligned read
         // and then slice out the requested region.
-        let got = io_ring::read_exact_at(submitter, fd, buffer.as_mut(), aligned_offset).await?;
+        let got = io_ring::read_exact_at_aligned(
+            submitter,
+            fd,
+            buffer.as_mut(),
+            aligned_offset,
+            self.alignment.memory,
+        )
+        .await?;
 
         if got <= head {
             return Ok(Bytes::new());
@@ -471,12 +478,22 @@ impl LocalFileInner {
 
         if (buf.as_ptr() as usize).is_multiple_of(self.alignment.memory) {
             // Buffer pointer is already aligned — submit directly, no copy.
-            Ok(io_ring::write_exact_at(submitter, fd, buf, offset).await?)
+            Ok(
+                io_ring::write_exact_at_aligned(submitter, fd, buf, offset, self.alignment.memory)
+                    .await?,
+            )
         } else {
             // Buffer pointer is unaligned — copy into an aligned bounce buffer first.
             let mut aligned = AlignedBuffer::new(buf.len(), self.alignment.memory)?;
             aligned.as_mut().copy_from_slice(buf);
-            Ok(io_ring::write_exact_at(submitter, fd, aligned.as_ref(), offset).await?)
+            Ok(io_ring::write_exact_at_aligned(
+                submitter,
+                fd,
+                aligned.as_ref(),
+                offset,
+                self.alignment.memory,
+            )
+            .await?)
         }
     }
 
@@ -580,7 +597,10 @@ impl LocalFileInner {
         }
 
         let fd = self.file.as_raw_fd();
-        Ok(io_ring::write_exact_at(submitter, fd, buf, offset).await?)
+        Ok(
+            io_ring::write_exact_at_aligned(submitter, fd, buf, offset, self.alignment.memory)
+                .await?,
+        )
     }
 }
 
