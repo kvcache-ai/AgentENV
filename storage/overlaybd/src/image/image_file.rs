@@ -668,11 +668,19 @@ impl ImageFile {
             .p2p_uuid_address()
             .context("lower layer local file is missing and p2p uuid facade is not configured")?;
         let url = format!("{}/{}", p2p_uuid_address.trim_end_matches('/'), uuid);
+        Self::open_ro_p2p_layer(image_service, layer, &url).await
+    }
+
+    async fn open_ro_p2p_layer(
+        image_service: &ImageService,
+        layer: &LayerConfig,
+        url: &str,
+    ) -> Result<OpenedLowerLayer> {
         let remote_file = image_service
-            .open_source_blob_with_size(&url, (layer.size != 0).then_some(layer.size))
+            .open_source_blob_with_size(url, (layer.size != 0).then_some(layer.size))
             .await?;
         let tar_file = new_tar_file_adaptor(remote_file).await?;
-        let switch_file = new_switch_file(tar_file, false, Some(&url)).await?;
+        let switch_file = new_switch_file(tar_file, false, Some(url)).await?;
         Ok(OpenedLowerLayer {
             file: switch_file,
             download: None,
@@ -723,6 +731,21 @@ impl ImageFile {
                         uuid = %layer.uuid,
                         error = ?error,
                         "p2p uuid lower open failed; falling back to remote digest"
+                    );
+                }
+            }
+        }
+
+        if let Some(address) = image_service.p2p_digest_address() {
+            let url = format!("{address}/{}", layer.digest);
+            match Self::open_ro_p2p_layer(image_service, layer, &url).await {
+                Ok(opened) => return Ok(opened),
+                Err(error) => {
+                    warn!(
+                        layer_index = index,
+                        digest = %layer.digest,
+                        error = ?error,
+                        "p2p digest lower open failed; falling back to origin"
                     );
                 }
             }
@@ -1279,6 +1302,30 @@ mod tests {
             .header(reqwest::header::CONTENT_LENGTH, body.len().to_string())
             .body(Body::from(body))
             .expect("206 response")
+    }
+
+    async fn handle_p2p_digest_request(
+        State(state): State<P2pUuidLayerState>,
+        request: Request,
+    ) -> Response<Body> {
+        assert!(request.uri().path().starts_with("/p2p-digest/sha256:"));
+        state.hits.fetch_add(1, AtomicOrdering::Relaxed);
+        if state.miss {
+            return Response::builder()
+                .status(HttpStatusCode::NOT_FOUND)
+                .body(Body::empty())
+                .unwrap();
+        }
+        let (start, end) = parse_request_range(request.headers()).expect("Range required");
+        let len = state.blob.len() as u64;
+        let end = end.min(len - 1);
+        let body = state.blob[start as usize..=end as usize].to_vec();
+        Response::builder()
+            .status(HttpStatusCode::PARTIAL_CONTENT)
+            .header(CONTENT_RANGE_RAW, format!("bytes {start}-{end}/{len}"))
+            .header(reqwest::header::CONTENT_LENGTH, body.len())
+            .body(Body::from(body))
+            .unwrap()
     }
 
     #[derive(Clone, Debug, Default)]
@@ -2365,6 +2412,111 @@ mod tests {
         assert_eq!(got.as_ref(), payload.as_slice());
         assert!(hits.load(AtomicOrdering::Relaxed) > 0);
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_oss_lower_without_uuid_prefers_p2p_digest_facade() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lower_path = tmp.path().join("lower.data");
+        let lower_index = tmp.path().join("lower.index");
+        let payload = vec![0x7d; 8192];
+        create_sealed_lower(&lower_path, &lower_index, &payload)
+            .await
+            .expect("build sealed lower");
+        let blob = std::fs::read(&lower_path).expect("read lower blob");
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/{*path}", any(handle_p2p_digest_request))
+            .with_state(P2pUuidLayerState {
+                blob: Arc::new(blob),
+                hits: hits.clone(),
+                miss: false,
+            });
+        let (base, handle) = spawn_server(app).await;
+        let service = build_service_with_p2p_address(&tmp, &format!("{base}/p2p-http")).await;
+        let image_cfg = ImageConfig {
+            repo_blob_url: "s3://unavailable/managed-layers".to_string(),
+            lowers: vec![LayerConfig {
+                digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                size: lower_path.metadata().expect("lower metadata").len(),
+                ..LayerConfig::default()
+            }],
+            upper: UpperConfig::default(),
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+
+        let image = ImageFile::open(image_cfg, service, None)
+            .await
+            .expect("open OSS lower from p2p digest facade");
+        let got = image.read_at(0, payload.len()).await.expect("read layer");
+
+        assert_eq!(got.as_ref(), payload.as_slice());
+        assert!(hits.load(AtomicOrdering::Relaxed) > 0);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_oss_lower_without_uuid_falls_back_on_p2p_digest_miss() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lower_path = tmp.path().join("lower.data");
+        let lower_index = tmp.path().join("lower.index");
+        let payload = vec![0x7d; 8192];
+        create_sealed_lower(&lower_path, &lower_index, &payload)
+            .await
+            .expect("build sealed lower");
+        let blob = std::fs::read(&lower_path).expect("read lower blob");
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/{*path}", any(handle_p2p_digest_request))
+            .with_state(P2pUuidLayerState {
+                blob: Arc::new(blob.clone()),
+                hits: hits.clone(),
+                miss: true,
+            });
+        let (base, handle) = spawn_server(app).await;
+        let origin = Router::new()
+            .route("/{*path}", any(handle_uploaded_object))
+            .with_state(UploadedObjectState {
+                blob: Arc::new(AsyncMutex::new(Some(blob))),
+            });
+        let (endpoint, origin_handle) = spawn_server(origin).await;
+        let _service = build_oss_service(&tmp, &endpoint, "us-east-1").await;
+        let config_path = tmp.path().join("overlaybd.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+        config["p2pConfig"] = json!({"enable": true, "address": format!("{base}/p2p-http")});
+        write_json(&config_path, &config);
+        let service = ImageService::from_config_path(config_path).await.unwrap();
+        let image_cfg = ImageConfig {
+            repo_blob_url: "s3://unavailable/managed-layers".to_string(),
+            lowers: vec![LayerConfig {
+                digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+                size: lower_path.metadata().expect("lower metadata").len(),
+                ..LayerConfig::default()
+            }],
+            upper: UpperConfig::default(),
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+
+        let image = ImageFile::open(image_cfg, service, None)
+            .await
+            .expect("open OSS lower after p2p digest miss");
+        let got = image.read_at(0, payload.len()).await.expect("read layer");
+
+        assert_eq!(got.as_ref(), payload.as_slice());
+        assert!(hits.load(AtomicOrdering::Relaxed) > 0);
+        handle.abort();
+        origin_handle.abort();
     }
 
     #[tokio::test]

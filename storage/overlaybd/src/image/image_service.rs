@@ -255,6 +255,14 @@ impl ImageService {
     }
 
     pub(crate) fn p2p_uuid_address(&self) -> Option<String> {
+        self.p2p_layer_address("p2p-uuid")
+    }
+
+    pub(crate) fn p2p_digest_address(&self) -> Option<String> {
+        self.p2p_layer_address("p2p-digest")
+    }
+
+    fn p2p_layer_address(&self, endpoint: &str) -> Option<String> {
         let p2p = &self.inner.global_config.p2p_config;
         if !p2p.enable {
             return None;
@@ -262,7 +270,7 @@ impl ImageService {
         p2p.address
             .trim_end_matches('/')
             .strip_suffix("/p2p-http")
-            .map(|base| format!("{base}/p2p-uuid"))
+            .map(|base| format!("{base}/{endpoint}"))
     }
 
     pub fn load_image_config(&self, path: impl AsRef<Path>) -> Result<ImageConfig> {

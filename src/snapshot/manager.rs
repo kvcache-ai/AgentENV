@@ -174,18 +174,24 @@ impl SnapshotManager {
         // Collect any overlaybd layers referenced by this snapshot's runtime images.
         let rootfs_uuids = managed_layer_uuids(&committed.rootfs_layers);
         let rootfs_digests = committed_layer_digests(&committed.rootfs_layers);
-        artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
-            &manifest.rootfs.image_config_path,
-            &rootfs_digests,
-            &rootfs_uuids,
-        ));
+        artifacts.extend(
+            SnapshotP2pArtifact::local_overlaybd_layers(
+                &manifest.rootfs.image_config_path,
+                &rootfs_digests,
+                &rootfs_uuids,
+            )
+            .await,
+        );
         let memory_uuids = managed_layer_uuids_from_managed(&committed.memory_layers);
         let memory_digests = committed_memory_layer_digests(&committed.memory_layers);
-        artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
-            &manifest.memory.image_config_path,
-            &memory_digests,
-            &memory_uuids,
-        ));
+        artifacts.extend(
+            SnapshotP2pArtifact::local_overlaybd_layers(
+                &manifest.memory.image_config_path,
+                &memory_digests,
+                &memory_uuids,
+            )
+            .await,
+        );
         for drive in &manifest.attached_drives {
             let (drive_digests, drive_uuids) = committed
                 .attached_drives
@@ -199,11 +205,14 @@ impl SnapshotManager {
                     _ => None,
                 })
                 .unwrap_or_default();
-            artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
-                &drive.image_config_path,
-                &drive_digests,
-                &drive_uuids,
-            ));
+            artifacts.extend(
+                SnapshotP2pArtifact::local_overlaybd_layers(
+                    &drive.image_config_path,
+                    &drive_digests,
+                    &drive_uuids,
+                )
+                .await,
+            );
         }
 
         // Publish all artifacts concurrently, but don't fail if any individual artifact fails to publish.
