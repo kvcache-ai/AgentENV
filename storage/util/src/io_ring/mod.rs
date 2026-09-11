@@ -172,6 +172,39 @@ pub async fn read_exact_at<S: IoUringSubmitter + ?Sized>(
     Ok(bytes_read)
 }
 
+pub async fn read_exact_at_aligned<S: IoUringSubmitter + ?Sized>(
+    submitter: &S,
+    fd: RawFd,
+    mut buf: &mut [u8],
+    mut offset: u64,
+    alignment: usize,
+) -> std::io::Result<usize> {
+    let mut total = 0;
+    while !buf.is_empty() {
+        let entry = opcode::Read::new(io_uring::types::Fd(fd), buf.as_mut_ptr(), buf.len() as _)
+            .offset(offset)
+            .build();
+        let res = submitter.submit(entry).await?;
+        if res <= 0 {
+            if res == 0 {
+                break;
+            }
+            if res == -libc::EINTR {
+                continue;
+            }
+            return Err(std::io::Error::from_raw_os_error(-res));
+        }
+        let n = res as usize;
+        total += n;
+        if n < buf.len() && !n.is_multiple_of(alignment) {
+            break;
+        }
+        buf = &mut buf[n..];
+        offset += n as u64;
+    }
+    Ok(total)
+}
+
 /// Try to write the `buf` into the file as much as possible.
 /// Similar to [write_exact_at_fixed], expect the `fd` is not
 /// an index to sparse file table, but a file descriptor.
@@ -203,4 +236,37 @@ pub async fn write_exact_at<S: IoUringSubmitter + ?Sized>(
         }
     }
     Ok(bytes_written)
+}
+
+pub async fn write_exact_at_aligned<S: IoUringSubmitter + ?Sized>(
+    submitter: &S,
+    fd: RawFd,
+    mut buf: &[u8],
+    mut offset: u64,
+    alignment: usize,
+) -> std::io::Result<usize> {
+    let mut total = 0;
+    while !buf.is_empty() {
+        let entry = opcode::Write::new(io_uring::types::Fd(fd), buf.as_ptr(), buf.len() as _)
+            .offset(offset)
+            .build();
+        let res = submitter.submit(entry).await?;
+        if res <= 0 {
+            if res == 0 {
+                break;
+            }
+            if res == -libc::EINTR {
+                continue;
+            }
+            return Err(std::io::Error::from_raw_os_error(-res));
+        }
+        let n = res as usize;
+        total += n;
+        if n < buf.len() && !n.is_multiple_of(alignment) {
+            break;
+        }
+        buf = &buf[n..];
+        offset += n as u64;
+    }
+    Ok(total)
 }
