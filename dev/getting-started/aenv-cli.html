@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-18a222cd.js";
+            window.path_to_searchindex_js = "../searchindex-d5f5dfb2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-a02e686b.js"></script>
@@ -186,6 +186,21 @@
 <h2 id="installation"><a class="header" href="#installation">Installation</a></h2>
 <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install-cli.sh | bash
 </code></pre>
+<p>Each release publishes <code>aenv-&lt;os&gt;-&lt;arch&gt;.tar.gz</code> for Linux and macOS on x86_64
+and aarch64 (arm64). The archive contains:</p>
+<pre><code class="language-text">aenv
+aenv-buildctl
+manifest.json
+</code></pre>
+<p>The manifest records the AgentENV version, BuildKit version, and platform.
+<code>SHA256SUMS</code> accompanies the release archives. The release workflow verifies the
+pinned upstream BuildKit download before packaging its client with <code>aenv</code>.</p>
+<p>Both <code>install-cli.sh</code> and the full <code>install.sh</code> download this single CLI archive
+and verify its GitHub release asset checksum before installing both executables.
+Installation does not contact the upstream BuildKit release. The private
+<code>aenv-buildctl</code> lives beside <code>aenv</code>, preserving an existing system <code>buildctl</code>.
+Set <code>INSTALL_DIR</code> for a user-local CLI installation. For manual installation,
+extract the archive and keep both executables in the same directory.</p>
 <p>Or build from source (requires Rust):</p>
 <pre><code class="language-bash">git clone https://github.com/kvcache-ai/AgentENV.git
 cd AgentENV
@@ -223,10 +238,13 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 </tbody>
 </table>
 </div>
-<h3 id="aenv-build-dockerfile---name-name"><a class="header" href="#aenv-build-dockerfile---name-name"><code>aenv build &lt;dockerfile&gt; --name &lt;name&gt;</code></a></h3>
-<p>Create a template from a local Dockerfile.</p>
-<pre><code class="language-bash">aenv build ./Dockerfile --name my-app
-aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
+<h3 id="aenv-build-context---name-name"><a class="header" href="#aenv-build-context---name-name"><code>aenv build &lt;context&gt; --name &lt;name&gt;</code></a></h3>
+<p>Create a template from a local Dockerfile using BuildKit in an isolated microVM.
+The installers include the required <code>buildctl</code> executable. For source builds,
+install BuildKit’s <code>buildctl</code> v0.33.0 or select an existing executable with <code>--buildctl</code>.</p>
+<pre><code class="language-bash">aenv build . --name my-app
+aenv build . -f deploy/docker/Dockerfile.agentenv --name aenv
+aenv build ./my-app --name my-app-v2 --build-arg VERSION=2
 </code></pre>
 <div class="table-wrapper">
 <table>
@@ -237,12 +255,29 @@ aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
 <tr><td><code>--name &lt;name&gt;</code></td><td>Required template name</td></tr>
 <tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores for the template. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory for the template. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
-<tr><td><code>--image &lt;image&gt;</code></td><td>Override the rootfs base. Defaults to the first concrete <code>FROM</code> image, then the server’s <code>[image.resolver].default_image</code> if none is usable. Alias: <code>--user-image</code>.</td></tr>
+<tr><td><code>-f, --file &lt;path&gt;</code></td><td>Dockerfile path relative to the current directory. Defaults to <code>&lt;context&gt;/Dockerfile</code>.</td></tr>
+<tr><td><code>--build-arg KEY=VALUE</code></td><td>Repeatable build arguments.</td></tr>
+<tr><td><code>--secret &lt;spec&gt;</code></td><td>Repeatable BuildKit secret mount.</td></tr>
+<tr><td><code>--no-cache</code></td><td>Disable instruction cache for this build.</td></tr>
+<tr><td><code>--timeout &lt;seconds&gt;</code></td><td>Dockerfile build deadline; defaults to 3600. The CLI allows 10 additional minutes for provisioning and publication.</td></tr>
 </tbody>
 </table>
 </div>
-<p><code>aenv build</code> submits the build and returns immediately. Use
-<code>aenv template watch &lt;template&gt;</code> to wait for completion.</p>
+<p>The command supports multi-stage builds, file updates, and <code>.dockerignore</code>, shows
+BuildKit progress, and waits until the template is ready. The server manages the
+internal worker and releases it afterward. The first Dockerfile build prepares a
+reusable builder template. Each build clones a shared cache seed, allowing
+concurrent builds and cache reuse across template names and nodes. Builder image and sizing
+are configured in <code>[template_build]</code> on the server, with defaults of 16 vCPUs,
+32 GiB memory, and 64 GiB cache disk. <code>FROM</code>, <code>ENTRYPOINT</code>, <code>CMD</code>, and
+<code>HEALTHCHECK</code> in the final image determine the template’s image, startup, and
+readiness. The final Dockerfile stage is always published.
+See <a href="../concepts/templates.html#aenv-build">templates</a> for the
+complete workflow, cache management, and startup behavior.</p>
+<p>Interactive builds show a three-stage bar for builder preparation, image build,
+and template publication, with elapsed time and Dockerfile logs above the bar.
+<code>--progress plain</code> keeps plain logs; <code>--progress tty</code> selects BuildKit’s native
+terminal display. Redirected output has no progress-bar control sequences.</p>
 <h3 id="aenv-template-list"><a class="header" href="#aenv-template-list"><code>aenv template list</code></a></h3>
 <p>List all templates. Alias: <code>aenv template ls</code>, <code>aenv templates list</code>.</p>
 <pre><code class="language-bash">aenv template list

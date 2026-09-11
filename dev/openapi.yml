@@ -977,6 +977,30 @@ components:
         memoryMB:
           $ref: "#/components/schemas/MemoryMB"
 
+    TemplateBuilderRequest:
+      type: object
+      properties:
+        startCmd:
+          type: string
+          description: Override the final image ENTRYPOINT/CMD for template startup. Omit to use the image command; an empty string disables startup.
+        readyCmd:
+          type: string
+          description: Override the final image HEALTHCHECK before snapshot capture.
+        timeout:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 86400
+          description: Builder preparation and Dockerfile build deadline in seconds; defaults to 3600.
+
+    TemplateBuilder:
+      type: object
+      required: [imageName]
+      properties:
+        imageName:
+          type: string
+          description: Required BuildKit image exporter name for this build. The server observes its successful completion and automatically imports and publishes the template.
+
     TemplateBuildStartV2:
       type: object
       properties:
@@ -1508,6 +1532,83 @@ paths:
           $ref: "#/components/responses/401"
         "400":
           $ref: "#/components/responses/400"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /templates/{templateID}/builds/{buildID}/builder:
+    description: BuildKit worker for an existing template build. Create the template with POST /v3/templates first. GET opens an authenticated binary WebSocket carrying native BuildKit traffic; at most 8 tunnels per build are allowed, with excess connections rejected with HTTP 429.
+    parameters:
+      - name: templateID
+        in: path
+        required: true
+        schema:
+          type: string
+      - name: buildID
+        in: path
+        required: true
+        schema:
+          type: string
+    put:
+      summary: Prepare the BuildKit worker for a template build
+      description: >
+        Claims a waiting build and prepares its worker. Poll the existing status
+        endpoint until building before connecting. Export one OCI image using
+        the returned imageName. Successful completion automatically starts image
+        import and template publication. A build that has already started returns 409.
+        Returns 429 when the node's configured concurrent build limit is reached;
+        the build remains waiting and the request can be retried.
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TemplateBuilderRequest"
+      responses:
+        "202":
+          description: Builder preparation accepted
+          headers:
+            x-agentenv-build-id:
+              description: Build identifier used by the gateway for routing.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuilder"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "429":
+          description: Concurrent build limit reached
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          $ref: "#/components/responses/500"
+    delete:
+      summary: Cancel a template build and release its worker
+      description: Cancellation before successful image completion stops the build. Once publication starts, the server finishes it and releases the worker independently of the client.
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        "204":
+          description: Builder released
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
         "409":
           $ref: "#/components/responses/409"
         "500":
@@ -2215,6 +2316,8 @@ paths:
           description: The template was deleted successfully
         "401":
           $ref: "#/components/responses/401"
+        "409":
+          $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
 

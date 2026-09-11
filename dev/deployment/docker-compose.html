@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-18a222cd.js";
+            window.path_to_searchindex_js = "../searchindex-d5f5dfb2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-a02e686b.js"></script>
@@ -206,6 +206,14 @@ make deploy-up
 <p><code>make deploy-up</code> builds the runtime, gateway, and scheduler images with Docker Compose
 before starting the stack. The Rust and Go toolchains are installed in the image
 build stages, so they are not required on the host.</p>
+<p>Runtime nodes mount the host’s upstream DNS configuration read-only for guest
+networks, including template builders. The <code>make deploy-*</code> targets select
+<code>/run/systemd/resolve/resolv.conf</code> when available, otherwise <code>/etc/resolv.conf</code>.
+Override <code>HOST_RESOLV_CONF</code> with an absolute path to a resolver file containing
+DNS servers reachable from guests; loopback addresses such as <code>127.0.0.53</code> and
+Docker’s <code>127.0.0.11</code> cannot be used by guests. Direct <code>docker compose</code> commands
+default to <code>/run/systemd/resolve/resolv.conf</code>; set <code>HOST_RESOLV_CONF</code> explicitly
+on hosts without that file. Containers retain Docker DNS for service discovery.</p>
 <p>To build without starting, run <code>make deploy-build</code>. To start images that are
 already built, run <code>make deploy-up-no-build</code>:</p>
 <pre><code class="language-bash"># Build only

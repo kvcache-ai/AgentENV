@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-18a222cd.js";
+            window.path_to_searchindex_js = "../searchindex-d5f5dfb2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-a02e686b.js"></script>
@@ -888,6 +888,27 @@ and are then re-fetched on demand.</p>
 <tr><td><code>block_size</code></td><td>integer</td><td><code>16777216</code></td><td>Background download chunk size in bytes (16 MiB): one source request fetches a chunk of this size, aligned down to whole cache blocks. The cache keeps its own smaller block size for foreground reads, so background downloads keep large-request throughput while foreground keeps fine-grained on-demand reads. Peak scratch per active layer download is <code>block_size × concurrency</code>.</td></tr>
 <tr><td><code>concurrency</code></td><td>integer</td><td><code>4</code></td><td>Maximum number of in-flight block remote reads within a single remote layer. <code>1</code> keeps the historical serial behavior. Must be greater than zero.</td></tr>
 <tr><td><code>max_inflight_blocks</code></td><td>integer</td><td><code>16</code></td><td>Cap on concurrently downloading chunks enforced by each file-cache backend’s download scheduler, shared by every concurrent layer download on that backend; bounds total scratch memory to <code>max_inflight_blocks</code> × the download chunk size (<code>block_size</code>). The value is fixed when the backend is created from the global config; a per-image <code>download</code> override never resizes the scheduler-owned cap (the first mismatch per scheduler is logged as <code>max_inflight_blocks_override_ignored</code>). Must be greater than zero.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="template_build"><a class="header" href="#template_build"><code>[template_build]</code></a></h2>
+<p>Managed Dockerfile builder resources. The first Dockerfile
+build on a node prepares a reusable internal builder template. Each build mounts
+a separate clone of the repository’s shared cache seed; concurrent builds do not
+queue for cache ownership. The last successfully published cache becomes the next
+seed, with best-effort reuse of concurrent branches.
+Builder resources do not change the resulting template’s CPU or memory.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_concurrent_builds</code></td><td>integer</td><td><code>4</code></td><td>Per-node limit for managed builds, including preparation, publication, and cleanup. Must be greater than zero. Excess builder PUT requests return HTTP 429 and leave the build waiting for retry.</td></tr>
+<tr><td><code>builder_image</code></td><td>string</td><td><code>"docker.io/moby/buildkit:v0.33.0"</code></td><td>Image containing the managed BuildKit daemon, client, and OCI runtime.</td></tr>
+<tr><td><code>builder_cpu_count</code></td><td>integer</td><td><code>16</code></td><td>Builder vCPUs, from 1 to 255.</td></tr>
+<tr><td><code>builder_memory_mb</code></td><td>integer</td><td><code>32768</code></td><td>Builder memory in MiB, from 256 to 2147483647.</td></tr>
+<tr><td><code>cache_size_mb</code></td><td>integer</td><td><code>65536</code></td><td>Capacity in MiB for new persistent BuildKit data disks. At least 1024 and at most <code>volume.max_size_mb</code>; changing it does not resize existing caches.</td></tr>
 </tbody>
 </table>
 </div>
