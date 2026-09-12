@@ -290,6 +290,115 @@ func TestLingeringNodeBecomesUnhealthyAfterTTL(t *testing.T) {
 	}
 }
 
+func TestSchedulingSnapshotDerivesCurrentStatus(t *testing.T) {
+	start := time.Unix(100, 0)
+	tests := []struct {
+		name        string
+		lingering   bool
+		queryOffset time.Duration
+		want        schedulerv1.NodeStatus
+	}{
+		{
+			name: "fresh ready heartbeat",
+			want: schedulerv1.NodeStatus_NODE_STATUS_READY,
+		},
+		{
+			name:        "expired heartbeat",
+			queryOffset: 2 * time.Second,
+			want:        schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY,
+		},
+		{
+			name:      "lingering overrides reported ready",
+			lingering: true,
+			want:      schedulerv1.NodeStatus_NODE_STATUS_LINGERING,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry := NewAtomicNodeRegistry(nil, time.Second)
+			node := Node{ID: "node-a", Endpoint: "http://node-a"}
+			if tt.lingering {
+				registry.Set(nil, []Node{node})
+			} else {
+				registry.Set([]Node{node}, nil)
+			}
+			if _, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+				NodeId:            node.ID,
+				ClusterId:         "cluster-a",
+				ServiceInstanceId: "svc-a",
+				Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+			}, start); err != nil {
+				t.Fatalf("heartbeat: %v", err)
+			}
+
+			snapshot := registry.SchedulingSnapshot(node.ID, start.Add(tt.queryOffset))
+			if snapshot == nil {
+				t.Fatal("expected scheduling snapshot")
+			}
+			if got := snapshot.GetStatus(); got != tt.want {
+				t.Fatalf("status = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSchedulingSnapshotReturnsNilWithoutHeartbeat(t *testing.T) {
+	registry := NewAtomicNodeRegistry(
+		[]Node{{ID: "node-a", Endpoint: "http://node-a"}},
+		time.Second,
+	)
+
+	if snapshot := registry.SchedulingSnapshot("node-a", time.Unix(100, 0)); snapshot != nil {
+		t.Fatalf("expected nil scheduling snapshot, got %+v", snapshot)
+	}
+}
+
+func TestSchedulingSnapshotReturnsDeepClone(t *testing.T) {
+	registry := NewAtomicNodeRegistry(
+		[]Node{{ID: "node-a", Endpoint: "http://node-a"}},
+		time.Second,
+	)
+	now := time.Unix(100, 0)
+	if _, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+		NodeId:            "node-a",
+		ClusterId:         "cluster-a",
+		ServiceInstanceId: "svc-a",
+		Snapshot: &schedulerv1.NodeSnapshot{
+			Status:       schedulerv1.NodeStatus_NODE_STATUS_READY,
+			AllocatedCpu: 2,
+			Disks: []*schedulerv1.DiskMetric{{
+				MountPoint: "/",
+				UsedBytes:  10,
+			}},
+		},
+	}, now); err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+
+	first := registry.SchedulingSnapshot("node-a", now)
+	if first == nil || len(first.GetDisks()) != 1 {
+		t.Fatalf("unexpected first scheduling snapshot: %+v", first)
+	}
+	first.Status = schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY
+	first.AllocatedCpu = 99
+	first.Disks[0].UsedBytes = 99
+
+	second := registry.SchedulingSnapshot("node-a", now)
+	if second == nil {
+		t.Fatal("expected second scheduling snapshot")
+	}
+	if got := second.GetStatus(); got != schedulerv1.NodeStatus_NODE_STATUS_READY {
+		t.Fatalf("stored status changed through returned snapshot: %v", got)
+	}
+	if got := second.GetAllocatedCpu(); got != 2 {
+		t.Fatalf("stored allocated CPU changed through returned snapshot: %d", got)
+	}
+	if got := second.GetDisks()[0].GetUsedBytes(); got != 10 {
+		t.Fatalf("stored disk metric changed through returned snapshot: %d", got)
+	}
+}
+
 func heartbeatWithConfig(t *testing.T, registry *AtomicNodeRegistry, nodeID, clusterID, svcID, cpuJSON string) string {
 	t.Helper()
 	var mi *schedulerv1.MachineInfo

@@ -232,6 +232,52 @@ func TestScheduleReturnsUnavailableWhenRegistryIsEmpty(t *testing.T) {
 	}
 }
 
+func TestGroupedRoundRobinScheduleSkipsStaleHeartbeat(t *testing.T) {
+	registry := NewAtomicNodeRegistry(
+		[]Node{
+			{ID: "node-a", Endpoint: "http://node-a"},
+			{ID: "node-b", Endpoint: "http://node-b"},
+		},
+		time.Second,
+	)
+	now := time.Now()
+	for _, heartbeat := range []struct {
+		nodeID string
+		at     time.Time
+	}{
+		{nodeID: "node-a", at: now.Add(-time.Minute)},
+		{nodeID: "node-b", at: now},
+	} {
+		_, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+			NodeId:            heartbeat.nodeID,
+			ClusterId:         "cluster-1",
+			ServiceInstanceId: "service-" + heartbeat.nodeID,
+			Snapshot: &schedulerv1.NodeSnapshot{
+				Status: schedulerv1.NodeStatus_NODE_STATUS_READY,
+			},
+		}, heartbeat.at)
+		if err != nil {
+			t.Fatalf("heartbeat %s failed: %v", heartbeat.nodeID, err)
+		}
+	}
+
+	service := NewService(
+		zap.NewNop(),
+		registry,
+		NewGroupedRoundRobinStrategy(GroupedRoundRobinLimits{MaxSandboxCount: 2}),
+		NewInMemoryBindingStore(defaultObservedReportTTL),
+	)
+	response, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{
+		Hint: coldHint("ubuntu", 0, 0),
+	})
+	if err != nil {
+		t.Fatalf("Schedule returned error: %v", err)
+	}
+	if got := response.GetNode().GetNodeId(); got != "node-b" {
+		t.Fatalf("scheduled node = %q, want node-b", got)
+	}
+}
+
 func TestScheduleOnlyConsidersReadyNodes(t *testing.T) {
 	registry := NewAtomicNodeRegistry(nil, defaultObservedReportTTL)
 	// node-a: active, node-b: lingering

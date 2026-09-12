@@ -21,11 +21,9 @@ type NodeRegistry interface {
 	ListP2pPeers(clusterID string, backend string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
 	FilterP2pPeers(clusterID string, backend string, nodeIDs []string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
 	GetObserved(nodeID string, clusterID string, now time.Time) (*schedulerv1.ObservedNode, bool)
-	// PeekObserved returns the latest heartbeat-reported NodeSnapshot for a node.
-	// Unlike GetObserved, it does not derive status from discovery state or TTL,
-	// and returns only the raw snapshot suitable for scheduling decisions.
-	// Returns nil if the node has never sent a heartbeat.
-	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
+	// SchedulingSnapshot returns the latest NodeSnapshot with status derived
+	// from current discovery state and heartbeat TTL.
+	SchedulingSnapshot(nodeID string, now time.Time) *schedulerv1.NodeSnapshot
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
 }
 
@@ -331,7 +329,9 @@ func (r *AtomicNodeRegistry) GetObserved(nodeID string, clusterID string, now ti
 	return r.deriveObservedNodeViewLocked(record, nowMs), true
 }
 
-func (r *AtomicNodeRegistry) PeekObserved(nodeID string) *schedulerv1.NodeSnapshot {
+func (r *AtomicNodeRegistry) SchedulingSnapshot(nodeID string, now time.Time) *schedulerv1.NodeSnapshot {
+	nowMs := now.UTC().UnixMilli()
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	record, ok := r.observed[nodeID]
@@ -342,7 +342,9 @@ func (r *AtomicNodeRegistry) PeekObserved(nodeID string) *schedulerv1.NodeSnapsh
 	if snapshot == nil {
 		return nil
 	}
-	return cloneSnapshot(snapshot)
+	out := cloneSnapshot(snapshot)
+	out.Status = r.derivedStatusLocked(record, nowMs)
+	return out
 }
 
 func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID string) error {
@@ -374,33 +376,38 @@ func (r *AtomicNodeRegistry) deriveObservedNodeViewLocked(record observedNodeRec
 	}
 
 	nodeID := out.GetNodeId()
-
 	knownNode, inDiscovery := r.nodesByID[nodeID]
-	isLingering := r.lingeringIDs[nodeID]
 
 	if inDiscovery && strings.TrimSpace(knownNode.Endpoint) != "" {
 		out.Endpoint = knownNode.Endpoint
 	}
 
+	out.Snapshot.Status = r.derivedStatusLocked(record, nowMs)
+	return out
+}
+
+// derivedStatusLocked computes the effective scheduling status for a heartbeat
+// record. r.mu must be held by the caller.
+func (r *AtomicNodeRegistry) derivedStatusLocked(record observedNodeRecord, nowMs int64) schedulerv1.NodeStatus {
 	ttl := record.reportTTL
 	if ttl <= 0 {
 		ttl = defaultObservedReportTTL
 	}
 
-	if out.GetLastSeenUnixMs() > 0 && nowMs-out.GetLastSeenUnixMs() > ttl.Milliseconds() {
-		out.Snapshot.Status = schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY
-	} else if !inDiscovery {
-		out.Snapshot.Status = schedulerv1.NodeStatus_NODE_STATUS_CONNECTING
-	} else if isLingering {
-		out.Snapshot.Status = schedulerv1.NodeStatus_NODE_STATUS_LINGERING
-	} else {
-		// Active — keep the status reported by the node.
-		if out.Snapshot.GetStatus() == schedulerv1.NodeStatus_NODE_STATUS_UNSPECIFIED {
-			out.Snapshot.Status = schedulerv1.NodeStatus_NODE_STATUS_CONNECTING
-		}
+	if lastSeen := record.node.GetLastSeenUnixMs(); lastSeen > 0 && nowMs-lastSeen > ttl.Milliseconds() {
+		return schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY
 	}
-
-	return out
+	nodeID := record.node.GetNodeId()
+	if _, inDiscovery := r.nodesByID[nodeID]; !inDiscovery {
+		return schedulerv1.NodeStatus_NODE_STATUS_CONNECTING
+	}
+	if r.lingeringIDs[nodeID] {
+		return schedulerv1.NodeStatus_NODE_STATUS_LINGERING
+	}
+	if status := record.node.GetSnapshot().GetStatus(); status != schedulerv1.NodeStatus_NODE_STATUS_UNSPECIFIED {
+		return status
+	}
+	return schedulerv1.NodeStatus_NODE_STATUS_CONNECTING
 }
 
 func cloneObservedNode(node *schedulerv1.ObservedNode) *schedulerv1.ObservedNode {
