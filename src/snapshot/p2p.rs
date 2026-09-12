@@ -95,12 +95,12 @@ impl SnapshotP2pArtifact {
     /// `committed_uuids` gates uuid-keyed publication as before; zfile layers
     /// record `uuid = None`, so recontainerized layers are filtered out of it
     /// naturally.
-    pub(crate) fn local_overlaybd_layers(
+    pub(crate) async fn local_overlaybd_layers(
         image_config_path: &Path,
         committed_digests: &HashSet<String>,
         committed_uuids: &HashSet<String>,
     ) -> Vec<Self> {
-        let image_config = match load_overlaybd_image_config(image_config_path) {
+        let mut image_config = match load_overlaybd_image_config(image_config_path) {
             Ok(image_config) => image_config,
             Err(error) => {
                 warn!(
@@ -111,6 +111,30 @@ impl SnapshotP2pArtifact {
                 return Vec::new();
             }
         };
+
+        // Captured memory layers may have only a local path. Derive their
+        // identity before applying the same committed-digest guard below.
+        for layer in &mut image_config.lowers {
+            if layer.file.is_empty()
+                || committed_digests.is_empty()
+                || (!layer.digest.is_empty() && layer.size > 0)
+            {
+                continue;
+            }
+            match crate::digest::FileDigest::describe(Path::new(&layer.file)).await {
+                Ok(descriptor) => {
+                    layer.digest = descriptor.sha256;
+                    layer.size = descriptor.size;
+                }
+                Err(error) => {
+                    warn!(
+                        path = %layer.file,
+                        error = %error,
+                        "could not describe local snapshot layer for digest-keyed P2P publication"
+                    );
+                }
+            }
+        }
 
         image_config
             .lowers
@@ -319,7 +343,8 @@ mod tests {
             &image_config_path,
             &HashSet::from([described_digest]),
             &HashSet::new(),
-        );
+        )
+        .await;
 
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].publish_mode, P2pPublishMode::Copy);
@@ -327,6 +352,52 @@ mod tests {
             artifacts[0].key,
             "overlaybd-layer/v1/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
+    }
+
+    #[tokio::test]
+    async fn local_overlaybd_layers_hashes_descriptorless_committed_layer() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let layer_path = temp.path().join("memory.commit");
+        let bytes = b"memory layer without digest or size in the runtime config";
+        std::fs::write(&layer_path, bytes).unwrap();
+        let digest = crate::digest::sha256_digest(bytes);
+        let image_config_path = temp.path().join("image.json");
+        let image_config = ImageConfig {
+            lowers: vec![LayerConfig {
+                file: layer_path.display().to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        std::fs::write(
+            &image_config_path,
+            serde_json::to_vec(&image_config).unwrap(),
+        )
+        .unwrap();
+
+        let artifacts = SnapshotP2pArtifact::local_overlaybd_layers(
+            &image_config_path,
+            &HashSet::from([digest.clone()]),
+            &HashSet::new(),
+        )
+        .await;
+        assert_eq!(
+            artifacts,
+            vec![SnapshotP2pArtifact::content_addressed_overlaybd_layer(
+                &layer_path,
+                &digest,
+                bytes.len() as u64,
+            )]
+        );
+
+        // Different committed bytes (for example after compression) must stay excluded.
+        assert!(SnapshotP2pArtifact::local_overlaybd_layers(
+            &image_config_path,
+            &HashSet::from([crate::digest::sha256_digest(b"different committed bytes")]),
+            &HashSet::new(),
+        )
+        .await
+        .is_empty());
     }
 
     /// Publish-time compression recontainerizes a raw local layer before
@@ -369,7 +440,8 @@ mod tests {
             &image_config_path,
             &committed_digests,
             &committed_uuids,
-        );
+        )
+        .await;
 
         assert_eq!(artifacts.len(), 1);
         assert_eq!(
@@ -421,7 +493,8 @@ mod tests {
             &image_config_path,
             &committed_digests,
             &committed_uuids,
-        );
+        )
+        .await;
 
         assert_eq!(artifacts.len(), 2);
         assert!(artifacts

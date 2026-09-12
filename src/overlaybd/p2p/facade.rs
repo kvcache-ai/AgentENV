@@ -11,6 +11,7 @@ use axum::http::header::{
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use axum::routing::{get, post};
+use axum::serve::ListenerExt;
 use axum::Router;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,7 @@ const DEFAULT_DESCRIPTOR_CACHE_MAX_ENTRIES: usize = 16 * 1024;
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const ADDRESS_PREFIX: &str = "/p2p-http";
 const UUID_ADDRESS_PREFIX: &str = "/p2p-uuid";
+const DIGEST_ADDRESS_PREFIX: &str = "/p2p-digest";
 const PUBLISH_LAYER_PATH: &str = "/p2p-control/publish-layer";
 
 #[derive(Debug, Clone)]
@@ -150,6 +152,13 @@ impl P2pHttpFacadeServer {
         let addr = listener
             .local_addr()
             .context("read p2p http facade local addr")?;
+        // Streaming range bodies can follow headers in a separate write. Avoid
+        // Nagle/delayed-ACK stalls on the many small reads during memory restore.
+        let listener = listener.tap_io(|stream| {
+            if let Err(error) = stream.set_nodelay(true) {
+                warn!(%error, "failed to set TCP_NODELAY on p2p facade connection");
+            }
+        });
         let address = format!("http://{addr}{ADDRESS_PREFIX}");
         let uuid_address = format!("http://{addr}{UUID_ADDRESS_PREFIX}");
         let publish_address = format!("http://{addr}{PUBLISH_LAYER_PATH}");
@@ -175,6 +184,10 @@ impl P2pHttpFacadeServer {
             .route(
                 &format!("{UUID_ADDRESS_PREFIX}/{{uuid}}"),
                 get(handle_uuid_facade),
+            )
+            .route(
+                &format!("{DIGEST_ADDRESS_PREFIX}/{{digest}}"),
+                get(handle_digest_facade),
             )
             .route(PUBLISH_LAYER_PATH, post(handle_publish_layer))
             .with_state(state);
@@ -237,7 +250,22 @@ async fn handle_uuid_facade(
     axum::extract::Path(uuid): axum::extract::Path<String>,
     request: Request,
 ) -> Response<Body> {
-    match handle_uuid_facade_result(state, uuid, request).await {
+    let canonical = Uuid::parse_str(&uuid)
+        .map(|uuid| CanonicalBlobIdentity::from_uuid(&uuid))
+        .map_err(|err| HttpFacadeError::new(StatusCode::BAD_REQUEST, err.to_string()));
+    match handle_layer_facade_result(state, canonical, request).await {
+        Ok(response) => response,
+        Err(err) => err.into_response(),
+    }
+}
+
+async fn handle_digest_facade(
+    State(state): State<P2pHttpFacadeState>,
+    axum::extract::Path(digest): axum::extract::Path<String>,
+    request: Request,
+) -> Response<Body> {
+    let canonical = validate_digest(&digest).map(|()| CanonicalBlobIdentity::from_digest(&digest));
+    match handle_layer_facade_result(state, canonical, request).await {
         Ok(response) => response,
         Err(err) => err.into_response(),
     }
@@ -298,22 +326,20 @@ async fn handle_http_facade_result(
     )
 }
 
-async fn handle_uuid_facade_result(
+async fn handle_layer_facade_result(
     state: P2pHttpFacadeState,
-    uuid: String,
+    canonical: std::result::Result<CanonicalBlobIdentity, HttpFacadeError>,
     request: Request,
 ) -> std::result::Result<Response<Body>, HttpFacadeError> {
     reject_conditional_headers(request.headers())?;
     let request_range = parse_single_range(request.headers())?;
     let len = request_range.len()?;
-    let uuid = Uuid::parse_str(&uuid)
-        .map_err(|err| HttpFacadeError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
-    let canonical = CanonicalBlobIdentity::from_uuid(&uuid);
+    let canonical = canonical?;
     let artifact_key = layer_artifact_key(&canonical);
     let Some(descriptor) = lookup_descriptor(&state, &artifact_key, &canonical).await else {
         return Err(HttpFacadeError::new(
             StatusCode::NOT_FOUND,
-            format!("p2p uuid layer {uuid} was not found"),
+            format!("p2p layer {artifact_key} was not found"),
         ));
     };
 
@@ -322,14 +348,10 @@ async fn handle_uuid_facade_result(
         .map_err(|err| {
             warn!(
                 key = %artifact_key,
-                uuid = %uuid,
                 error = ?err,
-                "p2p uuid layer range fetch failed"
+                "p2p layer range fetch failed"
             );
-            HttpFacadeError::new(
-                StatusCode::BAD_GATEWAY,
-                "failed to fetch p2p uuid layer range",
-            )
+            HttpFacadeError::new(StatusCode::BAD_GATEWAY, "failed to fetch p2p layer range")
         })?;
     build_range_body_response(
         &request_range,
@@ -1065,6 +1087,123 @@ mod tests {
         assert_eq!(resp.bytes().await.unwrap().as_ref(), &blob[100..200]);
         assert_eq!(transport.fetch_range_count.load(Ordering::Relaxed), 1);
         facade.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn overlaybd_registry_client_opens_and_reads_p2p_uuid_layer() {
+        let blob: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let uuid = Uuid::new_v4();
+        let key = layer_artifact_key(&CanonicalBlobIdentity::from_uuid(&uuid));
+        let transport = Arc::new(MockTransport::default());
+        transport.descriptors.write().await.insert(
+            key.clone(),
+            uuid_layer_descriptor(key.clone(), uuid, blob.len() as u64),
+        );
+        transport
+            .blobs
+            .write()
+            .await
+            .insert(key, Bytes::from(blob.clone()));
+        let facade = start_test_facade(transport.clone(), Vec::new()).await;
+        let backend = ::overlaybd::backend::registryfs_v2::RegistryFsV2::new();
+        backend.set_accelerate_address(facade.address());
+
+        // Use the real reader so URL/auth probes obey the facade's Range contract.
+        let file = backend
+            .open(format!("{}/{}", facade.uuid_address(), uuid))
+            .await
+            .expect("open layer through p2p uuid facade");
+        assert_eq!(file.size().await.unwrap(), blob.len() as u64);
+        assert_eq!(
+            file.read_at(100, 100).await.unwrap().as_ref(),
+            &blob[100..200]
+        );
+        let mut tail = [0; 96];
+        assert_eq!(
+            file.read_at_into(4000, &mut tail).await.unwrap(),
+            tail.len()
+        );
+        assert_eq!(tail.as_slice(), &blob[4000..]);
+
+        facade.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn overlaybd_registry_client_opens_and_reads_p2p_digest_layer() {
+        let blob: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let digest = format!("sha256:{}", digest::sha256_hex(&blob));
+        let key = layer_artifact_key(&CanonicalBlobIdentity::from_digest(&digest));
+        let transport = Arc::new(MockTransport::default());
+        transport.descriptors.write().await.insert(
+            key.clone(),
+            layer_descriptor(key.clone(), &digest, blob.len() as u64),
+        );
+        transport
+            .blobs
+            .write()
+            .await
+            .insert(key, Bytes::from(blob.clone()));
+        let facade = start_test_facade(transport.clone(), Vec::new()).await;
+        let backend = ::overlaybd::backend::registryfs_v2::RegistryFsV2::new();
+        backend.set_accelerate_address(facade.address());
+
+        // Use the real reader so URL/auth probes obey the facade's Range contract.
+        let file = backend
+            .open(format!(
+                "{}/p2p-digest/{digest}",
+                facade.address().trim_end_matches(ADDRESS_PREFIX)
+            ))
+            .await
+            .expect("open layer through p2p digest facade");
+        assert_eq!(file.size().await.unwrap(), blob.len() as u64);
+        assert_eq!(
+            file.read_at(100, 100).await.unwrap().as_ref(),
+            &blob[100..200]
+        );
+        let mut tail = [0; 96];
+        assert_eq!(
+            file.read_at_into(4000, &mut tail).await.unwrap(),
+            tail.len()
+        );
+        assert_eq!(tail.as_slice(), &blob[4000..]);
+
+        facade.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn p2p_digest_errors_do_not_fetch_origin() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        for (requested_digest, descriptor_digest, expected_status) in [
+            ("sha256:invalid", None, StatusCode::BAD_REQUEST),
+            (digest.as_str(), None, StatusCode::NOT_FOUND),
+            (
+                digest.as_str(),
+                Some(digest.as_str()),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                digest.as_str(),
+                Some("sha256:wrong"),
+                StatusCode::BAD_GATEWAY,
+            ),
+        ] {
+            let transport = Arc::new(MockTransport::default());
+            if let Some(descriptor_digest) = descriptor_digest {
+                let key = layer_artifact_key(&CanonicalBlobIdentity::from_digest(&digest));
+                transport
+                    .descriptors
+                    .write()
+                    .await
+                    .insert(key.clone(), layer_descriptor(key, descriptor_digest, 4096));
+            }
+            let facade = start_test_facade(transport, Vec::new()).await;
+            let url = format!(
+                "{}{DIGEST_ADDRESS_PREFIX}/{requested_digest}",
+                facade.address().trim_end_matches(ADDRESS_PREFIX)
+            );
+            assert_eq!(get_range(&url, 0, 63).await.status(), expected_status);
+            facade.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
