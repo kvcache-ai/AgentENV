@@ -29,7 +29,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d5f5dfb2.js";
+            window.path_to_searchindex_js = "searchindex-da116984.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-a02e686b.js"></script>
+        <script src="toc-c8205cda.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -283,6 +283,10 @@ docker run --rm -it \
 <p>Supports Linux and macOS on x86_64 and arm64:</p>
 <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install-cli.sh | bash
 </code></pre>
+<p>The installation script downloads and verifies the platform release archive
+containing <code>aenv</code> and <code>aenv-buildctl</code>. Set <code>INSTALL_DIR</code> for a user-local
+installation. For manual installation, extract the archive and keep <code>aenv</code> and
+<code>aenv-buildctl</code> in the same directory.</p>
 <h3 id="3-authenticate"><a class="header" href="#3-authenticate">3. Authenticate</a></h3>
 <p>The server generates the key on its first normal startup. Native installations
 reuse the managed key; a normal Docker container keeps it in its writable
@@ -382,130 +386,28 @@ docker run --rm -it --name aenv-server \
 default.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="aenv-cli-reference"><a class="header" href="#aenv-cli-reference">aenv CLI Reference</a></h1>
-<p><code>aenv</code> is the native CLI for AgentENV. It wraps the HTTP API and envd gRPC endpoints into a developer-friendly interface for managing templates, sandboxes, and snapshots.</p>
+<p><code>aenv</code> is the native CLI for AgentENV. It wraps the HTTP API and envd gRPC
+endpoints into a developer-friendly interface for managing templates,
+sandboxes, persistent volumes, and snapshots.</p>
 <h2 id="installation"><a class="header" href="#installation">Installation</a></h2>
 <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install-cli.sh | bash
 </code></pre>
-<p>Each release publishes <code>aenv-&lt;os&gt;-&lt;arch&gt;.tar.gz</code> for Linux and macOS on x86_64
-and aarch64 (arm64). The archive contains:</p>
-<pre><code class="language-text">aenv
-aenv-buildctl
-manifest.json
-</code></pre>
-<p>The manifest records the AgentENV version, BuildKit version, and platform.
-<code>SHA256SUMS</code> accompanies the release archives. The release workflow verifies the
-pinned upstream BuildKit download before packaging its client with <code>aenv</code>.</p>
-<p>Both <code>install-cli.sh</code> and the full <code>install.sh</code> download this single CLI archive
-and verify its GitHub release asset checksum before installing both executables.
-Installation does not contact the upstream BuildKit release. The private
-<code>aenv-buildctl</code> lives beside <code>aenv</code>, preserving an existing system <code>buildctl</code>.
-Set <code>INSTALL_DIR</code> for a user-local CLI installation. For manual installation,
-extract the archive and keep both executables in the same directory.</p>
 <p>Or build from source (requires Rust):</p>
 <pre><code class="language-bash">git clone https://github.com/kvcache-ai/AgentENV.git
 cd AgentENV
 make install-aenv
 </code></pre>
-<hr>
-<h2 id="authentication"><a class="header" href="#authentication">Authentication</a></h2>
-<h3 id="aenv-auth"><a class="header" href="#aenv-auth"><code>aenv auth</code></a></h3>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="authentication"><a class="header" href="#authentication">Authentication</a></h1>
+<h2 id="aenv-auth"><a class="header" href="#aenv-auth"><code>aenv auth</code></a></h2>
 <p>Save the server URL and API key. Credentials are stored at <code>~/.config/aenv/credentials</code> (mode <code>0600</code>).</p>
 <pre><code class="language-bash">aenv auth
 # AENV server URL [http://localhost:8000]: The address of the AgentENV server
 # API key: &lt;the server's configured or generated API key&gt;
 </code></pre>
-<hr>
-<h2 id="templates"><a class="header" href="#templates">Templates</a></h2>
-<h3 id="aenv-pull-image"><a class="header" href="#aenv-pull-image"><code>aenv pull &lt;image&gt;</code></a></h3>
-<p>Create a template from an OCI image. Waits for the build to complete by default.</p>
-<pre><code class="language-bash">aenv pull ubuntu:22.04
-aenv pull ubuntu:22.04 --name my-ubuntu
-</code></pre>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Flag</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>--name &lt;name&gt;</code></td><td>Override the template name. Defaults to the image’s repository segment.</td></tr>
-<tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores for the template. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
-<tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory for the template. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
-<tr><td><code>--start-cmd &lt;cmd&gt;</code></td><td>Shell command to run inside the sandbox before capturing the template snapshot</td></tr>
-<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td>Shell command polled until it exits 0. Defaults to <code>sleep 20</code> when <code>--start-cmd</code> is set; otherwise unset.</td></tr>
-<tr><td><code>--probe &lt;PORT&gt;</code></td><td>Wait until <code>localhost:&lt;PORT&gt;</code> accepts TCP connections. Conflicts with <code>--ready-cmd</code>.</td></tr>
-<tr><td><code>-d, --detach</code></td><td>Submit the build and return immediately without waiting</td></tr>
-<tr><td><code>--timeout &lt;SECS&gt;</code></td><td>Maximum seconds to wait for the build to complete. No timeout by default. Conflicts with <code>--detach</code>.</td></tr>
-</tbody>
-</table>
-</div>
-<h3 id="aenv-build-context---name-name"><a class="header" href="#aenv-build-context---name-name"><code>aenv build &lt;context&gt; --name &lt;name&gt;</code></a></h3>
-<p>Create a template from a local Dockerfile using BuildKit in an isolated microVM.
-The installers include the required <code>buildctl</code> executable. For source builds,
-install BuildKit’s <code>buildctl</code> v0.33.0 or select an existing executable with <code>--buildctl</code>.</p>
-<pre><code class="language-bash">aenv build . --name my-app
-aenv build . -f deploy/docker/Dockerfile.agentenv --name aenv
-aenv build ./my-app --name my-app-v2 --build-arg VERSION=2
-</code></pre>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Flag</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>--name &lt;name&gt;</code></td><td>Required template name</td></tr>
-<tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores for the template. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
-<tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory for the template. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
-<tr><td><code>-f, --file &lt;path&gt;</code></td><td>Dockerfile path relative to the current directory. Defaults to <code>&lt;context&gt;/Dockerfile</code>.</td></tr>
-<tr><td><code>--build-arg KEY=VALUE</code></td><td>Repeatable build arguments.</td></tr>
-<tr><td><code>--secret &lt;spec&gt;</code></td><td>Repeatable BuildKit secret mount.</td></tr>
-<tr><td><code>--no-cache</code></td><td>Disable instruction cache for this build.</td></tr>
-<tr><td><code>--timeout &lt;seconds&gt;</code></td><td>Dockerfile build deadline; defaults to 3600. The CLI allows 10 additional minutes for provisioning and publication.</td></tr>
-</tbody>
-</table>
-</div>
-<p>The command supports multi-stage builds, file updates, and <code>.dockerignore</code>, shows
-BuildKit progress, and waits until the template is ready. The server manages the
-internal worker and releases it afterward. The first Dockerfile build prepares a
-reusable builder template. Each build clones a shared cache seed, allowing
-concurrent builds and cache reuse across template names and nodes. Builder image and sizing
-are configured in <code>[template_build]</code> on the server, with defaults of 16 vCPUs,
-32 GiB memory, and 64 GiB cache disk. <code>FROM</code>, <code>ENTRYPOINT</code>, <code>CMD</code>, and
-<code>HEALTHCHECK</code> in the final image determine the template’s image, startup, and
-readiness. The final Dockerfile stage is always published.
-See <a href="#aenv-build">templates</a> for the
-complete workflow, cache management, and startup behavior.</p>
-<p>Interactive builds show a three-stage bar for builder preparation, image build,
-and template publication, with elapsed time and Dockerfile logs above the bar.
-<code>--progress plain</code> keeps plain logs; <code>--progress tty</code> selects BuildKit’s native
-terminal display. Redirected output has no progress-bar control sequences.</p>
-<h3 id="aenv-template-list"><a class="header" href="#aenv-template-list"><code>aenv template list</code></a></h3>
-<p>List all templates. Alias: <code>aenv template ls</code>, <code>aenv templates list</code>.</p>
-<pre><code class="language-bash">aenv template list
-aenv template list --output json
-</code></pre>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Flag</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>--output &lt;table|json&gt;</code></td><td>Output format. Defaults to table on a TTY and JSON when redirected.</td></tr>
-</tbody>
-</table>
-</div>
-<h3 id="aenv-template-watch-template"><a class="header" href="#aenv-template-watch-template"><code>aenv template watch &lt;template&gt;</code></a></h3>
-<p>Watch a template build until it succeeds or fails. Accepts either a template name/alias or a template UUID.</p>
-<pre><code class="language-bash">aenv template watch my-ubuntu
-aenv template watch &lt;template-id&gt;
-</code></pre>
-<h3 id="aenv-template-delete-template"><a class="header" href="#aenv-template-delete-template"><code>aenv template delete &lt;template&gt;</code></a></h3>
-<p>Delete a template by name or ID. Alias: <code>aenv template rm</code>.</p>
-<pre><code class="language-bash">aenv template delete my-ubuntu
-aenv template delete &lt;template-id&gt;
-</code></pre>
-<hr>
-<h2 id="sandboxes"><a class="header" href="#sandboxes">Sandboxes</a></h2>
-<h3 id="aenv-start-target"><a class="header" href="#aenv-start-target"><code>aenv start &lt;target&gt;</code></a></h3>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="sandboxes"><a class="header" href="#sandboxes">Sandboxes</a></h1>
+<h2 id="aenv-start-target"><a class="header" href="#aenv-start-target"><code>aenv start &lt;target&gt;</code></a></h2>
 <p>Start a sandbox and attach an interactive shell. <code>&lt;target&gt;</code> accepts a template
 or snapshot ID or alias, or an OCI image reference with <code>--cold</code>.</p>
 <pre><code class="language-bash">aenv start my-ubuntu
@@ -519,21 +421,22 @@ CLI obtains and manages the access token automatically.</p>
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--cold</code></td><td>Start directly from an external OCI image instead of a template</td></tr>
+<tr><td><code>--cold</code></td><td>Start directly from an external OCI image instead of a template or snapshot</td></tr>
 <tr><td><code>--timeout &lt;secs&gt;</code></td><td>Sandbox TTL in seconds (default: 300)</td></tr>
 <tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores; only valid with <code>--cold</code>. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory in MiB; only valid with <code>--cold</code>. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
 <tr><td><code>--disk-size-mb &lt;MiB&gt;</code></td><td>Root filesystem size; only valid with <code>--cold</code>. Defaults to the source image’s virtual size; an explicit value must be at least 1024 and divisible by 1024 MiB. Alias: <code>--disk-mb</code>.</td></tr>
+<tr><td><code>--volume &lt;MOUNT_PATH=VOLUME&gt;</code></td><td>Mount a persistent volume by ID or name. Available for warm and cold starts; repeatable.</td></tr>
 <tr><td><code>-d, --detach</code></td><td>Print the sandbox ID and exit without attaching a shell</td></tr>
 </tbody>
 </table>
 </div>
 <p>CPU, memory, and disk overrides are supported only for cold starts.</p>
-<h3 id="aenv-pause-sandbox-id"><a class="header" href="#aenv-pause-sandbox-id"><code>aenv pause &lt;sandbox-id&gt;</code></a></h3>
+<h2 id="aenv-pause-sandbox-id"><a class="header" href="#aenv-pause-sandbox-id"><code>aenv pause &lt;sandbox-id&gt;</code></a></h2>
 <p>Pause a running sandbox. The sandbox state is preserved and can be resumed later.</p>
 <pre><code class="language-bash">aenv pause &lt;sandbox-id&gt;
 </code></pre>
-<h3 id="aenv-resume-sandbox-id"><a class="header" href="#aenv-resume-sandbox-id"><code>aenv resume &lt;sandbox-id&gt;</code></a></h3>
+<h2 id="aenv-resume-sandbox-id"><a class="header" href="#aenv-resume-sandbox-id"><code>aenv resume &lt;sandbox-id&gt;</code></a></h2>
 <p>Resume a paused sandbox.</p>
 <pre><code class="language-bash">aenv resume &lt;sandbox-id&gt;
 </code></pre>
@@ -547,20 +450,23 @@ CLI obtains and manages the access token automatically.</p>
 </tbody>
 </table>
 </div>
-<h3 id="aenv-timeout-sandbox-id-seconds"><a class="header" href="#aenv-timeout-sandbox-id-seconds"><code>aenv timeout &lt;sandbox-id&gt; &lt;seconds&gt;</code></a></h3>
+<h2 id="aenv-timeout-sandbox-id-seconds"><a class="header" href="#aenv-timeout-sandbox-id-seconds"><code>aenv timeout &lt;sandbox-id&gt; &lt;seconds&gt;</code></a></h2>
 <p>Set or extend the sandbox expiration to <code>&lt;seconds&gt;</code> from now.</p>
 <pre><code class="language-bash">aenv timeout &lt;sandbox-id&gt; 600
 </code></pre>
-<h3 id="aenv-connect-sandbox-id"><a class="header" href="#aenv-connect-sandbox-id"><code>aenv connect &lt;sandbox-id&gt;</code></a></h3>
+<h2 id="aenv-connect-sandbox-id"><a class="header" href="#aenv-connect-sandbox-id"><code>aenv connect &lt;sandbox-id&gt;</code></a></h2>
 <p>Attach an interactive shell to a running or paused sandbox. Alias: <code>aenv cn</code>.</p>
 <pre><code class="language-bash">aenv connect &lt;sandbox-id&gt;
 </code></pre>
 <p>Resumes the sandbox if paused before attaching.</p>
-<h3 id="aenv-exec-sandbox-id-command-args"><a class="header" href="#aenv-exec-sandbox-id-command-args"><code>aenv exec &lt;sandbox-id&gt; &lt;command&gt; [args...]</code></a></h3>
+<h2 id="aenv-exec-sandbox-id-command-args"><a class="header" href="#aenv-exec-sandbox-id-command-args"><code>aenv exec &lt;sandbox-id&gt; &lt;command&gt; [args...]</code></a></h2>
 <p>Run a one-shot command in a sandbox and stream its output.</p>
+<p>Use a leading <code>--</code> when flags for the remote command could be interpreted as
+<code>aenv</code> flags.</p>
 <pre><code class="language-bash">aenv exec &lt;sandbox-id&gt; ls -la /
+aenv exec &lt;sandbox-id&gt; -- command-with-aenv-like-flags --timeout 10
 </code></pre>
-<h3 id="aenv-upload-sandbox-id-local-path-remote-path"><a class="header" href="#aenv-upload-sandbox-id-local-path-remote-path"><code>aenv upload &lt;sandbox-id&gt; &lt;local-path&gt; &lt;remote-path&gt;</code></a></h3>
+<h2 id="aenv-upload-sandbox-id-local-path-remote-path"><a class="header" href="#aenv-upload-sandbox-id-local-path-remote-path"><code>aenv upload &lt;sandbox-id&gt; &lt;local-path&gt; &lt;remote-path&gt;</code></a></h2>
 <p>Upload a local file or directory to a sandbox through envd. Files are streamed
 individually, and missing remote directories are created automatically.</p>
 <pre><code class="language-bash">aenv upload &lt;sandbox-id&gt; ./config.json /workspace/config.json
@@ -588,7 +494,7 @@ symbolic links and special files are rejected.</p>
 preserve host ownership or group, permissions (including executable bits),
 timestamps, ACLs, extended attributes, or hard-link relationships. Destination
 metadata is assigned by envd and the sandbox filesystem.</p>
-<h3 id="aenv-download-sandbox-id-remote-path-local-path"><a class="header" href="#aenv-download-sandbox-id-remote-path-local-path"><code>aenv download &lt;sandbox-id&gt; &lt;remote-path&gt; [local-path]</code></a></h3>
+<h2 id="aenv-download-sandbox-id-remote-path-local-path"><a class="header" href="#aenv-download-sandbox-id-remote-path-local-path"><code>aenv download &lt;sandbox-id&gt; &lt;remote-path&gt; [local-path]</code></a></h2>
 <p>Download a file or directory from a sandbox through envd.</p>
 <pre><code class="language-bash">aenv download &lt;sandbox-id&gt; /workspace/result.txt ./result.txt
 aenv download &lt;sandbox-id&gt; /workspace/result.txt
@@ -617,7 +523,7 @@ temporary file and moved into place only after that file succeeds. Symbolic
 links and special files are rejected. Downloads do <strong>not</strong> preserve remote
 ownership or group, permissions (including executable bits), timestamps, ACLs,
 extended attributes, or hard-link relationships.</p>
-<h3 id="aenv-list"><a class="header" href="#aenv-list"><code>aenv list</code></a></h3>
+<h2 id="aenv-list"><a class="header" href="#aenv-list"><code>aenv list</code></a></h2>
 <p>List all sandboxes. Alias: <code>aenv ls</code>.</p>
 <pre><code class="language-bash">aenv list
 </code></pre>
@@ -631,19 +537,19 @@ extended attributes, or hard-link relationships.</p>
 </tbody>
 </table>
 </div>
-<h3 id="aenv-delete-sandbox-id"><a class="header" href="#aenv-delete-sandbox-id"><code>aenv delete &lt;sandbox-id&gt;</code></a></h3>
+<h2 id="aenv-delete-sandbox-id"><a class="header" href="#aenv-delete-sandbox-id"><code>aenv delete &lt;sandbox-id&gt;</code></a></h2>
 <p>Kill and delete a sandbox. Alias: <code>aenv rm</code>.</p>
 <pre><code class="language-bash">aenv delete &lt;sandbox-id&gt;
 aenv rm &lt;sandbox-id&gt;
 </code></pre>
-<hr>
-<h2 id="volumes"><a class="header" href="#volumes">Volumes</a></h2>
-<h3 id="aenv-volume-create-name"><a class="header" href="#aenv-volume-create-name"><code>aenv volume create &lt;name&gt;</code></a></h3>
-<p>Create an independent persistent volume. Volumes default to 65536 MiB (64 GiB)
-and <code>exclusive</code> mode.</p>
-<pre><code class="language-bash">aenv volume create workspace
-aenv volume create models --mode ro --image ghcr.io/example/models:latest
-aenv volume create job-workspace --from-volume workspace
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="templates"><a class="header" href="#templates">Templates</a></h1>
+<p><code>aenv templates</code> is an alias for <code>aenv template</code>, including its <code>list</code>,
+<code>watch</code>, and <code>delete</code> subcommands.</p>
+<h2 id="aenv-pull-image"><a class="header" href="#aenv-pull-image"><code>aenv pull &lt;image&gt;</code></a></h2>
+<p>Create a template from an OCI image. Waits for the build to complete by default.</p>
+<pre><code class="language-bash">aenv pull ubuntu:22.04
+aenv pull ubuntu:22.04 --name my-ubuntu
 </code></pre>
 <div class="table-wrapper">
 <table>
@@ -651,32 +557,74 @@ aenv volume create job-workspace --from-volume workspace
 <tr><th>Flag</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--size-mb &lt;MiB&gt;</code></td><td>Volume size. A copy-on-write fork must use the same size as its source.</td></tr>
-<tr><td><code>--mode &lt;exclusive|ro&gt;</code></td><td>Access mode. Exclusive volumes are writable by one sandbox; read-only volumes can be shared.</td></tr>
-<tr><td><code>--from-volume &lt;volume&gt;</code></td><td>Create a copy-on-write fork from an existing volume ID or name.</td></tr>
-<tr><td><code>--image &lt;image&gt;</code></td><td>Initialize the volume from an OCI image.</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Override the template name. Defaults to the image’s repository segment.</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores for the template. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory for the template. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>--start-cmd &lt;cmd&gt;</code></td><td>Shell command to run inside the sandbox before capturing the template snapshot</td></tr>
+<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td>Shell command polled until it exits 0. Defaults to <code>sleep 20</code> when <code>--start-cmd</code> is set; otherwise unset.</td></tr>
+<tr><td><code>--probe &lt;PORT&gt;</code></td><td>Wait until <code>localhost:&lt;PORT&gt;</code> accepts TCP connections. Conflicts with <code>--ready-cmd</code>.</td></tr>
+<tr><td><code>-d, --detach</code></td><td>Submit the build and return immediately without waiting</td></tr>
+<tr><td><code>--timeout &lt;SECS&gt;</code></td><td>Maximum seconds to wait for the build to complete. No timeout by default. Conflicts with <code>--detach</code>.</td></tr>
 </tbody>
 </table>
 </div>
-<p>We recommend creating an exclusive fork for each sandbox instead of mounting a
-shared writable volume directly:</p>
-<pre><code class="language-bash">aenv volume create job-data --mode exclusive --from-volume dataset-base
-aenv start ubuntu --volume /workspace/data=job-data
+<h2 id="aenv-build-context---name-name"><a class="header" href="#aenv-build-context---name-name"><code>aenv build &lt;context&gt; --name &lt;name&gt;</code></a></h2>
+<p>Create a template from a local Dockerfile using BuildKit in an isolated
+microVM. The command waits until the template is ready.</p>
+<pre><code class="language-bash">aenv build . --name my-app
+aenv build . -f deploy/docker/Dockerfile.agentenv --name aenv
 </code></pre>
-<p>See <a href="#volumes-1">Volumes</a> for access-mode semantics, lifecycle
-behavior, automatic sandbox fork and snapshot handling, and complete CLI and
-HTTP API examples.</p>
-<h3 id="inspect-and-delete-volumes"><a class="header" href="#inspect-and-delete-volumes">Inspect and delete volumes</a></h3>
-<pre><code class="language-bash">aenv volume list
-aenv volume list --output json
-aenv volume inspect job-data
-aenv volume delete job-data
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Required template name.</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td>CPU cores for the template. Defaults to <code>[machine].vcpu_count</code> on the server. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory for the template. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>-f, --file &lt;path&gt;</code></td><td>Dockerfile path. Defaults to <code>&lt;context&gt;/Dockerfile</code>; explicit relative paths resolve from the current directory.</td></tr>
+<tr><td><code>--start-cmd &lt;command&gt;</code></td><td>Override the image <code>ENTRYPOINT</code>/<code>CMD</code>; an empty string disables startup.</td></tr>
+<tr><td><code>--ready-cmd &lt;command&gt;</code></td><td>Override the image <code>HEALTHCHECK</code> with a command that must succeed before capture.</td></tr>
+<tr><td><code>--build-arg KEY=VALUE</code></td><td>Build argument; repeatable.</td></tr>
+<tr><td><code>--secret &lt;spec&gt;</code></td><td>BuildKit secret mount; repeatable.</td></tr>
+<tr><td><code>--no-cache</code></td><td>Rebuild without cached instructions or their cache mounts.</td></tr>
+<tr><td><code>--buildctl &lt;path&gt;</code></td><td>Select the local BuildKit client executable.</td></tr>
+<tr><td><code>--progress &lt;auto|plain|tty&gt;</code></td><td>Build progress format. Defaults to <code>auto</code>.</td></tr>
+<tr><td><code>--timeout &lt;seconds&gt;</code></td><td>Build deadline, from 1 to 86400 seconds. Defaults to 3600; the CLI allows 10 additional minutes for provisioning and publication.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="aenv-template-list"><a class="header" href="#aenv-template-list"><code>aenv template list</code></a></h2>
+<p>List all templates. Alias: <code>aenv template ls</code>, <code>aenv templates list</code>.</p>
+<pre><code class="language-bash">aenv template list
+aenv template list --output json
 </code></pre>
-<p>A mounted volume cannot be deleted. <code>aenv volume ls</code> is an alias for
-<code>aenv volume list</code>.</p>
-<hr>
-<h2 id="snapshots"><a class="header" href="#snapshots">Snapshots</a></h2>
-<h3 id="aenv-snapshot-create-sandbox-id"><a class="header" href="#aenv-snapshot-create-sandbox-id"><code>aenv snapshot create &lt;sandbox-id&gt;</code></a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--output &lt;table|json&gt;</code></td><td>Output format. Defaults to table on a TTY and JSON when redirected.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="aenv-template-watch-template"><a class="header" href="#aenv-template-watch-template"><code>aenv template watch &lt;template&gt;</code></a></h2>
+<p>Watch a template build until it succeeds or fails. Accepts either a template name/alias or a template UUID.</p>
+<pre><code class="language-bash">aenv template watch my-ubuntu
+aenv template watch &lt;template-id&gt;
+</code></pre>
+<h2 id="aenv-template-delete-template"><a class="header" href="#aenv-template-delete-template"><code>aenv template delete &lt;template&gt;</code></a></h2>
+<p>Delete a template by name or ID. Alias: <code>aenv template rm</code>.</p>
+<pre><code class="language-bash">aenv template delete my-ubuntu
+aenv template delete &lt;template-id&gt;
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="snapshots"><a class="header" href="#snapshots">Snapshots</a></h1>
+<p><code>aenv snap</code> is an alias for <code>aenv snapshot</code>, including its <code>create</code> and <code>list</code>
+subcommands.</p>
+<h2 id="aenv-snapshot-create-sandbox-id"><a class="header" href="#aenv-snapshot-create-sandbox-id"><code>aenv snapshot create &lt;sandbox-id&gt;</code></a></h2>
 <p>Capture a persistent snapshot from a running sandbox. The snapshot can be used as a template to start new sandboxes with <code>aenv start</code>.</p>
 <pre><code class="language-bash">aenv snapshot create &lt;sandbox-id&gt;
 aenv snapshot create &lt;sandbox-id&gt; --name my-base
@@ -691,8 +639,10 @@ aenv snapshot create &lt;sandbox-id&gt; --name my-base
 </tbody>
 </table>
 </div>
-<p>When source-registry image publication is enabled on the server, the command also prints the published OverlayBD-native image reference on an <code>Image:</code> line; that tag can be used directly as a <code>userImage</code>.</p>
-<h3 id="aenv-snapshot-list"><a class="header" href="#aenv-snapshot-list"><code>aenv snapshot list</code></a></h3>
+<p>When source-registry image publication is enabled on the server, the command
+also prints the published OverlayBD-native image reference on an <code>Image:</code> line;
+that reference can be passed to <code>aenv start --cold &lt;image-reference&gt;</code>.</p>
+<h2 id="aenv-snapshot-list"><a class="header" href="#aenv-snapshot-list"><code>aenv snapshot list</code></a></h2>
 <p>List persistent snapshots. Alias: <code>aenv snapshot ls</code>, <code>aenv snap ls</code>.</p>
 <pre><code class="language-bash">aenv snapshot list
 aenv snapshot list --sandbox-id &lt;sandbox-id&gt;
@@ -710,8 +660,63 @@ aenv snapshot list --sandbox-id &lt;sandbox-id&gt;
 </div>
 <p>The table output includes an <code>IMAGE REF</code> column (<code>-</code> when no image was published); JSON output includes the optional <code>imageRef</code> field.</p>
 <p>To delete a snapshot, use <code>aenv template delete &lt;snapshot-id&gt;</code> or <code>aenv template delete &lt;name&gt;</code> — snapshots share the same underlying store as templates and are deleted through the same command.</p>
-<hr>
-<h2 id="shell-completion"><a class="header" href="#shell-completion">Shell completion</a></h2>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="volumes"><a class="header" href="#volumes">Volumes</a></h1>
+<h2 id="aenv-volume-create-name"><a class="header" href="#aenv-volume-create-name"><code>aenv volume create &lt;name&gt;</code></a></h2>
+<p>Create an independent persistent volume. Volumes default to 65536 MiB (64 GiB)
+and <code>exclusive</code> mode.</p>
+<pre><code class="language-bash">aenv volume create workspace
+aenv volume create models --mode ro --image ghcr.io/example/models:latest
+aenv volume create job-workspace --from-volume workspace
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--size-mb &lt;MiB&gt;</code></td><td>Volume size (default: 65536). A copy-on-write fork must use the same size as its source.</td></tr>
+<tr><td><code>--mode &lt;exclusive|ro&gt;</code></td><td>Access mode (default: <code>exclusive</code>). Exclusive volumes are writable by one sandbox; read-only volumes can be shared.</td></tr>
+<tr><td><code>--from-volume &lt;volume&gt;</code></td><td>Create a copy-on-write fork from an existing volume ID or name. Conflicts with <code>--image</code>.</td></tr>
+<tr><td><code>--image &lt;image&gt;</code></td><td>Initialize the volume from an OCI image. Conflicts with <code>--from-volume</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<p>We recommend creating an exclusive fork for each sandbox instead of mounting a
+shared writable volume directly:</p>
+<pre><code class="language-bash">aenv volume create job-data --mode exclusive --from-volume dataset-base
+aenv start ubuntu --volume /workspace/data=job-data
+</code></pre>
+<p>See <a href="#volumes-1">Volumes</a> for access-mode semantics, lifecycle
+behavior, automatic sandbox fork and snapshot handling, and complete CLI
+examples.</p>
+<h2 id="aenv-volume-list"><a class="header" href="#aenv-volume-list"><code>aenv volume list</code></a></h2>
+<p>List persistent volumes. Alias: <code>aenv volume ls</code>.</p>
+<pre><code class="language-bash">aenv volume list
+aenv volume list --output json
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Flag</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--output &lt;table|json&gt;</code></td><td>Output format. Defaults to table on a TTY and JSON when redirected.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="aenv-volume-inspect-volume"><a class="header" href="#aenv-volume-inspect-volume"><code>aenv volume inspect &lt;volume&gt;</code></a></h2>
+<p>Inspect a volume by ID or name. The command prints the complete volume record
+as formatted JSON.</p>
+<pre><code class="language-bash">aenv volume inspect job-data
+</code></pre>
+<h2 id="aenv-volume-delete-volume"><a class="header" href="#aenv-volume-delete-volume"><code>aenv volume delete &lt;volume&gt;</code></a></h2>
+<p>Delete a volume by ID or name.</p>
+<pre><code class="language-bash">aenv volume delete job-data
+</code></pre>
+<p>A mounted volume cannot be deleted.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="shell-completion"><a class="header" href="#shell-completion">Shell Completion</a></h1>
 <p><code>aenv completion &lt;shell&gt;</code> prints a shell-completion registration script for the
 <code>aenv</code> CLI to stdout. Supported shells: <code>bash</code>, <code>zsh</code>, and <code>fish</code>.</p>
 <p>The script registers a completion function that calls back into the <code>aenv</code>
@@ -719,8 +724,8 @@ binary at completion time (<code>COMPLETE=&lt;shell&gt; aenv ...</code>), so com
 always matches the installed CLI version — upgrading <code>aenv</code> does not require
 regenerating the script. The script invokes <code>aenv</code> by name, so the binary must
 be on your <code>PATH</code>.</p>
-<h3 id="generate-and-install-a-script"><a class="header" href="#generate-and-install-a-script">Generate and install a script</a></h3>
-<h4 id="bash"><a class="header" href="#bash">Bash</a></h4>
+<h2 id="generate-and-install-a-script"><a class="header" href="#generate-and-install-a-script">Generate and install a script</a></h2>
+<h3 id="bash"><a class="header" href="#bash">Bash</a></h3>
 <pre><code class="language-bash">mkdir -p ~/.local/share/bash-completion/completions
 aenv completion bash &gt; ~/.local/share/bash-completion/completions/aenv
 </code></pre>
@@ -728,7 +733,7 @@ aenv completion bash &gt; ~/.local/share/bash-completion/completions/aenv
 <a href="https://github.com/scop/bash-completion"><code>bash-completion</code></a>.
 This requires <code>bash-completion</code> to be installed and initialized in the current
 shell.</p>
-<h4 id="zsh"><a class="header" href="#zsh">Zsh</a></h4>
+<h3 id="zsh"><a class="header" href="#zsh">Zsh</a></h3>
 <pre><code class="language-zsh">mkdir -p ~/.local/share/zsh/site-functions
 aenv completion zsh &gt; ~/.local/share/zsh/site-functions/_aenv
 </code></pre>
@@ -740,18 +745,18 @@ all systems. Add the following lines to <code>~/.zshrc</code> before any existin
 autoload -Uz compinit
 compinit
 </code></pre>
-<h4 id="fish"><a class="header" href="#fish">Fish</a></h4>
+<h3 id="fish"><a class="header" href="#fish">Fish</a></h3>
 <pre><code class="language-shell">mkdir -p ~/.config/fish/completions
 aenv completion fish &gt; ~/.config/fish/completions/aenv.fish
 </code></pre>
-<h3 id="activate-without-installing"><a class="header" href="#activate-without-installing">Activate without installing</a></h3>
+<h2 id="activate-without-installing"><a class="header" href="#activate-without-installing">Activate without installing</a></h2>
 <p>To test completion for the current shell session without saving a generated
 file:</p>
 <pre><code class="language-bash">source &lt;(aenv completion bash)         # Bash
 eval "$(aenv completion zsh)"         # Zsh
 aenv completion fish | source          # Fish
 </code></pre>
-<h3 id="what-completion-covers"><a class="header" href="#what-completion-covers">What completion covers</a></h3>
+<h2 id="what-completion-covers"><a class="header" href="#what-completion-covers">What completion covers</a></h2>
 <p>Static completion covers the full CLI surface:</p>
 <pre><code class="language-bash">aenv &lt;TAB&gt;                       # top-level commands
 aenv snapshot &lt;TAB&gt;              # nested subcommands (create, list, ...)
@@ -1231,7 +1236,7 @@ cd AgentENV
 </code></pre>
 <p>This builds three images: <code>agentenv-runtime:latest</code>, <code>agentenv-gateway:latest</code>, and <code>agentenv-scheduler:latest</code>.</p>
 <h2 id="configure-the-access-token-seed-optional"><a class="header" href="#configure-the-access-token-seed-optional">Configure the Access-Token Seed (Optional)</a></h2>
-<p>See <a href="#sandbox-access-token-seed">Authentication</a>
+<p>See <a href="#sandbox-access-token-seed">Sandbox Access-Token Seed</a>
 for the shared sandbox access-token seed configuration.</p>
 <h2 id="deploy"><a class="header" href="#deploy">Deploy</a></h2>
 <pre><code class="language-bash"># Run on each worker node before deploying
@@ -1253,7 +1258,7 @@ configuring clients:</p>
 <code>make k8s-render</code> uses an invalid <code>REDACTED</code> placeholder so preview output never
 contains a deployable API key. The optional runtime seed keeps its existing
 <code>agentenv-runtime-secrets</code> contract described in
-<a href="#sandbox-access-token-seed">Authentication</a>.</p>
+<a href="#sandbox-access-token-seed">Sandbox Access-Token Seed</a>.</p>
 <p>To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when rendering or applying manifests:</p>
 <pre><code class="language-bash">SANDBOX_PROXY_DOMAINS=sandbox.example.com make k8s-apply
@@ -1773,13 +1778,27 @@ and WebSocket traffic to services inside the VM.</li>
 </div>
 <p>These credentials are not interchangeable. The API key belongs to the AgentENV
 deployment; the other two tokens belong to an individual sandbox.</p>
-<h2 id="api-authentication"><a class="header" href="#api-authentication">API Authentication</a></h2>
+<blockquote>
+<p><strong>Notice:</strong> Authentication verifies credentials but does not encrypt traffic.
+Use HTTPS termination, a VPN, loopback, or a trusted private network to
+protect API keys and sandbox tokens in transit.</p>
+</blockquote>
+<hr>
+<p>Where to Go Next:</p>
+<ul>
+<li><a href="#api-authentication">API Authentication</a> — authenticate lifecycle and management API requests.</li>
+<li><a href="#application-ingress-authentication">Application Ingress Authentication</a> — protect services exposed by a sandbox.</li>
+<li><a href="#secure-sandbox-authentication">Secure Sandbox Authentication</a> — authenticate command execution, file transfer, and other envd operations.</li>
+<li><a href="#sandbox-access-token-seed">Sandbox Access-Token Seed</a> — configure the seed used to derive sandbox access tokens.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="api-authentication"><a class="header" href="#api-authentication">API Authentication</a></h1>
 <p>The API key authenticates requests that create and manage AgentENV resources,
 including templates, sandboxes, and snapshots:</p>
 <pre><code class="language-bash">curl http://127.0.0.1:8000/sandboxes \
   -H "X-API-Key: &lt;api-key&gt;"
 </code></pre>
-<h3 id="get-the-api-key"><a class="header" href="#get-the-api-key">Get the API Key</a></h3>
+<h2 id="get-the-api-key"><a class="header" href="#get-the-api-key">Get the API Key</a></h2>
 <p>A runtime node checks these API-key sources in order:</p>
 <ol>
 <li><code>AENV_API_KEY</code></li>
@@ -1788,7 +1807,7 @@ including templates, sandboxes, and snapshots:</p>
 </ol>
 <p>The gateway checks only <code>AENV_API_KEY</code> and <code>/run/secrets/api-key</code>. The gateway
 and every runtime node in one deployment must use the same key.</p>
-<h4 id="provide-an-api-key"><a class="header" href="#provide-an-api-key">Provide an API Key</a></h4>
+<h3 id="provide-an-api-key"><a class="header" href="#provide-an-api-key">Provide an API Key</a></h3>
 <p>To provide your own key, generate a value containing 32 to 256 URL-safe
 characters and make it available through one of the locations above. For
 example, generate an E2B-compatible key and set it through the environment:</p>
@@ -1798,7 +1817,7 @@ example, generate an E2B-compatible key and set it through the environment:</p>
 a multi-node deployment. Docker Compose can provide it through its shared
 managed-secret volume, while Kubernetes stores it in <code>Secret/agentenv-auth</code>.
 See the corresponding deployment guide for setup instructions.</p>
-<h4 id="use-an-automatically-generated-api-key"><a class="header" href="#use-an-automatically-generated-api-key">Use an Automatically Generated API Key</a></h4>
+<h3 id="use-an-automatically-generated-api-key"><a class="header" href="#use-an-automatically-generated-api-key">Use an Automatically Generated API Key</a></h3>
 <p>If a runtime node finds no key in any of the three locations, normal server
 startup generates an E2B-compatible key and atomically stores it at
 <code>$AENV_HOME/secrets/api-key</code>. Read that file after the server starts and use its
@@ -1806,7 +1825,7 @@ value when configuring the CLI or another API client.</p>
 <p>Automatic generation is convenient for a normal single-node deployment. The
 gateway never generates a key, so a multi-node deployment must make one shared
 key available to the gateway and all runtime nodes.</p>
-<h3 id="configure-the-cli"><a class="header" href="#configure-the-cli">Configure the CLI</a></h3>
+<h2 id="configure-the-cli"><a class="header" href="#configure-the-cli">Configure the CLI</a></h2>
 <p>Run <code>aenv auth</code>, enter the AgentENV server URL, and paste the API key obtained
 above. Press Enter to accept the default local URL. The API key input is hidden:</p>
 <pre><code class="language-text">$ aenv auth
@@ -1817,15 +1836,16 @@ Credentials saved.
 <p>E2B-compatible SDKs read the same AgentENV API key from <code>E2B_API_KEY</code>:</p>
 <pre><code class="language-bash">export E2B_API_KEY="&lt;paste-api-key-here&gt;"
 </code></pre>
-<h3 id="unauthenticated-endpoints"><a class="header" href="#unauthenticated-endpoints">Unauthenticated Endpoints</a></h3>
+<h2 id="unauthenticated-endpoints"><a class="header" href="#unauthenticated-endpoints">Unauthenticated Endpoints</a></h2>
 <p><code>GET /health</code> and node <code>GET /metrics</code> are outside API-key authentication. The
 gateway exposes Prometheus metrics on a separate metrics listener. Protect
 these endpoints with the network and authentication controls used by your
 monitoring deployment.</p>
-<h3 id="rotate-the-api-key"><a class="header" href="#rotate-the-api-key">Rotate the API Key</a></h3>
+<h2 id="rotate-the-api-key"><a class="header" href="#rotate-the-api-key">Rotate the API Key</a></h2>
 <p>Changing <code>AENV_API_KEY</code> invalidates existing API clients but does not change
 the credentials of existing sandboxes.</p>
-<h2 id="application-ingress-authentication"><a class="header" href="#application-ingress-authentication">Application Ingress Authentication</a></h2>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="application-ingress-authentication"><a class="header" href="#application-ingress-authentication">Application Ingress Authentication</a></h1>
 <p>Application ingress is traffic sent through the AgentENV proxy to a service
 running inside a sandbox. It is independent from API and envd authentication.</p>
 <p>With <code>allowPublicTraffic: true</code>, which is the default, application ingress does
@@ -1857,12 +1877,14 @@ the sandbox:</p>
 credentials. AgentENV removes the traffic token before forwarding the request
 to the sandbox application. See <a href="#access-control">Proxy</a>
 for the complete proxy routing and access-control behavior.</p>
-<h2 id="secure-sandbox-authentication"><a class="header" href="#secure-sandbox-authentication">Secure Sandbox Authentication</a></h2>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="secure-sandbox-authentication"><a class="header" href="#secure-sandbox-authentication">Secure Sandbox Authentication</a></h1>
 <p>A secure sandbox requires an <code>envdAccessToken</code> for envd control operations,
 including interactive connections, command execution, and file upload or
 download. This does not protect services exposed by the sandbox; application
-ingress uses <code>trafficAccessToken</code> as described above.</p>
-<h3 id="enable-secure-mode"><a class="header" href="#enable-secure-mode">Enable Secure Mode</a></h3>
+ingress uses <code>trafficAccessToken</code> as described in
+<a href="#application-ingress-authentication">Application Ingress Authentication</a>.</p>
+<h2 id="enable-secure-mode"><a class="header" href="#enable-secure-mode">Enable Secure Mode</a></h2>
 <p>Set <code>secure: true</code> in the sandbox
 creation request. For example, create a secure sandbox and capture
 the token returned in the response:</p>
@@ -1890,306 +1912,48 @@ envd access token automatically:</p>
 <p>For <code>connect</code>, <code>exec</code>, <code>upload</code>, and
 <code>download</code>, it obtains the token through the authenticated AgentENV API and
 adds <code>X-Access-Token</code> to the subsequent envd request.</p>
-<h3 id="secure-mode-lifecycle"><a class="header" href="#secure-mode-lifecycle">Secure-Mode Lifecycle</a></h3>
+<h2 id="secure-mode-lifecycle"><a class="header" href="#secure-mode-lifecycle">Secure-Mode Lifecycle</a></h2>
 <p>Secure mode and its credentials remain valid across pause, server restart, and
 resume. Forked sandboxes receive independent credentials.</p>
-<h2 id="sandbox-access-token-seed"><a class="header" href="#sandbox-access-token-seed">Sandbox Access-Token Seed</a></h2>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="sandbox-access-token-seed"><a class="header" href="#sandbox-access-token-seed">Sandbox Access-Token Seed</a></h1>
 <p>AgentENV derives both <code>trafficAccessToken</code> and <code>envdAccessToken</code> from the
 sandbox identity and a random access-token seed. This seed is independent of
 the AgentENV API key.</p>
+<p>In a clustered deployment, configure the same seed on every runtime
+node that may create, host, resume, or recover a sandbox. The gateway does not
+derive sandbox access tokens and does not need this seed.</p>
+<h2 id="use-the-seed-generated-by-default"><a class="header" href="#use-the-seed-generated-by-default">Use the Seed Generated by Default</a></h2>
 <p>By default, no manual configuration is required. When a seed is not configured,
 AgentENV generates one on first startup and persists it at
 <code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code>. Later startups reuse the
 same value.</p>
+<h2 id="provide-your-own-seed"><a class="header" href="#provide-your-own-seed">Provide Your Own Seed</a></h2>
 <p>To provide your own seed, generate one value:</p>
 <pre><code class="language-bash">ACCESS_TOKEN_SEED="$(openssl rand -hex 32)"
 </code></pre>
 <p>Then configure it using one of the following methods.</p>
+<h3 id="1-environment-variable"><a class="header" href="#1-environment-variable">1. Environment Variable</a></h3>
 <p>Set the environment variable before starting AgentENV:</p>
 <pre><code class="language-bash">export AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED="$ACCESS_TOKEN_SEED"
 </code></pre>
-<p>Or set it in <code>config/default.toml</code>, or in the configuration file selected by
+<h3 id="2-agentenv-config-file"><a class="header" href="#2-agentenv-config-file">2. AgentENV Config File</a></h3>
+<p>Set the value in <code>config/default.toml</code>, or in the configuration file selected by
 <code>AENV_CONFIG_PATH</code>:</p>
 <pre><code class="language-toml">[sandbox]
 access_token_hash_seed = "&lt;generated-seed&gt;"
 </code></pre>
+<h3 id="3-kubernetes-secret"><a class="header" href="#3-kubernetes-secret">3. Kubernetes Secret</a></h3>
 <p>Kubernetes deployments store the shared value under the
 <code>sandbox-access-token-hash-seed</code> key in <code>Secret/agentenv-runtime-secrets</code>.</p>
 <p>Preserve the seed across upgrades. Changing it rotates both sandbox token types
 and requires all runtime nodes to be updated together.</p>
-<h2 id="transport-security"><a class="header" href="#transport-security">Transport Security</a></h2>
-<p>Authentication does not encrypt traffic. Use HTTPS termination, a VPN,
-loopback, or a trusted private network to protect API keys and sandbox tokens
-in transit.</p>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="templates-1"><a class="header" href="#templates-1">Templates</a></h1>
-<p>A template is a reusable starting point for launching sandboxes. Build or
-import it once, then use it to create sandboxes whenever you need the same
-software and configuration.</p>
-<h2 id="create-your-template"><a class="header" href="#create-your-template">Create Your Template</a></h2>
-<p>There are two ways to create a template: <code>aenv pull</code> imports an OCI image directly, and <code>aenv build</code> runs Dockerfile instructions inside a temporary build sandbox.</p>
-<p>Some defaults below come from your AgentENV config file. This is
-<code>config/default.toml</code> by default, or the file specified by
-<code>AENV_CONFIG_PATH</code>.</p>
-<h3 id="aenv-pull"><a class="header" href="#aenv-pull">aenv pull</a></h3>
-<p>Pull an existing OCI image as a template and optionally give it a memorable name:</p>
-<p>Usage:</p>
-<pre><code class="language-bash">aenv pull &lt;image&gt; [options]
-</code></pre>
-<p>Example:</p>
-<pre><code class="language-bash">aenv pull ubuntu:24.04
-aenv pull ubuntu:24.04 --name my-base
-</code></pre>
-<p><code>--name</code> is optional. Without it, AgentENV uses the image repository name. A template name can
-be used anywhere a template ID is accepted.</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>&lt;image&gt;</code></td><td>Required</td><td>OCI image reference. Short names such as <code>ubuntu:24.04</code> and full references are supported.</td></tr>
-<tr><td><code>--name &lt;name&gt;</code></td><td>Image repository name</td><td>Assign a human-readable template name.</td></tr>
-<tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your config file</td><td>Set the template’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
-<tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set the template’s memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
-<tr><td><code>--start-cmd &lt;cmd&gt;</code></td><td>None</td><td>Run a command before capturing the template snapshot.</td></tr>
-<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td><code>sleep 20</code> when <code>--start-cmd</code> is set; otherwise none</td><td>Poll a shell command every two seconds until it exits successfully.</td></tr>
-<tr><td><code>--probe &lt;port&gt;</code></td><td>None</td><td>Wait for TCP on <code>localhost:&lt;port&gt;</code>. Cannot be combined with <code>--ready-cmd</code>.</td></tr>
-<tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Submit the build and return immediately instead of waiting.</td></tr>
-<tr><td><code>--timeout &lt;seconds&gt;</code></td><td>No timeout</td><td>Limit how long the CLI waits for the build. Cannot be combined with <code>--detach</code>.</td></tr>
-</tbody>
-</table>
-</div>
-<p><code>Env</code>, <code>WorkingDir</code>, and <code>User</code> are automatically inherited from the OCI image config. See <a href="#runtime-configuration">Runtime Configuration</a> for the full field list.</p>
-<h3 id="aenv-build"><a class="header" href="#aenv-build">aenv build</a></h3>
-<p>Build a Dockerfile with BuildKit inside a temporary microVM, then convert the
-result to OverlayBD and capture a template. The CLI and full AgentENV installers
-include a private <code>aenv-buildctl</code> client. Source builds can use <code>--buildctl</code> to select a compatible
-client. Docker and a staging registry are not required on the CLI machine.
-On Linux and macOS, the local <code>buildctl</code> connection uses a Unix socket in a
-directory accessible only to the current user.</p>
-<pre><code class="language-bash">aenv build &lt;context&gt; --name &lt;name&gt; [options]
-# From the repository root:
-aenv build . -f deploy/docker/Dockerfile.agentenv --name aenv
-</code></pre>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>&lt;context&gt;</code></td><td>Required</td><td>Local context directory, as with <code>docker build</code>.</td></tr>
-<tr><td><code>-f, --file &lt;path&gt;</code></td><td><code>&lt;context&gt;/Dockerfile</code></td><td>Dockerfile path; explicit relative paths resolve from the current directory.</td></tr>
-<tr><td><code>--name &lt;name&gt;</code></td><td>Required</td><td>Assign the template name.</td></tr>
-<tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your config file</td><td>Set the template’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
-<tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set the template’s memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
-<tr><td><code>--start-cmd &lt;command&gt;</code></td><td>Image <code>ENTRYPOINT</code>/<code>CMD</code></td><td>Override template startup; an empty string disables startup.</td></tr>
-<tr><td><code>--ready-cmd &lt;command&gt;</code></td><td>Image <code>HEALTHCHECK</code>, or the normal startup delay</td><td>Override the command that must succeed before snapshot capture.</td></tr>
-<tr><td><code>--build-arg KEY=VALUE</code></td><td>None</td><td>Build argument; repeatable.</td></tr>
-<tr><td><code>--secret &lt;spec&gt;</code></td><td>None</td><td>Native BuildKit secret mounts; repeatable.</td></tr>
-<tr><td><code>--no-cache</code></td><td>False</td><td>Rebuild without cached instructions. BuildKit also resets cache mounts used by those instructions.</td></tr>
-<tr><td><code>--buildctl &lt;path&gt;</code></td><td><code>aenv-buildctl</code> beside <code>aenv</code></td><td>Local client executable.</td></tr>
-<tr><td><code>--progress &lt;format&gt;</code></td><td><code>auto</code></td><td>Three-stage bar on terminals, plain logs when redirected. <code>plain</code> selects plain logs; <code>tty</code> selects BuildKit’s native display.</td></tr>
-<tr><td><code>--timeout &lt;seconds&gt;</code></td><td>3600</td><td>Builder preparation and Dockerfile build deadline; the CLI allows 10 additional minutes for publication.</td></tr>
-</tbody>
-</table>
-</div>
-<p><code>COPY</code> and <code>ADD</code> resolve from the context directory, independently of the
-Dockerfile’s location. Local directories are supported; URL and stdin contexts
-are not supported. The final Dockerfile stage is always published. Select base
-images with <code>FROM</code> (or <code>ARG</code> used by <code>FROM</code>) and startup with <code>ENTRYPOINT</code>/<code>CMD</code>.
-<code>--start-cmd</code> and <code>--ready-cmd</code> override startup and readiness independently.
-There are no image, stage-selection, SSH, or builder-resource overrides in the
-build CLI.</p>
-<p>Managed builder settings belong to the server configuration:</p>
-<pre><code class="language-toml">[template_build]
-max_concurrent_builds = 4
-builder_image = "docker.io/moby/buildkit:v0.33.0"
-builder_cpu_count = 16
-builder_memory_mb = 32768
-cache_size_mb = 65536
-</code></pre>
-<p>Each node admits at most <code>max_concurrent_builds</code> managed builds, including
-preparation, image publication, and cleanup. Excess builder PUT requests return
-HTTP 429 without changing the waiting build; retry once capacity is available.
-Each build permits up to 8 simultaneous WebSocket tunnels, including pending
-connections and upgrades. Excess tunnel connections also return HTTP 429.</p>
-<p>The 64 GiB disk is the persistent <code>/var/lib/buildkit</code> data volume, where image
-layers, build contexts, and cache mounts live. Its capacity applies when creating
-the cache; changing the setting does not resize an existing volume. These
-resources are separate from the resulting template’s CPU and memory. Dockerfile
-build requests reject a cache capacity above <code>volume.max_size_mb</code>; a smaller
-volume limit does not prevent the server from starting or serving other APIs.</p>
-<p>BuildKit handles multi-stage builds, <code>COPY</code>, <code>ADD</code>, <code>.dockerignore</code>, cache mounts,
-and Dockerfile syntax. The CLI remains connected during the build, streams build
-progress, and exits nonzero on failure. The server provisions and releases an
-internal worker for each template build. The first Dockerfile build prepares a
-reusable builder snapshot in a private namespace of the configured snapshot
-repository. Nodes sharing that repository restore the same builder and attach a
-new cache volume before starting BuildKit. Concurrent first requests on a node
-share initialization. Simultaneous first builds on different nodes may both
-prepare a builder; subsequent builds reuse the published snapshot. Builder image,
-CPU, memory, virtualization mode, and readiness setup identify the reusable snapshot;
-changing those inputs prepares a new builder. The CLI uses
-only template and build IDs; workers are absent from public sandbox listings and endpoints. Cancellation
-and deadlines release the worker and discard its incomplete cache child. A hard client failure
-is covered by the build deadline, and server restart recovers unfinished builds
-and cache reservations from a durable journal. Failed cleanup is retained and
-retried every 30 seconds while the server runs, and cancellation retries use the
-same cleanup path. Active builds reject template deletion until cancellation or
-completion. An unreadable entry does not block recovery of other builds
-or prevent server startup. Once BuildKit succeeds, publication proceeds even if the
-CLI is interrupted; its status remains available:</p>
-<pre><code class="language-bash">aenv template watch my-template
-</code></pre>
-<p><code>aenv template watch</code> has no timeout option. Stop the
-local watch with <code>Ctrl-C</code>; the remote build continues.</p>
-<p>The node reads the completed image directly from the builder by SHA-256 digest.
-It verifies the transferred bytes and converts only missing layers, reusing the
-same content-addressed OverlayBD cache as registry image imports. The completed
-image never travels through the CLI. Only the final image configuration becomes
-template configuration; intermediate stages and build-time arguments are not
-template environment variables.</p>
-<p>Publishing also boots the image and runs its startup command. An image
-can compile and convert successfully but fail this step if its entrypoint needs
-devices absent from the guest. For example, <code>deploy/docker/Dockerfile.agentenv</code>
-starts the host AgentENV server, which requires <code>/dev/kvm</code>; it cannot run as a
-template in a guest without nested KVM support. Use <code>--start-cmd</code> to select another
-startup command, or <code>--start-cmd "" --ready-cmd true</code> to capture without starting
-the image’s application or running its health check.</p>
-<p>The guest image needs <code>/bin/sh</code> for envd process execution, including exec-form
-Dockerfile commands. Numeric <code>USER</code> values, including UIDs without an account
-and explicit UID/GID pairs, are preserved during startup and restore.</p>
-<p>Caches are shared across template names and nodes using the configured snapshot
-repository. Each build clones the latest immutable cache seed into its own
-writable volume. Sequential builds inherit the preceding build’s accumulated
-instruction cache and <code>RUN --mount=type=cache</code> data. Concurrent builds can fork
-the same seed without waiting for each other; the last successfully published
-cache becomes the next seed. Sibling cache additions are not merged.</p>
-<p>After image import, the node stops BuildKit, checkpoints and publishes its cache
-volume through the normal volume freeze and capture path, and stops the VM without
-saving its memory, rootfs, or device state. A failed shutdown or cache capture
-keeps the previous shared seed. Volume ownership remains held until the VM stops.</p>
-<p>Cache volumes use normal volume publication, uploading only missing layers.
-Cache publication adds cleanup time, but a failed cache upload does not fail an
-otherwise successful template build or replace the previous seed. Old cache
-volumes are removed after active children release their leases. The shared cache
-record commits the new seed and pending retirements together, and cleanup retries
-retirements independently of individual builds. BuildKit’s garbage collector
-manages cache contents. Cache sharing uses the repository’s existing API-key trust boundary.
-Registry credentials come from the local BuildKit session and normal Docker
-credential configuration.</p>
-<p>The BuildKit API extends the existing template/build lifecycle:</p>
-<ol>
-<li><code>POST /v3/templates</code> allocates template/build IDs using the existing request.</li>
-<li><code>PUT /templates/{templateID}/builds/{buildID}/builder</code> prepares the worker.
-It accepts optional <code>startCmd</code>, <code>readyCmd</code>, and <code>timeout</code>, and returns
-<code>imageName</code>. A build that has already started returns <code>409</code>.</li>
-<li>Poll <code>GET /templates/{templateID}/builds/{buildID}/status</code> until <code>building</code>;
-<code>waiting</code> means the worker is still preparing.</li>
-<li><code>GET /templates/{templateID}/builds/{buildID}/builder</code> opens the authenticated
-binary WebSocket for BuildKit. Use the returned name in
-<code>--output type=image,name=&lt;imageName&gt;,oci-mediatypes=true</code>.</li>
-<li>The server observes successful BuildKit completion, verifies the image digest,
-and automatically imports and publishes the template. No client submission
-request is needed. Continue polling status until <code>ready</code> or <code>error</code>.</li>
-<li><code>DELETE /templates/{templateID}/builds/{buildID}/builder</code> cancels the build
-before publication. Once publication starts, cancellation returns <code>409</code> and
-the server finishes publication and releases the worker.</li>
-</ol>
-<p>These endpoints require the API key. The gateway schedules worker preparation
-and binds subsequent requests to that node. Status polling falls back to the
-shared repository after the binding expires. The unique image name identifies
-this build among cached BuildKit history; a dropped connection is never treated
-as successful completion. Failed solves become <code>error</code>. Existing statuses are
-unchanged; <code>building</code> includes image import and publication.</p>
-<p>Image import has a one-hour deadline; metadata is limited to 4 MiB per blob and
-images to 1024 layers and 64 GiB of compressed data. Worker connections can drain
-for up to ten seconds after image import before the worker is stopped. Existing
-declarative template endpoints retain their behavior.</p>
-<p>By default, image <code>ENTRYPOINT</code> and <code>CMD</code> are combined for startup through <code>/bin/sh -c</code>.
-Dockerfile <code>HEALTHCHECK</code> supplies the readiness command before snapshot capture;
-shell checks honor Dockerfile <code>SHELL</code>, and <code>HEALTHCHECK NONE</code> disables the check.
-It uses AgentENV’s readiness polling and deadline, not Docker’s health-monitoring
-intervals or restart behavior. Without a check, startup uses the normal template
-readiness delay. <code>--start-cmd</code> and <code>--ready-cmd</code> (API fields <code>startCmd</code> and <code>readyCmd</code>)
-override these commands independently without modifying the image configuration.
-Images must satisfy AgentENV’s normal guest runtime requirements;
-<code>EXPOSE</code> and <code>VOLUME</code> are metadata, not Docker runtime services.</p>
-<h3 id="api-and-repository-compatibility"><a class="header" href="#api-and-repository-compatibility">API and repository compatibility</a></h3>
-<p>Existing template creation, declarative build, status, listing, and deletion
-endpoints remain available. BuildKit adds <code>PUT</code>, <code>GET</code>, and <code>DELETE</code> on the
-<code>builder</code> resource beneath an existing build. It adds no competing template
-creation endpoint or image submission endpoint. Upgrade the gateway and all
-nodes serving build requests before using BuildKit.</p>
-<p>Existing remote snapshots and volumes need no migration. Their catalog keys,
-artifact paths, and layer formats are unchanged. Builder snapshots use the
-separate <code>template-build/builder</code> namespace; the new cache head and retirement
-record uses <code>template-build/cache-head.json</code>. Cache volumes retain the normal
-volume format.</p>
-<p>Startup metadata adds an optional <code>shell</code> field. Older records omit it, retain
-<code>/bin/bash -lc</code> behavior, and are written back without adding the field. New
-BuildKit templates use <code>/bin/sh -c</code>. Older servers can deserialize these records,
-but ignore the shell field and drop it when rewriting the record. Building a
-derived template on an older server therefore uses Bash and can fail for images
-without Bash or change shell behavior. Keep builds derived from BuildKit templates
-on upgraded nodes; rolling back does not provide full BuildKit template support.</p>
-<h3 id="runtime-configuration"><a class="header" href="#runtime-configuration">Runtime Configuration</a></h3>
-<p>Both methods read the same set of OCI image config fields. For <code>aenv pull</code>, these come from the image config or flags; for <code>aenv build</code>, they are set by the
-corresponding Dockerfile instructions executed during the build. The following fields from the <a href="https://github.com/opencontainers/image-spec/blob/main/config.md">OCI image-spec config object</a> are recognised:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>OCI field</th><th>Dockerfile instruction</th><th>Runtime effect</th></tr>
-</thead>
-<tbody>
-<tr><td><code>Env</code></td><td><code>ENV</code></td><td>Environment variables injected into every sandbox process</td></tr>
-<tr><td><code>WorkingDir</code></td><td><code>WORKDIR</code></td><td>Default working directory</td></tr>
-<tr><td><code>User</code></td><td><code>USER</code></td><td>Default user</td></tr>
-<tr><td><code>Entrypoint</code> / <code>Cmd</code></td><td><code>ENTRYPOINT</code> / <code>CMD</code></td><td>Mapped to <code>startCmd</code> for <code>aenv build</code>; use <code>--start-cmd</code> explicitly for <code>aenv pull</code></td></tr>
-<tr><td><code>ExposedPorts</code></td><td><code>EXPOSE</code></td><td>Stored as metadata only</td></tr>
-<tr><td><code>Volumes</code></td><td><code>VOLUME</code></td><td>Stored as metadata only</td></tr>
-<tr><td><code>Labels</code></td><td><code>LABEL</code></td><td>Stored as metadata only</td></tr>
-</tbody>
-</table>
-</div>
-<h2 id="manage-templates"><a class="header" href="#manage-templates">Manage Templates</a></h2>
-<h3 id="list-templates"><a class="header" href="#list-templates">List templates</a></h3>
-<pre><code class="language-bash">aenv template list        # alias: aenv template ls
-aenv template list --output json
-</code></pre>
-<p>Displays all templates with their ID, name, build status, CPU, memory, disk
-size, and last-updated timestamp. <code>--output</code> accepts <code>table</code> or <code>json</code>. It
-defaults to <code>table</code> in an interactive terminal and <code>json</code> when output is piped
-or redirected.</p>
-<h3 id="list-template-builds"><a class="header" href="#list-template-builds">List template builds</a></h3>
-<p>List the complete build history for one template:</p>
-<pre><code class="language-bash">curl -H 'X-API-Key: test-key' \
-  http://127.0.0.1:8000/templates/&lt;template-id&gt;
-</code></pre>
-<h3 id="check-a-template-alias"><a class="header" href="#check-a-template-alias">Check a template alias</a></h3>
-<p>Check whether an alias exists and resolve it to a template ID:</p>
-<pre><code class="language-bash">curl -H 'X-API-Key: test-key' \
-  http://127.0.0.1:8000/templates/aliases/&lt;alias&gt;
-</code></pre>
-<h3 id="delete-a-template"><a class="header" href="#delete-a-template">Delete a template</a></h3>
-<pre><code class="language-bash">aenv template delete &lt;template-id-or-name&gt;   # alias: aenv template rm
-</code></pre>
-<h2 id="relationship-to-snapshots"><a class="header" href="#relationship-to-snapshots">Relationship to Snapshots</a></h2>
-<p>Templates are the API and UX layer. Snapshots are the durable runtime layer.</p>
-<ul>
-<li>A template build publishes one committed snapshot.</li>
-<li>A template ID or alias resolves to one committed snapshot.</li>
-<li>A sandbox created from a template resumes from that snapshot.</li>
-</ul>
-<p>If you want the storage and runtime model underneath templates, see
-<a href="#snapshots-1">Snapshots</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="sandboxes-1"><a class="header" href="#sandboxes-1">Sandboxes</a></h1>
 <p>A sandbox is an isolated Firecracker microVM with its own Linux kernel,
 filesystem, processes, and network stack. It is the environment where you run
 code, use tools, modify files, and start services.</p>
-<h2 id="lifecycle"><a class="header" href="#lifecycle">Lifecycle</a></h2>
+<p>A sandbox moves through the lifecycle shown below.</p>
 <pre class="mermaid">stateDiagram-v2
     [*] --&gt; Creating
     Creating --&gt; Running
@@ -2223,11 +1987,20 @@ code, use tools, modify files, and start services.</p>
 </table>
 </div>
 <hr>
-<h2 id="starting-a-sandbox"><a class="header" href="#starting-a-sandbox">Starting a Sandbox</a></h2>
-<p>You can start a sandbox from a reusable template or snapshot, or cold start one
-directly from an OCI image.</p>
-<h3 id="from-a-template-or-snapshot"><a class="header" href="#from-a-template-or-snapshot">From a Template or Snapshot</a></h3>
-<p>Pass either a template/snapshot alias or its ID:</p>
+<p>Where to Go Next:</p>
+<ul>
+<li><a href="#starting-a-sandbox">Starting a Sandbox</a> — start a sandbox from a template, snapshot, or OCI image.</li>
+<li><a href="#working-with-sandboxes">Working with Sandboxes</a> — basic commands such as connect, execute commands, transfer files, pause, snapshot, fork, and delete.</li>
+<li><a href="#auto-eviction">Auto-Eviction</a> — configure TTLs and expiration behavior of the sandbox.</li>
+<li><a href="#networking">Networking</a> — configure ingress and egress policies of the sandbox.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="starting-a-sandbox"><a class="header" href="#starting-a-sandbox">Starting a Sandbox</a></h1>
+<p>There are two ways to start a sandbox: warm start from a reusable template or
+snapshot, or cold start directly from an OCI image.</p>
+<h2 id="from-a-template-or-snapshot"><a class="header" href="#from-a-template-or-snapshot">From a Template or Snapshot</a></h2>
+<p>Before using a warm start, create a <a href="#templates-1">template</a> or a
+<a href="#snapshots-1">snapshot</a>. You can then start any number of sandboxes from its alias or ID:</p>
 <p>Usage:</p>
 <pre><code class="language-bash">aenv start &lt;template-or-snapshot&gt; [options]
 </code></pre>
@@ -2247,6 +2020,7 @@ aenv start 018f0d93-aaaa-bbbb-cccc-0123456789ab
 <tbody>
 <tr><td><code>&lt;template-or-snapshot&gt;</code></td><td>Required</td><td>Template or snapshot ID or alias.</td></tr>
 <tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
+<tr><td><code>--volume &lt;mount-path&gt;=&lt;volume&gt;</code></td><td>None</td><td>Mount a persistent volume by ID or name. Repeat the option to mount multiple volumes.</td></tr>
 <tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
 </tbody>
 </table>
@@ -2255,15 +2029,14 @@ aenv start 018f0d93-aaaa-bbbb-cccc-0123456789ab
 attaches an interactive shell. CPU, memory, and disk settings are inherited
 from the template or snapshot and cannot be overridden on a warm start. The CLI
 always enables secure sandbox authentication and manages the envd access token
-automatically; see <a href="#secure-sandbox-authentication">Authentication</a>.</p>
+automatically; see <a href="#secure-sandbox-authentication">Secure Sandbox Authentication</a>.</p>
 <p>To retrieve the current state and configuration of one sandbox, use the HTTP
 API:</p>
 <pre><code class="language-bash">curl -H 'X-API-Key: test-key' \
   http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;
 </code></pre>
-<h3 id="cold-start-from-an-oci-image"><a class="header" href="#cold-start-from-an-oci-image">Cold Start from an OCI Image</a></h3>
-<p>A cold start resolves an OCI image directly and prepares a fresh writable root
-filesystem at runtime:</p>
+<h2 id="cold-start-from-an-oci-image"><a class="header" href="#cold-start-from-an-oci-image">Cold Start from an OCI Image</a></h2>
+<p>A cold start resolves an OCI image directly and prepares a fresh writable root filesystem at runtime:</p>
 <p>Usage:</p>
 <pre><code class="language-bash">aenv start --cold &lt;image&gt; [options]
 </code></pre>
@@ -2284,6 +2057,7 @@ aenv start --cold ubuntu:24.04 --cpu 4 --memory 4096 --disk-size-mb 65536
 <tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your AgentENV config file</td><td>Set the sandbox’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set sandbox memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
 <tr><td><code>--disk-size-mb &lt;MiB&gt;</code></td><td>Source image virtual size</td><td>Set root filesystem size. The value must be greater than zero and divisible by 1024 MiB. Alias: <code>--disk-mb</code>.</td></tr>
+<tr><td><code>--volume &lt;mount-path&gt;=&lt;volume&gt;</code></td><td>None</td><td>Mount a persistent volume by ID or name. Repeat the option to mount multiple volumes.</td></tr>
 <tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
 </tbody>
 </table>
@@ -2300,24 +2074,25 @@ default. Shrinking below the source image size requires
 applies only when creating a fresh writable root filesystem, not to read-only
 images, images with an existing upper layer, or snapshot resume. Sandbox
 responses report the effective size as <code>diskSizeMB</code>.</p>
-<h2 id="working-with-sandboxes"><a class="header" href="#working-with-sandboxes">Working with Sandboxes</a></h2>
-<h3 id="connect-to-a-sandbox"><a class="header" href="#connect-to-a-sandbox">Connect to a Sandbox</a></h3>
-<p><code>aenv connect</code> opens an interactive shell inside the sandbox and attaches your
-terminal. <code>aenv cn</code> is its short alias:</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="working-with-sandboxes"><a class="header" href="#working-with-sandboxes">Working with Sandboxes</a></h1>
+<p>This page provides the basic commands for interacting with and managing a sandbox.</p>
+<h2 id="connect-to-a-sandbox"><a class="header" href="#connect-to-a-sandbox">Connect to a Sandbox</a></h2>
+<p><code>aenv connect</code> opens an interactive shell inside the sandbox and attaches your terminal. <code>aenv cn</code> is its short alias:</p>
 <pre><code class="language-bash">aenv connect &lt;sandbox-id&gt;
 aenv cn &lt;sandbox-id&gt;
 </code></pre>
 <p>If a sandbox is paused, <code>aenv connect</code> will automatically resume it.</p>
-<h3 id="execute-a-command"><a class="header" href="#execute-a-command">Execute a Command</a></h3>
-<p><code>aenv exec</code> runs one non-interactive command, streams its output to your local
-terminal, and exits with the remote command’s exit code. It does not attach an
-interactive shell.
-Flags intended for the remote command
-that collide with aenv’s own flags can be escaped with a leading <code>--</code>.</p>
+<h2 id="execute-a-command"><a class="header" href="#execute-a-command">Execute a Command</a></h2>
+<p><code>aenv exec</code> runs one non-interactive command, streams its
+output to your local terminal, and exits with the remote
+command’s exit code. It does not attach an interactive shell.
+Flags intended for the remote command that collide with aenv’s
+own flags can be escaped with a leading <code>--</code>.</p>
 <pre><code class="language-bash">aenv exec &lt;sandbox-id&gt; ls -la /
 aenv exec &lt;sandbox-id&gt; -- command-with-aenv-like-flags --timeout 10
 </code></pre>
-<h3 id="upload-files"><a class="header" href="#upload-files">Upload Files</a></h3>
+<h2 id="upload-files"><a class="header" href="#upload-files">Upload Files</a></h2>
 <p><code>aenv upload</code> copies a local file or directory into a running sandbox:</p>
 <p>Usage:</p>
 <pre><code class="language-bash">aenv upload &lt;sandbox-id&gt; &lt;local-path&gt; &lt;remote-path&gt; [options]
@@ -2338,9 +2113,8 @@ aenv exec &lt;sandbox-id&gt; -- command-with-aenv-like-flags --timeout 10
 </tbody>
 </table>
 </div>
-<h3 id="download-files"><a class="header" href="#download-files">Download Files</a></h3>
-<p><code>aenv download</code> copies a file or directory from a running sandbox to your local
-machine:</p>
+<h2 id="download-files"><a class="header" href="#download-files">Download Files</a></h2>
+<p><code>aenv download</code> copies a file or directory from a running sandbox to your local machine:</p>
 <p>Usage:</p>
 <pre><code class="language-bash">aenv download &lt;sandbox-id&gt; &lt;remote-path&gt; [local-path] [options]
 </code></pre>
@@ -2361,9 +2135,9 @@ machine:</p>
 </tbody>
 </table>
 </div>
-<h3 id="pause-and-resume"><a class="header" href="#pause-and-resume">Pause and Resume</a></h3>
-<p>Pausing saves the sandbox’s current runtime state and stops its microVM. While
-it is paused, programs inside it do not run, services do not handle requests,
+<h2 id="pause-and-resume"><a class="header" href="#pause-and-resume">Pause and Resume</a></h2>
+<p>Pausing saves the sandbox’s current runtime state and stops its
+microVM. While it is paused, programs inside it do not run, services do not handle requests,
 and the sandbox releases its CPU and memory resources. Its saved state remains
 in storage so the same sandbox can be resumed later.</p>
 <p>After resume, the filesystem, running processes, environment variables, and
@@ -2378,7 +2152,7 @@ sets the new TTL from resume time.</p>
 <p>By default, the sandbox automatically pauses when it reaches its TTL. See
 <a href="#auto-eviction">Auto-Eviction</a> for how the deadline is set and how to delete
 instead of pause.</p>
-<h3 id="persistent-snapshots"><a class="header" href="#persistent-snapshots">Persistent Snapshots</a></h3>
+<h2 id="persistent-snapshots"><a class="header" href="#persistent-snapshots">Persistent Snapshots</a></h2>
 <p>A snapshot is a durable, reusable checkpoint of a running sandbox. Creating one
 does not replace the sandbox: the source returns to Running after capture, and
 the snapshot can later launch one or more new sandboxes.</p>
@@ -2388,7 +2162,7 @@ aenv snapshot create &lt;sandbox-id&gt; --name my-base
 <p>The resulting snapshot appears in <code>aenv snapshot list</code> and can be started with
 <code>aenv start &lt;snapshot-id-or-name&gt;</code>. See <a href="#snapshots-1">Snapshots</a> for its
 parameters and lifecycle.</p>
-<h3 id="fork"><a class="header" href="#fork">Fork</a></h3>
+<h2 id="fork"><a class="header" href="#fork">Fork</a></h2>
 <p>Forking clones a running sandbox into independent child sandboxes on the same
 node. The source is briefly paused while its state is captured, then returns to
 Running. Children inherit the source filesystem, memory, network policy,
@@ -2417,25 +2191,27 @@ Each entry contains either a <code>sandbox</code> object—including its <code>s
 IDs. A non-201 response means the request failed before any child was attempted.
 See the <a href="#api-reference">API Reference</a> for the complete fork request and
 response schemas.</p>
-<h3 id="manage-sandboxes"><a class="header" href="#manage-sandboxes">Manage Sandboxes</a></h3>
+<h2 id="manage-sandboxes"><a class="header" href="#manage-sandboxes">Manage Sandboxes</a></h2>
 <p>List sandboxes:</p>
-<pre><code class="language-bash">aenv list
+<pre><code class="language-bash">aenv list  # alias: aenv ls
 aenv list --output json
 </code></pre>
-<p><code>--output</code> accepts <code>table</code> or <code>json</code>. It defaults to a table in an interactive
-terminal and JSON when output is piped or redirected.</p>
+<p><code>--output</code> accepts <code>table</code> or <code>json</code>. It
+defaults to a table in an interactive terminal and JSON when output is piped or
+redirected.</p>
 <p>Delete a sandbox:</p>
-<pre><code class="language-bash">aenv delete &lt;sandbox-id&gt;
+<pre><code class="language-bash">aenv delete &lt;sandbox-id&gt;  # alias: aenv rm
 </code></pre>
-<p>Deletion is permanent, but snapshots previously created from the sandbox are
-unaffected.</p>
-<h2 id="auto-eviction"><a class="header" href="#auto-eviction">Auto-Eviction</a></h2>
+<p>Deletion is permanent, but snapshots
+previously created from the sandbox are unaffected.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="auto-eviction"><a class="header" href="#auto-eviction">Auto-Eviction</a></h1>
 <p>Every running sandbox has a time-to-live (TTL). The TTL establishes an
 expiration deadline so a sandbox cannot occupy CPU and memory indefinitely.
 When the TTL is reached,
 AgentENV automatically pauses or deletes the sandbox so those resources can be
 reclaimed.</p>
-<h3 id="behavior-at-expiration"><a class="header" href="#behavior-at-expiration">Behavior at Expiration</a></h3>
+<h2 id="behavior-at-expiration"><a class="header" href="#behavior-at-expiration">Behavior at Expiration</a></h2>
 <p>When a sandbox reaches its TTL, AgentENV performs its configured timeout
 action:</p>
 <ul>
@@ -2468,7 +2244,7 @@ the API with <code>autoPause: false</code>.</p>
   }' \
   http://127.0.0.1:8000/sandboxes-cold
 </code></pre>
-<h3 id="set-or-extend-the-deadline"><a class="header" href="#set-or-extend-the-deadline">Set or Extend the Deadline</a></h3>
+<h2 id="set-or-extend-the-deadline"><a class="header" href="#set-or-extend-the-deadline">Set or Extend the Deadline</a></h2>
 <p><code>aenv start --timeout &lt;seconds&gt;</code> sets the initial TTL. If an automatically
 paused sandbox is needed again, <code>aenv resume --timeout &lt;seconds&gt;</code> resumes it and
 sets a new TTL from the resume time. Both commands default to 300 seconds.</p>
@@ -2492,40 +2268,33 @@ later. Refresh applies only to a running sandbox; resume a paused sandbox
 first. If <code>duration</code> is omitted, the server’s default sandbox timeout is used.</p>
 <p><code>aenv connect</code> resumes a paused sandbox when it connects and ensures that its
 TTL is at least the default 300 seconds.</p>
-<h2 id="networking"><a class="header" href="#networking">Networking</a></h2>
-<p>Each sandbox has an isolated network stack. Networking controls two separate
-boundaries:</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="networking"><a class="header" href="#networking">Networking</a></h1>
+<p>Each sandbox has an isolated network stack. Networking controls two separate boundaries:</p>
 <ul>
 <li><strong>Egress:</strong> which IP addresses, CIDRs, and domains the sandbox can connect to.</li>
-<li><strong>Ingress:</strong> whether services exposed through the AgentENV proxy are public
-or require the sandbox traffic access token.</li>
+<li><strong>Ingress:</strong> whether services exposed through the AgentENV proxy are public or require the sandbox traffic access token.</li>
 </ul>
-<h3 id="what-you-can-configure"><a class="header" href="#what-you-can-configure">What You Can Configure</a></h3>
+<h2 id="what-you-can-configure"><a class="header" href="#what-you-can-configure">What You Can Configure</a></h2>
+<p>Network configuration has two levels. Configure node-level guardrails in the
+AgentENV config file; they apply to every sandbox on that node. Configure
+sandbox-level policy by sending fields in sandbox API requests. Sandbox egress
+policy can be set at creation and replaced later with an update request.</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+<tr><th>Scope</th><th>Field</th><th>Default</th><th>Meaning</th></tr>
 </thead>
 <tbody>
-<tr><td><code>allow_internet_access</code> (warm) / <code>allowInternetAccess</code> (cold)</td><td><code>true</code></td><td>Base egress policy. <code>false</code> rejects destinations not explicitly allowed.</td></tr>
-<tr><td><code>network.allowOut</code></td><td>Empty</td><td>Egress exceptions expressed as IPv4 CIDRs, IPs, or domain patterns.</td></tr>
-<tr><td><code>network.denyOut</code></td><td>Empty</td><td>IPv4 CIDRs or IPs to reject. Domain names are not supported here.</td></tr>
-<tr><td><code>network.allowPublicTraffic</code></td><td><code>true</code></td><td>Per-sandbox creation setting controlling whether proxied services are public. When <code>false</code>, requests require the sandbox’s traffic access token.</td></tr>
+<tr><td>Sandbox</td><td><code>allow_internet_access</code> (warm)<br><code>allowInternetAccess</code> (cold)</td><td><code>true</code></td><td>Base egress policy. <code>false</code> rejects destinations not explicitly allowed.</td></tr>
+<tr><td>Sandbox</td><td><code>network.allowOut</code></td><td>Empty</td><td>Allowed IPv4 CIDRs, IPs, or domain patterns.</td></tr>
+<tr><td>Sandbox</td><td><code>network.denyOut</code></td><td>Empty</td><td>Denied IPv4 CIDRs or IPs. Domains are not supported.</td></tr>
+<tr><td>Sandbox</td><td><code>network.</code><br><code>allowPublicTraffic</code></td><td><code>true</code></td><td>Whether proxied services are public. When <code>false</code>, requests require a traffic access token.</td></tr>
+<tr><td>Node</td><td><code>[network.egress].</code><br><code>always_denied_cidrs</code></td><td>Configured in AgentENV config file</td><td>CIDRs denied before sandbox policy. Sandbox <code>allowOut</code> cannot override them.</td></tr>
 </tbody>
 </table>
 </div>
-<p>Node-wide egress denials are configured separately with
-<code>[network.egress].always_denied_cidrs</code> in your AgentENV config file. This lists
-IP ranges that every sandbox is prohibited from reaching, such as private or
-host-local networks. These rules are applied before per-sandbox rules and
-cannot be overridden by <code>allowOut</code>.</p>
-<pre><code class="language-toml">[network.egress]
-always_denied_cidrs = [
-  "10.0.0.0/8",
-  "169.254.0.0/16",
-]
-</code></pre>
-<h3 id="matching-rules"><a class="header" href="#matching-rules">Matching Rules</a></h3>
+<h2 id="matching-rules"><a class="header" href="#matching-rules">Matching Rules</a></h2>
 <p>Rules are evaluated in this order:</p>
 <pre class="mermaid">flowchart LR
     A[Destination&lt;br/&gt;packet] --&gt; N{Node-level&lt;br/&gt;deny?}
@@ -2547,7 +2316,7 @@ explicit rules.</p>
 names and wildcard forms such as <code>*.example.com</code> are supported. If <code>allowOut</code>
 contains a domain, also set <code>denyOut</code> to <code>["0.0.0.0/0"]</code>; this blocks other
 destinations and leaves the listed domains as the allowed exceptions.</p>
-<h3 id="configure-at-creation"><a class="header" href="#configure-at-creation">Configure at Creation</a></h3>
+<h2 id="configure-at-creation"><a class="header" href="#configure-at-creation">Configure at Creation</a></h2>
 <p>Both warm and cold sandbox creation support network policy.</p>
 <p>Warm start from a template or snapshot:</p>
 <pre><code class="language-bash">curl -X POST \
@@ -2576,7 +2345,7 @@ destinations and leaves the listed domains as the allowed exceptions.</p>
   }' \
   http://127.0.0.1:8000/sandboxes-cold
 </code></pre>
-<h3 id="update-a-running-sandbox"><a class="header" href="#update-a-running-sandbox">Update a Running Sandbox</a></h3>
+<h2 id="update-a-running-sandbox"><a class="header" href="#update-a-running-sandbox">Update a Running Sandbox</a></h2>
 <p>Replace the egress policy of a running sandbox:</p>
 <pre><code class="language-bash">curl -X PUT \
   -H 'X-API-Key: test-key' \
@@ -2591,470 +2360,6 @@ restore the default base policy.</p>
 not actively terminate existing ones. For domain-policy replacement, the old
 policy remains active until the new namespace rules are installed and the new
 proxy policy is activated.</p>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="snapshots-1"><a class="header" href="#snapshots-1">Snapshots</a></h1>
-<p>A snapshot is a reusable checkpoint of a sandbox. It preserves the sandbox’s
-filesystem and runtime state so that you can later start a new sandbox from the
-same point instead of rebuilding the environment and rerunning setup work.</p>
-<ul>
-<li><strong>Templates</strong> are stored as snapshots. A template build commits one snapshot;
-the template ID is an alias that resolves to it.</li>
-<li><strong>Sandboxes</strong> launch by resuming from a snapshot.</li>
-<li><strong>Running sandboxes</strong> can produce new snapshots, capturing their current
-state for later reuse or branching.</li>
-</ul>
-<h2 id="create-a-snapshot-from-a-running-sandbox"><a class="header" href="#create-a-snapshot-from-a-running-sandbox">Create a Snapshot from a Running Sandbox</a></h2>
-<p>Capture the current state of a running sandbox:</p>
-<pre><code class="language-bash">aenv snapshot create &lt;sandbox-id&gt;
-aenv snapshot create &lt;sandbox-id&gt; --name my-checkpoint
-</code></pre>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>&lt;sandbox-id&gt;</code></td><td>Required</td><td>ID of the running sandbox to capture.</td></tr>
-<tr><td><code>--name &lt;name&gt;</code></td><td>None</td><td>Assigns a human-readable alias. If omitted, use the generated snapshot ID returned by the command.</td></tr>
-</tbody>
-</table>
-</div>
-<p>The source sandbox continues running after the snapshot is created. You can
-then pass either the snapshot ID or its alias to <code>aenv start</code>:</p>
-<pre><code class="language-bash">aenv start my-checkpoint
-# Or:
-aenv start &lt;snapshot-id&gt;
-</code></pre>
-<p>This creates a separate sandbox with a new sandbox ID. It inherits the captured
-filesystem, running processes, memory state, environment variables, runtime
-configuration, and resource settings.</p>
-<p>To retrieve information about one snapshot by ID or alias, use the HTTP API:</p>
-<pre><code class="language-bash">curl -H 'X-API-Key: test-key' \
-  http://127.0.0.1:8000/snapshots/&lt;snapshot-id-or-alias&gt;
-</code></pre>
-<h2 id="use-a-snapshot-rootfs-as-an-oci-image"><a class="header" href="#use-a-snapshot-rootfs-as-an-oci-image">Use a Snapshot Rootfs as an OCI Image</a></h2>
-<p>Starting with <code>aenv start &lt;snapshot&gt;</code> restores the complete snapshot state. If
-you only need the captured root filesystem, you can instead publish it as an
-OCI image and cold-start sandboxes from that image.</p>
-<h3 id="publish-an-image-when-creating-a-snapshot"><a class="header" href="#publish-an-image-when-creating-a-snapshot">Publish an Image When Creating a Snapshot</a></h3>
-<p>AgentENV can automatically create and publish an OCI image of the snapshot
-rootfs whenever you create a snapshot. For snapshots backed by OSS and created
-from an OverlayBD-native OCI image, enable automatic publication in your
-AgentENV config file (<code>config/default.toml</code>, or the file selected by
-<code>AENV_CONFIG_PATH</code>):</p>
-<pre><code class="language-toml">[snapshot]
-repository_backend = "oss"
-
-[snapshot.image_publish]
-enabled = true
-</code></pre>
-<p>Create the snapshot:</p>
-<pre><code class="language-bash">aenv snapshot create &lt;sandbox-id&gt; --name my-checkpoint
-</code></pre>
-<p>The command prints the published image reference when publication succeeds.
-Use that reference to cold-start a sandbox:</p>
-<pre><code class="language-bash">aenv start --cold registry.example.com/team/app:agentenv-snapshot-&lt;snapshot-id&gt;
-</code></pre>
-<h3 id="export-an-existing-snapshot-rootfs"><a class="header" href="#export-an-existing-snapshot-rootfs">Export an Existing Snapshot Rootfs</a></h3>
-<p>You can manually export the rootfs of an existing snapshot as an OCI image.
-This is done with <code>aenv-snapshot-image</code>, which is not included in the regular
-AgentENV installation packages and must first be built and installed from the
-repository:</p>
-<pre><code class="language-bash">git clone https://github.com/kvcache-ai/AgentENV.git
-cd AgentENV
-make build-snapshot-image
-sudo install -m 0755 target/debug/aenv-snapshot-image /usr/local/bin/aenv-snapshot-image
-</code></pre>
-<p>Export the rootfs:</p>
-<pre><code class="language-bash">aenv-snapshot-image &lt;snapshot-id-or-alias&gt; \
-  --target-repository registry.example.com/team/app \
-  --tag release-1
-</code></pre>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>&lt;snapshot-id-or-alias&gt;</code></td><td>Required</td><td>Snapshot whose rootfs is exported.</td></tr>
-<tr><td><code>--target-repository &lt;registry/repository&gt;</code></td><td>Inferred from the snapshot</td><td>Destination OCI repository. Specify it when a unique source repository cannot be inferred.</td></tr>
-<tr><td><code>--tag &lt;tag&gt;</code></td><td><code>latest</code> for an explicit destination; otherwise <code>snapshot-&lt;snapshot-id&gt;</code></td><td>Tag for the exported image.</td></tr>
-<tr><td><code>--config &lt;path&gt;</code></td><td><code>AENV_CONFIG_PATH</code>, then the default config path</td><td>AgentENV config used to locate the snapshot repository.</td></tr>
-</tbody>
-</table>
-</div>
-<p>The exported image can be stored in an OCI registry, shared independently of
-the AgentENV snapshot repository, and used to cold-start new sandboxes. The new
-sandbox inherits the exported root filesystem and OCI runtime configuration,
-but not the snapshot’s memory or running-process state.</p>
-<p>You can capture it and start a sandbox from the resulting image:</p>
-<pre><code class="language-bash">aenv-snapshot-image &lt;snapshot-id-or-alias&gt; \
-  --target-repository registry.example.com/team/app \
-  --tag release-1
-
-aenv start --cold &lt;image_ref&gt;
-</code></pre>
-<h2 id="manage-snapshots"><a class="header" href="#manage-snapshots">Manage Snapshots</a></h2>
-<h3 id="list-snapshots"><a class="header" href="#list-snapshots">List Snapshots</a></h3>
-<pre><code class="language-bash">aenv snapshot list
-aenv snapshot list --sandbox-id &lt;sandbox-id&gt;
-</code></pre>
-<p><code>aenv snapshot ls</code> is an alias for <code>aenv snapshot list</code>.</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Option</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>--sandbox-id &lt;sandbox-id&gt;</code></td><td>All snapshots</td><td>Shows only snapshots created from the specified sandbox, including after that sandbox is deleted.</td></tr>
-<tr><td><code>--output &lt;table|json&gt;</code></td><td>Table in an interactive terminal; JSON when redirected</td><td>Selects the output format.</td></tr>
-</tbody>
-</table>
-</div>
-<h3 id="start-a-sandbox-from-a-snapshot"><a class="header" href="#start-a-sandbox-from-a-snapshot">Start a Sandbox from a Snapshot</a></h3>
-<pre><code class="language-bash">aenv start &lt;snapshot-id-or-name&gt;
-</code></pre>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
-</thead>
-<tbody>
-<tr><td><code>&lt;snapshot-id-or-name&gt;</code></td><td>Required</td><td>Snapshot ID or alias to start from.</td></tr>
-<tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Sets the sandbox TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
-<tr><td><code>-d</code>, <code>--detach</code></td><td>Disabled</td><td>Prints the new sandbox ID without attaching an interactive shell.</td></tr>
-</tbody>
-</table>
-</div>
-<p>The CLI always enables secure sandbox authentication and manages the envd
-access token automatically.</p>
-<h3 id="delete-a-snapshot"><a class="header" href="#delete-a-snapshot">Delete a Snapshot</a></h3>
-<p>Snapshots and templates share the same catalog. Delete a snapshot by passing
-its required ID or alias to the template delete command:</p>
-<pre><code class="language-bash">aenv template delete &lt;snapshot-id-or-name&gt;
-</code></pre>
-<h2 id="optional-p2p-visibility"><a class="header" href="#optional-p2p-visibility">Optional P2P Visibility</a></h2>
-<p>P2P visibility lets nodes discover and fetch committed snapshot artifacts from
-peers. The snapshot repository remains the durable source of truth, so P2P is
-an optional distribution path rather than a replacement for snapshot storage.</p>
-<p>Enable both the node-wide P2P transport and snapshot publication in your
-AgentENV config file (<code>config/default.toml</code>, or the file selected by
-<code>AENV_CONFIG_PATH</code>):</p>
-<pre><code class="language-toml">[p2p]
-enabled = true
-
-[snapshot]
-p2p_enabled = true
-</code></pre>
-<p>See the <a href="#p2p">Configuration Reference</a>
-for the optional transport, storage-directory, address, and timeout settings.</p>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="volumes-1"><a class="header" href="#volumes-1">Volumes</a></h1>
-<blockquote>
-<p><strong>Beta:</strong> The volume feature is still in beta. For workloads that can use a
-drive supplied only when cold-starting a sandbox, the <code>attachedDrives</code>
-feature on <code>POST /sandboxes-cold</code> is more extensively tested. See the
-<a href="#api-reference">API reference</a> for the extra-drive request schema.</p>
-</blockquote>
-<p>Volumes are persistent block filesystems managed independently from sandboxes.
-A volume has a stable ID, a unique name, a fixed size, and an access mode. You
-can mount it at an absolute guest path when creating a sandbox, then reuse its
-contents after that sandbox is deleted.</p>
-<p>Deleting a running sandbox freezes its writable volume filesystems, seals and
-publishes their layers, and stops the VM without saving memory or rootfs state.
-This checkpoints the filesystem journal so the next mount avoids journal replay.
-Recoverable capture or publication failures thaw the filesystems and retain the
-running sandbox and its volume reservations. A terminal capture failure stops the
-VM and marks writable volumes <code>failed</code>, preventing mounts of incomplete data.
-Stop or catalog failures retain the deletion state for retry; reservations are
-released only after stop succeeds. Pausing still saves the full sandbox state
-for later resume.</p>
-<p>The default volume size is 65536 MiB (64 GiB). By default, one sandbox may
-mount up to four volumes and each volume may be at most 262144 MiB (256 GiB).
-Administrators can change these limits in the <a href="#volume"><code>[volume]</code> configuration</a>.</p>
-<h2 id="access-modes"><a class="header" href="#access-modes">Access Modes</a></h2>
-<p>A volume’s mode is selected when the volume is created and cannot be changed.</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Mode</th><th>Writable</th><th>Mount concurrency</th><th>Intended use</th></tr>
-</thead>
-<tbody>
-<tr><td><code>exclusive</code></td><td>Yes</td><td>One sandbox</td><td>Per-sandbox workspaces, caches, databases, and mutable state</td></tr>
-<tr><td><code>ro</code></td><td>No</td><td>Multiple sandboxes</td><td>Shared datasets, models, tools, and other immutable inputs</td></tr>
-</tbody>
-</table>
-</div>
-<p>An exclusive volume is reserved by its mounted sandbox. Another sandbox cannot
-mount or delete it until that reservation is released. A read-only volume can
-be mounted by multiple sandboxes at the same time, but guest writes fail.</p>
-<h2 id="recommended-workflow-fork-before-use"><a class="header" href="#recommended-workflow-fork-before-use">Recommended Workflow: Fork Before Use</a></h2>
-<p>Treat a shared volume as an immutable base and create a copy-on-write fork for
-each sandbox that needs to modify it. This gives every sandbox an independent
-exclusive volume without copying all source data eagerly.</p>
-<pre><code class="language-text">read-only base volume
-        |
-        +-- exclusive fork for sandbox A
-        +-- exclusive fork for sandbox B
-</code></pre>
-<p>Forks capture the source volume state at creation time. Later changes to a fork
-do not change the source or another fork. The fork must have the same size as
-its source. An exclusive source must be unmounted before a public fork is
-created; a read-only source may remain shared.</p>
-<h2 id="sandbox-forks-and-snapshots"><a class="header" href="#sandbox-forks-and-snapshots">Sandbox Forks and Snapshots</a></h2>
-<p>AgentENV automatically carries mounted volumes through sandbox fork and
-snapshot operations. You do not need to fork or snapshot each mounted volume
-separately.</p>
-<h3 id="fork-a-sandbox"><a class="header" href="#fork-a-sandbox">Fork a sandbox</a></h3>
-<p>When a sandbox is forked, AgentENV processes every mounted volume for every
-child sandbox:</p>
-<ul>
-<li>Each mounted <code>exclusive</code> volume gets an independent copy-on-write volume
-fork. The child mounts the new volume at the same guest path and can modify
-it without changing the source sandbox’s volume.</li>
-<li>Each mounted <code>ro</code> volume remains mounted from the same read-only volume. It
-is safe to share because neither the source nor a child can modify it.</li>
-</ul>
-<p>This behavior is separate from manually creating a reusable volume fork with
-<code>aenv volume create --from-volume</code>.</p>
-<h3 id="snapshot-a-sandbox"><a class="header" href="#snapshot-a-sandbox">Snapshot a sandbox</a></h3>
-<p>When a sandbox is snapshotted, every mounted volume is included automatically.
-The volume snapshot records its layers, size, mount path, and access mode.
-Starting a sandbox from that snapshot creates new volumes with the captured
-contents and mounts them at the same paths. An exclusive volume remains
-exclusive; a read-only volume remains read-only.</p>
-<p>Volume snapshots are independent from their source volumes. Deleting a source
-volume does not remove volume data already committed into a sandbox snapshot.</p>
-<h2 id="cli-examples"><a class="header" href="#cli-examples">CLI Examples</a></h2>
-<h3 id="create-and-mount-an-empty-volume"><a class="header" href="#create-and-mount-an-empty-volume">Create and mount an empty volume</a></h3>
-<pre><code class="language-bash">aenv volume create workspace --mode exclusive --size-mb 65536
-aenv start ubuntu --volume /workspace=workspace
-</code></pre>
-<p><code>--volume</code> accepts <code>MOUNT_PATH=VOLUME_ID_OR_NAME</code> and can be repeated. Mount
-paths must be absolute, cannot be <code>/</code>, and cannot overlap another mount.</p>
-<pre><code class="language-bash">aenv start ubuntu \
-  --volume /workspace=workspace \
-  --volume /models=models-base
-</code></pre>
-<h3 id="create-a-volume-from-an-oci-image"><a class="header" href="#create-a-volume-from-an-oci-image">Create a volume from an OCI image</a></h3>
-<p>Use <code>--image</code> to initialize a volume with the contents of an OCI image:</p>
-<pre><code class="language-bash">aenv volume create models-base \
-  --mode ro \
-  --image registry.example.com/team/models:latest
-</code></pre>
-<p>For a standard OCI image, AgentENV downloads and converts its layers when the
-volume is created. For an OverlayBD-native image, AgentENV keeps the remote
-layer references and does not download the layer contents during volume
-creation. Blocks are fetched from the OCI registry on demand when the mounted
-volume is read, and then retained in the local remote-block cache.</p>
-<h3 id="create-a-reusable-base-and-fork-it"><a class="header" href="#create-a-reusable-base-and-fork-it">Create a reusable base and fork it</a></h3>
-<p>First populate an exclusive seed volume:</p>
-<pre><code class="language-bash">aenv volume create dataset-seed --mode exclusive
-SANDBOX_ID=$(aenv start ubuntu -d --volume /data=dataset-seed)
-aenv exec "$SANDBOX_ID" sh -lc 'printf "%s\n" training-data &gt; /data/input.txt'
-aenv delete "$SANDBOX_ID"
-</code></pre>
-<p>Create a read-only base from the seed, then create one exclusive fork per
-sandbox:</p>
-<pre><code class="language-bash">aenv volume create dataset-base --mode ro --from-volume dataset-seed
-aenv volume create job-42-data --mode exclusive --from-volume dataset-base
-aenv start ubuntu --volume /data=job-42-data
-</code></pre>
-<p>These commands use the default 64 GiB size for every volume. When the source
-has a custom size, pass the same <code>--size-mb</code> value while creating its fork.</p>
-<h3 id="share-a-read-only-volume"><a class="header" href="#share-a-read-only-volume">Share a read-only volume</a></h3>
-<pre><code class="language-bash">SANDBOX_A=$(aenv start ubuntu -d --volume /models=models-base)
-SANDBOX_B=$(aenv start ubuntu -d --volume /models=models-base)
-</code></pre>
-<p>Both sandboxes can read <code>/models</code>. Neither sandbox can modify it.</p>
-<h3 id="inspect-lifecycle-state"><a class="header" href="#inspect-lifecycle-state">Inspect lifecycle state</a></h3>
-<pre><code class="language-bash">aenv volume list
-aenv volume inspect job-42-data
-aenv volume delete job-42-data
-</code></pre>
-<p>The volume status controls whether it can be mounted:</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Status</th><th>Meaning</th></tr>
-</thead>
-<tbody>
-<tr><td><code>ready</code></td><td>The volume can be mounted.</td></tr>
-<tr><td><code>uploading</code></td><td>Publication is in progress; the volume is temporarily unavailable.</td></tr>
-<tr><td><code>failed</code></td><td>Publication failed; the volume is unavailable until recovered.</td></tr>
-</tbody>
-</table>
-</div>
-<p>Deleting a mounted volume returns a conflict. Delete its sandbox first, then
-delete the volume.</p>
-<h2 id="http-api-examples"><a class="header" href="#http-api-examples">HTTP API Examples</a></h2>
-<p>Set the server URL and API key before running these examples:</p>
-<pre><code class="language-bash">export AENV_URL=http://127.0.0.1:8000
-export AENV_API_KEY=&lt;api-key&gt;
-</code></pre>
-<p>Create a read-only base volume:</p>
-<pre><code class="language-bash">curl -fsS -X POST "$AENV_URL/volumes" \
-  -H "X-API-Key: $AENV_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "dataset-base",
-    "sizeMB": 65536,
-    "mode": "ro",
-    "image": "ghcr.io/example/dataset:latest"
-  }'
-</code></pre>
-<p>Create an exclusive copy-on-write fork:</p>
-<pre><code class="language-bash">curl -fsS -X POST "$AENV_URL/volumes" \
-  -H "X-API-Key: $AENV_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "job-42-data",
-    "sizeMB": 65536,
-    "mode": "exclusive",
-    "fromVolume": "dataset-base"
-  }'
-</code></pre>
-<p>Mount the fork into a sandbox:</p>
-<pre><code class="language-bash">curl -fsS -X POST "$AENV_URL/sandboxes" \
-  -H "X-API-Key: $AENV_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "templateID": "ubuntu",
-    "volumeMounts": [
-      {
-        "name": "job-42-data",
-        "path": "/workspace/data"
-      }
-    ]
-  }'
-</code></pre>
-<p>List and inspect volumes:</p>
-<pre><code class="language-bash">curl -fsS "$AENV_URL/volumes" -H "X-API-Key: $AENV_API_KEY"
-curl -fsS "$AENV_URL/volumes/job-42-data" -H "X-API-Key: $AENV_API_KEY"
-</code></pre>
-<div style="break-before: page; page-break-before: always;"></div>
-<h1 id="custom-extension"><a class="header" href="#custom-extension">Custom Extension</a></h1>
-<p>The custom extension is an optional external HTTP service that AgentENV calls during the sandbox lifecycle. It lets you implement deployment-specific behavior — for example, connecting sandboxes into a VPN, custom firewall rules, or extra mounts — without changing AgentENV itself.</p>
-<p>The extension implements a small set of HTTP endpoints (“hooks”); AgentENV is the client. The interface is defined in <a href="https://github.com/kvcache-ai/AgentENV/blob/main/src/custom_extension_api/openapi.yml"><code>src/custom_extension_api/openapi.yml</code></a>.</p>
-<h2 id="lifecycle-hooks"><a class="header" href="#lifecycle-hooks">Lifecycle hooks</a></h2>
-<p>To support the complete sandbox lifecycle, your extension should implement the
-following four APIs. AgentENV sends a JSON request to
-<code>POST {url}/sandbox-hook/&lt;hook&gt;</code> when the corresponding event occurs. Any connection error, timeout, or non-2xx response fails the corresponding sandbox operation (except <code>stop</code>, which is best-effort).</p>
-<p>See <a href="#minimal-extension-example">Minimal Extension Example</a> for an example
-extension that implements all four hooks.</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Hook</th><th>When</th><th>Request</th><th>Response</th></tr>
-</thead>
-<tbody>
-<tr><td><code>start-fresh</code></td><td>Before a fresh sandbox boots, after its network slot is allocated</td><td><code>sandboxId</code>, <code>sandboxInstanceId</code>, <code>networkNamespacePath</code>, <code>hostInteractionIp</code>, <code>customExtensionParams</code></td><td>optional <code>extraBootArgs</code> appended to the kernel cmdline</td></tr>
-<tr><td><code>start-resume</code></td><td>Before a sandbox resumes from a snapshot (template launch, resume after pause, fork child)</td><td>same as above</td><td>none</td></tr>
-<tr><td><code>patch-params</code></td><td>When a user PATCHes the sandbox’s params</td><td><code>sandboxId</code>, <code>patch</code> (verbatim user body)</td><td>updated <strong>full</strong> <code>customExtensionParams</code></td></tr>
-<tr><td><code>stop</code></td><td>When the sandbox runtime is torn down, before the network slot is released</td><td><code>sandboxId</code>, <code>sandboxInstanceId</code></td><td>none</td></tr>
-</tbody>
-</table>
-</div>
-<p>Notes:</p>
-<ul>
-<li><strong>Instance identity.</strong> A <code>sandboxId</code> is reused across pause/resume cycles. Every <code>start-fresh</code> / <code>start-resume</code> carries a fresh <code>sandboxInstanceId</code> identifying that runtime instance, and the subsequent <code>stop</code> carries the same value. Because <code>stop</code> is best-effort and may be reordered (e.g. a pause’s <code>stop</code> arriving after the resume’s <code>start-resume</code>), treat <code>(sandboxId, sandboxInstanceId)</code> as the identity of a running instance and ignore <code>stop</code> notifications whose <code>sandboxInstanceId</code> is not the latest started instance for that sandbox.</li>
-<li><strong><code>stop</code> also fires on pause.</strong> Pausing persists the sandbox state and then stops the VM process and releases the network namespace; the subsequent resume creates a fresh runtime and fires <code>start-resume</code>. In-place pause+resume during snapshot capture does not fire any hook (and keeps the same <code>sandboxInstanceId</code>).</li>
-<li><code>stop</code> is best-effort: delivery failures are only logged, and it is also fired fire-and-forget if a started sandbox is dropped without an explicit stop.</li>
-<li><code>networkNamespacePath</code> is the host path of the sandbox’s netns file (e.g. <code>/var/run/netns/agentenv-ns-*</code>), so the extension can enter the namespace (e.g. <code>nsenter --net=...</code>) to set up firewall rules or VPN interfaces.</li>
-<li><code>hostInteractionIp</code> is the per-runtime IPv4 address that AgentENV routes to this sandbox. It can change after pause/resume, so extensions must use the value from the current start hook rather than caching an older one.</li>
-<li>Concurrent <code>patch-params</code> calls to the same sandbox are not serialized; if your patch semantics are not commutative, handle concurrency in the extension.</li>
-</ul>
-<h2 id="connect-agentenv-to-an-extension"><a class="header" href="#connect-agentenv-to-an-extension">Connect AgentENV to an Extension</a></h2>
-<p>Connect AgentENV to your extension service by configuring its URL:</p>
-<pre><code class="language-toml"># config/default.toml (or your AENV_CONFIG_PATH)
-[custom_extension]
-url = "http://127.0.0.1:9090"
-# timeout_ms = 5000   # optional, per-call timeout in milliseconds
-</code></pre>
-<p><code>AENV_CUSTOM_EXTENSION_URL</code> works as well. When <code>url</code> is unset, the integration is fully disabled: no hooks are called and <code>customExtensionParams</code> must be empty.</p>
-<h2 id="use-the-extension"><a class="header" href="#use-the-extension">Use the Extension</a></h2>
-<p>Use <code>customExtensionParams</code> to pass extension-specific settings for a sandbox.
-It is an opaque JSON object interpreted only by your extension. An absent value
-and an empty object are equivalent.</p>
-<h3 id="set-at-creation"><a class="header" href="#set-at-creation">Set at Creation</a></h3>
-<p>Both <code>POST /sandboxes</code> and <code>POST /sandboxes-cold</code> accept
-<code>customExtensionParams</code>. For example, create a sandbox from a template with VPN
-settings for the extension:</p>
-<pre><code class="language-bash">curl -X POST http://127.0.0.1:8000/sandboxes \
-  -H 'X-API-Key: test-key' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "templateID": "my-template",
-    "customExtensionParams": {
-      "vpn": { "network": "team-a" }
-    }
-  }'
-</code></pre>
-<p>For a cold-start sandbox, include the same field in the cold-start request:</p>
-<pre><code class="language-bash">curl -X POST http://127.0.0.1:8000/sandboxes-cold \
-  -H 'X-API-Key: test-key' \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "image": "docker.io/library/ubuntu:24.04",
-    "customExtensionParams": {
-      "vpn": { "network": "team-a" }
-    }
-  }'
-</code></pre>
-<h3 id="read"><a class="header" href="#read">Read</a></h3>
-<p>Get the current params. AgentENV returns <code>{}</code> when they are empty:</p>
-<pre><code class="language-bash">curl http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/custom-extension-params \
-  -H 'X-API-Key: test-key'
-</code></pre>
-<h3 id="patch"><a class="header" href="#patch">Patch</a></h3>
-<p>The request body is passed through verbatim to the extension’s <code>patch-params</code> hook; its semantics are defined entirely by the extension. The hook returns the updated full params, which AgentENV stores and returns:</p>
-<pre><code class="language-bash">curl -X PATCH http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/custom-extension-params \
-  -H 'X-API-Key: test-key' \
-  -H 'Content-Type: application/json' \
-  -d '{"vpn": {"network": "team-a", "peers": ["10.8.0.2", "10.8.0.3"]}}'
-</code></pre>
-<h3 id="persistence"><a class="header" href="#persistence">Persistence</a></h3>
-<p>Params survive pause/resume and are stored into snapshots created from the sandbox. When starting from a template, a <code>customExtensionParams</code> provided at creation overrides the one stored in the snapshot; otherwise the snapshot’s value is inherited.</p>
-<hr>
-<h2 id="minimal-extension-example"><a class="header" href="#minimal-extension-example">Minimal extension example</a></h2>
-<pre><code class="language-python">from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
-
-app = FastAPI()
-
-# Latest started runtime instance per sandbox: (sandboxId, sandboxInstanceId)
-# is the identity of a running instance; a stop for a superseded instance
-# (e.g. arriving after a newer start) is ignored.
-latest_instance: dict[str, str] = {}
-
-@app.post("/sandbox-hook/start-fresh")
-async def start_fresh(req: Request):
-    body = await req.json()
-    latest_instance[body["sandboxId"]] = body["sandboxInstanceId"]
-    # e.g. nsenter --net={body["networkNamespacePath"]} wg-quick up ...
-    return {"extraBootArgs": None}
-
-@app.post("/sandbox-hook/start-resume")
-async def start_resume(req: Request):
-    body = await req.json()
-    latest_instance[body["sandboxId"]] = body["sandboxInstanceId"]
-    return {}
-
-@app.post("/sandbox-hook/patch-params")
-async def patch_params(req: Request):
-    body = await req.json()
-    # apply body["patch"] however you like, then return the full new params
-    return {"customExtensionParams": body["patch"]}
-
-@app.post("/sandbox-hook/stop")
-async def stop(req: Request):
-    body = await req.json()
-    if latest_instance.get(body["sandboxId"]) == body["sandboxInstanceId"]:
-        latest_instance.pop(body["sandboxId"], None)
-        # tear down resources for this instance
-    return {}
-</code></pre>
-<p>Any non-2xx response (or timeout) fails the corresponding sandbox operation, except for <code>stop</code>, which is always tolerated.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="proxy"><a class="header" href="#proxy">Proxy</a></h1>
 <p>The reverse proxy lets you reach services running inside a sandbox from outside. It supports HTTP requests, SSE streams, and WebSocket connections.</p>
@@ -3131,6 +2436,684 @@ The configured domain must route to the AgentENV server in single-node mode or
 to the gateway in multi-node mode. Host-based proxy traffic is always treated as
 data-plane traffic; lifecycle and other control-plane APIs should use the base
 API host.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="templates-1"><a class="header" href="#templates-1">Templates</a></h1>
+<p>A template is a reusable starting point for launching sandboxes. Build or
+import it once, then use it to create sandboxes whenever you need the same
+software and configuration.</p>
+<h2 id="lifecycle"><a class="header" href="#lifecycle">Lifecycle</a></h2>
+<pre class="mermaid">flowchart LR
+    image["OCI image"] --&gt;|"aenv pull"| template["Ready template"]
+    dockerfile["Dockerfile"] --&gt;|"aenv build"| template
+    template --&gt;|"aenv start"| sandbox["Running sandbox"]
+</pre>
+
+<h2 id="relationship-to-snapshots"><a class="header" href="#relationship-to-snapshots">Relationship to Snapshots</a></h2>
+<p>Templates are the API and UX layer. Snapshots are the durable runtime layer.</p>
+<ul>
+<li>A template build publishes one committed snapshot.</li>
+<li>A template ID or alias resolves to one committed snapshot.</li>
+<li>A sandbox created from a template resumes from that snapshot.</li>
+</ul>
+<p>If you want the storage and runtime model underneath templates, see
+<a href="#snapshots-1">Snapshots</a>.</p>
+<hr>
+<p>Where to Go Next:</p>
+<ul>
+<li><a href="#create-your-template">Create Your Template</a> — create a template from an OCI image or Dockerfile.</li>
+<li><a href="#manage-templates">Manage Templates</a> — list templates, review build history, resolve aliases, and delete templates.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="create-your-template"><a class="header" href="#create-your-template">Create Your Template</a></h1>
+<p>There are two ways to create a template: <code>aenv pull</code> imports an existing OCI image directly, while <code>aenv build</code> runs a Dockerfile with
+BuildKit.</p>
+<p>Some defaults below come from <code>config/default.toml</code>, or the file selected by
+<code>AENV_CONFIG_PATH</code>.</p>
+<h2 id="aenv-pull"><a class="header" href="#aenv-pull">aenv pull</a></h2>
+<p>Pull an existing OCI image as a template and optionally give it a memorable name:</p>
+<pre><code class="language-bash">aenv pull &lt;image&gt; [options]
+</code></pre>
+<p>Examples:</p>
+<pre><code class="language-bash">aenv pull ubuntu:24.04
+aenv pull ubuntu:24.04 --name my-base
+</code></pre>
+<p><code>--name</code> is optional. Without it, AgentENV uses the image repository name. A
+template name can be used anywhere a template ID is accepted.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;image&gt;</code></td><td>Required</td><td>OCI image reference. Short names such as <code>ubuntu:24.04</code> and full references are supported.</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Image repository name</td><td>Assign a human-readable template name.</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your config file</td><td>Set the template’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set the template’s memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>--start-cmd &lt;cmd&gt;</code></td><td>None</td><td>Run a command before capturing the template snapshot.</td></tr>
+<tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td><code>sleep 20</code> when <code>--start-cmd</code> is set; otherwise none</td><td>Poll a shell command every two seconds until it exits successfully.</td></tr>
+<tr><td><code>--probe &lt;port&gt;</code></td><td>None</td><td>Wait for TCP on <code>localhost:&lt;port&gt;</code>. Cannot be combined with <code>--ready-cmd</code>.</td></tr>
+<tr><td><code>-d, --detach</code></td><td>Off</td><td>Submit the build and return immediately instead of waiting.</td></tr>
+<tr><td><code>--timeout &lt;seconds&gt;</code></td><td>No timeout</td><td>Limit how long the CLI waits for the build. Cannot be combined with <code>--detach</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<p>When using <code>--detach</code>, monitor the build with <code>aenv template watch &lt;template&gt;</code>.</p>
+<h2 id="aenv-build"><a class="header" href="#aenv-build">aenv build</a></h2>
+<p>Build a Dockerfile with BuildKit inside a temporary microVM, then convert the
+result to OverlayBD and capture a template. Docker and a staging registry are
+not required on the CLI machine.</p>
+<pre><code class="language-bash">aenv build &lt;context&gt; --name &lt;name&gt; [options]
+# From the repository root:
+aenv build . -f deploy/docker/Dockerfile.agentenv --name aenv
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;context&gt;</code></td><td>Required</td><td>Local context directory, as with <code>docker build</code>.</td></tr>
+<tr><td><code>-f, --file &lt;path&gt;</code></td><td><code>&lt;context&gt;/Dockerfile</code></td><td>Dockerfile path; explicit relative paths resolve from the current directory.</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>Required</td><td>Assign the template name.</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code> from your config file</td><td>Set the template’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set the template’s memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>--start-cmd &lt;command&gt;</code></td><td>Image <code>ENTRYPOINT</code>/<code>CMD</code></td><td>Override template startup; an empty string disables startup.</td></tr>
+<tr><td><code>--ready-cmd &lt;command&gt;</code></td><td>Image <code>HEALTHCHECK</code>, or the normal startup delay</td><td>Override the command that must succeed before snapshot capture.</td></tr>
+<tr><td><code>--build-arg KEY=VALUE</code></td><td>None</td><td>Build argument; repeatable.</td></tr>
+<tr><td><code>--secret &lt;spec&gt;</code></td><td>None</td><td>Native BuildKit secret mounts; repeatable.</td></tr>
+<tr><td><code>--no-cache</code></td><td>False</td><td>Rebuild without cached instructions. BuildKit also resets cache mounts used by those instructions.</td></tr>
+<tr><td><code>--buildctl &lt;path&gt;</code></td><td><code>aenv-buildctl</code> beside <code>aenv</code></td><td>Local client executable.</td></tr>
+<tr><td><code>--progress &lt;format&gt;</code></td><td><code>auto</code></td><td>Three-stage bar on terminals, plain logs when redirected. <code>plain</code> selects plain logs; <code>tty</code> selects BuildKit’s native display.</td></tr>
+<tr><td><code>--timeout &lt;seconds&gt;</code></td><td>3600</td><td>Builder preparation and Dockerfile build deadline; the CLI allows 10 additional minutes for publication.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="build-context-and-dockerfile"><a class="header" href="#build-context-and-dockerfile">Build Context and Dockerfile</a></h3>
+<p><code>COPY</code> and <code>ADD</code> resolve from the context directory, independently of the
+Dockerfile’s location. Local directories are supported; URL and stdin contexts
+are not supported. BuildKit supports multi-stage builds, <code>.dockerignore</code>, cache
+mounts, and standard Dockerfile syntax. The final Dockerfile stage is always
+published.</p>
+<p>There are no image, stage-selection, SSH, or builder-resource overrides in the
+build CLI. Select base images with <code>FROM</code>, including an <code>ARG</code> used by <code>FROM</code>.</p>
+<h3 id="startup-and-readiness"><a class="header" href="#startup-and-readiness">Startup and Readiness</a></h3>
+<p>By default, image <code>ENTRYPOINT</code> and <code>CMD</code> determine template startup, and a
+Dockerfile <code>HEALTHCHECK</code> supplies the readiness command before snapshot capture.
+Shell health checks honor Dockerfile <code>SHELL</code>, and <code>HEALTHCHECK NONE</code> disables
+the check. Without a health check, startup uses the normal template readiness
+delay.</p>
+<p><code>--start-cmd</code> and <code>--ready-cmd</code> override startup and readiness independently
+without modifying the image configuration. Publishing boots the image and runs
+the selected startup command. An image can therefore compile successfully but
+fail during publication if its entrypoint requires devices that are unavailable
+in the guest. To capture the image without starting its application or running
+its health check, use:</p>
+<pre><code class="language-bash">aenv build &lt;context&gt; --name &lt;name&gt; --start-cmd "" --ready-cmd true
+</code></pre>
+<h3 id="build-capacity"><a class="header" href="#build-capacity">Build Capacity</a></h3>
+<p>Managed builder settings belong to the server configuration:</p>
+<pre><code class="language-toml">[template_build]
+max_concurrent_builds = 4
+builder_image = "docker.io/moby/buildkit:v0.33.0"
+builder_cpu_count = 16
+builder_memory_mb = 32768
+cache_size_mb = 65536
+</code></pre>
+<p>Each node admits at most <code>max_concurrent_builds</code> managed builds, including
+preparation, image publication, and cleanup. When the per-node limit is reached,
+builder preparation returns HTTP 429. Retry the build when capacity is
+available.</p>
+<p><code>cache_size_mb</code> controls the persistent BuildKit cache volume. Its capacity is
+set when the cache is created, so changing the setting does not resize an
+existing cache. It must be at least 1024 MiB and cannot exceed
+<code>volume.max_size_mb</code>. A Dockerfile build is rejected if the configured cache
+capacity exceeds that volume limit; setting a smaller volume limit does not
+prevent the server from starting or serving other APIs. Builder CPU, memory,
+and cache capacity are independent of the CPU and memory assigned to the
+resulting template.</p>
+<h3 id="monitor-a-build"><a class="header" href="#monitor-a-build">Monitor a Build</a></h3>
+<p><code>aenv build</code> remains connected, streams progress, and exits nonzero on failure.
+Once BuildKit succeeds, AgentENV continues importing and publishing the template
+even if the CLI is interrupted. Check its status by template name or ID:</p>
+<pre><code class="language-bash">aenv template watch my-template
+</code></pre>
+<p><code>aenv template watch</code> has no timeout option. Stop the local watch with <code>Ctrl-C</code>;
+the remote build continues. It reports the following statuses:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>waiting</code></td><td>The build has been submitted and is waiting to start.</td></tr>
+<tr><td><code>building</code></td><td>The template is currently being built or published.</td></tr>
+<tr><td><code>ready</code></td><td>The build succeeded and the template can start sandboxes.</td></tr>
+<tr><td><code>error</code></td><td>The build failed. <code>aenv template watch</code> reports the failure reason when available.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="runtime-configuration"><a class="header" href="#runtime-configuration">Runtime Configuration</a></h2>
+<p>Image configuration affects every sandbox created from the template. <code>aenv pull</code>
+retains the source image configuration, while <code>aenv build</code> produces it from the
+final Dockerfile stage. The table below distinguishes fields that affect the
+sandbox runtime automatically from fields that require explicit CLI options.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Image config field</th><th>Dockerfile instruction</th><th>Runtime effect</th></tr>
+</thead>
+<tbody>
+<tr><td><code>Env</code></td><td><code>ENV</code></td><td>Environment variables available to sandbox processes.</td></tr>
+<tr><td><code>WorkingDir</code></td><td><code>WORKDIR</code></td><td>Default working directory.</td></tr>
+<tr><td><code>User</code></td><td><code>USER</code></td><td>Default user.</td></tr>
+<tr><td><code>Entrypoint</code> / <code>Cmd</code></td><td><code>ENTRYPOINT</code> / <code>CMD</code></td><td>Determines startup for <code>aenv build</code>; <code>aenv pull</code> requires <code>--start-cmd</code> to configure startup explicitly.</td></tr>
+<tr><td><code>Healthcheck</code></td><td><code>HEALTHCHECK</code></td><td>Determines readiness for <code>aenv build</code>; <code>--ready-cmd</code> overrides it.</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>EXPOSE</code>, <code>VOLUME</code>, and <code>LABEL</code> are retained as image metadata but do not create
+ports, mount volumes, or otherwise configure the sandbox runtime.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="manage-templates"><a class="header" href="#manage-templates">Manage Templates</a></h1>
+<p>This page provides the basic commands for managing a template.</p>
+<h2 id="list-templates"><a class="header" href="#list-templates">List templates</a></h2>
+<pre><code class="language-bash">aenv template list        # alias: aenv template ls
+aenv template list --output json
+</code></pre>
+<p>Displays all templates with their ID, name, build status, CPU, memory, disk
+size, and last-updated timestamp. <code>--output</code> accepts <code>table</code> or <code>json</code>. It
+defaults to <code>table</code> in an interactive terminal and <code>json</code> when output is piped
+or redirected.</p>
+<h2 id="list-template-builds"><a class="header" href="#list-template-builds">List template builds</a></h2>
+<p>List the complete build history for one template:</p>
+<pre><code class="language-bash">curl -H 'X-API-Key: test-key' \
+  http://127.0.0.1:8000/templates/&lt;template-id&gt;
+</code></pre>
+<h2 id="check-a-template-alias"><a class="header" href="#check-a-template-alias">Check a template alias</a></h2>
+<p>Check whether an alias exists and resolve it to a template ID:</p>
+<pre><code class="language-bash">curl -H 'X-API-Key: test-key' \
+  http://127.0.0.1:8000/templates/aliases/&lt;alias&gt;
+</code></pre>
+<h2 id="delete-a-template"><a class="header" href="#delete-a-template">Delete a template</a></h2>
+<pre><code class="language-bash">aenv template delete &lt;template-id-or-name&gt;   # alias: aenv template rm
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="snapshots-1"><a class="header" href="#snapshots-1">Snapshots</a></h1>
+<p>A snapshot is a reusable checkpoint of a sandbox. It preserves the sandbox’s
+filesystem and runtime state so that you can later start a new sandbox from the
+same point instead of rebuilding the environment and rerunning setup work.</p>
+<ul>
+<li><strong>Templates</strong> are stored as snapshots. A template build commits one snapshot;
+the template ID is an alias that resolves to it.</li>
+<li><strong>Warm-started sandboxes</strong> restore the state of a committed template or snapshot.</li>
+<li><strong>Running sandboxes</strong> can produce new snapshots, capturing their current
+state for later reuse or branching.</li>
+</ul>
+<h2 id="what-a-snapshot-preserves"><a class="header" href="#what-a-snapshot-preserves">What a Snapshot Preserves</a></h2>
+<p>A snapshot preserves:</p>
+<ul>
+<li>VM state and memory, allowing running processes to continue from the captured point.</li>
+<li>The root filesystem and its changes.</li>
+<li>Attached-drive contents and attachment metadata.</li>
+<li>Mounted-volume contents, mount paths, sizes, and access modes. Starting from
+the snapshot creates new volumes from the captured contents rather than
+reusing the source volume identities.</li>
+<li>CPU, memory, and disk settings, together with command context such as
+environment variables, working directory, user, and startup commands.</li>
+</ul>
+<hr>
+<p>Where to Go Next:</p>
+<ul>
+<li><a href="#create-a-snapshot-from-a-running-sandbox">Create a Snapshot</a> — capture a reusable checkpoint from a running sandbox.</li>
+<li><a href="#manage-snapshots">Manage Snapshots</a> — list, inspect, and delete snapshots.</li>
+<li><a href="#use-a-snapshot-rootfs-as-an-oci-image">Rootfs as an OCI Image</a> — publish or export only the captured root filesystem.</li>
+<li><a href="#optional-p2p-visibility">Optional P2P Visibility</a> — accelerate committed snapshot artifact distribution between nodes.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="create-a-snapshot-from-a-running-sandbox"><a class="header" href="#create-a-snapshot-from-a-running-sandbox">Create a Snapshot from a Running Sandbox</a></h1>
+<p>Capture the current state of a running sandbox:</p>
+<pre><code class="language-bash">aenv snapshot create &lt;sandbox-id&gt;
+aenv snapshot create &lt;sandbox-id&gt; --name my-checkpoint
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;sandbox-id&gt;</code></td><td>Required</td><td>ID of the running sandbox to capture.</td></tr>
+<tr><td><code>--name &lt;name&gt;</code></td><td>None</td><td>Assigns a human-readable alias. If omitted, use the generated snapshot ID returned by the command.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The source sandbox continues running after the snapshot is created. Continue
+with <a href="#use-a-snapshot-rootfs-as-an-oci-image">Use a Snapshot</a> to restore it or publish its rootfs as an OCI
+image.</p>
+<p>You can then pass either the snapshot ID or its alias to <code>aenv start</code>:</p>
+<pre><code class="language-bash">aenv start my-checkpoint
+# Or:
+aenv start &lt;snapshot-id&gt;
+</code></pre>
+<p>This creates a separate sandbox with a new sandbox ID. It inherits the captured
+filesystem, running processes, memory state, environment variables, runtime
+configuration, and resource settings.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="manage-snapshots"><a class="header" href="#manage-snapshots">Manage Snapshots</a></h1>
+<p>This page provides the basic commands for managing a snapshot.</p>
+<h2 id="get-a-snapshot"><a class="header" href="#get-a-snapshot">Get a Snapshot</a></h2>
+<p>Retrieve information about one snapshot by ID or alias with the HTTP API:</p>
+<pre><code class="language-bash">curl -H 'X-API-Key: test-key' \
+  http://127.0.0.1:8000/snapshots/&lt;snapshot-id-or-alias&gt;
+</code></pre>
+<h2 id="list-snapshots"><a class="header" href="#list-snapshots">List Snapshots</a></h2>
+<pre><code class="language-bash">aenv snapshot list
+aenv snapshot list --sandbox-id &lt;sandbox-id&gt;
+</code></pre>
+<p><code>aenv snapshot ls</code> is an alias for <code>aenv snapshot list</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--sandbox-id &lt;sandbox-id&gt;</code></td><td>All snapshots</td><td>Shows only snapshots created from the specified sandbox, including after that sandbox is deleted.</td></tr>
+<tr><td><code>--output &lt;table|json&gt;</code></td><td>Table in an interactive terminal; JSON when redirected</td><td>Selects the output format.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="delete-a-snapshot"><a class="header" href="#delete-a-snapshot">Delete a Snapshot</a></h2>
+<p>Snapshots and templates share the same catalog. Delete a snapshot by passing
+its required ID or alias to the template delete command:</p>
+<pre><code class="language-bash">aenv template delete &lt;snapshot-id-or-name&gt;
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="use-a-snapshot-rootfs-as-an-oci-image"><a class="header" href="#use-a-snapshot-rootfs-as-an-oci-image">Use a Snapshot Rootfs as an OCI Image</a></h1>
+<p>Capturing a snapshot and starting it with <code>aenv start &lt;snapshot&gt;</code> restores the complete snapshot state. If
+you only need the captured root filesystem, you can instead publish it as an
+OCI image and cold-start sandboxes from that image.</p>
+<h2 id="publish-an-image-when-creating-a-snapshot"><a class="header" href="#publish-an-image-when-creating-a-snapshot">Publish an Image When Creating a Snapshot</a></h2>
+<p>AgentENV can automatically create and publish an OCI image of the snapshot
+rootfs whenever you create a snapshot. For snapshots backed by OSS and created
+from an OverlayBD-native OCI image, enable automatic publication in your
+AgentENV config file (<code>config/default.toml</code>, or the file selected by
+<code>AENV_CONFIG_PATH</code>):</p>
+<pre><code class="language-toml">[snapshot]
+repository_backend = "oss"
+
+[snapshot.image_publish]
+enabled = true
+</code></pre>
+<p>Create the snapshot:</p>
+<pre><code class="language-bash">aenv snapshot create &lt;sandbox-id&gt; --name my-checkpoint
+</code></pre>
+<p>The command prints the published image reference when publication succeeds.
+Use that reference to cold-start a sandbox:</p>
+<pre><code class="language-bash">aenv start --cold registry.example.com/team/app:agentenv-snapshot-&lt;snapshot-id&gt;
+</code></pre>
+<h2 id="export-an-existing-snapshot-rootfs"><a class="header" href="#export-an-existing-snapshot-rootfs">Export an Existing Snapshot Rootfs</a></h2>
+<p>You can manually export the rootfs of an existing snapshot as an OCI image.
+This is done with <code>aenv-snapshot-image</code>, which is not included in the regular
+AgentENV installation packages and must first be built and installed from the
+repository:</p>
+<pre><code class="language-bash">git clone https://github.com/kvcache-ai/AgentENV.git
+cd AgentENV
+make build-snapshot-image
+sudo install -m 0755 target/debug/aenv-snapshot-image /usr/local/bin/aenv-snapshot-image
+</code></pre>
+<p>Export the rootfs:</p>
+<pre><code class="language-bash">aenv-snapshot-image &lt;snapshot-id-or-alias&gt; \
+  --target-repository registry.example.com/team/app \
+  --tag release-1
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;snapshot-id-or-alias&gt;</code></td><td>Required</td><td>Snapshot whose rootfs is exported.</td></tr>
+<tr><td><code>--target-repository &lt;registry/repository&gt;</code></td><td>Inferred from the snapshot</td><td>Destination OCI repository. Specify it when a unique source repository cannot be inferred.</td></tr>
+<tr><td><code>--tag &lt;tag&gt;</code></td><td><code>latest</code> for an explicit destination; otherwise <code>snapshot-&lt;snapshot-id&gt;</code></td><td>Tag for the exported image.</td></tr>
+<tr><td><code>--config &lt;path&gt;</code></td><td><code>AENV_CONFIG_PATH</code>, then the default config path</td><td>AgentENV config used to locate the snapshot repository.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The exported image can be stored in an OCI registry, shared independently of
+the AgentENV snapshot repository, and used to cold-start new sandboxes. The new
+sandbox inherits the exported root filesystem and OCI runtime configuration,
+but not the snapshot’s memory or running-process state.</p>
+<p>You can capture it and start a sandbox from the resulting image:</p>
+<pre><code class="language-bash">aenv-snapshot-image &lt;snapshot-id-or-alias&gt; \
+  --target-repository registry.example.com/team/app \
+  --tag release-1
+
+aenv start --cold &lt;image_ref&gt;
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="optional-p2p-visibility"><a class="header" href="#optional-p2p-visibility">Optional P2P Visibility</a></h1>
+<p>P2P visibility lets nodes discover and fetch committed snapshot artifacts from
+peers. The snapshot repository remains the durable source of truth, so P2P is
+an optional distribution path rather than a replacement for snapshot storage.</p>
+<p>Enable both the node-wide P2P transport and snapshot publication in your
+AgentENV config file (<code>config/default.toml</code>, or the file selected by
+<code>AENV_CONFIG_PATH</code>):</p>
+<pre><code class="language-toml">[p2p]
+enabled = true
+
+[snapshot]
+p2p_enabled = true
+</code></pre>
+<p>See the <a href="#p2p">Configuration Reference</a>
+for the optional transport, storage-directory, address, and timeout settings.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="volumes-1"><a class="header" href="#volumes-1">Volumes</a></h1>
+<blockquote>
+<p><strong>Beta:</strong> The volume feature is still in beta. For workloads that can use a
+drive supplied only when cold-starting a sandbox, the <code>attachedDrives</code>
+feature on <code>POST /sandboxes-cold</code> is more extensively tested. See the
+<a href="#api-reference">API reference</a> for the extra-drive request schema.</p>
+</blockquote>
+<p>Volumes are persistent block filesystems managed independently from sandboxes.
+A volume has a stable ID, a unique name, a fixed size, and an access mode. You can
+mount it at an absolute guest path when creating a sandbox.</p>
+<p>Deleting a sandbox does not delete its volumes. Before stopping a running
+sandbox, AgentENV commits the latest writes from its writable volumes so they
+can be mounted by another sandbox later. If this commit cannot be completed
+safely, AgentENV prevents the incomplete volume data from being mounted.</p>
+<p>Pausing is different: it preserves the complete sandbox state, including its
+memory and root filesystem, for a later resume.</p>
+<p>The default volume size is 65536 MiB (64 GiB). By default, one sandbox may
+mount up to four volumes and each volume may be at most 262144 MiB (256 GiB).
+Administrators can change these limits in the <a href="#volume"><code>[volume]</code> configuration</a>.</p>
+<hr>
+<p>Where to Go Next:</p>
+<ul>
+<li><a href="#create-and-mount-volumes">Create and Mount Volumes</a> — create empty, forked, or image-backed volumes and mount them in sandboxes.</li>
+<li><a href="#manage-volumes">Manage Volumes</a> — list, inspect, and delete volumes.</li>
+<li><a href="#volumes-in-sandbox-forks-and-snapshots">Sandbox Forks and Snapshots</a> — understand how mounted volumes behave during sandbox fork and snapshot operations.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="create-and-mount-volumes"><a class="header" href="#create-and-mount-volumes">Create and Mount Volumes</a></h1>
+<h2 id="create-a-volume"><a class="header" href="#create-a-volume">Create a Volume</a></h2>
+<p><code>aenv volume create</code> creates an empty volume, a copy-on-write fork of an
+existing volume, or a volume initialized from an OCI image.</p>
+<p>Usage:</p>
+<pre><code class="language-bash">aenv volume create &lt;name&gt; [options]
+</code></pre>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>&lt;name&gt;</code></td><td>Required</td><td>Unique name for the new volume.</td></tr>
+<tr><td><code>--size-mb &lt;MiB&gt;</code></td><td><code>65536</code></td><td>Volume size in MiB. The value must be greater than zero.</td></tr>
+<tr><td><code>--mode &lt;exclusive|ro&gt;</code></td><td><code>exclusive</code></td><td>Access mode for the new volume.</td></tr>
+<tr><td><code>--from-volume &lt;volume&gt;</code></td><td>None</td><td>Create a copy-on-write fork from an existing volume ID or name. Conflicts with <code>--image</code>.</td></tr>
+<tr><td><code>--image &lt;image&gt;</code></td><td>None</td><td>Initialize the volume from an OCI image. Conflicts with <code>--from-volume</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="access-modes"><a class="header" href="#access-modes">Access Modes</a></h3>
+<p>A volume’s mode is selected when the volume is created and cannot be changed.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Mode</th><th>Writable</th><th>Mount concurrency</th><th>Intended use</th></tr>
+</thead>
+<tbody>
+<tr><td><code>exclusive</code></td><td>Yes</td><td>One sandbox</td><td>Per-sandbox workspaces, caches, databases, and mutable state</td></tr>
+<tr><td><code>ro</code></td><td>No</td><td>Multiple sandboxes</td><td>Shared datasets, models, tools, and other immutable inputs</td></tr>
+</tbody>
+</table>
+</div>
+<p>An exclusive volume is reserved by its mounted sandbox. Another sandbox cannot
+mount or delete it until that reservation is released. A read-only volume can
+be mounted by multiple sandboxes at the same time, but guest writes fail.</p>
+<h3 id="create-an-empty-volume"><a class="header" href="#create-an-empty-volume">Create an Empty Volume</a></h3>
+<p>Create an empty volume by omitting both <code>--from-volume</code> and <code>--image</code>:</p>
+<pre><code class="language-bash">aenv volume create workspace --size-mb 65536 --mode exclusive
+</code></pre>
+<p>Both options in this example use their default values, so
+<code>aenv volume create workspace</code> creates the same volume.</p>
+<h3 id="fork-an-existing-volume"><a class="header" href="#fork-an-existing-volume">Fork an Existing Volume</a></h3>
+<p>Use <code>--from-volume</code> to create a copy-on-write fork from an existing volume ID
+or name:</p>
+<pre><code class="language-bash">aenv volume create job-data --mode exclusive --from-volume dataset-base
+</code></pre>
+<p>The fork captures the source volume’s state at creation time. Later changes to
+the fork do not change the source or another fork. It must have the same size
+as its source; if the source has a custom size, pass that size with
+<code>--size-mb</code>. An exclusive source must be unmounted before a fork is created,
+while a read-only source may remain mounted.</p>
+<blockquote>
+<p><strong>Recommended workflow: fork before use</strong></p>
+<p>Treat a shared volume as an immutable, read-only base and create one
+exclusive fork for each sandbox that needs to modify it. This gives every
+sandbox an independent writable volume without copying all source data
+eagerly.</p>
+<pre><code class="language-bash">aenv volume create job-a-data --mode exclusive --from-volume dataset-base
+aenv volume create job-b-data --mode exclusive --from-volume dataset-base
+</code></pre>
+<p>This is an explicit volume operation. Mounting a volume does not change its
+mode or automatically fork it.</p>
+</blockquote>
+<h3 id="create-a-volume-from-an-oci-image"><a class="header" href="#create-a-volume-from-an-oci-image">Create a Volume from an OCI Image</a></h3>
+<p>Use <code>--image</code> to initialize a volume with the contents of an OCI image:</p>
+<pre><code class="language-bash">aenv volume create models-base \
+  --mode ro \
+  --image registry.example.com/team/models:latest
+</code></pre>
+<p>For a standard OCI image, AgentENV downloads and converts its
+layers when the volume is created. For an OverlayBD-native
+image, AgentENV keeps the remote layer references and does not
+download the layer contents during volume creation. Blocks are
+fetched from the OCI registry on demand when the mounted volume
+is read, and then retained in the local remote-block cache.</p>
+<h2 id="mount-volumes-when-starting-a-sandbox"><a class="header" href="#mount-volumes-when-starting-a-sandbox">Mount Volumes when Starting a Sandbox</a></h2>
+<p>Use <code>aenv start --volume MOUNT_PATH=VOLUME_ID_OR_NAME</code> to mount a volume while
+creating a sandbox. The option works for both warm and cold starts and can be
+repeated:</p>
+<pre><code class="language-bash">aenv start ubuntu \
+  --volume /workspace=workspace \
+  --volume /models=models-base
+</code></pre>
+<p>Mount paths must be absolute guest paths other than <code>/</code>, and cannot overlap another mount.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="manage-volumes"><a class="header" href="#manage-volumes">Manage Volumes</a></h1>
+<p>This page provides the basic commands for managing a volume.</p>
+<h2 id="list-volumes"><a class="header" href="#list-volumes">List Volumes</a></h2>
+<p><code>aenv volume list</code> lists all volumes.</p>
+<pre><code class="language-bash">aenv volume list  # Alias: aenv volume ls
+</code></pre>
+<p><code>--output</code> accepts <code>table</code> or <code>json</code>. It defaults to <code>table</code> in an interactive
+terminal and <code>json</code> when output is piped or redirected.</p>
+<h2 id="inspect-a-volume"><a class="header" href="#inspect-a-volume">Inspect a Volume</a></h2>
+<p><code>aenv volume inspect &lt;volume&gt;</code> prints the complete record for a volume ID or
+name as formatted JSON.</p>
+<p>The volume status controls whether it can be mounted:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Status</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ready</code></td><td>The volume can be mounted.</td></tr>
+<tr><td><code>uploading</code></td><td>Publication is in progress; the volume is temporarily unavailable.</td></tr>
+<tr><td><code>failed</code></td><td>Publication failed; the volume is unavailable until recovered.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="delete-a-volume"><a class="header" href="#delete-a-volume">Delete a Volume</a></h2>
+<p><code>aenv volume delete &lt;volume&gt;</code> deletes a volume by ID or name.</p>
+<p>A mounted volume cannot be deleted. Delete its sandbox first, then delete the
+volume.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="volumes-in-sandbox-forks-and-snapshots"><a class="header" href="#volumes-in-sandbox-forks-and-snapshots">Volumes in Sandbox Forks and Snapshots</a></h1>
+<p>AgentENV automatically carries mounted volumes through sandbox fork and
+snapshot operations. You do not need to fork or snapshot each mounted volume
+separately.</p>
+<h2 id="fork-a-sandbox"><a class="header" href="#fork-a-sandbox">Fork a Sandbox</a></h2>
+<p>When a sandbox is forked, AgentENV processes every mounted volume for every
+child sandbox:</p>
+<ul>
+<li>Each mounted <code>exclusive</code> volume gets an independent copy-on-write volume
+fork. The child mounts the new volume at the same guest path and can modify
+it without changing the source sandbox’s volume.</li>
+<li>Each mounted <code>ro</code> volume remains mounted from the same read-only volume. It
+is safe to share because neither the source nor a child can modify it.</li>
+</ul>
+<p>This behavior is separate from manually creating a reusable volume fork with
+<code>aenv volume create --from-volume</code>.</p>
+<h2 id="snapshot-a-sandbox"><a class="header" href="#snapshot-a-sandbox">Snapshot a Sandbox</a></h2>
+<p>When a sandbox is snapshotted, every mounted volume is included automatically.
+The volume snapshot records its layers, size, mount path, and access mode.
+Starting a sandbox from that snapshot creates new volumes with the captured
+contents and mounts them at the same paths. An exclusive volume remains
+exclusive; a read-only volume remains read-only.</p>
+<p>Volume snapshots are independent from their source volumes. Deleting a source
+volume does not remove volume data already committed into a sandbox snapshot.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="custom-extension"><a class="header" href="#custom-extension">Custom Extension</a></h1>
+<p>The custom extension is an optional external HTTP service that AgentENV calls
+during the sandbox lifecycle. It lets you implement deployment-specific
+behavior—such as connecting sandboxes to a VPN, applying custom firewall rules,
+or adding mounts—without changing AgentENV itself.</p>
+<p>The extension implements a small set of HTTP endpoints called hooks, and
+AgentENV acts as the client. The interface is defined in
+<a href="https://github.com/kvcache-ai/AgentENV/blob/main/src/custom_extension_api/openapi.yml"><code>src/custom_extension_api/openapi.yml</code></a>.</p>
+<hr>
+<p>Where to Go Next:</p>
+<ul>
+<li><a href="#lifecycle-hooks">Lifecycle Hooks</a> — implement the four lifecycle endpoints.</li>
+<li><a href="#use-the-extension">Use the Extension</a> — configure AgentENV and manage extension-specific Sandbox parameters.</li>
+</ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="lifecycle-hooks"><a class="header" href="#lifecycle-hooks">Lifecycle Hooks</a></h1>
+<p>To support the complete sandbox lifecycle, your extension should implement the
+following four APIs. AgentENV sends a JSON request to
+<code>POST {url}/sandbox-hook/&lt;hook&gt;</code> when the corresponding event occurs. Any connection error, timeout, or non-2xx response fails the corresponding sandbox operation (except <code>stop</code>, which is best-effort).</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Hook</th><th>When</th><th>Request</th><th>Response</th></tr>
+</thead>
+<tbody>
+<tr><td><code>start-fresh</code></td><td>Before a fresh sandbox boots, after its network slot is allocated</td><td><code>sandboxId</code>, <code>sandboxInstanceId</code>, <code>networkNamespacePath</code>, <code>hostInteractionIp</code>, <code>customExtensionParams</code></td><td>optional <code>extraBootArgs</code> appended to the kernel cmdline</td></tr>
+<tr><td><code>start-resume</code></td><td>Before a sandbox resumes from a snapshot (template launch, resume after pause, fork child)</td><td>same as above</td><td>none</td></tr>
+<tr><td><code>patch-params</code></td><td>When a user PATCHes the sandbox’s params</td><td><code>sandboxId</code>, <code>patch</code> (verbatim user body)</td><td>updated <strong>full</strong> <code>customExtensionParams</code></td></tr>
+<tr><td><code>stop</code></td><td>When the sandbox runtime is torn down, before the network slot is released</td><td><code>sandboxId</code>, <code>sandboxInstanceId</code></td><td>none</td></tr>
+</tbody>
+</table>
+</div>
+<p>Notes:</p>
+<ul>
+<li><strong>Instance identity.</strong> A <code>sandboxId</code> is reused across pause/resume cycles. Every <code>start-fresh</code> / <code>start-resume</code> carries a fresh <code>sandboxInstanceId</code> identifying that runtime instance, and the subsequent <code>stop</code> carries the same value. Because <code>stop</code> is best-effort and may be reordered (e.g. a pause’s <code>stop</code> arriving after the resume’s <code>start-resume</code>), treat <code>(sandboxId, sandboxInstanceId)</code> as the identity of a running instance and ignore <code>stop</code> notifications whose <code>sandboxInstanceId</code> is not the latest started instance for that sandbox.</li>
+<li><strong><code>stop</code> also fires on pause.</strong> Pausing persists the sandbox state and then stops the VM process and releases the network namespace; the subsequent resume creates a fresh runtime and fires <code>start-resume</code>. In-place pause+resume during snapshot capture does not fire any hook (and keeps the same <code>sandboxInstanceId</code>).</li>
+<li><code>stop</code> is best-effort: delivery failures are only logged, and it is also fired fire-and-forget if a started sandbox is dropped without an explicit stop.</li>
+<li><code>networkNamespacePath</code> is the host path of the sandbox’s netns file (e.g. <code>/var/run/netns/agentenv-ns-*</code>), so the extension can enter the namespace (e.g. <code>nsenter --net=...</code>) to set up firewall rules or VPN interfaces.</li>
+<li><code>hostInteractionIp</code> is the per-runtime IPv4 address that AgentENV routes to this sandbox. It can change after pause/resume, so extensions must use the value from the current start hook rather than caching an older one.</li>
+<li>Concurrent <code>patch-params</code> calls to the same sandbox are not serialized; if your patch semantics are not commutative, handle concurrency in the extension.</li>
+</ul>
+<h2 id="minimal-extension-example"><a class="header" href="#minimal-extension-example">Minimal Extension Example</a></h2>
+<pre><code class="language-python">from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+app = FastAPI()
+
+# Latest started runtime instance per sandbox: (sandboxId, sandboxInstanceId)
+# is the identity of a running instance; a stop for a superseded instance
+# (e.g. arriving after a newer start) is ignored.
+latest_instance: dict[str, str] = {}
+
+@app.post("/sandbox-hook/start-fresh")
+async def start_fresh(req: Request):
+    body = await req.json()
+    latest_instance[body["sandboxId"]] = body["sandboxInstanceId"]
+    # e.g. nsenter --net={body["networkNamespacePath"]} wg-quick up ...
+    return {"extraBootArgs": None}
+
+@app.post("/sandbox-hook/start-resume")
+async def start_resume(req: Request):
+    body = await req.json()
+    latest_instance[body["sandboxId"]] = body["sandboxInstanceId"]
+    return {}
+
+@app.post("/sandbox-hook/patch-params")
+async def patch_params(req: Request):
+    body = await req.json()
+    # apply body["patch"] however you like, then return the full new params
+    return {"customExtensionParams": body["patch"]}
+
+@app.post("/sandbox-hook/stop")
+async def stop(req: Request):
+    body = await req.json()
+    if latest_instance.get(body["sandboxId"]) == body["sandboxInstanceId"]:
+        latest_instance.pop(body["sandboxId"], None)
+        # tear down resources for this instance
+    return {}
+</code></pre>
+<p>Any non-2xx response or timeout fails the corresponding sandbox operation,
+except for <code>stop</code>, which is always tolerated.</p>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="use-the-extension"><a class="header" href="#use-the-extension">Use the Extension</a></h1>
+<p>This page shows how to connect the AgenENV server to the extension and use it.</p>
+<h2 id="connect-agentenv-to-the-extension"><a class="header" href="#connect-agentenv-to-the-extension">Connect AgentENV to the Extension</a></h2>
+<p>Connect AgentENV to your extension service by configuring its URL:</p>
+<pre><code class="language-toml"> config/default.toml (or your AENV_CONFIG_PATH)
+[custom_extension]
+url = "http://127.0.0.1:9090"
+ timeout_ms = 5000   # optional, per-call timeout in milliseconds
+</code></pre>
+<p><code>AENV_CUSTOM_EXTENSION_URL</code> works as well. When <code>url</code> is unset, the integration is fully disabled: no hooks are called and <code>customExtensionParams</code> must be empty.</p>
+<h2 id="use-the-extension-1"><a class="header" href="#use-the-extension-1">Use the Extension</a></h2>
+<p>Use <code>customExtensionParams</code> to pass extension-specific settings for a sandbox.
+It is an opaque JSON object interpreted only by your extension. An absent value
+and an empty object are equivalent.</p>
+<h3 id="set-at-creation"><a class="header" href="#set-at-creation">Set at Creation</a></h3>
+<p>Both <code>POST /sandboxes</code> and <code>POST /sandboxes-cold</code> accept
+<code>customExtensionParams</code>. For example, create a sandbox from a template with VPN
+settings for the extension:</p>
+<pre><code class="language-bash">curl -X POST http://127.0.0.1:8000/sandboxes \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "templateID": "my-template",
+    "customExtensionParams": {
+      "vpn": { "network": "team-a" }
+    }
+  }'
+</code></pre>
+<p>For a cold-start sandbox, include the same field in the cold-start request:</p>
+<pre><code class="language-bash">curl -X POST http://127.0.0.1:8000/sandboxes-cold \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "image": "docker.io/library/ubuntu:24.04",
+    "customExtensionParams": {
+      "vpn": { "network": "team-a" }
+    }
+  }'
+</code></pre>
+<h3 id="read"><a class="header" href="#read">Read</a></h3>
+<p>Get the current params. AgentENV returns <code>{}</code> when they are empty:</p>
+<pre><code class="language-bash">curl http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/custom-extension-params \
+  -H 'X-API-Key: test-key'
+</code></pre>
+<h3 id="patch"><a class="header" href="#patch">Patch</a></h3>
+<p>The request body is passed through verbatim to the extension’s <code>patch-params</code>
+hook; its semantics are defined entirely by the extension. The hook returns the
+updated full params, which AgentENV stores and returns:</p>
+<pre><code class="language-bash">curl -X PATCH http://127.0.0.1:8000/sandboxes/&lt;sandbox-id&gt;/custom-extension-params \
+  -H 'X-API-Key: test-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"vpn": {"network": "team-a", "peers": ["10.8.0.2", "10.8.0.3"]}}'
+</code></pre>
+<h3 id="persistence"><a class="header" href="#persistence">Persistence</a></h3>
+<p>Params survive pause/resume and are stored into snapshots created from the
+sandbox. When starting from a template, a <code>customExtensionParams</code> provided at
+creation overrides the one stored in the snapshot; otherwise the snapshot’s
+value is inherited.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="api-reference"><a href="#api-reference" class="header">API Reference</a></h1>
 <style>
@@ -4139,7 +4122,7 @@ export E2B_API_KEY=${AENV_API_KEY}
 <code>E2B_SANDBOX_URL=${E2B_API_URL}</code>. The explicit <code>/proxy</code> prefix
 (<code>${E2B_API_URL}/proxy</code>) is still accepted for back-compat.</p>
 </blockquote>
-<p>See <a href="#authentication-1">Authentication</a> for key generation and storage.</p>
+<p>See <a href="#api-authentication">API Authentication</a> for key generation and storage.</p>
 <h2 id="gateway-and-scheduler"><a class="header" href="#gateway-and-scheduler">Gateway and Scheduler</a></h2>
 <p>These variables apply to both the gateway and scheduler processes.</p>
 <div class="table-wrapper">
@@ -4463,7 +4446,7 @@ services/                       # distributed control plane (Go)
 <h1 id="sandbox-network-architecture"><a class="header" href="#sandbox-network-architecture">Sandbox Network Architecture</a></h1>
 <p>This document describes the network data plane for one AgentENV node. It covers the Linux network namespaces used by Firecracker sandboxes, host and namespace iptables, runtime egress policy updates, and the namespace-local egress proxy.</p>
 <p>The user-facing policy contract is documented in the public
-<a href="https://github.com/kvcache-ai/AgentENV/blob/main/docs/src/concepts/sandboxes.md#network-access">Sandboxes documentation</a>.
+<a href="#networking">Sandboxes networking documentation</a>.
 This page explains how that contract is implemented.</p>
 <h2 id="topology"><a class="header" href="#topology">Topology</a></h2>
 <p>Each running sandbox has a dedicated network namespace. The Firecracker VM is connected to the namespace through a TAP device. The namespace is connected to the host through a veth pair; the namespace side is named <code>vpeer</code> and the host side is named <code>veth-{slot}</code>.</p>
@@ -5650,6 +5633,56 @@ network namespaces are missing</li>
 <li>repository alias conflicts during publish</li>
 <li>runtime resolver cannot materialize local paths from committed artifacts</li>
 </ul>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="buildkit-template-build-internals"><a class="header" href="#buildkit-template-build-internals">BuildKit Template Build Internals</a></h1>
+<p>This page describes the internal worker, cache, publication, and recovery
+lifecycle behind <code>aenv build</code>. For the user-facing command and configuration,
+see <a href="#aenv-build">Create Your Template</a>.</p>
+<h2 id="worker-preparation-and-reuse"><a class="header" href="#worker-preparation-and-reuse">Worker Preparation and Reuse</a></h2>
+<p>The server provisions and releases an internal worker for each Dockerfile build.
+The first build prepares a reusable builder snapshot in a private namespace of
+the configured snapshot repository. Nodes sharing that repository restore the
+same builder and attach a new cache volume before starting BuildKit.</p>
+<p>Concurrent first requests on one node share initialization. Simultaneous first
+builds on different nodes may both prepare a builder; subsequent builds reuse
+the published snapshot. Builder image, CPU, memory, virtualization mode, and
+readiness setup identify that snapshot, so changing those inputs prepares a new
+one. Workers are internal and do not appear in public sandbox listings or
+endpoints.</p>
+<h2 id="build-cache-lifecycle"><a class="header" href="#build-cache-lifecycle">Build Cache Lifecycle</a></h2>
+<p>Each build clones the latest immutable cache seed into its own writable volume.
+Sequential builds inherit the preceding build’s instruction cache and
+<code>RUN --mount=type=cache</code> data. Concurrent builds can fork the same seed without
+waiting; their additions are not merged, and the last successfully published
+cache becomes the next seed.</p>
+<p>After image import, the node stops BuildKit, checkpoints and publishes its cache
+volume through the normal volume capture path, and stops the VM without saving
+its memory, rootfs, or device state. A failed shutdown or cache capture keeps the
+previous shared seed. Volume ownership remains held until the VM stops.</p>
+<p>Cache publication uploads only missing layers. Failure to publish the cache does
+not fail an otherwise successful template build or replace the previous seed.
+Old cache volumes are removed after active children release their leases. Cache
+head updates and pending retirements are committed together, while cleanup
+retries retirements independently. BuildKit’s garbage collector manages the
+cache contents.</p>
+<h2 id="image-publication"><a class="header" href="#image-publication">Image Publication</a></h2>
+<p>The node reads the completed image directly from the builder by SHA-256 digest,
+verifies its bytes, and converts only missing layers by reusing the
+content-addressed OverlayBD cache used for registry imports. The image does not
+travel through the CLI. Only the final image configuration becomes template
+configuration; intermediate stages and build arguments do not become template
+environment variables.</p>
+<p>Registry credentials come from the local BuildKit session and normal Docker
+credential configuration. Cache sharing stays within the snapshot repository’s
+existing API-key trust boundary.</p>
+<h2 id="cancellation-and-recovery"><a class="header" href="#cancellation-and-recovery">Cancellation and Recovery</a></h2>
+<p>Cancellation and deadlines release the worker and discard its incomplete cache
+child. If the client disappears, the build deadline eventually triggers the
+same cleanup. Server restart recovers unfinished builds and cache reservations
+from the durable journal. Failed cleanup is retained and retried while the
+server runs. Active builds prevent template deletion until cancellation or
+completion, and an unreadable journal entry does not block recovery of other
+builds or prevent server startup.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="persistence-artifact-inventory"><a class="header" href="#persistence-artifact-inventory">Persistence Artifact Inventory</a></h1>
 <p>This document lists AgentENV artifacts that can remain on disk or in object storage beyond a single function call. It is organized by the module that owns each artifact’s lifecycle.</p>

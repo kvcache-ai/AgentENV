@@ -17,6 +17,12 @@
     [data-testid="two-column-right"] .sl-code-editor {
       --fs-code: 15px !important;
     }
+    [data-testid="two-column-right"] .sl-rounded-lg.sl-overflow-y-hidden:empty {
+      display: none;
+    }
+    [data-testid="two-column-right"] .sl-rounded-lg.sl-overflow-y-hidden:empty + * {
+      margin-top: 0 !important;
+    }
   </style>
 </head>
 <body>
@@ -25,7 +31,7 @@
   layout="sidebar"
   hideSchemas="false"
   hideExport="true"
-  tryItCredentialsPolicy="same-origin">
+  hideTryIt="true">
 </elements-api>
 <script src="https://unpkg.com/js-yaml@4.1.0/dist/js-yaml.min.js"></script>
 <script src="https://unpkg.com/@stoplight/elements@8.5.2/web-components.min.js"></script>

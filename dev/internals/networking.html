@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d5f5dfb2.js";
+            window.path_to_searchindex_js = "../searchindex-da116984.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-a02e686b.js"></script>
+        <script src="../toc-c8205cda.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -184,7 +184,7 @@
                         <h1 id="sandbox-network-architecture"><a class="header" href="#sandbox-network-architecture">Sandbox Network Architecture</a></h1>
 <p>This document describes the network data plane for one AgentENV node. It covers the Linux network namespaces used by Firecracker sandboxes, host and namespace iptables, runtime egress policy updates, and the namespace-local egress proxy.</p>
 <p>The user-facing policy contract is documented in the public
-<a href="https://github.com/kvcache-ai/AgentENV/blob/main/docs/src/concepts/sandboxes.md#network-access">Sandboxes documentation</a>.
+<a href="../concepts/sandboxes/networking.html">Sandboxes networking documentation</a>.
 This page explains how that contract is implemented.</p>
 <h2 id="topology"><a class="header" href="#topology">Topology</a></h2>
 <p>Each running sandbox has a dedicated network namespace. The Firecracker VM is connected to the namespace through a TAP device. The namespace is connected to the host through a veth pair; the namespace side is named <code>vpeer</code> and the host side is named <code>veth-{slot}</code>.</p>

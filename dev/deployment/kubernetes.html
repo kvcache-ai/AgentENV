@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d5f5dfb2.js";
+            window.path_to_searchindex_js = "../searchindex-da116984.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-a02e686b.js"></script>
+        <script src="../toc-c8205cda.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -224,7 +224,7 @@ cd AgentENV
 </code></pre>
 <p>This builds three images: <code>agentenv-runtime:latest</code>, <code>agentenv-gateway:latest</code>, and <code>agentenv-scheduler:latest</code>.</p>
 <h2 id="configure-the-access-token-seed-optional"><a class="header" href="#configure-the-access-token-seed-optional">Configure the Access-Token Seed (Optional)</a></h2>
-<p>See <a href="../concepts/authentication.html#sandbox-access-token-seed">Authentication</a>
+<p>See <a href="../concepts/authentication/access-token-seed.html">Sandbox Access-Token Seed</a>
 for the shared sandbox access-token seed configuration.</p>
 <h2 id="deploy"><a class="header" href="#deploy">Deploy</a></h2>
 <pre><code class="language-bash"># Run on each worker node before deploying
@@ -246,7 +246,7 @@ configuring clients:</p>
 <code>make k8s-render</code> uses an invalid <code>REDACTED</code> placeholder so preview output never
 contains a deployable API key. The optional runtime seed keeps its existing
 <code>agentenv-runtime-secrets</code> contract described in
-<a href="../concepts/authentication.html#sandbox-access-token-seed">Authentication</a>.</p>
+<a href="../concepts/authentication/access-token-seed.html">Sandbox Access-Token Seed</a>.</p>
 <p>To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when rendering or applying manifests:</p>
 <pre><code class="language-bash">SANDBOX_PROXY_DOMAINS=sandbox.example.com make k8s-apply

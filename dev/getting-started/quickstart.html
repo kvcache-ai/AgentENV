@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d5f5dfb2.js";
+            window.path_to_searchindex_js = "../searchindex-da116984.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-a02e686b.js"></script>
+        <script src="../toc-c8205cda.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -242,6 +242,10 @@ docker run --rm -it \
 <p>Supports Linux and macOS on x86_64 and arm64:</p>
 <pre><code class="language-bash">curl -fsSL https://raw.githubusercontent.com/kvcache-ai/AgentENV/main/scripts/install-cli.sh | bash
 </code></pre>
+<p>The installation script downloads and verifies the platform release archive
+containing <code>aenv</code> and <code>aenv-buildctl</code>. Set <code>INSTALL_DIR</code> for a user-local
+installation. For manual installation, extract the archive and keep <code>aenv</code> and
+<code>aenv-buildctl</code> in the same directory.</p>
 <h3 id="3-authenticate"><a class="header" href="#3-authenticate">3. Authenticate</a></h3>
 <p>The server generates the key on its first normal startup. Native installations
 reuse the managed key; a normal Docker container keeps it in its writable
