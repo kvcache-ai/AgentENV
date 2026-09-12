@@ -31,7 +31,7 @@ enum Sub {
     #[command(visible_alias = "ls")]
     List {
         /// Filter snapshots by source sandbox ID
-        #[arg(long = "sandbox-id")]
+        #[arg(long = "sandbox-id", add = crate::commands::completion::add_active_sandbox_candidates())]
         sandbox_id: Option<String>,
         #[arg(long, value_enum)]
         output: Option<Format>,

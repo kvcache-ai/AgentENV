@@ -27,9 +27,15 @@ enum Sub {
     },
     /// Delete a template by ID or name
     #[command(visible_alias = "rm")]
-    Delete { template: String },
+    Delete {
+        #[arg(add = crate::commands::completion::add_template_candidates())]
+        template: String,
+    },
     /// Watch a template build until it succeeds or fails
-    Watch { template: String },
+    Watch {
+        #[arg(add = crate::commands::completion::add_template_candidates())]
+        template: String,
+    },
 }
 
 pub fn run(args: Args) -> Result<()> {
