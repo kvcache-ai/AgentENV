@@ -148,7 +148,7 @@ jobs:
           cargo build --release --locked \
             -p agentenv --bin server \
             -p uvm-ublk-daemon --bin uvm-ublk-daemon \
-            --features vendored-openssl
+            --features vendored-openssl,p2p-iroh
 
       - name: Stage artifacts
         run: |
