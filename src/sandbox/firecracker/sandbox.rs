@@ -1776,6 +1776,9 @@ impl FirecrackerSandbox {
             }
         }
 
+        boot_args =
+            add_damon_monitor_region(boot_args, config.mem_size_mib, std::env::consts::ARCH);
+
         // ── Spawn Firecracker inside the network namespace so it can access tap0 ──
         let firecracker_binary = config.common.firecracker_binary.clone();
         let (stdout_path, stderr_path) = self.firecracker_stdio_paths();
@@ -2481,6 +2484,76 @@ impl FirecrackerSandbox {
     }
 }
 
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * MIB;
+
+fn damon_monitor_region(mem_size_mib: u32, arch: &str) -> Option<(u64, u64)> {
+    let memory_size = u64::from(mem_size_mib).checked_mul(MIB)?;
+    if memory_size == 0 {
+        return None;
+    }
+
+    match arch {
+        "x86_64" => {
+            let end = if memory_size <= 3 * GIB {
+                memory_size
+            } else if memory_size <= 255 * GIB {
+                memory_size + GIB
+            } else {
+                memory_size + 257 * GIB
+            };
+            Some((4096, end))
+        }
+        "aarch64" => {
+            let end = if memory_size <= 254 * GIB {
+                2 * GIB + memory_size
+            } else {
+                memory_size + 258 * GIB
+            };
+            Some((2 * GIB, end))
+        }
+        _ => None,
+    }
+}
+
+fn add_damon_monitor_region(
+    boot_args: Option<String>,
+    mem_size_mib: u32,
+    arch: &str,
+) -> Option<String> {
+    let mut args = boot_args?;
+    let has_monitor_region = args.split_whitespace().any(|arg| {
+        arg.starts_with("damon_reclaim.monitor_region_start=")
+            || arg.starts_with("damon_reclaim.monitor_region_end=")
+    });
+    let use_computed_region = args
+        .split_whitespace()
+        .any(|arg| arg == "damon_reclaim.monitor_region_start=0")
+        && args
+            .split_whitespace()
+            .any(|arg| arg == "damon_reclaim.monitor_region_end=0");
+    if has_monitor_region && !use_computed_region {
+        return Some(args);
+    }
+
+    let Some((start, end)) = damon_monitor_region(mem_size_mib, arch) else {
+        return Some(args);
+    };
+    if use_computed_region {
+        args = args
+            .split_whitespace()
+            .filter(|arg| {
+                *arg != "damon_reclaim.monitor_region_start=0"
+                    && *arg != "damon_reclaim.monitor_region_end=0"
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+    }
+    Some(format!(
+        "{args} damon_reclaim.monitor_region_start={start} damon_reclaim.monitor_region_end={end}"
+    ))
+}
+
 // ── LaunchMode ───────────────────────────────────────────────────────────────
 
 enum LaunchMode {
@@ -2551,6 +2624,101 @@ mod tests {
             "0.1.0".to_string(),
             "user-image.json".into(),
         )
+    }
+
+    #[test]
+    fn damon_monitor_region_follows_firecracker_memory_layout() {
+        assert_eq!(damon_monitor_region(1024, "x86_64"), Some((4096, GIB)));
+        assert_eq!(damon_monitor_region(3072, "x86_64"), Some((4096, 3 * GIB)));
+        assert_eq!(
+            damon_monitor_region(3073, "x86_64"),
+            Some((4096, 4 * GIB + MIB))
+        );
+        assert_eq!(damon_monitor_region(4096, "x86_64"), Some((4096, 5 * GIB)));
+        assert_eq!(damon_monitor_region(8192, "x86_64"), Some((4096, 9 * GIB)));
+        assert_eq!(
+            damon_monitor_region(255 * 1024, "x86_64"),
+            Some((4096, 256 * GIB))
+        );
+        assert_eq!(
+            damon_monitor_region(255 * 1024 + 1, "x86_64"),
+            Some((4096, 512 * GIB + MIB))
+        );
+        assert_eq!(
+            damon_monitor_region(u32::MAX, "x86_64"),
+            Some((4096, u64::from(u32::MAX) * MIB + 257 * GIB))
+        );
+
+        assert_eq!(
+            damon_monitor_region(1024, "aarch64"),
+            Some((2 * GIB, 3 * GIB))
+        );
+        assert_eq!(
+            damon_monitor_region(254 * 1024, "aarch64"),
+            Some((2 * GIB, 256 * GIB))
+        );
+        assert_eq!(
+            damon_monitor_region(254 * 1024 + 1, "aarch64"),
+            Some((2 * GIB, 512 * GIB + MIB))
+        );
+        assert_eq!(
+            damon_monitor_region(u32::MAX, "aarch64"),
+            Some((2 * GIB, u64::from(u32::MAX) * MIB + 258 * GIB))
+        );
+        assert_eq!(damon_monitor_region(0, "x86_64"), None);
+        assert_eq!(damon_monitor_region(1024, "riscv64"), None);
+    }
+
+    #[test]
+    fn damon_monitor_region_is_added_only_when_needed() {
+        for args in [
+            "console=ttyS0",
+            "console=ttyS0 damon_reclaim.enabled=Y",
+            "console=ttyS0 damon_reclaim.enabled=N",
+        ] {
+            let expected = format!(
+                "{args} damon_reclaim.monitor_region_start=4096 \
+                 damon_reclaim.monitor_region_end=5368709120"
+            );
+            assert_eq!(
+                add_damon_monitor_region(Some(args.to_string()), 4096, "x86_64").as_deref(),
+                Some(expected.as_str())
+            );
+        }
+
+        for unchanged in [
+            "damon_reclaim.enabled=Y damon_reclaim.monitor_region_start=1234",
+            "damon_reclaim.enabled=Y damon_reclaim.monitor_region_end=5678",
+            "damon_reclaim.monitor_region_start=1234 damon_reclaim.monitor_region_end=5678",
+        ] {
+            assert_eq!(
+                add_damon_monitor_region(Some(unchanged.to_string()), 4096, "x86_64").as_deref(),
+                Some(unchanged)
+            );
+        }
+
+        assert_eq!(
+            add_damon_monitor_region(
+                Some(
+                    "console=ttyS0 damon_reclaim.monitor_region_start=0 \
+                     damon_reclaim.monitor_region_end=0"
+                        .to_string()
+                ),
+                4096,
+                "x86_64"
+            )
+            .as_deref(),
+            Some(
+                "console=ttyS0 damon_reclaim.monitor_region_start=4096 \
+                 damon_reclaim.monitor_region_end=5368709120"
+            )
+        );
+
+        assert_eq!(
+            add_damon_monitor_region(Some("console=ttyS0".to_string()), 4096, "riscv64"),
+            Some("console=ttyS0".to_string())
+        );
+        assert_eq!(add_damon_monitor_region(None, 4096, "x86_64"), None);
     }
 
     #[tokio::test]

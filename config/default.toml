@@ -30,7 +30,7 @@ virtualization_mode = "kvm"
 
 # Complete kernel command line passed to guest VMs. Editing it replaces the
 # shipped boot and DAMON reclaim settings; it does not append to them.
-boot_args = "console=ttyS0 reboot=k panic=1 pci=off mitigations=off init=/init damon_reclaim.enabled=Y damon_reclaim.min_age=60000000 damon_reclaim.quota_ms=100 damon_reclaim.quota_sz=1073741824 damon_reclaim.quota_reset_interval_ms=1000 damon_reclaim.wmarks_high=900 damon_reclaim.wmarks_mid=700 damon_reclaim.wmarks_low=200 damon_reclaim.skip_anon=Y damon_reclaim.wmarks_interval=5000000"
+boot_args = "console=ttyS0 reboot=k panic=1 pci=off mitigations=off init=/init damon_reclaim.enabled=Y damon_reclaim.min_age=100000 damon_reclaim.quota_ms=20 damon_reclaim.quota_sz=1073741824 damon_reclaim.quota_reset_interval_ms=500 damon_reclaim.wmarks_high=990 damon_reclaim.wmarks_mid=990 damon_reclaim.wmarks_low=200 damon_reclaim.skip_anon=Y damon_reclaim.wmarks_interval=1000000"
 
 # Prefix allowlist for cold-start request extraBootArgs. Empty means none.
 # allowed_extra_boot_args_prefixes = ["aenv-custom."]
