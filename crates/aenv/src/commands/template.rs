@@ -28,12 +28,12 @@ enum Sub {
     /// Delete a template by ID or name
     #[command(visible_alias = "rm")]
     Delete {
-        #[arg(add = crate::commands::completion::add_template_candidates())]
+        #[arg(add = crate::commands::completion::add_any_template_candidates())]
         template: String,
     },
     /// Watch a template build until it succeeds or fails
     Watch {
-        #[arg(add = crate::commands::completion::add_template_candidates())]
+        #[arg(add = crate::commands::completion::add_pending_template_candidates())]
         template: String,
     },
 }

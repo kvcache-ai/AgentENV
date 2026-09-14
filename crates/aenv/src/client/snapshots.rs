@@ -29,6 +29,24 @@ impl Client {
     }
 
     pub fn list_snapshots(&self, sandbox_id: Option<&str>) -> Result<Vec<SnapshotInfo>> {
+        self.list_snapshots_while(sandbox_id, |_| true)
+    }
+
+    /// List snapshots page by page, stopping early when `keep_going` says so.
+    ///
+    /// `keep_going` is called with everything collected so far after each page,
+    /// and only consulted when there is another page to fetch. `list_snapshots`
+    /// passes a predicate that always continues; callers that must bound their
+    /// own latency use this instead, because the client's timeouts apply per
+    /// request and a paged walk otherwise has no overall bound.
+    pub fn list_snapshots_while<F>(
+        &self,
+        sandbox_id: Option<&str>,
+        mut keep_going: F,
+    ) -> Result<Vec<SnapshotInfo>>
+    where
+        F: FnMut(&[SnapshotInfo]) -> bool,
+    {
         let mut snapshots = Vec::new();
         let mut next_token: Option<String> = None;
 
@@ -50,7 +68,7 @@ impl Client {
             let mut page: Vec<SnapshotInfo> = resp.into_json()?;
             snapshots.append(&mut page);
 
-            if next_token.is_none() {
+            if next_token.is_none() || !keep_going(&snapshots) {
                 break;
             }
         }

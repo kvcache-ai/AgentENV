@@ -419,7 +419,7 @@ filtered to the states each command accepts:
 |---------|--------------------|
 | `pause`, `exec`, `timeout`, `upload`, `download`, `snapshot create` | running |
 | `resume` | paused |
-| `connect`, `delete`, `snapshot list --sandbox-id` | running and paused |
+| `connect`, `delete` | running and paused |
 
 ```bash
 aenv resume <TAB>                # paused sandbox IDs
@@ -427,12 +427,13 @@ aenv exec <TAB>                  # running sandbox IDs
 ```
 
 Commands that take a template or a snapshot complete their names first, with
-IDs offered as a fallback for resources that have no name:
+IDs offered as a fallback for resources that have no name. Templates are
+filtered to the build statuses each command can act on:
 
 ```bash
-aenv start <TAB>                 # template and snapshot names, then IDs
-aenv template watch <TAB>        # template names, then template IDs
-aenv template delete <TAB>       # template names, then template IDs
+aenv start <TAB>                 # ready templates and snapshots: names, then IDs
+aenv template watch <TAB>        # templates still waiting or building
+aenv template delete <TAB>       # every template, whatever its build did
 ```
 
 `aenv start --cold` takes an external OCI image reference rather than a local
@@ -443,6 +444,9 @@ state for a sandbox, the underlying ID and build status for a template, and the
 underlying ID for a snapshot.
 
 Dynamic lookup is best-effort: it uses short timeouts (500 ms connect, 1 s
-request) and silently returns no candidates when credentials, the server, or
-the network are unavailable. Static command and flag completion keeps working
-in that case, and no diagnostic output is written to your command line.
+request, 2 s in total per completion request) and silently returns no
+candidates when credentials, the server, or the network are unavailable. Static
+command and flag completion keeps working in that case, and no diagnostic
+output is written to your command line. On a deployment large enough to hit
+those bounds, typing a longer prefix narrows the lookup and brings back
+candidates a shorter prefix had to leave out.

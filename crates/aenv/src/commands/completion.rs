@@ -2,12 +2,12 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::Args as ClapArgs;
 use clap::ValueEnum;
-use clap_complete::engine::{ArgValueCandidates, CompletionCandidate};
+use clap_complete::engine::{ArgValueCandidates, ArgValueCompleter, CompletionCandidate};
 use clap_complete::env::{Bash, EnvCompleter, Fish, Zsh};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::client::sandboxes::ListedSandbox;
 use crate::client::snapshots::SnapshotInfo;
@@ -17,13 +17,35 @@ use crate::client::Client;
 const DYNAMIC_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 const DYNAMIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// Wall-clock budget for one completion request, across all of its lookups.
+///
+/// The timeouts above bound a single HTTP call, but a provider can make several
+/// — templates, then snapshots a page at a time — so their sum is what the user
+/// actually waits for after pressing Tab. Every lookup checks this deadline
+/// before issuing another request, so a slow server costs a bounded pause and
+/// possibly fewer candidates rather than a stalled shell.
+const DYNAMIC_TOTAL_BUDGET: Duration = Duration::from_secs(2);
+
 /// Upper bound on the candidates one resource kind contributes.
 ///
 /// Completion is interactive: a deployment with thousands of templates or
 /// snapshots should not dump all of them into the shell's candidate list. The
 /// budget is per resource kind so that many templates cannot crowd snapshots
 /// out of `aenv start`'s candidates entirely.
+///
+/// The budget applies to candidates that already match what the user typed
+/// (see `CandidateSet`), so narrowing a prefix keeps reaching matches that a
+/// wider prefix had truncated away.
 const MAX_DYNAMIC_CANDIDATES: usize = 100;
+
+/// Upper bound on how many snapshots one completion request fetches.
+///
+/// Snapshot listing is paginated and completion walks the pages itself, so
+/// without a bound one Tab can turn into an unbounded walk on a large
+/// deployment. Prefix matching runs over what was fetched, so a deployment
+/// past this bound can hide late-page matches — an acceptable trade for a
+/// keystroke, and `DYNAMIC_TOTAL_BUDGET` can cut the walk shorter still.
+const MAX_SNAPSHOT_FETCH: usize = 1_000;
 
 /// Shell to generate completion for.
 ///
@@ -131,17 +153,48 @@ where
         .collect()
 }
 
-/// Candidates for arguments that accept a template ID or name, such as
-/// `aenv template watch` and `aenv template delete`.
-pub fn template_candidates() -> Vec<CompletionCandidate> {
+/// Which templates an argument accepts, which differs per command: starting a
+/// template needs a finished build, watching one needs an unfinished build, and
+/// deleting one works whatever the build did.
+///
+/// `buildStatus` is required by the API, so a missing status means a
+/// non-conforming server; such a template is only offered where any status is
+/// accepted, rather than guessed at.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum TemplateEligibility {
+    /// Templates that can be started now: `aenv start`.
+    Ready,
+    /// Templates whose build has not finished, so watching it will report
+    /// something: `aenv template watch`.
+    Pending,
+    /// Every template, including failed builds: `aenv template delete`.
+    Any,
+}
+
+impl TemplateEligibility {
+    fn accepts(self, build_status: Option<&str>) -> bool {
+        match self {
+            TemplateEligibility::Ready => build_status == Some("ready"),
+            TemplateEligibility::Pending => matches!(build_status, Some("waiting" | "building")),
+            TemplateEligibility::Any => true,
+        }
+    }
+}
+
+/// Candidates for arguments that accept a template ID or name, restricted to
+/// the templates `eligibility` accepts and to what the user has typed so far.
+fn template_candidates(
+    prefix: &OsStr,
+    eligibility: TemplateEligibility,
+) -> Vec<CompletionCandidate> {
     let Some(client) = dynamic_client() else {
         return Vec::new();
     };
     let Ok(templates) = client.list_templates() else {
         return Vec::new();
     };
-    let mut set = CandidateSet::default();
-    set.extend_templates(templates);
+    let mut set = CandidateSet::new(prefix);
+    set.extend_templates(templates, eligibility);
     set.into_vec()
 }
 
@@ -150,11 +203,11 @@ pub fn template_candidates() -> Vec<CompletionCandidate> {
 ///
 /// `--cold` takes an external OCI image reference instead, so no local
 /// resources are offered — and no API call is made — in that case.
-pub fn start_target_candidates() -> Vec<CompletionCandidate> {
-    start_target_candidates_for(std::env::args_os())
+fn start_target_candidates(prefix: &OsStr) -> Vec<CompletionCandidate> {
+    start_target_candidates_for(std::env::args_os(), prefix)
 }
 
-fn start_target_candidates_for<I, T>(args: I) -> Vec<CompletionCandidate>
+fn start_target_candidates_for<I, T>(args: I, prefix: &OsStr) -> Vec<CompletionCandidate>
 where
     I: IntoIterator<Item = T>,
     T: AsRef<OsStr>,
@@ -165,14 +218,22 @@ where
     let Some(client) = dynamic_client() else {
         return Vec::new();
     };
+    let deadline = Instant::now() + DYNAMIC_TOTAL_BUDGET;
 
     // Either lookup failing only costs us that resource kind's candidates.
-    let mut set = CandidateSet::default();
+    let mut set = CandidateSet::new(prefix);
     if let Ok(templates) = client.list_templates() {
-        set.extend_templates(templates);
+        // Only a finished build can be started; an unbuilt template would fail.
+        set.extend_templates(templates, TemplateEligibility::Ready);
     }
-    if let Ok(snapshots) = client.list_snapshots(None) {
-        set.extend_snapshots(snapshots);
+    // The template lookup may already have spent the whole budget.
+    if Instant::now() < deadline {
+        let snapshots = client.list_snapshots_while(None, |collected| {
+            Instant::now() < deadline && collected.len() < MAX_SNAPSHOT_FETCH
+        });
+        if let Ok(snapshots) = snapshots {
+            set.extend_snapshots(snapshots);
+        }
     }
     set.into_vec()
 }
@@ -201,17 +262,38 @@ where
 /// never offered twice — the same name can be both a template name and an
 /// alias — and each `extend_*` call contributes at most
 /// `MAX_DYNAMIC_CANDIDATES` candidates.
+///
+/// The prefix filter is applied before cap and deduplication, so a narrow
+/// prefix keeps finding matches that a wider one had truncated away.
 #[derive(Default)]
 struct CandidateSet {
     seen: HashSet<String>,
     candidates: Vec<CompletionCandidate>,
+    prefix: String,
 }
 
 impl CandidateSet {
-    /// Offer `value`, returning whether it was added (blank and already-offered
-    /// values are skipped).
+    fn new(prefix: &OsStr) -> Self {
+        CandidateSet {
+            prefix: prefix.to_string_lossy().into_owned(),
+            ..Default::default()
+        }
+    }
+
+    /// Whether `value` passes the prefix filter (empty prefix is always a
+    /// match, matching the shell's behaviour of showing everything when the
+    /// user has typed nothing).
+    fn matches_prefix(&self, value: &str) -> bool {
+        self.prefix.is_empty() || value.starts_with(&self.prefix)
+    }
+
+    /// Offer `value`, returning whether it was added (blank, already-offered,
+    /// and non-matching values are skipped).
     fn push(&mut self, value: String, help: String) -> bool {
-        if value.trim().is_empty() || !self.seen.insert(value.clone()) {
+        if value.trim().is_empty()
+            || !self.matches_prefix(&value)
+            || !self.seen.insert(value.clone())
+        {
             return false;
         }
         self.candidates
@@ -219,15 +301,21 @@ impl CandidateSet {
         true
     }
 
-    /// Add every template's names and aliases, then their IDs.
+    /// Add the names and aliases of every template `eligibility` accepts, then
+    /// their IDs.
     ///
     /// Names come first because that is what users type; IDs stay available as
     /// a fallback for resources without a name. Both groups are sorted so the
-    /// candidate order is stable across completion requests.
-    fn extend_templates(&mut self, templates: Vec<Template>) {
+    /// candidate order is stable across completion requests. Values that cannot
+    /// match are dropped before being cloned into those groups, so a narrow
+    /// prefix stays cheap however many templates exist.
+    fn extend_templates(&mut self, templates: Vec<Template>, eligibility: TemplateEligibility) {
         let mut names = Vec::new();
         let mut ids = Vec::new();
         for template in templates {
+            if !eligibility.accepts(template.build_status.as_deref()) {
+                continue;
+            }
             let status = template
                 .build_status
                 .as_deref()
@@ -236,12 +324,17 @@ impl CandidateSet {
                 .map(|status| format!(" ({status})"))
                 .unwrap_or_default();
             for name in template.names.iter().chain(template.aliases.iter()) {
+                if !self.matches_prefix(name) {
+                    continue;
+                }
                 names.push((
                     name.clone(),
                     format!("template {}{}", template.template_id, status),
                 ));
             }
-            ids.push((template.template_id, format!("template{status}")));
+            if self.matches_prefix(&template.template_id) {
+                ids.push((template.template_id, format!("template{status}")));
+            }
         }
         self.extend_sorted(names, ids);
     }
@@ -252,9 +345,14 @@ impl CandidateSet {
         let mut ids = Vec::new();
         for snapshot in snapshots {
             for name in &snapshot.names {
+                if !self.matches_prefix(name) {
+                    continue;
+                }
                 names.push((name.clone(), format!("snapshot {}", snapshot.snapshot_id)));
             }
-            ids.push((snapshot.snapshot_id, "snapshot".to_string()));
+            if self.matches_prefix(&snapshot.snapshot_id) {
+                ids.push((snapshot.snapshot_id, "snapshot".to_string()));
+            }
         }
         self.extend_sorted(names, ids);
     }
@@ -292,12 +390,28 @@ pub fn add_active_sandbox_candidates() -> ArgValueCandidates {
     ArgValueCandidates::new(active_sandbox_candidates)
 }
 
-pub fn add_template_candidates() -> ArgValueCandidates {
-    ArgValueCandidates::new(template_candidates)
+/// Template candidates for `aenv template watch`, limited to builds that have
+/// not finished yet.
+pub fn add_pending_template_candidates() -> ArgValueCompleter {
+    ArgValueCompleter::new(|prefix: &OsStr| {
+        template_candidates(prefix, TemplateEligibility::Pending)
+    })
 }
 
-pub fn add_start_target_candidates() -> ArgValueCandidates {
-    ArgValueCandidates::new(start_target_candidates)
+/// Template candidates for `aenv template delete`, which accepts any template.
+pub fn add_any_template_candidates() -> ArgValueCompleter {
+    ArgValueCompleter::new(|prefix: &OsStr| template_candidates(prefix, TemplateEligibility::Any))
+}
+
+/// Template and snapshot candidates for `aenv start <target>`.
+///
+/// These use `ArgValueCompleter` rather than `ArgValueCandidates` because they
+/// cap how many candidates they return: `ArgValueCandidates` is filtered
+/// against the typed prefix only *after* the provider returns, so the cap would
+/// silently discard the very match the user was typing towards. A completer
+/// receives the prefix and so filters before capping.
+pub fn add_start_target_candidates() -> ArgValueCompleter {
+    ArgValueCompleter::new(start_target_candidates)
 }
 
 /// Generate the completion registration script for `shell` and write it to
@@ -417,13 +531,13 @@ mod tests {
     }
 
     fn template_candidates_for(templates: Vec<Template>) -> Vec<CompletionCandidate> {
-        let mut set = CandidateSet::default();
-        set.extend_templates(templates);
+        let mut set = CandidateSet::new(OsStr::new(""));
+        set.extend_templates(templates, TemplateEligibility::Any);
         set.into_vec()
     }
 
     fn snapshot_candidates_for(snapshots: Vec<SnapshotInfo>) -> Vec<CompletionCandidate> {
-        let mut set = CandidateSet::default();
+        let mut set = CandidateSet::new(OsStr::new(""));
         set.extend_snapshots(snapshots);
         set.into_vec()
     }
@@ -501,8 +615,11 @@ mod tests {
 
     #[test]
     fn start_target_offers_templates_then_snapshots() {
-        let mut set = CandidateSet::default();
-        set.extend_templates(vec![template("id-a", &["alpha"], &[], None)]);
+        let mut set = CandidateSet::new(OsStr::new(""));
+        set.extend_templates(
+            vec![template("id-a", &["alpha"], &[], None)],
+            TemplateEligibility::Any,
+        );
         set.extend_snapshots(vec![snapshot_info("snap-a", &["base"])]);
         assert_eq!(
             values(set.into_vec()),
@@ -523,11 +640,12 @@ mod tests {
 
     #[test]
     fn many_templates_do_not_crowd_out_snapshots() {
-        let mut set = CandidateSet::default();
+        let mut set = CandidateSet::new(OsStr::new(""));
         set.extend_templates(
             (0..MAX_DYNAMIC_CANDIDATES + 10)
                 .map(|i| template(&format!("id-{i:04}"), &[], &[], None))
                 .collect(),
+            TemplateEligibility::Any,
         );
         set.extend_snapshots(vec![snapshot_info("snap-a", &["base"])]);
         let values = values(set.into_vec());
@@ -536,6 +654,117 @@ mod tests {
             values.contains(&"base".to_string()),
             "snapshots should still be offered after a full template budget"
         );
+    }
+
+    /// The regression behind the switch from `ArgValueCandidates` to
+    /// `ArgValueCompleter`: with candidates capped at 100, `z-target` sorts
+    /// after 100 `a*` templates and used to be truncated away, so typing `z`
+    /// offered nothing even though an exact match existed. The cap must apply
+    /// to what matches the prefix, not to the full list.
+    #[test]
+    fn cap_does_not_hide_a_match_that_sorts_late() {
+        let mut templates: Vec<Template> = (0..MAX_DYNAMIC_CANDIDATES)
+            .map(|i| template(&format!("a{i:04}"), &[], &[], None))
+            .collect();
+        templates.push(template("z-target", &[], &[], None));
+
+        let mut set = CandidateSet::new(OsStr::new("z"));
+        set.extend_templates(templates, TemplateEligibility::Any);
+        assert_eq!(values(set.into_vec()), vec!["z-target"]);
+    }
+
+    #[test]
+    fn prefix_filter_matches_names_ids_and_aliases() {
+        let templates = vec![
+            template("id-a", &["alpha"], &["alpha-alias"], None),
+            template("id-b", &["beta"], &[], None),
+        ];
+
+        let mut set = CandidateSet::new(OsStr::new("alpha"));
+        set.extend_templates(templates, TemplateEligibility::Any);
+        assert_eq!(values(set.into_vec()), vec!["alpha", "alpha-alias"]);
+
+        let mut set = CandidateSet::new(OsStr::new("id-"));
+        set.extend_templates(
+            vec![template("id-a", &["alpha"], &[], None)],
+            TemplateEligibility::Any,
+        );
+        assert_eq!(values(set.into_vec()), vec!["id-a"]);
+    }
+
+    #[test]
+    fn empty_prefix_matches_everything() {
+        let candidates = template_candidates_for(vec![template("id-a", &["alpha"], &[], None)]);
+        assert_eq!(values(candidates), vec!["alpha", "id-a"]);
+    }
+
+    #[test]
+    fn snapshot_prefix_filter_applies_to_names_and_ids() {
+        let mut set = CandidateSet::new(OsStr::new("snap-a"));
+        set.extend_snapshots(vec![
+            snapshot_info("snap-a", &["base"]),
+            snapshot_info("snap-b", &[]),
+        ]);
+        assert_eq!(values(set.into_vec()), vec!["snap-a"]);
+    }
+
+    #[test]
+    fn start_accepts_only_ready_templates() {
+        // Starting a template whose build has not succeeded fails, so offering
+        // it would only send the user down a dead end.
+        assert!(TemplateEligibility::Ready.accepts(Some("ready")));
+        for status in ["waiting", "building", "error"] {
+            assert!(
+                !TemplateEligibility::Ready.accepts(Some(status)),
+                "`start` should not offer a {status} template"
+            );
+        }
+    }
+
+    #[test]
+    fn watch_accepts_only_unfinished_builds() {
+        // A finished build returns immediately, so watching it is pointless.
+        for status in ["waiting", "building"] {
+            assert!(
+                TemplateEligibility::Pending.accepts(Some(status)),
+                "`template watch` should offer a {status} template"
+            );
+        }
+        for status in ["ready", "error"] {
+            assert!(
+                !TemplateEligibility::Pending.accepts(Some(status)),
+                "`template watch` should not offer a {status} template"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_accepts_every_build_status() {
+        for status in ["ready", "waiting", "building", "error"] {
+            assert!(TemplateEligibility::Any.accepts(Some(status)));
+        }
+    }
+
+    /// `buildStatus` is required by the API, so an absent one means a
+    /// non-conforming server. Such a template stays reachable where any status
+    /// is accepted (`delete`) rather than being guessed into `start`/`watch`.
+    #[test]
+    fn missing_build_status_is_only_accepted_where_any_status_is() {
+        assert!(TemplateEligibility::Any.accepts(None));
+        assert!(!TemplateEligibility::Ready.accepts(None));
+        assert!(!TemplateEligibility::Pending.accepts(None));
+    }
+
+    #[test]
+    fn eligibility_filters_templates_before_they_are_offered() {
+        let templates = vec![
+            template("id-ready", &["ready-one"], &[], Some("ready")),
+            template("id-building", &["building-one"], &[], Some("building")),
+        ];
+
+        let mut set = CandidateSet::new(OsStr::new(""));
+        set.extend_templates(templates, TemplateEligibility::Ready);
+        assert_eq!(values(set.into_vec()), vec!["ready-one", "id-ready"]);
     }
 
     #[test]
@@ -570,9 +799,11 @@ mod tests {
     /// is why this test passes with no server reachable.
     #[test]
     fn start_target_offers_nothing_for_cold_start() {
-        assert!(
-            start_target_candidates_for(["aenv", "--", "aenv", "start", "--cold", ""]).is_empty()
-        );
+        assert!(start_target_candidates_for(
+            ["aenv", "--", "aenv", "start", "--cold", ""],
+            OsStr::new("")
+        )
+        .is_empty());
     }
 
     #[test]
@@ -588,8 +819,30 @@ mod tests {
             .find(|arg| arg.get_id() == "target")
             .expect("`start` should declare a target argument");
         assert!(
-            target.get::<ArgValueCandidates>().is_some(),
+            target.get::<ArgValueCompleter>().is_some(),
             "`start <target>` should offer dynamic template/snapshot candidates"
+        );
+    }
+
+    /// Snapshots outlive the sandbox they were captured from, so filtering the
+    /// list by a live sandbox ID is not a useful suggestion — see the review on
+    /// #250.
+    #[test]
+    fn snapshot_list_sandbox_filter_has_no_dynamic_candidates() {
+        let cmd = crate::Cli::command();
+        let list = cmd
+            .find_subcommand("snapshot")
+            .expect("`snapshot` command exists")
+            .find_subcommand("list")
+            .expect("`snapshot list` exists");
+        let sandbox_id = list
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("sandbox-id"))
+            .expect("`snapshot list` declares --sandbox-id");
+        assert!(
+            sandbox_id.get::<ArgValueCandidates>().is_none()
+                && sandbox_id.get::<ArgValueCompleter>().is_none(),
+            "`snapshot list --sandbox-id` should not suggest live sandboxes"
         );
     }
 
@@ -608,28 +861,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("`template {sub}` declares a template argument"))
                 .clone();
             assert!(
-                arg.get::<ArgValueCandidates>().is_some(),
+                arg.get::<ArgValueCompleter>().is_some(),
                 "`template {sub}` should offer dynamic template candidates"
             );
         }
-    }
-
-    #[test]
-    fn snapshot_list_sandbox_filter_has_dynamic_candidates() {
-        let cmd = crate::Cli::command();
-        let list = cmd
-            .find_subcommand("snapshot")
-            .expect("`snapshot` command exists")
-            .find_subcommand("list")
-            .expect("`snapshot list` exists");
-        let sandbox_id = list
-            .get_arguments()
-            .find(|arg| arg.get_long() == Some("sandbox-id"))
-            .expect("`snapshot list` declares --sandbox-id");
-        assert!(
-            sandbox_id.get::<ArgValueCandidates>().is_some(),
-            "`snapshot list --sandbox-id` should offer dynamic sandbox candidates"
-        );
     }
 
     fn generate_for(shell: Shell) -> String {
