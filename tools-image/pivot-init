@@ -93,6 +93,7 @@ fi
 # ---- Guest-visible integration points ----
 
 # Expose envd as a stable guest command.
+$BB mkdir -p /usr/local/bin
 $BB ln -sf /agentenv/envd /usr/local/bin/envd
 
 # envd wraps guest processes in `/usr/bin/ionice ... /usr/bin/nice ...`. Minimal
@@ -111,6 +112,19 @@ fi
 $BB mkdir -p /bin
 if [ ! -x /bin/sh ]; then
     $BB ln -sf /agentenv/bin/busybox /bin/sh
+fi
+
+# Some images may not provide /etc/passwd
+# at all, so bootstrap the root identity before envd starts.
+if [ ! -e /etc/passwd ]; then
+    LOGIN_SHELL=/bin/sh
+    if [ -x /bin/bash ]; then
+        LOGIN_SHELL=/bin/bash
+    fi
+
+    $BB mkdir -p /etc /root
+    $BB printf 'root:x:0:0:root:/root:%s\n' "$LOGIN_SHELL" > /etc/passwd
+    $BB chmod 0644 /etc/passwd
 fi
 
 # Prepare remaining runtime directories envd and the guest init commonly
