@@ -39,14 +39,14 @@ COPY --from=planner /build/recipe.json recipe.json
 # cargo-chef dependency layer.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo chef cook --release --recipe-path recipe.json
+    cargo chef cook --release --recipe-path recipe.json --features jemalloc
 
 FROM build-deps AS builder
 
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo build --release -p agentenv --bin server -p uvm-ublk-daemon --bin uvm-ublk-daemon \
+    cargo build --release -p agentenv --bin server -p uvm-ublk-daemon --bin uvm-ublk-daemon --features jemalloc \
     && cp /build/target/release/server /out-server \
     && cp /build/target/release/uvm-ublk-daemon /out-uvm-ublk-daemon
 
