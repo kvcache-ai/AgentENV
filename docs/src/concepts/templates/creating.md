@@ -123,11 +123,10 @@ prevent the server from starting or serving other APIs. Builder CPU, memory,
 and cache capacity are independent of the CPU and memory assigned to the
 resulting template.
 
-### Monitor a Build
+## Monitor a Build
 
-`aenv build` remains connected, streams progress, and exits nonzero on failure.
-Once BuildKit succeeds, AgentENV continues importing and publishing the template
-even if the CLI is interrupted. Check its status by template name or ID:
+`aenv pull` waits for the template to become ready by default. If you submit it
+with `--detach`, monitor the build by template name or ID:
 
 ```bash
 aenv template watch my-template
