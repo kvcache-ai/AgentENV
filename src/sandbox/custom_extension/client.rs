@@ -26,7 +26,10 @@
 //! reordered relative to a newer start).
 //!
 //! Except for the best-effort stop hook, any hook failure (connection error,
-//! timeout, non-2xx) fails the corresponding sandbox operation. The client is
+//! timeout, non-2xx) fails the corresponding sandbox operation. A non-2xx
+//! response from the extension is preserved as a [`HookStatusError`] in the
+//! error chain so the API layer can surface extension 4xx responses as client
+//! errors and 5xx responses as server errors to the caller. The client is
 //! a process-wide singleton derived from the global config; when no URL is
 //! configured, all calls are skipped.
 
@@ -34,8 +37,10 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
-use custom_extension_client::apis::{configuration::Configuration, default_api};
+use anyhow::Result;
+use custom_extension_client::apis::{
+    configuration::Configuration, default_api, Error as ClientError,
+};
 use custom_extension_client::models;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -136,7 +141,7 @@ impl CustomExtensionClient {
         };
         let response = default_api::sandbox_start_fresh(&self.configuration, request)
             .await
-            .context("custom extension start-fresh hook failed")?;
+            .map_err(|err| hook_error("start-fresh", err))?;
         Ok(response.extra_boot_args.flatten())
     }
 
@@ -163,7 +168,7 @@ impl CustomExtensionClient {
         };
         default_api::sandbox_start_resume(&self.configuration, request)
             .await
-            .context("custom extension start-resume hook failed")?;
+            .map_err(|err| hook_error("start-resume", err))?;
         Ok(())
     }
 
@@ -184,7 +189,7 @@ impl CustomExtensionClient {
         };
         let response = default_api::sandbox_patch_params(&self.configuration, request)
             .await
-            .context("custom extension patch-params hook failed")?;
+            .map_err(|err| hook_error("patch-params", err))?;
         Ok(match response.custom_extension_params {
             None => None,
             Some(value) => match value {
@@ -344,6 +349,60 @@ impl Drop for CustomExtensionHookGuard {
                 sandbox_instance_id = %sandbox_instance_id,
                 "sandbox dropped outside a tokio runtime; skipping lifecycle stop hook"
             ),
+        }
+    }
+}
+
+/// A custom extension hook call that the extension answered with a non-2xx
+/// HTTP status. Preserves the response status so the API layer can surface
+/// extension 4xx responses as client errors and 5xx responses as server
+/// errors to the caller.
+#[derive(Debug, thiserror::Error)]
+#[error("custom extension {operation} hook failed with status {status}: {content}")]
+pub(crate) struct HookStatusError {
+    operation: &'static str,
+    status: reqwest::StatusCode,
+    content: String,
+}
+
+impl HookStatusError {
+    /// Whether the extension answered with a 4xx status.
+    pub(crate) fn is_client_error(&self) -> bool {
+        self.status.is_client_error()
+    }
+
+    /// Whether the extension answered with a 5xx status.
+    pub(crate) fn is_server_error(&self) -> bool {
+        self.status.is_server_error()
+    }
+
+    /// Build a hook status error for tests.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(status: reqwest::StatusCode) -> Self {
+        Self {
+            operation: "test",
+            status,
+            content: "test failure".to_string(),
+        }
+    }
+}
+
+/// Convert a generated hook client error into an anyhow error, preserving a
+/// non-2xx response from the extension as a [`HookStatusError`] in the error
+/// chain.
+fn hook_error<T>(operation: &'static str, err: ClientError<T>) -> anyhow::Error
+where
+    T: std::fmt::Debug + Send + Sync + 'static,
+{
+    match err {
+        ClientError::ResponseError(response) => HookStatusError {
+            operation,
+            status: response.status,
+            content: response.content,
+        }
+        .into(),
+        other => {
+            anyhow::Error::new(other).context(format!("custom extension {operation} hook failed"))
         }
     }
 }
@@ -549,6 +608,48 @@ pub(crate) mod tests {
             .expect_err("non-2xx response must fail the hook");
 
         assert!(err.to_string().contains("start-fresh hook failed"));
+    }
+
+    #[tokio::test]
+    async fn start_fresh_4xx_preserves_client_error_status() {
+        let (base, _rx) = spawn_one_shot_server(403, r#"{"error":"denied"}"#.to_string()).await;
+        let client = test_client(&base);
+
+        let err = client
+            .hook_start_fresh(
+                SandboxId::new(),
+                SandboxInstanceId::new(),
+                "/proc/1000/task/1001/ns/net",
+                Ipv4Addr::new(10, 11, 0, 131),
+                None,
+            )
+            .await
+            .expect_err("4xx response must fail the hook");
+
+        let hook_err = err
+            .downcast_ref::<HookStatusError>()
+            .expect("4xx response must be preserved as HookStatusError");
+        assert!(hook_err.is_client_error());
+        assert!(!hook_err.is_server_error());
+        assert!(hook_err.to_string().contains("403"));
+    }
+
+    #[tokio::test]
+    async fn patch_params_5xx_preserves_server_error_status() {
+        let (base, _rx) =
+            spawn_one_shot_server(502, r#"{"error":"bad gateway"}"#.to_string()).await;
+        let client = test_client(&base);
+
+        let err = client
+            .hook_patch_params(SandboxId::new(), params(serde_json::json!({})))
+            .await
+            .expect_err("5xx response must fail the hook");
+
+        let hook_err = err
+            .downcast_ref::<HookStatusError>()
+            .expect("5xx response must be preserved as HookStatusError");
+        assert!(hook_err.is_server_error());
+        assert!(!hook_err.is_client_error());
     }
 
     #[tokio::test]

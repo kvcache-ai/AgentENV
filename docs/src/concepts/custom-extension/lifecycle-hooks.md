@@ -4,6 +4,12 @@ To support the complete sandbox lifecycle, your extension should implement the
 following four APIs. AgentENV sends a JSON request to
 `POST {url}/sandbox-hook/<hook>` when the corresponding event occurs. Any connection error, timeout, or non-2xx response fails the corresponding sandbox operation (except `stop`, which is best-effort).
 
+A hook response with a 4xx status rejects the API request with a client error:
+400 for create, cold-create, fork, connect and patch-params, or 409 for resume.
+A hook response with a 5xx status produces a 500 error. The error message includes
+the extension's status and response body. Use 4xx for invalid caller parameters
+and 5xx for extension-internal failures.
+
 | Hook | When | Request | Response |
 |------|------|---------|----------|
 | `start-fresh` | Before a fresh sandbox boots, after its network slot is allocated | `sandboxId`, `sandboxInstanceId`, `networkNamespacePath`, `hostInteractionIp`, `customExtensionParams` | optional `extraBootArgs` appended to the kernel cmdline |

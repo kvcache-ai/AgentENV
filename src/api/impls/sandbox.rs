@@ -17,6 +17,7 @@ use crate::orchestrator::{
     SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
 };
 use crate::prometheus::SandboxStageTimer;
+use crate::sandbox::custom_extension::HookStatusError;
 use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
@@ -37,6 +38,27 @@ fn sandbox_not_found(id: impl Into<String>) -> models::Error {
     ApiImpl::error(404, format!("sandbox {} not found", id.into()))
 }
 
+/// Find the [`HookStatusError`] in an orchestrator error chain, present when
+/// the failure was a non-2xx response from the custom extension.
+fn hook_status_error(err: &OrchestratorError) -> Option<&HookStatusError> {
+    let OrchestratorError::SandboxOperationFailed { source, .. } = err else {
+        return None;
+    };
+    source
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<HookStatusError>())
+}
+
+/// Error message to surface to the caller as a client error (4xx) when the
+/// custom extension rejected the operation with a 4xx hook response.
+/// Extension 5xx responses and other failures are surfaced as 500 by the
+/// callers' generic error arms.
+fn hook_client_error_message(err: &OrchestratorError) -> Option<String> {
+    hook_status_error(err)
+        .filter(|hook_err| hook_err.is_client_error())
+        .map(ToString::to_string)
+}
+
 fn default_sandbox_timeout() -> Duration {
     static DEFAULT_SANDBOX_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
@@ -51,6 +73,9 @@ fn default_sandbox_timeout() -> Duration {
 
 impl From<OrchestratorError> for models::Error {
     fn from(err: OrchestratorError) -> Self {
+        if let Some(message) = hook_client_error_message(&err) {
+            return Self::new(400, message);
+        }
         match err {
             OrchestratorError::ShuttingDown => {
                 Self::new(503, "orchestrator is shutting down".to_string())
@@ -849,6 +874,9 @@ impl Sandboxes<()> for ApiImpl {
                     }
                     _ => None,
                 };
+                // The custom extension rejecting the start hook with a 4xx is
+                // a client error too.
+                let invalid_request = invalid_request.or_else(|| hook_client_error_message(&err));
                 match invalid_request {
                     Some(message) => Ok(SandboxesColdPostResponse::Status400_BadRequest(
                         Self::error(400, message),
@@ -1162,6 +1190,13 @@ impl Sandboxes<()> for ApiImpl {
                 )
                 .await;
                 cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                // The custom extension rejected the start hook with a 4xx
+                // (start-resume for template-based creates).
+                if let Some(message) = hook_client_error_message(&err) {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                        400, message,
+                    )));
+                }
                 Ok(SandboxesPostResponse::Status500_ServerError(
                     Self::internal_error(&err),
                 ))
@@ -1372,6 +1407,12 @@ impl Sandboxes<()> for ApiImpl {
                 ));
             }
             Err(err) => {
+                // The custom extension rejected the start-resume hook with a 4xx.
+                if let Some(message) = hook_client_error_message(&err) {
+                    return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
+                        Self::error(400, message),
+                    ));
+                }
                 return Ok(
                     SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()),
                 );
@@ -1550,6 +1591,12 @@ impl Sandboxes<()> for ApiImpl {
             }),
             Err(err) => {
                 cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
+                // The custom extension rejected the fork's start hook with a 4xx.
+                if let Some(message) = hook_client_error_message(&err) {
+                    return Ok(SandboxesSandboxIdForkPostResponse::Status400_BadRequest(
+                        Self::error(400, message),
+                    ));
+                }
                 Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
                     err.into(),
                 ))
@@ -1720,12 +1767,22 @@ impl Sandboxes<()> for ApiImpl {
                     Self::error(409, err.to_string()),
                 ),
             ),
-            // The extension rejected the patch, or no extension is configured.
-            Err(err @ OrchestratorError::SandboxOperationFailed { .. }) => Ok(
-                SandboxesSandboxIdCustomExtensionParamsPatchResponse::Status400_BadRequest(
-                    Self::error(400, err.to_string()),
-                ),
-            ),
+            // The extension rejected the patch (4xx), the extension itself
+            // failed (5xx), or no extension is configured.
+            Err(err @ OrchestratorError::SandboxOperationFailed { .. }) => {
+                match hook_status_error(&err).filter(|hook_err| hook_err.is_server_error()) {
+                    Some(hook_err) => Ok(
+                        SandboxesSandboxIdCustomExtensionParamsPatchResponse::Status500_ServerError(
+                            Self::error(500, hook_err.to_string()),
+                        ),
+                    ),
+                    None => Ok(
+                        SandboxesSandboxIdCustomExtensionParamsPatchResponse::Status400_BadRequest(
+                            Self::error(400, err.to_string()),
+                        ),
+                    ),
+                }
+            }
             Err(err) => Ok(
                 SandboxesSandboxIdCustomExtensionParamsPatchResponse::Status500_ServerError(err.into()),
             ),
@@ -1977,6 +2034,14 @@ impl Sandboxes<()> for ApiImpl {
                 ));
             }
             Err(err) => {
+                // The custom extension rejected the start-resume hook with a
+                // 4xx; the resume API has no 400 variant, so surface it as a
+                // (still 4xx) 409.
+                if let Some(message) = hook_client_error_message(&err) {
+                    return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
+                        Self::error(409, message),
+                    ));
+                }
                 return Ok(SandboxesSandboxIdResumePostResponse::Status500_ServerError(
                     err.into(),
                 ));
@@ -2121,6 +2186,77 @@ impl Sandboxes<()> for ApiImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::SandboxOperation;
+    use crate::sandbox::SandboxCaptureError;
+
+    #[test]
+    fn hook_status_error_found_in_direct_anyhow_chain() {
+        let err = OrchestratorError::SandboxOperationFailed {
+            sandbox_id: SandboxId::new(),
+            operation: SandboxOperation::Start,
+            source: anyhow::Error::new(HookStatusError::new_for_test(
+                reqwest::StatusCode::FORBIDDEN,
+            )),
+        };
+        let hook_err = hook_status_error(&err).expect("hook status error must be found");
+        assert!(hook_err.is_client_error());
+        assert!(hook_client_error_message(&err)
+            .expect("4xx hook failure must surface as a client error")
+            .contains("403"));
+    }
+
+    #[test]
+    fn hook_status_error_found_through_capture_error_wrapping() {
+        // Fork wraps child start failures in SandboxCaptureError before the
+        // orchestrator stores them as the SandboxOperationFailed source.
+        let source = SandboxCaptureError::recoverable(
+            anyhow::Error::new(HookStatusError::new_for_test(
+                reqwest::StatusCode::BAD_GATEWAY,
+            ))
+            .context("start forked sandbox"),
+        );
+        let err = OrchestratorError::SandboxOperationFailed {
+            sandbox_id: SandboxId::new(),
+            operation: SandboxOperation::Fork,
+            source: source.into(),
+        };
+        let hook_err = hook_status_error(&err)
+            .expect("hook status error must be found through SandboxCaptureError");
+        assert!(hook_err.is_server_error());
+        // A 5xx hook failure must not be classified as a client error.
+        assert!(hook_client_error_message(&err).is_none());
+    }
+
+    #[test]
+    fn fork_result_error_preserves_extension_rejection() {
+        for (status, expected_code) in [
+            (reqwest::StatusCode::FORBIDDEN, 400),
+            (reqwest::StatusCode::BAD_GATEWAY, 500),
+        ] {
+            let error = OrchestratorError::SandboxOperationFailed {
+                sandbox_id: SandboxId::new(),
+                operation: SandboxOperation::Start,
+                source: anyhow::Error::new(HookStatusError::new_for_test(status)),
+            };
+            let response = models::Error::from(error);
+            assert_eq!(response.code, expected_code);
+            assert!(response.message.contains(status.as_str()));
+        }
+    }
+
+    #[test]
+    fn hook_status_error_absent_for_other_errors() {
+        let err = OrchestratorError::SandboxNotFound(SandboxId::new());
+        assert!(hook_status_error(&err).is_none());
+
+        let err = OrchestratorError::SandboxOperationFailed {
+            sandbox_id: SandboxId::new(),
+            operation: SandboxOperation::Start,
+            source: anyhow::anyhow!("boom"),
+        };
+        assert!(hook_status_error(&err).is_none());
+        assert!(hook_client_error_message(&err).is_none());
+    }
 
     #[test]
     fn volume_mounts_from_model_maps_names_by_path() {
