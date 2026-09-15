@@ -12,7 +12,7 @@ use super::{
     RunnableSnapshot, SnapshotId, SnapshotManager, SnapshotPublishMetadata, SnapshotRecord,
     SNAPSHOT_ARTIFACT_LAYOUT,
 };
-use crate::sandbox::FirecrackerSnapshotManifest;
+use crate::sandbox::SandboxSnapshotManifest;
 
 /// Test double for snapshot repository interactions that should stay unreachable.
 #[derive(Clone, Debug, Default)]
@@ -35,7 +35,7 @@ impl SnapshotRepository for MockSnapshotRepository {
     async fn publish(
         &self,
         _metadata: SnapshotPublishMetadata,
-        _manifest: FirecrackerSnapshotManifest,
+        _manifest: SandboxSnapshotManifest,
     ) -> RepositoryResult<SnapshotRecord> {
         Err(Self::unsupported())
     }
@@ -100,7 +100,7 @@ pub fn mock_snapshot_manager() -> SnapshotManager {
 /// Writes a minimal exported snapshot artifact set for snapshot publish/resolve tests.
 pub fn write_mock_built_artifacts(
     root: &Path,
-) -> Result<(PathBuf, PathBuf, FirecrackerSnapshotManifest)> {
+) -> Result<(PathBuf, PathBuf, SandboxSnapshotManifest)> {
     std::fs::create_dir_all(root.join(SNAPSHOT_ARTIFACT_LAYOUT.rootfs_dir))?;
 
     let rootfs_lower = root.join("base.overlaybd.commit");
@@ -135,7 +135,8 @@ pub fn write_mock_built_artifacts(
         ),
     )?;
 
-    let manifest = FirecrackerSnapshotManifest::new(
+    let manifest = SandboxSnapshotManifest::new(
+        crate::sandbox::FIRECRACKER_BACKEND,
         root.join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
         root.join(SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config),
         0,

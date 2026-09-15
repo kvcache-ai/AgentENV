@@ -5,7 +5,7 @@ use agentenv::cfg::{
     ConfigManager, OssBackendConfig, OverlaybdCompressionAlgorithm,
     SnapshotPublishCompressionConfig,
 };
-use agentenv::sandbox::FirecrackerSnapshotManifest;
+use agentenv::sandbox::SandboxSnapshotManifest;
 use agentenv::snapshot::mock::write_mock_built_artifacts;
 use agentenv::snapshot::repository::backends::OssBackend;
 use agentenv::snapshot::{
@@ -98,7 +98,7 @@ fn digest_for_bytes(bytes: &[u8]) -> String {
 /// (found in repositories published while capture-time compression existed).
 async fn write_built_artifacts(
     root: &Path,
-) -> Result<(String, String, PathBuf, FirecrackerSnapshotManifest)> {
+) -> Result<(String, String, PathBuf, SandboxSnapshotManifest)> {
     let (rootfs_lower, _, manifest) = write_mock_built_artifacts(root)?;
     let memory_lower = root.join("mem.zfile.commit");
     write_zfile_memory_lower(&memory_lower).await?;
@@ -123,7 +123,7 @@ fn digest_for_file(path: &Path) -> Result<String> {
 /// compression has been removed. Returns the lower paths and the manifest.
 async fn write_raw_built_artifacts(
     root: &Path,
-) -> Result<(PathBuf, PathBuf, FirecrackerSnapshotManifest)> {
+) -> Result<(PathBuf, PathBuf, SandboxSnapshotManifest)> {
     let (_, _, manifest) = write_mock_built_artifacts(root)?;
     let rootfs_lower = root.join("base.raw.commit");
     let memory_lower = root.join("mem.raw.commit");

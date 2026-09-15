@@ -10,7 +10,7 @@ use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
 use super::catalog::PosixFsCatalogStore;
 use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
-use crate::sandbox::FirecrackerSnapshotManifest;
+use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 use crate::snapshot::repository::{
@@ -162,7 +162,7 @@ impl PosixFsSnapshotRepository {
     fn publish_sync(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: FirecrackerSnapshotManifest,
+        manifest: SandboxSnapshotManifest,
     ) -> RepositoryResult<SnapshotRecord> {
         let mut drive_ids = HashSet::new();
         for drive in &manifest.attached_drives {
@@ -254,7 +254,7 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
     async fn publish(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: FirecrackerSnapshotManifest,
+        manifest: SandboxSnapshotManifest,
     ) -> RepositoryResult<SnapshotRecord> {
         let repository = self.clone();
         run_repository_blocking("publish snapshot", move || {
@@ -477,7 +477,7 @@ mod tests {
     use super::super::runtime::PosixFsRuntimeResolver;
     use super::{PosixFsBackend, PosixFsBackendConfig, PosixFsSnapshotRepository};
     use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
-    use crate::sandbox::{ExtraDrive, FirecrackerSnapshotManifest};
+    use crate::sandbox::{ExtraDrive, SandboxSnapshotManifest};
     use crate::snapshot::artifact_cache::LocalArtifactCache;
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::repository::{
@@ -553,7 +553,7 @@ mod tests {
         )
     }
 
-    fn seed_built_snapshot(root: &Path) -> FirecrackerSnapshotManifest {
+    fn seed_built_snapshot(root: &Path) -> SandboxSnapshotManifest {
         let local_root = root.join("local").join(uuid::Uuid::now_v7().to_string());
         let (_, _, manifest) =
             write_mock_built_artifacts(&local_root).expect("mock built artifacts should write");
@@ -570,7 +570,8 @@ mod tests {
             .join("snapshots")
             .join(snapshot_id.to_string());
         fs::create_dir_all(&snapshot_dir).expect("snapshot dir");
-        let manifest = FirecrackerSnapshotManifest::new(
+        let manifest = SandboxSnapshotManifest::new(
+            crate::sandbox::FIRECRACKER_BACKEND,
             snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
             snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config),
             memory_virtual_size,
@@ -744,7 +745,7 @@ mod tests {
         let tempdir = TempDir::new().expect("tempdir");
         let repository = test_repository(tempdir.path());
         let snapshot_id = SnapshotId::generate();
-        let manifest = FirecrackerSnapshotManifest::for_test(
+        let manifest = SandboxSnapshotManifest::for_test(
             32768,
             &[
                 ExtraDrive::Overlaybd {

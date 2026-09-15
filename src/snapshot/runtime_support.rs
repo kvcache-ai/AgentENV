@@ -5,7 +5,7 @@ use std::sync::Arc;
 use overlaybd::config::{DownloadConfig, ImageConfig, LayerConfig};
 
 use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
-use crate::sandbox::FirecrackerSnapshotManifest;
+use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::{
     ManagedLayer, OverlaybdLayerRef, RepositoryError, RepositoryResult, ResolvedAttachedDrive,
     SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
@@ -105,7 +105,7 @@ pub(crate) fn materialize_image_config_error(label: &str, error: anyhow::Error) 
 pub(crate) fn parse_firecracker_manifest(
     bytes: &[u8],
     manifest_ref: impl AsRef<str>,
-) -> RepositoryResult<FirecrackerSnapshotManifest> {
+) -> RepositoryResult<SandboxSnapshotManifest> {
     serde_json::from_slice(bytes).map_err(|error| {
         RepositoryError::backend(
             format!("parse firecracker manifest '{}'", manifest_ref.as_ref()),
@@ -116,7 +116,7 @@ pub(crate) fn parse_firecracker_manifest(
 
 pub(crate) async fn load_firecracker_manifest_from_path(
     path: &Path,
-) -> RepositoryResult<FirecrackerSnapshotManifest> {
+) -> RepositoryResult<SandboxSnapshotManifest> {
     let bytes = tokio::fs::read(path).await.map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             return RepositoryError::ArtifactNotFound {
@@ -132,12 +132,12 @@ pub(crate) async fn load_firecracker_manifest_from_path(
 }
 
 pub(crate) fn hydrate_runtime_manifest(
-    mut manifest: FirecrackerSnapshotManifest,
+    mut manifest: SandboxSnapshotManifest,
     vm_state_path: PathBuf,
     memory_image_config_path: PathBuf,
     rootfs_image_config_path: PathBuf,
     attached_drives: &[ResolvedAttachedDrive],
-) -> RepositoryResult<FirecrackerSnapshotManifest> {
+) -> RepositoryResult<SandboxSnapshotManifest> {
     let extra_drives = attached_drives
         .iter()
         .map(ResolvedAttachedDrive::to_extra_drive)

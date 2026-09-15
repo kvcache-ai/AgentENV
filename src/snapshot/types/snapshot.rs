@@ -16,7 +16,7 @@ use shell_util::shell_quote;
 use super::drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
 use super::value::{SnapshotAlias, SnapshotId};
 use super::version::SnapshotRuntimeVersions;
-use crate::sandbox::FirecrackerSnapshotManifest;
+use crate::sandbox::SandboxSnapshotManifest;
 use crate::types::{ImageConfigs, SandboxResources};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -517,14 +517,14 @@ fn default_runtime_artifact_lease() -> Arc<dyn RuntimeArtifactLease> {
 /// Runtime-ready snapshot with node-local artifact paths.
 pub struct RunnableSnapshot {
     record: SnapshotRecord,
-    manifest: FirecrackerSnapshotManifest,
+    manifest: SandboxSnapshotManifest,
     _lease: Arc<dyn RuntimeArtifactLease>,
 }
 
 impl RunnableSnapshot {
     pub(crate) fn new(
         record: SnapshotRecord,
-        manifest: FirecrackerSnapshotManifest,
+        manifest: SandboxSnapshotManifest,
         lease: Arc<dyn RuntimeArtifactLease>,
     ) -> Self {
         Self {
@@ -556,7 +556,7 @@ impl RunnableSnapshot {
             .collect()
     }
 
-    pub fn manifest(&self) -> &FirecrackerSnapshotManifest {
+    pub fn manifest(&self) -> &SandboxSnapshotManifest {
         &self.manifest
     }
 
@@ -598,7 +598,7 @@ impl RunnableSnapshot {
 
         Self {
             record,
-            manifest: FirecrackerSnapshotManifest::for_test(0, &extra_drives),
+            manifest: SandboxSnapshotManifest::for_test(0, &extra_drives),
             _lease: default_runtime_artifact_lease(),
         }
     }

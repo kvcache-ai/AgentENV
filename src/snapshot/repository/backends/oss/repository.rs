@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use super::client::{OssClient, OssUploadArtifact};
 use super::layout::OssSnapshotArtifactLayout;
 use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
-use crate::sandbox::{FirecrackerSnapshotManifest, OverlaybdCompactOutput};
+use crate::sandbox::{OverlaybdCompactOutput, SandboxSnapshotManifest};
 use crate::snapshot::repository::backends::common::acr::{
     AcrDiskImageExporter, DiskImageExportOutcome, DiskImageSubject, SnapshotOciConfigInput,
 };
@@ -44,7 +44,7 @@ use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord, VolumeS
 /// catalog/aliases/{name}.json              → "snapshot-id"
 /// volumes/records/{volume-id}.json         → VolumeRecord
 /// volumes/aliases/{volume-name}.json       → "volume-id"
-/// artifacts/{id}/firecracker-manifest.json → FirecrackerSnapshotManifest (paths omitted)
+/// artifacts/{id}/firecracker-manifest.json → SandboxSnapshotManifest (paths omitted)
 /// artifacts/{id}/vm_state.bin
 /// managed-layers/{digest}
 /// ```
@@ -278,7 +278,7 @@ impl SnapshotRepository for OssSnapshotRepository {
     async fn publish(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: FirecrackerSnapshotManifest,
+        manifest: SandboxSnapshotManifest,
     ) -> RepositoryResult<SnapshotRecord> {
         let id = &metadata.id;
         let layout = self.layout(id);
@@ -1495,7 +1495,7 @@ impl OssSnapshotRepository {
     async fn export_attached_drives(
         &self,
         snapshot_id: &SnapshotId,
-        manifest: &crate::sandbox::FirecrackerSnapshotManifest,
+        manifest: &crate::sandbox::SandboxSnapshotManifest,
         publications: &mut Vec<PersistedDiskImagePublication>,
     ) -> RepositoryResult<Vec<CommittedAttachedDrive>> {
         let mut drives = Vec::new();
@@ -1785,7 +1785,7 @@ async fn upload_managed_layer_if_missing(
 }
 
 fn validate_publish_manifest_image_configs(
-    manifest: &FirecrackerSnapshotManifest,
+    manifest: &SandboxSnapshotManifest,
 ) -> RepositoryResult<()> {
     load_overlaybd_image_config(&manifest.rootfs.image_config_path).map_err(|e| {
         RepositoryError::backend(
@@ -1940,7 +1940,7 @@ mod tests {
             }),
         );
 
-        let mut manifest = FirecrackerSnapshotManifest::for_test(1024, &[]);
+        let mut manifest = SandboxSnapshotManifest::for_test(1024, &[]);
         manifest.rootfs.image_config_path = rootfs_image_config;
         manifest.memory.image_config_path = memory_image_config;
 

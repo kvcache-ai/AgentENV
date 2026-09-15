@@ -8,7 +8,6 @@ mod config;
 mod connector;
 mod factory;
 mod instance;
-mod manifest;
 mod mmds;
 mod overlaybd_snapshot;
 mod pool;
@@ -22,6 +21,5 @@ pub use config::{
 };
 pub use factory::FirecrackerSandboxFactory;
 pub(super) use instance::FirecrackerInstance;
-pub use manifest::FirecrackerSnapshotManifest;
 pub use pool::FirecrackerPool;
 pub use sandbox::{FirecrackerCapturedSnapshot, FirecrackerPausedState, FirecrackerSandbox};

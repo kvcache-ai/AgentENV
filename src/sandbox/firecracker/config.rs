@@ -16,6 +16,7 @@ use crate::sandbox::SandboxNetworkPolicy;
 use crate::sandbox::UblkBackend;
 use crate::sandbox::{
     validate_drive_id, EnvdAccessToken, ExtraDrive, OverlaybdConfig, SandboxLaunchConfig,
+    FIRECRACKER_BACKEND,
 };
 use crate::snapshot::RunnableSnapshot;
 use anyhow::{bail, Context, Result};
@@ -487,6 +488,14 @@ impl FirecrackerSnapshotConfig {
         let mut base_common =
             FirecrackerCommonConfig::from_global_config().context("load sandbox common config")?;
         let manifest = snapshot.manifest();
+        if manifest.backend != FIRECRACKER_BACKEND {
+            bail!(
+                "snapshot '{}' was captured by the {} backend, and a capture is restored by \
+                 the VMM which took it",
+                snapshot.record().id,
+                manifest.backend
+            );
+        }
 
         let app_config = ConfigManager::global_config();
         let snapshot_mode = snapshot.committed().virtualization_mode;

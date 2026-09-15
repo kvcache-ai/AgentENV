@@ -368,7 +368,7 @@ impl OssRuntimeResolver {
         &self,
         layout: &OssSnapshotArtifactLayout<'_>,
         snapshot_id: &SnapshotId,
-    ) -> RepositoryResult<crate::sandbox::FirecrackerSnapshotManifest> {
+    ) -> RepositoryResult<crate::sandbox::SandboxSnapshotManifest> {
         let p2p_key =
             p2p::fixed_artifact_key(snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
         if let Some(transport) = self.p2p_transport.as_ref() {

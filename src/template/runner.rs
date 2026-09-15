@@ -13,8 +13,8 @@ use super::build_spec::TemplateBuildStep;
 use super::errors::{command_output_suffix, TemplateBuildFailure};
 use super::step_executor::TemplateStepExecutor;
 use crate::sandbox::{
-    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotManifest, ProcessHandle,
-    ProcessOpts, SandboxExecutor, SandboxLaunchConfig, UblkConfig,
+    FirecrackerSandbox, FirecrackerSandboxConfig, ProcessHandle, ProcessOpts, SandboxExecutor,
+    SandboxLaunchConfig, SandboxSnapshotManifest, UblkConfig,
 };
 use crate::snapshot::{
     CommandContext, RunnableSnapshot, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions,
@@ -86,7 +86,7 @@ pub(crate) struct TemplateBuildRunner {
 #[derive(Clone, Debug)]
 pub(crate) struct TemplateBuildExecution {
     pub runtime_versions: SnapshotRuntimeVersions,
-    pub manifest: FirecrackerSnapshotManifest,
+    pub manifest: SandboxSnapshotManifest,
     pub build_context: CommandContext,
     pub startup: Option<StartupCommand>,
     pub image_configs: ImageConfigs,

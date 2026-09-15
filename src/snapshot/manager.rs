@@ -9,7 +9,7 @@ use super::p2p::SnapshotP2pArtifact;
 use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
 use crate::p2p::P2pTransport;
 use crate::sandbox::{
-    CapturedSandboxSnapshot, FirecrackerCapturedSnapshot, FirecrackerSnapshotManifest,
+    CapturedSandboxSnapshot, FirecrackerCapturedSnapshot, SandboxSnapshotManifest,
 };
 use crate::snapshot::repository::backends::build_snapshot_backend;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
@@ -110,7 +110,7 @@ impl SnapshotManager {
     pub async fn publish(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: FirecrackerSnapshotManifest,
+        manifest: SandboxSnapshotManifest,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
         let record = self
             .repository
@@ -146,7 +146,7 @@ impl SnapshotManager {
     async fn publish_p2p_artifacts(
         &self,
         record: &SnapshotRecord,
-        manifest: &FirecrackerSnapshotManifest,
+        manifest: &SandboxSnapshotManifest,
     ) {
         let Some(transport) = self.p2p_transport.as_ref() else {
             return;

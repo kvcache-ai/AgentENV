@@ -129,7 +129,7 @@ impl PosixFsRuntimeResolver {
     async fn load_committed_firecracker_manifest(
         &self,
         snapshot_id: &SnapshotId,
-    ) -> RepositoryResult<crate::sandbox::FirecrackerSnapshotManifest> {
+    ) -> RepositoryResult<crate::sandbox::SandboxSnapshotManifest> {
         let manifest_path = self
             .snapshot_layout(snapshot_id)
             .path(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);

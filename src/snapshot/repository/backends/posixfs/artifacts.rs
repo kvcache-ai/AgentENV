@@ -9,7 +9,7 @@ use tempfile::NamedTempFile;
 use super::super::common::write_dense_overlaybd_layer_to_file_blocking;
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::digest::{self, FileDigest};
-use crate::sandbox::FirecrackerSnapshotManifest;
+use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::{
     CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, RepositoryError, RepositoryResult,
     SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
@@ -55,7 +55,7 @@ impl PosixFsArtifactStore {
     pub(crate) fn import_built_artifacts(
         &self,
         snapshot_id: &SnapshotId,
-        manifest: &FirecrackerSnapshotManifest,
+        manifest: &SandboxSnapshotManifest,
     ) -> RepositoryResult<CollectedBuiltArtifacts> {
         let committed_layout = self.committed_layout(snapshot_id);
 
@@ -106,7 +106,7 @@ impl PosixFsArtifactStore {
     fn persist_firecracker_manifest(
         &self,
         destination: PathBuf,
-        manifest: &crate::sandbox::FirecrackerSnapshotManifest,
+        manifest: &crate::sandbox::SandboxSnapshotManifest,
     ) -> RepositoryResult<()> {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).map_err(|error| {

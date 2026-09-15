@@ -4,6 +4,7 @@ pub(crate) mod custom_extension;
 mod envd;
 mod extra_drive;
 mod firecracker;
+pub mod manifest;
 #[cfg(test)]
 pub(crate) mod mock;
 mod network;
@@ -32,8 +33,9 @@ pub use extra_drive::{
 pub use firecracker::{
     FirecrackerCapturedSnapshot, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
-    FirecrackerSandboxFactory, FirecrackerSnapshotConfig, FirecrackerSnapshotManifest,
+    FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
 };
+pub use manifest::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
 pub use network::{
     BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,

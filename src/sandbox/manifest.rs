@@ -3,11 +3,26 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::ExtraDrive;
+use super::ExtraDrive;
 
 pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 1;
 
-/// Manifest describing the on-disk layout of a Firecracker snapshot.
+/// Name `backend` takes when a record predates the field.
+pub const FIRECRACKER_BACKEND: &str = "firecracker";
+
+/// Names a restore knows how to reach a VMM by.
+const KNOWN_BACKENDS: &[&str] = &[FIRECRACKER_BACKEND];
+
+fn default_backend() -> String {
+    FIRECRACKER_BACKEND.to_string()
+}
+
+/// Manifest describing the on-disk layout of a captured sandbox.
+///
+/// The shape is the same whichever VMM took the capture: one VM-state file,
+/// an overlaybd image for the memory and one for the root filesystem, and a
+/// descriptor per attached drive. `backend` names the VMM, so a factory can
+/// refuse a snapshot it cannot restore.
 ///
 /// This is intentionally decoupled from in-memory snapshot representations.
 /// Snapshot-layer retrieve artifacts based on the manifest during snapshot
@@ -16,13 +31,18 @@ pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 1;
 /// All paths in the manifest should be absolute.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FirecrackerSnapshotManifest {
+pub struct SandboxSnapshotManifest {
     /// Schema/version marker for persisted manifest format.
     pub version: u32,
-    pub vm_state: FirecrackerVmStateArtifacts,
-    pub memory: FirecrackerMemoryArtifacts,
-    pub rootfs: FirecrackerRootfsArtifacts,
-    pub attached_drives: Vec<FirecrackerAttachedDriveArtifacts>,
+    /// The VMM which took the capture. Records written before the field
+    /// existed carry Firecracker captures, so that is what a missing value
+    /// means.
+    #[serde(default = "default_backend")]
+    pub backend: String,
+    pub vm_state: SnapshotVmStateArtifacts,
+    pub memory: SnapshotMemoryArtifacts,
+    pub rootfs: SnapshotRootfsArtifacts,
+    pub attached_drives: Vec<SnapshotAttachedDriveArtifacts>,
     /// Number of reserved virtio-block slots available for launch-time volumes.
     #[serde(default)]
     pub volume_drive_slots: usize,
@@ -34,14 +54,14 @@ pub struct FirecrackerSnapshotManifest {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FirecrackerVmStateArtifacts {
+pub struct SnapshotVmStateArtifacts {
     #[serde(skip)]
     pub path: PathBuf,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FirecrackerMemoryArtifacts {
+pub struct SnapshotMemoryArtifacts {
     #[serde(skip)]
     pub image_config_path: PathBuf,
     pub virtual_size: u64,
@@ -49,7 +69,7 @@ pub struct FirecrackerMemoryArtifacts {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FirecrackerRootfsArtifacts {
+pub struct SnapshotRootfsArtifacts {
     #[serde(skip)]
     pub image_config_path: PathBuf,
     pub virtual_size: u64,
@@ -57,7 +77,7 @@ pub struct FirecrackerRootfsArtifacts {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FirecrackerAttachedDriveArtifacts {
+pub struct SnapshotAttachedDriveArtifacts {
     pub drive_id: String,
     pub read_only: bool,
     #[serde(default)]
@@ -69,8 +89,13 @@ pub struct FirecrackerAttachedDriveArtifacts {
     pub image_config_path: PathBuf,
 }
 
-impl FirecrackerSnapshotManifest {
+impl SandboxSnapshotManifest {
+    /// Describe a capture `backend` wrote. Pass the backend's own name, one
+    /// of the `*_BACKEND` constants, so a restore reaches the VMM which took
+    /// it. A name no restore knows is refused here, before it reaches a
+    /// published record.
     pub fn new(
+        backend: &str,
         vm_state_path: impl Into<PathBuf>,
         mem_image_config_path: impl Into<PathBuf>,
         mem_virtual_size: u64,
@@ -78,16 +103,20 @@ impl FirecrackerSnapshotManifest {
         rootfs_virtual_size: u64,
         attached_drives: &[ExtraDrive],
     ) -> Result<Self> {
+        if !KNOWN_BACKENDS.contains(&backend) {
+            bail!("backend '{backend}' names no VMM a restore can reach");
+        }
         Self {
             version: MANIFEST_FORMAT_VERSION,
-            vm_state: FirecrackerVmStateArtifacts {
+            backend: backend.to_string(),
+            vm_state: SnapshotVmStateArtifacts {
                 path: vm_state_path.into(),
             },
-            memory: FirecrackerMemoryArtifacts {
+            memory: SnapshotMemoryArtifacts {
                 image_config_path: mem_image_config_path.into(),
                 virtual_size: mem_virtual_size,
             },
-            rootfs: FirecrackerRootfsArtifacts {
+            rootfs: SnapshotRootfsArtifacts {
                 image_config_path: rootfs_image_config_path.into(),
                 virtual_size: rootfs_virtual_size,
             },
@@ -135,7 +164,7 @@ impl FirecrackerSnapshotManifest {
                         drive.drive_id()
                     );
                 }
-                Ok(FirecrackerAttachedDriveArtifacts {
+                Ok(SnapshotAttachedDriveArtifacts {
                     drive_id: drive.drive_id().to_string(),
                     read_only: drive.read_only(),
                     mount_path: drive.mount_path().to_path_buf(),
@@ -151,12 +180,13 @@ impl FirecrackerSnapshotManifest {
 
 #[cfg(test)]
 #[doc(hidden)]
-impl FirecrackerSnapshotManifest {
+impl SandboxSnapshotManifest {
     pub(crate) fn for_test(
         rootfs_virtual_size: u64,
         attached_drives: &[ExtraDrive],
-    ) -> FirecrackerSnapshotManifest {
-        let mut manifest = FirecrackerSnapshotManifest::new(
+    ) -> SandboxSnapshotManifest {
+        let mut manifest = SandboxSnapshotManifest::new(
+            FIRECRACKER_BACKEND,
             "vm_state.bin",
             "mem_image.json",
             0,
@@ -183,7 +213,7 @@ mod tests {
 
     #[test]
     fn attached_drive_virtual_size_is_required() {
-        let err = serde_json::from_value::<FirecrackerAttachedDriveArtifacts>(serde_json::json!({
+        let err = serde_json::from_value::<SnapshotAttachedDriveArtifacts>(serde_json::json!({
             "driveId": "data",
             "readOnly": true,
             "mountPath": "/mnt/data"
@@ -195,7 +225,7 @@ mod tests {
 
     #[test]
     fn attached_drive_virtual_size_is_serialized_and_mapped_to_runtime_input() {
-        let known = FirecrackerAttachedDriveArtifacts {
+        let known = SnapshotAttachedDriveArtifacts {
             drive_id: "data".to_string(),
             read_only: true,
             mount_path: PathBuf::from("/mnt/data"),
@@ -207,16 +237,17 @@ mod tests {
         let known_json = serde_json::to_value(&known).unwrap();
         assert_eq!(known_json["virtualSize"], serde_json::json!(4096));
 
-        let manifest = FirecrackerSnapshotManifest {
+        let manifest = SandboxSnapshotManifest {
             version: MANIFEST_FORMAT_VERSION,
-            vm_state: FirecrackerVmStateArtifacts {
+            backend: default_backend(),
+            vm_state: SnapshotVmStateArtifacts {
                 path: PathBuf::from("vm_state.bin"),
             },
-            memory: FirecrackerMemoryArtifacts {
+            memory: SnapshotMemoryArtifacts {
                 image_config_path: PathBuf::from("mem_image.json"),
                 virtual_size: 4096,
             },
-            rootfs: FirecrackerRootfsArtifacts {
+            rootfs: SnapshotRootfsArtifacts {
                 image_config_path: PathBuf::from("rootfs/image.json"),
                 virtual_size: 4096,
             },
@@ -242,7 +273,8 @@ mod tests {
             volume: false,
         };
 
-        let err = FirecrackerSnapshotManifest::new(
+        let err = SandboxSnapshotManifest::new(
+            FIRECRACKER_BACKEND,
             "vm_state.bin",
             "mem_image.json",
             4096,
@@ -257,7 +289,8 @@ mod tests {
 
     #[test]
     fn with_extra_drives_rejects_zero_virtual_size() {
-        let manifest = FirecrackerSnapshotManifest::new(
+        let manifest = SandboxSnapshotManifest::new(
+            FIRECRACKER_BACKEND,
             "vm_state.bin",
             "mem_image.json",
             4096,
