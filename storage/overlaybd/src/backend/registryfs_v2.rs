@@ -533,7 +533,12 @@ impl RegistryFSImplV2 {
         url: &str,
         auth_header: &str,
     ) -> Result<ActualUrlResponse> {
-        let mut req = self.client.get(url).timeout(self.timeout);
+        // URL probes must also work with range-only endpoints such as the P2P facade.
+        let mut req = self
+            .client
+            .get(url)
+            .header(RANGE, "bytes=0-0")
+            .timeout(self.timeout);
         if !auth_header.is_empty() {
             req = req.header(AUTHORIZATION, auth_header);
         }
