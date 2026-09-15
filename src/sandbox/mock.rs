@@ -51,6 +51,7 @@ pub enum MockOperation {
     Pause,
     Resume,
     Snapshot,
+    CaptureToDir,
     SnapshotVolumes,
     ThawVolumes,
     Fork,
@@ -314,6 +315,16 @@ impl SandboxBackend for MockSandboxBackend {
             crate::sandbox::manifest::SandboxSnapshotManifest::for_test(4096, &[]),
             MockCapturedSnapshot,
         ))
+    }
+
+    async fn capture_to_dir(
+        &mut self,
+        _at: &std::path::Path,
+    ) -> SandboxCaptureResult<crate::sandbox::SandboxSnapshotManifest> {
+        self.behavior
+            .apply_capture_result(MockOperation::CaptureToDir)
+            .await?;
+        Ok(crate::sandbox::SandboxSnapshotManifest::for_test(4096, &[]))
     }
 
     async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {

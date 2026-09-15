@@ -345,6 +345,13 @@ impl SandboxBackend for FirecrackerSandbox {
         Ok(CapturedSandboxSnapshot::new(manifest, live_snapshot_root))
     }
 
+    async fn capture_to_dir(&mut self, at: &Path) -> SandboxCaptureResult<SandboxSnapshotManifest> {
+        match self.pause_to_dir(at).await {
+            Ok((_, manifest)) => Ok(manifest),
+            Err(error) => self.recover_capture_failure("capture", error).await,
+        }
+    }
+
     async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
         if !self.has_writable_persistent_volumes() {
             return Ok(());
@@ -1330,14 +1337,6 @@ impl FirecrackerSandbox {
         self.network_slot
             .as_ref()
             .map(|slot| slot.host_interaction_ip)
-    }
-
-    pub(crate) fn firecracker_binary_path(&self) -> &Path {
-        &self.launch.common().firecracker_binary
-    }
-
-    pub(crate) fn tools_drive_version(&self) -> &str {
-        &self.launch.common().tools_drive_version
     }
 
     /// Resolve the Firecracker stdout log path (created only when capture is enabled).

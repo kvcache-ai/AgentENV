@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::sandbox::{FirecrackerSandbox, SandboxExecutor};
+use crate::sandbox::SandboxExecutor;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotRuntimeVersions {
@@ -31,19 +31,24 @@ impl SnapshotRuntimeVersions {
         }
     }
 
+    /// Read the versions a sandbox is running under. `vmm_binary` is the
+    /// VMM the sandbox runs on, asked for its version, and
+    /// `tools_drive_version` is the one the sandbox was given.
     #[tracing::instrument(skip(sandbox))]
-    pub async fn probe(sandbox: &FirecrackerSandbox) -> Result<Self> {
-        let firecracker_binary = sandbox.firecracker_binary_path().to_path_buf();
+    pub async fn probe(
+        sandbox: &impl SandboxExecutor,
+        vmm_binary: PathBuf,
+        tools_drive_version: String,
+    ) -> Result<Self> {
         let (kernel_version, firecracker_version, envd_version) = tokio::join!(
             probe_kernel_version(sandbox),
-            probe_firecracker_version(firecracker_binary),
+            probe_vmm_version(vmm_binary),
             probe_envd_version(sandbox),
         );
 
         let kernel_version = version_or_unknown("kernel", kernel_version);
-        let firecracker_version = version_or_unknown("firecracker", firecracker_version);
+        let firecracker_version = version_or_unknown("vmm", firecracker_version);
         let envd_version = envd_version?;
-        let tools_drive_version = sandbox.tools_drive_version().to_string();
 
         debug!(
             kernel_version,
@@ -95,17 +100,17 @@ async fn probe_kernel_version(sandbox: &impl SandboxExecutor) -> Result<String> 
     parse_kernel_version(&output.stdout)
 }
 
-async fn probe_firecracker_version(firecracker_binary: PathBuf) -> Result<String> {
+async fn probe_vmm_version(vmm_binary: PathBuf) -> Result<String> {
     let output = tokio::time::timeout(
         Duration::from_secs(5),
         tokio::task::spawn_blocking(move || {
-            std::process::Command::new(&firecracker_binary)
+            std::process::Command::new(&vmm_binary)
                 .arg("--version")
                 .output()
                 .with_context(|| {
                     format!(
                         "run firecracker version probe using {}",
-                        firecracker_binary.display()
+                        vmm_binary.display()
                     )
                 })
         }),

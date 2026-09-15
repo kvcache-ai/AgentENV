@@ -12,9 +12,10 @@ use tracing::{debug, warn, Span};
 use super::build_spec::TemplateBuildStep;
 use super::errors::{command_output_suffix, TemplateBuildFailure};
 use super::step_executor::TemplateStepExecutor;
+use crate::cfg::ConfigManager;
 use crate::sandbox::{
-    FirecrackerSandbox, FirecrackerSandboxConfig, ProcessHandle, ProcessOpts, SandboxExecutor,
-    SandboxLaunchConfig, SandboxSnapshotManifest, UblkConfig,
+    FirecrackerSandbox, FirecrackerSandboxConfig, ProcessHandle, ProcessOpts, SandboxBackend,
+    SandboxExecutor, SandboxLaunchConfig, SandboxSnapshotManifest, UblkConfig,
 };
 use crate::snapshot::{
     CommandContext, RunnableSnapshot, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions,
@@ -83,6 +84,19 @@ pub(crate) struct TemplateBuildRunner {
     step_executor: TemplateStepExecutor,
 }
 
+/// What a template build needs beyond its context and the sandbox itself.
+///
+/// `vmm_binary` is the VMM the build runs on, asked for its version, and
+/// `tools_drive_version` is the one the sandbox was given. Both are recorded
+/// against the snapshot the build produces.
+struct TemplateBuildInputs {
+    sandbox_id: SandboxId,
+    resources: SandboxResources,
+    image_configs: ImageConfigs,
+    vmm_binary: PathBuf,
+    tools_drive_version: String,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct TemplateBuildExecution {
     pub runtime_versions: SnapshotRuntimeVersions,
@@ -132,6 +146,8 @@ impl TemplateBuildRunner {
             );
         }
 
+        let sandbox_id = SandboxId::new();
+        let global = ConfigManager::global_config();
         let user_image_config = crate::sandbox::OverlaybdConfig {
             image_config_path: launch_rootfs_path.to_path_buf(),
             read_only: false,
@@ -148,18 +164,22 @@ impl TemplateBuildRunner {
             .then_some(context.initial_context.env_vars.clone());
         config.common.default_user = context.initial_context.user.clone();
         config.common.default_workdir = Some(context.initial_context.workdir.clone());
-        let sandbox_id = SandboxId::new();
         let image_configs = image_configs.clone();
         let launch_config =
             SandboxLaunchConfig::new(sandbox_id, context.build_snapshot_id.to_string())
                 .with_image_configs(&image_configs);
         config = config.apply_launch_config(&launch_config);
 
+        let tools_drive_version = global.resolved_tools_version().to_string();
         self.run_template_build(
             context,
-            sandbox_id,
-            context.resources,
-            image_configs,
+            TemplateBuildInputs {
+                sandbox_id,
+                resources: context.resources,
+                image_configs,
+                vmm_binary: global.resolved_firecracker_binary_path(),
+                tools_drive_version,
+            },
             move || FirecrackerSandbox::new_with_id(config, sandbox_id),
         )
     }
@@ -181,22 +201,42 @@ impl TemplateBuildRunner {
                 .with_image_configs(&image_configs);
         let resources = *base_snapshot.resources();
 
-        self.run_template_build(context, sandbox_id, resources, image_configs, move || {
-            FirecrackerSandbox::from_snapshot(&base_snapshot, &launch_config)
-        })
+        let global = ConfigManager::global_config();
+        let tools_drive_version = base_snapshot
+            .committed()
+            .runtime_versions
+            .tools_drive_version
+            .clone();
+        self.run_template_build(
+            context,
+            TemplateBuildInputs {
+                sandbox_id,
+                resources,
+                image_configs,
+                vmm_binary: global.resolved_firecracker_binary_path(),
+                tools_drive_version,
+            },
+            move || FirecrackerSandbox::from_snapshot(&base_snapshot, &launch_config),
+        )
     }
 
-    fn run_template_build<F>(
+    fn run_template_build<F, S>(
         &self,
         context: &TemplateBuildContext,
-        sandbox_id: SandboxId,
-        resources: SandboxResources,
-        image_configs: ImageConfigs,
+        inputs: TemplateBuildInputs,
         create_sandbox: F,
     ) -> Result<TemplateBuildExecution>
     where
-        F: FnOnce() -> Result<FirecrackerSandbox> + Send + 'static,
+        F: FnOnce() -> Result<S> + Send + 'static,
+        S: SandboxBackend + SandboxExecutor + 'static,
     {
+        let TemplateBuildInputs {
+            sandbox_id,
+            resources,
+            image_configs,
+            vmm_binary,
+            tools_drive_version,
+        } = inputs;
         let worker_span = tracing::debug_span!("template_build_sandbox", sandbox_id = %sandbox_id);
         let step_executor = self.step_executor.clone();
         let steps = context.steps.clone();
@@ -228,10 +268,15 @@ impl TemplateBuildRunner {
                         ensure_default_user(&sandbox, &build_context).await?;
                         let startup = prepare_startup(startup, override_startup, &build_context);
                         run_startup_commands(&sandbox, startup.as_ref()).await?;
-                        let runtime_versions = SnapshotRuntimeVersions::probe(&sandbox).await?;
+                        let runtime_versions = SnapshotRuntimeVersions::probe(
+                            &sandbox,
+                            vmm_binary,
+                            tools_drive_version,
+                        )
+                        .await?;
 
                         debug!("capturing template snapshot");
-                        let (_, manifest) = sandbox.pause_to_dir(&output_dir).await?;
+                        let manifest = sandbox.capture_to_dir(&output_dir).await?;
                         debug!("template snapshot captured");
 
                         Ok(TemplateBuildExecution {

@@ -258,6 +258,13 @@ pub trait SandboxBackend: Send + 'static {
         spec: &[SandboxForkSpec],
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>>;
 
+    /// Capture the guest into `at` and describe what was written.
+    ///
+    /// The guest is left held. A template build takes its snapshot this way
+    /// and stops the sandbox afterwards, so unlike [`snapshot`][Self::snapshot]
+    /// nothing is resumed and the directory is the caller's to keep.
+    async fn capture_to_dir(&mut self, at: &Path) -> SandboxCaptureResult<SandboxSnapshotManifest>;
+
     /// Stop the sandbox and release all associated system resources.
     ///
     /// Idempotent: calling `stop` more than once must not return an error.
