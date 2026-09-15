@@ -310,7 +310,10 @@ impl SandboxBackend for MockSandboxBackend {
         self.behavior
             .apply_capture_result(MockOperation::Snapshot)
             .await?;
-        Ok(CapturedSandboxSnapshot::new(MockCapturedSnapshot))
+        Ok(CapturedSandboxSnapshot::new(
+            crate::sandbox::manifest::SandboxSnapshotManifest::for_test(4096, &[]),
+            MockCapturedSnapshot,
+        ))
     }
 
     async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {

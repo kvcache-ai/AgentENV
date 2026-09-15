@@ -4,6 +4,7 @@
 //! [`SandboxBackendFactory`] is responsible for constructing new sandbox
 //! instances (from scratch, from a committed snapshot, or from paused state).
 
+use super::manifest::SandboxSnapshotManifest;
 use std::any::Any;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -138,42 +139,48 @@ pub struct SandboxRuntimeInfo {
 /// consumption by snapshot publication code. Concrete backends may use it to
 /// keep temporary artifact directories alive until publication finishes.
 pub struct CapturedSandboxSnapshot {
-    inner: Box<dyn Any + Send>,
+    manifest: SandboxSnapshotManifest,
+    artifacts: Box<dyn Any + Send>,
 }
 
 impl CapturedSandboxSnapshot {
-    pub fn new<T>(snapshot: T) -> Self
+    /// Take a capture, with whatever the backend has to hold on to until
+    /// publication is over. A backend which writes its artifacts under a
+    /// temporary root passes the guard of that root as `artifacts`, and one
+    /// which writes them somewhere durable passes `()`.
+    pub fn new<T>(manifest: SandboxSnapshotManifest, artifacts: T) -> Self
     where
         T: Send + 'static,
     {
         Self {
-            inner: Box::new(snapshot),
+            manifest,
+            artifacts: Box::new(artifacts),
         }
     }
 
-    pub fn downcast_ref<T>(&self) -> Option<&T>
-    where
-        T: Send + 'static,
-    {
-        self.inner.downcast_ref::<T>()
+    /// What was captured, in the form the snapshot layer publishes.
+    pub fn manifest(&self) -> &SandboxSnapshotManifest {
+        &self.manifest
     }
 
-    pub fn downcast<T>(self) -> std::result::Result<T, Self>
+    /// The backend which took the capture.
+    pub fn backend(&self) -> &str {
+        &self.manifest.backend
+    }
+
+    pub fn downcast_artifacts_ref<T>(&self) -> Option<&T>
     where
         T: Send + 'static,
     {
-        match self.inner.downcast::<T>() {
-            Ok(inner) => Ok(*inner),
-            Err(inner) => Err(Self { inner }),
-        }
+        self.artifacts.downcast_ref::<T>()
     }
 }
 
 impl fmt::Debug for CapturedSandboxSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CapturedSandboxSnapshot")
-            .field("opaque", &true)
-            .finish()
+            .field("backend", &self.manifest.backend)
+            .finish_non_exhaustive()
     }
 }
 

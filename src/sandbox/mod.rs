@@ -31,9 +31,9 @@ pub use extra_drive::{
     validate_sub_path, ExtraDrive,
 };
 pub use firecracker::{
-    FirecrackerCapturedSnapshot, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
-    FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
-    FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
+    FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool, FirecrackerRuntimePolicy,
+    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSandboxFactory,
+    FirecrackerSnapshotConfig,
 };
 pub use manifest::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};

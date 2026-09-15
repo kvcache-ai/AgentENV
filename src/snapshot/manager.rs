@@ -8,12 +8,10 @@ use tracing::warn;
 use super::p2p::SnapshotP2pArtifact;
 use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
 use crate::p2p::P2pTransport;
-use crate::sandbox::{
-    CapturedSandboxSnapshot, FirecrackerCapturedSnapshot, SandboxSnapshotManifest,
-};
+use crate::sandbox::{CapturedSandboxSnapshot, SandboxSnapshotManifest};
 use crate::snapshot::repository::backends::build_snapshot_backend;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
-use crate::snapshot::repository::{RepositoryError, SnapshotListFilter};
+use crate::snapshot::repository::SnapshotListFilter;
 use crate::snapshot::{
     ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
     SnapshotRecord,
@@ -126,12 +124,7 @@ impl SnapshotManager {
         metadata: SnapshotPublishMetadata,
         captured_snapshot: CapturedSandboxSnapshot,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
-        let manifest = captured_snapshot
-            .downcast_ref::<FirecrackerCapturedSnapshot>()
-            .map(|snapshot| snapshot.manifest().clone())
-            .ok_or_else(|| RepositoryError::Unsupported {
-                feature: "publishing captured snapshots for this sandbox backend".to_string(),
-            })?;
+        let manifest = captured_snapshot.manifest().clone();
 
         let record = self
             .repository

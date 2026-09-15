@@ -208,13 +208,6 @@ pub struct FirecrackerSandbox {
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
 
-/// Firecracker-specific captured snapshot payload kept alive for publication.
-#[derive(Debug)]
-pub struct FirecrackerCapturedSnapshot {
-    manifest: SandboxSnapshotManifest,
-    _snapshot_root: Arc<PersistentSnapshotRootGuard>,
-}
-
 #[derive(Clone, Debug)]
 pub struct FirecrackerPausedState {
     snapshot_config: FirecrackerSnapshotConfig,
@@ -253,22 +246,6 @@ impl PausedSandboxState for FirecrackerPausedState {
         RuntimeArtifactSet::from_overlaybd_image_configs(rootfs_and_extra_drive_image_config_paths(
             &self.snapshot_config.common,
         ))
-    }
-}
-
-impl FirecrackerCapturedSnapshot {
-    pub(crate) fn new(
-        manifest: SandboxSnapshotManifest,
-        snapshot_root: Arc<PersistentSnapshotRootGuard>,
-    ) -> Self {
-        Self {
-            manifest,
-            _snapshot_root: snapshot_root,
-        }
-    }
-
-    pub fn manifest(&self) -> &SandboxSnapshotManifest {
-        &self.manifest
     }
 }
 
@@ -365,9 +342,7 @@ impl SandboxBackend for FirecrackerSandbox {
             .await
             .map_err(SandboxCaptureError::terminal)?;
 
-        Ok(CapturedSandboxSnapshot::new(
-            FirecrackerCapturedSnapshot::new(manifest, live_snapshot_root),
-        ))
+        Ok(CapturedSandboxSnapshot::new(manifest, live_snapshot_root))
     }
 
     async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {

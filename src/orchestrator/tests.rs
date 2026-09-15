@@ -1928,7 +1928,7 @@ async fn capture_snapshot_returns_snapshot_and_preserves_running_sandbox() -> Re
     assert!(
         result
             .captured_snapshot
-            .downcast_ref::<crate::sandbox::mock::MockCapturedSnapshot>()
+            .downcast_artifacts_ref::<crate::sandbox::mock::MockCapturedSnapshot>()
             .is_some(),
         "capture_snapshot should return the backend-provided snapshot payload"
     );
@@ -1998,7 +1998,7 @@ async fn capture_snapshot_recoverable_failure_rolls_back_to_running_and_allows_r
     assert!(
         retry
             .captured_snapshot
-            .downcast_ref::<crate::sandbox::mock::MockCapturedSnapshot>()
+            .downcast_artifacts_ref::<crate::sandbox::mock::MockCapturedSnapshot>()
             .is_some(),
         "retry should produce a captured snapshot"
     );
