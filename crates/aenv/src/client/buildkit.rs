@@ -118,7 +118,11 @@ where
     let downstream = async {
         while let Some(message) = receiver.next().await {
             match message? {
-                Message::Binary(bytes) => write.write_all(&bytes).await?,
+                Message::Binary(bytes) => match write.write_all(&bytes).await {
+                    Ok(()) => {}
+                    Err(error) if is_expected_disconnect(&error) => break,
+                    Err(error) => return Err(error.into()),
+                },
                 Message::Close(_) => break,
                 Message::Text(_) => bail!("expected binary BuildKit stream"),
                 _ => {}
@@ -126,7 +130,26 @@ where
         }
         Ok::<_, anyhow::Error>(())
     };
-    tokio::select! { result = upstream => Ok(result?), result = downstream => result }
+    tokio::select! {
+        result = upstream => match result {
+            Ok(()) => Ok(()),
+            Err(Error::Io(error)) if is_expected_disconnect(&error) => Ok(()),
+            Err(error) => Err(error.into()),
+        },
+        result = downstream => result,
+    }
+}
+
+fn is_expected_disconnect(error: &std::io::Error) -> bool {
+    // buildctl can close its sockets while final status traffic is still in flight.
+    // Let its exit status and the template status determine whether the build succeeded.
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::NotConnected
+    )
 }
 
 #[cfg(all(test, unix))]
@@ -136,6 +159,28 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncReadExt;
     use tokio::net::{TcpListener, UnixStream};
+
+    #[tokio::test]
+    async fn local_read_shutdown_does_not_fail_bridge() -> Result<()> {
+        use tokio_tungstenite::{tungstenite::protocol::Role, WebSocketStream};
+
+        let (stream, peer) = std::os::unix::net::UnixStream::pair()?;
+        stream.set_nonblocking(true)?;
+        // Keep the write side open so the bridge must handle the failed write,
+        // rather than completing through upstream EOF.
+        peer.shutdown(std::net::Shutdown::Read)?;
+        let stream = UnixStream::from_std(stream)?;
+        let (transport, remote) = tokio::io::duplex(1024);
+        let socket = WebSocketStream::from_raw_socket(transport, Role::Client, None).await;
+        let mut remote = WebSocketStream::from_raw_socket(remote, Role::Server, None).await;
+        remote
+            .send(Message::Binary(b"final status".as_slice().into()))
+            .await?;
+
+        tokio::time::timeout(Duration::from_secs(5), bridge(stream, socket)).await??;
+        drop(peer);
+        Ok(())
+    }
 
     #[tokio::test]
     #[allow(clippy::result_large_err)] // The WebSocket handshake fixes the callback error type.
