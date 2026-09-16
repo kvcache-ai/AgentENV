@@ -125,6 +125,44 @@ impl Snapshots<()> for ApiImpl {
         )
     }
 
+    async fn snapshots_snapshot_id_delete(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SnapshotsSnapshotIdDeletePathParams,
+    ) -> Result<SnapshotsSnapshotIdDeleteResponse, ()> {
+        // Mirror the scoping of the get/list endpoints: only sandbox-sourced
+        // snapshots are exposed here. Template records must be deleted through
+        // the template APIs instead.
+        let record = match self.snapshot_manager.get(&path_params.snapshot_id).await {
+            Ok(Some(record)) if matches!(record.source, SnapshotSource::Sandbox { .. }) => record,
+            Ok(_) => {
+                return Ok(SnapshotsSnapshotIdDeleteResponse::Status404_NotFound(
+                    Self::error(
+                        404,
+                        format!("snapshot '{}' not found", path_params.snapshot_id),
+                    ),
+                ))
+            }
+            Err(err) => {
+                return Ok(SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(
+                    Self::snapshot_manager_error(&err),
+                ))
+            }
+        };
+
+        match self.snapshot_manager.delete(record.id.to_string()).await {
+            Ok(()) => {
+                Ok(SnapshotsSnapshotIdDeleteResponse::Status204_TheSnapshotWasDeletedSuccessfully)
+            }
+            Err(err) => Ok(SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(
+                Self::snapshot_manager_error(&err),
+            )),
+        }
+    }
+
     async fn snapshots_snapshot_id_get(
         &self,
         _method: &Method,

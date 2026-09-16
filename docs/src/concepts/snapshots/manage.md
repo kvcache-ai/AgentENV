@@ -27,6 +27,16 @@ aenv snapshot list --sandbox-id <sandbox-id>
 
 ## Delete a Snapshot
 
+Delete a sandbox snapshot by ID or alias with the HTTP API:
+
+```bash
+curl -X DELETE -H 'X-API-Key: test-key' \
+  http://127.0.0.1:8000/snapshots/<snapshot-id-or-alias>
+```
+
+Success returns `204`. Missing snapshots, already deleted snapshots, and
+template builds return `404`; delete template builds through the template API.
+
 Snapshots and templates share the same catalog. Delete a snapshot by passing
 its required ID or alias to the template delete command:
 
