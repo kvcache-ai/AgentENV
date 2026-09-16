@@ -277,6 +277,16 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8], description: &str) -> Resul
     Ok(())
 }
 
+pub(super) fn write_image_config(
+    path: &Path,
+    image: &ImageConfig,
+    description: &str,
+) -> Result<()> {
+    let bytes =
+        serde_json::to_vec_pretty(image).with_context(|| format!("serialize {description}"))?;
+    write_bytes_atomically(path, &bytes, description)
+}
+
 async fn copy_file_atomically(src: &Path, dst: &Path, description: &str) -> Result<()> {
     let parent = dst.parent().with_context(|| {
         format!(
@@ -324,11 +334,9 @@ async fn rewrite_live_runtime_config_for_restack(
         snapshot_layer_path,
         descriptor,
     ));
-    let bytes = serde_json::to_vec_pretty(&image_config)
-        .context("serialize rewritten live overlaybd runtime config")?;
-    write_bytes_atomically(
+    write_image_config(
         live_runtime_image_config_path,
-        &bytes,
+        &image_config,
         "live overlaybd runtime config",
     )?;
     Ok(())
@@ -387,9 +395,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     image_config.result_file = "./result.txt".to_string();
 
     let output_path = output_dir.join("image.json");
-    let bytes = serde_json::to_vec_pretty(&image_config)
-        .context("serialize overlaybd rootfs image config with inherited runtime layers")?;
-    write_bytes_atomically(&output_path, &bytes, "overlaybd rootfs image config")?;
+    write_image_config(&output_path, &image_config, "overlaybd rootfs image config")?;
     Ok(output_path)
 }
 
