@@ -16,7 +16,7 @@ use uvm_ublk_daemon::{
     UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 
-use super::overlaybd::OverlaybdConfig;
+use super::overlaybd::{OverlaybdConfig, OverlaybdRuntimeHandle};
 use crate::prometheus::MetricGuard;
 use crate::sandbox::SandboxCaptureError;
 
@@ -71,13 +71,6 @@ pub(crate) enum UblkCreateSpec {
         image_config: PathBuf,
         global_config: PathBuf,
     },
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct OverlaybdRuntimeDevice {
-    pub(crate) device: UblkDevice,
-    pub(crate) image_config_path: PathBuf,
-    pub(crate) actual_virtual_size: u64,
 }
 
 impl UblkConfig {
@@ -456,7 +449,7 @@ impl UblkDeviceManager {
     pub(crate) async fn create_overlaybd_runtime_device(
         &self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,
-    ) -> Result<OverlaybdRuntimeDevice> {
+    ) -> Result<OverlaybdRuntimeHandle> {
         let client = self.require_client()?;
         let mut metric =
             MetricGuard::operation(UBLK_OPERATION_DURATION, "create_runtime_overlaybd");
@@ -467,7 +460,7 @@ impl UblkDeviceManager {
         metric.finish(&created);
         let created = created?;
 
-        Ok(OverlaybdRuntimeDevice {
+        Ok(OverlaybdRuntimeHandle {
             device: UblkDevice {
                 dev_id: created.dev_id,
                 device_path: created.device_path,

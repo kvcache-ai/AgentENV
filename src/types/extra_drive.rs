@@ -240,56 +240,25 @@ impl ExtraDrive {
         }
     }
 
-    pub(crate) fn with_image_config_path(&self, image_config_path: PathBuf) -> Self {
-        match self {
-            Self::Overlaybd {
-                drive_id,
-                read_only,
-                mount_path,
-                virtual_size,
-                sub_path,
-                snapshot_output_dir,
-                kind,
-                ..
-            } => Self::Overlaybd {
-                drive_id: drive_id.clone(),
-                image_config_path,
-                read_only: *read_only,
-                mount_path: mount_path.clone(),
-                virtual_size: *virtual_size,
-                sub_path: sub_path.clone(),
-                snapshot_output_dir: snapshot_output_dir.clone(),
-                kind: *kind,
-            },
-        }
+    pub(crate) fn with_image_config_path(mut self, image_config_path: PathBuf) -> Self {
+        let Self::Overlaybd {
+            image_config_path: path,
+            ..
+        } = &mut self;
+        *path = image_config_path;
+        self
     }
 
-    pub(crate) fn try_with_virtual_size(&self, virtual_size: u64) -> Result<Self> {
+    pub(crate) fn try_with_virtual_size(mut self, virtual_size: u64) -> Result<Self> {
         anyhow::ensure!(
             virtual_size > 0,
             "extra drive virtual size must be non-zero"
         );
-        match self {
-            Self::Overlaybd {
-                drive_id,
-                image_config_path,
-                read_only,
-                mount_path,
-                snapshot_output_dir,
-                kind,
-                sub_path,
-                ..
-            } => Ok(Self::Overlaybd {
-                drive_id: drive_id.clone(),
-                image_config_path: image_config_path.clone(),
-                read_only: *read_only,
-                mount_path: mount_path.clone(),
-                virtual_size: Some(virtual_size),
-                sub_path: sub_path.clone(),
-                snapshot_output_dir: snapshot_output_dir.clone(),
-                kind: *kind,
-            }),
-        }
+        let Self::Overlaybd {
+            virtual_size: size, ..
+        } = &mut self;
+        *size = Some(virtual_size);
+        Ok(self)
     }
 }
 
