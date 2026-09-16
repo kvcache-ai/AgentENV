@@ -1500,6 +1500,9 @@ async fn refill_idle_pool_best_effort(
             virtual_size,
             "failed to refill idle overlaybd pool"
         );
+        // Keep refill_inflight set during backoff so concurrent requests cannot
+        // bypass the delay when device creation keeps failing.
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -1663,6 +1666,41 @@ mod tests {
             high_watermark: 1,
             maintenance_enabled: false,
             startup_prewarm: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_idle_pool_refill_waits_before_retry() {
+        let dir = TempDir::new().unwrap();
+        let image_service = test_image_service(dir.path()).await;
+        let placeholder_dir = dir.path().join("not-a-directory");
+        std::fs::write(&placeholder_dir, b"").unwrap();
+        let pool = PoolState::new(
+            PoolConfig {
+                low_watermark: 1,
+                ..test_pool_config()
+            },
+            0,
+            image_service,
+            placeholder_dir,
+        );
+        let (ctrl_ring, _handle) =
+            storage_util::io_ring::spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+
+        // Fail before allocating any ublk device, and verify repeated failures
+        // leave time between attempts without permanently stopping retries.
+        assert!(refill_idle_pool(&pool, ctrl_ring.clone(), 4096)
+            .await
+            .is_err());
+        for _ in 0..2 {
+            let started = tokio::time::Instant::now();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                refill_idle_pool_best_effort(&pool, ctrl_ring.clone(), 4096),
+            )
+            .await
+            .expect("failed refill should eventually allow another attempt");
+            assert!(started.elapsed() >= Duration::from_secs(1));
         }
     }
 
