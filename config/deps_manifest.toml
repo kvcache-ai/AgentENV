@@ -15,7 +15,7 @@ version = "6.12.33-pvm"
 url = "https://github.com/kvcache-ai/linux/releases/download/pvm-kernel-6.12.33/vmlinux-guest-6.12.33-pvm"
 
 [tools]
-version = "0.1.0"
+version = "0.1.1"
 url = "ghcr.io/kvcache-ai/agentenv-tools:{version}"
 
 [overlaybd]
