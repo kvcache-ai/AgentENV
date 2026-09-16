@@ -19,15 +19,21 @@ fi
 # ---------------------------------------------------------------------------
 # 1. ublk_drv kernel module
 # ---------------------------------------------------------------------------
+UBLK_MODPROBE_CONF=/etc/modprobe.d/aenv-ublk.conf
+install -d -m 0755 "$(dirname "$UBLK_MODPROBE_CONF")"
+printf '%s\n' 'options ublk_drv ublks_max=4096' > "$UBLK_MODPROBE_CONF"
+
 echo "Loading ublk_drv kernel module ..."
-if ! modprobe ublk_drv 2>/dev/null; then
+if [[ -d /sys/module/ublk_drv ]]; then
+    echo "  ublk_drv is already loaded; leaving active devices untouched"
+elif ! modprobe ublk_drv ublks_max=4096 2>/dev/null; then
     echo "  ublk_drv not found; installing linux-modules-extra-$(uname -r) ..."
     if ! command -v apt-get &>/dev/null; then
         echo "error: apt-get not found — install linux-modules-extra-$(uname -r) with your package manager" >&2
         exit 1
     fi
     apt-get install -y "linux-modules-extra-$(uname -r)"
-    if ! modprobe ublk_drv; then
+    if ! modprobe ublk_drv ublks_max=4096; then
         echo "error: failed to load ublk_drv — try upgrading the kernel to 6.8+" >&2
         exit 1
     fi

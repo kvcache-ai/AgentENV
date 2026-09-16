@@ -247,6 +247,11 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
     sudo install -o root -g "$SERVICE_GROUP" -m 0640 "$tmp_dir/default.toml" "$CONFIG_PATH"
 fi
 
+# Raise the legacy ublk device limit before server setup loads the module.
+UBLK_MODPROBE_CONF="/etc/modprobe.d/aenv-ublk.conf"
+sudo install -d -m 0755 "$(dirname "$UBLK_MODPROBE_CONF")"
+printf '%s\n' 'options ublk_drv ublks_max=4096' | sudo tee "$UBLK_MODPROBE_CONF" > /dev/null
+
 if [[ "$SKIP_SETUP" == "1" ]]; then
     echo "Skipping setup (SKIP_SETUP=1)."
 else
