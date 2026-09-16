@@ -43,8 +43,7 @@ use crate::sandbox::guest_volumes;
 use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, SlotLease};
 use crate::sandbox::process::Executor;
 use crate::sandbox::ublk::{
-    OverlaybdConfig, OverlaybdRuntimeHandle, PackRecordingWindow, UblkBackend, UblkCreateSpec,
-    UblkDeviceManager,
+    OverlaybdConfig, PackRecordingWindow, UblkBackend, UblkCreateSpec, UblkDeviceManager,
 };
 use crate::sandbox::SandboxLaunchConfig;
 use crate::snapshot::RunnableSnapshot;
@@ -2076,12 +2075,8 @@ impl FirecrackerSandbox {
             }
             return Err(err);
         }
-        self.resources.rootfs_runtime = Some(OverlaybdRuntimeHandle {
-            device: runtime_device.device,
-            image_config_path: runtime_device.image_config_path,
-            actual_virtual_size: runtime_device.actual_virtual_size,
-        });
         self.current_rootfs_virtual_size = Some(runtime_device.actual_virtual_size);
+        self.resources.rootfs_runtime = Some(runtime_device);
         Ok(())
     }
 
@@ -2408,6 +2403,7 @@ impl FirecrackerSandbox {
             .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
             snapped.push(
                 drive
+                    .clone()
                     .with_image_config_path(snapshot_image_config_path)
                     .try_with_virtual_size(runtime.actual_virtual_size)?,
             );
