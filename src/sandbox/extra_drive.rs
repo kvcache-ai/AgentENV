@@ -139,35 +139,19 @@ pub(crate) async fn prepare_extra_drives(
                 }
                 return Err(err);
             }
-            Ok::<_, anyhow::Error>((
-                runtime_device.device,
-                runtime_device.image_config_path,
-                runtime_device.actual_virtual_size,
-                symlink_name,
-                symlink_path,
-            ))
+            Ok::<_, anyhow::Error>((runtime_device, symlink_name, symlink_path))
         }
         .await;
 
         match result {
-            Ok((
-                device,
-                runtime_image_config_path,
-                actual_virtual_size,
-                symlink_name,
-                symlink_path,
-            )) => {
+            Ok((runtime, symlink_name, symlink_path)) => {
                 mounts.push(DriveMount {
                     drive_id: drive.drive_id().to_string(),
                     attachment_path: PathBuf::from(symlink_name),
                     read_only: drive.read_only(),
                 });
                 cleanup_paths.push(symlink_path);
-                runtimes.push(OverlaybdRuntimeHandle {
-                    device,
-                    image_config_path: runtime_image_config_path,
-                    actual_virtual_size,
-                });
+                runtimes.push(runtime);
             }
             Err(err) => {
                 let prepared = PreparedDrives {
