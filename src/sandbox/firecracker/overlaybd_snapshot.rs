@@ -377,7 +377,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
     snapshot_layer_path: Option<&Path>,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, bool)> {
     tokio::fs::create_dir_all(output_dir)
         .await
         .with_context(|| format!("create overlaybd snapshot dir {}", output_dir.display()))?;
@@ -414,7 +414,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     let mut runtime_owned_roots = canonicalized_runtime_owned_roots().to_vec();
     let runtime_layers = live_runtime_image_config_path.with_file_name("runtime-layers");
     runtime_owned_roots.push(fs::canonicalize(&runtime_layers).unwrap_or(runtime_layers));
-    let rewritten_lowers = rewrite_lowers_with_runtime_roots(
+    let (rewritten_lowers, compacted) = rewrite_lowers_with_runtime_roots(
         image_config.lowers,
         output_dir,
         appended_layer,
@@ -431,7 +431,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
 
     let output_path = output_dir.join("image.json");
     write_image_config(&output_path, &image_config, "overlaybd rootfs image config")?;
-    Ok(output_path)
+    Ok((output_path, compacted))
 }
 
 async fn rewrite_lowers_with_owned_runtime_suffix(
@@ -440,7 +440,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
     compaction_output: OverlaybdCompactOutput,
-) -> Result<Vec<LayerConfig>> {
+) -> Result<(Vec<LayerConfig>, bool)> {
     rewrite_lowers_with_runtime_roots(
         existing_lowers,
         output_dir,
@@ -459,7 +459,7 @@ async fn rewrite_lowers_with_runtime_roots(
     compaction_output_name: &'static str,
     runtime_owned_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
-) -> Result<Vec<LayerConfig>> {
+) -> Result<(Vec<LayerConfig>, bool)> {
     let (mut lowers, mut runtime_owned_lowers) =
         split_runtime_suffix(existing_lowers, runtime_owned_roots);
 
@@ -491,7 +491,7 @@ async fn rewrite_lowers_with_runtime_roots(
         {
             lowers.push(local_layer_config(&compacted_path));
         }
-        return Ok(lowers);
+        return Ok((lowers, true));
     }
 
     // Otherwise, adopt the runtime-owned suffix into the snapshot artifact dir.
@@ -512,7 +512,7 @@ async fn rewrite_lowers_with_runtime_roots(
         lowers.push(layer);
     }
 
-    Ok(lowers)
+    Ok((lowers, false))
 }
 
 async fn capture_live_overlaybd_snapshot(
@@ -610,6 +610,29 @@ async fn capture_live_overlaybd_snapshot(
     Ok(Some(snapshot_layer_path))
 }
 
+/// Record the size of a freshly sealed upper layer produced by a snapshot,
+/// labeled by layer kind and whether staging compacted the runtime-owned
+/// lowers. Best-effort: an unreadable layer file is only logged.
+async fn record_sealed_upper_size(kind: &'static str, layer_path: &Path, compacted: bool) {
+    match tokio::fs::metadata(layer_path).await {
+        Ok(metadata) => {
+            metrics::histogram!(
+                "agentenv_snapshot_sealed_upper_size_bytes",
+                "kind" => kind,
+                "compacted" => if compacted { "true" } else { "false" },
+            )
+            .record(metadata.len() as f64);
+        }
+        Err(err) => {
+            warn!(
+                layer_path = %layer_path.display(),
+                error = %err,
+                "failed to stat sealed upper layer for size metric"
+            );
+        }
+    }
+}
+
 pub(super) async fn build_mem_snapshot_image_config(
     resume_mem_image_config_path: Option<&Path>,
     new_layer_path: &Path,
@@ -619,7 +642,7 @@ pub(super) async fn build_mem_snapshot_image_config(
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
     let new_layer = local_layer_config(new_layer_path);
-    let lowers = rewrite_lowers_with_owned_runtime_suffix(
+    let (lowers, compacted) = rewrite_lowers_with_owned_runtime_suffix(
         inherited_image_config.lowers,
         output_dir,
         Some(new_layer),
@@ -627,6 +650,7 @@ pub(super) async fn build_mem_snapshot_image_config(
         memory_output,
     )
     .await?;
+    record_sealed_upper_size("memory", new_layer_path, compacted).await;
 
     Ok(ImageConfig {
         repo_blob_url: inherited_image_config.repo_blob_url,
@@ -665,7 +689,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     )
     .await?;
 
-    let staged_snapshot = stage_overlaybd_snapshot_from_live_runtime(
+    let (staged_snapshot, compacted) = stage_overlaybd_snapshot_from_live_runtime(
         live_runtime_image_config_path,
         output_dir,
         snapshot_layer_path.as_deref(),
@@ -674,6 +698,9 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     materialize_live_runtime_lowers(live_runtime_image_config_path)
         .await
         .context("materialize live overlaybd runtime lowers")?;
+    if let Some(sealed_layer_path) = snapshot_layer_path {
+        record_sealed_upper_size(kind, &sealed_layer_path, compacted).await;
+    }
     Ok(staged_snapshot)
 }
 
@@ -1021,7 +1048,7 @@ mod tests {
         ];
         let runtime_owned_roots = [artifacts_root.canonicalize().unwrap()];
 
-        let rewritten = rewrite_lowers_with_runtime_roots(
+        let (rewritten, compacted) = rewrite_lowers_with_runtime_roots(
             lowers,
             &output_dir,
             None,
@@ -1032,6 +1059,7 @@ mod tests {
         .await
         .expect("rewrite inherited runtime layers");
 
+        assert!(!compacted);
         assert_eq!(rewritten.len(), 3);
         assert_eq!(PathBuf::from(&rewritten[0].file), cache_layer);
         assert_eq!(rewritten[0].digest, "sha256:base");
@@ -1086,7 +1114,7 @@ mod tests {
         lowers.push(local_layer_config(&runtime_b));
         let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
 
-        let rewritten = rewrite_lowers_with_runtime_roots(
+        let (rewritten, _) = rewrite_lowers_with_runtime_roots(
             lowers,
             &output_dir,
             None,
@@ -1166,7 +1194,7 @@ mod tests {
         lowers.push(local_layer_config(&layer_b));
         let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
 
-        let rewritten = rewrite_lowers_with_runtime_roots(
+        let (rewritten, _) = rewrite_lowers_with_runtime_roots(
             lowers,
             &output_dir,
             None,
@@ -1206,9 +1234,11 @@ mod tests {
         )
         .unwrap();
 
-        let staged = stage_overlaybd_snapshot_from_live_runtime(&config_path, &output_dir, None)
-            .await
-            .unwrap();
+        let (staged, compacted) =
+            stage_overlaybd_snapshot_from_live_runtime(&config_path, &output_dir, None)
+                .await
+                .unwrap();
+        assert!(!compacted);
         let image = overlaybd::config::load_image_config(staged).unwrap();
         let owned_layer = Path::new(&image.lowers[0].file);
         assert!(owned_layer.starts_with(&output_dir));
@@ -1245,13 +1275,14 @@ mod tests {
         )
         .expect("write live image config");
 
-        let output_path = stage_overlaybd_snapshot_from_live_runtime(
+        let (output_path, compacted) = stage_overlaybd_snapshot_from_live_runtime(
             &live_runtime_image_config_path,
             &output_dir,
             Some(&snapshot_lower),
         )
         .await
         .expect("stage snapshot");
+        assert!(!compacted);
 
         let staged =
             overlaybd::config::load_image_config(&output_path).expect("load staged image config");
