@@ -1,3 +1,4 @@
+use agentenv::snapshot::SnapshotPlacement;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -157,7 +158,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
         read_only,
     )?];
 
-    let mut sandbox = FirecrackerSandbox::new(config)?;
+    let mut sandbox = FirecrackerSandbox::new(config, SandboxId::new(), None)?;
     sandbox.start().await?;
     assert_snapshot_attached_drive_is_visible(&sandbox, "data", read_only).await?;
 
@@ -234,7 +235,8 @@ async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
             kind: ExtraDriveKind::Volume,
         });
     }
-    let mut worker = FirecrackerSandbox::new(config.clone())?;
+    let mut worker =
+        FirecrackerSandbox::new(config.clone(), agentenv::types::SandboxId::new(), None)?;
     worker.start().await?;
     let worker_result: Result<()> = async {
         let output = worker
@@ -323,7 +325,7 @@ async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
     config.common.default_user = Some("nobody".to_owned());
     config.common.default_workdir = Some("/".to_owned());
 
-    let mut replacement = FirecrackerSandbox::new(config)?;
+    let mut replacement = FirecrackerSandbox::new(config, agentenv::types::SandboxId::new(), None)?;
     replacement.start().await?;
     let replacement_result: Result<()> = async {
         let output = replacement
@@ -378,7 +380,7 @@ async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
 }
 
 #[tokio::test]
-async fn capture_failures_recover_only_before_writable_restack() -> Result<()> {
+async fn capture_export_failure_keeps_restacked_runtime_usable() -> Result<()> {
     common::setup().await;
     let mut config = common::default_sandbox_config()?;
     config.vcpu_count = 1;
@@ -389,7 +391,7 @@ async fn capture_failures_recover_only_before_writable_restack() -> Result<()> {
         image_config.image_config_path.clone(),
         true,
     )?];
-    let mut sandbox = FirecrackerSandbox::new(config)?;
+    let mut sandbox = FirecrackerSandbox::new(config, SandboxId::new(), None)?;
     sandbox.start().await?;
     let work_dir = sandbox.work_rootfs_path().parent().unwrap().to_path_buf();
     let rootfs_config = work_dir.join("overlaybd/image.json");
@@ -420,12 +422,51 @@ async fn capture_failures_recover_only_before_writable_restack() -> Result<()> {
     assert_eq!(output.stdout.trim(), "still-running");
 
     let lower_count = overlaybd_lower_count(&rootfs_config)?;
-    fs::remove_file(work_dir.join("extra-drive-runtime-data/image.json"))?;
-    let err = SandboxBackend::snapshot(&mut sandbox)
+    let drive_config = work_dir.join("extra-drive-runtime-data/image.json");
+    let saved_drive_config = fs::read(&drive_config)?;
+    fs::remove_file(&drive_config)?;
+    let err = sandbox
+        .capture_snapshot(SnapshotPlacement::Distributed)
         .await
         .expect_err("missing drive config must fail after rootfs restack");
-    assert!(err.is_terminal(), "{err:#}");
+    assert!(!err.is_terminal(), "{err:#}");
     assert_eq!(overlaybd_lower_count(&rootfs_config)?, lower_count + 1);
+    fs::write(drive_config, saved_drive_config)?;
+    assert_eq!(sandbox.run_command("true", &[]).await?.exit_code, 0);
+    drop(SandboxBackend::snapshot(&mut sandbox).await?);
+    sandbox.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn parallel_drive_capture_failure_preserves_completed_restack() -> Result<()> {
+    common::setup().await;
+    let default = common::default_sandbox_config()?;
+    let mut rootfs = default.common.rootfs_image_config.unwrap();
+    let image = rootfs.image_config_path.clone();
+    rootfs.read_only = true;
+    let mut config = FirecrackerSandboxConfig::from_global_config_with_user_image(rootfs)?;
+    config.vcpu_count = 1;
+    config.mem_size_mib = 128;
+    config.common.extra_drives = vec![
+        ExtraDrive::try_new_overlaybd("good", image.clone(), false)?,
+        ExtraDrive::try_new_overlaybd("broken", image, false)?,
+    ];
+    let mut sandbox = FirecrackerSandbox::new(config, SandboxId::new(), None)?;
+    sandbox.start_nowait().await?;
+    let work_dir = sandbox.work_rootfs_path().parent().unwrap().to_path_buf();
+    let good_config = work_dir.join("extra-drive-runtime-good/image.json");
+    let initial_lowers = overlaybd_lower_count(&good_config)?;
+    let broken_config = work_dir.join("extra-drive-runtime-broken/image.json");
+    let saved_config = fs::read(&broken_config)?;
+    fs::remove_file(&broken_config)?;
+    let capture = SandboxBackend::snapshot(&mut sandbox).await;
+    let good_lowers = overlaybd_lower_count(&good_config)?;
+    let error = capture.expect_err("one attached drive must fail capture");
+    assert_eq!(good_lowers, initial_lowers + 1);
+    assert!(!error.is_terminal(), "{error:#}");
+    fs::write(broken_config, saved_config)?;
+    drop(SandboxBackend::snapshot(&mut sandbox).await?);
     sandbox.stop().await?;
     Ok(())
 }
@@ -447,7 +488,7 @@ async fn forked_drive_snapshots_survive_parent_and_child_backend_drop() -> Resul
         ExtraDrive::try_new_overlaybd("data", image_path.clone(), false)?,
         ExtraDrive::try_new_overlaybd("readonly", image_path, true)?,
     ];
-    let mut parent = FirecrackerSandbox::new(config)?;
+    let mut parent = FirecrackerSandbox::new(config, SandboxId::new(), None)?;
     parent.start().await?;
     let output = parent
         .run_command(
@@ -493,10 +534,10 @@ async fn forked_drive_snapshots_survive_parent_and_child_backend_drop() -> Resul
     let paused = child.pause().await?;
     child.stop().await?;
     drop(child);
-    let snapshot = paused
+    let paused = paused
         .downcast_ref::<agentenv::sandbox::FirecrackerPausedState>()
-        .unwrap()
-        .snapshot_config();
+        .unwrap();
+    let snapshot = paused.snapshot_config();
     for drive in &snapshot.common.extra_drives {
         let ExtraDrive::Overlaybd {
             image_config_path, ..
@@ -507,7 +548,13 @@ async fn forked_drive_snapshots_survive_parent_and_child_backend_drop() -> Resul
             .iter()
             .all(|layer| { layer.file.is_empty() || Path::new(&layer.file).is_file() }));
     }
-    let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(snapshot).await?;
+    let mut resumed = FirecrackerSandbox::from_paused_state(
+        paused,
+        SandboxId::new(),
+        None,
+        paused.snapshot_config().vm_state_path.parent().unwrap(),
+    )?;
+    resumed.start().await?;
     let output = resumed
         .run_command(
             "sh",
@@ -560,7 +607,7 @@ async fn attached_overlaybd_drive_is_visible_on_snapshot_based_build() -> Result
         .resolve_runnable(loaded_snapshot.clone())
         .await?;
     let mut sandbox =
-        FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default())?;
+        FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default(), None)?;
     sandbox.start().await?;
     assert_snapshot_attached_drive_is_visible(&sandbox, "data", true).await?;
     sandbox.stop().await?;
@@ -598,7 +645,7 @@ async fn attached_overlaybd_drive_is_visible_on_snapshot_based_build() -> Result
 
     let runnable = snapshot_manager.resolve_runnable(derived).await?;
     let mut sandbox =
-        FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default())?;
+        FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default(), None)?;
     sandbox.start().await?;
     assert_snapshot_attached_drive_is_visible(&sandbox, "data", true).await?;
 
@@ -650,7 +697,7 @@ async fn writable_attached_overlaybd_drive_preserves_metadata_and_mount_mode() -
 
     let runnable = snapshot_manager.resolve_runnable(committed).await?;
     let mut sandbox =
-        FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default())?;
+        FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default(), None)?;
     sandbox.start().await?;
     assert_snapshot_attached_drive_is_visible(&sandbox, "data", false).await?;
     sandbox.stop().await?;

@@ -67,6 +67,15 @@ impl SnapshotPublishMetadata {
     }
 }
 
+/// Storage availability requested for a reusable snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotPlacement {
+    Local,
+    #[default]
+    Distributed,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SnapshotPublishSource {
     Template,

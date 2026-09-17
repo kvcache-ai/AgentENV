@@ -11,7 +11,7 @@ use warm_pool::PoolConfig;
 
 use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, DeviceRole, DeviceSpec,
-    PackRecordingState, RestackSnapshotStats, SourceStateStrategy,
+    PackRecordingState, RestackSnapshotResult, SourceStateStrategy,
 };
 use overlaybd::config::UpperMode;
 
@@ -472,7 +472,12 @@ impl UblkDaemonClient {
         tracing::info!("restarting ublk daemon");
         inner.restarting.store(true, Ordering::Release);
         let mut exited = inner.daemon_exited.subscribe();
-        match tokio::time::timeout(DETACH_TIMEOUT, inner.call_inner(DaemonRequest::Detach)).await {
+        match tokio::time::timeout(
+            DETACH_TIMEOUT,
+            inner.call_inner(DaemonRequest::Detach, &mut false),
+        )
+        .await
+        {
             Ok(Ok(DaemonResponse::Ok)) => {}
             Ok(Ok(other)) => tracing::warn!(?other, "unexpected response to ublk daemon detach"),
             Ok(Err(err)) => {
@@ -747,19 +752,23 @@ impl UblkDaemonClient {
         &self,
         dev_id: u32,
         output_layer_path: &Path,
-    ) -> Result<RestackSnapshotStats> {
+        compact_from: Option<usize>,
+    ) -> Result<RestackSnapshotResult> {
         let request = DaemonRequest::RestackSnapshot {
             dev_id,
             output_layer_path: output_layer_path.to_path_buf(),
+            compact_from,
         };
         let response = self.call(request, SNAPSHOT_TIMEOUT).await?;
         match response {
             DaemonResponse::RestackSnapshotCreated {
                 descriptor,
+                lowers,
                 data_stat,
                 ext4_used_bytes,
-            } => Ok(RestackSnapshotStats {
+            } => Ok(RestackSnapshotResult {
                 descriptor,
+                lowers,
                 data_stat,
                 ext4_used_bytes,
             }),
@@ -808,7 +817,7 @@ impl UblkDaemonClient {
         // Best-effort: daemon may close connection before responding.
         let _ = tokio::time::timeout(
             Duration::from_secs(5),
-            self.inner.call_inner(DaemonRequest::Shutdown),
+            self.inner.call_inner(DaemonRequest::Shutdown, &mut false),
         )
         .await;
         self.inner
@@ -836,14 +845,14 @@ impl UblkDaemonClient {
 
     /// Acquire a warm overlaybd device from the pool.
     ///
-    /// Returns `(dev_id, device_path)`.
+    /// Returns `(dev_id, device_path, actual_image_config_path)`.
     pub async fn acquire_overlaybd(
         &self,
         image_config: &Path,
         global_config: &Path,
         virtual_size: Option<u64>,
         access_mode: AccessMode,
-    ) -> Result<(u32, PathBuf)> {
+    ) -> Result<(u32, PathBuf, PathBuf)> {
         self.acquire_overlaybd_with_upper_access(
             image_config,
             global_config,
@@ -861,7 +870,7 @@ impl UblkDaemonClient {
         virtual_size: Option<u64>,
         access_mode: AccessMode,
         read_only_upper: bool,
-    ) -> Result<(u32, PathBuf)> {
+    ) -> Result<(u32, PathBuf, PathBuf)> {
         let request = DaemonRequest::AcquireOverlaybd {
             image_config: image_config.to_path_buf(),
             global_config: global_config.to_path_buf(),
@@ -873,7 +882,8 @@ impl UblkDaemonClient {
             DaemonResponse::DeviceAcquired {
                 dev_id,
                 device_path,
-            } => Ok((dev_id, device_path)),
+                image_config_path,
+            } => Ok((dev_id, device_path, image_config_path)),
             DaemonResponse::TerminalError { message } => {
                 bail!("daemon: acquire overlaybd failed terminally: {message}")
             }
@@ -1117,8 +1127,8 @@ impl UblkDaemonClientInner {
 
 /// How an RPC changes the devices a client holds.
 enum RegistryUpdate {
-    /// Recorded once the daemon hands the device over. Runtime devices take
-    /// their image config from the response.
+    /// Recorded once the daemon hands the device over. Acquired and runtime
+    /// devices take their actual image config from the response.
     Add {
         image_config: PathBuf,
         global_config: PathBuf,
@@ -1182,10 +1192,12 @@ impl RegistryUpdate {
                 role,
             } => {
                 let (dev_id, image_config) = match response {
-                    Some(
-                        DaemonResponse::DeviceCreated { dev_id, .. }
-                        | DaemonResponse::DeviceAcquired { dev_id, .. },
-                    ) => (*dev_id, image_config),
+                    Some(DaemonResponse::DeviceCreated { dev_id, .. }) => (*dev_id, image_config),
+                    Some(DaemonResponse::DeviceAcquired {
+                        dev_id,
+                        image_config_path,
+                        ..
+                    }) => (*dev_id, image_config_path.clone()),
                     Some(DaemonResponse::OverlaybdRuntimeDeviceCreated {
                         dev_id,
                         runtime_image_config_path,
@@ -1368,9 +1380,10 @@ mod tests {
         serve(
             tokio::net::UnixListener::bind(&socket).unwrap(),
             |request| {
-                let acquired = |dev_id| DaemonResponse::DeviceAcquired {
+                let acquired = |dev_id, image_config_path: &str| DaemonResponse::DeviceAcquired {
                     dev_id,
                     device_path: PathBuf::from(format!("/dev/ublkb{dev_id}")),
+                    image_config_path: image_config_path.into(),
                 };
                 match request {
                     DaemonRequest::CreateOverlaybd { .. } => DaemonResponse::DeviceCreated {
@@ -1388,11 +1401,11 @@ mod tests {
                     DaemonRequest::AcquireOverlaybd {
                         access_mode: AccessMode::Exclusive,
                         ..
-                    } => acquired(3),
+                    } => acquired(3, "/reused/x.json"),
                     DaemonRequest::AcquireOverlaybd {
                         access_mode: AccessMode::Shared,
                         ..
-                    } => acquired(4),
+                    } => acquired(4, "/reused/mem.json"),
                     DaemonRequest::ReleaseOverlaybd { .. } => DaemonResponse::Released,
                     DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
                     other => panic!("unexpected request {other:?}"),
@@ -1448,8 +1461,13 @@ mod tests {
             vec![
                 spec(1, "/raw.json", DeviceRole::Raw, true),
                 spec(2, "/run/rootfs/image.json", DeviceRole::Exclusive, false),
-                spec(3, "/x.json", DeviceRole::Exclusive, false),
-                spec(4, "/mem.json", DeviceRole::Shared { refcount: 2 }, true),
+                spec(3, "/reused/x.json", DeviceRole::Exclusive, false),
+                spec(
+                    4,
+                    "/reused/mem.json",
+                    DeviceRole::Shared { refcount: 2 },
+                    true
+                ),
             ]
         );
 
@@ -1482,6 +1500,7 @@ mod tests {
                 DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
                     dev_id: 5,
                     device_path: PathBuf::from("/dev/ublkb5"),
+                    image_config_path: PathBuf::from("/image.json"),
                 },
                 _ => DaemonResponse::Error {
                     message: "boom".to_string(),
@@ -1534,7 +1553,7 @@ mod tests {
         let err = client.delete(0).await;
         assert!(err.is_err());
 
-        let err = client.restack_snapshot(0, Path::new("/out")).await;
+        let err = client.restack_snapshot(0, Path::new("/out"), None).await;
         assert!(err.is_err());
     }
 
@@ -1585,7 +1604,7 @@ mod tests {
         });
 
         let error = client
-            .restack_snapshot(0, Path::new("/snapshot.commit"))
+            .restack_snapshot(0, Path::new("/snapshot.commit"), None)
             .await
             .unwrap_err();
         server.await.unwrap();
@@ -1625,7 +1644,7 @@ mod tests {
         ] {
             let client = UblkDaemonClient::new_for_test(dir.path().join("missing.sock"), dead);
             let err = client
-                .restack_snapshot(0, Path::new("/out"))
+                .restack_snapshot(0, Path::new("/out"), None)
                 .await
                 .unwrap_err();
             assert!(!err.is::<RestackSnapshotTerminalFailure>(), "{err:#}");
@@ -1658,7 +1677,7 @@ mod tests {
             });
             let client = UblkDaemonClient::new_for_test(socket, false);
             let err = client
-                .restack_snapshot(0, Path::new("/out"))
+                .restack_snapshot(0, Path::new("/out"), None)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -1693,6 +1712,7 @@ mod tests {
                 DaemonRequest::RestackSnapshot {
                     dev_id: 0,
                     output_layer_path: "/out".into(),
+                    compact_from: None,
                 },
                 Duration::from_secs(1),
             )

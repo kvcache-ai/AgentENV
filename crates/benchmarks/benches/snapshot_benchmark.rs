@@ -3,6 +3,8 @@ use agentenv::sandbox::{
     CapturedSandboxSnapshot, FirecrackerSandbox, FirecrackerSandboxConfig,
     FirecrackerSnapshotConfig, OverlaybdConfig, SandboxBackend, SandboxExecutor, UblkDeviceManager,
 };
+use agentenv::snapshot::SnapshotPlacement;
+use agentenv::types::SandboxId;
 use anyhow::{Context, Result};
 use criterion::{Criterion, SamplingMode, Throughput};
 use overlaybd::config::UpperMode;
@@ -211,7 +213,7 @@ async fn setup_sandbox() -> Result<FirecrackerSandbox> {
 
 async fn setup_sandbox_inner(mem_size_mib: u32) -> Result<FirecrackerSandbox> {
     let config = fresh_sandbox_config(mem_size_mib).await?;
-    let mut sandbox = FirecrackerSandbox::new(config)?;
+    let mut sandbox = FirecrackerSandbox::new(config, SandboxId::new(), None)?;
     if let Err(error) = sandbox.start().await {
         if let Err(cleanup_error) = sandbox.stop().await {
             return Err(error).context(format!(
@@ -326,7 +328,12 @@ fn bench_snapshot_creation_inner(
                 prepare(&rt, &sandbox).unwrap();
 
                 let start = std::time::Instant::now();
-                let _snapshot = rt.block_on(async { sandbox.pause().await.unwrap() });
+                let _snapshot = rt.block_on(async {
+                    sandbox
+                        .capture_snapshot(SnapshotPlacement::Distributed)
+                        .await
+                        .unwrap()
+                });
                 total += start.elapsed();
 
                 rt.block_on(async {
@@ -361,7 +368,9 @@ fn bench_snapshot_creation_1gmem(c: &mut Criterion) {
 
 async fn prepare_snapshot() -> Result<agentenv::sandbox::FirecrackerSnapshotConfig> {
     let mut sandbox = setup_sandbox().await?;
-    let snapshot = sandbox.pause().await?;
+    let snapshot = sandbox
+        .capture_snapshot(SnapshotPlacement::Distributed)
+        .await?;
     sandbox.stop().await?;
     Ok(snapshot)
 }
@@ -380,9 +389,12 @@ fn bench_snapshot_resume(c: &mut Criterion) {
 
     // Keep one instance alive so the benchmark matches the hot template path:
     // memory ublk devices are shared while at least one handle is live.
-    let mut warm_sandbox = match rt
-        .block_on(async { FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await })
-    {
+    let mut warm_sandbox = match rt.block_on(async {
+        let mut sandbox =
+            FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+        sandbox.start().await?;
+        Ok::<_, anyhow::Error>(sandbox)
+    }) {
         Ok(sandbox) => sandbox,
         Err(e) => {
             eprintln!("Failed to warm snapshot resume path: {:?}", e);
@@ -398,9 +410,11 @@ fn bench_snapshot_resume(c: &mut Criterion) {
             for _ in 0..iters {
                 let start = std::time::Instant::now();
                 let mut sandbox = rt.block_on(async {
-                    FirecrackerSandbox::resume_from_snapshot_config(&snapshot)
-                        .await
-                        .unwrap()
+                    let mut sandbox =
+                        FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)
+                            .unwrap();
+                    sandbox.start().await.unwrap();
+                    sandbox
                 });
                 total += start.elapsed();
 
@@ -438,9 +452,11 @@ fn bench_snapshot_resume_cold(c: &mut Criterion) {
             for _ in 0..iters {
                 let start = std::time::Instant::now();
                 let mut sandbox = rt.block_on(async {
-                    FirecrackerSandbox::resume_from_snapshot_config(&snapshot)
-                        .await
-                        .unwrap()
+                    let mut sandbox =
+                        FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)
+                            .unwrap();
+                    sandbox.start().await.unwrap();
+                    sandbox
                 });
                 total += start.elapsed();
 
@@ -468,9 +484,12 @@ fn bench_snapshot_concurrent_resume(c: &mut Criterion) {
     };
 
     // Keep the shared memory device hot while measuring concurrent resume.
-    let mut warm_sandbox = match rt
-        .block_on(async { FirecrackerSandbox::resume_from_snapshot_config(&base_snapshot).await })
-    {
+    let mut warm_sandbox = match rt.block_on(async {
+        let mut sandbox =
+            FirecrackerSandbox::from_snapshot_config(&base_snapshot, SandboxId::new(), None)?;
+        sandbox.start().await?;
+        Ok::<_, anyhow::Error>(sandbox)
+    }) {
         Ok(sandbox) => sandbox,
         Err(e) => {
             eprintln!("Failed to warm concurrent resume path: {:?}", e);
@@ -502,9 +521,14 @@ fn bench_snapshot_concurrent_resume(c: &mut Criterion) {
 
                             let start = std::time::Instant::now();
                             let mut sandbox = handle.block_on(async {
-                                FirecrackerSandbox::resume_from_snapshot_config(&snapshot)
-                                    .await
-                                    .unwrap()
+                                let mut sandbox = FirecrackerSandbox::from_snapshot_config(
+                                    &snapshot,
+                                    SandboxId::new(),
+                                    None,
+                                )
+                                .unwrap();
+                                sandbox.start().await.unwrap();
+                                sandbox
                             });
                             resume_latency_total += start.elapsed();
 
@@ -554,7 +578,11 @@ fn default_snapshot_creation_inner(
         prepare(rt, &sandbox)?;
 
         let start = std::time::Instant::now();
-        rt.block_on(async { sandbox.pause().await })?;
+        rt.block_on(async {
+            sandbox
+                .capture_snapshot(SnapshotPlacement::Distributed)
+                .await
+        })?;
         samples.push(start.elapsed());
 
         rt.block_on(async {
@@ -585,8 +613,12 @@ fn default_snapshot_resume_cold(rt: &Runtime) -> Result<Vec<Duration>> {
 
     for _ in 0..DEFAULT_SAMPLE_COUNT {
         let start = std::time::Instant::now();
-        let mut sandbox = rt
-            .block_on(async { FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await })?;
+        let mut sandbox = rt.block_on(async {
+            let mut sandbox =
+                FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+            sandbox.start().await?;
+            Ok::<_, anyhow::Error>(sandbox)
+        })?;
         samples.push(start.elapsed());
 
         rt.block_on(async {
@@ -600,14 +632,22 @@ fn default_snapshot_resume_cold(rt: &Runtime) -> Result<Vec<Duration>> {
 
 fn default_snapshot_resume(rt: &Runtime) -> Result<Vec<Duration>> {
     let snapshot = rt.block_on(prepare_snapshot())?;
-    let mut warm_sandbox =
-        rt.block_on(async { FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await })?;
+    let mut warm_sandbox = rt.block_on(async {
+        let mut sandbox =
+            FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+        sandbox.start().await?;
+        Ok::<_, anyhow::Error>(sandbox)
+    })?;
     let mut samples = Vec::with_capacity(DEFAULT_SAMPLE_COUNT);
 
     for _ in 0..DEFAULT_SAMPLE_COUNT {
         let start = std::time::Instant::now();
-        let mut sandbox = rt
-            .block_on(async { FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await })?;
+        let mut sandbox = rt.block_on(async {
+            let mut sandbox =
+                FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+            sandbox.start().await?;
+            Ok::<_, anyhow::Error>(sandbox)
+        })?;
         samples.push(start.elapsed());
 
         rt.block_on(async {
@@ -642,7 +682,13 @@ fn run_concurrent_resume_samples(
                 for _ in 0..sample_count {
                     let start = std::time::Instant::now();
                     let mut sandbox = handle.block_on(async {
-                        FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await
+                        let mut sandbox = FirecrackerSandbox::from_snapshot_config(
+                            &snapshot,
+                            SandboxId::new(),
+                            None,
+                        )?;
+                        sandbox.start().await?;
+                        Ok::<_, anyhow::Error>(sandbox)
                     })?;
                     samples.push(start.elapsed());
 
@@ -688,7 +734,10 @@ fn run_concurrent_resume_samples(
 fn default_concurrent_resume(rt: &Runtime) -> Result<Vec<Duration>> {
     let base_snapshot = rt.block_on(prepare_snapshot())?;
     let mut warm_sandbox = rt.block_on(async {
-        FirecrackerSandbox::resume_from_snapshot_config(&base_snapshot).await
+        let mut sandbox =
+            FirecrackerSandbox::from_snapshot_config(&base_snapshot, SandboxId::new(), None)?;
+        sandbox.start().await?;
+        Ok::<_, anyhow::Error>(sandbox)
     })?;
 
     let benchmark_result = (|| {
@@ -767,7 +816,7 @@ fn run_fresh_start_batch(
 ) -> Result<Duration> {
     // Resolve the base image and create sandbox handles before releasing the batch.
     let sandboxes = (0..concurrency)
-        .map(|_| FirecrackerSandbox::new(config.clone()))
+        .map(|_| FirecrackerSandbox::new(config.clone(), SandboxId::new(), None))
         .collect::<Result<Vec<_>>>()?;
     let work = sandboxes
         .into_iter()
@@ -850,8 +899,8 @@ fn capture_running_sandbox(
 fn pause_running_sandbox(
     handle: &Handle,
     sandbox: &mut FirecrackerSandbox,
-) -> Result<FirecrackerSnapshotConfig> {
-    handle.block_on(sandbox.pause())
+) -> Result<Arc<dyn agentenv::sandbox::PausedSandboxState>> {
+    Ok(handle.block_on(SandboxBackend::pause(sandbox))?)
 }
 
 fn run_running_batch<T, F>(rt: &Runtime, concurrency: usize, operation: F) -> Result<Duration>
@@ -961,7 +1010,11 @@ fn start_resume_sandbox(
     snapshot: &FirecrackerSnapshotConfig,
 ) -> Result<(FirecrackerSandbox, thread::Result<Result<()>>)> {
     // Keep ownership outside the start call so failures and panics can be cleaned up.
-    let mut sandbox = FirecrackerSandbox::from_snapshot_config(snapshot)?;
+    let mut sandbox = FirecrackerSandbox::from_snapshot_config(
+        snapshot,
+        agentenv::types::SandboxId::new(),
+        None,
+    )?;
     let start = catch_unwind(AssertUnwindSafe(|| handle.block_on(sandbox.start())));
     Ok((sandbox, start))
 }

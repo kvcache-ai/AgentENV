@@ -4,9 +4,12 @@ use std::sync::Arc;
 
 use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{
-    BaseSandboxNetworkPolicy, FirecrackerSandbox, FirecrackerSnapshotConfig, ProcessOutput,
-    SandboxBackend, SandboxExecutor, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+    BaseSandboxNetworkPolicy, FirecrackerPausedState, FirecrackerSandbox,
+    FirecrackerSnapshotConfig, PausedSandboxState, ProcessOutput, SandboxBackend, SandboxExecutor,
+    SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
 };
+use agentenv::snapshot::SnapshotPlacement;
+use agentenv::types::SandboxId;
 use anyhow::{bail, Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::ImageConfig;
@@ -145,21 +148,26 @@ async fn assert_memory_layer_is_raw(snapshot: &FirecrackerSnapshotConfig) -> Res
 async fn microvm_lifecycle_and_snapshot_preserve_disk_state() -> Result<()> {
     common::setup().await;
     let sandbox_config = common::default_sandbox_config()?;
-    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config, SandboxId::new(), None)?;
     sandbox.start().await?;
 
     write_disk_marker(&mut sandbox).await?;
-    let snapshot = sandbox.pause().await?;
+    let snapshot = sandbox
+        .capture_snapshot(SnapshotPlacement::Distributed)
+        .await?;
     assert!(snapshot.vm_state_path.exists());
     assert!(snapshot.mem_overlaybd_config.image_config_path.exists());
 
     sandbox.resume().await?;
     verify_disk_marker(&mut sandbox).await?;
 
-    let snapshot = sandbox.pause().await?;
+    let snapshot = sandbox
+        .capture_snapshot(SnapshotPlacement::Distributed)
+        .await?;
     sandbox.stop().await?;
 
-    let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
+    let mut resumed = FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+    resumed.start().await?;
     verify_disk_marker(&mut resumed).await?;
     resumed.stop().await?;
     Ok(())
@@ -256,7 +264,11 @@ async fn oci_tools_share_a_readonly_device_across_concurrent_launches() -> Resul
     fs::create_dir(&rootfs)?;
 
     // Reuse the provisioned guest binaries, regardless of the default tools format.
-    let mut seed = FirecrackerSandbox::new(common::default_sandbox_config()?)?;
+    let mut seed = FirecrackerSandbox::new(
+        common::default_sandbox_config()?,
+        agentenv::types::SandboxId::new(),
+        None,
+    )?;
     seed.start().await?;
     let extracted = tokio::process::Command::new("debugfs")
         .args(["-R", &format!("rdump / {}", rootfs.display())])
@@ -314,8 +326,9 @@ async fn oci_tools_share_a_readonly_device_across_concurrent_launches() -> Resul
 
     let mut config = common::default_sandbox_config()?;
     config.common.tools_drive_version = version.clone();
-    let mut first = FirecrackerSandbox::new(config.clone())?;
-    let mut second = FirecrackerSandbox::new(config)?;
+    let mut first =
+        FirecrackerSandbox::new(config.clone(), agentenv::types::SandboxId::new(), None)?;
+    let mut second = FirecrackerSandbox::new(config, agentenv::types::SandboxId::new(), None)?;
     tokio::try_join!(first.start(), second.start())?;
     let backing = |sandbox: &FirecrackerSandbox| {
         fs::canonicalize(sandbox.work_rootfs_path().with_file_name("rootfs.ext4"))
@@ -333,7 +346,15 @@ async fn oci_tools_share_a_readonly_device_across_concurrent_launches() -> Resul
     assert_eq!(output.exit_code, 0);
     assert_eq!(output.stdout.trim(), format!("{version}\n1"));
     let paused = second.pause().await?;
-    assert_eq!(paused.common.tools_drive_version, version);
+    assert_eq!(
+        paused
+            .downcast_ref::<FirecrackerPausedState>()
+            .unwrap()
+            .snapshot_config()
+            .common
+            .tools_drive_version,
+        version
+    );
     second.resume().await?;
     assert_eq!(device, backing(&second)?);
     second.stop().await?;
@@ -346,12 +367,14 @@ async fn oci_tools_share_a_readonly_device_across_concurrent_launches() -> Resul
 /// round-trip preserves guest disk state.
 async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
     let sandbox_config = common::default_sandbox_config()?;
-    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config, SandboxId::new(), None)?;
     sandbox.start().await?;
 
     write_disk_marker(&mut sandbox).await?;
     let snapshot_dir = tempfile::tempdir()?;
-    let (snapshot, _) = sandbox.pause_to_dir(snapshot_dir.path()).await?;
+    let snapshot = sandbox
+        .capture_snapshot_to_dir(snapshot_dir.path(), SnapshotPlacement::Distributed)
+        .await?;
     sandbox.stop().await?;
 
     assert!(snapshot.vm_state_path.exists());
@@ -367,7 +390,8 @@ async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
     );
     assert_memory_layer_is_raw(&snapshot).await?;
 
-    let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
+    let mut resumed = FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+    resumed.start().await?;
     verify_disk_marker(&mut resumed).await?;
     resumed.stop().await?;
     Ok(())
@@ -386,12 +410,14 @@ async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<(
     common::setup().await;
     let sandbox_config = common::default_sandbox_config()?;
     let tools_version = sandbox_config.common.tools_drive_version.clone();
-    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    let temp = tempfile::tempdir()?;
+    let artifact_root = temp.path().join("paused-artifacts");
+    fs::create_dir_all(&artifact_root)?;
+    let id = SandboxId::new();
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config, id, Some(&artifact_root))?;
     sandbox.start().await?;
 
     write_disk_marker(&mut sandbox).await?;
-    let temp = tempfile::tempdir()?;
-    let artifact_root = temp.path().join("paused-artifacts");
     let paused_state = SandboxBackend::pause(&mut sandbox).await?;
     sandbox.stop().await?;
 
@@ -403,8 +429,8 @@ async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<(
 
     let decoded =
         agentenv::sandbox::FirecrackerPausedState::decode(artifact_root.clone(), encoded)?;
-    let mut resumed =
-        FirecrackerSandbox::resume_from_snapshot_config(decoded.snapshot_config()).await?;
+    let mut resumed = FirecrackerSandbox::from_paused_state(&decoded, id, None, &artifact_root)?;
+    resumed.start().await?;
     verify_disk_marker(&mut resumed).await?;
     resumed.stop().await?;
     Ok(())
@@ -415,7 +441,8 @@ async fn consecutive_captures_keep_memory_baseline_and_release_generations() -> 
     const MEMORY_REQUEST: &str = "printf '%s\\n' \"$1\" > /tmp/memory-commands; \
         read -r state < /tmp/memory-replies; printf '%s' \"$state\"";
     common::setup().await;
-    let mut sandbox = FirecrackerSandbox::new(common::default_sandbox_config()?)?;
+    let mut sandbox =
+        FirecrackerSandbox::new(common::default_sandbox_config()?, SandboxId::new(), None)?;
     sandbox.start().await?;
     let output = sandbox
         .run_command(
@@ -432,13 +459,16 @@ async fn consecutive_captures_keep_memory_baseline_and_release_generations() -> 
         )
         .await?;
     assert_eq!(output.exit_code, 0, "{}", output.stderr);
-    let baseline = sandbox.pause().await?;
+    let baseline = sandbox
+        .capture_snapshot(SnapshotPlacement::Distributed)
+        .await?;
     sandbox.stop().await?;
     drop(sandbox);
     let baseline_dir = baseline.vm_state_path.parent().unwrap().to_path_buf();
     let baseline_layers =
         lower_file_paths_from_image_config(&baseline.mem_overlaybd_config.image_config_path)?;
-    let mut running = FirecrackerSandbox::resume_from_snapshot_config(&baseline).await?;
+    let mut running = FirecrackerSandbox::from_snapshot_config(&baseline, SandboxId::new(), None)?;
+    running.start().await?;
     drop(baseline);
 
     for (command, expected) in [
@@ -464,14 +494,17 @@ async fn consecutive_captures_keep_memory_baseline_and_release_generations() -> 
         );
     }
 
-    let paused = running.pause().await?;
+    let paused = running
+        .capture_snapshot(SnapshotPlacement::Distributed)
+        .await?;
     running.stop().await?;
     drop(running);
     assert!(
         !baseline_dir.exists(),
         "stopped baseline has no remaining owner"
     );
-    let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&paused).await?;
+    let mut resumed = FirecrackerSandbox::from_snapshot_config(&paused, SandboxId::new(), None)?;
+    resumed.start().await?;
     let output = resumed
         .run_command("sh", &["-c", MEMORY_REQUEST, "memory-request", "report"])
         .await?;
@@ -481,17 +514,154 @@ async fn consecutive_captures_keep_memory_baseline_and_release_generations() -> 
     Ok(())
 }
 
-/// Verify multi-level snapshot chains: first → second → resume from second after
-/// dropping the first snapshot handle.
+#[tokio::test]
+async fn repeated_capture_and_pause_compacts_live_disks_without_losing_old_snapshots() -> Result<()>
+{
+    common::setup().await;
+    let storage = tempfile::tempdir()?;
+    let runtime = storage.path().join("runtime");
+    fs::create_dir(&runtime)?;
+    let id = SandboxId::new();
+    let mut config = common::default_sandbox_config()?;
+    config.vcpu_count = 1;
+    config.mem_size_mib = 128;
+    let mut sandbox = FirecrackerSandbox::new(config, id, Some(&runtime))?;
+    sandbox.start().await?;
+    let runtime_config = runtime.join("overlaybd/image.json");
+    let initial_layers = overlaybd::config::load_image_config(&runtime_config)?
+        .lowers
+        .len();
+    let mut retained = Vec::new();
+    let mut previous_layers = initial_layers;
+    let mut compactions = 0;
+    for capture in 1..=70 {
+        let marker = capture.to_string();
+        let output = sandbox
+            .run_command(
+                "sh",
+                &["-c", &format!("echo {marker} > {DISK_MARKER_PATH}")],
+            )
+            .await?;
+        assert_eq!(output.exit_code, 0, "{}", output.stderr);
+        let old_paths = lower_file_paths_from_image_config(&runtime_config)?;
+        let snapshot = sandbox.capture_snapshot(SnapshotPlacement::Local).await?;
+        let new_paths = lower_file_paths_from_image_config(&runtime_config)?;
+        if new_paths.len() < previous_layers {
+            compactions += 1;
+            for path in &old_paths {
+                if path.starts_with(&runtime) && !new_paths.contains(path) {
+                    assert!(
+                        !path.exists(),
+                        "compacted runtime name must be reclaimed: {}",
+                        path.display()
+                    );
+                }
+            }
+        }
+        previous_layers = new_paths.len();
+        assert!(new_paths.len() <= initial_layers + 32);
+        if capture == 1 || capture == 35 {
+            retained.push((snapshot, marker.clone()));
+        }
+        sandbox.resume().await?;
+        let paused = SandboxBackend::pause(&mut sandbox).await?;
+        sandbox.stop().await?;
+        drop(sandbox);
+        let state = FirecrackerPausedState::decode(runtime.clone(), paused.encode()?)?;
+        drop(paused);
+        sandbox = FirecrackerSandbox::from_paused_state(&state, id, None, &runtime)?;
+        sandbox.start().await?;
+        let output = sandbox.run_command("cat", &[DISK_MARKER_PATH]).await?;
+        assert_eq!(output.stdout.trim(), marker);
+    }
+    assert!(
+        compactions >= 2,
+        "test must cross multiple compaction thresholds"
+    );
+    sandbox.stop().await?;
+    drop(sandbox);
+    fs::remove_dir_all(runtime)?;
+    for (snapshot, marker) in retained {
+        let mut restored =
+            FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+        restored.start().await?;
+        let output = restored.run_command("cat", &[DISK_MARKER_PATH]).await?;
+        assert_eq!(output.stdout.trim(), marker);
+        restored.stop().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn fork_children_keep_their_snapshot_after_source_teardown() -> Result<()> {
+    common::setup().await;
+    let mut config = common::default_sandbox_config()?;
+    config.vcpu_count = 1;
+    config.mem_size_mib = 128;
+    let mut source = FirecrackerSandbox::new(config, SandboxId::new(), None)?;
+    source.start().await?;
+    write_disk_marker(&mut source).await?;
+    let child_ids = [SandboxId::new(), SandboxId::new()];
+    let storage = tempfile::tempdir()?;
+    let child_roots = child_ids
+        .iter()
+        .map(|id| {
+            let path = storage.path().join(id.to_string());
+            fs::create_dir(&path).unwrap();
+            agentenv::sandbox::SandboxForkSpec {
+                sandbox_id: *id,
+                storage_root: path,
+                envd_access_token: None,
+                extra_drives: Vec::new(),
+                replace_drive_ids: Vec::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let children = SandboxBackend::fork(&mut source, &child_roots).await?;
+    assert_eq!(children.len(), child_ids.len());
+    verify_disk_marker(&mut source).await?;
+    source.stop().await?;
+    drop(source);
+
+    for child in children {
+        let mut child = child?;
+        let paused = child.pause().await?;
+        child.stop().await?;
+        drop(child);
+        let state = paused.downcast_ref::<FirecrackerPausedState>().unwrap();
+        let storage_root = state
+            .snapshot_config()
+            .vm_state_path
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let encoded = state.encode()?;
+        drop(paused);
+        let restored = FirecrackerPausedState::decode(storage_root.clone(), encoded)?;
+        let mut resumed = FirecrackerSandbox::from_paused_state(
+            &restored,
+            SandboxId::new(),
+            None,
+            &storage_root,
+        )?;
+        resumed.start().await?;
+        verify_disk_marker(&mut resumed).await?;
+        resumed.stop().await?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Result<()> {
     common::setup().await;
     let sandbox_config = common::default_sandbox_config()?;
-    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config, SandboxId::new(), None)?;
     sandbox.start().await?;
 
     write_disk_marker(&mut sandbox).await?;
-    let first_snapshot = sandbox.pause().await?;
+    let first_snapshot = sandbox
+        .capture_snapshot(SnapshotPlacement::Distributed)
+        .await?;
     assert_memory_layer_is_raw(&first_snapshot).await?;
     sandbox.stop().await?;
     drop(sandbox);
@@ -503,17 +673,16 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
             .parent()
             .context("first memory image should live under a persistent generation dir")?,
     )?;
-    let first_rootfs_commit = fs::canonicalize(
-        first_snapshot
+    let first_rootfs_commit = lower_file_paths_from_image_config(
+        &first_snapshot
             .common
             .rootfs_image_config
             .as_ref()
             .context("first snapshot rootfs image config should exist")?
-            .image_config_path
-            .parent()
-            .context("first rootfs image should have a parent dir")?
-            .join("snapshot.commit"),
-    )?;
+            .image_config_path,
+    )?
+    .pop()
+    .context("first snapshot should contain a captured rootfs layer")?;
     assert!(
         first_snapshot_dir.exists(),
         "first snapshot tempdir should exist at {}",
@@ -521,9 +690,13 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     );
 
     // Resume from first, write additional data, pause again.
-    let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&first_snapshot).await?;
+    let mut resumed =
+        FirecrackerSandbox::from_snapshot_config(&first_snapshot, SandboxId::new(), None)?;
+    resumed.start().await?;
     verify_disk_marker(&mut resumed).await?;
-    let second_snapshot = resumed.pause().await?;
+    let second_snapshot = resumed
+        .capture_snapshot(SnapshotPlacement::Distributed)
+        .await?;
     assert_memory_layer_is_raw(&second_snapshot).await?;
     resumed.stop().await?;
     drop(resumed);
@@ -590,13 +763,14 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     assert!(!first_snapshot_dir.exists());
 
     let mut resumed_again =
-        FirecrackerSandbox::resume_from_snapshot_config(&second_snapshot).await?;
+        FirecrackerSandbox::from_snapshot_config(&second_snapshot, SandboxId::new(), None)?;
+    resumed_again.start().await?;
     verify_disk_marker(&mut resumed_again).await?;
 
-    // Also test pause_to_dir with snapshot-owned inherited layer adoption.
+    // Also test caller-managed immutable capture with snapshot-owned inherited layer adoption.
     let expected_snapshot_dir = tempfile::tempdir()?;
-    let (dir_snapshot, _) = resumed_again
-        .pause_to_dir(expected_snapshot_dir.path())
+    let dir_snapshot = resumed_again
+        .capture_snapshot_to_dir(expected_snapshot_dir.path(), SnapshotPlacement::Distributed)
         .await?;
     resumed_again.stop().await?;
     drop(resumed_again);
@@ -611,7 +785,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     assert_no_lower_paths_under(
         &dir_snapshot_mem_lowers,
         &managed_snapshot_base_root,
-        "pause_to_dir memory snapshot",
+        "caller-managed memory snapshot",
     );
 
     let dir_snapshot_rootfs_lowers = lower_file_paths_from_image_config(
@@ -625,7 +799,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     assert_no_lower_paths_under(
         &dir_snapshot_rootfs_lowers,
         &managed_snapshot_base_root,
-        "pause_to_dir rootfs snapshot",
+        "caller-managed rootfs snapshot",
     );
     let actual_snapshot_dir = dir_snapshot.vm_state_path.parent().unwrap();
     assert!(
@@ -638,16 +812,17 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     );
     assert!(
         dir_snapshot_mem_lowers.iter().all(|path| path.exists()),
-        "pause_to_dir memory snapshot should keep all lower files after dropping the paused-state handle"
+        "caller-managed memory snapshot should keep all lower files after dropping the snapshot handle"
     );
     assert!(
         dir_snapshot_rootfs_lowers.iter().all(|path| path.exists()),
-        "pause_to_dir rootfs snapshot should keep all lower files after dropping the paused-state handle"
+        "caller-managed rootfs snapshot should keep all lower files after dropping the snapshot handle"
     );
     drop(second_snapshot);
 
     let mut resumed_from_dir =
-        FirecrackerSandbox::resume_from_snapshot_config(&dir_snapshot).await?;
+        FirecrackerSandbox::from_snapshot_config(&dir_snapshot, SandboxId::new(), None)?;
+    resumed_from_dir.start().await?;
     verify_disk_marker(&mut resumed_from_dir).await?;
     resumed_from_dir.stop().await?;
     Ok(())
@@ -659,11 +834,13 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
 async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
     common::setup().await;
     let sandbox_config = common::default_sandbox_config()?;
-    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config, SandboxId::new(), None)?;
     sandbox.start().await?;
 
     write_disk_marker(&mut sandbox).await?;
-    let snapshot = sandbox.pause().await?;
+    let snapshot = sandbox
+        .capture_snapshot(SnapshotPlacement::Distributed)
+        .await?;
     sandbox.stop().await?;
 
     // Resume multiple VMs sequentially from the same snapshot.
@@ -671,7 +848,9 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
     let vm_count = 2;
     let mut snapshots = Vec::new();
     for i in 0..vm_count {
-        let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
+        let mut resumed =
+            FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+        resumed.start().await?;
         verify_disk_marker(&mut resumed).await?;
         // Write a per-instance marker to prove writable state is independent.
         let per_vm_marker = format!("{DISK_MARKER_PATH}.vm{i}");
@@ -683,14 +862,17 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
             "per-vm write failed: {}",
             output.stderr
         );
-        let snap = resumed.pause().await?;
+        let snap = resumed
+            .capture_snapshot(SnapshotPlacement::Distributed)
+            .await?;
         resumed.stop().await?;
         snapshots.push(snap);
     }
 
     // Verify each snapshot still has the original marker.
     for snap in &snapshots {
-        let mut sandbox = FirecrackerSandbox::resume_from_snapshot_config(snap).await?;
+        let mut sandbox = FirecrackerSandbox::from_snapshot_config(snap, SandboxId::new(), None)?;
+        sandbox.start().await?;
         verify_disk_marker(&mut sandbox).await?;
         sandbox.stop().await?;
     }
@@ -801,13 +983,17 @@ async fn test_network(sandbox: &mut FirecrackerSandbox, after_resume: bool) -> R
 async fn microvm_can_access_internet() -> Result<()> {
     common::setup().await;
     let sandbox_config = common::default_sandbox_config()?;
-    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config, SandboxId::new(), None)?;
     sandbox.start().await?;
     test_network(&mut sandbox, false).await?;
-    let snapshot = sandbox.pause().await?;
+    let snapshot = sandbox
+        .capture_snapshot(SnapshotPlacement::Distributed)
+        .await?;
     sandbox.stop().await?;
 
-    let mut resumed_sandbox = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
+    let mut resumed_sandbox =
+        FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+    resumed_sandbox.start().await?;
     test_network(&mut resumed_sandbox, true).await?;
     resumed_sandbox.stop().await?;
 
@@ -824,7 +1010,7 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
         SandboxNetworkEgressPolicy::new(Some(vec!["8.8.8.8".to_string()]), None)?,
     ));
 
-    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config, SandboxId::new(), None)?;
     sandbox.start().await?;
 
     assert_tcp_connect(&mut sandbox, "8.8.8.8/53", true).await?;

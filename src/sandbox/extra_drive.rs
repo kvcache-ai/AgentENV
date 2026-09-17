@@ -24,8 +24,12 @@ pub(crate) struct PreparedDrives {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ExtraDrivePrepareMode {
-    Fresh { allow_shrink: bool },
-    Resume,
+    Fresh {
+        allow_shrink: bool,
+    },
+    Snapshot,
+    /// Reopen a paused sandbox's existing upper instead of building a runtime copy.
+    Paused,
 }
 
 impl ExtraDrivePrepareMode {
@@ -37,9 +41,9 @@ impl ExtraDrivePrepareMode {
                 // size is intentionally left unknown so the daemon can read it.
                 (drive.virtual_size(), None)
             }
-            Self::Resume => {
-                // For resume/snapshot-backed launches, virtual_size is the
-                // known actual block-device size recorded in snapshot metadata.
+            Self::Snapshot | Self::Paused => {
+                // Snapshot and paused launches use the actual block-device
+                // size recorded in the saved state.
                 (drive.virtual_size(), drive.virtual_size())
             }
         }
@@ -48,7 +52,7 @@ impl ExtraDrivePrepareMode {
     fn allow_shrink(self) -> bool {
         match self {
             Self::Fresh { allow_shrink } => allow_shrink,
-            Self::Resume => false,
+            Self::Snapshot | Self::Paused => false,
         }
     }
 }
@@ -90,6 +94,7 @@ pub(crate) async fn prepare_extra_drives(
     extra_drives: &[ExtraDrive],
     global_config_path: &Path,
     sandbox_work_dir: &Path,
+    storage_root: &Path,
     runtime_upper_mode: UpperMode,
     mode: impl Fn(usize) -> ExtraDrivePrepareMode,
 ) -> Result<PreparedDrives> {
@@ -100,22 +105,41 @@ pub(crate) async fn prepare_extra_drives(
     for (index, drive) in extra_drives.iter().enumerate() {
         let mode = mode(index);
         let result = async {
-            let runtime_dir = drive.runtime_dir(sandbox_work_dir);
+            let runtime_dir = drive.runtime_dir(storage_root);
             let (requested_virtual_size, known_source_virtual_size) = mode.device_sizes(drive);
             let allow_shrink = mode.allow_shrink();
-            let runtime_device = UblkDeviceManager::global()
-                .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                    source_image_config: drive.image_config_path(),
-                    global_config: global_config_path,
-                    runtime_dir: &runtime_dir,
-                    read_only: drive.read_only(),
-                    runtime_upper_mode,
-                    requested_virtual_size,
-                    known_source_virtual_size,
-                    allow_shrink,
-                })
-                .await
-                .context("create overlaybd extra drive runtime device")?;
+            if matches!(mode, ExtraDrivePrepareMode::Snapshot) {
+                match tokio::fs::remove_dir_all(&runtime_dir).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let manager = UblkDeviceManager::global();
+            let runtime_device = match mode {
+                ExtraDrivePrepareMode::Paused => {
+                    manager
+                        .open_overlaybd_runtime(
+                            drive.image_config_path(),
+                            global_config_path,
+                            drive.virtual_size().context("paused drive size")?,
+                        )
+                        .await?
+                }
+                _ => manager
+                    .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
+                        source_image_config: drive.image_config_path(),
+                        global_config: global_config_path,
+                        runtime_dir: &runtime_dir,
+                        read_only: drive.read_only(),
+                        runtime_upper_mode,
+                        requested_virtual_size,
+                        known_source_virtual_size,
+                        allow_shrink,
+                    })
+                    .await
+                    .context("create overlaybd extra drive runtime device")?,
+            };
             let symlink_name = drive.attachment_symlink_name();
             let symlink_path = sandbox_work_dir.join(&symlink_name);
             let device_path = runtime_device.device.device_path().to_path_buf();
@@ -188,7 +212,7 @@ mod tests {
             (None, None)
         );
         assert_eq!(
-            ExtraDrivePrepareMode::Resume.device_sizes(&drive_without_size),
+            ExtraDrivePrepareMode::Snapshot.device_sizes(&drive_without_size),
             (None, None)
         );
 
@@ -201,7 +225,7 @@ mod tests {
             (Some(2 * 1024 * 1024 * 1024), None)
         );
         assert_eq!(
-            ExtraDrivePrepareMode::Resume.device_sizes(&sized),
+            ExtraDrivePrepareMode::Snapshot.device_sizes(&sized),
             (Some(2 * 1024 * 1024 * 1024), Some(2 * 1024 * 1024 * 1024))
         );
     }

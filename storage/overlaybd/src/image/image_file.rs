@@ -8,8 +8,9 @@ use crate::image::image_service::ImageService;
 use crate::io::virtual_file::VirtualFile;
 use crate::layer::layer_metadata::{read_overlaybd_layer_uuid, COMMIT_FILE_NAME, SEALED_FILE_NAME};
 use crate::lsmt::file::{
-    open_file_rw, open_files_ro_with_premerged_cache, stack_files, CommitArgs, DataStat, LSMTFile,
-    LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy, PARALLEL_LOAD_INDEX,
+    merge_files_ro, open_file_rw, open_files_ro_with_premerged_cache, stack_files, CommitArgs,
+    DataStat, LSMTFile, LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy,
+    MAX_STACK_LAYERS, PARALLEL_LOAD_INDEX,
 };
 use crate::prefetch::{new_prefetcher, PrefetchMode, Prefetcher};
 use anyhow::{bail, ensure, Context, Result};
@@ -316,7 +317,8 @@ impl ImageFile {
     pub async fn create_snapshot_and_restack(
         &self,
         output_layer_path: &Path,
-    ) -> Result<Option<LayerDescriptor>> {
+        compact_from: Option<usize>,
+    ) -> Result<(Option<LayerDescriptor>, Vec<LayerConfig>)> {
         let mut state = self.state.write().await;
         let upper_mode = state.config.upper.writable_mode();
         let upper_data_path = PathBuf::from(&state.config.upper.data);
@@ -340,13 +342,43 @@ impl ImageFile {
             .writable()
             .context("create_snapshot_and_restack requires a writable image")?;
 
+        // Validate the final stack before sealing: a full stack must leave the
+        // current image writable when this capture is rejected.
+        let mut lower_files = current.lower_layer_files_bottom_to_top();
+        let mut lowers = state.config.lowers.clone();
+        ensure!(
+            lower_files.len() == lowers.len(),
+            "live lower/config count mismatch"
+        );
+        let final_lower_count = match compact_from {
+            Some(start) => {
+                ensure!(
+                    start < lower_files.len() && lower_files.len() - start >= 2,
+                    "compaction requires at least two existing lower layers"
+                );
+                start + 2
+            }
+            None => lower_files.len() + 1,
+        };
+        ensure!(
+            final_lower_count <= MAX_STACK_LAYERS,
+            "snapshot would exceed lower layer limit: {final_lower_count} > {MAX_STACK_LAYERS}"
+        );
+        if let Some(start) = compact_from {
+            let compacted_path = output_dir.join("managed-base.commit");
+            let (file, layer) =
+                Self::compact_lowers(&lower_files[start..], &compacted_path).await?;
+            lower_files.truncate(start);
+            lower_files.push(file);
+            lowers.truncate(start);
+            lowers.push(layer);
+        }
+
         let virtual_size = self.size_bytes();
         let max_io_size = current.get_max_io_size();
         let group_commit_size = current.get_index_group_commit_size();
         let (restacked, descriptor) = async {
-            // `open_files_ro` consumes layers in bottom-to-top order and flips
-            // them into its internal top-to-bottom representation.
-            let mut lower_files = current.lower_layer_files_bottom_to_top();
+            // Lower files are bottom-to-top; the current upper is appended last.
             let (reopened, descriptor) = current.close_seal_and_reopen().await?;
             lower_files.extend(reopened.get_lower_files());
 
@@ -396,7 +428,7 @@ impl ImageFile {
             .filter(|uuid| !uuid.is_nil())
             .map(|uuid| uuid.to_string())
             .unwrap_or_default();
-        state.config.lowers.push(LayerConfig {
+        lowers.push(LayerConfig {
             file: output_layer_path.display().to_string(),
             digest: descriptor
                 .as_ref()
@@ -410,12 +442,43 @@ impl ImageFile {
             uuid,
             ..LayerConfig::default()
         });
+        state.config.lowers = lowers.clone();
         state.base = ImageFileBase::Upper {
             file: restacked,
             read_only_upper: false,
         };
         self.update_size_metadata(virtual_size);
-        Ok(descriptor)
+        Ok((descriptor, lowers))
+    }
+
+    async fn compact_lowers(
+        files: &[Arc<dyn VirtualFile>],
+        path: &Path,
+    ) -> Result<(Arc<dyn VirtualFile>, LayerConfig)> {
+        let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        let result = async {
+            let output: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&temporary)?);
+            let mut args = CommitArgs::new(output.clone());
+            args.concurrency = 32;
+            merge_files_ro(files, args).await?;
+            // Validate the generated layer before changing the live upper.
+            LSMTReadOnlyFile::open(output.clone()).await?;
+            let size = output.size().await?;
+            tokio::fs::rename(&temporary, path).await?;
+            Ok((
+                output,
+                LayerConfig {
+                    file: path.display().to_string(),
+                    size,
+                    ..LayerConfig::default()
+                },
+            ))
+        }
+        .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_file(&temporary).await;
+        }
+        result
     }
 
     async fn init_image_file(
@@ -1739,6 +1802,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_compaction_bounds_layers_and_preserves_old_snapshots() -> Result<()> {
+        for mode in [
+            UpperMode::LogStructured,
+            UpperMode::Sparse,
+            UpperMode::HybridLogStructured,
+        ] {
+            let tmp = TempDir::new()?;
+            let base = tmp.path().join("base.commit");
+            create_sealed_lower(&base, &tmp.path().join("base.index"), &[0x11; 8192]).await?;
+            let data = tmp.path().join("upper.data");
+            let index = (mode != UpperMode::Sparse).then(|| tmp.path().join("upper.index"));
+            create_initialized_upper_with_mode(&data, index.as_deref(), 8192, mode).await?;
+            let mut config = ImageConfig {
+                lowers: vec![LayerConfig {
+                    file: base.display().to_string(),
+                    ..Default::default()
+                }],
+                upper: UpperConfig {
+                    data: data.display().to_string(),
+                    index: index
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                    mode: Some(mode),
+                    ..Default::default()
+                },
+                download_override: Some(DownloadConfig::default()),
+                ..Default::default()
+            };
+            let service = build_service(&tmp).await;
+            let mut image = ImageFile::open(config.clone(), service.clone(), None).await?;
+            let mut saved = Vec::new();
+            for capture in 1..=70 {
+                let value = (capture % 251) as u8;
+                image.write_at(4096, &[value; 4096]).await?;
+                let output = tmp.path().join(capture.to_string()).join("snapshot.commit");
+                let compact_from = (config.lowers.len() >= 32).then_some(1);
+                let (_, lowers) = image
+                    .create_snapshot_and_restack(&output, compact_from)
+                    .await?;
+                config.lowers = lowers;
+                assert!(config.lowers.len() <= 32);
+                if capture == 1 || capture == 33 {
+                    let mut snapshot = config.clone();
+                    snapshot.upper = UpperConfig::default();
+                    saved.push((snapshot, value));
+                }
+                image.flush_for_checkpoint().await?;
+                drop(image);
+                image = ImageFile::open(config.clone(), service.clone(), None).await?;
+                assert_eq!(image.read_at(0, 4096).await?.as_ref(), &[0x11; 4096]);
+                assert_eq!(image.read_at(4096, 4096).await?.as_ref(), &[value; 4096]);
+            }
+            drop(image);
+            for (snapshot, value) in saved {
+                let snapshot = ImageFile::open(snapshot, service.clone(), None).await?;
+                assert_eq!(snapshot.read_at(4096, 4096).await?.as_ref(), &[value; 4096]);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_layer_limit_rejection_preserves_the_writable_upper() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let base = tmp.path().join("base.commit");
+        create_sealed_lower(&base, &tmp.path().join("base.index"), &[0x11; 8192]).await?;
+        let data = tmp.path().join("upper.data");
+        let index = tmp.path().join("upper.index");
+        create_initialized_upper(&data, &index, 8192).await?;
+        let config = ImageConfig {
+            lowers: vec![
+                LayerConfig {
+                    file: base.display().to_string(),
+                    ..Default::default()
+                };
+                MAX_STACK_LAYERS
+            ],
+            upper: UpperConfig {
+                data: data.display().to_string(),
+                index: index.display().to_string(),
+                ..Default::default()
+            },
+            download_override: Some(DownloadConfig::default()),
+            ..Default::default()
+        };
+        let service = build_service(&tmp).await;
+        let image = ImageFile::open(config.clone(), service.clone(), None).await?;
+        let path = tmp.path().join("snapshot.commit");
+        let error = image
+            .create_snapshot_and_restack(&path, None)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("layer limit"));
+        assert!(!error.is::<RestackSnapshotTerminalFailure>());
+        assert!(!path.exists());
+        image.write_at(4096, &[0x22; 4096]).await?;
+        image.flush_for_checkpoint().await?;
+        drop(image);
+        let image = ImageFile::open(config, service, None).await?;
+        assert_eq!(image.read_at(4096, 4096).await?.as_ref(), &[0x22; 4096]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn snapshot_compaction_failure_keeps_the_upper_writable_and_retryable() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let base = tmp.path().join("base.commit");
+        create_sealed_lower(&base, &tmp.path().join("base.index"), &[0x11; 8192]).await?;
+        let data = tmp.path().join("upper.data");
+        let index = tmp.path().join("upper.index");
+        create_initialized_upper(&data, &index, 8192).await?;
+        let config = ImageConfig {
+            lowers: vec![
+                LayerConfig {
+                    file: base.display().to_string(),
+                    ..Default::default()
+                };
+                3
+            ],
+            upper: UpperConfig {
+                data: data.display().to_string(),
+                index: index.display().to_string(),
+                ..Default::default()
+            },
+            download_override: Some(DownloadConfig::default()),
+            ..Default::default()
+        };
+        let service = build_service(&tmp).await;
+        let image = ImageFile::open(config, service, None).await?;
+        let path = tmp.path().join("snapshot.commit");
+        let blocked = tmp.path().join("managed-base.commit");
+        std::fs::create_dir(&blocked)?;
+        let error = image
+            .create_snapshot_and_restack(&path, Some(1))
+            .await
+            .unwrap_err();
+        assert!(!error.is::<RestackSnapshotTerminalFailure>());
+        assert!(!path.exists());
+        assert!(!std::fs::read_dir(tmp.path())?.any(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "tmp")));
+        image.write_at(4096, &[0x22; 4096]).await?;
+        assert_eq!(image.read_at(4096, 4096).await?.as_ref(), &[0x22; 4096]);
+        std::fs::remove_dir(&blocked)?;
+        let (_, lowers) = image.create_snapshot_and_restack(&path, Some(1)).await?;
+        assert_eq!(lowers.len(), 3);
+        assert_eq!(image.read_at(0, 4096).await?.as_ref(), &[0x11; 4096]);
+        assert_eq!(image.read_at(4096, 4096).await?.as_ref(), &[0x22; 4096]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_create_snapshot_and_restack_keeps_image_writable() {
         let tmp = TempDir::new().expect("tempdir");
         let lower_path = tmp.path().join("lower.data");
@@ -1785,8 +2002,8 @@ mod tests {
         image.sync().await.expect("sync first overlay");
 
         let snapshot_path = tmp.path().join("snapshot.commit");
-        let descriptor = image
-            .create_snapshot_and_restack(&snapshot_path)
+        let (descriptor, _) = image
+            .create_snapshot_and_restack(&snapshot_path, None)
             .await
             .expect("restack snapshot");
         let snapshot_bytes = tokio::fs::read(&snapshot_path)
@@ -1875,8 +2092,8 @@ mod tests {
         image.sync().await.expect("sync first overlay");
 
         let snapshot_path = tmp.path().join("snapshot.commit");
-        let descriptor = image
-            .create_snapshot_and_restack(&snapshot_path)
+        let (descriptor, _) = image
+            .create_snapshot_and_restack(&snapshot_path, None)
             .await
             .expect("restack sparse snapshot");
         assert_eq!(descriptor, None);
@@ -1965,8 +2182,8 @@ mod tests {
         image.sync().await.expect("sync first overlay");
 
         let snapshot_path = tmp.path().join("snapshot.commit");
-        let descriptor = image
-            .create_snapshot_and_restack(&snapshot_path)
+        let (descriptor, _) = image
+            .create_snapshot_and_restack(&snapshot_path, None)
             .await
             .expect("restack hybrid snapshot");
         assert_eq!(descriptor, None);
@@ -2050,7 +2267,7 @@ mod tests {
         let snapshot_path = tmp.path().join("snapshot.commit");
         std::fs::create_dir(&snapshot_path).expect("create conflicting directory");
         let err = image
-            .create_snapshot_and_restack(&snapshot_path)
+            .create_snapshot_and_restack(&snapshot_path, None)
             .await
             .expect_err("rename conflict should fail");
         assert!(
@@ -2172,7 +2389,7 @@ mod tests {
         .expect("write must reach the bottom file while holding the state read lock");
 
         let output = tmp.path().join("snapshot.commit");
-        let snapshot = image.create_snapshot_and_restack(&output);
+        let snapshot = image.create_snapshot_and_restack(&output, None);
         tokio::pin!(snapshot);
         // Polling, rather than spawning and sleeping, guarantees that the writer
         // is queued before the blocked I/O is released.

@@ -30,7 +30,8 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
     let memory_mib = sandbox_config.mem_size_mib;
     let vmm_binary = sandbox_config.common.firecracker_binary.clone();
     let tools_drive_version = sandbox_config.common.tools_drive_version.clone();
-    let mut original = FirecrackerSandbox::new(sandbox_config)?;
+    let mut original =
+        FirecrackerSandbox::new(sandbox_config, agentenv::types::SandboxId::new(), None)?;
     let source_id = original.sandbox_id();
     let result = async {
         original.start().await?;
@@ -124,7 +125,7 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
             custom_extension_params: None,
             envd_access_token: None,
         };
-        let mut restored = FirecrackerSandbox::from_snapshot(&runnable, &launch)?;
+        let mut restored = FirecrackerSandbox::from_snapshot(&runnable, &launch, None)?;
         let resumed = restored.start().await;
         let stopped = restored.stop().await;
         resumed?;

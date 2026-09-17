@@ -1,6 +1,5 @@
 //! Host resources a running Firecracker sandbox owns.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,15 +21,8 @@ use crate::sandbox::ublk::{
 pub(super) struct SandboxResources {
     pub(super) network_slot: Option<Slot>,
     pub(super) rootfs_runtime: Option<OverlaybdRuntimeHandle>,
-    /// image.json path the rootfs device was opened with. Also released at
-    /// envd ready so a rootfs background download (when enabled) never
-    /// waits out the fallback with no notification.
-    pub(super) rootfs_image_config_path: Option<PathBuf>,
     pub(super) tools_ublk_device: Option<SharedReadOnlyDevice>,
     pub(super) mem_ublk_device: Option<SharedReadOnlyDevice>,
-    /// image.json path the memory device was opened with. Used as the device
-    /// key to release held background downloads once envd is ready.
-    pub(super) mem_snapshot_image_config_path: Option<PathBuf>,
     /// Dedicated, non-shared memory device used only by startup-pack
     /// recording VMs (`pack_recording = true`). Released with
     /// `UblkDeviceManager::delete_device`, never returned to the warm pool.

@@ -9,7 +9,7 @@ pub use client::{
 };
 pub use protocol::{
     AccessMode, DaemonRequest, DaemonResponse, DeviceRole, DeviceSpec, FailedRecovery,
-    ResizeToolSpec, RestackSnapshotStats, SourceStateStrategy,
+    ResizeToolSpec, RestackSnapshotResult, SourceStateStrategy,
 };
 pub use server::UblkDaemonServer;
 pub use warm_pool::PoolConfig;
