@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tonic::async_trait;
@@ -13,7 +13,7 @@ use crate::types::SandboxId;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) enum RecordingCall {
     LoadAll,
-    AllocateArtifactRoot,
+    PrepareRuntimeRoot,
     PersistPaused,
     MarkResuming,
     RollbackResuming,
@@ -25,7 +25,7 @@ impl RecordingCall {
     const fn as_str(self) -> &'static str {
         match self {
             Self::LoadAll => "load_all",
-            Self::AllocateArtifactRoot => "allocate_artifact_root",
+            Self::PrepareRuntimeRoot => "prepare_runtime_root",
             Self::PersistPaused => "persist_paused",
             Self::MarkResuming => "mark_resuming",
             Self::RollbackResuming => "rollback_resuming",
@@ -100,19 +100,15 @@ impl SandboxPersister for RecordingPersister {
         Ok(self.loaded.lock().unwrap().clone())
     }
 
-    async fn allocate_artifact_root(
-        &self,
-        _sandbox_id: &SandboxId,
-    ) -> PersistenceResult<Option<PathBuf>> {
-        self.record(RecordingCall::AllocateArtifactRoot);
-        self.maybe_fail(RecordingCall::AllocateArtifactRoot)?;
-        Ok(None)
+    async fn prepare_runtime_root(&self, _sandbox_id: &SandboxId) -> PersistenceResult<PathBuf> {
+        self.record(RecordingCall::PrepareRuntimeRoot);
+        self.maybe_fail(RecordingCall::PrepareRuntimeRoot)?;
+        Ok(std::env::temp_dir().join("mock-sandbox-storage"))
     }
 
     async fn persist_paused(
         &self,
         _metadata: &SandboxMetadata,
-        _artifact_root: Option<&Path>,
         _paused_state: &dyn PausedSandboxState,
     ) -> PersistenceResult<()> {
         self.record(RecordingCall::PersistPaused);
