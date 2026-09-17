@@ -9,7 +9,7 @@ pub use helper::{
 };
 pub(crate) use helper::{initialize_file_rw_paths, load_readonly_layers_metadata};
 pub use readonly::LSMTReadOnlyFile;
-pub use readwrite::LSMTFile;
+pub use readwrite::{write_sparse_upper, LSMTFile};
 pub use stack::{
     create_file_rw, is_lsmt, merge_files_ro, open_file_index, open_file_ro, open_file_rw,
     open_files_ro, open_files_ro_with_premerged_cache, stack_files,

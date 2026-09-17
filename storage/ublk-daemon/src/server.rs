@@ -639,6 +639,7 @@ async fn handle_connection(
         DaemonRequest::RestackSnapshot {
             dev_id,
             output_layer_path,
+            compact_from,
         } => {
             handle_restack_snapshot(
                 &devices,
@@ -646,6 +647,7 @@ async fn handle_connection(
                 &image_service_cache,
                 dev_id,
                 &output_layer_path,
+                compact_from,
             )
             .await
         }
@@ -730,10 +732,13 @@ async fn handle_connection(
             read_only_upper,
         )
         .await
-        .map(|(dev_id, device_path)| DaemonResponse::DeviceAcquired {
-            dev_id,
-            device_path,
-        }),
+        .map(
+            |(dev_id, device_path, image_config_path)| DaemonResponse::DeviceAcquired {
+                dev_id,
+                device_path,
+                image_config_path,
+            },
+        ),
         DaemonRequest::ReleaseOverlaybd { dev_id } => {
             handle_release_overlaybd(&pool_state, ctrl_ring.clone(), dev_id).await
         }
@@ -867,6 +872,7 @@ async fn handle_create_overlaybd_runtime_device(
             false,
         )
         .await
+        .map(|(id, path, _)| (id, path))
     } else {
         create_overlaybd_device(
             devices,
@@ -1455,6 +1461,7 @@ async fn handle_restack_snapshot(
     image_service_cache: &ImageServiceCache,
     dev_id: u32,
     output_layer_path: &Path,
+    compact_from: Option<usize>,
 ) -> Result<DaemonResponse> {
     let (image, image_config) = find_overlaybd_image(devices, pool_state, dev_id, "snapshot")?;
 
@@ -1464,12 +1471,12 @@ async fn handle_restack_snapshot(
         "creating restack snapshot"
     );
 
-    let descriptor = {
+    let result = {
         let image_lock = image_service_cache.image_lock(&image_config);
         let _image_guard = image_lock.write().await;
-        image.create_snapshot_and_restack(output_layer_path).await
+        runtime::restack_runtime(&image, &image_config, output_layer_path, compact_from).await
     };
-    let descriptor = descriptor.with_context(|| {
+    let (descriptor, lowers) = result.with_context(|| {
         format!(
             "restack overlaybd snapshot for dev_id={dev_id} to {}",
             output_layer_path.display()
@@ -1488,6 +1495,7 @@ async fn handle_restack_snapshot(
     );
     Ok(DaemonResponse::RestackSnapshotCreated {
         descriptor,
+        lowers,
         data_stat,
         ext4_used_bytes,
     })
@@ -1552,7 +1560,7 @@ async fn acquire_overlaybd(
     virtual_size: Option<u64>,
     access_mode: AccessMode,
     read_only_upper: bool,
-) -> Result<(u32, PathBuf)> {
+) -> Result<(u32, PathBuf, PathBuf)> {
     let pool = pool_state
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("warm pool not enabled"))?;
@@ -1635,7 +1643,7 @@ async fn acquire_exclusive(
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     image_config: &Path,
     image: Arc<ImageFile>,
-) -> Result<(u32, PathBuf)> {
+) -> Result<(u32, PathBuf, PathBuf)> {
     let (dev, is_reused) =
         prepare_overlaybd_device(&pool, &ctrl_ring, image_config, &image, "exclusive").await?;
 
@@ -1662,7 +1670,7 @@ async fn acquire_exclusive(
         },
     );
 
-    Ok((dev_id, device_path))
+    Ok((dev_id, device_path, image_config.to_path_buf()))
 }
 
 async fn acquire_shared(
@@ -1672,7 +1680,7 @@ async fn acquire_shared(
     global_config: &Path,
     read_only_upper: bool,
     image: Arc<ImageFile>,
-) -> Result<(u32, PathBuf)> {
+) -> Result<(u32, PathBuf, PathBuf)> {
     let key = (
         std::fs::canonicalize(image_config).unwrap_or_else(|_| image_config.to_path_buf()),
         std::fs::canonicalize(global_config).unwrap_or_else(|_| global_config.to_path_buf()),
@@ -1689,7 +1697,7 @@ async fn acquire_shared(
             refcount = entry.refcount,
             "reusing shared overlaybd device"
         );
-        return Ok((dev_id, device_path));
+        return Ok((dev_id, device_path, entry.image_config.clone()));
     }
 
     let (dev, is_reused) =
@@ -1714,6 +1722,7 @@ async fn acquire_shared(
             active.refcount += 1;
             let existing_dev_id = active.dev.dev_id();
             let existing_path = active.dev.device_path().to_path_buf();
+            let existing_config = active.image_config.clone();
             let refcount = active.refcount;
             drop(entry);
 
@@ -1725,7 +1734,7 @@ async fn acquire_shared(
                 refcount,
                 "concurrent shared overlaybd acquire reused existing device"
             );
-            return Ok((existing_dev_id, existing_path));
+            return Ok((existing_dev_id, existing_path, existing_config));
         }
         Entry::Vacant(entry) => {
             pool.shared_by_dev_id.insert(dev_id, key);
@@ -1742,7 +1751,7 @@ async fn acquire_shared(
         schedule_idle_pool_refill(Arc::clone(&pool), ctrl_ring, refill_virtual_size);
     }
 
-    Ok((dev_id, device_path))
+    Ok((dev_id, device_path, image_config.to_path_buf()))
 }
 
 async fn handle_release_overlaybd(

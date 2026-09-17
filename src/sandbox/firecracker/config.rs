@@ -67,12 +67,6 @@ impl PersistentSnapshotRootGuard {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
-
-    pub(crate) async fn prepare(&self) -> Result<()> {
-        tokio::fs::create_dir_all(&self.path)
-            .await
-            .with_context(|| format!("create managed snapshot root {}", self.path.display()))
-    }
 }
 
 impl Drop for PersistentSnapshotRootGuard {
@@ -480,6 +474,34 @@ pub struct FirecrackerSnapshotConfig {
 }
 
 impl FirecrackerSnapshotConfig {
+    pub fn to_manifest(&self) -> Result<crate::snapshot::SandboxSnapshotManifest> {
+        let rootfs = self
+            .common
+            .rootfs_image_config
+            .as_ref()
+            .context("snapshot rootfs image config is missing")?;
+        let extra_drives = self
+            .common
+            .extra_drives
+            .iter()
+            .filter(|drive| !drive.is_volume())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut manifest = crate::snapshot::SandboxSnapshotManifest::new(
+            FIRECRACKER_BACKEND,
+            self.vm_state_path.clone(),
+            self.mem_overlaybd_config.image_config_path.clone(),
+            self.mem_virtual_size,
+            rootfs.image_config_path.clone(),
+            self.common
+                .rootfs_virtual_size
+                .context("snapshot rootfs size is missing")?,
+            &extra_drives,
+        )?;
+        manifest.volume_drive_slots = self.common.volume_drive_slots;
+        Ok(manifest)
+    }
+
     pub fn from_runnable_snapshot(snapshot: &RunnableSnapshot) -> Result<Self> {
         let mut base_common =
             FirecrackerCommonConfig::from_global_config().context("load sandbox common config")?;
@@ -573,6 +595,10 @@ impl FirecrackerSnapshotConfig {
     }
 
     fn validate_persisted_artifacts(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.mem_virtual_size > 0,
+            "memory virtual size must be non-zero"
+        );
         let rootfs_virtual_size = self
             .common
             .rootfs_virtual_size

@@ -92,7 +92,11 @@ async fn boot_and_wait(
     budget_secs: u64,
 ) -> Option<PathBuf> {
     let phase_t0 = std::time::Instant::now();
-    let mut recording_vm = match FirecrackerSandbox::from_snapshot_config(&config) {
+    let mut recording_vm = match FirecrackerSandbox::from_snapshot_config(
+        &config,
+        crate::types::SandboxId::new(),
+        None,
+    ) {
         Ok(vm) => vm,
         Err(error) => {
             warn!(%error, "startup pack: build recording VM failed");

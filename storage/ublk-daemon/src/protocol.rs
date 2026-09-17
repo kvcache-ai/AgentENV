@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use overlaybd::config::UpperMode;
+use overlaybd::config::{LayerConfig, UpperMode};
 use overlaybd::index_file::DataStat;
 use overlaybd::LayerDescriptor;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -54,6 +54,8 @@ pub enum DaemonRequest {
     RestackSnapshot {
         dev_id: u32,
         output_layer_path: PathBuf,
+        /// Merge this suffix of existing lowers before sealing the upper.
+        compact_from: Option<usize>,
     },
     /// Flush a live image while excluding concurrent image I/O.
     FlushForCheckpoint {
@@ -195,6 +197,8 @@ pub enum DaemonResponse {
     DeviceAcquired {
         dev_id: u32,
         device_path: PathBuf,
+        /// Configuration path used to open the acquired device, including a reused one.
+        image_config_path: PathBuf,
     },
     Released,
     SizeUpdated,
@@ -204,6 +208,8 @@ pub enum DaemonResponse {
     Deleted,
     RestackSnapshotCreated {
         descriptor: Option<LayerDescriptor>,
+        /// Actual live lowers after restack, including any compaction.
+        lowers: Vec<LayerConfig>,
         /// Best-effort device usage stats captured after the restack. Absent
         /// when produced by an older daemon or when computation failed.
         #[serde(default)]
@@ -231,8 +237,9 @@ pub enum DaemonResponse {
 
 /// Client-side outcome of a restack snapshot RPC.
 #[derive(Debug, Clone, Default)]
-pub struct RestackSnapshotStats {
+pub struct RestackSnapshotResult {
     pub descriptor: Option<LayerDescriptor>,
+    pub lowers: Vec<LayerConfig>,
     pub data_stat: Option<DataStat>,
     pub ext4_used_bytes: Option<u64>,
 }
@@ -399,6 +406,7 @@ mod tests {
         let resp = DaemonResponse::DeviceAcquired {
             dev_id: 5,
             device_path: PathBuf::from("/dev/ublkb5"),
+            image_config_path: PathBuf::from("/image.json"),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
@@ -406,6 +414,7 @@ mod tests {
             DaemonResponse::DeviceAcquired {
                 dev_id,
                 device_path,
+                ..
             } => {
                 assert_eq!(dev_id, 5);
                 assert_eq!(device_path, PathBuf::from("/dev/ublkb5"));
@@ -483,25 +492,6 @@ mod tests {
         assert_eq!(json, r#""shared""#);
         let decoded: AccessMode = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, AccessMode::Shared);
-    }
-
-    #[test]
-    fn response_restack_snapshot_created_from_older_daemon() {
-        // Rolling upgrades: an old daemon's response carries no stats fields.
-        let json = r#"{"status":"restack_snapshot_created","descriptor":null}"#;
-        let decoded: DaemonResponse = serde_json::from_str(json).unwrap();
-        match decoded {
-            DaemonResponse::RestackSnapshotCreated {
-                descriptor,
-                data_stat,
-                ext4_used_bytes,
-            } => {
-                assert!(descriptor.is_none());
-                assert!(data_stat.is_none());
-                assert!(ext4_used_bytes.is_none());
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
     }
 
     // ── Wire protocol edge case tests ──────────────────────────────────

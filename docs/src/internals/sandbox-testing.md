@@ -33,7 +33,7 @@ This document describes the public sandbox API, the global `ConfigManager` under
     - `from_global_config_with_user_image(...)` builds a config from an already
       resolved overlaybd image config.
     - Runtime launches from committed snapshots are built through
-      `FirecrackerSandbox::from_snapshot(&RunnableSnapshot, &SandboxLaunchConfig)`.
+      `FirecrackerSandbox::from_snapshot(&RunnableSnapshot, &SandboxLaunchConfig, Option<&Path>)`.
     - `uid`/`gid`: File ownership (default `0`).
 
 - `ProcessOpts` (`AgentENV/src/sandbox/process.rs`)
@@ -81,16 +81,16 @@ This document describes the public sandbox API, the global `ConfigManager` under
 - `FirecrackerSandbox` (`AgentENV/src/sandbox/firecracker/sandbox.rs`)
   - **Purpose**: lifecycle controller for a single Firecracker instance.
   - **Main methods (detailed)**
-    - `FirecrackerSandbox::new(FirecrackerSandboxConfig)`
+    - `FirecrackerSandbox::new(FirecrackerSandboxConfig, SandboxId, Option<&Path>)`
       - Creates a sandbox handle for a fresh boot.
       - Does not start Firecracker; it only prepares the object.
       - Each sandbox gets its own temporary work directory.
-    - `FirecrackerSandbox::resume_from_snapshot_config(&FirecrackerSnapshotConfig)`
-      - Creates a new sandbox handle and immediately starts it from a snapshot config.
+    - `FirecrackerSandbox::from_snapshot_config(&FirecrackerSnapshotConfig, SandboxId, Option<&Path>)`
+      - Creates a new sandbox handle from a snapshot config; call `start()` to launch it.
       - Uses `vm_state_path`, the memory overlay image config, and
         `base_rootfs_path` from the config.
-      - Returns a running sandbox after Firecracker and envd are ready.
-    - `FirecrackerSandbox::from_snapshot(&RunnableSnapshot, &SandboxLaunchConfig)`
+      - `start()` returns after Firecracker and envd are ready.
+    - `FirecrackerSandbox::from_snapshot(&RunnableSnapshot, &SandboxLaunchConfig, Option<&Path>)`
       - Creates a sandbox handle from committed snapshot state resolved for a node.
       - Uses snapshot `vm_state.bin` plus node-local materialized
         `memory/image.json` and `rootfs/image.json`.
@@ -151,7 +151,7 @@ let mut cfg = FirecrackerSandboxConfig::new(
 );
 cfg.boot_args = Some("console=ttyS0 reboot=k panic=1 pci=off init=/init".into());
 
-let mut sandbox = FirecrackerSandbox::new(cfg)?;
+let mut sandbox = FirecrackerSandbox::new(cfg, agentenv::types::SandboxId::new(), None)?;
 sandbox.start().await?;
 
 // Run a command inside the VM
@@ -159,10 +159,13 @@ let output = sandbox.run_command("echo", &["hello"]).await?;
 assert_eq!(output.exit_code, 0);
 println!("{}", output.stdout);
 
-let snapshot = sandbox.pause().await?;
+let snapshot = sandbox.capture_snapshot(agentenv::snapshot::SnapshotPlacement::Distributed).await?;
 sandbox.stop().await?;
 
-let mut resumed_sandbox = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
+let mut resumed_sandbox = FirecrackerSandbox::from_snapshot_config(
+    &snapshot, agentenv::types::SandboxId::new(), None,
+)?;
+resumed_sandbox.start().await?;
 resumed_sandbox.stop().await?;
 ```
 
@@ -388,10 +391,13 @@ sandbox.start().await?;
 let output = sandbox.run_command("echo", &["hello"]).await?;
 assert_eq!(output.exit_code, 0);
 
-let snapshot = sandbox.pause().await?;
+let snapshot = sandbox.capture_snapshot(agentenv::snapshot::SnapshotPlacement::Distributed).await?;
 sandbox.stop().await?;
 
-let mut resumed_sandbox = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
+let mut resumed_sandbox = FirecrackerSandbox::from_snapshot_config(
+    &snapshot, agentenv::types::SandboxId::new(), None,
+)?;
+resumed_sandbox.start().await?;
 resumed_sandbox.stop().await?;
 ```
 
@@ -435,7 +441,7 @@ resumed_sandbox.stop().await?;
   - Creating a snapshot, resuming, creating a second snapshot.
   - Dropping the first snapshot handle.
   - Resuming from the second snapshot and verifying disk state.
-  - Also tests `pause_to_dir` with snapshot-owned inherited layer adoption.
+  - Also tests `capture_snapshot_to_dir` with snapshot-owned inherited layer adoption.
 
 - `microvm_can_access_internet`
   Confirms guest networking works before and after snapshot resume.

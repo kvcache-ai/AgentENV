@@ -150,6 +150,22 @@ async fn orchestrator_lifecycle() -> Result<()> {
         assert_eq!(fetched.id, sandbox_id);
         assert_eq!(fetched.state, SandboxState::Running);
 
+        for _ in 0..3 {
+            drop(orchestrator.capture_snapshot(sandbox_id).await?);
+            orchestrator.pause_sandbox(sandbox_id).await?;
+            orchestrator
+                .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+                .await?;
+        }
+        let child = orchestrator
+            .fork_sandbox(sandbox_id, 1, NewTimeout::UseExisting)
+            .await?
+            .remove(0)?;
+        orchestrator.pause_sandbox(child.id).await?;
+        orchestrator
+            .resume_sandbox(child.id, NewTimeout::UseExisting)
+            .await?;
+        orchestrator.delete_sandbox(child.id).await?;
         orchestrator.pause_sandbox(sandbox_id).await?;
         let paused = orchestrator
             .get_sandbox(&sandbox_id)
@@ -262,6 +278,10 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
             })
             .await?;
         let sandbox_id = created.id;
+        orchestrator.pause_sandbox(sandbox_id).await?;
+        orchestrator
+            .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+            .await?;
         let capture = orchestrator.capture_snapshot(sandbox_id).await?;
         assert_eq!(capture.metadata.id, sandbox_id);
         assert_eq!(capture.metadata.state, SandboxState::Running);

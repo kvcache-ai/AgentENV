@@ -140,8 +140,8 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         config.common.default_workdir = Some(build_spec.context.workdir.clone());
         config.common.default_user = build_spec.context.user.clone();
         let config = config.apply_launch_config(&launch_config);
-        let mut sandbox = FirecrackerSandbox::new_with_id(config, launch_config.sandbox_id)?;
-        sandbox.storage_root = storage_root.to_path_buf();
+        let sandbox =
+            FirecrackerSandbox::new(config, launch_config.sandbox_id, Some(storage_root))?;
         Ok(Box::new(sandbox))
     }
 
@@ -151,8 +151,8 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         launch_config: SandboxLaunchConfig,
         storage_root: &Path,
     ) -> Result<Box<dyn SandboxBackend>> {
-        let mut sandbox = FirecrackerSandbox::from_snapshot(snapshot, &launch_config)?;
-        sandbox.storage_root = storage_root.to_path_buf();
+        let sandbox =
+            FirecrackerSandbox::from_snapshot(snapshot, &launch_config, Some(storage_root))?;
         Ok(Box::new(sandbox))
     }
 
@@ -177,12 +177,12 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         let paused_state = state
             .downcast_ref::<FirecrackerPausedState>()
             .context("The provided PausedSandboxState is not a Firecracker paused state")?;
-        let mut sandbox = FirecrackerSandbox::from_snapshot_config_with_override(
-            paused_state.snapshot_config().clone(),
+        let sandbox = FirecrackerSandbox::from_paused_state(
+            paused_state,
             sandbox_id,
             envd_access_token,
+            storage_root,
         )?;
-        sandbox.storage_root = storage_root.to_path_buf();
         Ok(Box::new(sandbox))
     }
 }

@@ -8,7 +8,7 @@ pub use client::{
     RestackSnapshotTerminalFailure, UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 pub use protocol::{
-    AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec, RestackSnapshotStats,
+    AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec, RestackSnapshotResult,
     SourceStateStrategy,
 };
 pub use server::UblkDaemonServer;

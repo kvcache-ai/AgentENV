@@ -12,7 +12,7 @@ use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
 use uvm_ublk_daemon::protocol::PackRecordingState;
 use uvm_ublk_daemon::{
-    CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotStats, RestackSnapshotTerminalFailure,
+    CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotResult, RestackSnapshotTerminalFailure,
     UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 
@@ -70,6 +70,7 @@ pub(crate) enum UblkCreateSpec {
     Overlaybd {
         image_config: PathBuf,
         global_config: PathBuf,
+        read_only_upper: bool,
     },
 }
 
@@ -176,14 +177,14 @@ fn runtime_device_timeout(resize_timeout_secs: u64) -> Duration {
 pub struct UblkDeviceManager {
     client: Option<Arc<UblkDaemonClient>>,
     pool_enabled: bool,
-    /// Pool of shared read-only ublk devices, keyed by canonical image config path.
+    /// Pool of shared read-only ublk devices, keyed by canonical image config path and upper access.
     /// Values are `Weak` references: when the last `SharedReadOnlyDevice` handle is
     /// dropped, the device is deleted asynchronously and the entry becomes stale.
-    shared_readonly_devices: DashMap<PathBuf, Weak<SharedReadOnlyDeviceInner>>,
+    shared_readonly_devices: DashMap<(PathBuf, bool), Weak<SharedReadOnlyDeviceInner>>,
     /// Per-image notifications for asynchronous shared-memory releases. A new
     /// acquire for the same image waits until the previous last-handle release
     /// has completed so the daemon does not reuse stale opened image state.
-    shared_readonly_releases: DashMap<PathBuf, Arc<Notify>>,
+    shared_readonly_releases: DashMap<(PathBuf, bool), Arc<Notify>>,
     recent_tools_device: std::sync::Mutex<Option<SharedReadOnlyDevice>>,
 }
 
@@ -281,24 +282,27 @@ impl UblkDeviceManager {
             .context("ublk daemon client is unavailable")
     }
 
-    /// Tell the daemon the sandbox owning `device_key` finished booting,
-    /// releasing held background downloads. Best-effort: failures only mean
-    /// the downloads start after the fallback timeout instead.
-    pub(crate) async fn notify_sandbox_ready(&self, device_key: &Path) {
+    /// Release downloads registered by source probing or by the runtime open.
+    /// Failure leaves the existing fallback timeout in effect.
+    pub(crate) async fn notify_sandbox_ready(&self, device_keys: &[&Path]) {
         let Ok(client) = self.require_client() else {
             return;
         };
-        // The daemon waits on the canonicalized path (create_image_file
-        // canonicalizes the image config path), so the notification must use
-        // the same form — otherwise the held download silently waits out the
-        // 20s fallback on symlinked or relative spellings.
-        let key = std::fs::canonicalize(device_key).unwrap_or_else(|_| device_key.to_path_buf());
-        if let Err(error) = client.notify_sandbox_ready(&key.to_string_lossy()).await {
-            tracing::warn!(
-                %error,
-                device_key = %key.display(),
-                "failed to notify daemon of sandbox readiness; downloads start after fallback timeout"
-            );
+        let mut notified = Vec::with_capacity(device_keys.len());
+        for device_key in device_keys {
+            let key =
+                std::fs::canonicalize(device_key).unwrap_or_else(|_| device_key.to_path_buf());
+            if notified.contains(&key) {
+                continue;
+            }
+            if let Err(error) = client.notify_sandbox_ready(&key.to_string_lossy()).await {
+                tracing::warn!(
+                    %error,
+                    device_key = %key.display(),
+                    "failed to notify daemon of sandbox readiness; downloads start after fallback timeout"
+                );
+            }
+            notified.push(key);
         }
     }
 
@@ -328,10 +332,8 @@ impl UblkDeviceManager {
 
     /// Create a raw overlaybd device via the daemon.
     ///
-    /// This fallback is only used for shared read-only devices when the warm pool
-    /// is disabled. Rootfs and extra drives must use
-    /// [`create_overlaybd_runtime_device`] so the daemon owns runtime
-    /// materialization and rollback.
+    /// Used for shared memory and reopening paused runtimes when the pool
+    /// is disabled. New runtimes use [`Self::create_overlaybd_runtime_device`].
     async fn create_raw_overlaybd_device(&self, spec: &UblkCreateSpec) -> Result<UblkDevice> {
         let client = self.require_client()?;
 
@@ -342,8 +344,9 @@ impl UblkDeviceManager {
             UblkCreateSpec::Overlaybd {
                 image_config,
                 global_config,
+                read_only_upper,
             } => client
-                .create_overlaybd(image_config, global_config)
+                .create_overlaybd_with_upper_access(image_config, global_config, *read_only_upper)
                 .await
                 .context("create overlaybd device via daemon"),
         };
@@ -446,6 +449,42 @@ impl UblkDeviceManager {
         }
     }
 
+    /// Reopen storage already owned by this sandbox; no new upper or directory.
+    pub(crate) async fn open_overlaybd_runtime(
+        &self,
+        image_config: &Path,
+        global_config: &Path,
+        virtual_size: u64,
+    ) -> Result<OverlaybdRuntimeHandle> {
+        let device = if self.pool_enabled {
+            let (dev_id, device_path, _) = self
+                .require_client()?
+                .acquire_overlaybd(
+                    image_config,
+                    global_config,
+                    Some(virtual_size),
+                    uvm_ublk_daemon::AccessMode::Exclusive,
+                )
+                .await?;
+            UblkDevice {
+                dev_id,
+                device_path,
+            }
+        } else {
+            self.create_raw_overlaybd_device(&UblkCreateSpec::Overlaybd {
+                image_config: image_config.to_path_buf(),
+                global_config: global_config.to_path_buf(),
+                read_only_upper: false,
+            })
+            .await?
+        };
+        Ok(OverlaybdRuntimeHandle {
+            device,
+            image_config_path: image_config.to_path_buf(),
+            actual_virtual_size: virtual_size,
+        })
+    }
+
     pub(crate) async fn create_overlaybd_runtime_device(
         &self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,
@@ -498,8 +537,9 @@ impl UblkDeviceManager {
         &self,
         device: &UblkDevice,
         output_layer_path: &Path,
+        compact_from: Option<usize>,
         kind: &'static str,
-    ) -> Result<Option<overlaybd::LayerDescriptor>> {
+    ) -> Result<Vec<overlaybd::config::LayerConfig>> {
         let client = self.require_client()?;
         debug!(
             dev_id = device.dev_id,
@@ -508,20 +548,35 @@ impl UblkDeviceManager {
         );
         let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "restack_snapshot");
         let result = client
-            .restack_snapshot(device.dev_id, output_layer_path)
+            .restack_snapshot(device.dev_id, output_layer_path, compact_from)
             .await;
         metric.finish(&result);
         match result {
-            Ok(stats) => {
-                record_restack_usage_stats(device.dev_id, kind, &stats);
+            Ok(result) => {
+                if let Some(descriptor) = result.descriptor.as_ref() {
+                    let size = tokio::fs::metadata(output_layer_path)
+                        .await
+                        .with_context(|| {
+                            format!("read sealed layer metadata {}", output_layer_path.display())
+                        })
+                        .map_err(SandboxCaptureError::terminal)?
+                        .len();
+                    if size != descriptor.size {
+                        return Err(SandboxCaptureError::terminal(anyhow!(
+                            "restack snapshot descriptor size mismatch for {}: descriptor says {}, file has {}",
+                            output_layer_path.display(), descriptor.size, size,
+                        )).into());
+                    }
+                }
+                record_restack_usage_stats(device.dev_id, kind, &result);
                 debug!(
                     dev_id = device.dev_id,
                     output = %output_layer_path.display(),
-                    digest = stats.descriptor.as_ref().map(|d| d.digest.as_str()),
-                    size = stats.descriptor.as_ref().map(|d| d.size),
+                    digest = result.descriptor.as_ref().map(|d| d.digest.as_str()),
+                    size = result.descriptor.as_ref().map(|d| d.size),
                     "overlaybd restack snapshot completed"
                 );
-                Ok(stats.descriptor)
+                Ok(result.lowers)
             }
             Err(err) => {
                 if err
@@ -544,6 +599,16 @@ impl UblkDeviceManager {
                 })
             }
         }
+    }
+
+    /// Flush a live OverlayBD image before preserving its mutable upper.
+    pub(crate) async fn flush_for_checkpoint(&self, device: &UblkDevice) -> Result<()> {
+        let client = self.require_client()?;
+        let dev_id = device.dev_id;
+        let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "flush_checkpoint");
+        let result = client.flush_for_checkpoint(dev_id).await;
+        metric.finish(&result);
+        result.with_context(|| format!("flush overlaybd device {dev_id} for checkpoint"))
     }
 
     /// Gracefully shut down the daemon process.
@@ -604,9 +669,14 @@ impl UblkDeviceManager {
         let UblkCreateSpec::Overlaybd {
             image_config,
             global_config,
+            read_only_upper,
         } = spec;
 
-        let key = std::fs::canonicalize(image_config).unwrap_or_else(|_| image_config.clone());
+        // The memory backend configuration is fixed for this process.
+        let key = (
+            std::fs::canonicalize(image_config).unwrap_or_else(|_| image_config.clone()),
+            *read_only_upper,
+        );
 
         loop {
             // If the previous last handle is still releasing the daemon-side
@@ -616,6 +686,9 @@ impl UblkDeviceManager {
                 .get(&key)
                 .map(|entry| Arc::clone(entry.value()))
             {
+                // Register before re-checking the map. `notify_waiters` does
+                // not retain a permit, so registering only after observing the
+                // entry can miss the release notification and wait forever.
                 let notified = notify.notified();
                 tokio::pin!(notified);
                 notified.as_mut().enable();
@@ -636,7 +709,8 @@ impl UblkDeviceManager {
                     .filter(|inner| !inner.released.load(Ordering::Acquire))
                 {
                     debug!(
-                        key = %key.display(),
+                        key = %key.0.display(),
+                        read_only_upper = key.1,
                         dev_id = strong.device.dev_id,
                         "reusing shared read-only ublk device"
                     );
@@ -646,30 +720,37 @@ impl UblkDeviceManager {
             break;
         }
 
-        let device = if self.pool_enabled {
+        let (device, opened_image_config_path) = if self.pool_enabled {
             let client = self.require_client()?;
             let mut metric =
                 MetricGuard::operation(UBLK_OPERATION_DURATION, "acquire_shared_memory");
             let acquired = client
-                .acquire_overlaybd(
+                .acquire_overlaybd_with_upper_access(
                     image_config,
                     global_config,
                     virtual_size,
                     uvm_ublk_daemon::AccessMode::Shared,
+                    *read_only_upper,
                 )
                 .await
                 .context("acquire shared read-only ublk device");
             metric.finish(&acquired);
-            let (dev_id, device_path) = acquired?;
+            let (dev_id, device_path, opened_config) = acquired?;
 
-            UblkDevice {
-                dev_id,
-                device_path,
-            }
+            (
+                UblkDevice {
+                    dev_id,
+                    device_path,
+                },
+                opened_config,
+            )
         } else {
-            self.create_raw_overlaybd_device(spec)
-                .await
-                .context("create shared read-only ublk device")?
+            (
+                self.create_raw_overlaybd_device(spec)
+                    .await
+                    .context("create shared memory ublk device")?,
+                image_config.clone(),
+            )
         };
 
         let cache_fd = match File::open(&device.device_path) {
@@ -680,7 +761,8 @@ impl UblkDeviceManager {
             }
         };
         debug!(
-            key = %key.display(),
+            key = %key.0.display(),
+            read_only_upper = key.1,
             dev_id = device.dev_id,
             path = %device.device_path.display(),
             "created or acquired shared read-only ublk device"
@@ -689,6 +771,7 @@ impl UblkDeviceManager {
         let inner = Arc::new(SharedReadOnlyDeviceInner {
             device,
             image_config_key: key.clone(),
+            opened_image_config_path,
             released: AtomicBool::new(false),
             cache_fd: std::sync::Mutex::new(Some(cache_fd)),
         });
@@ -733,7 +816,8 @@ impl UblkDeviceManager {
 struct SharedReadOnlyDeviceInner {
     device: UblkDevice,
     /// Canonical key used for the shared device pool lookup.
-    image_config_key: PathBuf,
+    image_config_key: (PathBuf, bool),
+    opened_image_config_path: PathBuf,
     released: AtomicBool,
     // Linux clears a block device's page cache when its last opener closes
     // (blkdev_put_whole -> kill_bdev). Keep an opener between sandbox launches;
@@ -762,7 +846,7 @@ impl Drop for SharedReadOnlyDeviceInner {
             .insert(key.clone(), Arc::clone(&notify));
         info!(
             dev_id,
-            key = %key.display(),
+            key = %key.0.display(),
             "last reference to shared read-only ublk device dropped, scheduling release"
         );
         // Remove the stale Weak entry from the pool and release the device.
@@ -792,7 +876,7 @@ impl Drop for SharedReadOnlyDeviceInner {
 }
 
 async fn release_shared_readonly_device(
-    key: PathBuf,
+    key: (PathBuf, bool),
     device: UblkDevice,
     notify: Arc<Notify>,
 ) -> Result<()> {
@@ -837,7 +921,15 @@ impl SharedReadOnlyDevice {
     }
 
     pub fn image_config_path(&self) -> &Path {
-        &self.inner.image_config_key
+        &self.inner.image_config_key.0
+    }
+
+    pub(crate) fn opened_image_config_path(&self) -> &Path {
+        &self.inner.opened_image_config_path
+    }
+
+    pub(crate) fn canonical_image_config_path(&self) -> &Path {
+        &self.inner.image_config_key.0
     }
 
     /// The `/dev/ublkb<N>` path of this device.
@@ -889,7 +981,7 @@ impl UblkDevice {
 }
 
 /// Record per-device overlaybd/ext4 usage gauges piggybacked on a restack RPC.
-fn record_restack_usage_stats(dev_id: u32, kind: &'static str, stats: &RestackSnapshotStats) {
+fn record_restack_usage_stats(dev_id: u32, kind: &'static str, stats: &RestackSnapshotResult) {
     let dev_id = dev_id.to_string();
     if let Some(stat) = &stats.data_stat {
         metrics::gauge!(
@@ -921,6 +1013,131 @@ fn record_restack_usage_stats(dev_id: u32, kind: &'static str, stats: &RestackSn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shared_memory_uses_daemon_backing_path_when_reusing_an_alias() {
+        use uvm_ublk_daemon::protocol::{
+            recv_message, send_message, DaemonRequest, DaemonResponse,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("image.json");
+        std::fs::write(&config, "{}").unwrap();
+        let first = dir.path().join("first/image.json");
+        std::fs::create_dir(first.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&config, &first).unwrap();
+        let alias = dir.path().join("alias.json");
+        std::os::unix::fs::symlink(&config, &alias).unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let opened_path = first.clone();
+        let device_path = dir.path().join("mock-device");
+        std::fs::write(&device_path, []).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            assert!(matches!(
+                recv_message::<DaemonRequest>(&mut stream).await.unwrap(),
+                Some(DaemonRequest::AcquireOverlaybd { .. })
+            ));
+            send_message(
+                &mut stream,
+                &DaemonResponse::DeviceAcquired {
+                    dev_id: 123,
+                    device_path,
+                    image_config_path: opened_path,
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let manager =
+            UblkDeviceManager::new(Some(UblkDaemonClient::new_for_test(socket, false)), true);
+        let mut spec = UblkCreateSpec::Overlaybd {
+            image_config: alias,
+            global_config: dir.path().join("global.json"),
+            read_only_upper: true,
+        };
+        let device = manager.get_or_create_shared_mem(&spec, 4096).await.unwrap();
+        server.await.unwrap();
+        assert_eq!(device.opened_image_config_path(), first);
+        assert_eq!(
+            device.canonical_image_config_path(),
+            config.canonicalize().unwrap()
+        );
+        let UblkCreateSpec::Overlaybd { image_config, .. } = &mut spec;
+        *image_config = config;
+        let reused = manager.get_or_create_shared_mem(&spec, 4096).await.unwrap();
+        assert!(Arc::ptr_eq(&device.inner, &reused.inner));
+        assert_eq!(reused.opened_image_config_path(), first);
+        // The mocked device has no kernel resource to release.
+        device.inner.released.store(true, Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn ready_notifies_source_and_runtime_once_per_canonical_key() {
+        use uvm_ublk_daemon::protocol::{
+            recv_message, send_message, DaemonRequest, DaemonResponse,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.json");
+        let runtime = dir.path().join("runtime.json");
+        let alias = dir.path().join("source-alias.json");
+        std::fs::write(&source, "{}").unwrap();
+        std::fs::write(&runtime, "{}").unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let mut keys = Vec::new();
+            while let Ok((mut stream, _)) = listener.accept().await {
+                match recv_message::<DaemonRequest>(&mut stream)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
+                    DaemonRequest::NotifySandboxReady { device_key } => keys.push(device_key),
+                    DaemonRequest::GetFeatures => {
+                        send_message(&mut stream, &DaemonResponse::Ok)
+                            .await
+                            .unwrap();
+                        return keys;
+                    }
+                    request => panic!("unexpected request: {request:?}"),
+                }
+                send_message(&mut stream, &DaemonResponse::Ok)
+                    .await
+                    .unwrap();
+            }
+            unreachable!()
+        });
+        let client = UblkDaemonClient::new_for_test(socket.clone(), false);
+        let manager = UblkDeviceManager::new(Some(client), false);
+        manager
+            .notify_sandbox_ready(&[&source, &runtime, &alias])
+            .await;
+        // A final request ensures all notifications, including duplicates, were observed.
+        let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+        send_message(&mut stream, &DaemonRequest::GetFeatures)
+            .await
+            .unwrap();
+        let _: DaemonResponse = recv_message(&mut stream).await.unwrap().unwrap();
+        assert_eq!(
+            server.await.unwrap(),
+            vec![
+                source
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                runtime
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        );
+    }
 
     #[test]
     fn rejects_persisted_cow_backend_with_migration_guidance() {

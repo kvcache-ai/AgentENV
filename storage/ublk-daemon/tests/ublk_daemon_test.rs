@@ -446,11 +446,18 @@ mod client_tests {
     #[tokio::test]
     async fn snapshot_success() {
         let server = MockServer::start(Box::new(|req| match req {
-            DaemonRequest::RestackSnapshot { .. } => DaemonResponse::RestackSnapshotCreated {
+            DaemonRequest::RestackSnapshot {
+                compact_from: Some(1),
+                ..
+            } => DaemonResponse::RestackSnapshotCreated {
                 descriptor: Some(overlaybd::LayerDescriptor {
                     digest: "sha256:abc".to_string(),
                     size: 4096,
                 }),
+                lowers: vec![overlaybd::config::LayerConfig {
+                    file: "/snapshots/managed-base.commit".into(),
+                    ..Default::default()
+                }],
                 data_stat: None,
                 ext4_used_bytes: None,
             },
@@ -462,9 +469,10 @@ mod client_tests {
 
         let client = server.client();
         let stats = client
-            .restack_snapshot(2, Path::new("/snapshots/layer0"))
+            .restack_snapshot(2, Path::new("/snapshots/layer0"), Some(1))
             .await
             .unwrap();
+        assert_eq!(stats.lowers[0].file, "/snapshots/managed-base.commit");
         assert_eq!(
             stats.descriptor,
             Some(overlaybd::LayerDescriptor {
@@ -483,7 +491,7 @@ mod client_tests {
 
         let client = server.client();
         let err = client
-            .restack_snapshot(2, Path::new("/out"))
+            .restack_snapshot(2, Path::new("/out"), None)
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -500,7 +508,7 @@ mod client_tests {
 
         let client = server.client();
         let err = client
-            .restack_snapshot(2, Path::new("/out"))
+            .restack_snapshot(2, Path::new("/out"), None)
             .await
             .unwrap_err();
         assert!(
@@ -516,7 +524,7 @@ mod client_tests {
 
         let client = server.client();
         let err = client
-            .restack_snapshot(1, Path::new("/out"))
+            .restack_snapshot(1, Path::new("/out"), None)
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -633,6 +641,7 @@ mod client_tests {
                 DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
                 DaemonRequest::RestackSnapshot { .. } => DaemonResponse::RestackSnapshotCreated {
                     descriptor: None,
+                    lowers: Vec::new(),
                     data_stat: None,
                     ext4_used_bytes: None,
                 },
@@ -642,6 +651,7 @@ mod client_tests {
                 DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
                     dev_id: 99,
                     device_path: PathBuf::from("/dev/ublkb99"),
+                    image_config_path: PathBuf::from("/actual/image.json"),
                 },
                 DaemonRequest::CreateOverlaybdRuntimeDevice { .. } => {
                     DaemonResponse::OverlaybdRuntimeDeviceCreated {
@@ -672,7 +682,7 @@ mod client_tests {
             .unwrap();
         client.delete(30).await.unwrap();
         client
-            .restack_snapshot(40, Path::new("/snap/output"))
+            .restack_snapshot(40, Path::new("/snap/output"), None)
             .await
             .unwrap();
         client.flush_for_checkpoint(17).await.unwrap();
@@ -1021,6 +1031,7 @@ mod server_tests {
             &DaemonRequest::RestackSnapshot {
                 dev_id: 888,
                 output_layer_path: PathBuf::from("/tmp/snap"),
+                compact_from: None,
             },
         )
         .await
@@ -1064,6 +1075,7 @@ mod server_tests {
             DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
                 dev_id: 10,
                 device_path: PathBuf::from("/dev/ublkb10"),
+                image_config_path: PathBuf::from("/tmp/image.json"),
             },
             _ => DaemonResponse::Error {
                 message: "unexpected request".into(),
@@ -1072,7 +1084,7 @@ mod server_tests {
         .await;
 
         let client = server.client();
-        let (dev_id, path) = client
+        let (dev_id, path, _) = client
             .acquire_overlaybd(
                 Path::new("/tmp/image.json"),
                 Path::new("/global.json"),
@@ -1098,6 +1110,7 @@ mod server_tests {
                 DaemonResponse::DeviceAcquired {
                     dev_id: 20,
                     device_path: PathBuf::from("/dev/ublkb20"),
+                    image_config_path: PathBuf::from("/actual/first-opener/image.json"),
                 }
             }
             _ => DaemonResponse::Error {
@@ -1108,7 +1121,7 @@ mod server_tests {
 
         let client = server.client();
 
-        let (dev_id, path) = client
+        let (dev_id, path, image_config) = client
             .acquire_overlaybd(
                 Path::new("/tmp/mem.json"),
                 Path::new("/global.json"),
@@ -1118,6 +1131,10 @@ mod server_tests {
             .await
             .unwrap();
         assert_eq!(dev_id, 20);
+        assert_eq!(
+            image_config,
+            PathBuf::from("/actual/first-opener/image.json")
+        );
         assert_eq!(path, PathBuf::from("/dev/ublkb20"));
     }
 

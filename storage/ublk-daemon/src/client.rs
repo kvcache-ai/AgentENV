@@ -10,7 +10,7 @@ use warm_pool::PoolConfig;
 
 use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
-    RestackSnapshotStats, SourceStateStrategy,
+    RestackSnapshotResult, SourceStateStrategy,
 };
 use overlaybd::config::UpperMode;
 
@@ -575,19 +575,23 @@ impl UblkDaemonClient {
         &self,
         dev_id: u32,
         output_layer_path: &Path,
-    ) -> Result<RestackSnapshotStats> {
+        compact_from: Option<usize>,
+    ) -> Result<RestackSnapshotResult> {
         let request = DaemonRequest::RestackSnapshot {
             dev_id,
             output_layer_path: output_layer_path.to_path_buf(),
+            compact_from,
         };
         let response = self.call(request, SNAPSHOT_TIMEOUT).await?;
         match response {
             DaemonResponse::RestackSnapshotCreated {
                 descriptor,
+                lowers,
                 data_stat,
                 ext4_used_bytes,
-            } => Ok(RestackSnapshotStats {
+            } => Ok(RestackSnapshotResult {
                 descriptor,
+                lowers,
                 data_stat,
                 ext4_used_bytes,
             }),
@@ -657,14 +661,14 @@ impl UblkDaemonClient {
 
     /// Acquire a warm overlaybd device from the pool.
     ///
-    /// Returns `(dev_id, device_path)`.
+    /// Returns `(dev_id, device_path, actual_image_config_path)`.
     pub async fn acquire_overlaybd(
         &self,
         image_config: &Path,
         global_config: &Path,
         virtual_size: Option<u64>,
         access_mode: AccessMode,
-    ) -> Result<(u32, PathBuf)> {
+    ) -> Result<(u32, PathBuf, PathBuf)> {
         self.acquire_overlaybd_with_upper_access(
             image_config,
             global_config,
@@ -682,7 +686,7 @@ impl UblkDaemonClient {
         virtual_size: Option<u64>,
         access_mode: AccessMode,
         read_only_upper: bool,
-    ) -> Result<(u32, PathBuf)> {
+    ) -> Result<(u32, PathBuf, PathBuf)> {
         let request = DaemonRequest::AcquireOverlaybd {
             image_config: image_config.to_path_buf(),
             global_config: global_config.to_path_buf(),
@@ -694,7 +698,8 @@ impl UblkDaemonClient {
             DaemonResponse::DeviceAcquired {
                 dev_id,
                 device_path,
-            } => Ok((dev_id, device_path)),
+                image_config_path,
+            } => Ok((dev_id, device_path, image_config_path)),
             DaemonResponse::TerminalError { message } => {
                 bail!("daemon: acquire overlaybd failed terminally: {message}")
             }
@@ -902,7 +907,7 @@ mod tests {
         let err = client.delete(0).await;
         assert!(err.is_err());
 
-        let err = client.restack_snapshot(0, Path::new("/out")).await;
+        let err = client.restack_snapshot(0, Path::new("/out"), None).await;
         assert!(err.is_err());
     }
 
@@ -953,7 +958,7 @@ mod tests {
         });
 
         let error = client
-            .restack_snapshot(0, Path::new("/snapshot.commit"))
+            .restack_snapshot(0, Path::new("/snapshot.commit"), None)
             .await
             .unwrap_err();
         server.await.unwrap();
@@ -993,7 +998,7 @@ mod tests {
         ] {
             let client = UblkDaemonClient::new_for_test(dir.path().join("missing.sock"), dead);
             let err = client
-                .restack_snapshot(0, Path::new("/out"))
+                .restack_snapshot(0, Path::new("/out"), None)
                 .await
                 .unwrap_err();
             assert!(!err.is::<RestackSnapshotTerminalFailure>(), "{err:#}");
@@ -1026,7 +1031,7 @@ mod tests {
             });
             let client = UblkDaemonClient::new_for_test(socket, false);
             let err = client
-                .restack_snapshot(0, Path::new("/out"))
+                .restack_snapshot(0, Path::new("/out"), None)
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -1061,6 +1066,7 @@ mod tests {
                 DaemonRequest::RestackSnapshot {
                     dev_id: 0,
                     output_layer_path: "/out".into(),
+                    compact_from: None,
                 },
                 Duration::from_secs(1),
             )
