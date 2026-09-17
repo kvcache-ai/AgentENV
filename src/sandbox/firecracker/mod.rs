@@ -8,6 +8,7 @@ mod config;
 mod connector;
 mod factory;
 mod instance;
+mod memory_snapshot;
 mod mmds;
 mod overlaybd_snapshot;
 mod pool;

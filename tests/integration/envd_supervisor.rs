@@ -1,4 +1,5 @@
 use crate::common;
+use agentenv::types::SandboxId;
 
 use agentenv::sandbox::{FirecrackerSandbox, SandboxBackend, SandboxExecutor};
 use anyhow::Result;
@@ -16,7 +17,7 @@ async fn envd_recovers_after_sigkill() -> Result<()> {
     common::setup().await;
     tokio::time::timeout(TEST_TIMEOUT, async {
         let sandbox_config = common::default_sandbox_config()?;
-        let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+        let mut sandbox = FirecrackerSandbox::new(sandbox_config, SandboxId::new(), None)?;
         sandbox.start().await?;
 
         // Record the envd PID that runsv is currently supervising.

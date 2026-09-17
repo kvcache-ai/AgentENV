@@ -24,6 +24,17 @@ use crate::lsmt::index::{
     ComboIndex, LogIndex, MutableIndex, ReadOnlyIndex, Segment, SegmentMapping,
 };
 
+/// Write data to an already prepared sparse upper without rebuilding its index.
+/// The caller excludes concurrent writes; sealing collects the sparse extents.
+pub async fn write_sparse_upper(
+    file: &crate::backend::local::LocalFile,
+    offset: u64,
+    data: &[u8],
+) -> Result<usize> {
+    use crate::io::virtual_file::VirtualFile;
+    file.write_at(HEADER_SIZE + offset, data).await
+}
+
 pub struct LSMTFile {
     pub(super) index: Arc<RwLock<ComboIndex>>,
     /// the layers order is as following:
