@@ -11,8 +11,8 @@ pub use manifest::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
 pub(crate) use snapshot::{rootfs_snapshot_image_tag, RuntimeArtifactLease};
 pub use snapshot::{
     CommandContext, CommittedSnapshot, PersistedDiskImagePublication, RunnableSnapshot,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-    SnapshotSourceKind, SnapshotVolume, StartupCommand, TemplateBuildErrorReason,
+    SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
+    SnapshotSource, SnapshotSourceKind, SnapshotVolume, StartupCommand, TemplateBuildErrorReason,
     TemplateBuildInfo, TemplateBuildStatus,
 };
 pub use version::SnapshotRuntimeVersions;

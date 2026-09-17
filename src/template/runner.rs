@@ -197,7 +197,7 @@ impl TemplateBuildRunner {
                 vmm_binary: global.resolved_firecracker_binary_path(),
                 tools_drive_version,
             },
-            move || FirecrackerSandbox::new_with_id(config, sandbox_id),
+            move || FirecrackerSandbox::new(config, sandbox_id, None),
         )
     }
 
@@ -233,7 +233,7 @@ impl TemplateBuildRunner {
                 vmm_binary: global.resolved_firecracker_binary_path(),
                 tools_drive_version,
             },
-            move || FirecrackerSandbox::from_snapshot(&base_snapshot, &launch_config),
+            move || FirecrackerSandbox::from_snapshot(&base_snapshot, &launch_config, None),
         )
     }
 
