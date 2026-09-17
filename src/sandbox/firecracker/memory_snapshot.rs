@@ -13,7 +13,7 @@ use nix::unistd::Pid;
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::{load_image_config, ImageConfig, UpperConfig, UpperMode};
 use overlaybd::index::{Segment, SegmentMapping};
-use overlaybd::index_file::{compact_to, open_file_rw};
+use overlaybd::index_file::{checkpoint_sparse_index, compact_to, open_file_rw};
 use overlaybd::layer_metadata::resolve_local_layer_path;
 use overlaybd::virtual_file::VirtualFile;
 use std::path::{Path, PathBuf};
@@ -66,6 +66,7 @@ pub(super) async fn save_paused_memory(
         .0;
         image.upper = UpperConfig {
             data: upper.display().to_string(),
+            index: upper.with_extension("index").display().to_string(),
             mode: Some(UpperMode::Sparse),
             ..Default::default()
         };
@@ -203,7 +204,11 @@ pub(super) async fn capture_memory_snapshot(
             .await
             .map_err(|error| SandboxCaptureError::recoverable(error.into()))?;
         let file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(&path, false)?);
-        open_file_rw(file, None).await?.close_seal().await?;
+        let index: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_rw(path.with_extension("index"), false)?);
+        open_file_rw(file, Some(index)).await?.close_seal().await?;
+        // Sealed lowers contain their index; only writable uppers need the sidecar.
+        tokio::fs::remove_file(path.with_extension("index")).await?;
         Some(path)
     } else {
         write_dirty_memory_layer(
@@ -279,7 +284,9 @@ async fn remove_replaced_memory_layers(
 async fn seal_memory_upper(path: &Path) -> SandboxCaptureResult<PathBuf> {
     let file: Arc<dyn VirtualFile> =
         Arc::new(LocalFile::open_rw(path, false).context("open paused memory upper")?);
-    let upper = open_file_rw(file, None).await?;
+    let index: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::open_rw(path.with_extension("index"), false)?);
+    let upper = open_file_rw(file, Some(index)).await?;
     let size = upper.size().await?;
     let lower = path.with_file_name(format!("memory-base-{}.commit", Uuid::now_v7()));
     async {
@@ -294,8 +301,13 @@ async fn seal_memory_upper(path: &Path) -> SandboxCaptureResult<PathBuf> {
 }
 
 fn prepare_sparse_memory_upper(path: &Path, virtual_size: u64) -> Result<()> {
-    overlaybd::helper::prepare_runtime_upper(path, None, virtual_size, UpperMode::Sparse)
-        .with_context(|| format!("prepare sparse memory upper {}", path.display()))
+    overlaybd::helper::prepare_runtime_upper(
+        path,
+        Some(&path.with_extension("index")),
+        virtual_size,
+        UpperMode::Sparse,
+    )
+    .with_context(|| format!("prepare sparse memory upper {}", path.display()))
 }
 
 async fn write_memory_layer(
@@ -498,6 +510,24 @@ async fn write_dirty_memory_to_sparse_upper(
         .map(|range| range.length as u64)
         .sum::<u64>()
         .min(SPARSE_MEMORY_WRITE_CHUNK_SIZE as u64) as usize;
+    let sparse_ranges: Vec<Segment> = dirty_ranges
+        .ranges
+        .iter()
+        .flat_map(|range| {
+            let mut offset = range.image_offset as u64 / OVERLAYBD_ALIGNMENT;
+            let mut remaining = range.length as u64 / OVERLAYBD_ALIGNMENT;
+            std::iter::from_fn(move || {
+                if remaining == 0 {
+                    return None;
+                }
+                let length = remaining.min(u64::from(Segment::MAX_LENGTH));
+                let segment = Segment::new(offset, length as u32);
+                offset += length;
+                remaining -= length;
+                Some(segment)
+            })
+        })
+        .collect();
     let mut chunks = dirty_ranges
         .ranges
         .iter()
@@ -539,6 +569,9 @@ async fn write_dirty_memory_to_sparse_upper(
             .read_exact_remote(first[0].host_address, &mut buffer)
             .map_err(SandboxCaptureError::recoverable)?;
         write_memory_batch(&file, &first, &buffer)
+            .await
+            .map_err(SandboxCaptureError::terminal)?;
+        checkpoint_sparse_index(&upper_path.with_extension("index"), sparse_ranges)
             .await
             .map_err(SandboxCaptureError::terminal)?;
         return Ok(());
@@ -586,6 +619,9 @@ async fn write_dirty_memory_to_sparse_upper(
         (batch, buffer) = next;
     }
     write_memory_batch(&file, &batch, &buffer)
+        .await
+        .map_err(SandboxCaptureError::terminal)?;
+    checkpoint_sparse_index(&upper_path.with_extension("index"), sparse_ranges)
         .await
         .map_err(SandboxCaptureError::terminal)?;
     Ok(())
@@ -834,6 +870,17 @@ mod tests {
         assert_eq!(&updated[4096..8192], &[0x33; 4096]);
         assert_eq!(&updated[8192..], &output[8192..]);
         assert_eq!(std::fs::metadata(&path).unwrap().blocks(), allocated);
+        let data: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(&path, false).unwrap());
+        let index: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_rw(path.with_extension("index"), false).unwrap());
+        let reopened = open_file_rw(data, Some(index)).await.unwrap();
+        assert_eq!(reopened.read_at(0, 4096).await.unwrap(), vec![0x33; 4096]);
+        assert!(reopened
+            .read_at(4 * mib as u64, 4096)
+            .await
+            .unwrap()
+            .iter()
+            .all(|byte| *byte == 0));
     }
 
     #[tokio::test]
@@ -933,7 +980,10 @@ mod tests {
                     let path = entry?.path();
                     if path.is_dir() {
                         directories.push(path);
-                    } else if path != config && path != upper {
+                    } else if path != config
+                        && path != upper
+                        && path != Path::new(&image.upper.index)
+                    {
                         assert!(
                             retained.contains(&path),
                             "unowned memory file: {}",
