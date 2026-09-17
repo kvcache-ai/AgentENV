@@ -1,6 +1,7 @@
 //! Host resources a running Firecracker sandbox owns.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -41,6 +42,8 @@ pub(super) struct SandboxResources {
     /// best-effort notification. `None` when no start hook was delivered (or
     /// no extension is configured).
     pub(super) custom_extension_hook_guard: Option<CustomExtensionHookGuard>,
+    /// Declared last so resource handles drop before source files are unpinned.
+    pub(super) source_lease: Option<Arc<crate::snapshot::RuntimeArtifactLease>>,
 }
 
 impl SandboxResources {
@@ -123,6 +126,7 @@ impl SandboxResources {
                 warn!(%error, "failed to release shared memory ublk device during stop");
             }
         }
+        self.source_lease.take();
         match network_error {
             Some(error) => Err(error),
             None => Ok(()),

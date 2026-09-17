@@ -7,23 +7,18 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::fs;
-use tokio::sync::{watch, Mutex as AsyncMutex};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tracing::warn;
-
-use crate::snapshot::types::RuntimeArtifactLease;
 
 const DEFAULT_MAX_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 const EVICTION_TARGET_RATIO: f64 = 0.8;
 
-/// A reference-counted handle to a cached file.
+/// A handle that keeps a cached file pinned.
 ///
-/// While held, the underlying file is pinned and will not be evicted by LRU.
-/// When all handles for a given key are dropped the ref-count reaches zero and
-/// the file becomes eligible for eviction.
+/// While held, the underlying file will not be evicted by LRU.
 pub(crate) struct CacheHandle {
-    cache: Arc<LocalArtifactCache>,
-    key: String,
     local_path: PathBuf,
+    _pin: Arc<()>,
 }
 
 impl CacheHandle {
@@ -33,27 +28,11 @@ impl CacheHandle {
     }
 }
 
-impl Drop for CacheHandle {
-    fn drop(&mut self) {
-        self.cache.release(&self.key);
-    }
-}
-
-/// Lease implementation that keeps a collection of [`CacheHandle`]s pinned.
-///
-/// Stored as `RunnableSnapshot._lease`; as long as the sandbox keeps the
-/// runnable snapshot the artifact files stay pinned in the local cache.
-pub(crate) struct CacheArtifactLease {
-    pub(crate) _handles: Vec<CacheHandle>,
-}
-
-impl RuntimeArtifactLease for CacheArtifactLease {}
-
 struct CacheEntry {
     local_path: PathBuf,
     size: u64,
     last_accessed: Instant,
-    ref_count: usize,
+    pin: Arc<()>,
 }
 
 struct CacheIndex {
@@ -61,28 +40,10 @@ struct CacheIndex {
     total_size: u64,
 }
 
-/// Tracks in-flight fetches so concurrent callers that request the same key
-/// wait for a single materialization rather than duplicating work.
-#[derive(Clone)]
-struct InflightFetch {
-    receiver: watch::Receiver<Option<InflightFetchResult>>,
-}
-
-#[derive(Clone, Debug)]
-enum InflightFetchResult {
-    Success,
-    Failed(SharedFetchError),
-}
-
-#[derive(Clone, Debug)]
-struct SharedFetchError {
-    message: String,
-}
-
 /// Node-local disk cache for downloaded or materialized runtime artifacts.
 ///
 /// Design invariants:
-/// - Files with `ref_count > 0` are never evicted.
+/// - Files with a live [`CacheHandle`] are never evicted.
 /// - Fetches are deduplicated: only one fetch per key at a time.
 /// - Entries are node-local derived state that can be regenerated or
 ///   re-fetched if the cache is missing or partially evicted.
@@ -90,7 +51,7 @@ pub(crate) struct LocalArtifactCache {
     cache_root: PathBuf,
     max_size_bytes: u64,
     index: Mutex<CacheIndex>,
-    inflight: AsyncMutex<HashMap<String, InflightFetch>>,
+    key_locks: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
 }
 
 impl LocalArtifactCache {
@@ -107,7 +68,7 @@ impl LocalArtifactCache {
                 entries: HashMap::new(),
                 total_size: 0,
             }),
-            inflight: AsyncMutex::new(HashMap::new()),
+            key_locks: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -122,7 +83,7 @@ impl LocalArtifactCache {
         fetch: F,
     ) -> Result<CacheHandle>
     where
-        F: Fn(PathBuf) -> Fut,
+        F: FnOnce(PathBuf) -> Fut,
         Fut: Future<Output = Result<u64>>,
     {
         let local_path = self.key_to_local_path(key)?;
@@ -143,140 +104,98 @@ impl LocalArtifactCache {
         fetch: F,
     ) -> Result<CacheHandle>
     where
-        F: Fn(PathBuf) -> Fut,
+        F: FnOnce(PathBuf) -> Fut,
         Fut: Future<Output = Result<u64>>,
     {
-        loop {
-            if let Some(handle) = self.try_acquire(key) {
-                return Ok(handle);
-            }
+        if let Some(handle) = self.try_acquire(key) {
+            return Ok(handle);
+        }
+        let _key_lock = self.acquire_key_lock(key).await;
+        if let Some(handle) = self.try_acquire(key) {
+            return Ok(handle);
+        }
 
-            if fs::try_exists(&local_path)
-                .await
-                .with_context(|| format!("check local cache file '{}'", local_path.display()))?
-            {
-                return self.pin_local_file(key, &local_path).await;
-            }
-
-            let sender = {
-                let mut inflight = self.inflight.lock().await;
-                if let Some(existing) = inflight.get(key).cloned() {
-                    drop(inflight);
-                    wait_for_inflight_result(existing.receiver, key).await?;
-                    continue;
-                }
-
-                let (sender, receiver) = watch::channel(None);
-                inflight.insert(key.to_string(), InflightFetch { receiver });
-                sender
-            };
-
-            if let Some(parent) = local_path.parent() {
+        let size = match fs::metadata(&local_path).await {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let parent = local_path
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
                 fs::create_dir_all(parent)
                     .await
                     .with_context(|| format!("create local cache dir '{}'", parent.display()))?;
-            }
-            let result = fetch(local_path.clone())
+
+                async {
+                    let staging = tempfile::tempdir_in(parent)?;
+                    let staged_path = staging.path().join("artifact");
+                    let size = fetch(staged_path.clone()).await?;
+                    std::fs::rename(&staged_path, &local_path)?;
+                    Ok::<_, anyhow::Error>(size)
+                }
                 .await
-                .with_context(|| format!("materialize '{key}' into local cache"));
-
-            let size = match result {
-                Ok(size) => size,
-                Err(error) => {
-                    let shared_error = SharedFetchError::from_anyhow(&error);
-                    self.finish_inflight(key, sender, InflightFetchResult::Failed(shared_error))
-                        .await;
-                    return Err(error);
-                }
-            };
-
-            {
-                let mut idx = self.lock_index();
-                if let Some(previous) = idx.entries.insert(
-                    key.to_string(),
-                    CacheEntry {
-                        local_path: local_path.clone(),
-                        size,
-                        last_accessed: Instant::now(),
-                        ref_count: 1,
-                    },
-                ) {
-                    idx.total_size = idx.total_size.saturating_sub(previous.size);
-                }
-                idx.total_size += size;
+                .with_context(|| format!("materialize '{key}' into local cache"))?
             }
-
-            self.finish_inflight(key, sender, InflightFetchResult::Success)
-                .await;
-
-            if self.is_over_limit() {
-                let cache = Arc::clone(self);
-                tokio::spawn(async move {
-                    if let Err(error) = cache.evict_lru() {
-                        warn!(error = %error, "failed to evict snapshot artifact cache entries");
-                    }
-                });
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("stat local cache file '{}'", local_path.display()));
             }
+        };
 
-            return Ok(CacheHandle {
-                cache: Arc::clone(self),
-                key: key.to_string(),
-                local_path,
-            });
-        }
-    }
-
-    /// Register an already-materialized local file with the cache and pin it.
-    ///
-    /// The same key/path identity contract as [`Self::ensure_cached_at`] applies.
-    pub(crate) async fn pin_local_file(
-        self: &Arc<Self>,
-        key: &str,
-        local_path: &Path,
-    ) -> Result<CacheHandle> {
-        loop {
-            if let Some(handle) = self.try_acquire(key) {
-                return Ok(handle);
-            }
-
-            let existing = {
-                let inflight = self.inflight.lock().await;
-                inflight.get(key).cloned()
-            };
-            if let Some(existing) = existing {
-                wait_for_inflight_result(existing.receiver, key).await?;
-                continue;
-            }
-            break;
-        }
-
-        // A local materialization can still disappear or change between the
-        // metadata read below and index insertion. The cache tolerates this:
-        // later `try_acquire()` checks file existence and drops stale entries.
-        let size = tokio::fs::metadata(local_path)
-            .await
-            .with_context(|| format!("stat local cache file '{}'", local_path.display()))?
-            .len();
-
+        let pin = Arc::new(());
         let mut idx = self.lock_index();
-        if let Some(previous) = idx.entries.insert(
+        idx.entries.insert(
             key.to_string(),
             CacheEntry {
-                local_path: local_path.to_path_buf(),
+                local_path: local_path.clone(),
                 size,
                 last_accessed: Instant::now(),
-                ref_count: 1,
+                pin: Arc::clone(&pin),
             },
-        ) {
-            idx.total_size = idx.total_size.saturating_sub(previous.size);
-        }
+        );
         idx.total_size += size;
+        drop(idx);
+        let handle = CacheHandle {
+            local_path,
+            _pin: pin,
+        };
+        if self.is_over_limit() {
+            let cache = Arc::clone(self);
+            tokio::spawn(async move {
+                cache.evict_lru().await;
+            });
+        }
 
-        Ok(CacheHandle {
+        Ok(handle)
+    }
+
+    async fn acquire_key_lock(self: &Arc<Self>, key: &str) -> CacheKeyLock {
+        let lock = {
+            let mut locks = self.key_locks.lock().unwrap_or_else(|poisoned| {
+                warn!("snapshot artifact cache key-lock mutex poisoned; recovering");
+                poisoned.into_inner()
+            });
+            locks
+                .entry(key.to_string())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let mut key_lock = CacheKeyLock {
             cache: Arc::clone(self),
             key: key.to_string(),
-            local_path: local_path.to_path_buf(),
-        })
+            lock: Some(lock),
+            guard: None,
+        };
+        key_lock.guard = Some(
+            key_lock
+                .lock
+                .as_ref()
+                .expect("cache key lock missing")
+                .clone()
+                .lock_owned()
+                .await,
+        );
+        key_lock
     }
 
     fn key_to_local_path(&self, key: &str) -> Result<PathBuf> {
@@ -309,18 +228,7 @@ impl LocalArtifactCache {
         })
     }
 
-    async fn finish_inflight(
-        &self,
-        key: &str,
-        sender: watch::Sender<Option<InflightFetchResult>>,
-        result: InflightFetchResult,
-    ) {
-        let _ = sender.send(Some(result));
-        let mut inflight = self.inflight.lock().await;
-        inflight.remove(key);
-    }
-
-    fn try_acquire(self: &Arc<Self>, key: &str) -> Option<CacheHandle> {
+    fn try_acquire(&self, key: &str) -> Option<CacheHandle> {
         let mut idx = self.lock_index();
         let entry = idx.entries.get_mut(key)?;
         if !entry.local_path.exists() {
@@ -329,20 +237,11 @@ impl LocalArtifactCache {
             idx.total_size = idx.total_size.saturating_sub(size);
             return None;
         }
-        entry.ref_count += 1;
         entry.last_accessed = Instant::now();
         Some(CacheHandle {
-            cache: Arc::clone(self),
-            key: key.to_string(),
             local_path: entry.local_path.clone(),
+            _pin: Arc::clone(&entry.pin),
         })
-    }
-
-    fn release(&self, key: &str) {
-        let mut idx = self.lock_index();
-        if let Some(entry) = idx.entries.get_mut(key) {
-            entry.ref_count = entry.ref_count.saturating_sub(1);
-        }
     }
 
     fn is_over_limit(&self) -> bool {
@@ -350,92 +249,77 @@ impl LocalArtifactCache {
         idx.total_size > self.max_size_bytes
     }
 
-    fn evict_lru(&self) -> Result<()> {
+    pub(crate) async fn evict_lru(self: &Arc<Self>) {
         let target = (self.max_size_bytes as f64 * EVICTION_TARGET_RATIO) as u64;
 
-        let (mut candidates, total_size) = {
+        let mut candidates = {
             let idx = self.lock_index();
             if idx.total_size <= target {
-                return Ok(());
+                return;
             }
 
-            let candidates = idx
-                .entries
+            idx.entries
                 .iter()
-                .filter(|(_, entry)| entry.ref_count == 0)
-                .map(|(key, entry)| (key.clone(), entry.last_accessed, entry.size))
-                .collect::<Vec<_>>();
-            (candidates, idx.total_size)
+                .filter(|(_, entry)| Arc::strong_count(&entry.pin) == 1)
+                .map(|(key, entry)| (key.clone(), entry.last_accessed))
+                .collect::<Vec<_>>()
         };
-        if total_size <= target {
-            return Ok(());
-        }
 
-        candidates.sort_by_key(|(_, ts, _)| *ts);
-
-        let mut idx = self.lock_index();
-        let mut removals = Vec::new();
-        for (key, _, size) in candidates {
-            if idx.total_size <= target {
-                break;
-            }
-            let Some(entry) = idx.entries.get(&key) else {
-                continue;
-            };
-            if entry.ref_count > 0 {
-                continue;
-            }
-            removals.push((key.clone(), entry.local_path.clone(), size));
-            idx.entries.remove(&key);
-            idx.total_size = idx.total_size.saturating_sub(size);
-        }
-        drop(idx);
-
-        for (key, path, _) in removals {
-            if let Err(error) = std::fs::remove_file(&path) {
-                if error.kind() != ErrorKind::NotFound {
-                    warn!(
-                        cache_key = %key,
-                        path = %path.display(),
-                        error = %error,
-                        "failed to remove evicted cache file"
-                    );
+        candidates.sort_by_key(|(_, last_accessed)| *last_accessed);
+        for (key, _) in candidates {
+            let _key_lock = self.acquire_key_lock(&key).await;
+            let entry = {
+                let mut idx = self.lock_index();
+                if idx.total_size <= target {
+                    return;
                 }
+                match idx.entries.get(&key) {
+                    Some(entry) if Arc::strong_count(&entry.pin) == 1 => {}
+                    _ => continue,
+                }
+                let entry = idx.entries.remove(&key).expect("cache entry disappeared");
+                idx.total_size = idx.total_size.saturating_sub(entry.size);
+                entry
+            };
+
+            if let Err(error) = std::fs::remove_file(&entry.local_path) {
+                if error.kind() == ErrorKind::NotFound {
+                    continue;
+                }
+                warn!(
+                    cache_key = %key,
+                    path = %entry.local_path.display(),
+                    error = %error,
+                    "failed to remove evicted cache file"
+                );
+                let mut idx = self.lock_index();
+                idx.total_size += entry.size;
+                idx.entries.insert(key, entry);
             }
         }
-
-        Ok(())
     }
 }
 
-impl SharedFetchError {
-    fn from_anyhow(error: &anyhow::Error) -> Self {
-        Self {
-            message: format!("{error:#}"),
-        }
-    }
-
-    fn into_anyhow(self) -> anyhow::Error {
-        anyhow!(self.message)
-    }
+struct CacheKeyLock {
+    cache: Arc<LocalArtifactCache>,
+    key: String,
+    lock: Option<Arc<AsyncMutex<()>>>,
+    guard: Option<OwnedMutexGuard<()>>,
 }
 
-async fn wait_for_inflight_result(
-    mut receiver: watch::Receiver<Option<InflightFetchResult>>,
-    key: &str,
-) -> Result<()> {
-    loop {
-        if let Some(result) = receiver.borrow().clone() {
-            return match result {
-                InflightFetchResult::Success => Ok(()),
-                InflightFetchResult::Failed(error) => Err(error.into_anyhow()),
-            };
-        }
-
-        if receiver.changed().await.is_err() {
-            return Err(anyhow!(
-                "inflight cache materialization for '{key}' ended without a result"
-            ));
+impl Drop for CacheKeyLock {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        drop(self.lock.take());
+        let mut locks = self.cache.key_locks.lock().unwrap_or_else(|poisoned| {
+            warn!("snapshot artifact cache key-lock mutex poisoned; recovering");
+            poisoned.into_inner()
+        });
+        if locks
+            .get(&self.key)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(&self.key);
         }
     }
 }
@@ -454,79 +338,90 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    use tokio::sync::Barrier;
+
     use super::*;
 
     fn test_cache(dir: &Path) -> Arc<LocalArtifactCache> {
         LocalArtifactCache::new(dir.join("cache"), Some(1)).unwrap()
     }
 
-    #[tokio::test]
-    async fn ensure_cached_materializes_and_pins() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_cold_fetch_materializes_once_and_pins_all_handles() {
+        const CALLERS: usize = 8;
+        const KEY: &str = "artifacts/cold/vm_state.bin";
+
         let tempdir = tempfile::TempDir::new().unwrap();
         let cache = test_cache(tempdir.path());
-        let key = "artifacts/t1/vm_state.bin";
-        let handle = cache
-            .ensure_cached(key, |dest| async move {
-                tokio::fs::write(dest, b"snap-data").await?;
-                Ok(9)
-            })
-            .await
-            .unwrap();
+        let barrier = Arc::new(Barrier::new(CALLERS));
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
 
-        assert!(handle.path().exists());
-        assert_eq!(std::fs::read(handle.path()).unwrap(), b"snap-data".to_vec());
-
-        {
-            let idx = cache.lock_index();
-            let entry = idx.entries.get(key).unwrap();
-            assert_eq!(entry.ref_count, 1);
+        for _ in 0..CALLERS {
+            let cache = Arc::clone(&cache);
+            let barrier = Arc::clone(&barrier);
+            let fetch_calls = Arc::clone(&fetch_calls);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                cache
+                    .ensure_cached(KEY, move |dest| {
+                        let fetch_calls = Arc::clone(&fetch_calls);
+                        async move {
+                            fetch_calls.fetch_add(1, Ordering::SeqCst);
+                            tokio::fs::write(dest, b"cold-data").await?;
+                            Ok(9)
+                        }
+                    })
+                    .await
+                    .unwrap()
+            }));
         }
 
-        drop(handle);
-        {
-            let idx = cache.lock_index();
-            let entry = idx.entries.get(key).unwrap();
-            assert_eq!(entry.ref_count, 0);
+        let mut handles = Vec::new();
+        for task in tasks {
+            handles.push(task.await.unwrap());
         }
+
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(std::fs::read(handles[0].path()).unwrap(), b"cold-data");
+        drop(handles);
     }
 
     #[tokio::test]
-    async fn evict_lru_skips_pinned_entries() {
+    async fn cancelled_fetch_does_not_publish_partial_data_and_can_be_retried() {
         let tempdir = tempfile::TempDir::new().unwrap();
-        let cache = LocalArtifactCache::new(tempdir.path().join("cache"), None).unwrap();
+        let cache = test_cache(tempdir.path());
+        let key = "artifacts/cancelled/vm_state.bin";
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(1);
+        let fetch_cache = Arc::clone(&cache);
+        let fetch = tokio::spawn(async move {
+            fetch_cache
+                .ensure_cached(key, |path| {
+                    let started_tx = started_tx.clone();
+                    async move {
+                        tokio::fs::write(&path, b"partial").await?;
+                        started_tx.send(()).await.unwrap();
+                        std::future::pending::<Result<u64>>().await
+                    }
+                })
+                .await
+        });
+        started_rx.recv().await.unwrap();
+        fetch.abort();
+        assert!(fetch.await.err().unwrap().is_cancelled());
+        assert!(!cache.key_to_local_path(key).unwrap().exists());
 
-        let handle_a = cache
-            .ensure_cached("file-a", |dest| async move {
-                tokio::fs::write(dest, b"aaa").await?;
-                Ok(3)
-            })
-            .await
-            .unwrap();
-        let handle_b = cache
-            .ensure_cached("file-b", |dest| async move {
-                tokio::fs::write(dest, b"bbb").await?;
-                Ok(3)
-            })
-            .await
-            .unwrap();
-
-        let path_a = handle_a.path().to_path_buf();
-        drop(handle_a);
-
-        {
-            let mut idx = cache.lock_index();
-            idx.total_size = cache.max_size_bytes + 1;
-        }
-
-        cache.evict_lru().unwrap();
-
-        assert!(
-            !path_a.exists() || {
-                let idx = cache.lock_index();
-                !idx.entries.contains_key("file-a")
-            }
-        );
-        assert!(handle_b.path().exists());
+        let handle = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            cache.ensure_cached(key, |path| async move {
+                tokio::fs::write(path, b"complete").await?;
+                Ok(8)
+            }),
+        )
+        .await
+        .expect("a cancelled fetch must not block later callers")
+        .unwrap();
+        assert_eq!(std::fs::read(handle.path()).unwrap(), b"complete");
     }
 
     #[tokio::test]
@@ -539,7 +434,7 @@ mod tests {
                 entries: HashMap::new(),
                 total_size: 0,
             }),
-            inflight: AsyncMutex::new(HashMap::new()),
+            key_locks: Mutex::new(HashMap::new()),
         });
         std::fs::create_dir_all(&cache.cache_root).unwrap();
 
@@ -562,7 +457,7 @@ mod tests {
         let path_b = handle_b.path().to_path_buf();
         drop(handle_b);
 
-        cache.evict_lru().unwrap();
+        cache.evict_lru().await;
 
         let idx = cache.lock_index();
         assert!(idx.total_size <= 8);
@@ -572,54 +467,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pin_local_file_reuses_cached_entry_without_double_counting_size() {
+    async fn warm_file_pins_keep_each_handle_leased() {
+        const KEY: &str = "runtime/snapshot/image.json";
+
         let tempdir = tempfile::TempDir::new().unwrap();
         let cache = test_cache(tempdir.path());
-        let local_path = tempdir
-            .path()
-            .join("runtime")
-            .join(crate::snapshot::SNAPSHOT_ARTIFACT_LAYOUT.overlaybd_image_config_file);
+        let local_path = tempdir.path().join("runtime").join("image.json");
         std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
         std::fs::write(&local_path, b"runtime-config").unwrap();
         let expected_size = std::fs::metadata(&local_path).unwrap().len();
 
+        let fetch_calls = Arc::new(AtomicUsize::new(0));
         let first = cache
-            .pin_local_file("runtime/snapshot/image.json", &local_path)
+            .ensure_cached_at(KEY, local_path.clone(), {
+                let fetch_calls = Arc::clone(&fetch_calls);
+                move |_dest| {
+                    fetch_calls.fetch_add(1, Ordering::SeqCst);
+                    async { anyhow::bail!("warm file should not be fetched") }
+                }
+            })
             .await
             .unwrap();
         let second = cache
-            .pin_local_file("runtime/snapshot/image.json", &local_path)
+            .ensure_cached_at(KEY, local_path.clone(), {
+                let fetch_calls = Arc::clone(&fetch_calls);
+                move |_dest| {
+                    fetch_calls.fetch_add(1, Ordering::SeqCst);
+                    async { anyhow::bail!("warm file should not be fetched") }
+                }
+            })
             .await
             .unwrap();
+        assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
 
         {
             let idx = cache.lock_index();
-            let entry = idx.entries.get("runtime/snapshot/image.json").unwrap();
-            assert_eq!(entry.ref_count, 2);
             assert_eq!(idx.total_size, expected_size);
+            assert!(idx.entries.contains_key(KEY));
         }
 
         drop(first);
-        drop(second);
-        let idx = cache.lock_index();
-        let entry = idx.entries.get("runtime/snapshot/image.json").unwrap();
-        assert_eq!(entry.ref_count, 0);
-    }
-
-    #[tokio::test]
-    async fn ensure_cached_rejects_path_traversal_keys() {
-        let tempdir = tempfile::TempDir::new().unwrap();
-        let cache = test_cache(tempdir.path());
-
-        let err = match cache
-            .ensure_cached("../escape", |_dest| async move { Ok(0) })
-            .await
         {
-            Ok(_) => panic!("path traversal key should fail"),
-            Err(err) => err,
-        };
+            let mut idx = cache.lock_index();
+            idx.total_size = cache.max_size_bytes + 1;
+        }
+        cache.evict_lru().await;
+        assert!(second.path().exists());
 
-        assert!(err.to_string().contains("path traversal"));
+        drop(second);
+        cache.evict_lru().await;
+        assert!(!local_path.exists());
+        assert!(cache.key_locks.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -645,10 +543,23 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            std::fs::read(handle.path()).unwrap(),
-            b"warm-cache".to_vec()
-        );
+        assert_eq!(std::fs::read(handle.path()).unwrap(), b"warm-cache");
         assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ensure_cached_rejects_path_traversal_keys() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let cache = test_cache(tempdir.path());
+
+        let err = match cache
+            .ensure_cached("../escape", |_dest| async move { Ok(0) })
+            .await
+        {
+            Ok(_) => panic!("path traversal key should fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("path traversal"));
     }
 }

@@ -775,6 +775,7 @@ impl FirecrackerSandbox {
             launch_config.sandbox_id,
             LaunchMode::Resume(snapshot_config),
         )?;
+        sandbox.resources.source_lease = Some(snapshot.lease());
         sandbox.initial_guest_drive_mounts = initial_guest_drive_mounts;
         Ok(sandbox)
     }
@@ -2631,6 +2632,45 @@ mod tests {
             "0.1.0".to_string(),
             "user-image.json".into(),
         )
+    }
+
+    #[tokio::test]
+    async fn sandbox_keeps_its_source_config_pinned_until_stopped() -> Result<()> {
+        use crate::snapshot::artifact_cache::LocalArtifactCache;
+
+        let temp = tempfile::tempdir()?;
+        let cache = LocalArtifactCache::new(temp.path().join("cache"), Some(0))?;
+        let handle = cache
+            .ensure_cached("memory/image.json", |path| async move {
+                let bytes = br#"{"lowers":[],"upper":{}}"#;
+                tokio::fs::write(path, bytes).await?;
+                Ok(bytes.len() as u64)
+            })
+            .await?;
+        let memory_path = handle.path().to_path_buf();
+        let template = RunnableSnapshot::mock();
+        let mut manifest = template.manifest().clone();
+        manifest.memory.image_config_path = memory_path.clone();
+        let runnable =
+            RunnableSnapshot::new(template.record().clone(), manifest, Arc::new(vec![handle]));
+        let mut sandbox = FirecrackerSandbox::from_snapshot(
+            &runnable,
+            &SandboxLaunchConfig::new(SandboxId::new(), "cache-test"),
+        )?;
+        drop(runnable);
+
+        cache.evict_lru().await;
+        assert!(
+            memory_path.exists(),
+            "capture still needs the source config after launch input is dropped"
+        );
+        sandbox.stop().await?;
+        cache.evict_lru().await;
+        assert!(
+            !memory_path.exists(),
+            "stopped sandbox must release its source lease"
+        );
+        Ok(())
     }
 
     #[test]
