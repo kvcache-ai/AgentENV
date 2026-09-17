@@ -119,6 +119,8 @@ pub enum TemplatesTemplateIdDeleteResponse {
     Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
+    /// Service unavailable
+    Status503_ServiceUnavailable(models::Error),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]

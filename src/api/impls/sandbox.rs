@@ -17,6 +17,7 @@ use crate::orchestrator::{
     SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
 };
 use crate::prometheus::SandboxStageTimer;
+use crate::repository::RepositoryError;
 use crate::sandbox::custom_extension::HookStatusError;
 use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive, ExtraDriveKind};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
@@ -753,7 +754,18 @@ impl ApiImpl {
         let snapshot = match timer
             .time(
                 "load_snapshot",
-                self.snapshot_manager.load_runnable(&body.template_id),
+                async {
+                    let Some(record) = self.snapshot_manager.get(&body.template_id).await? else {
+                        return Ok(None);
+                    };
+                    if record.snapshot_type == crate::snapshot::SnapshotPlacement::Local {
+                        return Err(anyhow::Error::new(RepositoryError::InvalidRequest {
+                            reason: "Local snapshots must be promoted to Distributed before starting a sandbox"
+                                .to_string(),
+                        }));
+                    }
+                    self.snapshot_manager.resolve_runnable(record).await.map(Some)
+                },
             )
             .await
         {
@@ -766,9 +778,12 @@ impl ApiImpl {
             }
             Err(err) => {
                 warn!(error = ?err, template_id = %body.template_id, "failed to load runnable snapshot");
-                return Ok(SandboxesPostResponse::Status500_ServerError(
-                    Self::snapshot_manager_error(&err),
-                ));
+                let error = Self::reusable_snapshot_manager_error(&err);
+                return Ok(match error.code {
+                    400 => SandboxesPostResponse::Status400_BadRequest(error),
+                    503 => SandboxesPostResponse::Status503_ServiceUnavailable(error),
+                    _ => SandboxesPostResponse::Status500_ServerError(error),
+                });
             }
         };
 
@@ -1374,6 +1389,9 @@ impl Sandboxes<()> for ApiImpl {
                 SandboxesPostResponse::Status500_ServerError(error) => {
                     V2SandboxesPostResponse::Status500_ServerError(error)
                 }
+                SandboxesPostResponse::Status503_ServiceUnavailable(error) => {
+                    V2SandboxesPostResponse::Status503_ServiceUnavailable(error)
+                }
             },
         )
     }
@@ -1967,6 +1985,18 @@ impl Sandboxes<()> for ApiImpl {
             ));
         };
 
+        let placement = match body.snapshot_type.as_ref() {
+            Some(models::SnapshotType::Local) => crate::snapshot::SnapshotPlacement::Local,
+            _ => crate::snapshot::SnapshotPlacement::Distributed,
+        };
+        if placement == crate::snapshot::SnapshotPlacement::Local && body.name.is_some() {
+            return Ok(
+                SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
+                    400,
+                    "Local snapshots do not support names",
+                )),
+            );
+        }
         let alias = match &body.name {
             Some(name) => match SnapshotAlias::parse(name) {
                 Ok(alias) => Some(alias),
@@ -1985,11 +2015,8 @@ impl Sandboxes<()> for ApiImpl {
         let capture = match timer
             .time(
                 "capture",
-                self.orchestrator.capture_snapshot(
-                    sandbox_id,
-                    SnapshotId::generate(),
-                    crate::snapshot::SnapshotPlacement::Distributed,
-                ),
+                self.orchestrator
+                    .capture_snapshot(sandbox_id, SnapshotId::generate(), placement),
             )
             .await
         {
@@ -2032,7 +2059,7 @@ impl Sandboxes<()> for ApiImpl {
                 crate::sandbox::publish_captured(
                     &self.snapshot_manager,
                     SnapshotPublishMetadata {
-                        snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
+                        snapshot_type: placement,
                         id: capture.captured_snapshot.id().clone(),
                         alias: alias.clone(),
                         source: SnapshotPublishSource::Sandbox {
@@ -2055,16 +2082,24 @@ impl Sandboxes<()> for ApiImpl {
         {
             Ok(snapshot) => snapshot,
             Err(err) => {
-                let error =
+                let error = if matches!(
+                    err,
+                    RepositoryError::Backend { .. } | RepositoryError::Unavailable { .. }
+                ) {
+                    Self::reusable_snapshot_error(&err)
+                } else {
                     Self::bad_request_for_repository_build_error(&err).unwrap_or_else(|| {
                         warn!(error = ?err, %sandbox_id, "failed to publish captured snapshot");
                         Self::error(500, err.to_string())
-                    });
-                return Ok(Self::client_or_server_response(
-                    error,
-                    SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest,
-                    SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError,
-                ));
+                    })
+                };
+                return Ok(match error.code {
+                    400 => SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(error),
+                    503 => {
+                        SandboxesSandboxIdSnapshotsPostResponse::Status503_ServiceUnavailable(error)
+                    }
+                    _ => SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(error),
+                });
             }
         };
 
