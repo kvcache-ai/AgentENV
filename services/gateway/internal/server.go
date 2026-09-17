@@ -224,6 +224,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	operation, snapshotRef := snapshotRequestOperation(r)
 	sandboxID, hasSandbox := "", false
 	buildReadRequest := false
 	routeSource := routeSourceHeader
@@ -240,6 +241,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			buildReadRequest = route.owner == ownerBuildRead
 			routeSource = routeSourcePath
 		}
+	} else if operation != snapshotOperationNone {
+		routeSource = routeSourceSchedule
 	} else {
 		sandboxID, hasSandbox = sandboxIDFromHeaders(r.Header)
 	}
@@ -248,6 +251,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	setGatewayRouteSource(w, routeSource)
 	var node *schedulerv1.Node
+	ownerBound := false
 
 	if hasSandbox {
 		rpcStart := time.Now()
@@ -277,16 +281,42 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
 			return
 		}
-		rpcStart := time.Now()
-		resp, err := s.scheduler.Schedule(routingCtx, &schedulerv1.ScheduleRequest{
-			Hint: hint,
-		})
-		recordGatewaySchedulerRPC("Schedule", rpcStart, err)
-		if err != nil {
-			s.writeSchedulerError(w, err)
-			return
+		if operation != snapshotOperationNone {
+			routedNode, routedOwnerBound, routingErr := s.routeSnapshotRequest(
+				routingCtx, r, operation, snapshotRef,
+			)
+			if routingErr != nil {
+				s.logger.Warn("snapshot routing failed",
+					zap.String("method", r.Method),
+					zap.String("path", r.URL.Path),
+					zap.String("snapshot_ref", snapshotRef),
+					zap.Error(routingErr),
+				)
+				if routingErr.statusCode == http.StatusUnauthorized {
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				s.writeJSON(w, routingErr.statusCode, struct {
+					Code    int    `json:"code"`
+					Message string `json:"message"`
+				}{
+					Code:    routingErr.statusCode,
+					Message: routingErr.message,
+				})
+				return
+			}
+			node = routedNode
+			ownerBound = routedOwnerBound
+		} else {
+			rpcStart := time.Now()
+			resp, err := s.scheduler.Schedule(routingCtx, &schedulerv1.ScheduleRequest{Hint: hint})
+			recordGatewaySchedulerRPC("Schedule", rpcStart, err)
+			if err != nil {
+				s.writeSchedulerError(w, err)
+				return
+			}
+			node = resp.GetNode()
 		}
-		node = resp.GetNode()
 	}
 
 	s.logger.Debug("gateway routed request",
@@ -302,7 +332,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	escapedPath := upstreamTargetEscapedPath(routeSource, requestEscapedPath(r))
 	upstreamURL, err := joinUpstream(node.GetEndpoint(), decodedPath, escapedPath, r.URL.RawQuery)
 	if err != nil {
-		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+		if ownerBound {
+			http.Error(w, "snapshot owner unavailable", http.StatusServiceUnavailable)
+		} else {
+			http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+		}
 		return
 	}
 
@@ -327,32 +361,41 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			recordAssignment: shouldRecordAssignment(r, routeSource, hasSandbox),
 			hostRoute:        hostRoute,
 			flushImmediately: longLived,
+			ownerBound:       ownerBound,
 		},
 	)
 }
 
 func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
+	response := schedulerResponseError(err)
+	http.Error(w, response.message, response.statusCode)
+}
+
+func schedulerResponseError(err error) *proxyResponseError {
+	code, message := http.StatusBadGateway, "scheduler error"
 	st, ok := status.FromError(err)
 	if !ok {
-		http.Error(w, "scheduler unavailable", http.StatusBadGateway)
-		return
+		message = "scheduler unavailable"
+	} else {
+		switch st.Code() {
+		case codes.InvalidArgument:
+			code, message = http.StatusBadRequest, st.Message()
+		case codes.NotFound:
+			code, message = http.StatusNotFound, st.Message()
+		case codes.ResourceExhausted:
+			code, message = http.StatusTooManyRequests, st.Message()
+		case codes.Unavailable:
+			code, message = http.StatusServiceUnavailable, st.Message()
+		}
 	}
-	switch st.Code() {
-	case codes.InvalidArgument:
-		http.Error(w, st.Message(), http.StatusBadRequest)
-	case codes.NotFound:
-		http.Error(w, st.Message(), http.StatusNotFound)
-	case codes.Unavailable:
-		http.Error(w, st.Message(), http.StatusServiceUnavailable)
-	default:
-		http.Error(w, "scheduler error", http.StatusBadGateway)
-	}
+	return &proxyResponseError{statusCode: code, message: message, cause: err}
 }
 
 type proxyRequestOptions struct {
 	recordAssignment bool
 	hostRoute        *hostRoute
 	flushImmediately bool
+	ownerBound       bool
 }
 
 func (s *Server) proxyRequest(
@@ -415,29 +458,31 @@ func (s *Server) proxyRequest(
 				return
 			}
 
-			if errors.Is(err, context.DeadlineExceeded) || errors.Is(proxyReq.Context().Err(), context.DeadlineExceeded) {
-				s.logger.Warn("proxy request timed out",
-					zap.Error(err),
-					zap.String("node", node.GetNodeId()),
-					zap.String("path", proxyReq.URL.Path),
-					zap.String("target", upstreamURL.String()),
-				)
-				http.Error(rw, "upstream timeout", http.StatusGatewayTimeout)
-				return
-			}
-
 			var proxyErr *proxyResponseError
 			if errors.As(err, &proxyErr) {
 				http.Error(rw, proxyErr.message, proxyErr.statusCode)
 				return
 			}
 
-			s.logger.Warn("proxy request failed",
+			fields := []zap.Field{
 				zap.Error(err),
 				zap.String("node", node.GetNodeId()),
 				zap.String("path", proxyReq.URL.Path),
 				zap.String("target", upstreamURL.String()),
-			)
+			}
+			if options.ownerBound {
+				s.logger.Warn("snapshot owner proxy request failed", fields...)
+				http.Error(rw, "snapshot owner unavailable", http.StatusServiceUnavailable)
+				return
+			}
+
+			if errors.Is(err, context.DeadlineExceeded) || errors.Is(proxyReq.Context().Err(), context.DeadlineExceeded) {
+				s.logger.Warn("proxy request timed out", fields...)
+				http.Error(rw, "upstream timeout", http.StatusGatewayTimeout)
+				return
+			}
+
+			s.logger.Warn("proxy request failed", fields...)
 			http.Error(rw, "upstream unavailable", http.StatusBadGateway)
 		},
 	}
@@ -803,14 +848,6 @@ func headerContainsToken(h http.Header, name string, want string) bool {
 	return false
 }
 
-func extractSandboxIDFromResponse(body []byte) (string, bool) {
-	ids := extractSandboxIDsFromResponse(body)
-	if len(ids) == 0 {
-		return "", false
-	}
-	return ids[0], true
-}
-
 func extractSandboxIDsFromResponse(body []byte) []string {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
@@ -918,7 +955,8 @@ func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
 	}
 
 	_, pathRouted := matchPathRoute(r.Method, r.URL.Path)
-	return !pathRouted && hasCompleteProxyRouteHeaders(r.Header)
+	operation, _ := snapshotRequestOperation(r)
+	return !pathRouted && operation == snapshotOperationNone && hasCompleteProxyRouteHeaders(r.Header)
 }
 
 func isExplicitProxyPath(path string) bool {

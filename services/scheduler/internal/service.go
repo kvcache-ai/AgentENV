@@ -136,8 +136,8 @@ func summarizeScheduleHint(hint *schedulerv1.ScheduleRequestHint) string {
 	}
 }
 
-func (s *Service) ListNodes(_ context.Context, _ *schedulerv1.ListNodesRequest) (*schedulerv1.ListNodesResponse, error) {
-	snapshot := s.nodes.Snapshot( /* allowLingering */ true)
+func (s *Service) ListNodes(_ context.Context, req *schedulerv1.ListNodesRequest) (*schedulerv1.ListNodesResponse, error) {
+	snapshot := s.nodes.Snapshot(!req.GetActiveOnly())
 	nodes := make([]*schedulerv1.Node, 0, len(snapshot))
 	for _, node := range snapshot {
 		nodes = append(nodes, node.ToProto())

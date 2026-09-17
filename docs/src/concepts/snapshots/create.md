@@ -27,3 +27,11 @@ aenv start <snapshot-id>
 This creates a separate sandbox with a new sandbox ID. It inherits the captured
 filesystem, running processes, memory state, environment variables, runtime
 configuration, and resource settings.
+
+The HTTP endpoint `POST /sandboxes/{sandboxID}/snapshots` also accepts
+`{"snapshotType":"local"}` to create an owner-local snapshot. Omitting
+`snapshotType` selects `distributed`. Local snapshots do not accept `name`.
+Use `POST /snapshots/{snapshotID}/promote` to publish an existing Local snapshot
+as Distributed without recapturing the VM. `POST /sandboxes` requires a Distributed
+snapshot, so promote a Local snapshot before using it to create a sandbox.
+Repeating promotion returns the same Distributed snapshot.

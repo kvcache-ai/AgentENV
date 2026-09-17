@@ -108,6 +108,10 @@ impl ApiImpl {
         Arc::clone(&self.image_resolver)
     }
 
+    pub(crate) fn snapshot_manager(&self) -> Arc<SnapshotManager> {
+        Arc::clone(&self.snapshot_manager)
+    }
+
     /// Returns the optional observability service backing node/admin
     /// observability endpoints. This is `None` when the server is configured
     /// with `observability.enabled = false`.
@@ -147,6 +151,27 @@ impl ApiImpl {
             RepositoryError::Unavailable { .. } => Self::error(503, err.to_string()),
             RepositoryError::Unsupported { .. } => Self::error(500, err.to_string()),
             RepositoryError::Backend { .. } => Self::internal_error(err),
+        }
+    }
+
+    pub(crate) fn find_repository_error(err: &AnyhowError) -> Option<&RepositoryError> {
+        err.chain()
+            .find_map(|cause| cause.downcast_ref::<RepositoryError>())
+    }
+
+    fn reusable_snapshot_error(err: &RepositoryError) -> models::Error {
+        match err {
+            RepositoryError::Backend { .. } | RepositoryError::Unavailable { .. } => {
+                Self::error(503, err.to_string())
+            }
+            _ => Self::repository_error(err),
+        }
+    }
+
+    fn reusable_snapshot_manager_error(err: &AnyhowError) -> models::Error {
+        match Self::find_repository_error(err) {
+            Some(error) => Self::reusable_snapshot_error(error),
+            None => Self::internal_error(err.as_ref()),
         }
     }
 

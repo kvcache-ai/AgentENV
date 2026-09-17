@@ -108,6 +108,10 @@ func TestListNodesReturnsActiveAndLingeringNodes(t *testing.T) {
 	if !ids["node-a"] || !ids["node-b"] {
 		t.Fatalf("expected node-a and node-b, got %v", ids)
 	}
+	active, err := service.ListNodes(context.Background(), &schedulerv1.ListNodesRequest{ActiveOnly: true})
+	if err != nil || len(active.GetNodes()) != 1 || active.GetNodes()[0].GetNodeId() != "node-a" {
+		t.Fatalf("active discovery = %v, error=%v", active, err)
+	}
 }
 
 func TestQueryOnlyServiceOnlySupportsLookupNode(t *testing.T) {

@@ -56,13 +56,18 @@ message NewSandboxHint {
 message ScheduleRequest {
   reserved 1;  // formerly: string hint = 1
   ScheduleRequestHint hint = 2;
+  reserved 3;  // formerly: string required_node_id = 3
+  reserved "required_node_id";
 }
 
 message ScheduleResponse {
   Node node = 1;
 }
 
-message ListNodesRequest {}
+message ListNodesRequest {
+  // Read-only discovery for control-plane requests; does not consume quota.
+  bool active_only = 1;
+}
 
 message ListNodesResponse {
   repeated Node nodes = 1;

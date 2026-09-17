@@ -10,12 +10,8 @@ import (
 	schedulerv1 "agentenv/services/api/proto"
 )
 
-// buildScheduleHint inspects the incoming request and produces a structured
-// scheduling hint. Requests that do not map to a known hint type return a nil
-// hint. For cold-sandbox creation the request body is parsed to extract
-// structured fields and then restored so the full body remains available for
-// the upstream request.
-// It only returns error when it's a fatal error and the request cannot be proceeded.
+// buildScheduleHint inspects the incoming request and restores any body it
+// reads. Scheduling hints are advisory; request validation remains downstream.
 func buildScheduleHint(r *http.Request) (*schedulerv1.ScheduleRequestHint, error) {
 	if r.Method != http.MethodPost {
 		return nil, nil
@@ -47,7 +43,7 @@ func buildScheduleHint(r *http.Request) (*schedulerv1.ScheduleRequestHint, error
 }
 
 // maxHintBodyBytes bounds how much of a request body the gateway buffers in
-// memory while extracting a scheduling hint. Cold-sandbox creation bodies are
+// memory while extracting a scheduling hint. Sandbox creation bodies are
 // small, so anything larger is assumed not worth inspecting. Keeping a bound
 // here matters because hint extraction runs before upstream authentication;
 // without it an unauthenticated client could force the gateway to buffer an
@@ -58,8 +54,7 @@ const maxHintBodyBytes = 64 * 1024
 // scheduling hint can be extracted, then restores r.Body so the full body
 // remains available for the upstream request. If the body exceeds the budget,
 // the buffered prefix is stitched back in front of the unread remainder (no
-// full buffering) and a nil body is returned so the caller skips hint
-// extraction.
+// full buffering) and a nil body is returned so hint extraction is skipped.
 func captureRequestBody(r *http.Request) ([]byte, error) {
 	if r.Body == nil || r.Body == http.NoBody {
 		return nil, nil

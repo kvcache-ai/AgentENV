@@ -87,7 +87,7 @@ func TestBuildScheduleHintNewColdSandbox(t *testing.T) {
 
 func TestBuildScheduleHintTrailingSlash(t *testing.T) {
 
-	hint, err := buildScheduleHint(newHintRequest(t, http.MethodPost, "/sandboxes/", ""))
+	hint, err := buildScheduleHint(newHintRequest(t, http.MethodPost, "/sandboxes/", `{"templateID":"tmpl"}`))
 	if err != nil {
 		t.Fatalf("buildScheduleHint returned error: %v", err)
 	}
@@ -173,35 +173,41 @@ func TestCaptureRequestBodyNil(t *testing.T) {
 	}
 }
 
-func TestBuildScheduleHintColdSandboxOversizedBodyStreams(t *testing.T) {
+func TestBuildScheduleHintOversizedBodyStreams(t *testing.T) {
 	// A body larger than the inspection budget must not be fully buffered:
 	// hint extraction is skipped, but the full body must still reach upstream.
-	prefix := `{"image":"ubuntu:24.04","pad":"`
-	reqBody := prefix + strings.Repeat("a", maxHintBodyBytes) + `"}`
+	reqBody := `{"image":"ubuntu:24.04","templateID":"base","metadata":{"pad":"` + strings.Repeat("a", maxHintBodyBytes) + `"}}`
 	if int64(len(reqBody)) <= maxHintBodyBytes {
 		t.Fatalf("test body must exceed the budget")
 	}
-	r := newHintRequest(t, http.MethodPost, "/sandboxes-cold", reqBody)
+	for _, target := range []string{"/sandboxes-cold", "/sandboxes"} {
+		t.Run(target, func(t *testing.T) {
+			r := newHintRequest(t, http.MethodPost, target, reqBody)
+			hint, err := buildScheduleHint(r)
+			if err != nil {
+				t.Fatalf("buildScheduleHint returned error: %v", err)
+			}
+			// Oversized body is not inspected, so no fields are extracted.
+			if target == "/sandboxes-cold" {
+				cold := hint.GetNewColdSandbox()
+				if cold == nil || len(cold.GetImages()) != 0 || cold.GetCpuCount() != 0 || cold.GetMemoryMb() != 0 {
+					t.Fatalf("expected empty cold sandbox hint for oversized body, got %v", hint)
+				}
+			} else {
+				sandbox := hint.GetNewSandbox()
+				if sandbox == nil || len(sandbox.GetMetadata()) != 0 {
+					t.Fatalf("expected empty new sandbox hint for oversized body, got %v", hint)
+				}
+			}
 
-	hint, err := buildScheduleHint(r)
-	if err != nil {
-		t.Fatalf("buildScheduleHint returned error: %v", err)
-	}
-	cold := hint.GetNewColdSandbox()
-	if cold == nil {
-		t.Fatalf("expected cold sandbox hint, got %v", hint)
-	}
-	// Oversized body is not inspected, so no fields are extracted.
-	if len(cold.GetImages()) != 0 || cold.GetCpuCount() != 0 || cold.GetMemoryMb() != 0 {
-		t.Fatalf("expected empty hint for oversized body, got %v", cold)
-	}
-
-	// The full original body must still be readable for the upstream request.
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		t.Fatalf("read restored body failed: %v", err)
-	}
-	if string(body) != reqBody {
-		t.Fatalf("restored body length = %d, want %d", len(body), len(reqBody))
+			// The full original body must still be readable for the upstream request.
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read restored body failed: %v", err)
+			}
+			if string(body) != reqBody {
+				t.Fatalf("restored body length = %d, want %d", len(body), len(reqBody))
+			}
+		})
 	}
 }
