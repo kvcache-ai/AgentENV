@@ -28,6 +28,33 @@ const ZFILE_FINE_DURATION_BUCKETS: &[f64] = &[
     30.0,
 ];
 
+/// Byte-size buckets for `agentenv_snapshot_sealed_upper_size_bytes`, the
+/// only non-duration histogram today: 128 KiB..64 GiB in 2x steps. The
+/// global `DURATION_BUCKETS` default is seconds-based and would land every
+/// size observation in `+Inf`.
+const SIZE_BYTES_BUCKETS: &[f64] = &[
+    131_072.0,        // 128 KiB
+    262_144.0,        // 256 KiB
+    524_288.0,        // 512 KiB
+    1_048_576.0,      // 1 MiB
+    2_097_152.0,      // 2 MiB
+    4_194_304.0,      // 4 MiB
+    8_388_608.0,      // 8 MiB
+    16_777_216.0,     // 16 MiB
+    33_554_432.0,     // 32 MiB
+    67_108_864.0,     // 64 MiB
+    134_217_728.0,    // 128 MiB
+    268_435_456.0,    // 256 MiB
+    536_870_912.0,    // 512 MiB
+    1_073_741_824.0,  // 1 GiB
+    2_147_483_648.0,  // 2 GiB
+    4_294_967_296.0,  // 4 GiB
+    8_589_934_592.0,  // 8 GiB
+    17_179_869_184.0, // 16 GiB
+    34_359_738_368.0, // 32 GiB
+    68_719_476_736.0, // 64 GiB
+];
+
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
 pub fn init_prometheus_recorder() -> anyhow::Result<()> {
@@ -49,6 +76,10 @@ pub fn init_prometheus_recorder() -> anyhow::Result<()> {
         .set_buckets_for_metric(
             Matcher::Full("agentenv_overlaybd_zfile_decompress_duration_seconds".to_owned()),
             ZFILE_FINE_DURATION_BUCKETS,
+        )?
+        .set_buckets_for_metric(
+            Matcher::Full("agentenv_snapshot_sealed_upper_size_bytes".to_owned()),
+            SIZE_BYTES_BUCKETS,
         )?
         .install_recorder()?;
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
