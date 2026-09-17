@@ -110,6 +110,9 @@ async fn create_probed_hybrid(
 struct CountingSizeFile {
     inner: Arc<dyn VirtualFile>,
     size_calls: std::sync::atomic::AtomicUsize,
+    sync_calls: std::sync::atomic::AtomicUsize,
+    seek_calls: AtomicUsize,
+    write_limit: AtomicUsize,
 }
 
 impl CountingSizeFile {
@@ -117,6 +120,9 @@ impl CountingSizeFile {
         Arc::new(Self {
             inner,
             size_calls: std::sync::atomic::AtomicUsize::new(0),
+            sync_calls: std::sync::atomic::AtomicUsize::new(0),
+            seek_calls: AtomicUsize::new(0),
+            write_limit: AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -141,7 +147,10 @@ impl VirtualFile for CountingSizeFile {
     }
 
     async fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
-        self.inner.write_at(offset, data).await
+        let len = data
+            .len()
+            .min(self.write_limit.load(AtomicOrdering::Relaxed));
+        self.inner.write_at(offset, &data[..len]).await
     }
 
     async fn write_bytes_at(&self, offset: u64, data: Bytes) -> Result<usize> {
@@ -199,6 +208,8 @@ impl VirtualFile for CountingSizeFile {
     }
 
     async fn sync(&self) -> Result<()> {
+        self.sync_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.sync().await
     }
 
@@ -207,10 +218,12 @@ impl VirtualFile for CountingSizeFile {
     }
 
     async fn seek_data(&self, offset: u64) -> Result<Option<u64>> {
+        self.seek_calls.fetch_add(1, AtomicOrdering::Relaxed);
         self.inner.seek_data(offset).await
     }
 
     async fn seek_hole(&self, offset: u64) -> Result<Option<u64>> {
+        self.seek_calls.fetch_add(1, AtomicOrdering::Relaxed);
         self.inner.seek_hole(offset).await
     }
 }
@@ -273,6 +286,107 @@ async fn prepared_log_and_hybrid_uppers_use_compatible_index_offset() {
         let index_file = Arc::new(LocalFile::open_rw(index_path, false).unwrap());
         assert_unsealed_upper_headers_and_reopen(data_file, index_file).await;
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn indexed_sparse_checkpoint_reopens_without_extent_discovery() -> Result<()> {
+    let dir = TempDir::new()?;
+    let data_path = dir.path().join("upper.data");
+    let index_path = dir.path().join("upper.index");
+    crate::helper::prepare_runtime_upper(
+        &data_path,
+        Some(&index_path),
+        16384,
+        crate::config::UpperMode::Sparse,
+    )?;
+    validate_rw_header_pair_paths(&data_path, Some(&index_path), 16384, RwLayout::Sparse)?;
+
+    let data: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(&data_path, false)?);
+    let index: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(&index_path, false)?);
+    let upper = open_file_rw(data.clone(), Some(index.clone())).await?;
+    data.write_at(HEADER_SIZE, &[0xA5; 4096]).await?;
+    checkpoint_sparse_index(&index_path, vec![Segment::new(0, 8)]).await?;
+    drop(upper);
+    let upper = open_file_rw(data.clone(), Some(index.clone())).await?;
+    data.write_at(HEADER_SIZE + 8192, &[0; 4096]).await?;
+    checkpoint_sparse_index(&index_path, vec![Segment::new(16, 8)]).await?;
+    drop(upper);
+    let counted = CountingSizeFile::new(data.clone());
+    let reopened = open_file_rw(counted.clone(), Some(index.clone())).await?;
+    assert_eq!(counted.seek_calls.load(AtomicOrdering::Relaxed), 0);
+    assert_eq!(reopened.read_at(0, 4096).await?.as_ref(), &[0xA5; 4096]);
+    let mappings = reopened.index().read().await.upper.dump();
+    assert_eq!(mappings.len(), 2);
+    assert!(mappings.iter().any(|m| m.offset() == 16 && !m.zeroed));
+    reopened.write_at(4096, &[0x5A; 4096]).await?;
+    drop(reopened);
+    let reopened = open_file_rw(data, Some(index)).await?;
+    assert_eq!(reopened.read_at(4096, 4096).await?.as_ref(), &[0x5A; 4096]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn temporal_checkpoint_bounds_index_history_and_preserves_discard() -> Result<()> {
+    use crate::config::UpperMode;
+    for (mode, trim) in [
+        (UpperMode::LogStructured, false),
+        (UpperMode::HybridLogStructured, false),
+        (UpperMode::HybridLogStructured, true),
+    ] {
+        let dir = TempDir::new()?;
+        let data_path = dir.path().join("upper.data");
+        let index_path = dir.path().join("upper.index");
+        crate::helper::prepare_runtime_upper(&data_path, Some(&index_path), 128 * 1024, mode)?;
+
+        let data = CountingSizeFile::new(Arc::new(LocalFile::open_rw(&data_path, false)?));
+        let index = CountingSizeFile::new(Arc::new(LocalFile::open_rw(&index_path, false)?));
+        let upper = open_file_rw(data.clone(), Some(index.clone())).await?;
+        upper.set_index_group_commit(1024)?;
+        for _ in 0..160 {
+            if trim {
+                upper.discard_range(0, 128 * 1024).await?;
+            }
+            for page in 0..32 {
+                upper.write_at(page * 4096, &[0xA5; 4096]).await?;
+            }
+        }
+        upper.discard_range(31 * 4096, 4096).await?;
+        let data_size = data.size().await?;
+        upper.flush_group_commit().await?;
+        index.write_limit.store(7, AtomicOrdering::Relaxed);
+        upper.flush_for_checkpoint().await?;
+        index.write_limit.store(usize::MAX, AtomicOrdering::Relaxed);
+        assert_eq!(
+            data.size().await?,
+            data_size,
+            "checkpoint must not rewrite data"
+        );
+        assert!(index.size().await? <= HEADER_SIZE + 33 * 16);
+        assert_eq!(data.sync_calls.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(index.sync_calls.load(AtomicOrdering::Relaxed), 0);
+        drop(upper);
+        let upper = open_file_rw(data.clone(), Some(index.clone())).await?;
+        assert!(upper
+            .index()
+            .read()
+            .await
+            .upper
+            .dump()
+            .iter()
+            .any(|m| m.offset() == 31 * 8 && m.zeroed));
+        assert_eq!(upper.read_at(0, 4096).await?.as_ref(), &[0xA5; 4096]);
+        assert_eq!(upper.read_at(31 * 4096, 4096).await?.as_ref(), &[0; 4096]);
+        upper.write_at(31 * 4096, &[0x5A; 4096]).await?;
+        upper.flush_for_checkpoint().await?;
+        drop(upper);
+        let reopened = open_file_rw(data, Some(index)).await?;
+        assert_eq!(
+            reopened.read_at(31 * 4096, 4096).await?.as_ref(),
+            &[0x5A; 4096]
+        );
+    }
+    Ok(())
 }
 
 // The two log-structured layouts are portable, so they are validated on every
@@ -2451,6 +2565,38 @@ async fn test_hybrid_discard_reuse_hot_path_avoids_size_calls() {
     upper.write_at(0, &[0xBB; 4096]).await.unwrap();
     upper.sync().await.unwrap();
     assert_no_size_calls(&data, &index);
+}
+
+#[tokio::test]
+async fn checkpoint_index_flush_allows_reopen_without_disk_sync() {
+    let temp_dir = TempDir::new().unwrap();
+    let (data, index, lsmt) = create_counting_log_lsmt_env(&temp_dir, 1024 * 1024).await;
+    lsmt.set_index_group_commit(size_of::<DiskSegmentMapping>() * 4)
+        .unwrap();
+    lsmt.write_at(0, &[0xE9; 4096]).await.unwrap();
+    lsmt.write_at(4096, &[0xEA; 4096]).await.unwrap();
+
+    lsmt.flush_group_commit().await.unwrap();
+    drop(lsmt);
+    let reopened = open_file_rw(data.clone(), Some(index.clone()))
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened.read_at(0, 4096).await.unwrap().as_ref(),
+        &[0xE9; 4096]
+    );
+    assert_eq!(
+        reopened.read_at(4096, 4096).await.unwrap().as_ref(),
+        &[0xEA; 4096]
+    );
+    assert_eq!(
+        data.sync_calls.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert_eq!(
+        index.sync_calls.load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
 }
 
 #[tokio::test]

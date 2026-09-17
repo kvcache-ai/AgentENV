@@ -134,6 +134,7 @@ impl Env {
             .call(DaemonRequest::CreateOverlaybd {
                 image_config: image_config.to_path_buf(),
                 global_config: self.global_config.clone(),
+                read_only_upper: false,
             })
             .await
         {
@@ -150,6 +151,7 @@ impl Env {
             dev_id,
             image_config: image_config.to_path_buf(),
             global_config: self.global_config.clone(),
+            read_only_upper: false,
             role: DeviceRole::Raw,
         }
     }
@@ -453,6 +455,7 @@ async fn recover_restores_pool_devices_and_shared_refcount() {
         global_config: env.global_config.clone(),
         virtual_size: None,
         access_mode,
+        read_only_upper: false,
     };
     let acquired = |response| match response {
         DaemonResponse::DeviceAcquired { dev_id, .. } => dev_id,

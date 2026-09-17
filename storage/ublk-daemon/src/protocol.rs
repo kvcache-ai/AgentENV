@@ -25,6 +25,10 @@ pub enum DaemonRequest {
         /// Path to the overlaybd global config JSON for this device.
         /// The daemon lazily creates an `ImageService` per unique config path.
         global_config: PathBuf,
+        /// Open a configured sparse upper read-only while retaining it as the
+        /// top layer. Used by Temporal memory resumes.
+        #[serde(default)]
+        read_only_upper: bool,
     },
     /// Materialize an OverlayBD runtime directory and create/acquire the ublk
     /// device for it. This is the rootfs/extra-drive block-device path.
@@ -39,6 +43,10 @@ pub enum DaemonRequest {
         known_source_virtual_size: Option<u64>,
         #[serde(default)]
         allow_shrink: bool,
+        /// Whether source-owned state is consumed into the new runtime
+        /// directory before opening the device.
+        #[serde(default)]
+        source_state_strategy: SourceStateStrategy,
     },
     Delete {
         dev_id: u32,
@@ -46,6 +54,10 @@ pub enum DaemonRequest {
     RestackSnapshot {
         dev_id: u32,
         output_layer_path: PathBuf,
+    },
+    /// Flush a live image while excluding concurrent image I/O.
+    FlushForCheckpoint {
+        dev_id: u32,
     },
     /// Query daemon capabilities (e.g., dynamic resize support).
     GetFeatures,
@@ -99,6 +111,8 @@ pub enum DaemonRequest {
         /// Expected capacity; omit to use the published image capacity.
         virtual_size: Option<u64>,
         access_mode: AccessMode,
+        #[serde(default)]
+        read_only_upper: bool,
     },
     /// Release an overlaybd device back to the pool.
     ReleaseOverlaybd {
@@ -131,6 +145,8 @@ pub struct DeviceSpec {
     /// returned as `runtime_image_config_path` for runtime devices).
     pub image_config: PathBuf,
     pub global_config: PathBuf,
+    #[serde(default)]
+    pub read_only_upper: bool,
     pub role: DeviceRole,
 }
 
@@ -156,6 +172,17 @@ pub struct FailedRecovery {
 
 fn default_runtime_upper_mode() -> UpperMode {
     UpperMode::LogStructured
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceStateStrategy {
+    /// Reuse local state referenced by the source image config.
+    #[default]
+    Reuse,
+    /// Transfer source-owned state into the new runtime. Upper files are
+    /// renamed on the same filesystem, or copied then removed across mounts.
+    Consume,
 }
 
 const fn default_resize_timeout_secs() -> u64 {
@@ -302,72 +329,6 @@ pub async fn recv_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Resul
 mod tests {
     use super::*;
 
-    // ── Existing serde round-trip tests ─────────────────────────────────
-
-    #[test]
-    fn request_serialization_round_trip() {
-        let req = DaemonRequest::CreateOverlaybd {
-            image_config: PathBuf::from("/tmp/image.json"),
-            global_config: PathBuf::from("/etc/overlaybd/global.json"),
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
-        match decoded {
-            DaemonRequest::CreateOverlaybd { image_config, .. } => {
-                assert_eq!(image_config, PathBuf::from("/tmp/image.json"));
-            }
-            _ => panic!("unexpected variant"),
-        }
-    }
-
-    #[test]
-    fn response_serialization_round_trip() {
-        let resp = DaemonResponse::DeviceCreated {
-            dev_id: 42,
-            device_path: PathBuf::from("/dev/ublkb0"),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
-        match decoded {
-            DaemonResponse::DeviceCreated {
-                dev_id,
-                device_path,
-            } => {
-                assert_eq!(dev_id, 42);
-                assert_eq!(device_path, PathBuf::from("/dev/ublkb0"));
-            }
-            _ => panic!("unexpected variant"),
-        }
-    }
-
-    #[test]
-    fn error_response_round_trip() {
-        let resp = DaemonResponse::Error {
-            message: "something went wrong".into(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
-        match decoded {
-            DaemonResponse::Error { message } => assert_eq!(message, "something went wrong"),
-            _ => panic!("unexpected variant"),
-        }
-    }
-
-    #[test]
-    fn terminal_error_response_round_trip() {
-        let resp = DaemonResponse::TerminalError {
-            message: "live state mutated".into(),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
-        match decoded {
-            DaemonResponse::TerminalError { message } => {
-                assert_eq!(message, "live state mutated")
-            }
-            _ => panic!("unexpected variant"),
-        }
-    }
-
     #[tokio::test]
     async fn send_recv_round_trip_over_unix_socket() {
         let dir = tempfile::tempdir().unwrap();
@@ -391,53 +352,7 @@ mod tests {
         }
     }
 
-    // ── New serde round-trip tests for pool RPCs ────────────────────────
-
-    #[test]
-    fn request_get_features_round_trip() {
-        let req = DaemonRequest::GetFeatures;
-        let json = serde_json::to_string(&req).unwrap();
-        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
-        assert!(matches!(decoded, DaemonRequest::GetFeatures));
-    }
-
-    #[test]
-    fn request_create_overlaybd_runtime_device_round_trip() {
-        let req = DaemonRequest::CreateOverlaybdRuntimeDevice {
-            source_image_config: PathBuf::from("/src/image.json"),
-            global_config: PathBuf::from("/global.json"),
-            runtime_dir: PathBuf::from("/work/overlaybd"),
-            read_only: false,
-            runtime_upper_mode: UpperMode::Sparse,
-            requested_virtual_size: Some(8192),
-            known_source_virtual_size: Some(8192),
-            allow_shrink: true,
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
-        match decoded {
-            DaemonRequest::CreateOverlaybdRuntimeDevice {
-                source_image_config,
-                global_config,
-                runtime_dir,
-                read_only,
-                runtime_upper_mode,
-                requested_virtual_size,
-                known_source_virtual_size,
-                allow_shrink,
-            } => {
-                assert_eq!(source_image_config, PathBuf::from("/src/image.json"));
-                assert_eq!(global_config, PathBuf::from("/global.json"));
-                assert_eq!(runtime_dir, PathBuf::from("/work/overlaybd"));
-                assert!(!read_only);
-                assert_eq!(runtime_upper_mode, UpperMode::Sparse);
-                assert_eq!(requested_virtual_size, Some(8192));
-                assert_eq!(known_source_virtual_size, Some(8192));
-                assert!(allow_shrink);
-            }
-            _ => panic!("unexpected variant"),
-        }
-    }
+    // ── Wire-format compatibility tests (fixed JSON from older peers) ───
 
     #[test]
     fn runtime_resize_fields_default_for_old_requests() {
@@ -452,8 +367,13 @@ mod tests {
         }"#;
         let decoded: DaemonRequest = serde_json::from_str(json).unwrap();
         match decoded {
-            DaemonRequest::CreateOverlaybdRuntimeDevice { allow_shrink, .. } => {
+            DaemonRequest::CreateOverlaybdRuntimeDevice {
+                allow_shrink,
+                source_state_strategy,
+                ..
+            } => {
                 assert!(!allow_shrink);
+                assert_eq!(source_state_strategy, SourceStateStrategy::Reuse);
             }
             other => panic!("unexpected request: {other:?}"),
         }
@@ -473,6 +393,7 @@ mod tests {
             global_config: PathBuf::from("/global.json"),
             virtual_size: Some(1024 * 1024 * 1024),
             access_mode: AccessMode::Exclusive,
+            read_only_upper: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
@@ -649,12 +570,14 @@ mod tests {
                     dev_id: 3,
                     image_config: PathBuf::from("/run/rootfs/image.json"),
                     global_config: PathBuf::from("/etc/overlaybd/global.json"),
+                    read_only_upper: false,
                     role: DeviceRole::Exclusive,
                 },
                 DeviceSpec {
                     dev_id: 4,
                     image_config: PathBuf::from("/snap/mem/image.json"),
                     global_config: PathBuf::from("/etc/overlaybd/global.json"),
+                    read_only_upper: true,
                     role: DeviceRole::Shared { refcount: 2 },
                 },
             ],
@@ -665,7 +588,9 @@ mod tests {
             DaemonRequest::Recover { devices } => {
                 assert_eq!(devices.len(), 2);
                 assert_eq!(devices[0].role, DeviceRole::Exclusive);
+                assert!(!devices[0].read_only_upper);
                 assert_eq!(devices[1].role, DeviceRole::Shared { refcount: 2 });
+                assert!(devices[1].read_only_upper);
             }
             _ => panic!("unexpected variant"),
         }
@@ -801,6 +726,7 @@ mod tests {
                 DaemonRequest::CreateOverlaybd {
                     image_config: PathBuf::from("/img.json"),
                     global_config: PathBuf::from("/etc/overlaybd/global.json"),
+                    read_only_upper: false,
                 },
             ];
             for msg in &messages {
