@@ -23,6 +23,8 @@ pub enum SnapshotsGetResponse {
     Status401_AuthenticationError(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
+    /// Service unavailable
+    Status503_ServiceUnavailable(models::Error),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -37,6 +39,8 @@ pub enum SnapshotsSnapshotIdDeleteResponse {
     Status404_NotFound(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
+    /// Service unavailable
+    Status503_ServiceUnavailable(models::Error),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -49,6 +53,28 @@ pub enum SnapshotsSnapshotIdGetResponse {
     Status401_AuthenticationError(models::Error),
     /// Not found
     Status404_NotFound(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Service unavailable
+    Status503_ServiceUnavailable(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum SnapshotsSnapshotIdPromotePostResponse {
+    /// Snapshot is available as Distributed
+    Status200_SnapshotIsAvailableAsDistributed(models::SnapshotInfo),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
+    /// Service unavailable
+    Status503_ServiceUnavailable(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -95,4 +121,17 @@ pub trait Snapshots<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         claims: &Self::Claims,
         path_params: &models::SnapshotsSnapshotIdGetPathParams,
     ) -> Result<SnapshotsSnapshotIdGetResponse, E>;
+
+    /// Promote a Local snapshot.
+    ///
+    /// SnapshotsSnapshotIdPromotePost - POST /snapshots/{snapshotID}/promote
+    async fn snapshots_snapshot_id_promote_post(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::SnapshotsSnapshotIdPromotePostPathParams,
+    ) -> Result<SnapshotsSnapshotIdPromotePostResponse, E>;
 }

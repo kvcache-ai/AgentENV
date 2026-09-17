@@ -761,11 +761,11 @@ func TestSandboxIDFromHeadersOnResponse(t *testing.T) {
 }
 
 func TestExtractSandboxIDFromResponse(t *testing.T) {
-	id, ok := extractSandboxIDFromResponse([]byte(`{"sandboxID":"sbx-123"}`))
-	if !ok || id != "sbx-123" {
-		t.Fatalf("expected sandbox id to be extracted, got %q (ok=%v)", id, ok)
+	ids := extractSandboxIDsFromResponse([]byte(`{"sandboxID":"sbx-123"}`))
+	if !equalStrings(ids, []string{"sbx-123"}) {
+		t.Fatalf("expected sandbox id to be extracted, got %#v", ids)
 	}
-	ids := extractSandboxIDsFromResponse([]byte(`{"sandboxes":[{"sandboxID":"sbx-1"},{"sandboxID":"sbx-2"}]}`))
+	ids = extractSandboxIDsFromResponse([]byte(`{"sandboxes":[{"sandboxID":"sbx-1"},{"sandboxID":"sbx-2"}]}`))
 	if !equalStrings(ids, []string{"sbx-1", "sbx-2"}) {
 		t.Fatalf("expected batch sandbox ids, got %#v", ids)
 	}
@@ -2120,6 +2120,7 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 
 	requests := make(chan upstreamRequestSnapshot, 1)
 	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 1)
+	schedules := 0
 
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		payload, err := io.ReadAll(r.Body)
@@ -2146,7 +2147,12 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 	defer upstream.Close()
 
 	server := newTestServer(t, stubSchedulerClient{
+		listNodesFunc: func(context.Context, *schedulerv1.ListNodesRequest, ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
+			t.Error("snapshot launch must not discover metadata nodes")
+			return nil, fmt.Errorf("unexpected ListNodes call")
+		},
 		scheduleFunc: func(_ context.Context, req *schedulerv1.ScheduleRequest, _ ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			schedules++
 			if req.GetHint().GetNewSandbox() == nil {
 				return nil, fmt.Errorf("unexpected schedule hint: %v", req.GetHint())
 			}
@@ -2166,7 +2172,7 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
 
-	req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+"/sandboxes", strings.NewReader(`{"template":"base"}`))
+	req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+"/sandboxes", strings.NewReader(`{"templateID":"base"}`))
 	if err != nil {
 		t.Fatalf("build request failed: %v", err)
 	}
@@ -2210,8 +2216,8 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 	if upstreamReq.contentType != "application/json" {
 		t.Fatalf("upstream content type = %q, want %q", upstreamReq.contentType, "application/json")
 	}
-	if upstreamReq.body != `{"template":"base"}` {
-		t.Fatalf("upstream body = %q, want %q", upstreamReq.body, `{"template":"base"}`)
+	if upstreamReq.body != `{"templateID":"base"}` {
+		t.Fatalf("upstream body = %q, want %q", upstreamReq.body, `{"templateID":"base"}`)
 	}
 	if upstreamReq.forwardedHost != "gateway.test" {
 		t.Fatalf("X-Forwarded-Host = %q, want %q", upstreamReq.forwardedHost, "gateway.test")
@@ -2227,6 +2233,9 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 	}
 
 	recordReq := <-recorded
+	if schedules != 1 {
+		t.Fatalf("Schedule calls = %d, want 1", schedules)
+	}
 	if recordReq.GetSandboxId() != "sbx-created" {
 		t.Fatalf("recorded sandbox id = %q, want %q", recordReq.GetSandboxId(), "sbx-created")
 	}
