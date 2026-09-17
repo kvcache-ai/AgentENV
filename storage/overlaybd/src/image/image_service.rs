@@ -328,6 +328,16 @@ impl ImageService {
     }
 
     pub async fn create_image_file(&self, path: impl AsRef<Path>) -> Result<ImageFile> {
+        self.create_image_file_with_upper_access(path, false).await
+    }
+
+    /// Temporal memory sets `read_only_upper` to reserve sparse-upper writes
+    /// for the paused checkpoint path while exposing its contents for reads.
+    pub async fn create_image_file_with_upper_access(
+        &self,
+        path: impl AsRef<Path>,
+        read_only_upper: bool,
+    ) -> Result<ImageFile> {
         let device_key =
             std::fs::canonicalize(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
         let image_config = self.load_image_config(path)?;
@@ -335,7 +345,14 @@ impl ImageService {
 
         let _ = self.enable_acceleration();
 
-        match ImageFile::open(image_config, self.clone(), Some(device_key)).await {
+        let opened = ImageFile::open_with_upper_access(
+            image_config,
+            self.clone(),
+            Some(device_key),
+            read_only_upper,
+        )
+        .await;
+        match opened {
             Ok(image) => {
                 self.set_result_file(&result_file, "success")?;
                 Ok(image)

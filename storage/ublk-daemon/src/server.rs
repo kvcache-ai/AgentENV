@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,14 +28,15 @@ use uvm_ublk::{
 
 use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
-    ResizeToolSpec,
+    ResizeToolSpec, SourceStateStrategy,
 };
-use crate::runtime;
+use crate::runtime::{self, MaterializeOverlaybdRuntimeRequest};
 
 // ── Managed device wrapper ──────────────────────────────────────────────────
 
 struct ManagedDevice {
     dev: UVMUblkDev<OverlaybdTarget>,
+    image_config: PathBuf,
     image: Arc<ImageFile>,
 }
 
@@ -78,11 +80,8 @@ struct ActiveShared {
     refcount: usize,
 }
 
-/// Canonical key for shared-mode devices: (image_config, global_config).
-type SharedKey = (PathBuf, PathBuf);
-
-/// Canonical key used to coordinate image opens with restack mutation.
-type ImageLockKey = PathBuf;
+/// Canonical key for shared-mode devices: (image_config, global_config, upper access).
+type SharedKey = (PathBuf, PathBuf, bool);
 
 // ── Lazy ImageService cache ─────────────────────────────────────────────────
 
@@ -93,14 +92,58 @@ type ImageLockKey = PathBuf;
 /// on the first request that opens an overlaybd image with a given config path.
 pub(crate) struct ImageServiceCache {
     services: Mutex<HashMap<PathBuf, ImageService>>,
+    /// Coordinate source consumption and image opens even without a warm pool.
+    image_locks: DashMap<PathBuf, Arc<RwLock<()>>>,
     p2p_publish_url: Option<String>,
+}
+
+struct ImageLock<'a> {
+    cache: &'a ImageServiceCache,
+    key: PathBuf,
+    lock: Option<Arc<RwLock<()>>>,
+}
+
+impl Deref for ImageLock<'_> {
+    type Target = RwLock<()>;
+
+    fn deref(&self) -> &Self::Target {
+        self.lock.as_deref().expect("image lock released")
+    }
+}
+
+impl Drop for ImageLock<'_> {
+    fn drop(&mut self) {
+        drop(self.lock.take());
+        self.cache.image_locks.remove_if(&self.key, |_, lock| {
+            // Release this caller before checking, so concurrent final drops
+            // cannot both leave the last map-owned reference behind.
+            Arc::strong_count(lock) == 1
+        });
+    }
 }
 
 impl ImageServiceCache {
     pub(crate) fn new(p2p_publish_url: Option<String>) -> Self {
         Self {
             services: Mutex::new(HashMap::new()),
+            image_locks: DashMap::new(),
             p2p_publish_url,
+        }
+    }
+
+    fn image_lock(&self, image_config: &Path) -> ImageLock<'_> {
+        let key =
+            std::fs::canonicalize(image_config).unwrap_or_else(|_| image_config.to_path_buf());
+        let lock = Arc::clone(
+            self.image_locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(RwLock::new(())))
+                .value(),
+        );
+        ImageLock {
+            cache: self,
+            key,
+            lock: Some(lock),
         }
     }
 
@@ -146,9 +189,6 @@ struct PoolState {
     /// `active_shared` with `iter_mut`, which can deadlock under concurrent
     /// release requests.
     shared_by_dev_id: DashMap<u32, SharedKey>,
-    /// Per-image locks keep restack mutation exclusive with image opens for
-    /// the same image config without serializing unrelated sandbox resumes.
-    image_locks: DashMap<ImageLockKey, Arc<RwLock<()>>>,
     /// Coalesces asynchronous pool refill work so concurrent acquire/release
     /// requests do not all synchronously create replacement ublk devices.
     refill_inflight: AtomicBool,
@@ -178,7 +218,6 @@ impl PoolState {
             active_exclusive: DashMap::new(),
             active_shared: DashMap::new(),
             shared_by_dev_id: DashMap::new(),
-            image_locks: DashMap::new(),
             refill_inflight: AtomicBool::new(false),
             config,
             features,
@@ -244,24 +283,6 @@ impl PoolState {
 
     fn supports_update_size(&self) -> bool {
         self.features & ublk_caps::UBLK_F_UPDATE_SIZE != 0
-    }
-
-    fn image_lock_key(image_config: &Path) -> ImageLockKey {
-        // Matches ImageServiceCache behavior: canonicalize when possible, but
-        // tolerate paths that do not exist yet by falling back to the raw path.
-        // Non-canonical aliases to the same missing file are therefore not
-        // serialized with each other until the path exists.
-        std::fs::canonicalize(image_config).unwrap_or_else(|_| image_config.to_path_buf())
-    }
-
-    fn image_lock(&self, image_config: &Path) -> Arc<RwLock<()>> {
-        let key = Self::image_lock_key(image_config);
-        Arc::clone(
-            self.image_locks
-                .entry(key)
-                .or_insert_with(|| Arc::new(RwLock::new(())))
-                .value(),
-        )
     }
 }
 
@@ -572,6 +593,7 @@ async fn handle_connection(
         DaemonRequest::CreateOverlaybd {
             image_config,
             global_config,
+            read_only_upper,
         } => {
             handle_create_raw_overlaybd(
                 &devices,
@@ -579,6 +601,7 @@ async fn handle_connection(
                 &image_service_cache,
                 &image_config,
                 &global_config,
+                read_only_upper,
             )
             .await
         }
@@ -591,8 +614,10 @@ async fn handle_connection(
             requested_virtual_size,
             known_source_virtual_size,
             allow_shrink,
+            source_state_strategy,
         } => {
-            let request = OverlaybdRuntimeDeviceRequest {
+            let request = MaterializeOverlaybdRuntimeRequest {
+                image_service_cache: &image_service_cache,
                 source_image_config: &source_image_config,
                 global_config: &global_config,
                 runtime_dir: &runtime_dir,
@@ -604,15 +629,9 @@ async fn handle_connection(
                 resize_global_config: &resize_global_config,
                 resize_permit: Arc::clone(&resize_permit),
                 allow_shrink,
+                source_state_strategy,
             };
-            handle_create_overlaybd_runtime_device(
-                request,
-                ctrl_ring,
-                &devices,
-                &image_service_cache,
-                &pool_state,
-            )
-            .await
+            handle_create_overlaybd_runtime_device(request, ctrl_ring, &devices, &pool_state).await
         }
         DaemonRequest::Delete { dev_id } => {
             handle_delete(&devices, ctrl_ring, &pack_recordings, dev_id).await
@@ -620,7 +639,19 @@ async fn handle_connection(
         DaemonRequest::RestackSnapshot {
             dev_id,
             output_layer_path,
-        } => handle_restack_snapshot(&devices, &pool_state, dev_id, &output_layer_path).await,
+        } => {
+            handle_restack_snapshot(
+                &devices,
+                &pool_state,
+                &image_service_cache,
+                dev_id,
+                &output_layer_path,
+            )
+            .await
+        }
+        DaemonRequest::FlushForCheckpoint { dev_id } => {
+            handle_flush_for_checkpoint(&devices, &pool_state, dev_id).await
+        }
         DaemonRequest::GetFeatures => handle_get_features(&pool_state),
         DaemonRequest::NotifySandboxReady { device_key } => {
             tracing::info!(
@@ -687,18 +718,22 @@ async fn handle_connection(
             global_config,
             virtual_size,
             access_mode,
-        } => {
-            handle_acquire_overlaybd(
-                &pool_state,
-                ctrl_ring.clone(),
-                &image_service_cache,
-                &image_config,
-                &global_config,
-                virtual_size,
-                access_mode,
-            )
-            .await
-        }
+            read_only_upper,
+        } => acquire_overlaybd(
+            &pool_state,
+            ctrl_ring.clone(),
+            &image_service_cache,
+            &image_config,
+            &global_config,
+            virtual_size,
+            access_mode,
+            read_only_upper,
+        )
+        .await
+        .map(|(dev_id, device_path)| DaemonResponse::DeviceAcquired {
+            dev_id,
+            device_path,
+        }),
         DaemonRequest::ReleaseOverlaybd { dev_id } => {
             handle_release_overlaybd(&pool_state, ctrl_ring.clone(), dev_id).await
         }
@@ -799,81 +834,47 @@ async fn deliver_device_handoff(
 
 // ── Request handlers ────────────────────────────────────────────────────────
 
-struct OverlaybdRuntimeDeviceRequest<'a> {
-    source_image_config: &'a Path,
-    global_config: &'a Path,
-    runtime_dir: &'a Path,
-    read_only: bool,
-    runtime_upper_mode: overlaybd::config::UpperMode,
-    requested_virtual_size: Option<u64>,
-    known_source_virtual_size: Option<u64>,
-    resize_tool: Option<&'a crate::protocol::ResizeToolSpec>,
-    resize_global_config: &'a Path,
-    resize_permit: Arc<Mutex<()>>,
-    allow_shrink: bool,
-}
-
 async fn handle_create_overlaybd_runtime_device(
-    request: OverlaybdRuntimeDeviceRequest<'_>,
+    request: MaterializeOverlaybdRuntimeRequest<'_>,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     devices: &DashMap<u32, ManagedDevice>,
-    image_service_cache: &ImageServiceCache,
     pool_state: &Option<Arc<PoolState>>,
 ) -> Result<DaemonResponse> {
-    let runtime =
-        match runtime::materialize_overlaybd_runtime(runtime::MaterializeOverlaybdRuntimeRequest {
-            image_service_cache,
-            source_image_config: request.source_image_config,
-            global_config: request.global_config,
-            runtime_dir: request.runtime_dir,
-            read_only: request.read_only,
-            runtime_upper_mode: request.runtime_upper_mode,
-            requested_virtual_size: request.requested_virtual_size,
-            known_source_virtual_size: request.known_source_virtual_size,
-            resize_tool: request.resize_tool,
-            resize_global_config: request.resize_global_config,
-            resize_permit: request.resize_permit,
-            allow_shrink: request.allow_shrink,
-        })
+    let image_service_cache = request.image_service_cache;
+    let global_config = request.global_config;
+    let runtime_dir = request.runtime_dir;
+    // Reuse still needs the source files when it opens the materialized config.
+    // Keep this guard through device creation; different sources and concurrent
+    // Reuse requests retain their existing parallelism.
+    let source_lock = image_service_cache.image_lock(request.source_image_config);
+    let (_reuse_guard, _consume_guard) = match request.source_state_strategy {
+        SourceStateStrategy::Reuse => (Some(source_lock.read().await), None),
+        SourceStateStrategy::Consume => (None, Some(source_lock.write().await)),
+    };
+    let runtime = runtime::materialize_overlaybd_runtime(request)
         .await
-        {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "materialize overlaybd runtime in {}",
-                        request.runtime_dir.display()
-                    )
-                });
-            }
-        };
+        .with_context(|| format!("materialize overlaybd runtime in {}", runtime_dir.display()))?;
 
     let created = if pool_state.is_some() {
-        match handle_acquire_overlaybd(
+        acquire_overlaybd(
             pool_state,
             ctrl_ring,
             image_service_cache,
             &runtime.runtime_image_config_path,
-            request.global_config,
+            global_config,
             Some(runtime.actual_virtual_size),
             AccessMode::Exclusive,
+            false,
         )
         .await
-        {
-            Ok(DaemonResponse::DeviceAcquired {
-                dev_id,
-                device_path,
-            }) => Ok((dev_id, device_path)),
-            Ok(other) => bail!("unexpected acquire response for runtime device: {other:?}"),
-            Err(err) => Err(err),
-        }
     } else {
         create_overlaybd_device(
             devices,
             ctrl_ring,
             image_service_cache,
             &runtime.runtime_image_config_path,
-            request.global_config,
+            global_config,
+            false,
         )
         .await
     };
@@ -909,6 +910,7 @@ async fn handle_create_raw_overlaybd(
     image_service_cache: &ImageServiceCache,
     image_config: &Path,
     global_config: &Path,
+    read_only_upper: bool,
 ) -> Result<DaemonResponse> {
     tracing::info!(
         image_config = %image_config.display(),
@@ -922,6 +924,7 @@ async fn handle_create_raw_overlaybd(
         image_service_cache,
         image_config,
         global_config,
+        read_only_upper,
     )
     .await?;
 
@@ -931,23 +934,37 @@ async fn handle_create_raw_overlaybd(
     })
 }
 
+async fn open_overlaybd_image(
+    image_service_cache: &ImageServiceCache,
+    image_config: &Path,
+    global_config: &Path,
+    read_only_upper: bool,
+) -> Result<Arc<ImageFile>> {
+    let image_lock = image_service_cache.image_lock(image_config);
+    let _image_guard = image_lock.read().await;
+    let image_service = image_service_cache.get_or_create(global_config).await?;
+    let image = image_service
+        .create_image_file_with_upper_access(image_config, read_only_upper)
+        .await?;
+    Ok(Arc::new(image))
+}
+
 async fn create_overlaybd_device(
     devices: &DashMap<u32, ManagedDevice>,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     image_service_cache: &ImageServiceCache,
     image_config: &Path,
     global_config: &Path,
+    read_only_upper: bool,
 ) -> Result<(u32, PathBuf)> {
-    let image_service = image_service_cache
-        .get_or_create(global_config)
-        .await
-        .context("resolve image service for raw overlaybd device")?;
-    let image = Arc::new(
-        image_service
-            .create_image_file(image_config)
-            .await
-            .with_context(|| format!("open overlaybd image: {}", image_config.display()))?,
-    );
+    let image = open_overlaybd_image(
+        image_service_cache,
+        image_config,
+        global_config,
+        read_only_upper,
+    )
+    .await
+    .with_context(|| format!("open overlaybd image: {}", image_config.display()))?;
     let image_config_path = image_config.to_path_buf();
     let discard_supported = !image.is_read_only().await;
 
@@ -985,6 +1002,7 @@ async fn create_overlaybd_device(
         dev_id,
         ManagedDevice {
             dev,
+            image_config: image_config.to_path_buf(),
             image: Arc::clone(&image),
         },
     );
@@ -1434,30 +1452,11 @@ async fn stop_overlaybd_device(
 async fn handle_restack_snapshot(
     devices: &DashMap<u32, ManagedDevice>,
     pool_state: &Option<Arc<PoolState>>,
+    image_service_cache: &ImageServiceCache,
     dev_id: u32,
     output_layer_path: &Path,
 ) -> Result<DaemonResponse> {
-    let (image, image_config) = if let Some(device_ref) = devices.get(&dev_id) {
-        let image = Arc::clone(&device_ref.image);
-        drop(device_ref);
-        (image, None)
-    } else if let Some(pool) = pool_state {
-        if let Some(active) = pool.active_exclusive.get(&dev_id) {
-            (Arc::clone(&active.image), Some(active.image_config.clone()))
-        } else if let Some(shared_key) = pool.shared_by_dev_id.get(&dev_id) {
-            let key = shared_key.clone();
-            drop(shared_key);
-            let active = pool
-                .active_shared
-                .get(&key)
-                .with_context(|| format!("device {dev_id} not found for snapshot"))?;
-            (Arc::clone(&active.image), Some(active.image_config.clone()))
-        } else {
-            bail!("device {dev_id} not found for snapshot");
-        }
-    } else {
-        bail!("device {dev_id} not found for snapshot");
-    };
+    let (image, image_config) = find_overlaybd_image(devices, pool_state, dev_id, "snapshot")?;
 
     tracing::info!(
         dev_id,
@@ -1465,14 +1464,11 @@ async fn handle_restack_snapshot(
         "creating restack snapshot"
     );
 
-    let descriptor =
-        if let (Some(pool), Some(image_config)) = (pool_state.as_ref(), image_config.as_deref()) {
-            let image_lock = pool.image_lock(image_config);
-            let _image_guard = image_lock.write().await;
-            image.create_snapshot_and_restack(output_layer_path).await
-        } else {
-            image.create_snapshot_and_restack(output_layer_path).await
-        };
+    let descriptor = {
+        let image_lock = image_service_cache.image_lock(&image_config);
+        let _image_guard = image_lock.write().await;
+        image.create_snapshot_and_restack(output_layer_path).await
+    };
     let descriptor = descriptor.with_context(|| {
         format!(
             "restack overlaybd snapshot for dev_id={dev_id} to {}",
@@ -1497,6 +1493,48 @@ async fn handle_restack_snapshot(
     })
 }
 
+async fn handle_flush_for_checkpoint(
+    devices: &DashMap<u32, ManagedDevice>,
+    pool_state: &Option<Arc<PoolState>>,
+    dev_id: u32,
+) -> Result<DaemonResponse> {
+    let (image, _) = find_overlaybd_image(devices, pool_state, dev_id, "checkpoint flush")?;
+    image
+        .flush_for_checkpoint()
+        .await
+        .with_context(|| format!("flush overlaybd image for dev_id={dev_id}"))?;
+    Ok(DaemonResponse::Ok)
+}
+
+fn find_overlaybd_image(
+    devices: &DashMap<u32, ManagedDevice>,
+    pool_state: &Option<Arc<PoolState>>,
+    dev_id: u32,
+    operation: &str,
+) -> Result<(Arc<ImageFile>, PathBuf)> {
+    if let Some(device) = devices.get(&dev_id) {
+        return Ok((Arc::clone(&device.image), device.image_config.clone()));
+    }
+
+    let Some(pool) = pool_state else {
+        bail!("device {dev_id} not found for {operation}");
+    };
+    if let Some(active) = pool.active_exclusive.get(&dev_id) {
+        return Ok((Arc::clone(&active.image), active.image_config.clone()));
+    }
+    if let Some(shared_key) = pool.shared_by_dev_id.get(&dev_id) {
+        let key = shared_key.clone();
+        drop(shared_key);
+        let active = pool
+            .active_shared
+            .get(&key)
+            .with_context(|| format!("device {dev_id} not found for {operation}"))?;
+        return Ok((Arc::clone(&active.image), active.image_config.clone()));
+    }
+
+    bail!("device {dev_id} not found for {operation}")
+}
+
 // ── Pool handlers ───────────────────────────────────────────────────────────
 
 fn handle_get_features(pool_state: &Option<Arc<PoolState>>) -> Result<DaemonResponse> {
@@ -1504,7 +1542,8 @@ fn handle_get_features(pool_state: &Option<Arc<PoolState>>) -> Result<DaemonResp
     Ok(DaemonResponse::Features { flags })
 }
 
-async fn handle_acquire_overlaybd(
+#[allow(clippy::too_many_arguments)]
+async fn acquire_overlaybd(
     pool_state: &Option<Arc<PoolState>>,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     image_service_cache: &ImageServiceCache,
@@ -1512,26 +1551,20 @@ async fn handle_acquire_overlaybd(
     global_config: &Path,
     virtual_size: Option<u64>,
     access_mode: AccessMode,
-) -> Result<DaemonResponse> {
+    read_only_upper: bool,
+) -> Result<(u32, PathBuf)> {
     let pool = pool_state
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("warm pool not enabled"))?;
 
-    let image_lock = pool.image_lock(image_config);
-    let image = {
-        let _image_guard = image_lock.read().await;
-        let image_service = image_service_cache
-            .get_or_create(global_config)
-            .await
-            .context("resolve image service for acquire")?;
-
-        Arc::new(
-            image_service
-                .create_image_file(image_config)
-                .await
-                .with_context(|| format!("open overlaybd image: {}", image_config.display()))?,
-        )
-    };
+    let image = open_overlaybd_image(
+        image_service_cache,
+        image_config,
+        global_config,
+        read_only_upper,
+    )
+    .await
+    .with_context(|| format!("open overlaybd image: {}", image_config.display()))?;
     let actual_virtual_size = image.size_bytes();
     if let Some(virtual_size) = virtual_size {
         anyhow::ensure!(
@@ -1551,6 +1584,7 @@ async fn handle_acquire_overlaybd(
                 ctrl_ring,
                 image_config,
                 global_config,
+                read_only_upper,
                 image,
             )
             .await
@@ -1601,7 +1635,7 @@ async fn acquire_exclusive(
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     image_config: &Path,
     image: Arc<ImageFile>,
-) -> Result<DaemonResponse> {
+) -> Result<(u32, PathBuf)> {
     let (dev, is_reused) =
         prepare_overlaybd_device(&pool, &ctrl_ring, image_config, &image, "exclusive").await?;
 
@@ -1628,10 +1662,7 @@ async fn acquire_exclusive(
         },
     );
 
-    Ok(DaemonResponse::DeviceAcquired {
-        dev_id,
-        device_path,
-    })
+    Ok((dev_id, device_path))
 }
 
 async fn acquire_shared(
@@ -1639,9 +1670,14 @@ async fn acquire_shared(
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     image_config: &Path,
     global_config: &Path,
+    read_only_upper: bool,
     image: Arc<ImageFile>,
-) -> Result<DaemonResponse> {
-    let key = (image_config.to_path_buf(), global_config.to_path_buf());
+) -> Result<(u32, PathBuf)> {
+    let key = (
+        std::fs::canonicalize(image_config).unwrap_or_else(|_| image_config.to_path_buf()),
+        std::fs::canonicalize(global_config).unwrap_or_else(|_| global_config.to_path_buf()),
+        read_only_upper,
+    );
 
     // Check if already active.
     if let Some(mut entry) = pool.active_shared.get_mut(&key) {
@@ -1653,10 +1689,7 @@ async fn acquire_shared(
             refcount = entry.refcount,
             "reusing shared overlaybd device"
         );
-        return Ok(DaemonResponse::DeviceAcquired {
-            dev_id,
-            device_path,
-        });
+        return Ok((dev_id, device_path));
     }
 
     let (dev, is_reused) =
@@ -1692,10 +1725,7 @@ async fn acquire_shared(
                 refcount,
                 "concurrent shared overlaybd acquire reused existing device"
             );
-            return Ok(DaemonResponse::DeviceAcquired {
-                dev_id: existing_dev_id,
-                device_path: existing_path,
-            });
+            return Ok((existing_dev_id, existing_path));
         }
         Entry::Vacant(entry) => {
             pool.shared_by_dev_id.insert(dev_id, key);
@@ -1712,10 +1742,7 @@ async fn acquire_shared(
         schedule_idle_pool_refill(Arc::clone(&pool), ctrl_ring, refill_virtual_size);
     }
 
-    Ok(DaemonResponse::DeviceAcquired {
-        dev_id,
-        device_path,
-    })
+    Ok((dev_id, device_path))
 }
 
 async fn handle_release_overlaybd(
@@ -1729,7 +1756,9 @@ async fn handle_release_overlaybd(
 
     // Try exclusive first.
     if let Some((_, active)) = pool.active_exclusive.remove(&dev_id) {
-        return release_exclusive_device(pool, ctrl_ring, dev_id, active).await;
+        tracing::info!(dev_id, "releasing exclusive device");
+        idle_released_device(pool, ctrl_ring, dev_id, active.dev, active.image).await;
+        return Ok(DaemonResponse::Released);
     }
 
     // Try shared.
@@ -1754,34 +1783,14 @@ async fn handle_release_overlaybd(
         if remove_shared {
             pool.shared_by_dev_id.remove(&dev_id);
             if let Some((_, active)) = pool.active_shared.remove(&key) {
-                return release_shared_device(pool, ctrl_ring, dev_id, active).await;
+                tracing::info!(dev_id, "releasing shared device (refcount reached 0)");
+                idle_released_device(pool, ctrl_ring, dev_id, active.dev, active.image).await;
+                return Ok(DaemonResponse::Released);
             }
         }
     }
 
     bail!("device {dev_id} not found in active pool");
-}
-
-async fn release_exclusive_device(
-    pool: &Arc<PoolState>,
-    ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
-    dev_id: u32,
-    active: ActiveExclusive,
-) -> Result<DaemonResponse> {
-    tracing::info!(dev_id, "releasing exclusive device");
-    idle_released_device(pool, ctrl_ring, dev_id, active.dev, active.image).await;
-    Ok(DaemonResponse::Released)
-}
-
-async fn release_shared_device(
-    pool: &Arc<PoolState>,
-    ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
-    dev_id: u32,
-    active: ActiveShared,
-) -> Result<DaemonResponse> {
-    tracing::info!(dev_id, "releasing shared device (refcount reached 0)");
-    idle_released_device(pool, ctrl_ring, dev_id, active.dev, active.image).await;
-    Ok(DaemonResponse::Released)
 }
 
 /// Idle devices must bind daemon-owned placeholders, never business images.
@@ -2122,6 +2131,147 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[tokio::test]
+    async fn cancelled_image_lock_waiter_keeps_active_source_protected() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source.json");
+        std::fs::write(&source, b"{}").unwrap();
+        let alias = dir.path().join("alias.json");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let cache = ImageServiceCache::new(None);
+        let reader = cache.image_lock(&source);
+        let read_guard = reader.read().await;
+
+        let mut cancelled = Box::pin(async {
+            let lock = cache.image_lock(&alias);
+            let _guard = lock.write().await;
+        });
+        poll_fn(|cx| {
+            assert!(cancelled.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(cancelled);
+
+        let mut next = Box::pin(async {
+            let lock = cache.image_lock(&alias);
+            let _guard = lock.write().await;
+        });
+        poll_fn(|cx| {
+            assert!(next.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        drop(read_guard);
+        drop(reader);
+        next.as_mut().await;
+        drop(next);
+        assert!(cache.image_locks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn consume_waits_until_reuse_has_opened_the_source() {
+        use std::future::{poll_fn, Future};
+        use std::task::Poll;
+
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source.json");
+        let upper_data = dir.path().join("upper.data");
+        let upper_index = dir.path().join("upper.index");
+        prepare_runtime_upper(
+            &upper_data,
+            Some(&upper_index),
+            8192,
+            UpperMode::LogStructured,
+        )
+        .unwrap();
+        std::fs::write(
+            &source,
+            serde_json::to_vec(&serde_json::json!({
+                "upper": {"data": upper_data, "index": upper_index}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let source_alias = dir.path().join("source-alias.json");
+        std::os::unix::fs::symlink(&source, &source_alias).unwrap();
+        let cache = ImageServiceCache::new(None);
+        // Hold image opening at an actual await after Reuse has materialized
+        // its config, while Consume could otherwise move its data/index pair.
+        let _opening_blocker = cache.services.lock().await;
+        let (ctrl_ring, _worker) = storage_util::io_ring::spawn_io_ring_worker(0);
+        let devices = DashMap::new();
+        let runtime_dirs = [
+            dir.path().join("reuse"),
+            dir.path().join("reuse-alias"),
+            dir.path().join("consume"),
+        ];
+        let create = |index: usize| {
+            handle_create_overlaybd_runtime_device(
+                MaterializeOverlaybdRuntimeRequest {
+                    image_service_cache: &cache,
+                    source_image_config: if index == 0 { &source } else { &source_alias },
+                    global_config: &source,
+                    runtime_dir: runtime_dirs[index].as_path(),
+                    read_only: false,
+                    runtime_upper_mode: UpperMode::LogStructured,
+                    requested_virtual_size: None,
+                    known_source_virtual_size: Some(8192),
+                    resize_tool: None,
+                    resize_global_config: &source,
+                    resize_permit: Arc::new(Mutex::new(())),
+                    allow_shrink: false,
+                    source_state_strategy: if index < 2 {
+                        SourceStateStrategy::Reuse
+                    } else {
+                        SourceStateStrategy::Consume
+                    },
+                },
+                ctrl_ring.clone(),
+                &devices,
+                &None,
+            )
+        };
+        let mut reuse = std::pin::pin!(create(0));
+        poll_fn(|cx| {
+            assert!(reuse.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(runtime_dirs[0].join("image.json").is_file());
+        let mut reuse_alias = std::pin::pin!(create(1));
+        poll_fn(|cx| {
+            assert!(reuse_alias.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        assert!(
+            runtime_dirs[1].join("image.json").is_file(),
+            "Reuse requests should open concurrently"
+        );
+        let mut consume = std::pin::pin!(create(2));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut consume)
+                .await
+                .is_err()
+        );
+        assert!(
+            upper_data.is_file(),
+            "Consume moved data before Reuse opened it"
+        );
+        assert!(
+            upper_index.is_file(),
+            "Consume moved index before Reuse opened it"
+        );
+        assert!(
+            !runtime_dirs[2].exists(),
+            "Consume must wait before materialization"
+        );
+    }
+
     /// Minimal local `ImageService`; placeholder images have no lowers, so this
     /// is never used for registry access.
     async fn test_image_service(dir: &Path) -> ImageService {
@@ -2239,6 +2389,7 @@ mod tests {
     fn test_handoff() -> DaemonResponse {
         DaemonResponse::DeviceAcquired {
             dev_id: 7,
+            image_config_path: PathBuf::from("/tmp/image.json"),
             device_path: PathBuf::from("/dev/ublkb7"),
         }
     }

@@ -104,7 +104,7 @@ impl LSMTFile {
         let mut mutable_index = MutableIndex::new();
         let mut rw_index_append_offset = HEADER_SIZE;
 
-        if rw_layout == RwLayout::Sparse {
+        if rw_layout == RwLayout::Sparse && rw_index_file.is_none() {
             // Redundant with the `ensure_supported` above, and kept anyway: the
             // hazard is not "this layout is Sparse", it is "we are about to let
             // an extent map tell us which blocks this layer owns". Guarding the
@@ -215,20 +215,19 @@ impl LSMTFile {
         let header = rw_header(virtual_size, rw_layout, uuid, parent_uuid, user_tag);
         write_header_block(&rw_data_file, &header).await?;
 
-        match rw_layout {
-            RwLayout::Sparse => {
-                rw_data_file.truncate(virtual_size + HEADER_SIZE).await?;
-            }
-            RwLayout::LogStructured | RwLayout::HybridLogStructured => {
-                if let Some(ref idx_file) = rw_index_file {
-                    let mut idx_header = header;
-                    idx_header.set_index_file();
-                    idx_header.set_unsealed_index_offset();
-                    write_header_block(idx_file, &idx_header).await?;
-                } else {
-                    bail!("missing index file for non-sparse LSMT create");
-                }
-            }
+        if rw_layout == RwLayout::Sparse {
+            rw_data_file.truncate(virtual_size + HEADER_SIZE).await?;
+        } else {
+            ensure!(
+                rw_index_file.is_some(),
+                "missing index file for non-sparse LSMT create"
+            );
+        }
+        if let Some(ref idx_file) = rw_index_file {
+            let mut idx_header = header;
+            idx_header.set_index_file();
+            idx_header.set_unsealed_index_offset();
+            write_header_block(idx_file, &idx_header).await?;
         }
 
         let mutable_index = MutableIndex::new();
@@ -531,7 +530,7 @@ impl LSMTFile {
         compact_to(&self.layers, &mappings, virtual_size, args).await
     }
 
-    async fn flush_group_commit(&self) -> Result<()> {
+    pub(crate) async fn flush_group_commit(&self) -> Result<()> {
         let idx = self.index.write().await;
         let mut buf = self.group_commit_buf.lock().await;
         if buf.is_empty() {
@@ -543,6 +542,47 @@ impl LSMTFile {
         }
         self.append_index_bytes(&idx, &DirectWrite, &bytes).await?;
         buf.clear();
+        Ok(())
+    }
+
+    /// Bound replay work for a quiesced Temporal upper without syncing or copying data.
+    pub async fn flush_for_checkpoint(&self) -> Result<()> {
+        self.flush_group_commit().await?;
+        if self.rw_index_file.is_none() {
+            return Ok(());
+        }
+        let index = self.index.write().await;
+        let records = (self.rw_index_append_offset.load(Ordering::Acquire) - HEADER_SIZE)
+            / size_of::<DiskSegmentMapping>() as u64;
+        // Leave small journals and ordinary hybrid overwrites alone.
+        if records >= 4096 && records > 4 * index.upper_len() as u64 {
+            self.rewrite_upper_index(&index).await?;
+        }
+        Ok(())
+    }
+
+    async fn rewrite_upper_index(&self, index: &RwLockWriteGuard<'_, ComboIndex>) -> Result<()> {
+        let file = self
+            .rw_index_file
+            .as_ref()
+            .context("upper has no index file")?;
+        let mut bytes = Vec::with_capacity(index.upper_len() * size_of::<DiskSegmentMapping>());
+        for mut mapping in index.upper.dump() {
+            mapping.tag = 0;
+            bytes.extend_from_slice(DiskSegmentMapping::from_memory(&mapping).as_bytes());
+        }
+        let mut written = 0;
+        while written < bytes.len() {
+            let n = file
+                .write_at(HEADER_SIZE + written as u64, &bytes[written..])
+                .await?;
+            ensure!(n != 0, "checkpoint index write made no progress");
+            written += n;
+        }
+        let end = HEADER_SIZE + bytes.len() as u64;
+        file.truncate(end).await?;
+        self.rw_index_append_offset.store(end, Ordering::Release);
+        self.group_commit_buf.lock().await.clear();
         Ok(())
     }
 
@@ -752,7 +792,7 @@ impl LSMTFile {
             let mut idx = self.index.write().await;
             idx.insert(m_mem);
 
-            if self.file_type != LSMTFileType::SparseReadWrite {
+            if self.rw_index_file.is_some() {
                 let mut m_disk = m_mem;
                 m_disk.tag = 0;
                 let disk_m = DiskSegmentMapping::from_memory(&m_disk);
@@ -936,7 +976,7 @@ impl LSMTFile {
             m_disk.tag = 0;
 
             idx.insert(m_mem);
-            if self.file_type != LSMTFileType::SparseReadWrite {
+            if self.rw_index_file.is_some() {
                 let disk_m = DiskSegmentMapping::from_memory(&m_disk);
                 self.append_index_mapping_generic(&idx, writer, disk_m)
                     .await?;

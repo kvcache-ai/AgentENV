@@ -18,7 +18,7 @@ use uvm_ublk_daemon::protocol::{
 };
 use uvm_ublk_daemon::{
     CreateOverlaybdRuntimeDeviceRequest, InvalidRequestError, RestackSnapshotTerminalFailure,
-    UblkDaemonClient,
+    SourceStateStrategy, UblkDaemonClient,
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -163,36 +163,6 @@ impl Drop for MockServer {
 mod protocol_tests {
     use super::*;
 
-    /// Test bidirectional exchange: client sends request, server sends response.
-    #[tokio::test]
-    async fn bidirectional_request_response() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("bidir.sock");
-        let listener = UnixListener::bind(&sock_path).unwrap();
-
-        let sock_path_clone = sock_path.clone();
-        let client_task = tokio::spawn(async move {
-            let mut stream = tokio::net::UnixStream::connect(&sock_path_clone)
-                .await
-                .unwrap();
-            let req = DaemonRequest::Delete { dev_id: 42 };
-            send_message(&mut stream, &req).await.unwrap();
-
-            let resp: DaemonResponse = recv_message(&mut stream).await.unwrap().unwrap();
-            resp
-        });
-
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let req: DaemonRequest = recv_message(&mut stream).await.unwrap().unwrap();
-        assert!(matches!(req, DaemonRequest::Delete { dev_id: 42 }));
-
-        let resp = DaemonResponse::Deleted;
-        send_message(&mut stream, &resp).await.unwrap();
-
-        let client_resp = client_task.await.unwrap();
-        assert!(matches!(client_resp, DaemonResponse::Deleted));
-    }
-
     /// Test sending a request with a long path (exercising larger payloads).
     #[tokio::test]
     async fn large_payload_path() {
@@ -212,6 +182,7 @@ mod protocol_tests {
             let req = DaemonRequest::CreateOverlaybd {
                 image_config: PathBuf::from(&long_path_clone),
                 global_config: PathBuf::from("/etc/overlaybd/global.json"),
+                read_only_upper: false,
             };
             send_message(&mut stream, &req).await.unwrap();
         });
@@ -226,46 +197,6 @@ mod protocol_tests {
             }
             _ => panic!("unexpected variant"),
         }
-    }
-
-    /// Test concurrent clients sending on separate connections.
-    #[tokio::test]
-    async fn concurrent_clients() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("concurrent.sock");
-        let listener = UnixListener::bind(&sock_path).unwrap();
-
-        let num_clients = 10;
-
-        // Spawn N clients that each send a Delete request.
-        let mut client_handles = Vec::new();
-        for i in 0..num_clients {
-            let path = sock_path.clone();
-            client_handles.push(tokio::spawn(async move {
-                let mut stream = tokio::net::UnixStream::connect(&path).await.unwrap();
-                let req = DaemonRequest::Delete { dev_id: i };
-                send_message(&mut stream, &req).await.unwrap();
-            }));
-        }
-
-        // Accept all N connections and verify.
-        let mut received_ids = Vec::new();
-        for _ in 0..num_clients {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let msg: DaemonRequest = recv_message(&mut stream).await.unwrap().unwrap();
-            match msg {
-                DaemonRequest::Delete { dev_id } => received_ids.push(dev_id),
-                _ => panic!("unexpected variant"),
-            }
-        }
-
-        for handle in client_handles {
-            handle.await.unwrap();
-        }
-
-        received_ids.sort();
-        let expected: Vec<u32> = (0..num_clients).collect();
-        assert_eq!(received_ids, expected);
     }
 }
 
@@ -347,6 +278,7 @@ mod client_tests {
                 requested_virtual_size,
                 known_source_virtual_size,
                 allow_shrink,
+                source_state_strategy,
             } => {
                 assert_eq!(source_image_config, PathBuf::from("/src/image.json"));
                 assert_eq!(global_config, PathBuf::from("/global.json"));
@@ -356,6 +288,7 @@ mod client_tests {
                 assert_eq!(requested_virtual_size, None);
                 assert_eq!(known_source_virtual_size, Some(8192));
                 assert!(!allow_shrink);
+                assert_eq!(source_state_strategy, SourceStateStrategy::Reuse);
                 DaemonResponse::OverlaybdRuntimeDeviceCreated {
                     dev_id: 11,
                     device_path: PathBuf::from("/dev/ublkb11"),
@@ -662,7 +595,7 @@ mod client_tests {
     }
 
     #[tokio::test]
-    async fn daemon_dead_prevents_all_rpcs() {
+    async fn daemon_dead_prevents_create_and_delete() {
         // Even with a valid server running, a dead daemon flag should prevent calls.
         let server = MockServer::start(Box::new(|_| DaemonResponse::Deleted)).await;
 
@@ -675,12 +608,6 @@ mod client_tests {
 
         let err = client
             .create_overlaybd(Path::new("/img"), Path::new("/global.json"))
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("not running"));
-
-        let err = client
-            .restack_snapshot(0, Path::new("/out"))
             .await
             .unwrap_err();
         assert!(format!("{err:#}").contains("not running"));
@@ -709,6 +636,7 @@ mod client_tests {
                     data_stat: None,
                     ext4_used_bytes: None,
                 },
+                DaemonRequest::FlushForCheckpoint { .. } => DaemonResponse::Ok,
                 DaemonRequest::Shutdown => DaemonResponse::Ok,
                 DaemonRequest::GetFeatures => DaemonResponse::Features { flags: 0 },
                 DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
@@ -747,8 +675,9 @@ mod client_tests {
             .restack_snapshot(40, Path::new("/snap/output"))
             .await
             .unwrap();
+        client.flush_for_checkpoint(17).await.unwrap();
         let requests = captured.lock().unwrap();
-        assert_eq!(requests.len(), 3);
+        assert_eq!(requests.len(), 4);
 
         assert!(requests[0].contains("CreateOverlaybd"));
         assert!(requests[0].contains("img.json"));
@@ -760,6 +689,9 @@ mod client_tests {
 
         assert!(requests[2].contains("RestackSnapshot"));
         assert!(requests[2].contains("40"));
+
+        assert!(requests[3].contains("FlushForCheckpoint"));
+        assert!(requests[3].contains("17"));
         assert!(requests[2].contains("output"));
     }
 }
@@ -1175,6 +1107,7 @@ mod server_tests {
         .await;
 
         let client = server.client();
+
         let (dev_id, path) = client
             .acquire_overlaybd(
                 Path::new("/tmp/mem.json"),

@@ -10,7 +10,7 @@ use warm_pool::PoolConfig;
 
 use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
-    RestackSnapshotStats,
+    RestackSnapshotStats, SourceStateStrategy,
 };
 use overlaybd::config::UpperMode;
 
@@ -352,9 +352,20 @@ impl UblkDaemonClient {
         image_config: &Path,
         global_config: &Path,
     ) -> Result<(u32, PathBuf)> {
+        self.create_overlaybd_with_upper_access(image_config, global_config, false)
+            .await
+    }
+
+    pub async fn create_overlaybd_with_upper_access(
+        &self,
+        image_config: &Path,
+        global_config: &Path,
+        read_only_upper: bool,
+    ) -> Result<(u32, PathBuf)> {
         let request = DaemonRequest::CreateOverlaybd {
             image_config: image_config.to_path_buf(),
             global_config: global_config.to_path_buf(),
+            read_only_upper,
         };
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::DeviceCreated {
@@ -485,12 +496,23 @@ impl UblkDaemonClient {
     }
 
     /// Create an OverlayBD runtime config and acquire a ublk device for it.
-    ///
-    /// This is the sandbox rootfs/extra-drive path. The daemon owns runtime
-    /// materialization and returns the generated runtime image config path.
     pub async fn create_overlaybd_runtime_device(
         &self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,
+    ) -> Result<OverlaybdRuntimeDevice> {
+        self.create_overlaybd_runtime_device_with_source_state_strategy(
+            request,
+            SourceStateStrategy::Reuse,
+        )
+        .await
+    }
+
+    /// Create an OverlayBD runtime while optionally consuming source-owned
+    /// state into the new runtime directory before opening the device.
+    pub async fn create_overlaybd_runtime_device_with_source_state_strategy(
+        &self,
+        request: CreateOverlaybdRuntimeDeviceRequest<'_>,
+        source_state_strategy: SourceStateStrategy,
     ) -> Result<OverlaybdRuntimeDevice> {
         let request = DaemonRequest::CreateOverlaybdRuntimeDevice {
             source_image_config: request.source_image_config.to_path_buf(),
@@ -501,6 +523,7 @@ impl UblkDaemonClient {
             requested_virtual_size: request.requested_virtual_size,
             known_source_virtual_size: request.known_source_virtual_size,
             allow_shrink: request.allow_shrink,
+            source_state_strategy,
         };
         match self
             .call(request, self.inner.runtime_device_timeout)
@@ -590,6 +613,21 @@ impl UblkDaemonClient {
         }
     }
 
+    /// Flush a live image after its owning VM has stopped issuing I/O.
+    pub async fn flush_for_checkpoint(&self, dev_id: u32) -> Result<()> {
+        let request = DaemonRequest::FlushForCheckpoint { dev_id };
+        match self.call(request, SNAPSHOT_TIMEOUT).await? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::TerminalError { message } => {
+                bail!("daemon: checkpoint flush dev_id={dev_id} failed terminally: {message}")
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: checkpoint flush dev_id={dev_id} failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for checkpoint flush: {other:?}"),
+        }
+    }
+
     /// Request graceful daemon shutdown.
     ///
     /// Signals the watchdog that this is an expected exit so it does not
@@ -633,11 +671,30 @@ impl UblkDaemonClient {
         virtual_size: Option<u64>,
         access_mode: AccessMode,
     ) -> Result<(u32, PathBuf)> {
+        self.acquire_overlaybd_with_upper_access(
+            image_config,
+            global_config,
+            virtual_size,
+            access_mode,
+            false,
+        )
+        .await
+    }
+
+    pub async fn acquire_overlaybd_with_upper_access(
+        &self,
+        image_config: &Path,
+        global_config: &Path,
+        virtual_size: Option<u64>,
+        access_mode: AccessMode,
+        read_only_upper: bool,
+    ) -> Result<(u32, PathBuf)> {
         let request = DaemonRequest::AcquireOverlaybd {
             image_config: image_config.to_path_buf(),
             global_config: global_config.to_path_buf(),
             virtual_size,
             access_mode,
+            read_only_upper,
         };
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::DeviceAcquired {

@@ -1,6 +1,6 @@
 use anyhow::{ensure, Context, Result};
+use ring::digest::{Context as Sha256Context, SHA256};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::mem::size_of;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -193,9 +193,8 @@ pub struct LayerDescriptor {
     pub size: u64,
 }
 
-#[derive(Debug)]
 pub(super) struct AppendDigestTracker {
-    hasher: Sha256,
+    hasher: Sha256Context,
     pub(super) offset: u64,
 }
 
@@ -207,7 +206,7 @@ impl AppendDigestTracker {
             read == HEADER_SIZE as usize,
             "short read while initializing append digest tracker: expected {HEADER_SIZE}, got {read}"
         );
-        let mut hasher = Sha256::new();
+        let mut hasher = Sha256Context::new(&SHA256);
         hasher.update(&raw);
         Ok(Self {
             hasher,
@@ -234,7 +233,7 @@ impl AppendDigestTracker {
 
     pub(super) fn descriptor(&self) -> LayerDescriptor {
         LayerDescriptor {
-            digest: format!("sha256:{:x}", self.hasher.clone().finalize()),
+            digest: format!("sha256:{}", hex::encode(self.hasher.clone().finish())),
             size: self.offset,
         }
     }
