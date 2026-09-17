@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 use tracing::debug;
 
-use super::artifact_cache::{CacheArtifactLease, CacheHandle, LocalArtifactCache};
+use super::artifact_cache::{CacheHandle, LocalArtifactCache};
 use super::p2p;
 use super::runtime_support::{
     hydrate_runtime_manifest, load_firecracker_manifest_from_path, materialize_image_config_error,
@@ -148,8 +148,7 @@ impl SnapshotRuntimeResolver for RepositoryRuntimeResolver {
         // Runtime artifacts are protected by the sandbox start-window lease (over
         // local-only commits) + the orchestrator running set; the resolved-handle
         // needs no separate local image ref pin.
-        let cache_lease: Arc<dyn RuntimeArtifactLease> =
-            Arc::new(CacheArtifactLease { _handles: handles });
+        let cache_lease: Arc<RuntimeArtifactLease> = Arc::new(handles);
         debug!(snapshot_id = %id, "resolved snapshot to local runnable paths");
         Ok(RunnableSnapshot::new(
             (*snapshot).clone(),

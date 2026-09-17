@@ -3,9 +3,6 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-#[cfg(test)]
-use std::sync::OnceLock;
-
 use serde::{Deserialize, Serialize};
 
 use crate::types::CustomExtensionParams;
@@ -508,36 +505,25 @@ pub(crate) fn rootfs_snapshot_image_tag(snapshot_id: &SnapshotId) -> String {
     format!("{SNAPSHOT_IMAGE_TAG_PREFIX}{snapshot_id}")
 }
 
-pub(crate) trait RuntimeArtifactLease: Send + Sync {}
-
-#[derive(Clone, Default)]
-#[cfg(test)]
-struct EmptyRuntimeArtifactLease;
-
-#[cfg(test)]
-impl RuntimeArtifactLease for EmptyRuntimeArtifactLease {}
-
-#[cfg(test)]
-fn default_runtime_artifact_lease() -> Arc<dyn RuntimeArtifactLease> {
-    static INSTANCE: OnceLock<Arc<dyn RuntimeArtifactLease>> = OnceLock::new();
-    INSTANCE
-        .get_or_init(|| Arc::new(EmptyRuntimeArtifactLease))
-        .clone()
-}
+pub(crate) type RuntimeArtifactLease = dyn Send + Sync;
 
 #[derive(Clone)]
 /// Runtime-ready snapshot with node-local artifact paths.
 pub struct RunnableSnapshot {
     record: SnapshotRecord,
     manifest: SandboxSnapshotManifest,
-    _lease: Arc<dyn RuntimeArtifactLease>,
+    _lease: Arc<RuntimeArtifactLease>,
 }
 
 impl RunnableSnapshot {
+    pub(crate) fn lease(&self) -> Arc<RuntimeArtifactLease> {
+        Arc::clone(&self._lease)
+    }
+
     pub(crate) fn new(
         record: SnapshotRecord,
         manifest: SandboxSnapshotManifest,
-        lease: Arc<dyn RuntimeArtifactLease>,
+        lease: Arc<RuntimeArtifactLease>,
     ) -> Self {
         Self {
             record,
@@ -609,7 +595,7 @@ impl RunnableSnapshot {
         Self {
             record,
             manifest: SandboxSnapshotManifest::for_test(0, &extra_drives),
-            _lease: default_runtime_artifact_lease(),
+            _lease: Arc::new(()),
         }
     }
 
