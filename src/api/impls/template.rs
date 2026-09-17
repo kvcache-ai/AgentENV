@@ -787,9 +787,12 @@ impl Templates<()> for ApiImpl {
                     ));
                 }
                 Err(err) => {
-                    return Ok(TemplatesTemplateIdDeleteResponse::Status500_ServerError(
-                        Self::snapshot_manager_error(&err),
-                    ))
+                    let error = Self::reusable_snapshot_manager_error(&err);
+                    return Ok(if error.code == 503 {
+                        TemplatesTemplateIdDeleteResponse::Status503_ServiceUnavailable(error)
+                    } else {
+                        TemplatesTemplateIdDeleteResponse::Status500_ServerError(error)
+                    });
                 }
                 Ok(Some(record)) => record,
                 // An imageOnly build has a build record instead of a template.
@@ -811,9 +814,14 @@ impl Templates<()> for ApiImpl {
                 self.build_logs.remove(&deleted_id);
                 Ok(TemplatesTemplateIdDeleteResponse::Status204_TheTemplateWasDeletedSuccessfully)
             }
-            Err(err) => Ok(TemplatesTemplateIdDeleteResponse::Status500_ServerError(
-                Self::snapshot_manager_error(&err),
-            )),
+            Err(err) => {
+                let error = Self::reusable_snapshot_manager_error(&err);
+                Ok(if error.code == 503 {
+                    TemplatesTemplateIdDeleteResponse::Status503_ServiceUnavailable(error)
+                } else {
+                    TemplatesTemplateIdDeleteResponse::Status500_ServerError(error)
+                })
+            }
         }
     }
 

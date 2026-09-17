@@ -10,6 +10,23 @@ same point instead of rebuilding the environment and rerunning setup work.
 - **Running sandboxes** can produce new snapshots, capturing their current
   state for later reuse or branching.
 
+## Temporal and Local State
+
+Temporal pause preserves a single-use continuation for resume on its node.
+It drains in-flight disk I/O and flushes buffered indexes so the state can be
+reopened, without fsyncing the disk upper files in that checkpoint step. The
+latest paused state is not guaranteed to survive host power loss or a kernel crash.
+
+Local snapshots keep immutable state independently of the source sandbox for
+later publication. They remain available only while the publishing owner process
+retains them. Creation succeeds after their files are ready and shared catalog
+metadata is committed. They are not recovered into a new process after a restart.
+
+Promotion publishes the same snapshot ID through the Distributed repository
+before releasing the Local store's reference. Existing readers retain their
+artifact leases. Deletion removes the shared record and the store's reference;
+physical files are reclaimed after the last lease is released.
+
 ## What a Snapshot Preserves
 
 A snapshot preserves:

@@ -8,6 +8,7 @@ use http::Method;
 use agentenv_http_server::apis::snapshots::*;
 use agentenv_http_server::models;
 
+use crate::repository::RepositoryError;
 use crate::snapshot::{SnapshotId, SnapshotRecord, SnapshotSource};
 
 use super::pagination::PaginationCursor;
@@ -35,6 +36,12 @@ impl From<SnapshotRecord> for models::SnapshotInfo {
                 record.updated_at_unix_ms,
             )),
             image_ref,
+            snapshot_type: Some(match record.snapshot_type {
+                crate::snapshot::SnapshotPlacement::Local => models::SnapshotType::Local,
+                crate::snapshot::SnapshotPlacement::Distributed => {
+                    models::SnapshotType::Distributed
+                }
+            }),
         }
     }
 }
@@ -88,9 +95,12 @@ impl Snapshots<()> for ApiImpl {
         {
             Ok(summaries) => summaries,
             Err(err) => {
-                return Ok(SnapshotsGetResponse::Status500_ServerError(
-                    Self::snapshot_manager_error(&err),
-                ));
+                let error = Self::reusable_snapshot_manager_error(&err);
+                return Ok(if error.code == 503 {
+                    SnapshotsGetResponse::Status503_ServiceUnavailable(error)
+                } else {
+                    SnapshotsGetResponse::Status500_ServerError(error)
+                });
             }
         };
 
@@ -147,9 +157,12 @@ impl Snapshots<()> for ApiImpl {
                 ))
             }
             Err(err) => {
-                return Ok(SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(
-                    Self::snapshot_manager_error(&err),
-                ))
+                let error = Self::reusable_snapshot_manager_error(&err);
+                return Ok(if error.code == 503 {
+                    SnapshotsSnapshotIdDeleteResponse::Status503_ServiceUnavailable(error)
+                } else {
+                    SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(error)
+                });
             }
         };
 
@@ -157,9 +170,14 @@ impl Snapshots<()> for ApiImpl {
             Ok(()) => {
                 Ok(SnapshotsSnapshotIdDeleteResponse::Status204_TheSnapshotWasDeletedSuccessfully)
             }
-            Err(err) => Ok(SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(
-                Self::snapshot_manager_error(&err),
-            )),
+            Err(err) => {
+                let error = Self::reusable_snapshot_manager_error(&err);
+                Ok(if error.code == 503 {
+                    SnapshotsSnapshotIdDeleteResponse::Status503_ServiceUnavailable(error)
+                } else {
+                    SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(error)
+                })
+            }
         }
     }
 
@@ -187,9 +205,55 @@ impl Snapshots<()> for ApiImpl {
                     format!("snapshot '{}' not found", path_params.snapshot_id),
                 ),
             )),
-            Err(err) => Ok(SnapshotsSnapshotIdGetResponse::Status500_ServerError(
-                Self::snapshot_manager_error(&err),
+            Err(err) => {
+                let error = Self::reusable_snapshot_manager_error(&err);
+                Ok(match error.code {
+                    400 => SnapshotsSnapshotIdGetResponse::Status400_BadRequest(error),
+                    503 => SnapshotsSnapshotIdGetResponse::Status503_ServiceUnavailable(error),
+                    _ => SnapshotsSnapshotIdGetResponse::Status500_ServerError(error),
+                })
+            }
+        }
+    }
+
+    async fn snapshots_snapshot_id_promote_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SnapshotsSnapshotIdPromotePostPathParams,
+    ) -> Result<SnapshotsSnapshotIdPromotePostResponse, ()> {
+        match self
+            .snapshot_manager
+            .promote(&path_params.snapshot_id)
+            .await
+        {
+            Ok(Some(record)) => Ok(
+                SnapshotsSnapshotIdPromotePostResponse::Status200_SnapshotIsAvailableAsDistributed(
+                    models::SnapshotInfo::from(record),
+                ),
+            ),
+            Ok(None) => Ok(SnapshotsSnapshotIdPromotePostResponse::Status404_NotFound(
+                Self::error(
+                    404,
+                    format!("snapshot '{}' not found", path_params.snapshot_id),
+                ),
             )),
+            Err(error) => {
+                let error = match error {
+                    RepositoryError::InvalidRequest { .. } => Self::error(409, error.to_string()),
+                    _ => Self::reusable_snapshot_error(&error),
+                };
+                Ok(match error.code {
+                    404 => SnapshotsSnapshotIdPromotePostResponse::Status404_NotFound(error),
+                    409 => SnapshotsSnapshotIdPromotePostResponse::Status409_Conflict(error),
+                    503 => {
+                        SnapshotsSnapshotIdPromotePostResponse::Status503_ServiceUnavailable(error)
+                    }
+                    _ => SnapshotsSnapshotIdPromotePostResponse::Status500_ServerError(error),
+                })
+            }
         }
     }
 }
