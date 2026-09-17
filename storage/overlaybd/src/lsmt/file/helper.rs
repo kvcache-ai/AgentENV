@@ -18,7 +18,9 @@ use zerocopy::{FromBytes, IntoBytes};
 
 use crate::io::virtual_file::VirtualFile;
 use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer, NO_PHYSICAL_OFFSET};
-use crate::lsmt::index::{compress_raw_index, ReadOnlyIndex, Segment, SegmentMapping};
+use crate::lsmt::index::{
+    compress_raw_index, MutableIndex, ReadOnlyIndex, Segment, SegmentMapping,
+};
 use storage_util::{AlignedBuffer, CompactWriter};
 
 /// Validate the headers and physical layout of an unsealed RW layer pair.
@@ -87,10 +89,6 @@ pub fn validate_rw_header_pair_paths(
     match expected_layout {
         RwLayout::Sparse => {
             ensure!(
-                index_path.is_none(),
-                "sparse RW layer must not have an index file"
-            );
-            ensure!(
                 data_size == HEADER_SIZE + expected_virtual_size,
                 "sparse RW data size mismatch: expected {}, got {}",
                 HEADER_SIZE + expected_virtual_size,
@@ -98,37 +96,41 @@ pub fn validate_rw_header_pair_paths(
             );
         }
         RwLayout::LogStructured | RwLayout::HybridLogStructured => {
-            let index_path =
-                index_path.context("log-structured RW layer requires an index file")?;
-            let (index_header, index_size) = read_header(index_path, expected_virtual_size)?;
             ensure!(
-                !index_header.is_data_file(),
-                "RW index header has data-file type: {}",
-                index_path.display()
-            );
-            let data_uuid = data_header.uuid;
-            let index_uuid = index_header.uuid;
-            ensure!(index_uuid == data_uuid, "RW data/index UUID mismatch");
-            ensure!(
-                index_header.index_offset.get() == HEADER_SIZE,
-                "RW index header has invalid unsealed index offset: {}",
-                index_header.index_offset.get()
-            );
-            ensure!(
-                index_header.is_hybrid_rw() == data_header.is_hybrid_rw(),
-                "RW data/index hybrid flag mismatch"
-            );
-            ensure!(
-                data_size.is_multiple_of(ALIGNMENT),
-                "RW data file size is not {ALIGNMENT}-byte aligned: {data_size}"
-            );
-            ensure!(
-                index_size >= HEADER_SIZE
-                    && (index_size - HEADER_SIZE)
-                        .is_multiple_of(size_of::<DiskSegmentMapping>() as u64),
-                "RW index mapping area is misaligned: {index_size}"
+                index_path.is_some(),
+                "log-structured RW layer requires an index file"
             );
         }
+    }
+    if let Some(index_path) = index_path {
+        let (index_header, index_size) = read_header(index_path, expected_virtual_size)?;
+        ensure!(
+            !index_header.is_data_file(),
+            "RW index header has data-file type: {}",
+            index_path.display()
+        );
+        let data_uuid = data_header.uuid;
+        let index_uuid = index_header.uuid;
+        ensure!(index_uuid == data_uuid, "RW data/index UUID mismatch");
+        ensure!(
+            index_header.index_offset.get() == HEADER_SIZE,
+            "RW index header has invalid unsealed index offset: {}",
+            index_header.index_offset.get()
+        );
+        ensure!(
+            index_header.is_hybrid_rw() == data_header.is_hybrid_rw(),
+            "RW data/index hybrid flag mismatch"
+        );
+        ensure!(
+            data_size.is_multiple_of(ALIGNMENT),
+            "RW data file size is not {ALIGNMENT}-byte aligned: {data_size}"
+        );
+        ensure!(
+            index_size >= HEADER_SIZE
+                && (index_size - HEADER_SIZE)
+                    .is_multiple_of(size_of::<DiskSegmentMapping>() as u64),
+            "RW index mapping area is misaligned: {index_size}"
+        );
     }
     Ok(())
 }
@@ -830,29 +832,73 @@ pub(crate) fn initialize_file_rw_paths(
     write_header_block_sync(&data_file, &header)
         .with_context(|| format!("initialize overlaybd upper data {}", data_path.display()))?;
 
-    match rw_layout {
-        RwLayout::Sparse => {
-            let sparse_size = virtual_size
-                .checked_add(HEADER_SIZE)
-                .context("sparse overlaybd upper size overflow")?;
-            data_file.set_len(sparse_size).with_context(|| {
-                format!("truncate sparse overlaybd upper {}", data_path.display())
-            })?;
-            Ok(())
+    if rw_layout == RwLayout::Sparse {
+        let sparse_size = virtual_size
+            .checked_add(HEADER_SIZE)
+            .context("sparse overlaybd upper size overflow")?;
+        data_file.set_len(sparse_size)?;
+    } else {
+        ensure!(
+            index_path.is_some(),
+            "log-structured overlaybd upper requires an index path during initialization"
+        );
+    }
+    if let Some(index_path) = index_path {
+        let index_file = open_truncated_rw_file(index_path)?;
+        let mut index_header = header;
+        index_header.set_index_file();
+        index_header.set_unsealed_index_offset();
+        write_header_block_sync(&index_file, &index_header).with_context(|| {
+            format!("initialize overlaybd upper index {}", index_path.display())
+        })?;
+    }
+    Ok(())
+}
+
+/// Record externally-written sparse ranges after the owning VM has stopped writing.
+/// Small indexes use buffered local I/O; large mapping merges run off the async workers.
+pub async fn checkpoint_sparse_index(path: &Path, ranges: Vec<Segment>) -> Result<()> {
+    let file = OpenOptions::new().read(true).write(true).open(path)?;
+    let size = file.metadata()?.len();
+    let stride = size_of::<DiskSegmentMapping>();
+    ensure!(
+        size >= HEADER_SIZE && (size - HEADER_SIZE).is_multiple_of(stride as u64),
+        "invalid sparse index size"
+    );
+    let inline = size <= 64 * 1024 && ranges.len() <= 4096;
+    let checkpoint = move || {
+        let mut raw = vec![0u8; (size - HEADER_SIZE) as usize];
+        file.read_exact_at(&mut raw, HEADER_SIZE)?;
+        let mut index = MutableIndex::new();
+        for bytes in raw.chunks_exact(stride) {
+            let mapping = DiskSegmentMapping::read_from_bytes(bytes)
+                .map_err(|_| anyhow!("invalid sparse index mapping"))?
+                .to_memory();
+            index.insert(mapping);
         }
-        RwLayout::LogStructured | RwLayout::HybridLogStructured => {
-            let index_path = index_path.context(
-                "log-structured overlaybd upper requires an index path during initialization",
-            )?;
-            let index_file = open_truncated_rw_file(index_path)?;
-            let mut index_header = header;
-            index_header.set_index_file();
-            index_header.set_unsealed_index_offset();
-            write_header_block_sync(&index_file, &index_header).with_context(|| {
-                format!("initialize overlaybd upper index {}", index_path.display())
-            })?;
-            Ok(())
+        for range in ranges {
+            index.insert(SegmentMapping::new(
+                range.offset,
+                range.length,
+                range.offset + HEADER_SIZE / ALIGNMENT,
+                false,
+                0,
+            ));
         }
+        raw.clear();
+        for mapping in index.dump() {
+            raw.extend_from_slice(DiskSegmentMapping::from_memory(&mapping).as_bytes());
+        }
+        write_all_at(&file, HEADER_SIZE, &raw)?;
+        file.set_len(HEADER_SIZE + raw.len() as u64)?;
+        Ok(())
+    };
+    if inline {
+        checkpoint()
+    } else {
+        tokio::task::spawn_blocking(checkpoint)
+            .await
+            .context("join sparse index checkpoint")?
     }
 }
 

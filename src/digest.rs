@@ -122,4 +122,28 @@ mod tests {
             FileDigest::describe_blocking(temp.path()).expect("describe_blocking");
         assert_eq!(described_blocking, described);
     }
+    #[tokio::test]
+    async fn content_identity_matches_sha256_across_read_boundaries() {
+        use sha2::{Digest, Sha256};
+        let data = (0..2 * DIGEST_BUFFER_SIZE + 17)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let expected = format!("{:x}", Sha256::digest(&data));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::write(file.path(), &data).unwrap();
+        assert_eq!(sha256_hex(&data), expected);
+        assert_eq!(hex::encode(sha256_bytes(&data)), expected);
+        let described = FileDigest::describe(file.path()).await.unwrap();
+        assert_eq!(described.sha256, format!("sha256:{expected}"));
+        assert_eq!(described.size, data.len() as u64);
+        assert_eq!(
+            described,
+            FileDigest::describe_blocking(file.path()).unwrap()
+        );
+        let mut copied = Vec::new();
+        let (digest, size) = copy_with_sha256_hex(data.as_slice(), &mut copied).unwrap();
+        assert_eq!(digest, expected);
+        assert_eq!(size, data.len() as u64);
+        assert_eq!(copied, data);
+    }
 }

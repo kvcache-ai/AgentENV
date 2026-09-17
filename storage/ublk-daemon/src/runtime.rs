@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use overlaybd::config::{load_image_config, validate_upper_config, UpperConfig, UpperMode};
+use overlaybd::config::{
+    load_image_config, resolve_image_config_local_paths, validate_image_config,
+    validate_upper_config, ImageConfig, UpperConfig, UpperMode,
+};
 use overlaybd::helper::{
     prepare_runtime_upper, relative_path, resolve_config_path, rewrite_overlaybd_lower_paths,
 };
@@ -17,7 +20,7 @@ use overlaybd::virtual_file::VirtualFile;
 use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 
-use crate::protocol::ResizeToolSpec;
+use crate::protocol::{ResizeToolSpec, SourceStateStrategy};
 use crate::server::ImageServiceCache;
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -26,6 +29,7 @@ const RESIZE_OUTPUT_TRUNCATED_MARKER: &[u8] = b" ... (truncated)";
 const RUNTIME_IMAGE_CONFIG_FILE: &str = "image.json";
 const RUNTIME_UPPER_DATA_FILE: &str = "upper.data";
 const RUNTIME_UPPER_INDEX_FILE: &str = "upper.index";
+const RUNTIME_SOURCE_LOWERS_DIR: &str = "source-lowers";
 const RUNTIME_RESULT_FILE: &str = "result.txt";
 
 #[derive(Debug)]
@@ -39,33 +43,14 @@ impl std::fmt::Display for InvalidRequest {
 
 impl std::error::Error for InvalidRequest {}
 
-#[derive(Debug)]
-struct ClaimedRuntimeDir {
-    path: PathBuf,
-}
-
-impl ClaimedRuntimeDir {
-    fn claim(path: &Path) -> Result<Self> {
-        fs::create_dir(path).with_context(|| {
-            format!(
-                "claim overlaybd runtime dir {} (it must not already exist)",
-                path.display()
-            )
-        })?;
-        Ok(Self {
-            path: path.to_path_buf(),
-        })
-    }
-
-    fn cleanup(self) {
-        if let Err(err) = fs::remove_dir_all(&self.path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    path = %self.path.display(),
-                    error = %err,
-                    "failed to remove daemon-owned overlaybd runtime dir during rollback"
-                );
-            }
+fn cleanup_runtime_dir(path: &Path) {
+    if let Err(err) = fs::remove_dir_all(path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "failed to remove daemon-owned overlaybd runtime dir during rollback"
+            );
         }
     }
 }
@@ -74,12 +59,15 @@ impl ClaimedRuntimeDir {
 pub(crate) struct MaterializedOverlaybdRuntime {
     pub runtime_image_config_path: PathBuf,
     pub actual_virtual_size: u64,
-    claimed_runtime_dir: ClaimedRuntimeDir,
 }
 
 impl MaterializedOverlaybdRuntime {
     pub(crate) fn rollback(self) {
-        self.claimed_runtime_dir.cleanup();
+        cleanup_runtime_dir(
+            self.runtime_image_config_path
+                .parent()
+                .expect("runtime config parent"),
+        );
     }
 }
 
@@ -103,20 +91,12 @@ pub(crate) struct MaterializeOverlaybdRuntimeRequest<'a> {
     /// all share the single isolated resize cacheDir.
     pub(crate) resize_permit: Arc<tokio::sync::Mutex<()>>,
     pub(crate) allow_shrink: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ResolvedSourceUpper {
-    data_path: PathBuf,
-    index_path: Option<PathBuf>,
-    target_path: Option<PathBuf>,
-    gzip_index_path: Option<PathBuf>,
-    writable_mode: UpperMode,
+    pub(crate) source_state_strategy: SourceStateStrategy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ResolvedUpperMode {
-    Existing(ResolvedSourceUpper),
+    Existing(UpperConfig),
     Create(UpperMode),
     Absent,
 }
@@ -124,23 +104,21 @@ enum ResolvedUpperMode {
 pub(crate) async fn materialize_overlaybd_runtime(
     request: MaterializeOverlaybdRuntimeRequest<'_>,
 ) -> Result<MaterializedOverlaybdRuntime> {
-    let claimed_runtime_dir = ClaimedRuntimeDir::claim(request.runtime_dir)?;
-    match materialize_runtime_contents(request).await {
-        Ok((runtime_image_config_path, actual_virtual_size)) => Ok(MaterializedOverlaybdRuntime {
-            runtime_image_config_path,
-            actual_virtual_size,
-            claimed_runtime_dir,
-        }),
-        Err(err) => {
-            claimed_runtime_dir.cleanup();
-            Err(err)
-        }
-    }
+    let runtime_dir = request.runtime_dir;
+    fs::create_dir(runtime_dir).with_context(|| {
+        format!(
+            "claim overlaybd runtime dir {} (it must not already exist)",
+            runtime_dir.display()
+        )
+    })?;
+    materialize_runtime_contents(request)
+        .await
+        .inspect_err(|_| cleanup_runtime_dir(runtime_dir))
 }
 
 async fn materialize_runtime_contents(
     request: MaterializeOverlaybdRuntimeRequest<'_>,
-) -> Result<(PathBuf, u64)> {
+) -> Result<MaterializedOverlaybdRuntime> {
     let MaterializeOverlaybdRuntimeRequest {
         image_service_cache,
         source_image_config,
@@ -154,20 +132,54 @@ async fn materialize_runtime_contents(
         resize_global_config,
         resize_permit,
         allow_shrink,
+        source_state_strategy,
     } = request;
+
+    let source_image_config =
+        std::path::absolute(source_image_config).context("resolve source image config path")?;
+    let source_image_config = source_image_config.as_path();
+    let raw = fs::read(source_image_config).with_context(|| {
+        format!(
+            "read overlaybd image config '{}'",
+            source_image_config.display()
+        )
+    })?;
+    let mut image: Value = serde_json::from_slice(&raw).with_context(|| {
+        format!(
+            "parse overlaybd image config '{}'",
+            source_image_config.display()
+        )
+    })?;
+    // Keep the original JSON for output so fields unknown to this daemon survive.
+    // Known-size Reuse can also build a new upper from an otherwise empty source.
+    let source = if known_source_virtual_size.is_none()
+        || source_state_strategy == SourceStateStrategy::Consume
+    {
+        let mut source: ImageConfig =
+            serde_json::from_value(image.clone()).context("parse source OverlayBD image config")?;
+        resolve_image_config_local_paths(source_image_config, &mut source);
+        Some(source)
+    } else {
+        None
+    };
 
     let base_virtual_size = match known_source_virtual_size {
         Some(size) => size,
-        None => {
-            resolve_overlaybd_virtual_size(image_service_cache, source_image_config, global_config)
-                .await
-                .with_context(|| {
-                    format!(
-                        "resolve overlaybd base virtual size from {}",
-                        source_image_config.display()
-                    )
-                })?
-        }
+        None => resolve_overlaybd_virtual_size(
+            image_service_cache,
+            source_image_config,
+            source
+                .as_ref()
+                .expect("unknown size requires source config"),
+            global_config,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "resolve overlaybd base virtual size from {}",
+                source_image_config.display()
+            )
+        })?,
     };
     anyhow::ensure!(
         base_virtual_size > 0,
@@ -177,7 +189,16 @@ async fn materialize_runtime_contents(
         validate_requested_virtual_size(requested_virtual_size, base_virtual_size, allow_shrink)
             .map_err(|err| InvalidRequest(format!("{err:#}")))?;
 
-    let upper_mode = resolve_upper_mode(source_image_config, read_only, runtime_upper_mode)?;
+    let upper_mode =
+        resolve_upper_mode(&image, source_image_config, read_only, runtime_upper_mode)?;
+    if source_state_strategy == SourceStateStrategy::Consume
+        && matches!(upper_mode, ResolvedUpperMode::Create(_))
+    {
+        return Err(InvalidRequest(
+            "source state consume requires an existing writable OverlayBD upper".to_string(),
+        )
+        .into());
+    }
     if actual_virtual_size != base_virtual_size
         && !matches!(upper_mode, ResolvedUpperMode::Create(_))
     {
@@ -186,6 +207,31 @@ async fn materialize_runtime_contents(
         )
         .into());
     }
+    let upper_mode = match source_state_strategy {
+        SourceStateStrategy::Reuse => upper_mode,
+        SourceStateStrategy::Consume => {
+            let source_root = fs::canonicalize(source_image_config.parent().unwrap())
+                .with_context(|| {
+                    format!(
+                        "resolve source image config directory {}",
+                        source_image_config.display()
+                    )
+                })?;
+            adopt_source_owned_lowers(
+                &mut image,
+                source.as_ref().expect("Consume requires source config"),
+                &source_root,
+                runtime_dir,
+            )
+            .await?;
+            match upper_mode {
+                ResolvedUpperMode::Existing(upper) => ResolvedUpperMode::Existing(
+                    consume_existing_upper(upper, &source_root, runtime_dir).await?,
+                ),
+                upper_mode => upper_mode,
+            }
+        }
+    };
     match &upper_mode {
         ResolvedUpperMode::Absent | ResolvedUpperMode::Existing(_) => {}
         ResolvedUpperMode::Create(mode) => {
@@ -206,7 +252,8 @@ async fn materialize_runtime_contents(
         }
     }
 
-    let image = materialize_overlaybd_image_config(source_image_config, runtime_dir, &upper_mode)?;
+    let image =
+        materialize_overlaybd_image_config(image, source_image_config, runtime_dir, &upper_mode)?;
     let runtime_image_config_path = runtime_dir.join(RUNTIME_IMAGE_CONFIG_FILE);
     fs::write(
         &runtime_image_config_path,
@@ -251,17 +298,19 @@ async fn materialize_runtime_contents(
         .await?;
     }
 
-    Ok((runtime_image_config_path, actual_virtual_size))
+    Ok(MaterializedOverlaybdRuntime {
+        runtime_image_config_path,
+        actual_virtual_size,
+    })
 }
 
-pub(crate) async fn resolve_overlaybd_virtual_size(
+async fn resolve_overlaybd_virtual_size(
     image_service_cache: &ImageServiceCache,
     image_config: &Path,
+    image_cfg: &ImageConfig,
     global_config: &Path,
 ) -> Result<u64> {
-    let image_cfg = load_image_config(image_config)
-        .with_context(|| format!("load overlaybd image config '{}'", image_config.display()))?;
-
+    validate_image_config(image_cfg)?;
     for layer in image_cfg.lowers.iter().rev() {
         let Some(local_path) = resolve_local_layer_path(layer) else {
             continue;
@@ -279,23 +328,7 @@ pub(crate) async fn resolve_overlaybd_virtual_size(
         }
     }
 
-    let image_service = image_service_cache
-        .get_or_create(global_config)
-        .await
-        .with_context(|| format!("load overlaybd global config '{}'", global_config.display()))?;
-    let image = ImageFile::open(
-        image_cfg,
-        image_service,
-        Some(std::fs::canonicalize(image_config).unwrap_or_else(|_| image_config.to_path_buf())),
-    )
-    .await
-    .with_context(|| format!("open overlaybd image config '{}'", image_config.display()))?;
-    image.size().await.with_context(|| {
-        format!(
-            "read overlaybd virtual size from '{}'",
-            image_config.display()
-        )
-    })
+    open_overlaybd_virtual_size(image_service_cache, image_config, image_cfg, global_config).await
 }
 
 fn validate_requested_virtual_size(
@@ -438,19 +471,18 @@ fn runtime_upper_index_path(runtime_dir: &Path, mode: UpperMode) -> Option<PathB
     .then(|| runtime_dir.join(RUNTIME_UPPER_INDEX_FILE))
 }
 
-async fn reopen_overlaybd_virtual_size(
+async fn open_overlaybd_virtual_size(
     image_service_cache: &ImageServiceCache,
     image_config: &Path,
+    image_cfg: &ImageConfig,
     global_config: &Path,
 ) -> Result<u64> {
-    let image_cfg = load_image_config(image_config)
-        .with_context(|| format!("load overlaybd image config '{}'", image_config.display()))?;
     let image_service = image_service_cache
         .get_or_create(global_config)
         .await
         .with_context(|| format!("load overlaybd global config '{}'", global_config.display()))?;
     let image = ImageFile::open(
-        image_cfg,
+        image_cfg.clone(),
         image_service,
         Some(std::fs::canonicalize(image_config).unwrap_or_else(|_| image_config.to_path_buf())),
     )
@@ -483,9 +515,12 @@ async fn verify_resized_runtime(
         .context("validate resized OverlayBD RW header pair")?;
     }
 
-    let reopened = reopen_overlaybd_virtual_size(image_service_cache, image_config, global_config)
-        .await
-        .context("reopen resized overlaybd runtime")?;
+    let image_cfg = load_image_config(image_config)
+        .with_context(|| format!("load overlaybd image config '{}'", image_config.display()))?;
+    let reopened =
+        open_overlaybd_virtual_size(image_service_cache, image_config, &image_cfg, global_config)
+            .await
+            .context("reopen resized overlaybd runtime")?;
     anyhow::ensure!(
         reopened == expected_size,
         "resized overlaybd runtime size mismatch: expected {expected_size}, got {reopened}"
@@ -494,6 +529,7 @@ async fn verify_resized_runtime(
 }
 
 fn resolve_upper_mode(
+    image: &Value,
     image_config_path: &Path,
     read_only: bool,
     runtime_upper_mode: UpperMode,
@@ -501,107 +537,229 @@ fn resolve_upper_mode(
     if read_only {
         return Ok(ResolvedUpperMode::Absent);
     }
-
-    let existing_upper = resolve_source_upper(image_config_path)?;
-    if let Some(existing_upper) = existing_upper {
-        return Ok(ResolvedUpperMode::Existing(existing_upper));
+    let mut upper: UpperConfig =
+        serde_json::from_value(image.get("upper").cloned().unwrap_or_else(|| json!({})))
+            .with_context(|| format!("parse overlaybd upper '{}'", image_config_path.display()))?;
+    if !validate_upper_config(&upper)? {
+        return Ok(ResolvedUpperMode::Create(runtime_upper_mode));
     }
-
-    Ok(ResolvedUpperMode::Create(runtime_upper_mode))
+    let base = image_config_path.parent().unwrap_or_else(|| Path::new("."));
+    for path in [
+        &mut upper.data,
+        &mut upper.index,
+        &mut upper.target,
+        &mut upper.gzip_index,
+    ] {
+        if !path.is_empty() {
+            *path = resolve_config_path(base, path)?
+                .to_string_lossy()
+                .into_owned();
+        }
+    }
+    upper.mode = Some(upper.writable_mode());
+    Ok(ResolvedUpperMode::Existing(upper))
 }
 
-fn resolve_source_upper(image_config_path: &Path) -> Result<Option<ResolvedSourceUpper>> {
-    let raw = fs::read_to_string(image_config_path).with_context(|| {
-        format!(
-            "read overlaybd image config '{}'",
-            image_config_path.display()
-        )
-    })?;
-    let value: Value = serde_json::from_str(&raw).with_context(|| {
-        format!(
-            "parse overlaybd image config '{}'",
-            image_config_path.display()
-        )
-    })?;
-    let base = image_config_path.parent().unwrap_or_else(|| Path::new("."));
-    let upper_value = value
-        .as_object()
-        .and_then(|obj| obj.get("upper").cloned())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let upper: UpperConfig = serde_json::from_value(upper_value)
-        .with_context(|| format!("parse overlaybd upper '{}'", image_config_path.display()))?;
-    if !validate_upper_config(&upper)? {
-        return Ok(None);
+async fn adopt_source_owned_lowers(
+    image: &mut Value,
+    source_config: &ImageConfig,
+    source_root: &Path,
+    runtime_dir: &Path,
+) -> Result<()> {
+    validate_image_config(source_config)?;
+    let runtime_dir = std::path::absolute(runtime_dir)
+        .context("resolve OverlayBD runtime directory for lower adoption")?;
+    for (layer_index, layer) in source_config.lowers.iter().enumerate() {
+        let Some(source) = resolve_local_layer_path(layer) else {
+            continue;
+        };
+        let Some(source) = fs::canonicalize(source).ok() else {
+            continue;
+        };
+        let source_owned = source.starts_with(source_root);
+        let file = if source_owned {
+            let destination = runtime_dir
+                .join(RUNTIME_SOURCE_LOWERS_DIR)
+                .join(format!("{layer_index:04}"))
+                .join("layer.data");
+            link_immutable_layer(&source, &destination).await?;
+            destination
+        } else {
+            source
+        };
+        let lower = image["lowers"][layer_index]
+            .as_object_mut()
+            .with_context(|| format!("overlaybd lower {layer_index} should be an object"))?;
+        lower.insert(
+            "file".into(),
+            Value::String(file.to_string_lossy().into_owned()),
+        );
+        if !layer.dir.is_empty() {
+            lower.insert("dir".into(), Value::String(String::new()));
+        }
     }
 
-    Ok(Some(ResolvedSourceUpper {
-        data_path: resolve_config_path(base, &upper.data)?,
-        index_path: (!upper.index.is_empty())
-            .then(|| resolve_config_path(base, &upper.index))
-            .transpose()?,
-        target_path: (!upper.target.is_empty())
-            .then(|| resolve_config_path(base, &upper.target))
-            .transpose()?,
-        gzip_index_path: (!upper.gzip_index.is_empty())
-            .then(|| resolve_config_path(base, &upper.gzip_index))
-            .transpose()?,
-        writable_mode: upper.writable_mode(),
-    }))
+    Ok(())
+}
+
+async fn consume_existing_upper(
+    mut upper: UpperConfig,
+    source_root: &Path,
+    runtime_dir: &Path,
+) -> Result<UpperConfig> {
+    anyhow::ensure!(
+        upper.target.is_empty() && upper.gzip_index.is_empty(),
+        "consume does not support OverlayBD upper.target or upper.gzipIndex"
+    );
+    let source_data = ensure_source_owned_state(Path::new(&upper.data), source_root)?;
+    let source_index = (!upper.index.is_empty())
+        .then(|| ensure_source_owned_state(Path::new(&upper.index), source_root))
+        .transpose()?;
+    let data_path = runtime_dir.join(RUNTIME_UPPER_DATA_FILE);
+    consume_state_file(
+        &source_data,
+        &data_path,
+        upper.writable_mode() == UpperMode::Sparse,
+    )
+    .await?;
+    upper.data = data_path.to_string_lossy().into_owned();
+    if let Some(source) = source_index {
+        let destination = runtime_dir.join(RUNTIME_UPPER_INDEX_FILE);
+        consume_state_file(&source, &destination, false).await?;
+        upper.index = destination.to_string_lossy().into_owned();
+    }
+    Ok(upper)
+}
+
+fn ensure_source_owned_state(path: &Path, source_root: &Path) -> Result<PathBuf> {
+    let resolved = fs::canonicalize(path)
+        .with_context(|| format!("resolve OverlayBD source state {}", path.display()))?;
+    anyhow::ensure!(
+        resolved.starts_with(source_root),
+        "cannot consume OverlayBD source state {} outside source artifact root {}",
+        path.display(),
+        source_root.display()
+    );
+    Ok(resolved)
+}
+
+async fn consume_state_file(
+    source: &Path,
+    destination: &Path,
+    preserve_sparse_layout: bool,
+) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create OverlayBD runtime directory {}", parent.display()))?;
+    }
+
+    // Keep the normal same-filesystem rename fast path. A Temporal resume may
+    // place the persisted source and runtime directory on different mounts,
+    // in which case rename returns EXDEV and the source must be copied before
+    // it is consumed.
+    match tokio::fs::rename(source, destination).await {
+        Ok(()) => return Ok(()),
+        Err(error) if error.raw_os_error() != Some(libc::EXDEV) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "consume OverlayBD source state {} into {}",
+                    source.display(),
+                    destination.display()
+                )
+            })
+        }
+        Err(_) => {}
+    }
+
+    copy_runtime_artifact(source, destination, preserve_sparse_layout).await?;
+    tokio::fs::remove_file(source).await.with_context(|| {
+        format!(
+            "remove consumed OverlayBD source state {}",
+            source.display()
+        )
+    })?;
+    Ok(())
+}
+
+async fn copy_runtime_artifact(
+    source: &Path,
+    destination: &Path,
+    preserve_sparse_layout: bool,
+) -> Result<()> {
+    if preserve_sparse_layout {
+        storage_util::copy_sparse_file(source, destination).await
+    } else {
+        tokio::fs::copy(source, destination).await.map(|_| ())
+    }
+    .with_context(|| {
+        format!(
+            "copy OverlayBD artifact {} into {} across filesystems",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
+async fn link_immutable_layer(source: &Path, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("create OverlayBD lower directory {}", parent.display()))?;
+    }
+    match tokio::fs::hard_link(source, destination).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+            copy_runtime_artifact(source, destination, true).await
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "link immutable OverlayBD lower {} into {}",
+                source.display(),
+                destination.display()
+            )
+        }),
+    }
 }
 
 fn materialize_overlaybd_image_config(
+    mut value: Value,
     image_config_path: &Path,
     runtime_dir: &Path,
     upper_mode: &ResolvedUpperMode,
 ) -> Result<Value> {
-    let raw = fs::read_to_string(image_config_path).with_context(|| {
-        format!(
-            "read overlaybd image config failed: {}",
-            image_config_path.display()
-        )
-    })?;
-    let mut value: Value = serde_json::from_str(&raw).with_context(|| {
-        format!(
-            "parse overlaybd image config failed: {}",
-            image_config_path.display()
-        )
-    })?;
     let base = image_config_path.parent().unwrap_or_else(|| Path::new("."));
 
     rewrite_overlaybd_lower_paths(&mut value, base, runtime_dir)?;
-
     let upper = match upper_mode {
         ResolvedUpperMode::Absent => json!({}),
-        ResolvedUpperMode::Create(mode) => {
-            json!({
-                "mode": mode,
-                "index": match mode {
-                    UpperMode::Sparse => "",
-                    UpperMode::LogStructured | UpperMode::HybridLogStructured => "./upper.index",
-                },
-                "data": "./upper.data",
-                "target": "",
-                "gzipIndex": ""
-            })
-        }
-        ResolvedUpperMode::Existing(upper) => json!({
-            "mode": upper.writable_mode,
-            "index": match upper.index_path.as_ref() {
-                Some(path) => relative_path(runtime_dir, path)?.to_string_lossy().into_owned(),
-                None => String::new(),
+        ResolvedUpperMode::Create(mode) => serde_json::to_value(UpperConfig {
+            mode: Some(*mode),
+            data: "./upper.data".into(),
+            index: if *mode == UpperMode::Sparse {
+                String::new()
+            } else {
+                "./upper.index".into()
             },
-            "data": relative_path(runtime_dir, &upper.data_path)?
-                .to_string_lossy()
-                .into_owned(),
-            "target": match upper.target_path.as_ref() {
-                Some(path) => relative_path(runtime_dir, path)?.to_string_lossy().into_owned(),
-                None => String::new(),
-            },
-            "gzipIndex": match upper.gzip_index_path.as_ref() {
-                Some(path) => relative_path(runtime_dir, path)?.to_string_lossy().into_owned(),
-                None => String::new(),
+            ..Default::default()
+        })?,
+        ResolvedUpperMode::Existing(upper) => {
+            let mut upper = upper.clone();
+            for path in [
+                &mut upper.data,
+                &mut upper.index,
+                &mut upper.target,
+                &mut upper.gzip_index,
+            ] {
+                if !path.is_empty() {
+                    *path = relative_path(runtime_dir, Path::new(path))?
+                        .to_string_lossy()
+                        .into_owned();
+                }
             }
-        }),
+            serde_json::to_value(upper)?
+        }
     };
 
     let obj = value
@@ -620,6 +778,7 @@ fn materialize_overlaybd_image_config(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{FileExt, MetadataExt};
     use std::sync::Arc;
 
     use overlaybd::backend::local::LocalFile;
@@ -672,6 +831,7 @@ mod tests {
             resize_global_config: global_config,
             resize_permit: Arc::new(tokio::sync::Mutex::new(())),
             allow_shrink: false,
+            source_state_strategy: SourceStateStrategy::Reuse,
         }
     }
 
@@ -708,28 +868,162 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_overlaybd_virtual_size_falls_back_to_opening_image() {
-        let temp = tempfile::tempdir().unwrap();
+    async fn consume_runtime_transfers_writable_upper_without_copying() {
+        let temp = tempfile::tempdir_in(".").unwrap();
+        let source_root = fs::canonicalize(temp.path()).unwrap();
         let (cache, global_config) = test_cache(temp.path()).await;
-        let upper_path = temp.path().join("upper.data");
-        prepare_runtime_upper(&upper_path, None, 12288, UpperMode::Sparse).unwrap();
-        let source = write_source(
-            temp.path(),
-            json!({
+        let source_upper_data = source_root.join("source-upper.data");
+        let source_upper_index = source_root.join("source-upper.index");
+        prepare_runtime_upper(
+            &source_upper_data,
+            Some(&source_upper_index),
+            12288,
+            UpperMode::LogStructured,
+        )
+        .unwrap();
+        let source_upper_identity = |path: &Path| {
+            let metadata = fs::metadata(path).unwrap();
+            (metadata.dev(), metadata.ino())
+        };
+        let source_upper_data_identity = source_upper_identity(&source_upper_data);
+        let source_upper_index_identity = source_upper_identity(&source_upper_index);
+        // Keep the config in the test's working directory so its bare filename
+        // can be passed without changing the process-wide current directory.
+        let source_file = tempfile::NamedTempFile::new_in(".").unwrap();
+        fs::write(
+            source_file.path(),
+            serde_json::to_vec(&json!({
                 "lowers": [],
                 "upper": {
-                    "mode": "sparse",
-                    "data": upper_path
+                    "mode": "logStructured",
+                    "data": source_upper_data,
+                    "index": source_upper_index
                 },
+                "resultFile": ""
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let source = Path::new(source_file.path().file_name().unwrap());
+        let runtime_dir = temp.path().join("runtime");
+        let mut request = materialize_test_request(&cache, source, &global_config, &runtime_dir);
+        request.source_state_strategy = SourceStateStrategy::Consume;
+
+        materialize_overlaybd_runtime(request).await.unwrap();
+
+        for (source, name, identity) in [
+            (
+                source_upper_data,
+                RUNTIME_UPPER_DATA_FILE,
+                source_upper_data_identity,
+            ),
+            (
+                source_upper_index,
+                RUNTIME_UPPER_INDEX_FILE,
+                source_upper_index_identity,
+            ),
+        ] {
+            assert!(!source.exists());
+            assert_eq!(
+                source_upper_identity(&runtime_dir.join(name)),
+                identity,
+                "Consume must rename the {name} inode"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn consume_runtime_survives_source_deletion_across_filesystems() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir_in("/dev/shm").unwrap();
+        if fs::metadata(temp.path()).unwrap().dev()
+            == fs::metadata(destination.path()).unwrap().dev()
+        {
+            eprintln!("cross-filesystem test requires /dev/shm on a different mount");
+            return;
+        }
+        let (cache, global_config) = test_cache(temp.path()).await;
+        let source_dir = temp.path().join("source");
+        fs::create_dir(&source_dir).unwrap();
+        let upper = source_dir.join("upper.data");
+        prepare_runtime_upper(&upper, None, 16384, UpperMode::Sparse).unwrap();
+        let upper_file = fs::OpenOptions::new().write(true).open(&upper).unwrap();
+        upper_file.write_all_at(&[0; 4096], 4096).unwrap();
+        upper_file.write_all_at(&[0xa7; 4096], 12288).unwrap();
+        drop(upper_file);
+        let lower = source_dir.join("lower.data");
+        create_sealed_lower(&lower, &source_dir.join("lower.index"), &[0x5a; 16384]).await;
+        let expected = fs::read(&lower).unwrap();
+        let source = write_source(
+            &source_dir,
+            json!({
+                "lowers": [{"file": lower, "layerExtension": {"version": 1}}],
+                "imageExtension": {"policy": "keep"},
+                "upper": {"mode": "sparse", "data": upper},
+            }),
+        );
+        let runtime_dir = destination.path().join("runtime");
+        let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
+        request.known_source_virtual_size = Some(16384);
+        request.source_state_strategy = SourceStateStrategy::Consume;
+        let runtime = materialize_overlaybd_runtime(request).await.unwrap();
+        assert!(!upper.exists());
+        fs::remove_dir_all(source_dir).unwrap();
+
+        let raw: Value =
+            serde_json::from_slice(&fs::read(&runtime.runtime_image_config_path).unwrap()).unwrap();
+        assert_eq!(raw["imageExtension"], json!({"policy": "keep"}));
+        assert_eq!(raw["lowers"][0]["layerExtension"], json!({"version": 1}));
+        let image = load_image_config(&runtime.runtime_image_config_path).unwrap();
+        assert_eq!(fs::read(&image.lowers[0].file).unwrap(), expected);
+        assert!(Path::new(&image.upper.data).is_file());
+        let image = ImageFile::open(
+            image,
+            cache.get_or_create(&global_config).await.unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+        let restored = image.read_at(0, 16384).await.unwrap();
+        assert!(restored[..4096].iter().all(|byte| *byte == 0));
+        assert!(restored[4096..8192].iter().all(|byte| *byte == 0x5a));
+        assert!(restored[8192..12288].iter().all(|byte| *byte == 0xa7));
+        assert!(restored[12288..].iter().all(|byte| *byte == 0x5a));
+    }
+
+    #[tokio::test]
+    async fn consume_runtime_rejects_upper_outside_source_artifact_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let (cache, global_config) = test_cache(temp.path()).await;
+        let source_dir = temp.path().join("source");
+        fs::create_dir_all(&source_dir).unwrap();
+        let external_upper = temp.path().join("external-upper.data");
+        prepare_runtime_upper(&external_upper, None, 12288, UpperMode::Sparse).unwrap();
+        let source = write_source(
+            &source_dir,
+            json!({
+                "lowers": [],
+                "upper": { "mode": "sparse", "data": external_upper },
                 "resultFile": ""
             }),
         );
+        let runtime_dir = temp.path().join("runtime");
+        let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
+        request.known_source_virtual_size = Some(12288);
+        request.source_state_strategy = SourceStateStrategy::Consume;
 
-        let size = resolve_overlaybd_virtual_size(&cache, &source, &global_config)
-            .await
-            .unwrap();
+        let err = materialize_overlaybd_runtime(request).await.unwrap_err();
 
-        assert_eq!(size, 12288);
+        assert!(err.to_string().contains("outside source artifact root"));
+        assert!(external_upper.exists());
+
+        fs::write(&source, br#"{"lowers":[],"upper":{}}"#).unwrap();
+        let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
+        request.known_source_virtual_size = Some(12288);
+        request.source_state_strategy = SourceStateStrategy::Consume;
+        let err = materialize_overlaybd_runtime(request).await.unwrap_err();
+        assert!(err.is::<InvalidRequest>(), "{err:#}");
+        assert!(!runtime_dir.exists());
     }
 
     fn fake_resize_tool(dir: &Path, body: &str) -> PathBuf {
@@ -830,23 +1124,15 @@ mod tests {
         let materialized = materialize_overlaybd_runtime(request).await.unwrap();
 
         assert_eq!(materialized.actual_virtual_size, 2 * GIB);
-        validate_rw_header_pair_paths(
-            &runtime.join(RUNTIME_UPPER_DATA_FILE),
-            Some(&runtime.join(RUNTIME_UPPER_INDEX_FILE)),
-            2 * GIB,
-            RwLayout::LogStructured,
-        )
-        .unwrap();
-        assert_eq!(
-            reopen_overlaybd_virtual_size(
-                &cache,
-                &materialized.runtime_image_config_path,
-                &global_config,
-            )
+        let image = cache
+            .get_or_create(&global_config)
             .await
-            .unwrap(),
-            2 * GIB
-        );
+            .unwrap()
+            .create_image_file(&materialized.runtime_image_config_path)
+            .await
+            .unwrap();
+        assert_eq!(image.size_bytes(), 2 * GIB);
+        drop(image);
         let observed = fs::read_to_string(observed).unwrap();
         let expected_prefix = format!(
             "{}\n--config\n{}\n--size\n2\n--service_config_path\n{}\n",
@@ -860,90 +1146,54 @@ mod tests {
             Some(tool_lib)
         );
 
-        let timeout_tool = ResizeToolSpec {
-            binary: fake_resize_tool(temp.path(), "sleep 30"),
-            lib_dir: None,
-            timeout_secs: 1,
-        };
-        let timed_out_runtime = temp.path().join("runtime-timed-out");
-        let mut timed_out_request =
-            materialize_test_request(&cache, &source, &global_config, &timed_out_runtime);
-        timed_out_request.requested_virtual_size = Some(2 * GIB);
-        timed_out_request.resize_tool = Some(&timeout_tool);
-        timed_out_request.resize_global_config = &resize_global_config;
-        timed_out_request.resize_permit = Arc::clone(&resize_permit);
-        let err = materialize_overlaybd_runtime(timed_out_request)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("timed out after 1 seconds"));
-
-        let second_tool = fake_resize_tool(temp.path(), "exit 0");
-        let second_tool = ResizeToolSpec {
-            binary: second_tool,
-            lib_dir: None,
-            timeout_secs: 2,
-        };
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let _guard = resize_permit.lock().await;
-            run_resize_tool(
-                &second_tool,
-                &materialized.runtime_image_config_path,
-                &resize_global_config,
-                2 * GIB,
-            )
-            .await
-        })
-        .await
-        .expect("resize permit must be released after timeout")
-        .unwrap();
-    }
-
-    #[tokio::test]
-    async fn run_resize_tool_handles_failure_and_timeout() {
-        let temp = tempfile::tempdir().unwrap();
-        let image = temp.path().join("image.json");
-        let global = temp.path().join("global.json");
-        let failure = fake_resize_tool(temp.path(), "echo failed-out; echo failed-err >&2; exit 7");
-        let err = run_resize_tool(
-            &ResizeToolSpec {
-                binary: failure,
-                lib_dir: None,
-                timeout_secs: 2,
-            },
-            &image,
-            &global,
-            GIB,
-        )
-        .await
-        .unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("failed-out") && message.contains("failed-err"));
-
-        let timeout = fake_resize_tool(temp.path(), "sleep 5");
-        let err = run_resize_tool(
-            &ResizeToolSpec {
-                binary: timeout,
+        for (name, script, expected) in [
+            (
+                "failed",
+                "echo failed-out; echo failed-err >&2; exit 7",
+                &["failed-out", "failed-err"][..],
+            ),
+            ("timed-out", "sleep 5", &["timed out after 1 seconds"][..]),
+        ] {
+            let tool = ResizeToolSpec {
+                binary: fake_resize_tool(temp.path(), script),
                 lib_dir: None,
                 timeout_secs: 1,
-            },
-            &image,
-            &global,
-            GIB,
-        )
-        .await
-        .unwrap_err();
-        assert!(err.to_string().contains("timed out after 1 seconds"));
+            };
+            let failed_runtime = temp.path().join(name);
+            let mut request =
+                materialize_test_request(&cache, &source, &global_config, &failed_runtime);
+            request.requested_virtual_size = Some(2 * GIB);
+            request.resize_tool = Some(&tool);
+            request.resize_global_config = &resize_global_config;
+            request.resize_permit = Arc::clone(&resize_permit);
+            let error = materialize_overlaybd_runtime(request).await.unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                expected.iter().all(|text| message.contains(*text)),
+                "{message}"
+            );
+            assert!(
+                !failed_runtime.exists(),
+                "failed materialization must clean its runtime"
+            );
+            assert!(
+                resize_permit.try_lock().is_ok(),
+                "failed resize must release its permit"
+            );
+        }
     }
 
     #[tokio::test]
-    async fn materialize_read_only_runtime_writes_empty_upper() {
+    async fn read_only_runtime_preserves_lowers_and_omits_upper() {
         let temp = tempfile::tempdir().unwrap();
         let (cache, global_config) = test_cache(temp.path()).await;
+        fs::create_dir(temp.path().join("layers")).unwrap();
+        fs::write(temp.path().join("layers/base.commit"), b"immutable lower").unwrap();
         let source = write_source(
             temp.path(),
             json!({
                 "lowers": [{ "file": "layers/base.commit" }],
-                "upper": {},
+                "upper": {"mode": "sparse", "data": "unused-upper.data"},
                 "resultFile": ""
             }),
         );
@@ -952,7 +1202,9 @@ mod tests {
         let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
         request.read_only = true;
         request.known_source_virtual_size = Some(8192);
-        let runtime = materialize_overlaybd_runtime(request).await.unwrap();
+        let runtime = materialize_overlaybd_runtime(request.clone())
+            .await
+            .unwrap();
 
         assert_eq!(runtime.actual_virtual_size, 8192);
         assert!(runtime.runtime_image_config_path.exists());
@@ -963,6 +1215,23 @@ mod tests {
         assert_eq!(image["upper"], json!({}));
         assert_eq!(image["resultFile"], json!("./result.txt"));
         assert_eq!(image["lowers"][0]["file"], json!("../layers/base.commit"));
+
+        let cwd = std::env::current_dir().unwrap();
+        let destination = tempfile::tempdir_in(&cwd).unwrap();
+        let relative_runtime = destination
+            .path()
+            .strip_prefix(&cwd)
+            .unwrap()
+            .join("runtime");
+        request.runtime_dir = &relative_runtime;
+        request.source_state_strategy = SourceStateStrategy::Consume;
+        let consumed = materialize_overlaybd_runtime(request).await.unwrap();
+        let config_path = fs::canonicalize(consumed.runtime_image_config_path).unwrap();
+        let config = load_image_config(&config_path).unwrap();
+        let lower = Path::new(&config.lowers[0].file);
+        assert!(lower.starts_with(config_path.parent().unwrap()));
+        assert_eq!(fs::read(lower).unwrap(), b"immutable lower");
+        assert!(config.upper.data.is_empty());
     }
 
     #[tokio::test]
@@ -1005,65 +1274,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn materialize_writable_existing_upper_reuses_source_upper() {
-        let temp = tempfile::tempdir().unwrap();
-        let (cache, global_config) = test_cache(temp.path()).await;
-        let source = write_source(
-            temp.path(),
-            json!({
-                "lowers": [],
-                "upper": {
-                    "mode": "logStructured",
-                    "data": "existing-upper.data",
-                    "index": "existing-upper.index"
-                },
-                "resultFile": ""
-            }),
-        );
-        let runtime_dir = temp.path().join("runtime");
-
-        let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
-        request.runtime_upper_mode = UpperMode::Sparse;
-        request.known_source_virtual_size = Some(16384);
-        let runtime = materialize_overlaybd_runtime(request).await.unwrap();
-
-        assert_eq!(runtime.actual_virtual_size, 16384);
-        assert!(!runtime_dir.join(RUNTIME_UPPER_DATA_FILE).exists());
-        let image: Value =
-            serde_json::from_slice(&fs::read(&runtime.runtime_image_config_path).unwrap()).unwrap();
-        assert_eq!(image["upper"]["data"], json!("../existing-upper.data"));
-        assert_eq!(image["upper"]["index"], json!("../existing-upper.index"));
-    }
-
-    #[tokio::test]
-    async fn materialize_writable_existing_sparse_upper_reuses_source_upper() {
-        let temp = tempfile::tempdir().unwrap();
-        let (cache, global_config) = test_cache(temp.path()).await;
-        let source = write_source(
-            temp.path(),
-            json!({
-                "lowers": [],
-                "upper": {
-                    "mode": "sparse",
-                    "data": "existing-upper.data"
-                },
-                "resultFile": ""
-            }),
-        );
-        let runtime_dir = temp.path().join("runtime");
-
-        let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
-        request.known_source_virtual_size = Some(8192);
-        let runtime = materialize_overlaybd_runtime(request).await.unwrap();
-
-        assert_eq!(runtime.actual_virtual_size, 8192);
-        assert!(!runtime_dir.join(RUNTIME_UPPER_DATA_FILE).exists());
-        assert!(!runtime_dir.join(RUNTIME_UPPER_INDEX_FILE).exists());
-        let image: Value =
-            serde_json::from_slice(&fs::read(&runtime.runtime_image_config_path).unwrap()).unwrap();
-        assert_eq!(image["upper"]["mode"], json!("sparse"));
-        assert_eq!(image["upper"]["data"], json!("../existing-upper.data"));
-        assert_eq!(image["upper"]["index"], json!(""));
+    async fn materialize_reuses_existing_upper_and_resolves_its_size() {
+        for mode in [UpperMode::LogStructured, UpperMode::Sparse] {
+            let temp = tempfile::tempdir().unwrap();
+            let (cache, global_config) = test_cache(temp.path()).await;
+            let data = temp.path().join("existing-upper.data");
+            let index =
+                (mode != UpperMode::Sparse).then(|| temp.path().join("existing-upper.index"));
+            prepare_runtime_upper(&data, index.as_deref(), 8192, mode).unwrap();
+            let source = write_source(
+                temp.path(),
+                json!({
+                    "lowers": [],
+                    "upper": {
+                        "mode": if mode == UpperMode::Sparse { Some(mode) } else { None },
+                        "data": "existing-upper.data",
+                        "index": if index.is_some() { "existing-upper.index" } else { "" }
+                    }
+                }),
+            );
+            let runtime_dir = temp.path().join("runtime");
+            let mut request =
+                materialize_test_request(&cache, &source, &global_config, &runtime_dir);
+            request.runtime_upper_mode = if mode == UpperMode::Sparse {
+                UpperMode::LogStructured
+            } else {
+                UpperMode::Sparse
+            };
+            let runtime = materialize_overlaybd_runtime(request).await.unwrap();
+            assert_eq!(runtime.actual_virtual_size, 8192);
+            assert!(!runtime_dir.join(RUNTIME_UPPER_DATA_FILE).exists());
+            assert!(!runtime_dir.join(RUNTIME_UPPER_INDEX_FILE).exists());
+            let image = load_image_config(&runtime.runtime_image_config_path).unwrap();
+            assert_eq!(image.upper.writable_mode(), mode);
+            assert_eq!(Path::new(&image.upper.data), data);
+            assert_eq!(
+                image.upper.index,
+                index.map(|p| p.display().to_string()).unwrap_or_default()
+            );
+        }
     }
 
     #[test]
@@ -1087,20 +1336,5 @@ mod tests {
         );
         assert!(validate_requested_virtual_size(Some(0), 2 * GIB, true).is_err());
         assert!(validate_requested_virtual_size(Some(GIB + 1), 2 * GIB, true).is_err());
-    }
-
-    #[test]
-    fn cleanup_runtime_dir_removes_all_daemon_owned_contents() {
-        let temp = tempfile::tempdir().unwrap();
-        let runtime_dir = temp.path().join("runtime");
-        let claimed = ClaimedRuntimeDir::claim(&runtime_dir).unwrap();
-        fs::write(runtime_dir.join(RUNTIME_IMAGE_CONFIG_FILE), b"runtime").unwrap();
-        let tool_temp_dir = runtime_dir.join("resize-tmp");
-        fs::create_dir(&tool_temp_dir).unwrap();
-        fs::write(tool_temp_dir.join("scratch"), b"temporary").unwrap();
-
-        claimed.cleanup();
-
-        assert!(!runtime_dir.exists());
     }
 }
