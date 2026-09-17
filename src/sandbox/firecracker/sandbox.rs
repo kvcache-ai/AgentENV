@@ -176,6 +176,7 @@ fn volume_drive_slot_id(index: usize) -> String {
 pub struct FirecrackerSandbox {
     id: SandboxId,
     launch: LaunchMode,
+    pub(super) storage_root: PathBuf,
     work_dir: TempDir,
     fc_instance: FirecrackerInstance,
     runtime_policy: FirecrackerRuntimePolicy,
@@ -345,16 +346,11 @@ impl SandboxBackend for FirecrackerSandbox {
     }
 
     /// Pauses the VM and returns the paused state wrapped as a [`PausedSandboxState`].
-    async fn pause(
-        &mut self,
-        artifact_root: Option<&Path>,
-    ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
-        let pause_result = match artifact_root {
-            Some(artifact_root) => FirecrackerSandbox::pause_to_dir(self, artifact_root)
-                .await
-                .map(|(snapshot_config, _)| snapshot_config),
-            None => FirecrackerSandbox::pause(self).await,
-        };
+    async fn pause(&mut self) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
+        let root = self.storage_root.join(format!("pause-{}", Uuid::now_v7()));
+        let pause_result = FirecrackerSandbox::pause_to_dir(self, &root)
+            .await
+            .map(|(config, _)| config);
         let snapshot_config = match pause_result {
             Ok(snapshot_config) => snapshot_config,
             Err(error) => return self.recover_capture_failure("pause", error).await,
@@ -462,7 +458,10 @@ impl SandboxBackend for FirecrackerSandbox {
                     child.sandbox_id,
                     child.envd_access_token.clone(),
                 )
-                .map(|child| Box::new(child) as Box<dyn SandboxBackend>)
+                .map(|mut sandbox| {
+                    sandbox.storage_root = child.storage_root.clone();
+                    Box::new(sandbox) as Box<dyn SandboxBackend>
+                })
                 .context("build forked sandbox")
             })
             .collect::<Vec<_>>();
@@ -1495,6 +1494,7 @@ impl FirecrackerSandbox {
                 LaunchMode::Resume(config) => config.common.rootfs_virtual_size,
             },
             launch,
+            storage_root: work_dir.path().to_path_buf(),
             work_dir,
             fc_instance,
             resources: SandboxResources::default(),
@@ -1782,6 +1782,9 @@ impl FirecrackerSandbox {
         );
 
         self.resources.network_slot = Some(warm.slot);
+        if self.storage_root == self.work_dir.path() {
+            self.storage_root = warm.work_dir.path().to_path_buf();
+        }
         self.work_dir = warm.work_dir; // Update self.work_dir before relocating logs since the fallback log paths are relative to the work_dir.
         let _cold = std::mem::replace(&mut self.fc_instance, warm.fc_instance);
         if let Err(err) = relocate_warm_log(warm_stdout.as_deref(), &self.firecracker_stdout_path())

@@ -290,10 +290,7 @@ impl SandboxBackend for MockSandboxBackend {
         self.behavior.apply_async(MockOperation::WaitForReady).await
     }
 
-    async fn pause(
-        &mut self,
-        _artifact_root: Option<&Path>,
-    ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
+    async fn pause(&mut self) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
         let pause_result = self
             .behavior
             .apply_capture_result(MockOperation::Pause)
@@ -458,6 +455,7 @@ impl SandboxBackendFactory for MockBackendFactory {
         &self,
         _build_spec: FreshSandboxBuildSpec,
         _launch_config: SandboxLaunchConfig,
+        _storage_root: &Path,
     ) -> Result<Box<dyn SandboxBackend>> {
         self.behavior.apply_sync(MockOperation::Build)?;
         Ok(Box::new(MockSandboxBackend::new_with_host_ip(
@@ -470,6 +468,7 @@ impl SandboxBackendFactory for MockBackendFactory {
         &self,
         _snapshot: &RunnableSnapshot,
         _launch_config: SandboxLaunchConfig,
+        _storage_root: &Path,
     ) -> Result<Box<dyn SandboxBackend>> {
         self.behavior.apply_sync(MockOperation::Build)?;
         Ok(Box::new(MockSandboxBackend::new_with_host_ip(
@@ -483,6 +482,7 @@ impl SandboxBackendFactory for MockBackendFactory {
         _sandbox_id: crate::types::SandboxId,
         _state: &dyn PausedSandboxState,
         _envd_access_token: Option<super::EnvdAccessToken>,
+        _storage_root: &Path,
     ) -> Result<Box<dyn SandboxBackend>> {
         self.behavior.apply_sync(MockOperation::BuildFromSnapshot)?;
         Ok(Box::new(MockSandboxBackend::new_with_host_ip(
