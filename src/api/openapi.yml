@@ -157,6 +157,13 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
 
+    "503":
+      description: Service unavailable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
   schemas:
     CPUCount:
       type: integer
@@ -200,6 +207,16 @@ components:
         - asc
         - desc
 
+    SnapshotType:
+      type: string
+      enum:
+        - local
+        - distributed
+      description: >-
+        Storage availability of a reusable snapshot. Local snapshots are
+        retained only by the publishing owner process and must be promoted before
+        starting a sandbox; distributed snapshots are published to the primary repository.
+
     SnapshotInfo:
       type: object
       required:
@@ -239,6 +256,9 @@ components:
             OverlayBD-native OCI image reference for the snapshot rootfs when
             source-registry image publication was enabled and succeeded.
             Omitted when no rootfs image was published.
+        snapshotType:
+          $ref: "#/components/schemas/SnapshotType"
+          description: Storage availability of this reusable snapshot.
 
     EnvVars:
       additionalProperties:
@@ -651,7 +671,7 @@ components:
         templateID:
           type: string
           description: >
-            Identifier of the required template/snapshot. Use
+            Identifier of the required Distributed template/snapshot. Local snapshots must be promoted first. Use
             POST /sandboxes-cold to create a sandbox directly from an external
             OCI image.
         timeout:
@@ -864,6 +884,10 @@ components:
     SandboxSnapshotRequest:
       type: object
       properties:
+        snapshotType:
+          $ref: "#/components/schemas/SnapshotType"
+          default: distributed
+          description: Local captures skip artifact publication and do not support a name.
         name:
           type: string
           description: Optional name for the snapshot template. If a snapshot template with this name already exists, a new build will be assigned to the existing template instead of creating a new one.
@@ -1732,7 +1756,7 @@ paths:
     post:
       summary: Create sandbox
       description: >
-        Create a sandbox from an existing template/snapshot. Use POST /v2/sandboxes instead or
+        Create a sandbox from an existing Distributed template/snapshot. Local snapshots must first be promoted through POST /snapshots/{snapshotID}/promote. Use POST /v2/sandboxes instead or
         POST /sandboxes-cold to create a sandbox directly from an external OCI
         image.
       deprecated: true
@@ -1769,6 +1793,8 @@ paths:
           $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
+        "503":
+          $ref: "#/components/responses/503"
 
   /sandboxes-cold:
     post:
@@ -1919,6 +1945,9 @@ paths:
           $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
+        "503":
+          $ref: "#/components/responses/503"
+
     get:
       summary: List sandboxes (v2)
       x-api-group: list
@@ -2172,7 +2201,6 @@ paths:
         '500':
           $ref: '#/components/responses/500'
 
-  # TODO: Pause and resume might be exposed as POST /sandboxes/{sandboxID}/snapshot and then POST /sandboxes with specified snapshotting setup
   /sandboxes/{sandboxID}/pause:
     post:
       summary: Pause sandbox
@@ -2541,7 +2569,7 @@ paths:
   /sandboxes/{sandboxID}/snapshots:
     post:
       summary: Create snapshot
-      description: Create a persistent snapshot from the sandbox's current state. Snapshots can be used to create new sandboxes and persist beyond the original sandbox's lifetime.
+      description: Create a reusable snapshot from the sandbox's current state. Distributed snapshots persist in the repository; local snapshots remain available only in the publishing owner process and must be promoted before starting a sandbox.
       tags: [sandboxes]
       security:
         - ApiKeyAuth: []
@@ -2572,6 +2600,8 @@ paths:
           $ref: "#/components/responses/404"
         "500":
           $ref: "#/components/responses/500"
+        "503":
+          $ref: "#/components/responses/503"
 
   /snapshots:
     get:
@@ -2618,6 +2648,8 @@ paths:
           $ref: "#/components/responses/401"
         "500":
           $ref: "#/components/responses/500"
+        "503":
+          $ref: "#/components/responses/503"
 
   /snapshots/{snapshotID}:
     get:
@@ -2644,6 +2676,11 @@ paths:
           $ref: "#/components/responses/404"
         "500":
           $ref: "#/components/responses/500"
+        "400":
+          $ref: "#/components/responses/400"
+        "503":
+          $ref: "#/components/responses/503"
+
     delete:
       description: Delete a single snapshot by its ID or alias. Only sandbox-sourced snapshots can be deleted through this endpoint; template builds must be deleted through the template APIs.
       tags: [snapshots]
@@ -2662,6 +2699,35 @@ paths:
           $ref: "#/components/responses/401"
         "404":
           $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+        "503":
+          $ref: "#/components/responses/503"
+
+  /snapshots/{snapshotID}/promote:
+    post:
+      summary: Promote a Local snapshot
+      description: Promote a Local reusable snapshot to Distributed availability without recapturing the source sandbox. Repeating the request after promotion is idempotent.
+      tags: [snapshots]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: "#/components/parameters/snapshotID"
+      responses:
+        "200":
+          description: Snapshot is available as Distributed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SnapshotInfo"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "503":
+          $ref: "#/components/responses/503"
         "500":
           $ref: "#/components/responses/500"
 
@@ -2826,6 +2892,8 @@ paths:
           $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
+        "503":
+          $ref: "#/components/responses/503"
 
   /v2/templates/{templateID}/builds/{buildID}:
     post:

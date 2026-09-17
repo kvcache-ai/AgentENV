@@ -72,6 +72,8 @@ pub enum SandboxesPostResponse {
     Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
+    /// Service unavailable
+    Status503_ServiceUnavailable(models::Error),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -272,6 +274,8 @@ pub enum SandboxesSandboxIdSnapshotsPostResponse {
     Status404_NotFound(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
+    /// Service unavailable
+    Status503_ServiceUnavailable(models::Error),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -323,6 +327,8 @@ pub enum V2SandboxesPostResponse {
     Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
+    /// Service unavailable
+    Status503_ServiceUnavailable(models::Error),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
