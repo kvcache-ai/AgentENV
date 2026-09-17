@@ -13,9 +13,11 @@ compile_error!("the `io-uring` feature requires target_os = \"linux\"");
 #[cfg(feature = "io-uring")]
 pub mod io_ring;
 pub mod mmap_region;
+mod sparse_file;
 
 pub use aligned_buffer::AlignedBuffer;
 pub use always_send::AlwaysSend;
 pub use compact_writer::{CompactBuffer, CompactWriter};
 pub use id_allocator::ReloadableIDAllocator;
 pub use mmap_region::{MMapRegion, MMapRegionSlice};
+pub use sparse_file::{copy_sparse_file, copy_sparse_file_blocking};

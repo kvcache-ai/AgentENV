@@ -12,7 +12,7 @@ use crate::lsmt::file::{
     LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy, PARALLEL_LOAD_INDEX,
 };
 use crate::prefetch::{new_prefetcher, PrefetchMode, Prefetcher};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
@@ -48,18 +48,33 @@ struct InitializedImageFile {
 
 enum ImageFileBase {
     ReadOnly(LSMTReadOnlyFile),
-    ReadWrite(LSMTFile),
+    /// Temporal memory keeps its sparse upper in writable format but opens
+    /// the backing file read-only. Access permission is independent of format.
+    Upper {
+        file: LSMTFile,
+        read_only_upper: bool,
+    },
 }
 
 impl ImageFileBase {
     fn is_read_only(&self) -> bool {
-        matches!(self, Self::ReadOnly(_))
+        self.writable().is_none()
     }
 
     fn writable(&self) -> Option<&LSMTFile> {
         match self {
-            Self::ReadOnly(_) => None,
-            Self::ReadWrite(file) => Some(file),
+            Self::Upper {
+                file,
+                read_only_upper: false,
+            } => Some(file),
+            _ => None,
+        }
+    }
+
+    async fn sync(&self) -> Result<()> {
+        match self {
+            Self::ReadOnly(file) => file.sync().await,
+            Self::Upper { file, .. } => file.sync().await,
         }
     }
 }
@@ -94,7 +109,12 @@ impl fmt::Debug for ImageFileBase {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ReadOnly(_) => f.write_str("ImageFileBase::ReadOnly(..)"),
-            Self::ReadWrite(_) => f.write_str("ImageFileBase::ReadWrite(..)"),
+            Self::Upper {
+                read_only_upper, ..
+            } => f
+                .debug_struct("ImageFileBase::Upper")
+                .field("read_only_upper", read_only_upper)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -131,10 +151,24 @@ impl ImageFile {
         image_service: ImageService,
         device_key: Option<PathBuf>,
     ) -> Result<Self> {
+        Self::open_with_upper_access(config, image_service, device_key, false).await
+    }
+
+    pub(crate) async fn open_with_upper_access(
+        config: ImageConfig,
+        image_service: ImageService,
+        device_key: Option<PathBuf>,
+        read_only_upper: bool,
+    ) -> Result<Self> {
+        ensure!(
+            !read_only_upper || config.upper.writable_mode() == UpperMode::Sparse,
+            "read-only upper access requires a sparse OverlayBD upper"
+        );
         let download_cfg = config
             .effective_download(image_service.global_config())
             .clone();
-        let mut initialized = Self::init_image_file(&config, &image_service, &download_cfg).await?;
+        let mut initialized =
+            Self::init_image_file(&config, &image_service, &download_cfg, read_only_upper).await?;
         let size = Self::base_size(&initialized.state.base).await?;
         let block_size = DEFAULT_BLOCK_SIZE;
         let num_lbas = size / u64::from(block_size);
@@ -177,7 +211,7 @@ impl ImageFile {
         let state = self.state.read().await;
         match &state.base {
             ImageFileBase::ReadOnly(file) => Ok(file.data_stat()),
-            ImageFileBase::ReadWrite(file) => file.data_stat().await,
+            ImageFileBase::Upper { file, .. } => file.data_stat().await,
         }
     }
 
@@ -185,7 +219,7 @@ impl ImageFile {
         let state = self.state.blocking_read();
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.get_uuid(layer_idx),
-            ImageFileBase::ReadWrite(file) => file.get_uuid(layer_idx),
+            ImageFileBase::Upper { file, .. } => file.get_uuid(layer_idx),
         }
     }
 
@@ -193,7 +227,7 @@ impl ImageFile {
         let state = self.state.read().await;
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.flatten(as_file).await,
-            ImageFileBase::ReadWrite(file) => file.flatten(as_file).await,
+            ImageFileBase::Upper { file, .. } => file.flatten(as_file).await,
         }
     }
 
@@ -265,6 +299,20 @@ impl ImageFile {
         Ok(descriptor)
     }
 
+    /// Flush image state while excluding concurrent I/O through this image.
+    ///
+    /// The caller must first stop the owning VM from issuing new requests.
+    /// Taking the write lock then waits for already-dispatched requests before
+    /// flushing buffered index entries so the upper can be reopened. Temporal
+    /// continuations do not require data to survive a host power loss.
+    pub async fn flush_for_checkpoint(&self) -> Result<()> {
+        let state = self.state.write().await;
+        if let Some(upper) = state.base.writable() {
+            upper.flush_for_checkpoint().await?;
+        }
+        Ok(())
+    }
+
     pub async fn create_snapshot_and_restack(
         &self,
         output_layer_path: &Path,
@@ -320,27 +368,10 @@ impl ImageFile {
             )
             .context("prepare fresh upper after restack")?;
 
-            let new_upper_data: Arc<dyn VirtualFile> = Arc::new(
-                LocalFile::open_rw(&upper_data_path, false).with_context(|| {
-                    format!("open fresh upper data {}", upper_data_path.display())
-                })?,
-            );
-            let new_upper_index = match upper_mode {
-                UpperMode::Sparse => None,
-                UpperMode::LogStructured | UpperMode::HybridLogStructured => {
-                    let upper_index_path = upper_index_path
-                        .as_ref()
-                        .context("log-structured upper lost its index path during restack")?;
-                    Some(
-                        Arc::new(LocalFile::open_rw(upper_index_path, false).with_context(
-                            || format!("open fresh upper index {}", upper_index_path.display()),
-                        )?) as Arc<dyn VirtualFile>,
-                    )
-                }
-            };
-            let new_upper = open_file_rw(new_upper_data, new_upper_index)
+            let new_upper = Self::open_upper(&state.config.upper, false)
                 .await
-                .context("open fresh upper after restack")?;
+                .context("open fresh upper after restack")?
+                .expect("writable upper was validated before restack");
             new_upper.set_max_io_size(max_io_size)?;
             new_upper.set_index_group_commit(group_commit_size)?;
 
@@ -379,7 +410,10 @@ impl ImageFile {
             uuid,
             ..LayerConfig::default()
         });
-        state.base = ImageFileBase::ReadWrite(restacked);
+        state.base = ImageFileBase::Upper {
+            file: restacked,
+            read_only_upper: false,
+        };
         self.update_size_metadata(virtual_size);
         Ok(descriptor)
     }
@@ -388,6 +422,7 @@ impl ImageFile {
         config: &ImageConfig,
         image_service: &ImageService,
         download_cfg: &DownloadConfig,
+        read_only_upper: bool,
     ) -> Result<InitializedImageFile> {
         let mut lowers_config = config.lowers.clone();
         let mut prefetcher = None;
@@ -421,7 +456,7 @@ impl ImageFile {
             prefetcher.as_ref(),
         )
         .await?;
-        let upper_file = Self::open_upper(&config.upper).await?;
+        let upper_file = Self::open_upper(&config.upper, read_only_upper).await?;
         let replay_prefetch = prefetcher
             .as_ref()
             .map(|prefetcher| prefetcher.mode() == PrefetchMode::Replay)
@@ -433,44 +468,34 @@ impl ImageFile {
             image_service.global_config().cache_config.cache_size_gb,
         );
 
+        let downloads = lowers.downloads;
         let base = match (lowers.file, upper_file) {
-            (Some(lower), Some(upper)) => InitializedImageFile {
-                state: LiveImageState {
-                    config: config.clone(),
-                    base: ImageFileBase::ReadWrite(stack_files(&upper, &lower, false).await?),
-                    premerged_index_cache_dir: premerged_index_cache_dir.clone(),
-                    premerged_index_cache_policy,
-                },
-                downloads: lowers.downloads,
-                prefetcher,
-                replay_prefetch,
-            },
-            (Some(lower), None) => InitializedImageFile {
-                state: LiveImageState {
-                    config: config.clone(),
-                    base: ImageFileBase::ReadOnly(lower),
-                    premerged_index_cache_dir: premerged_index_cache_dir.clone(),
-                    premerged_index_cache_policy,
-                },
-                downloads: lowers.downloads,
-                prefetcher,
-                replay_prefetch,
-            },
-            (None, Some(upper)) => InitializedImageFile {
-                state: LiveImageState {
-                    config: config.clone(),
-                    base: ImageFileBase::ReadWrite(upper),
-                    premerged_index_cache_dir,
-                    premerged_index_cache_policy,
-                },
-                downloads: Vec::new(),
-                prefetcher,
-                replay_prefetch: false,
+            (Some(lower), Some(upper)) => {
+                let upper = stack_files(&upper, &lower, false).await?;
+                ImageFileBase::Upper {
+                    file: upper,
+                    read_only_upper,
+                }
+            }
+            (Some(lower), None) => ImageFileBase::ReadOnly(lower),
+            (None, Some(upper)) => ImageFileBase::Upper {
+                file: upper,
+                read_only_upper,
             },
             (None, None) => bail!("image config has no lower and no upper layer"),
         };
 
-        Ok(base)
+        Ok(InitializedImageFile {
+            state: LiveImageState {
+                config: config.clone(),
+                base,
+                premerged_index_cache_dir,
+                premerged_index_cache_policy,
+            },
+            downloads,
+            prefetcher,
+            replay_prefetch,
+        })
     }
 
     async fn open_lowers(
@@ -516,18 +541,9 @@ impl ImageFile {
                 Some(result.with_context(|| format!("failed to open lower layer {index}"))?);
         }
 
-        let opened = ordered
-            .into_iter()
-            .map(|entry| {
-                entry.ok_or_else(|| {
-                    anyhow::anyhow!("parallel lower open returned missing layer slot")
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let mut files = Vec::with_capacity(opened.len());
+        let mut files = Vec::with_capacity(ordered.len());
         let mut downloads = Vec::new();
-        for entry in opened {
+        for entry in ordered.into_iter().flatten() {
             files.push(entry.file);
             if let Some(download) = entry.download {
                 downloads.push(download);
@@ -596,7 +612,7 @@ impl ImageFile {
         Ok(opened)
     }
 
-    async fn open_upper(upper: &UpperConfig) -> Result<Option<LSMTFile>> {
+    async fn open_upper(upper: &UpperConfig, read_only_upper: bool) -> Result<Option<LSMTFile>> {
         if upper.data.is_empty() {
             return Ok(None);
         }
@@ -606,15 +622,24 @@ impl ImageFile {
             ));
         }
 
-        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(&upper.data, false)?);
-        let idx_file = match upper.writable_mode() {
-            UpperMode::Sparse => None,
-            UpperMode::LogStructured | UpperMode::HybridLogStructured => {
-                if upper.index.is_empty() {
-                    bail!("log-structured upper requires upper.index");
-                }
-                Some(Arc::new(LocalFile::open_rw(&upper.index, false)?) as Arc<dyn VirtualFile>)
-            }
+        let data_file: Arc<dyn VirtualFile> = if read_only_upper {
+            Arc::new(LocalFile::open_ro(&upper.data)?)
+        } else {
+            Arc::new(LocalFile::open_rw(&upper.data, false)?)
+        };
+        let idx_file = if upper.index.is_empty() {
+            ensure!(
+                upper.writable_mode() == UpperMode::Sparse,
+                "log-structured upper requires upper.index"
+            );
+            None
+        } else {
+            let file = if read_only_upper {
+                LocalFile::open_ro(&upper.index)?
+            } else {
+                LocalFile::open_rw(&upper.index, false)?
+            };
+            Some(Arc::new(file) as Arc<dyn VirtualFile>)
         };
         Ok(Some(open_file_rw(data_file, idx_file).await?))
     }
@@ -682,7 +707,7 @@ impl ImageFile {
     async fn base_size(base: &ImageFileBase) -> Result<u64> {
         match base {
             ImageFileBase::ReadOnly(file) => file.size().await,
-            ImageFileBase::ReadWrite(file) => file.size().await,
+            ImageFileBase::Upper { file, .. } => file.size().await,
         }
     }
 
@@ -787,7 +812,7 @@ impl VirtualFile for ImageFile {
         let state = self.state.read().await;
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.read_at(offset, len).await,
-            ImageFileBase::ReadWrite(file) => file.read_at(offset, len).await,
+            ImageFileBase::Upper { file, .. } => file.read_at(offset, len).await,
         }
     }
 
@@ -796,7 +821,7 @@ impl VirtualFile for ImageFile {
         let state = self.state.read().await;
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.read_at_into(offset, dst).await,
-            ImageFileBase::ReadWrite(file) => file.read_at_into(offset, dst).await,
+            ImageFileBase::Upper { file, .. } => file.read_at_into(offset, dst).await,
         }
     }
 
@@ -827,7 +852,7 @@ impl VirtualFile for ImageFile {
             let state = self.state.read().await;
             match &state.base {
                 ImageFileBase::ReadOnly(file) => file.read_at_with_ctx(ctx, offset, len).await,
-                ImageFileBase::ReadWrite(file) => file.read_at_with_ctx(ctx, offset, len).await,
+                ImageFileBase::Upper { file, .. } => file.read_at_with_ctx(ctx, offset, len).await,
             }
         })
     }
@@ -846,7 +871,7 @@ impl VirtualFile for ImageFile {
             let state = self.state.read().await;
             match &state.base {
                 ImageFileBase::ReadOnly(file) => file.read_at_into_with_ctx(ctx, offset, dst).await,
-                ImageFileBase::ReadWrite(file) => {
+                ImageFileBase::Upper { file, .. } => {
                     file.read_at_into_with_ctx(ctx, offset, dst).await
                 }
             }
@@ -926,10 +951,7 @@ impl VirtualFile for ImageFile {
 
     async fn sync(&self) -> Result<()> {
         let state = self.state.read().await;
-        match &state.base {
-            ImageFileBase::ReadOnly(file) => file.sync().await,
-            ImageFileBase::ReadWrite(file) => file.sync().await,
-        }
+        state.base.sync().await
     }
 
     async fn seek_data(&self, offset: u64) -> Result<Option<u64>> {
@@ -938,7 +960,7 @@ impl VirtualFile for ImageFile {
             ImageFileBase::ReadOnly(file) => {
                 <LSMTReadOnlyFile as VirtualFile>::seek_data(file, offset).await
             }
-            ImageFileBase::ReadWrite(file) => {
+            ImageFileBase::Upper { file, .. } => {
                 <LSMTFile as VirtualFile>::seek_data(file, offset).await
             }
         }
@@ -950,7 +972,7 @@ impl VirtualFile for ImageFile {
             ImageFileBase::ReadOnly(file) => {
                 <LSMTReadOnlyFile as VirtualFile>::seek_hole(file, offset).await
             }
-            ImageFileBase::ReadWrite(file) => {
+            ImageFileBase::Upper { file, .. } => {
                 <LSMTFile as VirtualFile>::seek_hole(file, offset).await
             }
         }
@@ -960,7 +982,7 @@ impl VirtualFile for ImageFile {
         let state = self.state.read().await;
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.evict_range(offset, len).await,
-            ImageFileBase::ReadWrite(file) => file.evict_range(offset, len).await,
+            ImageFileBase::Upper { file, .. } => file.evict_range(offset, len).await,
         }
     }
 
@@ -968,7 +990,7 @@ impl VirtualFile for ImageFile {
         let state = self.state.read().await;
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.evict_all().await,
-            ImageFileBase::ReadWrite(file) => file.evict_all().await,
+            ImageFileBase::Upper { file, .. } => file.evict_all().await,
         }
     }
 }
@@ -1483,7 +1505,8 @@ mod tests {
         };
 
         let service = build_service(&tmp).await;
-        let image = ImageFile::open(image_cfg, service, None)
+        let read_only_cfg = image_cfg.clone();
+        let image = ImageFile::open(image_cfg, service.clone(), None)
             .await
             .expect("open image");
 
@@ -1500,6 +1523,112 @@ mod tests {
             "sparse upper should not create an index file"
         );
         assert!(!image.is_read_only().await);
+
+        drop(image);
+        let read_only = ImageFile::open_with_upper_access(read_only_cfg, service, None, true)
+            .await
+            .expect("open sparse upper read-only");
+        assert!(read_only.is_read_only().await);
+        assert_eq!(
+            read_only
+                .read_at(0, overlay.len())
+                .await
+                .expect("read overlay"),
+            overlay
+        );
+        assert!(read_only.write_at(0, &[0x33; 4096]).await.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_read_only_sparse_upper_survives_external_seal_and_rename() {
+        let tmp = TempDir::new().expect("tempdir");
+        let upper_data = tmp.path().join("upper.data");
+        create_initialized_upper_with_mode(&upper_data, None, 8192, UpperMode::Sparse)
+            .await
+            .expect("build initialized sparse upper");
+        let image_cfg = ImageConfig {
+            repo_blob_url: String::new(),
+            lowers: Vec::new(),
+            upper: UpperConfig {
+                mode: Some(UpperMode::Sparse),
+                index: String::new(),
+                data: upper_data.to_string_lossy().into_owned(),
+                target: String::new(),
+                gzip_index: String::new(),
+            },
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+        let service = build_service(&tmp).await;
+        let image = ImageFile::open(image_cfg.clone(), service.clone(), None)
+            .await
+            .expect("open writable image");
+        image
+            .write_at(0, &[0x22; 4096])
+            .await
+            .expect("write source upper");
+        image.sync().await.expect("sync source upper");
+        drop(image);
+
+        let read_only = ImageFile::open_with_upper_access(image_cfg, service.clone(), None, true)
+            .await
+            .expect("open read-only upper");
+
+        let sealed_path = tmp.path().join("sealed.commit");
+        let data_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_rw(&upper_data, false).expect("reopen upper data"));
+        let upper = open_file_rw(data_file.clone(), None)
+            .await
+            .expect("open upper for sealing");
+        upper.close_seal().await.expect("seal upper");
+        data_file.sync().await.expect("sync sealed upper");
+        tokio::fs::rename(&upper_data, &sealed_path)
+            .await
+            .expect("move sealed upper");
+
+        assert_eq!(
+            read_only
+                .read_at(0, 4096)
+                .await
+                .expect("read sealed inode through existing image"),
+            vec![0x22; 4096]
+        );
+        assert!(read_only.write_at(0, &[0x33; 4096]).await.is_err());
+
+        let next_upper = tmp.path().join("upper.data");
+        prepare_runtime_upper(&next_upper, None, 8192, UpperMode::Sparse)
+            .expect("create next sparse upper");
+        let next_config = ImageConfig {
+            repo_blob_url: String::new(),
+            lowers: vec![LayerConfig {
+                file: sealed_path.to_string_lossy().into_owned(),
+                ..LayerConfig::default()
+            }],
+            upper: UpperConfig {
+                mode: Some(UpperMode::Sparse),
+                index: String::new(),
+                data: next_upper.to_string_lossy().into_owned(),
+                target: String::new(),
+                gzip_index: String::new(),
+            },
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+        let next = ImageFile::open(next_config, service, None)
+            .await
+            .expect("open next upper");
+        next.write_at(0, &[0x44; 4096])
+            .await
+            .expect("write next upper");
+        assert_eq!(
+            next.read_at(0, 4096).await.expect("read next upper"),
+            vec![0x44; 4096]
+        );
     }
 
     // Sparse LSMT files are rejected where the filesystem does not guarantee
@@ -2021,11 +2150,12 @@ mod tests {
             let index: Arc<dyn VirtualFile> = Arc::new(
                 LocalFile::open_rw(&state.config.upper.index, false).expect("open upper index"),
             );
-            state.base = ImageFileBase::ReadWrite(
-                open_file_rw(data.clone(), Some(index))
+            state.base = ImageFileBase::Upper {
+                file: open_file_rw(data.clone(), Some(index))
                     .await
                     .expect("reopen upper with paused writes"),
-            );
+                read_only_upper: false,
+            };
         }
         data.pause_next.store(true, AtomicOrdering::SeqCst);
 
