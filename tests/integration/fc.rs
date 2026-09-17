@@ -392,7 +392,7 @@ async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<(
     write_disk_marker(&mut sandbox).await?;
     let temp = tempfile::tempdir()?;
     let artifact_root = temp.path().join("paused-artifacts");
-    let paused_state = SandboxBackend::pause(&mut sandbox, Some(&artifact_root)).await?;
+    let paused_state = SandboxBackend::pause(&mut sandbox).await?;
     sandbox.stop().await?;
 
     let encoded = paused_state.encode()?;

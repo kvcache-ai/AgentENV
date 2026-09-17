@@ -31,7 +31,8 @@ use crate::types::{RuntimeArtifactSet, SandboxId};
 /// The Orchestrator treats this value as completely opaque: it stores it in
 /// its `SandboxMetadata` after a `pause` call and passes it back to
 /// [`SandboxBackendFactory::build_from_paused_state`] when a resume is requested.
-/// Concrete implementations own their serialized form.
+/// Concrete implementations own their serialized form. A paused state can be retried
+/// only before backend startup begins; a failed startup invalidates that state.
 pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
     fn encode(&self) -> Result<Value>;
 
@@ -90,6 +91,7 @@ pub type SandboxForkResult = anyhow::Result<Box<dyn SandboxBackend>>;
 
 #[derive(Clone, Debug)]
 pub struct SandboxForkSpec {
+    pub storage_root: PathBuf,
     pub sandbox_id: SandboxId,
     pub envd_access_token: Option<EnvdAccessToken>,
     pub extra_drives: Vec<super::ExtraDrive>,
@@ -220,10 +222,7 @@ pub trait SandboxBackend: Send + 'static {
     ///
     /// For simplicity, [`SandboxCaptureError::Recoverable`] must guarantee the sandbox
     /// has already been restored to a running state before the error is returned.
-    async fn pause(
-        &mut self,
-        artifact_root: Option<&Path>,
-    ) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>>;
+    async fn pause(&mut self) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>>;
 
     /// Resume a paused but not-yet-stopped sandbox from its snapshot.
     ///
@@ -233,7 +232,6 @@ pub trait SandboxBackend: Send + 'static {
     /// Capture a persistent snapshot from a running sandbox.
     ///
     /// After this call the sandbox is expected to continue running.
-    ///
     /// [`SandboxCaptureError::Terminal`] indicates snapshot capture mutated the live
     /// runtime before failing, so callers must not keep treating the sandbox
     /// as safely runnable.
@@ -317,13 +315,15 @@ pub trait SandboxBackend: Send + 'static {
 /// Factory interface for creating and restoring sandbox backend instances.
 ///
 /// A single factory instance is stored inside the `Orchestrator` and is
-/// used for every `create_sandbox` and `resume_sandbox` request.
+/// used for every `create_sandbox` and `resume_sandbox` request. Runtime directories
+/// are owned by the service; backends borrow their paths and never reclaim them on drop.
 pub trait SandboxBackendFactory: Send + Sync + 'static {
     /// Build a brand-new sandbox backend from a high-level launch request.
     fn build(
         &self,
         build_spec: FreshSandboxBuildSpec,
         launch_config: SandboxLaunchConfig,
+        storage_root: &Path,
     ) -> Result<Box<dyn SandboxBackend>>;
 
     /// Build a sandbox backend from a runnable committed snapshot plus launch request.
@@ -331,6 +331,7 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         &self,
         snapshot: &RunnableSnapshot,
         launch_config: SandboxLaunchConfig,
+        storage_root: &Path,
     ) -> Result<Box<dyn SandboxBackend>>;
 
     /// Decode backend-specific paused state loaded from persistence.
@@ -346,6 +347,7 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         sandbox_id: crate::types::SandboxId,
         state: &dyn PausedSandboxState,
         envd_access_token: Option<EnvdAccessToken>,
+        storage_root: &Path,
     ) -> Result<Box<dyn SandboxBackend>>;
 }
 

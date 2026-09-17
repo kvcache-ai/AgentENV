@@ -7,7 +7,6 @@ use serde_json::Value;
 use tokio::fs;
 use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use super::{PersistenceResult, SandboxPersistenceError, SandboxPersister};
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
@@ -224,11 +223,13 @@ impl FileBackedSandboxPersister {
                 continue;
             }
 
-            let Some(sandbox_id) = entry
-                .file_name()
-                .to_str()
-                .and_then(|name| SandboxId::parse_str(name).ok())
-            else {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(".retired-") {
+                Self::remove_artifact_root(&entry.path()).await?;
+                continue;
+            }
+            let Some(sandbox_id) = SandboxId::parse_str(&name).ok() else {
                 continue;
             };
 
@@ -316,47 +317,34 @@ impl SandboxPersister for FileBackedSandboxPersister {
         Ok(sandboxes)
     }
 
-    async fn allocate_artifact_root(
-        &self,
-        sandbox_id: &SandboxId,
-    ) -> PersistenceResult<Option<PathBuf>> {
-        let artifact_root = self
-            .sandbox_artifact_root(sandbox_id)
-            .join(Uuid::now_v7().to_string());
-        fs::create_dir_all(&artifact_root).await.map_err(|source| {
-            SandboxPersistenceError::io(
-                "allocate paused sandbox artifact root",
-                &artifact_root,
-                source,
-            )
+    async fn prepare_runtime_root(&self, sandbox_id: &SandboxId) -> PersistenceResult<PathBuf> {
+        let root = self.sandbox_artifact_root(sandbox_id).join("runtime");
+        fs::create_dir_all(&root).await.map_err(|source| {
+            SandboxPersistenceError::io("prepare runtime storage", &root, source)
         })?;
-        Ok(Some(artifact_root))
+        fs::canonicalize(&root)
+            .await
+            .map_err(|source| SandboxPersistenceError::io("resolve runtime storage", &root, source))
     }
 
     async fn persist_paused(
         &self,
         metadata: &SandboxMetadata,
-        artifact_root: Option<&Path>,
         paused_state: &dyn PausedSandboxState,
     ) -> PersistenceResult<()> {
-        let artifact_root = artifact_root.ok_or_else(|| SandboxPersistenceError::RuntimeState {
-            reason: "file-backed persister requires an allocated artifact root",
-        })?;
+        let artifact_root = self.sandbox_artifact_root(&metadata.id).join("runtime");
         debug!(
             sandbox_id = %metadata.id,
             artifact_root = %artifact_root.display(),
             "persisting paused sandbox"
         );
-        let state = match paused_state.encode() {
-            Ok(state) => state,
-            Err(source) => {
-                let _ = Self::remove_artifact_root(artifact_root).await;
-                return Err(SandboxPersistenceError::InvalidRecord {
+        let state =
+            paused_state
+                .encode()
+                .map_err(|source| SandboxPersistenceError::InvalidRecord {
                     reason: "failed to encode paused sandbox state".to_string(),
                     source: Some(source),
-                });
-            }
-        };
+                })?;
         let record = PersistedPausedRecord {
             version: RECORD_VERSION,
             lifecycle: PersistedPausedLifecycle::Paused,
@@ -364,11 +352,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
             artifact_root: artifact_root.to_path_buf(),
             state,
         };
-        let result = self.put_record(&record).await;
-        if result.is_err() {
-            let _ = Self::remove_artifact_root(artifact_root).await;
-        }
-        result
+        self.put_record(&record).await
     }
 
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
@@ -393,7 +377,14 @@ impl SandboxPersister for FileBackedSandboxPersister {
     async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
         debug!(sandbox_id = %sandbox_id, "deleting paused sandbox record and artifacts");
         self.remove_record(sandbox_id).await?;
-        Self::remove_artifact_root(&self.sandbox_artifact_root(sandbox_id)).await?;
+        // Once the record is gone, cleanup errors must not restore a Paused sandbox.
+        if let Err(error) = super::retire_artifacts(&self.sandbox_artifact_root(sandbox_id)).await {
+            warn!(
+                %sandbox_id,
+                %error,
+                "deleted sandbox record; deferring artifact retirement to orphan cleanup"
+            );
+        }
         Ok(())
     }
 }
@@ -433,6 +424,7 @@ mod tests {
             &self,
             _build_spec: FreshSandboxBuildSpec,
             _launch_config: SandboxLaunchConfig,
+            _storage_root: &Path,
         ) -> Result<Box<dyn SandboxBackend>> {
             unreachable!("persister tests only decode state")
         }
@@ -441,6 +433,7 @@ mod tests {
             &self,
             _snapshot: &RunnableSnapshot,
             _launch_config: SandboxLaunchConfig,
+            _storage_root: &Path,
         ) -> Result<Box<dyn SandboxBackend>> {
             unreachable!("persister tests only decode state")
         }
@@ -450,6 +443,7 @@ mod tests {
             _sandbox_id: SandboxId,
             _state: &dyn PausedSandboxState,
             _envd_access_token: Option<crate::sandbox::EnvdAccessToken>,
+            _storage_root: &Path,
         ) -> Result<Box<dyn SandboxBackend>> {
             unreachable!("persister tests only decode state")
         }
@@ -486,7 +480,7 @@ mod tests {
         };
         let sandbox_id = metadata.id;
         persister
-            .persist_paused(&metadata, Some(snapshot_root), paused_state.as_ref())
+            .persist_paused(&metadata, paused_state.as_ref())
             .await?;
         Ok((sandbox_id, paused_state))
     }
@@ -516,7 +510,7 @@ mod tests {
         };
 
         persister
-            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
+            .persist_paused(&metadata, paused_state.as_ref())
             .await?;
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
 
@@ -594,22 +588,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allocate_artifact_root_creates_unique_snapshot_roots() -> anyhow::Result<()> {
+    async fn runtime_root_is_stable_for_a_sandbox() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let sandbox_id = SandboxId::new();
 
-        let first_root = persister
-            .allocate_artifact_root(&sandbox_id)
-            .await?
-            .expect("file-backed persister should allocate artifact root");
-        let second_root = persister
-            .allocate_artifact_root(&sandbox_id)
-            .await?
-            .expect("file-backed persister should allocate artifact root");
+        let first_root = persister.prepare_runtime_root(&sandbox_id).await?;
+        let second_root = persister.prepare_runtime_root(&sandbox_id).await?;
         let sandbox_id_dir = sandbox_id.to_string();
 
-        assert_ne!(first_root, second_root);
+        assert_eq!(first_root, second_root);
         assert!(first_root.is_dir());
         assert!(second_root.is_dir());
         assert_eq!(
@@ -642,7 +630,7 @@ mod tests {
         };
 
         persister
-            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
+            .persist_paused(&metadata, paused_state.as_ref())
             .await?;
         persister.mark_resuming(&metadata.id).await?;
 
@@ -663,7 +651,7 @@ mod tests {
         let metadata = SandboxMetadata::default();
 
         persister
-            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
+            .persist_paused(&metadata, paused_state.as_ref())
             .await?;
         drop(paused_state);
 
@@ -672,23 +660,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_paused_cleans_artifacts_when_encode_fails() -> anyhow::Result<()> {
+    async fn persist_paused_keeps_live_artifacts_when_encode_fails() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let snapshot_root = temp.path().join("artifacts");
         tokio::fs::create_dir_all(&snapshot_root).await?;
         let paused_state: Arc<dyn PausedSandboxState> = Arc::new(FailingEncodeState);
         let err = persister
-            .persist_paused(
-                &SandboxMetadata::default(),
-                Some(&snapshot_root),
-                paused_state.as_ref(),
-            )
+            .persist_paused(&SandboxMetadata::default(), paused_state.as_ref())
             .await
             .expect_err("encode failure should reject paused state");
 
         assert!(matches!(err, SandboxPersistenceError::InvalidRecord { .. }));
-        assert!(!snapshot_root.exists());
+        assert!(snapshot_root.exists());
         Ok(())
     }
 
@@ -715,16 +699,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_record_removes_record_but_keeps_artifacts() -> anyhow::Result<()> {
+    async fn retired_cleanup_preserves_a_new_pause_for_the_same_sandbox() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        let (sandbox_id, _paused_state) = persist_test_record(&persister, &snapshot_root).await?;
+        let sandbox_id = SandboxId::new();
+        let root = persister.sandbox_artifact_root(&sandbox_id);
+        tokio::fs::create_dir_all(root.join("old-generation")).await?;
+        persister.delete_record_and_artifacts(&sandbox_id).await?;
 
-        persister.delete_record(&sandbox_id).await?;
+        let fresh = persister.prepare_runtime_root(&sandbox_id).await?;
+        let state = paused_state(&fresh);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            ..Default::default()
+        };
+        persister.persist_paused(&metadata, state.as_ref()).await?;
 
-        assert!(!has_record(&persister, &sandbox_id).await?);
-        assert!(snapshot_root.exists());
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let mut entries = tokio::fs::read_dir(persister.artifacts_root()).await?;
+                let mut retired = false;
+                while let Some(entry) = entries.next_entry().await? {
+                    retired |= entry.file_name().to_string_lossy().starts_with(".retired-");
+                }
+                if !retired {
+                    return Ok::<_, std::io::Error>(());
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await??;
+        assert!(fresh.exists());
+        assert_eq!(
+            persister.get_record(&sandbox_id).await?.artifact_root,
+            fresh
+        );
         Ok(())
     }
 
@@ -760,13 +769,27 @@ mod tests {
             ..Default::default()
         };
         persister
-            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
+            .persist_paused(&metadata, paused_state.as_ref())
             .await?;
 
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
 
         assert_eq!(loaded.len(), 1);
         assert!(persister.sandbox_artifact_root(&sandbox_id).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_record_removes_record_but_keeps_artifacts() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let snapshot_root = temp.path().join("artifacts");
+        let (sandbox_id, _) = persist_test_record(&persister, &snapshot_root).await?;
+
+        persister.delete_record(&sandbox_id).await?;
+
+        assert!(!has_record(&persister, &sandbox_id).await?);
+        assert!(snapshot_root.exists());
         Ok(())
     }
 
@@ -785,13 +808,45 @@ mod tests {
             ..Default::default()
         };
         persister
-            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
+            .persist_paused(&metadata, paused_state.as_ref())
             .await?;
 
         persister.delete_record_and_artifacts(&sandbox_id).await?;
 
         assert!(!has_record(&persister, &sandbox_id).await?);
         assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn artifact_cleanup_failure_does_not_restore_a_deleted_record() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        let sandbox_id = SandboxId::new();
+        let sandbox_artifact_root = persister.sandbox_artifact_root(&sandbox_id);
+        let snapshot_root = sandbox_artifact_root.join("snapshot");
+        let paused_state = paused_state(&snapshot_root);
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            paused_state: Some(Arc::clone(&paused_state)),
+            ..Default::default()
+        };
+        persister
+            .persist_paused(&metadata, paused_state.as_ref())
+            .await?;
+        tokio::fs::remove_dir_all(&sandbox_artifact_root).await?;
+        tokio::fs::write(&sandbox_artifact_root, b"not a directory").await?;
+
+        persister.delete_record_and_artifacts(&sandbox_id).await?;
+
+        assert!(!has_record(&persister, &sandbox_id).await?);
+        assert!(!sandbox_artifact_root.exists());
+        assert!(std::fs::read_dir(persister.artifacts_root())?
+            .filter_map(Result::ok)
+            .any(
+                |entry| entry.file_name().to_string_lossy().starts_with(".retired-")
+                    && entry.path().is_file()
+            ));
         Ok(())
     }
 
@@ -859,7 +914,7 @@ mod tests {
             ..Default::default()
         };
         persister
-            .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
+            .persist_paused(&metadata, paused_state.as_ref())
             .await?;
 
         let loaded = persister.load_all(&RejectingFactory).await?;
