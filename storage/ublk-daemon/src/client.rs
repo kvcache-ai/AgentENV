@@ -11,7 +11,7 @@ use warm_pool::PoolConfig;
 
 use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, DeviceRole, DeviceSpec,
-    PackRecordingState, RestackSnapshotStats,
+    PackRecordingState, RestackSnapshotStats, SourceStateStrategy,
 };
 use overlaybd::config::UpperMode;
 
@@ -524,9 +524,20 @@ impl UblkDaemonClient {
         image_config: &Path,
         global_config: &Path,
     ) -> Result<(u32, PathBuf)> {
+        self.create_overlaybd_with_upper_access(image_config, global_config, false)
+            .await
+    }
+
+    pub async fn create_overlaybd_with_upper_access(
+        &self,
+        image_config: &Path,
+        global_config: &Path,
+        read_only_upper: bool,
+    ) -> Result<(u32, PathBuf)> {
         let request = DaemonRequest::CreateOverlaybd {
             image_config: image_config.to_path_buf(),
             global_config: global_config.to_path_buf(),
+            read_only_upper,
         };
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::DeviceCreated {
@@ -657,12 +668,23 @@ impl UblkDaemonClient {
     }
 
     /// Create an OverlayBD runtime config and acquire a ublk device for it.
-    ///
-    /// This is the sandbox rootfs/extra-drive path. The daemon owns runtime
-    /// materialization and returns the generated runtime image config path.
     pub async fn create_overlaybd_runtime_device(
         &self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,
+    ) -> Result<OverlaybdRuntimeDevice> {
+        self.create_overlaybd_runtime_device_with_source_state_strategy(
+            request,
+            SourceStateStrategy::Reuse,
+        )
+        .await
+    }
+
+    /// Create an OverlayBD runtime while optionally consuming source-owned
+    /// state into the new runtime directory before opening the device.
+    pub async fn create_overlaybd_runtime_device_with_source_state_strategy(
+        &self,
+        request: CreateOverlaybdRuntimeDeviceRequest<'_>,
+        source_state_strategy: SourceStateStrategy,
     ) -> Result<OverlaybdRuntimeDevice> {
         let request = DaemonRequest::CreateOverlaybdRuntimeDevice {
             source_image_config: request.source_image_config.to_path_buf(),
@@ -673,6 +695,7 @@ impl UblkDaemonClient {
             requested_virtual_size: request.requested_virtual_size,
             known_source_virtual_size: request.known_source_virtual_size,
             allow_shrink: request.allow_shrink,
+            source_state_strategy,
         };
         match self
             .call(request, self.inner.runtime_device_timeout)
@@ -762,6 +785,21 @@ impl UblkDaemonClient {
         }
     }
 
+    /// Flush a live image after its owning VM has stopped issuing I/O.
+    pub async fn flush_for_checkpoint(&self, dev_id: u32) -> Result<()> {
+        let request = DaemonRequest::FlushForCheckpoint { dev_id };
+        match self.call(request, SNAPSHOT_TIMEOUT).await? {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::TerminalError { message } => {
+                bail!("daemon: checkpoint flush dev_id={dev_id} failed terminally: {message}")
+            }
+            DaemonResponse::Error { message } => {
+                bail!("daemon: checkpoint flush dev_id={dev_id} failed: {message}")
+            }
+            other => bail!("daemon: unexpected response for checkpoint flush: {other:?}"),
+        }
+    }
+
     /// Request graceful daemon shutdown.
     ///
     /// Signals the watchdog that this is an expected exit so it does not
@@ -812,11 +850,30 @@ impl UblkDaemonClient {
         virtual_size: Option<u64>,
         access_mode: AccessMode,
     ) -> Result<(u32, PathBuf)> {
+        self.acquire_overlaybd_with_upper_access(
+            image_config,
+            global_config,
+            virtual_size,
+            access_mode,
+            false,
+        )
+        .await
+    }
+
+    pub async fn acquire_overlaybd_with_upper_access(
+        &self,
+        image_config: &Path,
+        global_config: &Path,
+        virtual_size: Option<u64>,
+        access_mode: AccessMode,
+        read_only_upper: bool,
+    ) -> Result<(u32, PathBuf)> {
         let request = DaemonRequest::AcquireOverlaybd {
             image_config: image_config.to_path_buf(),
             global_config: global_config.to_path_buf(),
             virtual_size,
             access_mode,
+            read_only_upper,
         };
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::DeviceAcquired {
@@ -1057,6 +1114,7 @@ enum RegistryUpdate {
     Add {
         image_config: PathBuf,
         global_config: PathBuf,
+        read_only_upper: bool,
         role: DeviceRole,
     },
     /// Dropped whatever the outcome: the caller stops using the device. If
@@ -1072,24 +1130,29 @@ impl RegistryUpdate {
             DaemonRequest::CreateOverlaybd {
                 image_config,
                 global_config,
+                read_only_upper,
             } => Some(Self::Add {
                 image_config: image_config.clone(),
                 global_config: global_config.clone(),
+                read_only_upper: *read_only_upper,
                 role: DeviceRole::Raw,
             }),
             DaemonRequest::CreateOverlaybdRuntimeDevice { global_config, .. } => Some(Self::Add {
                 image_config: PathBuf::new(),
                 global_config: global_config.clone(),
+                read_only_upper: false,
                 role: DeviceRole::Exclusive,
             }),
             DaemonRequest::AcquireOverlaybd {
                 image_config,
                 global_config,
                 access_mode,
+                read_only_upper,
                 ..
             } => Some(Self::Add {
                 image_config: image_config.clone(),
                 global_config: global_config.clone(),
+                read_only_upper: *read_only_upper,
                 role: match access_mode {
                     AccessMode::Exclusive => DeviceRole::Exclusive,
                     AccessMode::Shared => DeviceRole::Shared { refcount: 1 },
@@ -1107,6 +1170,7 @@ impl RegistryUpdate {
             Self::Add {
                 image_config,
                 global_config,
+                read_only_upper,
                 role,
             } => {
                 let (dev_id, image_config) = match response {
@@ -1136,6 +1200,7 @@ impl RegistryUpdate {
                         dev_id,
                         image_config,
                         global_config,
+                        read_only_upper,
                         role,
                     },
                 );
@@ -1330,7 +1395,7 @@ mod tests {
         let global = Path::new("/global.json");
 
         client
-            .create_overlaybd(Path::new("/raw.json"), global)
+            .create_overlaybd_with_upper_access(Path::new("/raw.json"), global, true)
             .await
             .unwrap();
         client
@@ -1352,24 +1417,31 @@ mod tests {
             .unwrap();
         for _ in 0..2 {
             client
-                .acquire_overlaybd(Path::new("/mem.json"), global, None, AccessMode::Shared)
+                .acquire_overlaybd_with_upper_access(
+                    Path::new("/mem.json"),
+                    global,
+                    None,
+                    AccessMode::Shared,
+                    true,
+                )
                 .await
                 .unwrap();
         }
 
-        let spec = |dev_id, image_config: &str, role| DeviceSpec {
+        let spec = |dev_id, image_config: &str, role, read_only_upper| DeviceSpec {
             dev_id,
             image_config: PathBuf::from(image_config),
             global_config: global.to_path_buf(),
+            read_only_upper,
             role,
         };
         assert_eq!(
             registry(&client),
             vec![
-                spec(1, "/raw.json", DeviceRole::Raw),
-                spec(2, "/run/rootfs/image.json", DeviceRole::Exclusive),
-                spec(3, "/x.json", DeviceRole::Exclusive),
-                spec(4, "/mem.json", DeviceRole::Shared { refcount: 2 }),
+                spec(1, "/raw.json", DeviceRole::Raw, true),
+                spec(2, "/run/rootfs/image.json", DeviceRole::Exclusive, false),
+                spec(3, "/x.json", DeviceRole::Exclusive, false),
+                spec(4, "/mem.json", DeviceRole::Shared { refcount: 2 }, true),
             ]
         );
 
@@ -1383,7 +1455,12 @@ mod tests {
         client.delete(1).await.unwrap();
         assert_eq!(
             registry(&client),
-            vec![spec(2, "/run/rootfs/image.json", DeviceRole::Exclusive)]
+            vec![spec(
+                2,
+                "/run/rootfs/image.json",
+                DeviceRole::Exclusive,
+                false
+            )]
         );
     }
 
