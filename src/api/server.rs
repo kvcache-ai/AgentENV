@@ -37,6 +37,7 @@ where
         .route_layer(middleware::from_fn(optional_connect_body))
         .route_layer(middleware::from_fn(sandbox_logs_cursor))
         .merge(proxy::router(api_impl.clone()))
+        .merge(super::snapshot_placement::router(api_impl.clone()))
         .merge(super::impls::image_build::router(api_impl.clone()))
         .route("/metrics", get(metrics_handler))
         .layer(middleware::from_fn_with_state(

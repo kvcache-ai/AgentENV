@@ -2307,6 +2307,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_placement_requires_control_plane_authentication() {
+        let app = server::new(build_api().await);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/internal/snapshots/placement?snapshotID=snapshot-test")
+                    .header(SANDBOX_ID_HEADER, SandboxId::new().to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn proxy_requires_routing_headers() {
         let app = server::new(build_api().await);
 
