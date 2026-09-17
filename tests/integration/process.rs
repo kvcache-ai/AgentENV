@@ -1,4 +1,5 @@
 use crate::common;
+use agentenv::types::SandboxId;
 
 use std::collections::HashMap;
 
@@ -12,7 +13,7 @@ const TEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// Helper: create and start a sandbox for process tests.
 async fn start_sandbox() -> Result<FirecrackerSandbox> {
     let sandbox_config = common::default_sandbox_config()?;
-    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config, SandboxId::new(), None)?;
     sandbox.start().await?;
     Ok(sandbox)
 }
@@ -60,14 +61,21 @@ async fn numeric_image_users_preserve_identity_after_start_and_resume() -> Resul
         config.mem_size_mib = 512;
         config.common.default_user = Some(identity.to_owned());
         config.common.default_workdir = Some("/tmp".to_owned());
-        let mut sandbox = FirecrackerSandbox::new(config)?;
+        let mut sandbox = FirecrackerSandbox::new(config, agentenv::types::SandboxId::new(), None)?;
         sandbox.start().await?;
 
         for restored in [false, true] {
             if restored {
-                let snapshot = sandbox.pause().await?;
+                let snapshot = sandbox
+                    .capture_snapshot(agentenv::snapshot::SnapshotPlacement::Distributed)
+                    .await?;
                 sandbox.stop().await?;
-                sandbox = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
+                sandbox = FirecrackerSandbox::from_snapshot_config(
+                    &snapshot,
+                    agentenv::types::SandboxId::new(),
+                    None,
+                )?;
+                sandbox.start().await?;
             }
             let output = sandbox
                 .run_command_with_opts(

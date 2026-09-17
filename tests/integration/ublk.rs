@@ -1,4 +1,6 @@
 use crate::common;
+use agentenv::snapshot::SnapshotPlacement;
+use agentenv::types::SandboxId;
 
 use agentenv::sandbox::{
     FirecrackerSandbox, FirecrackerSandboxConfig, SandboxExecutor, UblkBackend, UblkConfig,
@@ -37,7 +39,7 @@ async fn sandbox_config_with_overlaybd_ublk() -> Result<FirecrackerSandboxConfig
 async fn overlaybd_ublk_lifecycle() -> Result<()> {
     common::setup().await;
     let config = sandbox_config_with_overlaybd_ublk().await?;
-    let mut sandbox = FirecrackerSandbox::new(config)?;
+    let mut sandbox = FirecrackerSandbox::new(config, SandboxId::new(), None)?;
     sandbox.start().await?;
 
     let output = sandbox.run_command("echo", &["hello-overlaybd"]).await?;
@@ -59,10 +61,13 @@ async fn overlaybd_ublk_lifecycle() -> Result<()> {
         .await?;
     assert_eq!(output.exit_code, 0);
 
-    let snapshot = sandbox.pause().await?;
+    let snapshot = sandbox
+        .capture_snapshot(SnapshotPlacement::Distributed)
+        .await?;
     sandbox.stop().await?;
 
-    let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
+    let mut resumed = FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+    resumed.start().await?;
 
     let output = resumed
         .run_command("cat", &["/tmp/overlaybd_test.txt"])
