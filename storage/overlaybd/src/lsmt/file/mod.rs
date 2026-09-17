@@ -4,7 +4,9 @@ mod readwrite;
 mod stack;
 mod types;
 
-pub use helper::{compact_to, create_mappings_from_sparse, validate_rw_header_pair_paths};
+pub use helper::{
+    checkpoint_sparse_index, compact_to, create_mappings_from_sparse, validate_rw_header_pair_paths,
+};
 pub(crate) use helper::{initialize_file_rw_paths, load_readonly_layers_metadata};
 pub use readonly::LSMTReadOnlyFile;
 pub use readwrite::LSMTFile;
