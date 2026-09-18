@@ -377,7 +377,7 @@ snapshot publication/runtime resolution as an optional acceleration path.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | Enable the P2P artifact transport. When false, AgentENV uses `DisabledP2pTransport`, so lookups miss and publishes are no-ops. |
-| `transport` | string | `"iroh"` | Transport backend. Supported values are `"disabled"` and `"iroh"`. Ignored while `enabled = false`. |
+| `transport` | string | `"iroh"` | Transport backend. Supported values are `"disabled"` and `"iroh"`. Ignored while `enabled = false`; enabling `"iroh"` requires a server built with the `p2p-iroh` Cargo feature. |
 | `store_dir` | string | `"$AENV_HOME/p2p/store"` | Local store used by the transport backend. Relative explicit paths are resolved against the config file directory. |
 | `listen_addr` | string | `"0.0.0.0:0"` | Optional local listen address for the embedded transport endpoint. Port `0` lets the OS choose a free port. |
 | `lookup_timeout_ms` | integer | `5000` | Timeout for one artifact catalog lookup against a peer. |
