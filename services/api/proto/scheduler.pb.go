@@ -1238,6 +1238,11 @@ type HeartbeatRequest struct {
 	Snapshot          *NodeSnapshot          `protobuf:"bytes,7,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
 	SandboxIds        []string               `protobuf:"bytes,8,rep,name=sandbox_ids,json=sandboxIds,proto3" json:"sandbox_ids,omitempty"`
 	P2PEndpoint       *P2PEndpoint           `protobuf:"bytes,9,opt,name=p2p_endpoint,json=p2pEndpoint,proto3" json:"p2p_endpoint,omitempty"`
+	// HTTP endpoint used by heartbeat discovery, for example
+	// http://10.0.0.10:8000. Static and Kubernetes discovery ignore it.
+	Endpoint string `protobuf:"bytes,10,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
+	// Shared secret required when the scheduler uses heartbeat discovery.
+	RegistrationToken string `protobuf:"bytes,11,opt,name=registration_token,json=registrationToken,proto3" json:"registration_token,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -1333,6 +1338,20 @@ func (x *HeartbeatRequest) GetP2PEndpoint() *P2PEndpoint {
 		return x.P2PEndpoint
 	}
 	return nil
+}
+
+func (x *HeartbeatRequest) GetEndpoint() string {
+	if x != nil {
+		return x.Endpoint
+	}
+	return ""
+}
+
+func (x *HeartbeatRequest) GetRegistrationToken() string {
+	if x != nil {
+		return x.RegistrationToken
+	}
+	return ""
 }
 
 type HeartbeatResponse struct {
@@ -2307,6 +2326,373 @@ func (*UnregisterNodeResponse) Descriptor() ([]byte, []int) {
 	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{36}
 }
 
+type GetFleetPlanRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Current infrastructure members, including VMs that have not completed
+	// AgentENV registration. The scheduler uses the difference from observed
+	// node IDs to count booting capacity without probing hosts.
+	FleetNodeIds  []string `protobuf:"bytes,1,rep,name=fleet_node_ids,json=fleetNodeIds,proto3" json:"fleet_node_ids,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetFleetPlanRequest) Reset() {
+	*x = GetFleetPlanRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[37]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetFleetPlanRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetFleetPlanRequest) ProtoMessage() {}
+
+func (x *GetFleetPlanRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[37]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetFleetPlanRequest.ProtoReflect.Descriptor instead.
+func (*GetFleetPlanRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{37}
+}
+
+func (x *GetFleetPlanRequest) GetFleetNodeIds() []string {
+	if x != nil {
+		return x.FleetNodeIds
+	}
+	return nil
+}
+
+type FleetNodeReference struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	NodeId            string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	ServiceInstanceId string                 `protobuf:"bytes,2,opt,name=service_instance_id,json=serviceInstanceId,proto3" json:"service_instance_id,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *FleetNodeReference) Reset() {
+	*x = FleetNodeReference{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[38]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FleetNodeReference) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FleetNodeReference) ProtoMessage() {}
+
+func (x *FleetNodeReference) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[38]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FleetNodeReference.ProtoReflect.Descriptor instead.
+func (*FleetNodeReference) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{38}
+}
+
+func (x *FleetNodeReference) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *FleetNodeReference) GetServiceInstanceId() string {
+	if x != nil {
+		return x.ServiceInstanceId
+	}
+	return ""
+}
+
+type GetFleetPlanResponse struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	DesiredNodes       uint32                 `protobuf:"varint,1,opt,name=desired_nodes,json=desiredNodes,proto3" json:"desired_nodes,omitempty"`
+	ReadyNodes         uint32                 `protobuf:"varint,2,opt,name=ready_nodes,json=readyNodes,proto3" json:"ready_nodes,omitempty"`
+	ProvisioningNodes  uint32                 `protobuf:"varint,3,opt,name=provisioning_nodes,json=provisioningNodes,proto3" json:"provisioning_nodes,omitempty"`
+	CordonCandidates   []*FleetNodeReference  `protobuf:"bytes,4,rep,name=cordon_candidates,json=cordonCandidates,proto3" json:"cordon_candidates,omitempty"`
+	DeleteCandidates   []*FleetNodeReference  `protobuf:"bytes,5,rep,name=delete_candidates,json=deleteCandidates,proto3" json:"delete_candidates,omitempty"`
+	UncordonCandidates []*FleetNodeReference  `protobuf:"bytes,6,rep,name=uncordon_candidates,json=uncordonCandidates,proto3" json:"uncordon_candidates,omitempty"`
+	Reason             string                 `protobuf:"bytes,7,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *GetFleetPlanResponse) Reset() {
+	*x = GetFleetPlanResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetFleetPlanResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetFleetPlanResponse) ProtoMessage() {}
+
+func (x *GetFleetPlanResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetFleetPlanResponse.ProtoReflect.Descriptor instead.
+func (*GetFleetPlanResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *GetFleetPlanResponse) GetDesiredNodes() uint32 {
+	if x != nil {
+		return x.DesiredNodes
+	}
+	return 0
+}
+
+func (x *GetFleetPlanResponse) GetReadyNodes() uint32 {
+	if x != nil {
+		return x.ReadyNodes
+	}
+	return 0
+}
+
+func (x *GetFleetPlanResponse) GetProvisioningNodes() uint32 {
+	if x != nil {
+		return x.ProvisioningNodes
+	}
+	return 0
+}
+
+func (x *GetFleetPlanResponse) GetCordonCandidates() []*FleetNodeReference {
+	if x != nil {
+		return x.CordonCandidates
+	}
+	return nil
+}
+
+func (x *GetFleetPlanResponse) GetDeleteCandidates() []*FleetNodeReference {
+	if x != nil {
+		return x.DeleteCandidates
+	}
+	return nil
+}
+
+func (x *GetFleetPlanResponse) GetUncordonCandidates() []*FleetNodeReference {
+	if x != nil {
+		return x.UncordonCandidates
+	}
+	return nil
+}
+
+func (x *GetFleetPlanResponse) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+type CordonNodeRequest struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	NodeId            string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	ServiceInstanceId string                 `protobuf:"bytes,2,opt,name=service_instance_id,json=serviceInstanceId,proto3" json:"service_instance_id,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *CordonNodeRequest) Reset() {
+	*x = CordonNodeRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CordonNodeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CordonNodeRequest) ProtoMessage() {}
+
+func (x *CordonNodeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CordonNodeRequest.ProtoReflect.Descriptor instead.
+func (*CordonNodeRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *CordonNodeRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *CordonNodeRequest) GetServiceInstanceId() string {
+	if x != nil {
+		return x.ServiceInstanceId
+	}
+	return ""
+}
+
+type CordonNodeResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CordonNodeResponse) Reset() {
+	*x = CordonNodeResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CordonNodeResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CordonNodeResponse) ProtoMessage() {}
+
+func (x *CordonNodeResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CordonNodeResponse.ProtoReflect.Descriptor instead.
+func (*CordonNodeResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{41}
+}
+
+type UncordonNodeRequest struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	NodeId            string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	ServiceInstanceId string                 `protobuf:"bytes,2,opt,name=service_instance_id,json=serviceInstanceId,proto3" json:"service_instance_id,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *UncordonNodeRequest) Reset() {
+	*x = UncordonNodeRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UncordonNodeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UncordonNodeRequest) ProtoMessage() {}
+
+func (x *UncordonNodeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UncordonNodeRequest.ProtoReflect.Descriptor instead.
+func (*UncordonNodeRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *UncordonNodeRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *UncordonNodeRequest) GetServiceInstanceId() string {
+	if x != nil {
+		return x.ServiceInstanceId
+	}
+	return ""
+}
+
+type UncordonNodeResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UncordonNodeResponse) Reset() {
+	*x = UncordonNodeResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[43]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UncordonNodeResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UncordonNodeResponse) ProtoMessage() {}
+
+func (x *UncordonNodeResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[43]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UncordonNodeResponse.ProtoReflect.Descriptor instead.
+func (*UncordonNodeResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{43}
+}
+
 var File_api_proto_scheduler_proto protoreflect.FileDescriptor
 
 const file_api_proto_scheduler_proto_rawDesc = "" +
@@ -2399,7 +2785,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x06commit\x18\x06 \x01(\tR\x06commit\x12<\n" +
 	"\fmachine_info\x18\a \x01(\v2\x19.scheduler.v1.MachineInfoR\vmachineInfo\x126\n" +
 	"\bsnapshot\x18\b \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12)\n" +
-	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\"\x81\x03\n" +
+	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\"\xcc\x03\n" +
 	"\x10HeartbeatRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +
@@ -2411,7 +2797,10 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\bsnapshot\x18\a \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12\x1f\n" +
 	"\vsandbox_ids\x18\b \x03(\tR\n" +
 	"sandboxIds\x12<\n" +
-	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\";\n" +
+	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\x12\x1a\n" +
+	"\bendpoint\x18\n" +
+	" \x01(\tR\bendpoint\x12-\n" +
+	"\x12registration_token\x18\v \x01(\tR\x11registrationToken\";\n" +
 	"\x11HeartbeatResponse\x12&\n" +
 	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\"\xf9\x01\n" +
 	"\fSandboxEvent\x12\x1d\n" +
@@ -2475,7 +2864,29 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x15UnregisterNodeRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12.\n" +
 	"\x13service_instance_id\x18\x02 \x01(\tR\x11serviceInstanceId\"\x18\n" +
-	"\x16UnregisterNodeResponse*\x92\x01\n" +
+	"\x16UnregisterNodeResponse\";\n" +
+	"\x13GetFleetPlanRequest\x12$\n" +
+	"\x0efleet_node_ids\x18\x01 \x03(\tR\ffleetNodeIds\"]\n" +
+	"\x12FleetNodeReference\x12\x17\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12.\n" +
+	"\x13service_instance_id\x18\x02 \x01(\tR\x11serviceInstanceId\"\x94\x03\n" +
+	"\x14GetFleetPlanResponse\x12#\n" +
+	"\rdesired_nodes\x18\x01 \x01(\rR\fdesiredNodes\x12\x1f\n" +
+	"\vready_nodes\x18\x02 \x01(\rR\n" +
+	"readyNodes\x12-\n" +
+	"\x12provisioning_nodes\x18\x03 \x01(\rR\x11provisioningNodes\x12M\n" +
+	"\x11cordon_candidates\x18\x04 \x03(\v2 .scheduler.v1.FleetNodeReferenceR\x10cordonCandidates\x12M\n" +
+	"\x11delete_candidates\x18\x05 \x03(\v2 .scheduler.v1.FleetNodeReferenceR\x10deleteCandidates\x12Q\n" +
+	"\x13uncordon_candidates\x18\x06 \x03(\v2 .scheduler.v1.FleetNodeReferenceR\x12uncordonCandidates\x12\x16\n" +
+	"\x06reason\x18\a \x01(\tR\x06reason\"\\\n" +
+	"\x11CordonNodeRequest\x12\x17\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12.\n" +
+	"\x13service_instance_id\x18\x02 \x01(\tR\x11serviceInstanceId\"\x14\n" +
+	"\x12CordonNodeResponse\"^\n" +
+	"\x13UncordonNodeRequest\x12\x17\n" +
+	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12.\n" +
+	"\x13service_instance_id\x18\x02 \x01(\tR\x11serviceInstanceId\"\x16\n" +
+	"\x14UncordonNodeResponse*\x92\x01\n" +
 	"\n" +
 	"NodeStatus\x12\x1b\n" +
 	"\x17NODE_STATUS_UNSPECIFIED\x10\x00\x12\x15\n" +
@@ -2489,7 +2900,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x19SANDBOX_EVENT_TYPE_DELETE\x10\x02\x12\x1c\n" +
 	"\x18SANDBOX_EVENT_TYPE_PAUSE\x10\x03\x12\x1d\n" +
 	"\x19SANDBOX_EVENT_TYPE_RESUME\x10\x04\x12\x1b\n" +
-	"\x17SANDBOX_EVENT_TYPE_FORK\x10\x052\xa3\t\n" +
+	"\x17SANDBOX_EVENT_TYPE_FORK\x10\x052\xa2\v\n" +
 	"\tScheduler\x12I\n" +
 	"\bSchedule\x12\x1d.scheduler.v1.ScheduleRequest\x1a\x1e.scheduler.v1.ScheduleResponse\x12L\n" +
 	"\tListNodes\x12\x1e.scheduler.v1.ListNodesRequest\x1a\x1f.scheduler.v1.ListNodesResponse\x12O\n" +
@@ -2504,7 +2915,11 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x11ForgetP2pArtifact\x12&.scheduler.v1.ForgetP2pArtifactRequest\x1a'.scheduler.v1.ForgetP2pArtifactResponse\x12d\n" +
 	"\x11LookupP2pArtifact\x12&.scheduler.v1.LookupP2pArtifactRequest\x1a'.scheduler.v1.LookupP2pArtifactResponse\x12F\n" +
 	"\aGetNode\x12\x1c.scheduler.v1.GetNodeRequest\x1a\x1d.scheduler.v1.GetNodeResponse\x12[\n" +
-	"\x0eUnregisterNode\x12#.scheduler.v1.UnregisterNodeRequest\x1a$.scheduler.v1.UnregisterNodeResponseB)Z'agentenv/services/api/proto;schedulerv1b\x06proto3"
+	"\x0eUnregisterNode\x12#.scheduler.v1.UnregisterNodeRequest\x1a$.scheduler.v1.UnregisterNodeResponse\x12U\n" +
+	"\fGetFleetPlan\x12!.scheduler.v1.GetFleetPlanRequest\x1a\".scheduler.v1.GetFleetPlanResponse\x12O\n" +
+	"\n" +
+	"CordonNode\x12\x1f.scheduler.v1.CordonNodeRequest\x1a .scheduler.v1.CordonNodeResponse\x12U\n" +
+	"\fUncordonNode\x12!.scheduler.v1.UncordonNodeRequest\x1a\".scheduler.v1.UncordonNodeResponseB)Z'agentenv/services/api/proto;schedulerv1b\x06proto3"
 
 var (
 	file_api_proto_scheduler_proto_rawDescOnce sync.Once
@@ -2519,7 +2934,7 @@ func file_api_proto_scheduler_proto_rawDescGZIP() []byte {
 }
 
 var file_api_proto_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_api_proto_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
+var file_api_proto_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 46)
 var file_api_proto_scheduler_proto_goTypes = []any{
 	(NodeStatus)(0),                    // 0: scheduler.v1.NodeStatus
 	(SandboxEventType)(0),              // 1: scheduler.v1.SandboxEventType
@@ -2560,14 +2975,21 @@ var file_api_proto_scheduler_proto_goTypes = []any{
 	(*GetNodeResponse)(nil),            // 36: scheduler.v1.GetNodeResponse
 	(*UnregisterNodeRequest)(nil),      // 37: scheduler.v1.UnregisterNodeRequest
 	(*UnregisterNodeResponse)(nil),     // 38: scheduler.v1.UnregisterNodeResponse
-	nil,                                // 39: scheduler.v1.NewColdSandboxHint.MetadataEntry
-	nil,                                // 40: scheduler.v1.NewSandboxHint.MetadataEntry
+	(*GetFleetPlanRequest)(nil),        // 39: scheduler.v1.GetFleetPlanRequest
+	(*FleetNodeReference)(nil),         // 40: scheduler.v1.FleetNodeReference
+	(*GetFleetPlanResponse)(nil),       // 41: scheduler.v1.GetFleetPlanResponse
+	(*CordonNodeRequest)(nil),          // 42: scheduler.v1.CordonNodeRequest
+	(*CordonNodeResponse)(nil),         // 43: scheduler.v1.CordonNodeResponse
+	(*UncordonNodeRequest)(nil),        // 44: scheduler.v1.UncordonNodeRequest
+	(*UncordonNodeResponse)(nil),       // 45: scheduler.v1.UncordonNodeResponse
+	nil,                                // 46: scheduler.v1.NewColdSandboxHint.MetadataEntry
+	nil,                                // 47: scheduler.v1.NewSandboxHint.MetadataEntry
 }
 var file_api_proto_scheduler_proto_depIdxs = []int32{
 	4,  // 0: scheduler.v1.ScheduleRequestHint.new_cold_sandbox:type_name -> scheduler.v1.NewColdSandboxHint
 	5,  // 1: scheduler.v1.ScheduleRequestHint.new_sandbox:type_name -> scheduler.v1.NewSandboxHint
-	39, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
-	40, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
+	46, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
+	47, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
 	3,  // 4: scheduler.v1.ScheduleRequest.hint:type_name -> scheduler.v1.ScheduleRequestHint
 	2,  // 5: scheduler.v1.ScheduleResponse.node:type_name -> scheduler.v1.Node
 	2,  // 6: scheduler.v1.ListNodesResponse.nodes:type_name -> scheduler.v1.Node
@@ -2587,37 +3009,46 @@ var file_api_proto_scheduler_proto_depIdxs = []int32{
 	26, // 20: scheduler.v1.ListP2pPeersResponse.peers:type_name -> scheduler.v1.P2pPeer
 	26, // 21: scheduler.v1.LookupP2pArtifactResponse.peers:type_name -> scheduler.v1.P2pPeer
 	18, // 22: scheduler.v1.GetNodeResponse.node:type_name -> scheduler.v1.ObservedNode
-	6,  // 23: scheduler.v1.Scheduler.Schedule:input_type -> scheduler.v1.ScheduleRequest
-	8,  // 24: scheduler.v1.Scheduler.ListNodes:input_type -> scheduler.v1.ListNodesRequest
-	10, // 25: scheduler.v1.Scheduler.LookupNode:input_type -> scheduler.v1.LookupNodeRequest
-	12, // 26: scheduler.v1.Scheduler.RecordAssignment:input_type -> scheduler.v1.RecordAssignmentRequest
-	19, // 27: scheduler.v1.Scheduler.Heartbeat:input_type -> scheduler.v1.HeartbeatRequest
-	22, // 28: scheduler.v1.Scheduler.ReportSandboxEvent:input_type -> scheduler.v1.ReportSandboxEventRequest
-	24, // 29: scheduler.v1.Scheduler.ListObservedNodes:input_type -> scheduler.v1.ListObservedNodesRequest
-	27, // 30: scheduler.v1.Scheduler.ListP2pPeers:input_type -> scheduler.v1.ListP2pPeersRequest
-	29, // 31: scheduler.v1.Scheduler.RecordP2pArtifact:input_type -> scheduler.v1.RecordP2pArtifactRequest
-	31, // 32: scheduler.v1.Scheduler.ForgetP2pArtifact:input_type -> scheduler.v1.ForgetP2pArtifactRequest
-	33, // 33: scheduler.v1.Scheduler.LookupP2pArtifact:input_type -> scheduler.v1.LookupP2pArtifactRequest
-	35, // 34: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
-	37, // 35: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
-	7,  // 36: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
-	9,  // 37: scheduler.v1.Scheduler.ListNodes:output_type -> scheduler.v1.ListNodesResponse
-	11, // 38: scheduler.v1.Scheduler.LookupNode:output_type -> scheduler.v1.LookupNodeResponse
-	13, // 39: scheduler.v1.Scheduler.RecordAssignment:output_type -> scheduler.v1.RecordAssignmentResponse
-	20, // 40: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
-	23, // 41: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
-	25, // 42: scheduler.v1.Scheduler.ListObservedNodes:output_type -> scheduler.v1.ListObservedNodesResponse
-	28, // 43: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
-	30, // 44: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
-	32, // 45: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
-	34, // 46: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
-	36, // 47: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
-	38, // 48: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
-	36, // [36:49] is the sub-list for method output_type
-	23, // [23:36] is the sub-list for method input_type
-	23, // [23:23] is the sub-list for extension type_name
-	23, // [23:23] is the sub-list for extension extendee
-	0,  // [0:23] is the sub-list for field type_name
+	40, // 23: scheduler.v1.GetFleetPlanResponse.cordon_candidates:type_name -> scheduler.v1.FleetNodeReference
+	40, // 24: scheduler.v1.GetFleetPlanResponse.delete_candidates:type_name -> scheduler.v1.FleetNodeReference
+	40, // 25: scheduler.v1.GetFleetPlanResponse.uncordon_candidates:type_name -> scheduler.v1.FleetNodeReference
+	6,  // 26: scheduler.v1.Scheduler.Schedule:input_type -> scheduler.v1.ScheduleRequest
+	8,  // 27: scheduler.v1.Scheduler.ListNodes:input_type -> scheduler.v1.ListNodesRequest
+	10, // 28: scheduler.v1.Scheduler.LookupNode:input_type -> scheduler.v1.LookupNodeRequest
+	12, // 29: scheduler.v1.Scheduler.RecordAssignment:input_type -> scheduler.v1.RecordAssignmentRequest
+	19, // 30: scheduler.v1.Scheduler.Heartbeat:input_type -> scheduler.v1.HeartbeatRequest
+	22, // 31: scheduler.v1.Scheduler.ReportSandboxEvent:input_type -> scheduler.v1.ReportSandboxEventRequest
+	24, // 32: scheduler.v1.Scheduler.ListObservedNodes:input_type -> scheduler.v1.ListObservedNodesRequest
+	27, // 33: scheduler.v1.Scheduler.ListP2pPeers:input_type -> scheduler.v1.ListP2pPeersRequest
+	29, // 34: scheduler.v1.Scheduler.RecordP2pArtifact:input_type -> scheduler.v1.RecordP2pArtifactRequest
+	31, // 35: scheduler.v1.Scheduler.ForgetP2pArtifact:input_type -> scheduler.v1.ForgetP2pArtifactRequest
+	33, // 36: scheduler.v1.Scheduler.LookupP2pArtifact:input_type -> scheduler.v1.LookupP2pArtifactRequest
+	35, // 37: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
+	37, // 38: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
+	39, // 39: scheduler.v1.Scheduler.GetFleetPlan:input_type -> scheduler.v1.GetFleetPlanRequest
+	42, // 40: scheduler.v1.Scheduler.CordonNode:input_type -> scheduler.v1.CordonNodeRequest
+	44, // 41: scheduler.v1.Scheduler.UncordonNode:input_type -> scheduler.v1.UncordonNodeRequest
+	7,  // 42: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
+	9,  // 43: scheduler.v1.Scheduler.ListNodes:output_type -> scheduler.v1.ListNodesResponse
+	11, // 44: scheduler.v1.Scheduler.LookupNode:output_type -> scheduler.v1.LookupNodeResponse
+	13, // 45: scheduler.v1.Scheduler.RecordAssignment:output_type -> scheduler.v1.RecordAssignmentResponse
+	20, // 46: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
+	23, // 47: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
+	25, // 48: scheduler.v1.Scheduler.ListObservedNodes:output_type -> scheduler.v1.ListObservedNodesResponse
+	28, // 49: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
+	30, // 50: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
+	32, // 51: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
+	34, // 52: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
+	36, // 53: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
+	38, // 54: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
+	41, // 55: scheduler.v1.Scheduler.GetFleetPlan:output_type -> scheduler.v1.GetFleetPlanResponse
+	43, // 56: scheduler.v1.Scheduler.CordonNode:output_type -> scheduler.v1.CordonNodeResponse
+	45, // 57: scheduler.v1.Scheduler.UncordonNode:output_type -> scheduler.v1.UncordonNodeResponse
+	42, // [42:58] is the sub-list for method output_type
+	26, // [26:42] is the sub-list for method input_type
+	26, // [26:26] is the sub-list for extension type_name
+	26, // [26:26] is the sub-list for extension extendee
+	0,  // [0:26] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_scheduler_proto_init() }
@@ -2635,7 +3066,7 @@ func file_api_proto_scheduler_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_scheduler_proto_rawDesc), len(file_api_proto_scheduler_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   39,
+			NumMessages:   46,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

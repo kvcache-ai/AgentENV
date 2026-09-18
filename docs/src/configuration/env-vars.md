@@ -23,6 +23,8 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED` | from config | Enable scheduler heartbeat reporting |
 | `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` | unset | Override scheduler heartbeat reporting endpoint |
 | `AENV_OBSERVABILITY_REPORT_INTERVAL_SECS` | `5` | Override heartbeat reporting interval in seconds |
+| `AENV_OBSERVABILITY_NODE_ENDPOINT` | unset | Runtime HTTP endpoint advertised during heartbeat discovery, for example `http://10.0.0.20:8000` |
+| `AENV_OBSERVABILITY_REGISTRATION_TOKEN` | unset | Shared secret sent by a runtime to authenticate heartbeat discovery registration |
 | `AENV_CUSTOM_EXTENSION_URL` | unset | Override `[custom_extension].url`, the HTTP base URL of the custom extension service |
 | `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` | auto-generated under `$AENV_HOME/secrets` | Optional runtime override for the secret used to derive sandbox envd and traffic access tokens. Configure the same value on every runtime node in clustered deployments. |
 | `AENV_SANDBOX_PROXY_DOMAINS` | from config | Comma-separated DNS domains that enable server-side host-based sandbox proxy URLs like `{port}-{sandboxID}.{domain}` and populate the sandbox response `domain` field. Empty or unset keeps `[sandbox_proxy].domains`. |
@@ -104,5 +106,6 @@ These variables apply to both the gateway and scheduler processes.
 | `SCHEDULER_STRATEGY` | `round_robin` | Node selection strategy for new sandboxes: `round_robin` or `random` |
 | `SCHEDULER_REDIS_ADDR` | unset | Redis address for persistent sandbox-to-node bindings (for example, `redis:6379`). Unset = in-memory bindings, lost on scheduler restart. |
 | `SCHEDULER_BINDING_TTL` | `30s` | How long a sandbox-to-node binding is kept without a confirming heartbeat. Accepts Go duration strings (for example, `1m`). |
+| `SCHEDULER_HEARTBEAT_REGISTRATION_TOKEN` | unset | Shared secret required by the Scheduler when `scheduler.discovery.mode` is `heartbeat` |
 | `SCHEDULER_ARTIFACT_STORE_CAPACITY` | `1000000` | Maximum number of P2P artifact entries held in the scheduler's in-memory index |
 | `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT` | `0` | Maximum number of nodes checked per P2P artifact lookup. `0` means no limit. |
