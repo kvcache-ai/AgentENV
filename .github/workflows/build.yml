@@ -4,6 +4,10 @@ on:
     branches: [prometheus-main]
   workflow_dispatch: {}
 
+# The page job pushes gh-pages; default token perms can be read-only.
+permissions:
+  contents: write
+
 env:
   REGISTRY: us-dallas-1.ocir.io/ax3vcxtxsjva/dev/research
 
