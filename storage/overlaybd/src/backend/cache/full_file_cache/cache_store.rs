@@ -559,8 +559,10 @@ impl FileCacheBackend {
     ///
     /// Uses `read_at_into` to write source data straight into the page cache
     /// via the mmap'd buffer, then marks the block as cached in the bitmap.
-    /// This eliminates the intermediate `Bytes` allocation and the `pwrite`
-    /// syscall that the old path used.
+    /// For local sources this eliminates the intermediate `Bytes` allocation
+    /// and the `pwrite` syscall that the old path used; a
+    /// `RuntimeDispatchFile`-wrapped remote source falls back to `read_at` +
+    /// one block-sized copy, since the mmap buffer cannot cross runtimes.
     async fn do_refill_block_generic<R: FileReader>(
         &self,
         reader: &R,

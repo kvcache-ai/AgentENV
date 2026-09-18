@@ -498,6 +498,11 @@ pub struct UblkOverlaybdTomlConfig {
     /// Timeout for the OverlayBD resize tool. Default: `120`.
     #[config(default = 120u64)]
     pub resize_timeout_secs: u64,
+    /// Worker threads of the overlaybd runtime's dedicated remote-I/O
+    /// runtime (OSS/registry downloads); written as `remoteIoWorkers` into
+    /// generated overlaybd global configs. Default: `4`.
+    #[config(default = 4u64)]
+    pub remote_io_workers: u64,
     /// Enable overlaybd layer-level background download. Default: `false`.
     #[config(default = false)]
     pub download_enable: bool,
@@ -1011,6 +1016,9 @@ impl AppConfig {
             bail!("invalid ublk.overlaybd config: resize_timeout_secs must be > 0");
         }
         self.validate_memory_snapshot_options()?;
+        if self.ublk.overlaybd.remote_io_workers == 0 {
+            bail!("invalid ublk.overlaybd config: remote_io_workers must be > 0");
+        }
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;

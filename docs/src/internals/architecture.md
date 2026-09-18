@@ -89,6 +89,7 @@ Async userspace block device server using Linux's ublk kernel driver. Exposes Ov
 Long-running daemon process (`uvm-ublk-daemon`) that manages all ublk devices in one process and communicates with the AgentENV node over a Unix domain socket.
 
 - Supports RPCs for OverlayBD runtime creation for sandbox rootfs/extra drives, raw OverlayBD device creation for non-runtime callers, warm-pool acquire/release, resize capability queries, restack snapshot, delete, and shutdown.
+- All remote image I/O (OSS/registry reads) is dispatched from the per-queue runtimes onto a dedicated per-`ImageService` remote-io runtime via `RuntimeDispatchFile` (`storage/overlaybd/src/io/dispatch_file.rs`), because opendal/reqwest pin pooled HTTP connection tasks to whatever runtime polls them and per-device runtimes are dropped on device teardown; the lazily-built remote runtime (file-cache workers, background-download scheduler) is likewise constructed and driven on that dedicated runtime so its internal `tokio::spawn` calls bind there. The runtime is created when the overlaybd global config sets `remoteIoWorkers` > 0 (agentenv-generated configs emit it from `ublk.overlaybd.remote_io_workers`, default 4); with it unset/zero, remote I/O runs on the runtime that constructed the `ImageService`.
 - `UblkDaemonClient` spawns and monitors the daemon process from the node runtime.
 - `UblkDeviceManager` (`src/sandbox/ublk/device.rs`) is the node-facing singleton that delegates lifecycle operations to the daemon client; device IDs are allocated in the daemon.
 

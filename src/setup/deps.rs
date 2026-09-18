@@ -808,7 +808,8 @@ fn write_generated_overlaybd_global_config(
         "download": download,
         "p2pConfig": p2p_config,
         "enableAudit": false,
-        "registryFsVersion": "v2"
+        "registryFsVersion": "v2",
+        "remoteIoWorkers": app_config.ublk.overlaybd.remote_io_workers,
     });
 
     if app_config.snapshot.repository_backend == SnapshotRepositoryBackendKind::Oss {
@@ -1526,6 +1527,7 @@ mod tests {
                 "http://127.0.0.1:12345/p2p-http"
             );
             assert_eq!(value["registryFsVersion"], "v2");
+            assert_eq!(value["remoteIoWorkers"], 4);
         }
     }
 

@@ -306,6 +306,7 @@ runtime_upper_mode = "hybridLogStructured"
 allow_shrink = false
 # Cold-start resize timeout in seconds; must be positive (120 = 2 minutes).
 resize_timeout_secs = 120
+remote_io_workers = 4
 # Enable layer-level background download for remote rootfs layers.
 download_enable = false
 # P2P descriptor lookup timeout in milliseconds; timeout is a cacheable miss.

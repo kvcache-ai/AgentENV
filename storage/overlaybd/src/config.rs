@@ -372,6 +372,13 @@ pub struct GlobalConfig {
     /// Legacy compatibility field. Local files no longer allocate io_uring
     /// workers through `ImageService`; ublk owns its queue-local rings.
     pub nr_io_rings: usize,
+
+    /// Worker threads of the dedicated runtime that drives all remote image
+    /// I/O (OSS/registry downloads and their reqwest connection tasks). `0`
+    /// (the default) dispatches remote I/O onto the runtime that constructed
+    /// the `ImageService` — adequate for tests and ad-hoc users; `> 0`
+    /// creates a dedicated runtime with that many worker threads.
+    pub remote_io_workers: usize,
 }
 
 impl Default for GlobalConfig {
@@ -401,6 +408,7 @@ impl Default for GlobalConfig {
             credential_config: CredentialConfig::default(),
 
             nr_io_rings: 4,
+            remote_io_workers: 0,
         }
     }
 }

@@ -3,7 +3,6 @@ use crate::io::virtual_file::VirtualFile;
 use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::TryStreamExt;
 use object_store_operator::{
     build_object_store_operator, credential_source_from_fields, run_with_refresh, AddressingStyle,
     CachedCredentialSource, CredentialFields, CredentialSource, CredentialSourceOptions,
@@ -414,76 +413,6 @@ impl VirtualFile for OssFile {
             crate::metrics::RemoteReadOperation::ReadRange,
             &result,
             |data| data.len() as u64,
-            start.elapsed(),
-        );
-
-        result
-    }
-
-    async fn read_at_into(&self, offset: u64, dst: &mut [u8]) -> Result<usize> {
-        if dst.is_empty() {
-            return Ok(0);
-        }
-
-        let size = self.size().await?;
-        if offset >= size {
-            return Ok(0);
-        }
-
-        let end = min(offset.saturating_add(dst.len() as u64), size);
-        let key = self.location.key.clone();
-        let start = Instant::now();
-        // Stream the response body straight into the caller's buffer. Unlike
-        // read_at (whole-range Buffer + one memcpy), this holds at most a few
-        // chunks of network data per in-flight read, halving peak memory and
-        // removing the copy. The bounded channel forwards chunks from the
-        // operator side (which may refresh credentials) to the plain write
-        // loop here, so no &mut escapes any closure.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(4);
-        let read_fut = self.backend.run_with_operator(&self.location, |operator| {
-            let key = key.clone();
-            let tx = tx.clone();
-            async move {
-                let reader = operator.reader(&key).await?;
-                let mut stream = reader.into_bytes_stream(offset..end).await?;
-                while let Some(chunk) = stream.try_next().await.map_err(|err| {
-                    OpenDalError::new(
-                        OpenDalErrorKind::Unexpected,
-                        "stream read from oss object failed",
-                    )
-                    .set_source(err)
-                })? {
-                    if tx.send(chunk).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(())
-            }
-        });
-        let write_fut = async {
-            let mut written = 0usize;
-            while let Some(chunk) = rx.recv().await {
-                let n = chunk.len().min(dst.len() - written);
-                dst[written..written + n].copy_from_slice(&chunk[..n]);
-                written += n;
-                if n < chunk.len() || written == dst.len() {
-                    break;
-                }
-            }
-            Ok::<usize, anyhow::Error>(written)
-        };
-        let (read_result, write_result) = tokio::join!(read_fut, write_fut);
-        let result = read_result.and(write_result).with_context(|| {
-            format!(
-                "stream range {offset}..{end} from oss object '{}'",
-                self.location.key
-            )
-        });
-        crate::metrics::record_remote_read(
-            &crate::metrics::RemoteSource::OssObject,
-            crate::metrics::RemoteReadOperation::ReadRangeInto,
-            &result,
-            |written| *written as u64,
             start.elapsed(),
         );
 
