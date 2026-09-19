@@ -8,7 +8,9 @@ use tracing::warn;
 
 use crate::digest;
 use crate::sandbox::OverlaybdCompactOutput;
-use crate::snapshot::repository::backends::common::recontainerize::prepare_layer_upload;
+use crate::snapshot::repository::backends::common::recontainerize::{
+    prepare_layer_upload, PreparedLayerUpload,
+};
 use crate::snapshot::repository::backends::common::write_dense_overlaybd_layer_to_file;
 use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::rootfs_snapshot_image_tag;
@@ -45,6 +47,7 @@ impl DiskImageSubject {
 pub(crate) struct DiskImageExportOutcome {
     pub(crate) layers: Vec<OverlaybdLayerRef>,
     pub(crate) publication: Option<PersistedDiskImagePublication>,
+    pub(crate) local_layers: Vec<PreparedLayerUpload>,
 }
 
 type AcrClientBuilder = dyn Fn(&str) -> Result<AcrClient, AcrClientError> + Send + Sync + 'static;
@@ -101,13 +104,14 @@ impl AcrDiskImageExporter {
 
         let mut descriptors = Vec::with_capacity(image.layers.len());
         let mut committed_layers = Vec::with_capacity(image.layers.len());
+        let mut local_layers = Vec::new();
         let upload_url = target.upload_url();
 
         for layer in &image.layers {
             let (digest, size) = match layer {
                 SourceRegistryLayer::Remote { digest, size } => (digest.clone(), *size),
                 SourceRegistryLayer::LocalDelta(local) => {
-                    let (digest, size) = self
+                    let upload = self
                         .upload_local_delta(
                             &client,
                             &upload_url,
@@ -116,7 +120,9 @@ impl AcrDiskImageExporter {
                             local,
                         )
                         .await?;
-                    (digest, size)
+                    let descriptor = (upload.digest().to_string(), upload.size());
+                    local_layers.push(upload);
+                    descriptor
                 }
             };
             descriptors.push(OciDescriptor::overlaybd_layer(digest.clone(), size));
@@ -155,6 +161,7 @@ impl AcrDiskImageExporter {
 
         Ok(DiskImageExportOutcome {
             layers: committed_layers,
+            local_layers,
             publication: Some(PersistedDiskImagePublication {
                 image_ref: target.image_ref(&tag),
                 tag,
@@ -228,7 +235,7 @@ impl AcrDiskImageExporter {
         repo_blob_url: &str,
         repository: &str,
         local: &LocalSnapshotDelta,
-    ) -> RepositoryResult<(String, u64)> {
+    ) -> RepositoryResult<PreparedLayerUpload> {
         match &local.descriptor {
             LocalSnapshotDeltaDescriptor::Raw { digest, size } => {
                 // Publish compression recontainerizes raw deltas as zfile,
@@ -254,7 +261,8 @@ impl AcrDiskImageExporter {
                         upload.size(),
                     )
                     .await
-                    .map_err(RepositoryError::from)
+                    .map_err(RepositoryError::from)?;
+                Ok(upload)
             }
             LocalSnapshotDeltaDescriptor::DenseOverlaybd => {
                 let dense_temp = NamedTempFile::new().map_err(|e| {
@@ -275,12 +283,13 @@ impl AcrDiskImageExporter {
                             e,
                         )
                     })?;
-                let upload = prepare_layer_upload(
+                let mut upload = prepare_layer_upload(
                     &dense_path,
                     self.publish_compression,
                     Some((&descriptor.digest, descriptor.size)),
                 )
                 .await?;
+                upload.retain_source(dense_temp);
                 client
                     .upload_blob_with_descriptor(
                         upload_url,
@@ -291,7 +300,8 @@ impl AcrDiskImageExporter {
                         upload.size(),
                     )
                     .await
-                    .map_err(RepositoryError::from)
+                    .map_err(RepositoryError::from)?;
+                Ok(upload)
             }
         }
     }
@@ -669,6 +679,11 @@ mod tests {
         blob: &Path,
     ) {
         let descriptor = FileDigest::describe_blocking(blob).unwrap();
+        assert_eq!(outcome.local_layers.len(), 1);
+        let retained = &outcome.local_layers[0];
+        assert_eq!(retained.digest(), descriptor.sha256);
+        assert_eq!(retained.size(), descriptor.size);
+        assert_eq!(fs::read(retained.path()).unwrap(), fs::read(blob).unwrap());
         assert_eq!(
             outcome.layers,
             vec![
