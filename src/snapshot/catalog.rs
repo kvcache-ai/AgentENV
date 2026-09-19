@@ -369,7 +369,7 @@ where
             let Some(mut record) = current else {
                 return Ok(new_committed_record(&metadata, committed.clone(), now));
             };
-            if record.committed.is_some() {
+            if record.committed.is_some() && record.snapshot_type != SnapshotPlacement::Local {
                 return Err(RepositoryError::InvalidRequest {
                     reason: format!("snapshot '{}' is already committed", record.id),
                 });
