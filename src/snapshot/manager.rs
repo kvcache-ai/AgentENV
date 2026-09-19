@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
+use dashmap::DashMap;
 use futures::{stream, StreamExt};
 use tracing::warn;
 
@@ -16,7 +17,8 @@ use crate::p2p::P2pTransport;
 use crate::repository::{Repository, RepositoryError};
 use crate::snapshot::{
     CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SandboxSnapshotManifest,
-    SnapshotId, SnapshotPlacement, SnapshotPublishMetadata, SnapshotRecord,
+    SnapshotId, SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
+    SnapshotSource,
 };
 
 /// Concurrency limit for publishing snapshot artifacts to P2P after commit.
@@ -69,6 +71,23 @@ pub struct SnapshotManager {
     local_store: Option<LocalSnapshotStore>,
     node_id: String,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
+    mutation_locks: Arc<DashMap<SnapshotId, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+struct SnapshotMutationGuard<'a> {
+    locks: &'a DashMap<SnapshotId, Arc<tokio::sync::Mutex<()>>>,
+    id: SnapshotId,
+    lock: Option<Arc<tokio::sync::Mutex<()>>>,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for SnapshotMutationGuard<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        drop(self.lock.take());
+        self.locks
+            .remove_if(&self.id, |_, lock| Arc::strong_count(lock) == 1);
+    }
 }
 
 impl SnapshotManager {
@@ -89,6 +108,7 @@ impl SnapshotManager {
             local_store,
             node_id,
             p2p_transport,
+            mutation_locks: Arc::new(DashMap::new()),
         })
     }
 
@@ -104,6 +124,7 @@ impl SnapshotManager {
             local_store: None,
             node_id: String::new(),
             p2p_transport,
+            mutation_locks: Arc::new(DashMap::new()),
         }
     }
 
@@ -111,6 +132,38 @@ impl SnapshotManager {
     /// can share the same PosixFS/OSS source of truth.
     pub fn repository(&self) -> Arc<dyn Repository> {
         Arc::clone(&self.repository)
+    }
+
+    async fn lock_snapshot_mutation(&self, id: SnapshotId) -> SnapshotMutationGuard<'_> {
+        let lock = Arc::clone(
+            self.mutation_locks
+                .entry(id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .value(),
+        );
+        let mut lease = SnapshotMutationGuard {
+            locks: &self.mutation_locks,
+            id,
+            lock: Some(Arc::clone(&lock)),
+            guard: None,
+        };
+        // Construct the lease before waiting so cancellation also releases its key.
+        lease.guard = Some(lock.lock_owned().await);
+        lease
+    }
+
+    async fn resolve_snapshot_id(
+        &self,
+        reference: &str,
+    ) -> crate::repository::RepositoryResult<Option<SnapshotId>> {
+        if let Ok(id) = SnapshotId::parse(reference) {
+            return Ok(Some(id));
+        }
+        Ok(self
+            .repository
+            .get(reference)
+            .await?
+            .map(|record| record.id))
     }
 
     pub async fn create(
@@ -210,6 +263,98 @@ impl SnapshotManager {
                 Err(error)
             }
         }
+    }
+
+    /// Promotes one reusable Local snapshot to Distributed without recapture.
+    ///
+    /// The lookup is always resolved by the canonical repository. A missing or
+    /// foreign-owner Local snapshot is never substituted from node-local state.
+    pub async fn promote(
+        &self,
+        id_or_alias: &str,
+    ) -> crate::repository::RepositoryResult<Option<SnapshotRecord>> {
+        let Some(snapshot_id) = self.resolve_snapshot_id(id_or_alias).await? else {
+            return Ok(None);
+        };
+        let manager = self.clone();
+        tokio::spawn(async move { manager.promote_inner(snapshot_id).await })
+            .await
+            .map_err(|error| RepositoryError::backend("finish snapshot promotion", error))?
+    }
+
+    async fn promote_inner(
+        &self,
+        snapshot_id: SnapshotId,
+    ) -> crate::repository::RepositoryResult<Option<SnapshotRecord>> {
+        let canonical_ref = snapshot_id.to_string();
+        let _mutation_guard = self.lock_snapshot_mutation(snapshot_id).await;
+        let Some(record) = self.repository.get(&canonical_ref).await? else {
+            return Ok(None);
+        };
+        let SnapshotSource::Sandbox {
+            source_sandbox_id,
+            source_sandbox_metadata,
+        } = &record.source
+        else {
+            return Ok(None);
+        };
+        if record.snapshot_type == SnapshotPlacement::Distributed {
+            if let Some(local_store) = &self.local_store {
+                local_store.delete_snapshot(&record.id);
+            }
+            return Ok(Some(record));
+        }
+        let local_store =
+            self.local_store
+                .as_ref()
+                .ok_or_else(|| RepositoryError::Unavailable {
+                    reason: "node-local snapshot store is not configured".to_string(),
+                })?;
+        let (manifest, _lease) = self.acquire_local_manifest(&record)?;
+        let committed =
+            record
+                .committed
+                .as_ref()
+                .ok_or_else(|| RepositoryError::InvalidRequest {
+                    reason: format!("snapshot '{}' has no committed artifacts", record.id),
+                })?;
+        // Publish from the leased immutable manifest. The repository prepares
+        // dense output without rewriting files used by existing Local readers.
+        let metadata = SnapshotPublishMetadata {
+            id: record.id.clone(),
+            snapshot_type: SnapshotPlacement::Distributed,
+            alias: record.alias.clone(),
+            source: SnapshotPublishSource::Sandbox {
+                source_sandbox_id: source_sandbox_id.clone(),
+                source_sandbox_metadata: source_sandbox_metadata.clone(),
+            },
+            context: committed.context.clone(),
+            startup: committed.startup.clone(),
+            resources: record.resources,
+            runtime_versions: committed.runtime_versions.clone(),
+            virtualization_mode: committed.virtualization_mode,
+            volume_snapshots: committed.volume_snapshots.clone(),
+            image_configs: committed.image_configs.clone(),
+            custom_extension_params: committed.custom_extension_params.clone(),
+        };
+        let promoted =
+            self.publish(metadata, manifest, None)
+                .await
+                .map_err(|error| match error {
+                    error @ (RepositoryError::ArtifactNotFound { .. }
+                    | RepositoryError::ManagedLayerNotFound { .. }) => {
+                        RepositoryError::Unavailable {
+                            reason: format!(
+                                "publish Distributed closure for snapshot '{}': {error}",
+                                record.id
+                            ),
+                        }
+                    }
+                    error => error,
+                })?;
+
+        local_store.delete_snapshot(&record.id);
+        Ok(Some(promoted))
     }
 
     fn require_local_owner(
@@ -378,34 +523,25 @@ impl SnapshotManager {
     /// Returns `Ok(())` on success. The operation is idempotent:
     /// if the snapshot does not exist, it is still considered success.
     pub async fn delete(&self, id_or_alias: impl AsRef<str>) -> anyhow::Result<()> {
-        let lookup = id_or_alias.as_ref();
-        let local_id = SnapshotId::parse(lookup).ok().filter(|id| {
-            self.local_store
-                .as_ref()
-                .is_some_and(|store| store.contains_snapshot(id))
-        });
-        if let Some(id) = local_id {
-            let manager = self.clone();
-            return tokio::spawn(async move {
-                let reference = id.to_string();
-                if let Err(error) = manager.repository.delete(&reference).await {
-                    if !matches!(manager.repository.get(&reference).await, Ok(None)) {
-                        return Err(anyhow::Error::new(error));
-                    }
+        let Some(id) = self.resolve_snapshot_id(id_or_alias.as_ref()).await? else {
+            return Ok(());
+        };
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let reference = id.to_string();
+            let _mutation_guard = manager.lock_snapshot_mutation(id.clone()).await;
+            if let Err(error) = manager.repository.delete(&reference).await {
+                if !matches!(manager.repository.get(&reference).await, Ok(None)) {
+                    return Err(anyhow::Error::new(error));
                 }
-                if let Some(local_store) = &manager.local_store {
-                    local_store.delete_snapshot(&id);
-                }
-                Ok(())
-            })
-            .await
-            .context("finish Local snapshot deletion")?;
-        }
-        // Also permits removal of an unavailable Local record after its owner exits.
-        self.repository
-            .delete(lookup)
-            .await
-            .with_context(|| format!("delete snapshot '{lookup}' through repository"))
+            }
+            if let Some(local_store) = &manager.local_store {
+                local_store.delete_snapshot(&id);
+            }
+            Ok(())
+        })
+        .await
+        .context("finish snapshot deletion")?
     }
 
     /// Resolves an alias to its committed snapshot id.
@@ -519,14 +655,17 @@ mod tests {
         (metadata, capture)
     }
 
-    struct DeferredCommitRepository {
+    struct DeferredPublicationRepository {
         inner: Arc<dyn Repository>,
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Notify>,
     }
 
     #[async_trait::async_trait]
-    impl Repository for DeferredCommitRepository {
+    impl Repository for DeferredPublicationRepository {
+        fn publish_policy(&self) -> crate::repository::PublishPolicy {
+            self.inner.publish_policy()
+        }
         async fn get_document(
             &self,
             key: crate::repository::DocumentKey,
@@ -538,9 +677,53 @@ mod tests {
             key: crate::repository::DocumentKey,
             update: crate::repository::DocumentUpdate,
         ) -> crate::repository::RepositoryResult<Option<Vec<u8>>> {
-            self.entered.notify_one();
-            self.release.notified().await;
+            let current = self.inner.get_document(key.clone()).await?;
+            if let crate::repository::DocumentChange::Put(bytes) = update(current.as_deref())? {
+                let record: SnapshotRecord = serde_json::from_slice(&bytes).unwrap();
+                if !record.deleting {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+            }
             self.inner.update_document(key, update).await
+        }
+        async fn delete_document(
+            &self,
+            key: crate::repository::DocumentKey,
+        ) -> crate::repository::RepositoryResult<()> {
+            self.inner.delete_document(key).await
+        }
+        async fn put_blob(
+            &self,
+            key: &crate::repository::BlobKey,
+            body: crate::repository::BlobBody<'_>,
+        ) -> crate::repository::RepositoryResult<()> {
+            self.inner.put_blob(key, body).await
+        }
+        fn locate_blob(
+            &self,
+            key: &crate::repository::BlobKey,
+        ) -> crate::repository::RepositoryResult<crate::repository::BlobLocation> {
+            self.inner.locate_blob(key)
+        }
+        async fn has_blob(
+            &self,
+            key: &crate::repository::BlobKey,
+        ) -> crate::repository::RepositoryResult<bool> {
+            self.inner.has_blob(key).await
+        }
+        async fn fetch_blob(
+            &self,
+            key: &crate::repository::BlobKey,
+            to: &Path,
+        ) -> crate::repository::RepositoryResult<u64> {
+            self.inner.fetch_blob(key, to).await
+        }
+        async fn delete_snapshot_blobs(
+            &self,
+            id: &SnapshotId,
+        ) -> crate::repository::RepositoryResult<()> {
+            self.inner.delete_snapshot_blobs(id).await
         }
     }
 
@@ -552,7 +735,7 @@ mod tests {
         let primary = Arc::clone(&manager.repository);
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
-        manager.repository = Arc::new(DeferredCommitRepository {
+        manager.repository = Arc::new(DeferredPublicationRepository {
             inner: Arc::clone(&primary),
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
@@ -665,6 +848,79 @@ mod tests {
         assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
         release.send(()).unwrap();
         wait_for_lease_release(&dropped).await;
+    }
+
+    #[tokio::test]
+    async fn promotion_retries_failed_publish_and_keeps_existing_readers() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let manager = local_manager(root.path());
+        let (metadata, capture) = local_capture(&root.path().join("capture"));
+        let local = crate::sandbox::publish_captured(&manager, metadata, capture).await?;
+        let reader = manager.resolve_runnable(local.clone()).await?;
+        let config = &reader.manifest().memory.image_config_path;
+        let original = std::fs::read(config)?;
+        let reference = local.id.to_string();
+        let blocked = root.path().join("repository/managed-layers");
+        std::fs::write(&blocked, b"blocked")?;
+        assert!(manager.promote(&reference).await.is_err());
+        assert_eq!(
+            manager.get(&reference).await?.unwrap().snapshot_type,
+            SnapshotPlacement::Local
+        );
+        std::fs::remove_file(blocked)?;
+
+        let (first, repeated) =
+            tokio::join!(manager.promote(&reference), manager.promote(&reference));
+        let promoted = first?.unwrap();
+        assert_eq!(promoted.id, local.id);
+        assert_eq!(promoted.snapshot_type, SnapshotPlacement::Distributed);
+        assert!(promoted.owner_node_id.is_none());
+        assert_eq!(
+            repeated?.unwrap().updated_at_unix_ms,
+            promoted.updated_at_unix_ms
+        );
+        assert_eq!(std::fs::read(config)?, original);
+        assert!(manager
+            .local_store
+            .as_ref()
+            .unwrap()
+            .acquire_manifest(&local.id)
+            .is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelling_promotion_keeps_delete_waiting_for_publication() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let mut manager = local_manager(root.path());
+        let (metadata, capture) = local_capture(&root.path().join("capture"));
+        let record = crate::sandbox::publish_captured(&manager, metadata, capture).await?;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        manager.repository = Arc::new(DeferredPublicationRepository {
+            inner: Arc::clone(&manager.repository),
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let publishing = manager.clone();
+        let reference = record.id.to_string();
+        let caller = tokio::spawn(async move { publishing.promote(&reference).await });
+        entered.notified().await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let mut waiting = Box::pin(manager.lock_snapshot_mutation(record.id.clone()));
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+        drop(waiting);
+        release.notify_one();
+        manager.delete(record.id.to_string()).await?;
+        assert!(manager.get(record.id.to_string()).await?.is_none());
+        assert!(manager
+            .local_store
+            .as_ref()
+            .unwrap()
+            .acquire_manifest(&record.id)
+            .is_err());
+        Ok(())
     }
 
     #[tokio::test]
