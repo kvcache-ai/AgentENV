@@ -10,6 +10,8 @@ deliberately, then re-run CI and roll pods per the OnDelete runbook.
 |---|---|
 | (none yet) | pipeline proof-of-life builds pristine 6e8deea |
 
-Planned: disk-full admission reserve (capsule #21376 semantics), resume
-memory accounting, disk-aware placement strategy, S3/OSS snapshot backend
-enablement.
+Planned (design: `DESIGN-OVERLOAD.md`; Rust-only, phases R0 -> R1 -> R2):
+R0 node-runtime overload safety (resume memory gate, create watermark
+rejection, capacity gauges, lazy snapshot exporter with LRU drain at 70%
+and blocking flush at 95%); R1 Rust scheduler drop-in; R2 P2C placement,
+tenant quotas, snapshot restore-on-load.
