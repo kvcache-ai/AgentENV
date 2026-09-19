@@ -160,9 +160,13 @@ impl LocalArtifactCache {
 
             let sender = {
                 let mut inflight = self.inflight.lock().await;
-                if let Some(existing) = inflight.get(key).cloned() {
+                if let Some(mut existing) = inflight.get(key).cloned() {
                     drop(inflight);
-                    wait_for_inflight_result(existing.receiver, key).await?;
+                    if wait_for_inflight_result(&mut existing.receiver).await?
+                        == InflightWait::Abandoned
+                    {
+                        self.clear_abandoned_inflight(key, &existing.receiver).await;
+                    }
                     continue;
                 }
 
@@ -243,8 +247,12 @@ impl LocalArtifactCache {
                 let inflight = self.inflight.lock().await;
                 inflight.get(key).cloned()
             };
-            if let Some(existing) = existing {
-                wait_for_inflight_result(existing.receiver, key).await?;
+            if let Some(mut existing) = existing {
+                if wait_for_inflight_result(&mut existing.receiver).await?
+                    == InflightWait::Abandoned
+                {
+                    self.clear_abandoned_inflight(key, &existing.receiver).await;
+                }
                 continue;
             }
             break;
@@ -318,6 +326,20 @@ impl LocalArtifactCache {
         let _ = sender.send(Some(result));
         let mut inflight = self.inflight.lock().await;
         inflight.remove(key);
+    }
+
+    async fn clear_abandoned_inflight(
+        &self,
+        key: &str,
+        receiver: &watch::Receiver<Option<InflightFetchResult>>,
+    ) {
+        let mut inflight = self.inflight.lock().await;
+        let is_same_fetch = inflight
+            .get(key)
+            .is_some_and(|current| current.receiver.same_channel(receiver));
+        if is_same_fetch {
+            inflight.remove(key);
+        }
     }
 
     fn try_acquire(self: &Arc<Self>, key: &str) -> Option<CacheHandle> {
@@ -420,22 +442,25 @@ impl SharedFetchError {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InflightWait {
+    Finished,
+    Abandoned,
+}
+
 async fn wait_for_inflight_result(
-    mut receiver: watch::Receiver<Option<InflightFetchResult>>,
-    key: &str,
-) -> Result<()> {
+    receiver: &mut watch::Receiver<Option<InflightFetchResult>>,
+) -> Result<InflightWait> {
     loop {
         if let Some(result) = receiver.borrow().clone() {
             return match result {
-                InflightFetchResult::Success => Ok(()),
+                InflightFetchResult::Success => Ok(InflightWait::Finished),
                 InflightFetchResult::Failed(error) => Err(error.into_anyhow()),
             };
         }
 
         if receiver.changed().await.is_err() {
-            return Err(anyhow!(
-                "inflight cache materialization for '{key}' ended without a result"
-            ));
+            return Ok(InflightWait::Abandoned);
         }
     }
 }
@@ -650,5 +675,40 @@ mod tests {
             b"warm-cache".to_vec()
         );
         assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ensure_cached_recovers_when_materialization_leader_is_cancelled() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let cache = test_cache(tempdir.path());
+        let key = "runtime/snapshot/rootfs/image.json";
+        let started = Arc::new(tokio::sync::Notify::new());
+        let leader_cache = Arc::clone(&cache);
+        let leader_started = Arc::clone(&started);
+
+        let leader = tokio::spawn(async move {
+            leader_cache
+                .ensure_cached(key, move |_dest| {
+                    let leader_started = Arc::clone(&leader_started);
+                    async move {
+                        leader_started.notify_one();
+                        std::future::pending::<Result<u64>>().await
+                    }
+                })
+                .await
+        });
+        started.notified().await;
+        leader.abort();
+        let _ = leader.await;
+
+        let handle = cache
+            .ensure_cached(key, |dest| async move {
+                tokio::fs::write(dest, b"recovered").await?;
+                Ok(9)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(handle.path()).unwrap(), b"recovered");
     }
 }
