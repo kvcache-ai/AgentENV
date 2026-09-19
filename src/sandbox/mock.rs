@@ -313,7 +313,10 @@ impl SandboxBackend for MockSandboxBackend {
         self.behavior.apply_async(MockOperation::Resume).await
     }
 
-    async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
+    async fn snapshot(
+        &mut self,
+        _placement: crate::snapshot::SnapshotPlacement,
+    ) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
         self.behavior
             .apply_capture_result(MockOperation::Snapshot)
             .await?;
