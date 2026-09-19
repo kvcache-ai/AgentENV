@@ -42,6 +42,9 @@ pub enum RepositoryError {
         actual: String,
     },
 
+    #[error("snapshot unavailable: {reason}")]
+    Unavailable { reason: String },
+
     #[error("unsupported operation: {feature}")]
     Unsupported { feature: String },
 

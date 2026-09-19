@@ -1,3 +1,4 @@
+use agentenv::snapshot::mock::publish_metadata_for_test;
 use agentenv::snapshot::SnapshotPlacement;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -81,6 +82,7 @@ async fn publish_captured_snapshot_for_test(
     Ok(agentenv::sandbox::publish_captured(
         snapshot_manager,
         SnapshotPublishMetadata {
+            snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
             id: SnapshotId::generate(),
             alias: Some(SnapshotAlias::parse(alias)?),
             source: SnapshotPublishSource::Sandbox {
@@ -325,7 +327,8 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
 
     write_guest_file(&original, "/tmp/agentenv-lifecycle/base.txt", "base").await?;
     let first_alias = unique_alias_for_test("lifecycle_first");
-    let first_capture = SandboxBackend::snapshot(&mut original).await?;
+    let first_capture =
+        SandboxBackend::snapshot(&mut original, SnapshotPlacement::Distributed).await?;
     assert_guest_file(&original, "/tmp/agentenv-lifecycle/base.txt", "base").await?;
     write_guest_file(
         &original,
@@ -342,7 +345,8 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
     .await?;
 
     let second_alias = unique_alias_for_test("lifecycle_second");
-    let second_capture = SandboxBackend::snapshot(&mut original).await?;
+    let second_capture =
+        SandboxBackend::snapshot(&mut original, SnapshotPlacement::Distributed).await?;
     assert_guest_file(&original, "/tmp/agentenv-lifecycle/base.txt", "base").await?;
     assert_guest_file(
         &original,
@@ -435,6 +439,93 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
     )
     .await?;
     resumed_original.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> Result<()> {
+    common::setup().await;
+    let snapshot_manager = agentenv::snapshot::SnapshotManager::new("node-a".to_string(), None)?;
+
+    let mut source =
+        FirecrackerSandbox::new(common::default_sandbox_config()?, SandboxId::new(), None)?;
+    source.start().await?;
+    write_guest_file(&source, "/tmp/local-child-marker.txt", "local-child").await?;
+
+    let captured = SandboxBackend::snapshot(&mut source, SnapshotPlacement::Local).await?;
+    let mut metadata = publish_metadata_for_test(
+        SnapshotId::generate(),
+        None,
+        SnapshotPublishSource::Sandbox {
+            source_sandbox_id: SandboxId::new().to_string(),
+            source_sandbox_metadata: None,
+        },
+    );
+    metadata.snapshot_type = SnapshotPlacement::Local;
+    metadata.resources = SandboxResources {
+        cpu_count: 1,
+        memory_mib: 128,
+        disk_size_mib: 0,
+    };
+    let local = agentenv::sandbox::publish_captured(&snapshot_manager, metadata, captured).await?;
+    source.stop().await?;
+    drop(source);
+
+    let runnable = snapshot_manager.resolve_runnable(local.clone()).await?;
+    let local_root = runnable
+        .manifest()
+        .vm_state
+        .path
+        .parent()
+        .context("Local snapshot root")?
+        .to_path_buf();
+    let launch_config = SandboxLaunchConfig {
+        sandbox_id: SandboxId::new(),
+        snapshot_id: local.id.to_string(),
+        ..SandboxLaunchConfig::default()
+    };
+    let child_root = tempdir()?;
+    let mut child =
+        FirecrackerSandbox::from_snapshot(&runnable, &launch_config, Some(child_root.path()))?;
+    drop(runnable);
+    // The child retains the Local artifact lease, so deleting the canonical
+    // record must not reclaim the bytes it is about to start from.
+    snapshot_manager.delete(local.id.to_string()).await?;
+    child.start().await?;
+    assert_guest_file(&child, "/tmp/local-child-marker.txt", "local-child").await?;
+
+    let checkpoint = child.capture_snapshot(SnapshotPlacement::Local).await?;
+    child.resume().await?;
+
+    let paused = SandboxBackend::pause(&mut child).await?;
+    child.stop().await?;
+    let encoded = paused.encode()?;
+    drop(paused);
+    drop(child);
+    // Reclamation is asynchronous; remove the source now so neither restore
+    // can accidentally pass by reading files awaiting background cleanup.
+    match std::fs::remove_dir_all(&local_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        result => result?,
+    }
+
+    let mut forked = FirecrackerSandbox::from_snapshot_config(&checkpoint, SandboxId::new(), None)?;
+    forked.start().await?;
+    assert_guest_file(&forked, "/tmp/local-child-marker.txt", "local-child").await?;
+    forked.stop().await?;
+    drop(forked);
+    drop(checkpoint);
+
+    let decoded =
+        agentenv::sandbox::FirecrackerPausedState::decode(std::path::PathBuf::new(), encoded)?;
+    let mut resumed = FirecrackerSandbox::from_paused_state(
+        &decoded,
+        launch_config.sandbox_id,
+        child_root.path(),
+    )?;
+    resumed.start().await?;
+    assert_guest_file(&resumed, "/tmp/local-child-marker.txt", "local-child").await?;
+    resumed.stop().await?;
     Ok(())
 }
 
@@ -544,7 +635,9 @@ async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() 
                     else {
                         unreachable!("candidate must be running");
                     };
-                    let captured = SandboxBackend::snapshot(sandbox.as_mut()).await?;
+                    let captured =
+                        SandboxBackend::snapshot(sandbox.as_mut(), SnapshotPlacement::Distributed)
+                            .await?;
                     assert_expected_files(sandbox, &expected_files_at_capture).await?;
                     let record = publish_captured_snapshot_for_test(
                         &snapshot_manager,

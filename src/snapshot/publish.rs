@@ -37,6 +37,14 @@ pub(crate) async fn publish<R>(
 where
     R: Repository + ?Sized,
 {
+    metadata
+        .validate()
+        .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+    if metadata.snapshot_type != super::SnapshotPlacement::Distributed {
+        return Err(RepositoryError::Unsupported {
+            feature: "Distributed publication required".to_string(),
+        });
+    }
     validate_attached_drives(&manifest)?;
     // Fail before uploading anything; the commit checks both again.
     ensure_not_committed(repository, &metadata.id).await?;
@@ -86,7 +94,7 @@ where
     }
 }
 
-fn validate_attached_drives(manifest: &SandboxSnapshotManifest) -> RepositoryResult<()> {
+pub(crate) fn validate_attached_drives(manifest: &SandboxSnapshotManifest) -> RepositoryResult<()> {
     let mut drive_ids = HashSet::new();
     for drive in &manifest.attached_drives {
         if !drive_ids.insert(drive.drive_id.clone()) {

@@ -491,10 +491,11 @@ impl SandboxBackend for FirecrackerSandbox {
         Ok(Arc::new(FirecrackerPausedState::new(snapshot_config)))
     }
 
-    async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
-        let mut config = self
-            .capture_snapshot(SnapshotPlacement::Distributed)
-            .await?;
+    async fn snapshot(
+        &mut self,
+        placement: SnapshotPlacement,
+    ) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
+        let mut config = self.capture_snapshot(placement).await?;
         let manifest = match config.to_manifest() {
             Ok(manifest) => manifest,
             Err(error) => return Err(self.recover_capture_error(error).await),
@@ -3726,6 +3727,8 @@ mod tests {
         snapshot_env_vars.insert("SHARED_KEY".to_string(), "snapshot".to_string());
         let record = SnapshotRecord {
             id: crate::snapshot::SnapshotId::generate(),
+            snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
+            owner_node_id: None,
             ..SnapshotRecord::mock_ready(CommittedSnapshot {
                 context: crate::snapshot::CommandContext::new(snapshot_env_vars, "/"),
                 ..CommittedSnapshot::mock()
@@ -3773,6 +3776,8 @@ mod tests {
     fn from_snapshot_custom_extension_params_launch_overrides_snapshot() -> Result<()> {
         let record = SnapshotRecord {
             id: crate::snapshot::SnapshotId::generate(),
+            snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
+            owner_node_id: None,
             ..SnapshotRecord::mock_ready(CommittedSnapshot {
                 custom_extension_params: Some(params(serde_json::json!({"from": "snapshot"}))),
                 ..CommittedSnapshot::mock()

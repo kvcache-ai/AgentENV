@@ -29,6 +29,7 @@ pub struct SnapshotVolume {
 #[derive(Clone, Debug)]
 pub struct SnapshotPublishMetadata {
     pub id: SnapshotId,
+    pub snapshot_type: SnapshotPlacement,
     pub alias: Option<SnapshotAlias>,
     pub source: SnapshotPublishSource,
     pub context: CommandContext,
@@ -48,6 +49,7 @@ impl SnapshotPublishMetadata {
     pub fn mock() -> Self {
         Self {
             id: SnapshotId::generate(),
+            snapshot_type: SnapshotPlacement::Distributed,
             alias: None,
             source: SnapshotPublishSource::Template,
             context: CommandContext::default(),
@@ -185,6 +187,30 @@ pub enum SnapshotSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_sandbox_metadata: Option<HashMap<String, String>>,
     },
+}
+
+fn validate_snapshot_metadata(
+    snapshot_type: SnapshotPlacement,
+    source_is_sandbox: bool,
+    alias: Option<&SnapshotAlias>,
+) -> Result<(), String> {
+    if snapshot_type == SnapshotPlacement::Local && !source_is_sandbox {
+        return Err("Local snapshots must originate from a sandbox".to_string());
+    }
+    if snapshot_type == SnapshotPlacement::Local && alias.is_some() {
+        return Err("Local snapshots do not support aliases".to_string());
+    }
+    Ok(())
+}
+
+impl SnapshotPublishMetadata {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        validate_snapshot_metadata(
+            self.snapshot_type,
+            matches!(&self.source, SnapshotPublishSource::Sandbox { .. }),
+            self.alias.as_ref(),
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +423,12 @@ impl CommittedSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotRecord {
     pub id: SnapshotId,
+    /// Records written before Local support describe Distributed snapshots.
+    #[serde(default)]
+    pub snapshot_type: SnapshotPlacement,
+    /// Routing identity only; Local availability also requires this process's registry entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_node_id: Option<String>,
     pub alias: Option<SnapshotAlias>,
     pub source: SnapshotSource,
     pub resources: SandboxResources,
@@ -409,6 +441,64 @@ pub struct SnapshotRecord {
 }
 
 impl SnapshotRecord {
+    pub(crate) fn new_committed(
+        metadata: &SnapshotPublishMetadata,
+        committed: CommittedSnapshot,
+        now_unix_ms: i64,
+    ) -> Self {
+        let source = match &metadata.source {
+            SnapshotPublishSource::Template => SnapshotSource::Template {
+                build: TemplateBuildInfo {
+                    status: TemplateBuildStatus::Ready,
+                    started_at_unix_ms: None,
+                    finished_at_unix_ms: Some(now_unix_ms),
+                    error_reason: None,
+                },
+            },
+            SnapshotPublishSource::Sandbox {
+                source_sandbox_id,
+                source_sandbox_metadata,
+            } => SnapshotSource::Sandbox {
+                source_sandbox_id: source_sandbox_id.clone(),
+                source_sandbox_metadata: source_sandbox_metadata.clone(),
+            },
+        };
+        Self {
+            id: metadata.id.clone(),
+            snapshot_type: metadata.snapshot_type,
+            owner_node_id: None,
+            alias: metadata.alias.clone(),
+            source,
+            resources: metadata.resources,
+            created_at_unix_ms: now_unix_ms,
+            updated_at_unix_ms: now_unix_ms,
+            committed: Some(committed),
+            deleting: false,
+        }
+    }
+
+    pub(crate) fn validate_committed_metadata(&self) -> Result<(), String> {
+        if self.committed.is_none() {
+            return Err("committed snapshot metadata requires a ready payload".to_string());
+        }
+        if self.snapshot_type == SnapshotPlacement::Local
+            && self
+                .owner_node_id
+                .as_deref()
+                .is_none_or(|owner| owner.trim().is_empty())
+        {
+            return Err("Local snapshots require owner_node_id".to_string());
+        }
+        if self.snapshot_type == SnapshotPlacement::Distributed && self.owner_node_id.is_some() {
+            return Err("Distributed snapshots must not carry owner_node_id".to_string());
+        }
+        validate_snapshot_metadata(
+            self.snapshot_type,
+            matches!(&self.source, SnapshotSource::Sandbox { .. }),
+            self.alias.as_ref(),
+        )
+    }
+
     pub fn template_waiting(
         id: SnapshotId,
         alias: Option<SnapshotAlias>,
@@ -417,6 +507,8 @@ impl SnapshotRecord {
         let now_unix_ms = now_unix_ms();
         Self {
             id,
+            snapshot_type: SnapshotPlacement::Distributed,
+            owner_node_id: None,
             alias,
             source: SnapshotSource::Template {
                 build: TemplateBuildInfo::waiting(),
@@ -453,6 +545,8 @@ impl SnapshotRecord {
             build.error_reason = None;
         }
         self.alias = alias;
+        self.snapshot_type = SnapshotPlacement::Distributed;
+        self.owner_node_id = None;
         self.resources = resources;
         self.updated_at_unix_ms = now_unix_ms;
         self.committed = Some(committed);
@@ -474,6 +568,8 @@ impl SnapshotRecord {
     pub fn mock_ready(committed: CommittedSnapshot) -> Self {
         Self {
             id: SnapshotId::generate(),
+            snapshot_type: SnapshotPlacement::Distributed,
+            owner_node_id: None,
             alias: None,
             source: SnapshotSource::Template {
                 build: TemplateBuildInfo {
@@ -492,7 +588,7 @@ impl SnapshotRecord {
     }
 }
 
-fn now_unix_ms() -> i64 {
+pub(crate) fn now_unix_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
@@ -641,11 +737,12 @@ impl fmt::Debug for RunnableSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::VolumeMode;
+    use crate::types::{SnapshotAlias, VolumeMode};
 
     use super::{
         rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ManagedLayer,
-        OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotRecord, SnapshotSource,
+        OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotPlacement,
+        SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
         SnapshotVolume, TemplateBuildErrorReason,
     };
     use std::collections::HashMap;
@@ -765,6 +862,30 @@ mod tests {
             decoded.committed.unwrap().volume_snapshots[0].mode,
             VolumeMode::Exclusive
         );
+    }
+
+    #[test]
+    fn legacy_snapshot_records_are_distributed() {
+        let record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let mut value = serde_json::to_value(record).unwrap();
+        value.as_object_mut().unwrap().remove("snapshot_type");
+        let record: SnapshotRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(record.snapshot_type, SnapshotPlacement::Distributed);
+    }
+
+    #[test]
+    fn local_snapshots_reject_aliases() {
+        let mut metadata = SnapshotPublishMetadata {
+            snapshot_type: SnapshotPlacement::Local,
+            source: SnapshotPublishSource::Sandbox {
+                source_sandbox_id: "sandbox-a".to_string(),
+                source_sandbox_metadata: None,
+            },
+            ..SnapshotPublishMetadata::mock()
+        };
+        assert!(metadata.validate().is_ok());
+        metadata.alias = Some(SnapshotAlias::parse("checkpoint").unwrap());
+        assert!(metadata.validate().is_err());
     }
 
     #[test]

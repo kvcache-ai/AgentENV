@@ -481,7 +481,11 @@ async fn consecutive_captures_keep_memory_baseline_and_release_generations() -> 
             .await?;
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         assert_eq!(output.stdout, expected);
-        let captured = SandboxBackend::snapshot(&mut running).await?;
+        let captured = SandboxBackend::snapshot(
+            &mut running,
+            agentenv::snapshot::SnapshotPlacement::Distributed,
+        )
+        .await?;
         let manifest = captured.manifest();
         let generation_dir = manifest.vm_state.path.parent().unwrap().to_path_buf();
         let memory_layers = lower_file_paths_from_image_config(&manifest.memory.image_config_path)?;

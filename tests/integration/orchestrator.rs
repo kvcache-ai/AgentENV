@@ -7,8 +7,8 @@ use agentenv::orchestrator::{
 };
 use agentenv::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
 use agentenv::snapshot::{
-    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotSource,
-    StartupCommand,
+    SnapshotAlias, SnapshotId, SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource,
+    SnapshotSource, StartupCommand,
 };
 
 use anyhow::Result;
@@ -151,7 +151,11 @@ async fn orchestrator_lifecycle() -> Result<()> {
         assert_eq!(fetched.state, SandboxState::Running);
 
         for _ in 0..3 {
-            drop(orchestrator.capture_snapshot(sandbox_id).await?);
+            drop(
+                orchestrator
+                    .capture_snapshot(sandbox_id, SnapshotPlacement::Distributed)
+                    .await?,
+            );
             orchestrator.pause_sandbox(sandbox_id).await?;
             orchestrator
                 .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
@@ -282,7 +286,9 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
         orchestrator
             .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
             .await?;
-        let capture = orchestrator.capture_snapshot(sandbox_id).await?;
+        let capture = orchestrator
+            .capture_snapshot(sandbox_id, SnapshotPlacement::Distributed)
+            .await?;
         assert_eq!(capture.metadata.id, sandbox_id);
         assert_eq!(capture.metadata.state, SandboxState::Running);
         assert_eq!(capture.metadata.context.workdir, "/workspace");
@@ -312,6 +318,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
         let published = agentenv::sandbox::publish_captured(
             &snapshot_manager,
             SnapshotPublishMetadata {
+                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
                 id: SnapshotId::generate(),
                 alias: Some(SnapshotAlias::parse(&published_alias)?),
                 source: SnapshotPublishSource::Sandbox {

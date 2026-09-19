@@ -41,10 +41,15 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
         let rootfs_bytes = SandboxBackend::runtime_info(&original)
             .rootfs_virtual_size
             .context("source sandbox has no rootfs virtual size")?;
-        let captured = SandboxBackend::snapshot(&mut original).await?;
+        let captured = SandboxBackend::snapshot(
+            &mut original,
+            agentenv::snapshot::SnapshotPlacement::Distributed,
+        )
+        .await?;
         let record = agentenv::sandbox::publish_captured(
             &manager,
             SnapshotPublishMetadata {
+                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
                 id: SnapshotId::generate(),
                 alias: Some(SnapshotAlias::parse(&format!(
                     "posix-startup-pack-{}",

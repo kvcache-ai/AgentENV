@@ -27,6 +27,7 @@ fn test_repository(root: &std::path::Path) -> PosixFsRepository {
 
 fn metadata(id: &SnapshotId) -> SnapshotPublishMetadata {
     SnapshotPublishMetadata {
+        snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
         id: id.clone(),
         ..SnapshotPublishMetadata::mock()
     }

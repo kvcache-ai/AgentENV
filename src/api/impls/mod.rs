@@ -144,6 +144,7 @@ impl ApiImpl {
             RepositoryError::AliasConflict { .. }
             | RepositoryError::VolumeNameConflict { .. }
             | RepositoryError::IntegrityMismatch { .. } => Self::error(409, err.to_string()),
+            RepositoryError::Unavailable { .. } => Self::error(503, err.to_string()),
             RepositoryError::Unsupported { .. } => Self::error(500, err.to_string()),
             RepositoryError::Backend { .. } => Self::internal_error(err),
         }
