@@ -2,6 +2,7 @@ pub(crate) mod artifact_cache;
 pub mod backends;
 mod catalog;
 pub mod image_export;
+mod local_store;
 mod manager;
 #[doc(hidden)]
 pub mod mock;

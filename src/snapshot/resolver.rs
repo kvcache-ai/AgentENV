@@ -94,6 +94,11 @@ impl RepositoryRuntimeResolver {
 #[async_trait]
 impl SnapshotRuntimeResolver for RepositoryRuntimeResolver {
     async fn resolve(&self, snapshot: Arc<SnapshotRecord>) -> RepositoryResult<RunnableSnapshot> {
+        if snapshot.snapshot_type != crate::snapshot::SnapshotPlacement::Distributed {
+            return Err(RepositoryError::Unsupported {
+                feature: "resolve Local snapshots through their owner manager".to_string(),
+            });
+        }
         let id = &snapshot.id;
         let committed =
             snapshot

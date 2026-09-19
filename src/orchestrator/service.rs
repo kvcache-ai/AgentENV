@@ -1800,10 +1800,11 @@ where
     pub async fn capture_snapshot(
         self: &Arc<Self>,
         sandbox_id: SandboxId,
+        placement: crate::snapshot::SnapshotPlacement,
     ) -> Result<SnapshotCaptureResult> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("snapshot", sandbox_id, async move {
-            this.capture_snapshot_inner(sandbox_id).await
+            this.capture_snapshot_inner(sandbox_id, placement).await
         })
         .await
     }
@@ -1930,12 +1931,13 @@ where
     async fn capture_snapshot_inner(
         self: Arc<Self>,
         sandbox_id: SandboxId,
+        placement: crate::snapshot::SnapshotPlacement,
     ) -> Result<SnapshotCaptureResult> {
         info!("capturing sandbox snapshot");
         let handle = self.begin_snapshot_operation(sandbox_id).await?;
         let result = {
             let mut sandbox = handle.lock().await;
-            sandbox.snapshot().await
+            sandbox.snapshot(placement).await
         };
         let captured_snapshot = match result {
             Ok(captured_snapshot) => captured_snapshot,
