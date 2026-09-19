@@ -530,6 +530,72 @@ async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> 
 }
 
 #[tokio::test]
+async fn promoted_snapshot_launches_on_another_owner_and_preserves_local_child() -> Result<()> {
+    common::setup().await;
+    let manager = agentenv::snapshot::SnapshotManager::new("node-a".to_string(), None)?;
+    let source_id = SandboxId::new();
+    let mut source = FirecrackerSandbox::new(common::default_sandbox_config()?, source_id, None)?;
+    source.start().await?;
+    write_guest_file(&source, "/tmp/promoted.txt", "promoted").await?;
+    let captured = SandboxBackend::snapshot(&mut source, SnapshotPlacement::Local).await?;
+    let mut metadata = publish_metadata_for_test(
+        SnapshotId::generate(),
+        None,
+        SnapshotPublishSource::Sandbox {
+            source_sandbox_id: source_id.to_string(),
+            source_sandbox_metadata: None,
+        },
+    );
+    metadata.snapshot_type = SnapshotPlacement::Local;
+    metadata.resources = SandboxResources {
+        cpu_count: 1,
+        memory_mib: 128,
+        disk_size_mib: 0,
+    };
+    let record = agentenv::sandbox::publish_captured(&manager, metadata, captured).await?;
+    let runnable = manager.resolve_runnable(record.clone()).await?;
+    let launch = SandboxLaunchConfig {
+        sandbox_id: SandboxId::new(),
+        snapshot_id: record.id.to_string(),
+        ..SandboxLaunchConfig::default()
+    };
+    let mut local_child = FirecrackerSandbox::from_snapshot(&runnable, &launch, None)?;
+    drop(runnable);
+
+    let promoted = manager
+        .promote(&record.id.to_string())
+        .await?
+        .context("promoted record")?;
+    assert_eq!(promoted.id, record.id);
+    source.stop().await?;
+    drop(source);
+    local_child.start().await?;
+    assert_guest_file(&local_child, "/tmp/promoted.txt", "promoted").await?;
+    local_child.stop().await?;
+    drop(local_child);
+    drop(manager);
+
+    let other_owner = agentenv::snapshot::SnapshotManager::new("node-b".to_string(), None)?;
+    let published = other_owner
+        .load_runnable(record.id.to_string())
+        .await?
+        .context("published snapshot")?;
+    let mut restored = FirecrackerSandbox::from_snapshot(
+        &published,
+        &SandboxLaunchConfig {
+            sandbox_id: SandboxId::new(),
+            ..launch
+        },
+        None,
+    )?;
+    restored.start().await?;
+    assert_guest_file(&restored, "/tmp/promoted.txt", "promoted").await?;
+    restored.stop().await?;
+    other_owner.delete(record.id.to_string()).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;
