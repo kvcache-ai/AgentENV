@@ -165,7 +165,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
     let setup = sandbox.run_command("sh", &["-lc", setup_cmd]).await?;
     assert_eq!(setup.exit_code, 0);
 
-    let captured = SandboxBackend::snapshot(&mut sandbox).await?;
+    let captured = SandboxBackend::snapshot(&mut sandbox, SnapshotPlacement::Distributed).await?;
     sandbox.stop().await?;
     drop(sandbox);
     publish_capture(snapshot_manager, alias, captured).await
@@ -177,6 +177,7 @@ async fn publish_capture(
     captured: agentenv::sandbox::CapturedSandboxSnapshot,
 ) -> Result<SnapshotRecord> {
     let metadata = SnapshotPublishMetadata {
+        snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
         id: SnapshotId::generate(),
         alias: Some(SnapshotAlias::parse(alias)?),
         source: agentenv::snapshot::SnapshotPublishSource::Sandbox {
@@ -433,7 +434,7 @@ async fn capture_export_failure_keeps_restacked_runtime_usable() -> Result<()> {
     assert_eq!(overlaybd_lower_count(&rootfs_config)?, lower_count + 1);
     fs::write(drive_config, saved_drive_config)?;
     assert_eq!(sandbox.run_command("true", &[]).await?.exit_code, 0);
-    drop(SandboxBackend::snapshot(&mut sandbox).await?);
+    drop(SandboxBackend::snapshot(&mut sandbox, SnapshotPlacement::Distributed).await?);
     sandbox.stop().await?;
     Ok(())
 }
@@ -460,13 +461,13 @@ async fn parallel_drive_capture_failure_preserves_completed_restack() -> Result<
     let broken_config = work_dir.join("extra-drive-runtime-broken/image.json");
     let saved_config = fs::read(&broken_config)?;
     fs::remove_file(&broken_config)?;
-    let capture = SandboxBackend::snapshot(&mut sandbox).await;
+    let capture = SandboxBackend::snapshot(&mut sandbox, SnapshotPlacement::Distributed).await;
     let good_lowers = overlaybd_lower_count(&good_config)?;
     let error = capture.expect_err("one attached drive must fail capture");
     assert_eq!(good_lowers, initial_lowers + 1);
     assert!(!error.is_terminal(), "{error:#}");
     fs::write(broken_config, saved_config)?;
-    drop(SandboxBackend::snapshot(&mut sandbox).await?);
+    drop(SandboxBackend::snapshot(&mut sandbox, SnapshotPlacement::Distributed).await?);
     sandbox.stop().await?;
     Ok(())
 }
@@ -500,7 +501,7 @@ async fn forked_drive_snapshots_survive_parent_and_child_backend_drop() -> Resul
         )
         .await?;
     assert_eq!(output.exit_code, 0);
-    drop(SandboxBackend::snapshot(&mut parent).await?);
+    drop(SandboxBackend::snapshot(&mut parent, SnapshotPlacement::Distributed).await?);
     let child_storage = tempdir()?;
     let mut children = SandboxBackend::fork(
         &mut parent,
@@ -525,11 +526,11 @@ async fn forked_drive_snapshots_survive_parent_and_child_backend_drop() -> Resul
         )
         .await?;
     assert_eq!(output.exit_code, 0);
-    drop(SandboxBackend::snapshot(&mut parent).await?);
-    drop(child.snapshot().await?);
+    drop(SandboxBackend::snapshot(&mut parent, SnapshotPlacement::Distributed).await?);
+    drop(child.snapshot(SnapshotPlacement::Distributed).await?);
     parent.stop().await?;
     drop(parent);
-    drop(child.snapshot().await?);
+    drop(child.snapshot(SnapshotPlacement::Distributed).await?);
 
     let paused = child.pause().await?;
     child.stop().await?;

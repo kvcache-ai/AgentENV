@@ -13,9 +13,9 @@ use tracing::warn;
 use super::publish;
 use super::publish::SnapshotPublication;
 use super::{
-    CommittedSnapshot, MemoryStartupPackInfo, SnapshotAlias, SnapshotId, SnapshotPublishMetadata,
-    SnapshotPublishSource, SnapshotRecord, SnapshotSource, SnapshotSourceKind,
-    TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
+    CommittedSnapshot, MemoryStartupPackInfo, SnapshotAlias, SnapshotId, SnapshotPlacement,
+    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
+    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };
 use crate::repository::{
     DocumentChange, DocumentCollection, DocumentKey, Repository, RepositoryError, RepositoryResult,
@@ -113,6 +113,9 @@ pub trait SnapshotCatalog {
         manifest: SandboxSnapshotManifest,
     ) -> RepositoryResult<SnapshotPublication>;
 
+    /// Commits node-local snapshot metadata without uploading its artifacts.
+    async fn commit_record(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
+
     /// Loads one snapshot record by ID or alias.
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>>;
 
@@ -201,6 +204,27 @@ impl<R: Repository + ?Sized> SnapshotCatalog for R {
         manifest: SandboxSnapshotManifest,
     ) -> RepositoryResult<SnapshotPublication> {
         publish::publish(self, metadata, manifest).await
+    }
+
+    async fn commit_record(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+        if record.snapshot_type != SnapshotPlacement::Local {
+            return Err(RepositoryError::Unsupported {
+                feature: "metadata-only commit of Distributed snapshots".to_string(),
+            });
+        }
+        record
+            .validate_committed_metadata()
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+        let id = record.id.clone();
+        update_record(self, &id, move |_, current| {
+            if current.is_some() {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!("snapshot '{}' already exists", record.id),
+                });
+            }
+            Ok((Some(record.clone()), record.clone()))
+        })
+        .await
     }
 
     /// Snapshots being deleted are hidden, since their files may be gone.
@@ -472,6 +496,8 @@ fn new_committed_record(
     };
     SnapshotRecord {
         id: metadata.id.clone(),
+        snapshot_type: SnapshotPlacement::Distributed,
+        owner_node_id: None,
         alias: metadata.alias.clone(),
         source,
         resources: metadata.resources,
@@ -784,6 +810,7 @@ mod tests {
 
     fn metadata(alias: Option<&str>, source: SnapshotPublishSource) -> SnapshotPublishMetadata {
         SnapshotPublishMetadata {
+            snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
             id: SnapshotId::generate(),
             alias: alias.map(|alias| SnapshotAlias::parse(alias).expect("alias")),
             source,

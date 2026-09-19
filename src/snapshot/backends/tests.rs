@@ -101,6 +101,7 @@ fn test_overlaybd_layer_store() -> Arc<dyn OverlaybdLayerStore> {
 
 fn sample_metadata(id: SnapshotId, alias: Option<&str>) -> SnapshotPublishMetadata {
     SnapshotPublishMetadata {
+        snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
         id,
         alias: alias.map(|value| SnapshotAlias::parse(value).expect("alias should parse")),
         ..SnapshotPublishMetadata::mock()

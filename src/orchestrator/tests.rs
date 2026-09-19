@@ -1823,7 +1823,9 @@ async fn capture_snapshot_returns_snapshot_and_preserves_running_sandbox() -> Re
         .await?;
     let sandbox_id = created.id;
 
-    let result = orchestrator.capture_snapshot(sandbox_id).await?;
+    let result = orchestrator
+        .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed)
+        .await?;
     assert_eq!(result.metadata.id, sandbox_id);
     assert_eq!(result.metadata.state, SandboxState::Running);
     assert!(
@@ -1875,7 +1877,7 @@ async fn capture_snapshot_recoverable_failure_rolls_back_to_running_and_allows_r
     let baseline_metrics = current_metrics(&orchestrator).await;
 
     let err = orchestrator
-        .capture_snapshot(sandbox_id)
+        .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed)
         .await
         .expect_err("recoverable snapshot failure should be returned to the caller");
     assert!(matches!(
@@ -1894,7 +1896,9 @@ async fn capture_snapshot_recoverable_failure_rolls_back_to_running_and_allows_r
     assert_proxy_ready(&orchestrator, &sandbox_id).await?;
     assert_metrics_snapshot(&orchestrator, &baseline_metrics).await;
 
-    let retry = orchestrator.capture_snapshot(sandbox_id).await?;
+    let retry = orchestrator
+        .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed)
+        .await?;
     assert_eq!(retry.metadata.state, SandboxState::Running);
     assert!(
         retry
@@ -1932,7 +1936,7 @@ async fn capture_snapshot_terminal_failure_removes_sandbox_and_releases_metrics(
     let sandbox_id = created.id;
 
     let err = orchestrator
-        .capture_snapshot(sandbox_id)
+        .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed)
         .await
         .expect_err("terminal snapshot failure should fail the operation");
     assert!(matches!(
@@ -1983,7 +1987,7 @@ async fn capture_snapshot_without_runtime_handle_removes_sandbox_and_releases_me
     );
 
     let err = orchestrator
-        .capture_snapshot(sandbox_id)
+        .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed)
         .await
         .expect_err("capture_snapshot should fail when persisted running sandbox has no handle");
     assert!(matches!(err, OrchestratorError::SandboxNotFound(_)));
@@ -2011,7 +2015,7 @@ async fn capture_snapshot_rejects_non_running_states() -> Result<()> {
     orchestrator.pause_sandbox(sandbox_id).await?;
 
     let err = orchestrator
-        .capture_snapshot(sandbox_id)
+        .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed)
         .await
         .expect_err("capture_snapshot should reject paused sandboxes");
     assert!(matches!(
@@ -2035,7 +2039,7 @@ async fn capture_snapshot_maps_killing_state_to_not_found() -> Result<()> {
         .await?;
 
     let err = orchestrator
-        .capture_snapshot(sandbox_id)
+        .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed)
         .await
         .expect_err("capture_snapshot should treat killing sandboxes as gone");
     assert!(matches!(err, OrchestratorError::SandboxNotFound(id) if id == sandbox_id));

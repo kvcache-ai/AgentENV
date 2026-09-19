@@ -165,6 +165,18 @@ pub async fn publish_captured(
     captured_snapshot: CapturedSandboxSnapshot,
 ) -> RepositoryResult<SnapshotRecord> {
     let manifest = captured_snapshot.manifest().clone();
+    if metadata.snapshot_type == crate::snapshot::SnapshotPlacement::Local {
+        let manager = snapshots.clone();
+        return tokio::spawn(async move {
+            let result = manager.publish_local(metadata, manifest).await;
+            drop(captured_snapshot);
+            result
+        })
+        .await
+        .map_err(|error| {
+            crate::repository::RepositoryError::backend("finish Local snapshot publication", error)
+        })?;
+    }
 
     // Spawn the startup-manifest recording up front (a no-op task when
     // the feature is disabled): the throwaway recording VM overlaps the
@@ -235,7 +247,10 @@ pub trait SandboxBackend: Send + 'static {
     /// [`SandboxCaptureError::Terminal`] indicates snapshot capture mutated the live
     /// runtime before failing, so callers must not keep treating the sandbox
     /// as safely runnable.
-    async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot>;
+    async fn snapshot(
+        &mut self,
+        placement: crate::snapshot::SnapshotPlacement,
+    ) -> SandboxCaptureResult<CapturedSandboxSnapshot>;
 
     /// Flush and seal writable persistent-volume upper layers while keeping
     /// the sandbox running.
