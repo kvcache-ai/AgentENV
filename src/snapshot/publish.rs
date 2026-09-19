@@ -129,11 +129,12 @@ where
     else {
         return Ok(());
     };
-    let committed = serde_json::from_slice::<serde_json::Value>(&bytes)
-        .map_err(|error| RepositoryError::backend(format!("parse snapshot record '{id}'"), error))?
-        .get("committed")
-        .is_some_and(|committed| !committed.is_null());
-    if committed {
+    let record: SnapshotRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        RepositoryError::backend(format!("parse snapshot record '{id}'"), error)
+    })?;
+    if record.deleting
+        || (record.committed.is_some() && record.snapshot_type != super::SnapshotPlacement::Local)
+    {
         return Err(RepositoryError::InvalidRequest {
             reason: format!("snapshot '{id}' is already committed"),
         });
