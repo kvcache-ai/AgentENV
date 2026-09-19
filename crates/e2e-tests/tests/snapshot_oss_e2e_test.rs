@@ -273,6 +273,7 @@ async fn snapshot_oss_publish_retains_dense_delta_for_p2p() -> Result<()> {
             serde_json::to_vec(&serde_json::json!({"lowers": [{"file": delta_path}]}))?,
         )?;
         let metadata = SnapshotPublishMetadata {
+            snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
             id: SnapshotId::generate(),
             alias: None,
             source: SnapshotPublishSource::Sandbox {
@@ -358,6 +359,7 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
     let stored = manager
         .publish(
             SnapshotPublishMetadata {
+                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
                 id: snapshot_id.clone(),
                 alias: Some(SnapshotAlias::parse("oss-e2e").expect("alias should parse")),
                 source: SnapshotPublishSource::Template,
@@ -499,6 +501,7 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
     let stored = manager
         .publish(
             SnapshotPublishMetadata {
+                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
                 id: snapshot_id,
                 alias: None,
                 source: SnapshotPublishSource::Template,
@@ -624,6 +627,7 @@ async fn snapshot_oss_resolve_alias_cleans_up_stale_binding() -> Result<()> {
     let stored = repository
         .publish(
             SnapshotPublishMetadata {
+                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
                 id: snapshot_id.clone(),
                 alias: Some(alias.clone()),
                 source: SnapshotPublishSource::Template,
@@ -688,6 +692,7 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
     let stored = repository
         .publish(
             SnapshotPublishMetadata {
+                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
                 id: snapshot_id,
                 alias: None,
                 source: SnapshotPublishSource::Template,
@@ -756,6 +761,7 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
     let stored = repository
         .publish(
             SnapshotPublishMetadata {
+                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
                 id: snapshot_id.clone(),
                 alias: Some(alias.clone()),
                 source: SnapshotPublishSource::Template,

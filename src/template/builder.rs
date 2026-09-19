@@ -171,6 +171,7 @@ impl TemplateBuilder {
             .publish(
                 SnapshotPublishMetadata {
                     id: context.build_snapshot_id.clone(),
+                    snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
                     alias: context.alias.clone(),
                     source: SnapshotPublishSource::Template,
                     context: build_execution.build_context,
