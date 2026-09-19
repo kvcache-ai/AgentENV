@@ -40,12 +40,18 @@ is deletable locally iff durable; no live state ever has zero copies.
 
 ### Snapshot store
 
-Dedicated bucket (`agentenv-snapshots`) via the in-tree
-`crates/object-store-operator`; content-addressed keys + one manifest JSON
-per snapshot (tenant, class, sandbox_id, paused_at, ttl). NOT the shared
-swef registry bucket (its GC is frozen; snapshots are high-churn). Durable
-TTL = bucket lifecycle rules per class prefix (no code); a small quota job
-handles per-tenant snapshot-GB later. OCI-artifact formalism deferred.
+Reuse the existing publish machinery, don't invent a transport: snapshot
+publishing already commits artifacts under `snapshot/v1/artifacts/
+{snapshot_id}/...` with an OSS object-storage backend and P2P-first
+resolution (`src/snapshot/p2p.rs`, `SnapshotManager::publish*`; overlaybd
+layer identity via `src/overlaybd/p2p/artifact.rs` — snapshot publishing
+must reuse that helper). Our addition is POLICY, not plumbing: the
+watermark-driven exporter decides WHEN to publish and when the local copy
+may be deleted. Target bucket: dedicated `agentenv-snapshots` (never the
+shared swef registry bucket — its GC is frozen and snapshots are
+high-churn). Tenant/class/ttl ride the artifact metadata; durable TTL =
+bucket lifecycle rules per class prefix (no code); a small quota job
+handles per-tenant snapshot-GB later.
 
 ### The "DB"
 
@@ -111,8 +117,10 @@ gateway by `x-agentenv-sandbox-id`, which is what lets admission apply.
   elsewhere); capacity gauges in `src/orchestrator/metrics.rs` +
   `src/observability/prometheus.rs`; `src/snapshot/exporter.rs` state
   machine (Idle/Draining/Blocking) mirroring the image-cache GC watermark
-  mechanics (`src/image/cache/service.rs`), LRU key = `touched_at` on
-  `SnapshotRecord`.
+  mechanics (`src/image/cache/service.rs`); exports ride the existing
+  `SnapshotManager::publish*` path; LRU `touched_at` persists in the shared
+  `LocalKvStore` (`src/local_store.rs`, the repo convention for node-local
+  catalogs). `make fmt` + `make clippy -D warnings` gate every patch.
 - **R1 — Rust scheduler drop-in**: `crates/scheduler` implementing the
   existing gRPC proto + Redis schema + EndpointSlice discovery; parity
   first (RR, bindings, heartbeats, GetNode), image swap in the chart.
