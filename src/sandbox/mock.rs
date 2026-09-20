@@ -495,7 +495,6 @@ impl SandboxBackendFactory for MockBackendFactory {
 
     fn decode_paused_state(
         &self,
-        _artifact_root: std::path::PathBuf,
         _state: serde_json::Value,
     ) -> Result<Arc<dyn PausedSandboxState>> {
         Ok(Arc::new(MockSnapshot))

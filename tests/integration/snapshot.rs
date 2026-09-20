@@ -552,8 +552,7 @@ async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> 
     drop(forked);
     drop(checkpoint);
 
-    let decoded =
-        agentenv::sandbox::FirecrackerPausedState::decode(std::path::PathBuf::new(), encoded)?;
+    let decoded = agentenv::sandbox::FirecrackerPausedState::decode(encoded)?;
     let mut resumed = FirecrackerSandbox::from_paused_state(
         &decoded,
         launch_config.sandbox_id,
