@@ -654,7 +654,7 @@ pub struct OrchestratorConfig {
     #[config(default = 300u64)]
     pub auto_resume_min_sandbox_timeout_secs: u64,
     #[config(
-        default = "$AENV_HOME/persisted-sandboxes",
+        default = "$AENV_HOME/sandboxes",
         env = "AENV_PERSISTED_SANDBOX_STORE_PATH",
         parse_env = parse_required_path
     )]
@@ -2087,7 +2087,7 @@ mod tests {
         config.kernel.image_path = Some("./kernel/vmlinux.bin".into());
         config.tools.drive_path = Some("./tools.ext4".into());
         config.image.cache.root_dir = "./custom-image-cache".into();
-        config.snapshot.local_root = "./snapshot-local-cache".into();
+        config.snapshot.local_root = "./custom-snapshots".into();
         config.backend.posix_fs = Some(PosixFsBackendConfig {
             snapshot_store: "./snapshot-store".into(),
         });
@@ -2097,7 +2097,7 @@ mod tests {
         config.ublk.daemon_log_path = Some("./logs/uvm-ublk-daemon.log".into());
         config.ublk.overlaybd.global_config_path = "./overlaybd-global.json".into();
         config.memory_snapshot.overlaybd_global_config_path = "./mem-overlaybd-global.json".into();
-        config.orchestrator.persisted_sandbox_store_path = "./persisted-sandboxes".into();
+        config.orchestrator.persisted_sandbox_store_path = "./custom-sandboxes".into();
         config.normalize(&config_dir)?;
 
         assert_eq!(config.deps_path, config_dir.join("env"));
@@ -2124,7 +2124,7 @@ mod tests {
         );
         assert_eq!(
             config.snapshot.local_root,
-            config_dir.join("snapshot-local-cache")
+            config_dir.join("custom-snapshots")
         );
         assert_eq!(config.p2p.store_dir, config_dir.join("p2p-store"));
         assert_eq!(
@@ -2153,7 +2153,7 @@ mod tests {
         );
         assert_eq!(
             config.orchestrator.persisted_sandbox_store_path,
-            config_dir.join("persisted-sandboxes")
+            config_dir.join("custom-sandboxes")
         );
 
         Ok(())
@@ -2319,7 +2319,7 @@ mod tests {
         );
         assert_eq!(
             config.orchestrator.persisted_sandbox_store_path,
-            home_path.join("persisted-sandboxes")
+            home_path.join("sandboxes")
         );
         assert_eq!(
             config.backend.posix_fs.as_ref().unwrap().snapshot_store,

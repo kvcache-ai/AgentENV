@@ -4317,8 +4317,9 @@ async fn paused_delete_persistence_failure_keeps_sandbox_retryable() -> Result<(
 async fn paused_delete_completes_when_artifact_retirement_fails() -> anyhow::Result<()> {
     setup();
     let temp = TempDir::new()?;
+    let artifacts = temp.path().join("artifacts");
     let persister = FileBackedSandboxPersister::new(
-        temp.path().to_path_buf(),
+        artifacts.clone(),
         crate::virtualization::VirtualizationMode::Kvm,
     )
     .with_durability(crate::local_store::LocalStoreDurability::Memory);
@@ -4333,7 +4334,6 @@ async fn paused_delete_completes_when_artifact_retirement_fails() -> anyhow::Res
     orchestrator.pause_sandbox(created.id).await?;
 
     // Keep the real record and artifacts, but make directory retirement fail.
-    let artifacts = temp.path().join("artifacts");
     let held_artifacts = temp.path().join("held-artifacts");
     tokio::fs::rename(&artifacts, &held_artifacts).await?;
     tokio::fs::write(&artifacts, b"not a directory").await?;

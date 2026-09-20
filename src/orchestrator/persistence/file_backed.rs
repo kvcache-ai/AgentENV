@@ -31,7 +31,6 @@ struct PersistedPausedRecord {
     version: u32,
     lifecycle: PersistedPausedLifecycle,
     metadata: SandboxMetadata,
-    artifact_root: PathBuf,
     state: Value,
 }
 
@@ -40,14 +39,12 @@ impl PersistedPausedRecord {
     where
         F: SandboxBackendFactory,
     {
-        ensure_supported_version(self.version)?;
-
-        let paused_state = factory
-            .decode_paused_state(self.artifact_root, self.state)
-            .map_err(|source| SandboxPersistenceError::InvalidRecord {
+        let paused_state = factory.decode_paused_state(self.state).map_err(|source| {
+            SandboxPersistenceError::InvalidRecord {
                 reason: "failed to decode paused sandbox state".to_string(),
                 source: Some(source),
-            })?;
+            }
+        })?;
         self.metadata.state = SandboxState::Paused;
         self.metadata.paused_state = Some(paused_state);
 
@@ -113,12 +110,8 @@ impl FileBackedSandboxPersister {
         self.root.join(RECORD_DB_DIR)
     }
 
-    fn artifacts_root(&self) -> PathBuf {
-        self.root.join("artifacts")
-    }
-
-    fn sandbox_artifact_root(&self, sandbox_id: &SandboxId) -> PathBuf {
-        self.artifacts_root().join(sandbox_id.to_string())
+    fn sandbox_root(&self, sandbox_id: &SandboxId) -> PathBuf {
+        self.root.join(sandbox_id.to_string())
     }
 
     async fn db(&self) -> PersistenceResult<LocalKvStore> {
@@ -185,32 +178,24 @@ impl FileBackedSandboxPersister {
         }
     }
 
-    async fn cleanup_invalid_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
-        debug!(sandbox_id = %sandbox_id, "cleaning up invalid paused sandbox record");
-        self.remove_record(sandbox_id).await?;
-        Self::remove_artifact_root(&self.sandbox_artifact_root(sandbox_id)).await?;
-        Ok(())
-    }
-
     async fn cleanup_orphan_artifacts(
         &self,
         retained_sandbox_ids: &HashSet<SandboxId>,
     ) -> PersistenceResult<()> {
-        let artifacts_root = self.artifacts_root();
-        let mut entries = match fs::read_dir(&artifacts_root).await {
+        let mut entries = match fs::read_dir(&self.root).await {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(source) => {
                 return Err(SandboxPersistenceError::io(
                     "read paused sandbox artifacts",
-                    &artifacts_root,
+                    &self.root,
                     source,
                 ));
             }
         };
 
         while let Some(entry) = entries.next_entry().await.map_err(|source| {
-            SandboxPersistenceError::io("scan paused sandbox artifacts", &artifacts_root, source)
+            SandboxPersistenceError::io("scan paused sandbox artifacts", &self.root, source)
         })? {
             let file_type = entry.file_type().await.map_err(|source| {
                 SandboxPersistenceError::io(
@@ -225,7 +210,10 @@ impl FileBackedSandboxPersister {
 
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(".retired-") {
+            if name
+                .strip_prefix(".retired-")
+                .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
+            {
                 Self::remove_artifact_root(&entry.path()).await?;
                 continue;
             }
@@ -261,47 +249,43 @@ impl SandboxPersister for FileBackedSandboxPersister {
         let mut retained_artifacts = HashSet::new();
 
         for (key, bytes) in records {
-            let sandbox_id_from_key = std::str::from_utf8(&key)
-                .ok()
-                .and_then(|value| SandboxId::parse_str(value).ok());
-            let record = match decode_record(&bytes) {
-                Ok(record) => record,
-                Err(err) => {
-                    warn!(record_key = %String::from_utf8_lossy(&key), error = %err, "discarding invalid paused sandbox record");
-                    if let Some(sandbox_id) = sandbox_id_from_key {
-                        let _ = self.remove_record(&sandbox_id).await;
-                    }
-                    continue;
+            let restored = decode_record(&bytes).and_then(|record| {
+                if record.metadata.id.to_string().as_bytes() != key.as_slice() {
+                    return Err(SandboxPersistenceError::InvalidRecord {
+                        reason: "sandbox ID does not match its record key".to_string(),
+                        source: None,
+                    });
                 }
-            };
-            let sandbox_id = record.metadata.id;
-
-            if record.lifecycle == PersistedPausedLifecycle::Resuming {
-                warn!(sandbox_id = %sandbox_id, "discarding paused sandbox record left in resuming state");
-                self.cleanup_invalid_record(&sandbox_id).await?;
-                continue;
-            }
-
-            if record.metadata.virtualization_mode != self.virtualization_mode {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    record_mode = %record.metadata.virtualization_mode,
-                    node_mode = %self.virtualization_mode,
-                    "loading paused sandbox metadata without resumable runtime state because its virtualization mode is incompatible"
-                );
-                retained_artifacts.insert(sandbox_id);
-                sandboxes.push(record.into_metadata_without_runtime_state());
-                continue;
-            }
-
-            match record.into_metadata(factory) {
+                if record.lifecycle == PersistedPausedLifecycle::Resuming {
+                    return Err(SandboxPersistenceError::RuntimeState {
+                        reason: "continuation was left in resuming state",
+                    });
+                }
+                if record.metadata.virtualization_mode != self.virtualization_mode {
+                    warn!(
+                        sandbox_id = %record.metadata.id,
+                        record_mode = %record.metadata.virtualization_mode,
+                        node_mode = %self.virtualization_mode,
+                        "loading paused sandbox metadata without resumable runtime state because its virtualization mode is incompatible"
+                    );
+                    Ok(record.into_metadata_without_runtime_state())
+                } else {
+                    record.into_metadata(factory)
+                }
+            });
+            match restored {
                 Ok(metadata) => {
-                    retained_artifacts.insert(sandbox_id);
+                    retained_artifacts.insert(metadata.id);
                     sandboxes.push(metadata);
                 }
-                Err(err) => {
-                    warn!(sandbox_id = %sandbox_id, error = %err, "discarding unusable paused sandbox record");
-                    self.cleanup_invalid_record(&sandbox_id).await?;
+                Err(error) => {
+                    warn!(record_key = %String::from_utf8_lossy(&key), %error, "discarding invalid paused sandbox record");
+                    self.db().await?.delete(key).await.map_err(|source| {
+                        SandboxPersistenceError::store(
+                            "remove invalid paused sandbox record",
+                            source,
+                        )
+                    })?;
                 }
             }
         }
@@ -318,7 +302,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
     }
 
     async fn prepare_runtime_root(&self, sandbox_id: &SandboxId) -> PersistenceResult<PathBuf> {
-        let root = self.sandbox_artifact_root(sandbox_id).join("runtime");
+        let root = self.sandbox_root(sandbox_id);
         fs::create_dir_all(&root).await.map_err(|source| {
             SandboxPersistenceError::io("prepare runtime storage", &root, source)
         })?;
@@ -332,10 +316,8 @@ impl SandboxPersister for FileBackedSandboxPersister {
         metadata: &SandboxMetadata,
         paused_state: &dyn PausedSandboxState,
     ) -> PersistenceResult<()> {
-        let artifact_root = self.sandbox_artifact_root(&metadata.id).join("runtime");
         debug!(
             sandbox_id = %metadata.id,
-            artifact_root = %artifact_root.display(),
             "persisting paused sandbox"
         );
         let state =
@@ -349,7 +331,6 @@ impl SandboxPersister for FileBackedSandboxPersister {
             version: RECORD_VERSION,
             lifecycle: PersistedPausedLifecycle::Paused,
             metadata: metadata.clone(),
-            artifact_root: artifact_root.to_path_buf(),
             state,
         };
         self.put_record(&record).await
@@ -378,7 +359,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
         debug!(sandbox_id = %sandbox_id, "deleting paused sandbox record and artifacts");
         self.remove_record(sandbox_id).await?;
         // Once the record is gone, cleanup errors must not restore a Paused sandbox.
-        if let Err(error) = super::retire_artifacts(&self.sandbox_artifact_root(sandbox_id)).await {
+        if let Err(error) = super::retire_artifacts(&self.sandbox_root(sandbox_id)).await {
             warn!(
                 %sandbox_id,
                 %error,
@@ -394,13 +375,9 @@ mod tests {
     use super::*;
     use crate::sandbox::{
         mock::{MockBackendFactory, MockSnapshot},
-        FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
-        SandboxLaunchConfig,
+        FirecrackerSandboxFactory, RuntimeArtifactSet,
     };
-    use crate::snapshot::RunnableSnapshot;
     use anyhow::Result;
-    use std::sync::Arc;
-    use std::time::Duration;
     use tempfile::TempDir;
 
     #[derive(Debug)]
@@ -416,122 +393,31 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct RejectingFactory;
-
-    impl SandboxBackendFactory for RejectingFactory {
-        fn build(
-            &self,
-            _build_spec: FreshSandboxBuildSpec,
-            _launch_config: SandboxLaunchConfig,
-            _storage_root: &Path,
-        ) -> Result<Box<dyn SandboxBackend>> {
-            unreachable!("persister tests only decode state")
-        }
-
-        fn build_from_snapshot(
-            &self,
-            _snapshot: &RunnableSnapshot,
-            _launch_config: SandboxLaunchConfig,
-            _storage_root: &Path,
-        ) -> Result<Box<dyn SandboxBackend>> {
-            unreachable!("persister tests only decode state")
-        }
-
-        fn build_from_paused_state(
-            &self,
-            _sandbox_id: SandboxId,
-            _state: &dyn PausedSandboxState,
-            _envd_access_token: Option<crate::sandbox::EnvdAccessToken>,
-            _storage_root: &Path,
-        ) -> Result<Box<dyn SandboxBackend>> {
-            unreachable!("persister tests only decode state")
-        }
-
-        fn decode_paused_state(
-            &self,
-            _artifact_root: PathBuf,
-            _state: Value,
-        ) -> Result<Arc<dyn PausedSandboxState>> {
-            anyhow::bail!("forced decode failure")
-        }
-    }
-
-    fn paused_state(root: &Path) -> Arc<dyn PausedSandboxState> {
-        std::fs::create_dir_all(root).expect("create test artifact root");
-        Arc::new(MockSnapshot)
-    }
-
     fn test_persister(root: &Path) -> FileBackedSandboxPersister {
         FileBackedSandboxPersister::new_for_test(root.to_path_buf())
             .with_durability(LocalStoreDurability::Memory)
     }
 
-    async fn persist_test_record(
-        persister: &FileBackedSandboxPersister,
-        snapshot_root: &Path,
-    ) -> anyhow::Result<(SandboxId, Arc<dyn PausedSandboxState>)> {
-        let paused_state = paused_state(snapshot_root);
+    async fn persist_test_record(persister: &FileBackedSandboxPersister) -> Result<SandboxId> {
         let metadata = SandboxMetadata {
-            id: SandboxId::new(),
             virtualization_mode: persister.virtualization_mode,
-            paused_state: Some(Arc::clone(&paused_state)),
             ..Default::default()
         };
-        let sandbox_id = metadata.id;
-        persister
-            .persist_paused(&metadata, paused_state.as_ref())
-            .await?;
-        Ok((sandbox_id, paused_state))
+        persister.prepare_runtime_root(&metadata.id).await?;
+        persister.persist_paused(&metadata, &MockSnapshot).await?;
+        Ok(metadata.id)
     }
 
-    async fn has_record(
-        persister: &FileBackedSandboxPersister,
-        sandbox_id: &SandboxId,
-    ) -> anyhow::Result<bool> {
-        Ok(persister
-            .db()
-            .await?
-            .get(sandbox_id.to_string())
-            .await?
-            .is_some())
-    }
-
-    #[tokio::test]
-    async fn file_persister_round_trips_paused_record() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        let paused_state = paused_state(&snapshot_root);
-        let metadata = SandboxMetadata {
-            timeout: Some(Duration::from_secs(5)),
-            paused_state: Some(Arc::clone(&paused_state)),
-            ..Default::default()
-        };
-
-        persister
-            .persist_paused(&metadata, paused_state.as_ref())
-            .await?;
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
-
-        assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, metadata.id);
-        assert!(loaded[0]
-            .paused_state
-            .as_ref()
-            .expect("paused state should be restored")
-            .downcast_ref::<MockSnapshot>()
-            .is_some());
-        Ok(())
+    async fn has_record(persister: &FileBackedSandboxPersister, id: &SandboxId) -> Result<bool> {
+        Ok(persister.db().await?.get(id.to_string()).await?.is_some())
     }
 
     #[tokio::test]
     async fn paused_record_from_other_mode_is_visible_but_not_resumable() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let kvm_persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        let (sandbox_id, _paused_state) =
-            persist_test_record(&kvm_persister, &snapshot_root).await?;
+        let sandbox_id = persist_test_record(&kvm_persister).await?;
+        let snapshot_root = kvm_persister.sandbox_root(&sandbox_id);
         drop(kvm_persister);
         let pvm_persister =
             FileBackedSandboxPersister::new(temp.path().to_path_buf(), VirtualizationMode::Pvm)
@@ -553,15 +439,15 @@ mod tests {
     async fn mixed_mode_records_are_both_visible_and_retained() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let kvm_persister = test_persister(temp.path());
-        let kvm_root = temp.path().join("kvm-artifacts");
-        let (kvm_id, _kvm_state) = persist_test_record(&kvm_persister, &kvm_root).await?;
+        let kvm_id = persist_test_record(&kvm_persister).await?;
+        let kvm_root = kvm_persister.sandbox_root(&kvm_id);
         drop(kvm_persister);
 
         let pvm_persister =
             FileBackedSandboxPersister::new(temp.path().to_path_buf(), VirtualizationMode::Pvm)
                 .with_durability(LocalStoreDurability::Memory);
-        let pvm_root = temp.path().join("pvm-artifacts");
-        let (pvm_id, _pvm_state) = persist_test_record(&pvm_persister, &pvm_root).await?;
+        let pvm_id = persist_test_record(&pvm_persister).await?;
+        let pvm_root = pvm_persister.sandbox_root(&pvm_id);
 
         let mut loaded = pvm_persister.load_all(&MockBackendFactory::new()).await?;
         loaded.sort_by_key(|metadata| metadata.id);
@@ -588,136 +474,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_root_is_stable_for_a_sandbox() -> anyhow::Result<()> {
+    async fn startup_restores_paused_and_reclaims_only_unowned_state() -> Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-
-        let first_root = persister.prepare_runtime_root(&sandbox_id).await?;
-        let second_root = persister.prepare_runtime_root(&sandbox_id).await?;
-        let sandbox_id_dir = sandbox_id.to_string();
-
-        assert_eq!(first_root, second_root);
-        assert!(first_root.is_dir());
-        assert!(second_root.is_dir());
-        assert_eq!(
-            first_root.parent().and_then(Path::file_name),
-            Some(std::ffi::OsStr::new(&sandbox_id_dir))
-        );
-        assert_eq!(
-            first_root
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::file_name),
-            Some(std::ffi::OsStr::new("artifacts"))
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn resuming_records_are_cleaned_on_load() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        let snapshot_root = persister
-            .sandbox_artifact_root(&sandbox_id)
-            .join("snapshot");
-        let paused_state = paused_state(&snapshot_root);
-        let metadata = SandboxMetadata {
-            id: sandbox_id,
-            paused_state: Some(Arc::clone(&paused_state)),
-            ..Default::default()
-        };
-
+        let paused = persist_test_record(&persister).await?;
+        let root = persister.prepare_runtime_root(&paused).await?;
+        assert_eq!(root, temp.path().canonicalize()?.join(paused.to_string()));
+        assert_eq!(root, persister.prepare_runtime_root(&paused).await?);
+        tokio::fs::write(root.join("state"), b"retained").await?;
+        let resuming = persist_test_record(&persister).await?;
+        persister.mark_resuming(&resuming).await?;
+        let corrupt = persist_test_record(&persister).await?;
         persister
-            .persist_paused(&metadata, paused_state.as_ref())
+            .db()
+            .await?
+            .put(corrupt.to_string(), b"not-json")
             .await?;
-        persister.mark_resuming(&metadata.id).await?;
+        let mismatched = SandboxId::new();
+        persister.prepare_runtime_root(&mismatched).await?;
+        let mut wrong_record = persister.get_record(&paused).await?;
+        wrong_record.lifecycle = PersistedPausedLifecycle::Resuming;
+        persister
+            .db()
+            .await?
+            .put(mismatched.to_string(), serde_json::to_vec(&wrong_record)?)
+            .await?;
+        let orphan = SandboxId::new();
+        persister.prepare_runtime_root(&orphan).await?;
+        let retired = temp
+            .path()
+            .join(format!(".retired-{}", uuid::Uuid::now_v7()));
+        tokio::fs::create_dir(&retired).await?;
+        let unknown = temp.path().join("operator-files");
+        tokio::fs::create_dir(&unknown).await?;
+        let outside = TempDir::new()?;
+        tokio::fs::write(outside.path().join("keep"), b"outside").await?;
+        let link = temp.path().join(SandboxId::new().to_string());
+        std::os::unix::fs::symlink(outside.path(), &link)?;
 
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
-
-        assert!(loaded.is_empty());
-        assert!(!has_record(&persister, &metadata.id).await?);
-        assert!(!persister.sandbox_artifact_root(&metadata.id).exists());
+        for _ in 0..2 {
+            let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].id, paused);
+            assert_eq!(loaded[0].state, SandboxState::Paused);
+            assert!(loaded[0]
+                .paused_state
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<MockSnapshot>()
+                .is_some());
+        }
+        for id in [resuming, corrupt, mismatched, orphan] {
+            assert!(!has_record(&persister, &id).await?);
+            assert!(!persister.sandbox_root(&id).exists());
+        }
+        assert_eq!(tokio::fs::read(root.join("state")).await?, b"retained");
+        assert!(!retired.exists());
+        assert!(temp.path().join(RECORD_DB_DIR).is_dir());
+        assert!(unknown.is_dir() && link.is_symlink());
+        assert_eq!(
+            tokio::fs::read(outside.path().join("keep")).await?,
+            b"outside"
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn persist_paused_accepts_backend_agnostic_state() -> anyhow::Result<()> {
+    async fn persist_paused_keeps_live_artifacts_when_encode_fails() -> Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        let paused_state = paused_state(&snapshot_root);
         let metadata = SandboxMetadata::default();
-
-        persister
-            .persist_paused(&metadata, paused_state.as_ref())
-            .await?;
-        drop(paused_state);
-
-        assert!(snapshot_root.exists());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn persist_paused_keeps_live_artifacts_when_encode_fails() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        tokio::fs::create_dir_all(&snapshot_root).await?;
-        let paused_state: Arc<dyn PausedSandboxState> = Arc::new(FailingEncodeState);
+        let root = persister.prepare_runtime_root(&metadata.id).await?;
         let err = persister
-            .persist_paused(&SandboxMetadata::default(), paused_state.as_ref())
+            .persist_paused(&metadata, &FailingEncodeState)
             .await
-            .expect_err("encode failure should reject paused state");
-
+            .unwrap_err();
         assert!(matches!(err, SandboxPersistenceError::InvalidRecord { .. }));
-        assert!(snapshot_root.exists());
+        assert!(root.is_dir());
+        assert!(!has_record(&persister, &metadata.id).await?);
         Ok(())
     }
 
     #[tokio::test]
-    async fn mark_resuming_and_rollback_preserve_loadability() -> anyhow::Result<()> {
+    async fn mark_resuming_and_rollback_preserve_loadability() -> Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        let (sandbox_id, _paused_state) = persist_test_record(&persister, &snapshot_root).await?;
-
-        persister.mark_resuming(&sandbox_id).await?;
+        let id = persist_test_record(&persister).await?;
+        persister.mark_resuming(&id).await?;
         assert_eq!(
-            persister.get_record(&sandbox_id).await?.lifecycle,
+            persister.get_record(&id).await?.lifecycle,
             PersistedPausedLifecycle::Resuming
         );
-
-        persister.rollback_resuming(&sandbox_id).await?;
+        persister.rollback_resuming(&id).await?;
         let loaded = persister.load_all(&MockBackendFactory::new()).await?;
-
         assert_eq!(loaded.len(), 1);
-        assert_eq!(loaded[0].id, sandbox_id);
-        assert!(snapshot_root.exists());
+        assert_eq!(loaded[0].id, id);
+        assert!(persister.sandbox_root(&id).is_dir());
         Ok(())
     }
 
     #[tokio::test]
-    async fn retired_cleanup_preserves_a_new_pause_for_the_same_sandbox() -> anyhow::Result<()> {
+    async fn retired_cleanup_preserves_a_new_pause_for_the_same_sandbox() -> Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        let root = persister.sandbox_artifact_root(&sandbox_id);
-        tokio::fs::create_dir_all(root.join("old-generation")).await?;
-        persister.delete_record_and_artifacts(&sandbox_id).await?;
-
-        let fresh = persister.prepare_runtime_root(&sandbox_id).await?;
-        let state = paused_state(&fresh);
-        let metadata = SandboxMetadata {
-            id: sandbox_id,
-            ..Default::default()
-        };
-        persister.persist_paused(&metadata, state.as_ref()).await?;
-
+        let id = persist_test_record(&persister).await?;
+        tokio::fs::write(persister.sandbox_root(&id).join("old"), b"old").await?;
+        persister.delete_record_and_artifacts(&id).await?;
+        let fresh = persister.prepare_runtime_root(&id).await?;
+        tokio::fs::write(fresh.join("new"), b"new").await?;
+        persister
+            .persist_paused(
+                &SandboxMetadata {
+                    id,
+                    ..Default::default()
+                },
+                &MockSnapshot,
+            )
+            .await?;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                let mut entries = tokio::fs::read_dir(persister.artifacts_root()).await?;
+                let mut entries = tokio::fs::read_dir(&persister.root).await?;
                 let mut retired = false;
                 while let Some(entry) = entries.next_entry().await? {
                     retired |= entry.file_name().to_string_lossy().starts_with(".retired-");
@@ -729,199 +605,49 @@ mod tests {
             }
         })
         .await??;
-        assert!(fresh.exists());
-        assert_eq!(
-            persister.get_record(&sandbox_id).await?.artifact_root,
-            fresh
-        );
+        assert!(has_record(&persister, &id).await?);
+        assert_eq!(tokio::fs::read(fresh.join("new")).await?, b"new");
+        assert!(!fresh.join("old").exists());
         Ok(())
     }
 
     #[tokio::test]
-    async fn load_all_removes_orphan_artifacts_without_records() -> anyhow::Result<()> {
+    async fn deleting_a_record_preserves_storage_until_explicit_retirement() -> Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        let artifact_root = persister
-            .sandbox_artifact_root(&sandbox_id)
-            .join("resumed-generation");
-        tokio::fs::create_dir_all(&artifact_root).await?;
-
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
-
-        assert!(loaded.is_empty());
-        assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
+        let id = persist_test_record(&persister).await?;
+        persister.delete_record(&id).await?;
+        assert!(!has_record(&persister, &id).await?);
+        assert!(persister.sandbox_root(&id).is_dir());
+        // Retirement also works when the record is absent or undecodable.
+        for invalid_record in [false, true] {
+            persister.prepare_runtime_root(&id).await?;
+            if invalid_record {
+                persister
+                    .db()
+                    .await?
+                    .put(id.to_string(), b"not-json")
+                    .await?;
+            }
+            persister.delete_record_and_artifacts(&id).await?;
+            assert!(!has_record(&persister, &id).await?);
+            assert!(!persister.sandbox_root(&id).exists());
+        }
         Ok(())
     }
 
     #[tokio::test]
-    async fn load_all_keeps_artifacts_for_valid_paused_record() -> anyhow::Result<()> {
+    async fn load_all_discards_unusable_backend_state_and_artifacts() -> Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        let snapshot_root = persister
-            .sandbox_artifact_root(&sandbox_id)
-            .join("paused-generation");
-        let paused_state = paused_state(&snapshot_root);
-        let metadata = SandboxMetadata {
-            id: sandbox_id,
-            paused_state: Some(Arc::clone(&paused_state)),
-            ..Default::default()
-        };
-        persister
-            .persist_paused(&metadata, paused_state.as_ref())
-            .await?;
-
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
-
-        assert_eq!(loaded.len(), 1);
-        assert!(persister.sandbox_artifact_root(&sandbox_id).exists());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_record_removes_record_but_keeps_artifacts() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let snapshot_root = temp.path().join("artifacts");
-        let (sandbox_id, _) = persist_test_record(&persister, &snapshot_root).await?;
-
-        persister.delete_record(&sandbox_id).await?;
-
-        assert!(!has_record(&persister, &sandbox_id).await?);
-        assert!(snapshot_root.exists());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_record_and_artifacts_removes_both() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        let snapshot_root = persister
-            .sandbox_artifact_root(&sandbox_id)
-            .join("snapshot");
-        let paused_state = paused_state(&snapshot_root);
-        let metadata = SandboxMetadata {
-            id: sandbox_id,
-            paused_state: Some(Arc::clone(&paused_state)),
-            ..Default::default()
-        };
-        persister
-            .persist_paused(&metadata, paused_state.as_ref())
-            .await?;
-
-        persister.delete_record_and_artifacts(&sandbox_id).await?;
-
-        assert!(!has_record(&persister, &sandbox_id).await?);
-        assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn artifact_cleanup_failure_does_not_restore_a_deleted_record() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        let sandbox_artifact_root = persister.sandbox_artifact_root(&sandbox_id);
-        let snapshot_root = sandbox_artifact_root.join("snapshot");
-        let paused_state = paused_state(&snapshot_root);
-        let metadata = SandboxMetadata {
-            id: sandbox_id,
-            paused_state: Some(Arc::clone(&paused_state)),
-            ..Default::default()
-        };
-        persister
-            .persist_paused(&metadata, paused_state.as_ref())
-            .await?;
-        tokio::fs::remove_dir_all(&sandbox_artifact_root).await?;
-        tokio::fs::write(&sandbox_artifact_root, b"not a directory").await?;
-
-        persister.delete_record_and_artifacts(&sandbox_id).await?;
-
-        assert!(!has_record(&persister, &sandbox_id).await?);
-        assert!(!sandbox_artifact_root.exists());
-        assert!(std::fs::read_dir(persister.artifacts_root())?
-            .filter_map(Result::ok)
-            .any(
-                |entry| entry.file_name().to_string_lossy().starts_with(".retired-")
-                    && entry.path().is_file()
-            ));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_record_and_artifacts_removes_artifacts_without_record() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        let sandbox_artifact_root = persister.sandbox_artifact_root(&sandbox_id);
-        tokio::fs::create_dir_all(sandbox_artifact_root.join("stale-generation")).await?;
-
-        persister.delete_record_and_artifacts(&sandbox_id).await?;
-
-        assert!(!sandbox_artifact_root.exists());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn delete_record_and_artifacts_removes_invalid_record() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        persister
-            .db()
+        let id = persist_test_record(&persister).await?;
+        // A mock state cannot decode as a Firecracker continuation.
+        assert!(persister
+            .load_all(&FirecrackerSandboxFactory::new())
             .await?
-            .put(sandbox_id.to_string(), b"not-json")
-            .await?;
-
-        persister.delete_record_and_artifacts(&sandbox_id).await?;
-
-        assert!(!has_record(&persister, &sandbox_id).await?);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn load_all_discards_invalid_record() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        persister
-            .db()
-            .await?
-            .put(sandbox_id.to_string(), b"not-json")
-            .await?;
-
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
-
-        assert!(loaded.is_empty());
-        assert!(!has_record(&persister, &sandbox_id).await?);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn load_all_discards_unusable_record_and_artifacts() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let persister = test_persister(temp.path());
-        let sandbox_id = SandboxId::new();
-        let snapshot_root = persister
-            .sandbox_artifact_root(&sandbox_id)
-            .join("snapshot");
-        let paused_state = paused_state(&snapshot_root);
-        let metadata = SandboxMetadata {
-            id: sandbox_id,
-            paused_state: Some(Arc::clone(&paused_state)),
-            ..Default::default()
-        };
-        persister
-            .persist_paused(&metadata, paused_state.as_ref())
-            .await?;
-
-        let loaded = persister.load_all(&RejectingFactory).await?;
-
-        assert!(loaded.is_empty());
-        assert!(!has_record(&persister, &sandbox_id).await?);
-        assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
+            .is_empty());
+        assert!(!has_record(&persister, &id).await?);
+        assert!(!persister.sandbox_root(&id).exists());
         Ok(())
     }
 }

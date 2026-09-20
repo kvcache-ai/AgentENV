@@ -438,8 +438,7 @@ async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<(
     assert!(!artifact_root.join("tools").exists());
     drop(paused_state);
 
-    let decoded =
-        agentenv::sandbox::FirecrackerPausedState::decode(artifact_root.clone(), encoded)?;
+    let decoded = agentenv::sandbox::FirecrackerPausedState::decode(encoded)?;
     let mut resumed = FirecrackerSandbox::from_paused_state(&decoded, id, None, &artifact_root)?;
     resumed.start().await?;
     verify_disk_marker(&mut resumed).await?;
@@ -621,7 +620,7 @@ async fn repeated_capture_and_pause_compacts_live_disks_without_losing_old_snaps
         let paused = SandboxBackend::pause(&mut sandbox).await?;
         sandbox.stop().await?;
         drop(sandbox);
-        let state = FirecrackerPausedState::decode(runtime.clone(), paused.encode()?)?;
+        let state = FirecrackerPausedState::decode(paused.encode()?)?;
         drop(paused);
         sandbox = FirecrackerSandbox::from_paused_state(&state, id, None, &runtime)?;
         sandbox.start().await?;
@@ -696,7 +695,7 @@ async fn fork_children_keep_their_snapshot_after_source_teardown() -> Result<()>
             .to_path_buf();
         let encoded = state.encode()?;
         drop(paused);
-        let restored = FirecrackerPausedState::decode(storage_root.clone(), encoded)?;
+        let restored = FirecrackerPausedState::decode(encoded)?;
         let mut resumed = FirecrackerSandbox::from_paused_state(
             &restored,
             SandboxId::new(),

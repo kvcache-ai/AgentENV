@@ -10,7 +10,9 @@ x-agentenv-base: &agentenv-base
     AENV_UBLK_DAEMON_BINARY_PATH: /usr/local/bin/uvm-ublk-daemon
     AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED: "true"
     AENV_OBSERVABILITY_SCHEDULER_ENDPOINT: http://scheduler:9090
-    AENV_SNAPSHOT_LOCAL_ROOT: /var/cache/agentenv/snapshot-local-cache/snapshots
+    AENV_SNAPSHOT_LOCAL_ROOT: /var/lib/agentenv/node-state/snapshots
+    AENV_FIRECRACKER_WORK_DIR: /var/lib/agentenv/node-state/firecracker-work
+    AENV_PERSISTED_SANDBOX_STORE_PATH: /var/lib/agentenv/node-state/sandboxes
     AENV_SANDBOX_PROXY_DOMAINS: ${SANDBOX_PROXY_DOMAINS:-}
     RUST_LOG: ${RUST_LOG:-agentenv=info,envd=info,uvm_ublk=info}
   volumes:
@@ -100,6 +102,21 @@ services:
     environment:
       <<: *agentenv-environment
       AENV_NODE_ID: node-a
+    # Keep each node's sandbox and Local snapshot state separate.
+    volumes:
+      - /dev:/dev
+      - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
+      - type: bind
+        source: ${HOST_RESOLV_CONF:-/run/systemd/resolve/resolv.conf}
+        target: /run/systemd/resolve/resolv.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      # Runtime assets are baked into the image by `server --setup-only`; compose
+      # persists committed snapshots and deployment secrets across restarts.
+      - agentenv-snapshot-store:/workspace/env/snapshot-store
+      - agentenv-auth:/workspace/env/secrets
+      - agentenv-node-state-a:/var/lib/agentenv/node-state
 
   agentenv-b:
     <<: *agentenv-base
@@ -107,8 +124,25 @@ services:
     environment:
       <<: *agentenv-environment
       AENV_NODE_ID: node-b
+    # Keep each node's sandbox and Local snapshot state separate.
+    volumes:
+      - /dev:/dev
+      - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
+      - type: bind
+        source: ${HOST_RESOLV_CONF:-/run/systemd/resolve/resolv.conf}
+        target: /run/systemd/resolve/resolv.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      # Runtime assets are baked into the image by `server --setup-only`; compose
+      # persists committed snapshots and deployment secrets across restarts.
+      - agentenv-snapshot-store:/workspace/env/snapshot-store
+      - agentenv-auth:/workspace/env/secrets
+      - agentenv-node-state-b:/var/lib/agentenv/node-state
 
 volumes:
   gateway-tls:
   agentenv-auth:
   agentenv-snapshot-store:
+  agentenv-node-state-a:
+  agentenv-node-state-b:

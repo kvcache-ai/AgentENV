@@ -269,11 +269,7 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
     ) -> Result<Box<dyn SandboxBackend>>;
 
     /// Decode backend-specific paused state loaded from persistence.
-    fn decode_paused_state(
-        &self,
-        artifact_root: PathBuf,
-        state: Value,
-    ) -> Result<Arc<dyn PausedSandboxState>>;
+    fn decode_paused_state(&self, state: Value) -> Result<Arc<dyn PausedSandboxState>>;
 
     /// Build a sandbox backend from backend-specific paused state captured by `pause`.
     fn build_from_paused_state(
