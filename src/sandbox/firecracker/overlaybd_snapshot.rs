@@ -382,19 +382,17 @@ mod tests {
     #[test]
     fn split_runtime_suffix_preserves_stable_lowers() {
         let temp = tempfile::tempdir().unwrap();
-        let snapshot_store_root = temp.path().join("snapshots");
-        let persisted_sandbox_store_root = temp.path().join("persisted-sandboxes");
-        let managed_base = temp.path().join("managed-snapshots");
+        let snapshot_store_root = temp.path().join("repository");
+        let sandbox_root = temp.path().join("sandboxes");
+        let source_snapshot_root = temp.path().join("snapshots/snapshot-parent");
         let snapshot_store_lower = snapshot_store_root
             .join("managed-layers")
             .join("sha256_base.overlaybd.commit");
-        let persisted_store_lower = persisted_sandbox_store_root
-            .join("artifacts")
+        let persisted_store_lower = sandbox_root
             .join("sandbox-parent")
-            .join("1700000000000")
-            .join("rootfs")
+            .join("overlaybd/runtime-layers/parent")
             .join("snapshot.commit");
-        let managed_base_lower = managed_base.join("sandbox/1700000000001/mem.commit");
+        let source_memory_lower = source_snapshot_root.join("mem_overlaybd/overlaybd.commit");
         let lowers = vec![
             LayerConfig {
                 file: String::new(),
@@ -404,11 +402,11 @@ mod tests {
             },
             local_layer_config(&snapshot_store_lower),
             local_layer_config(&persisted_store_lower),
-            local_layer_config(&managed_base_lower),
+            local_layer_config(&source_memory_lower),
         ];
 
         let (preserved, managed) =
-            split_runtime_suffix(lowers, &[persisted_sandbox_store_root, managed_base]);
+            split_runtime_suffix(lowers, &[sandbox_root, source_snapshot_root]);
 
         assert_eq!(preserved.len(), 2);
         assert_eq!(preserved[0].file, "");
@@ -416,15 +414,15 @@ mod tests {
         assert_eq!(PathBuf::from(&preserved[1].file), snapshot_store_lower);
         assert_eq!(managed.len(), 2);
         assert_eq!(PathBuf::from(&managed[0].file), persisted_store_lower);
-        assert_eq!(PathBuf::from(&managed[1].file), managed_base_lower);
+        assert_eq!(PathBuf::from(&managed[1].file), source_memory_lower);
     }
 
     #[tokio::test]
     async fn snapshot_adopts_persisted_runtime_suffix_by_link() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let artifacts_root = temp.path().join("persisted-sandboxes").join("artifacts");
-        let output_dir = artifacts_root.join("sandbox-c").join("gen1").join("rootfs");
-        let parent_root = artifacts_root.join("sandbox-b").join("gen1").join("rootfs");
+        let sandbox_root = temp.path().join("sandboxes");
+        let output_dir = temp.path().join("snapshots/capture/rootfs");
+        let parent_root = sandbox_root.join("sandbox-b/overlaybd");
         let cache_root = temp.path().join("image-cache").join("commits");
         std::fs::create_dir_all(&parent_root).expect("create parent rootfs");
         std::fs::create_dir_all(&cache_root).expect("create cache root");
@@ -447,7 +445,7 @@ mod tests {
             local_layer_config(&parent_base),
             local_layer_config(&parent_snapshot),
         ];
-        let runtime_owned_roots = [artifacts_root.canonicalize().unwrap()];
+        let runtime_owned_roots = [sandbox_root.canonicalize().unwrap()];
 
         let (rewritten, _) = rewrite_lowers_with_runtime_roots(
             lowers,
@@ -492,7 +490,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let runtime_dir = temp.path().join("runtime");
         let runtime_alias = temp.path().join("runtime-alias");
-        let output_dir = temp.path().join("generation");
+        let output_dir = temp.path().join("snapshots/capture/rootfs");
         let stable_lower = temp.path().join("base.commit");
         fs::write(&stable_lower, b"base").unwrap();
         fs::create_dir_all(runtime_dir.join("runtime-layers")).unwrap();

@@ -237,6 +237,8 @@ async fn orchestrator_lifecycle() -> Result<()> {
                 .expect("secure sandbox access token");
 
             let sandbox_id = created.id;
+            assert!(paused_store.join(sandbox_id.to_string()).is_dir());
+            assert!(!paused_store.join("artifacts").exists());
             let lookup = orchestrator.proxy_lookup_for(&sandbox_id).await?;
             assert!(
                 matches!(lookup, ProxyLookupResult::Ready(_)),
