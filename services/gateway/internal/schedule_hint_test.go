@@ -35,6 +35,9 @@ func TestBuildScheduleHintNewSandbox(t *testing.T) {
 	if hint.GetNewColdSandbox() != nil {
 		t.Fatalf("did not expect cold sandbox hint")
 	}
+	if got := hint.GetNewSandbox().GetTemplateId(); got != "tmpl" {
+		t.Fatalf("template_id = %q, want tmpl", got)
+	}
 
 	// Body must remain available for the upstream request.
 	body, err := io.ReadAll(r.Body)
@@ -154,6 +157,25 @@ func TestParseNewColdSandboxHint(t *testing.T) {
 		hint := parseNewColdSandboxHint([]byte(`{"image":"img","attachedDrives":[{"source":{"image":""}},{"source":{"image":"data:v1"}}]}`))
 		if got := hint.GetImages(); !equalStrings(got, []string{"img", "data:v1"}) {
 			t.Fatalf("images = %v", got)
+		}
+	})
+}
+
+func TestParseNewSandboxHint(t *testing.T) {
+	t.Run("template and metadata", func(t *testing.T) {
+		hint := parseNewSandboxHint([]byte(`{"templateID":"tmpl","metadata":{"team":"infra"}}`))
+		if got := hint.GetTemplateId(); got != "tmpl" {
+			t.Fatalf("template_id = %q, want tmpl", got)
+		}
+		if got := hint.GetMetadata()["team"]; got != "infra" {
+			t.Fatalf("metadata team = %q, want infra", got)
+		}
+	})
+
+	t.Run("malformed json", func(t *testing.T) {
+		hint := parseNewSandboxHint([]byte("{not json"))
+		if hint.GetTemplateId() != "" || len(hint.GetMetadata()) != 0 {
+			t.Fatalf("expected empty best-effort hint, got %v", hint)
 		}
 	})
 }
