@@ -3310,16 +3310,9 @@ async fn auto_evict_waits_for_startup_image_reconciliation() -> anyhow::Result<(
             paused_state: Some(test_paused_state().clone()),
             ..Default::default()
         };
-        let artifact_root = persister
-            .allocate_artifact_root(&metadata.id)
-            .await?
-            .unwrap();
+        let runtime_root = persister.prepare_runtime_root(&metadata.id).await?;
         persister
-            .persist_paused(
-                &metadata,
-                Some(&artifact_root),
-                test_paused_state().as_ref(),
-            )
+            .persist_paused(&metadata, test_paused_state().as_ref())
             .await?;
         let image_refs = Arc::new(StartupImageRefs {
             fail_pin,
@@ -3343,7 +3336,7 @@ async fn auto_evict_waits_for_startup_image_reconciliation() -> anyhow::Result<(
             .await
             .expect("expiry must finish cleanup after either reconciliation outcome");
         assert!(orchestrator.get_sandbox(&metadata.id).await?.is_none());
-        assert!(!artifact_root.exists());
+        assert!(!runtime_root.exists());
         assert!(orchestrator
             .persister
             .load_all(&MockBackendFactory::new())
@@ -4585,8 +4578,9 @@ async fn paused_delete_persistence_failure_keeps_sandbox_retryable() -> Result<(
 async fn paused_delete_completes_when_artifact_retirement_fails() -> anyhow::Result<()> {
     setup();
     let temp = TempDir::new()?;
+    let artifacts = temp.path().join("artifacts");
     let persister = FileBackedSandboxPersister::new(
-        temp.path().to_path_buf(),
+        artifacts.clone(),
         crate::virtualization::VirtualizationMode::Kvm,
     )
     .with_durability(crate::local_store::LocalStoreDurability::Memory);
@@ -4601,7 +4595,6 @@ async fn paused_delete_completes_when_artifact_retirement_fails() -> anyhow::Res
     orchestrator.pause_sandbox(created.id).await?;
 
     // Keep the real record and artifacts, but make directory retirement fail.
-    let artifacts = temp.path().join("artifacts");
     let held_artifacts = temp.path().join("held-artifacts");
     tokio::fs::rename(&artifacts, &held_artifacts).await?;
     tokio::fs::write(&artifacts, b"not a directory").await?;
