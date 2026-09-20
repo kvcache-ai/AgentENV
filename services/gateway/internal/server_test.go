@@ -450,6 +450,9 @@ func TestIsSandboxControlPlaneRequest(t *testing.T) {
 	}{
 		{name: "sandbox detail", method: http.MethodGet, path: "/sandboxes/sbx-123", want: true},
 		{name: "sandbox delete", method: http.MethodDelete, path: "/sandboxes/sbx-123", want: true},
+		{name: "v2 sandbox connect", method: http.MethodPost, path: "/v2/sandboxes/sbx-123/connect", want: true},
+		{name: "v2 connect wrong method", method: http.MethodGet, path: "/v2/sandboxes/sbx-123/connect", want: false},
+		{name: "v2 connect missing ID", method: http.MethodPost, path: "/v2/sandboxes//connect", want: false},
 		{name: "sandbox pause", method: http.MethodPost, path: "/sandboxes/sbx-123/pause", want: true},
 		{name: "sandbox fork", method: http.MethodPost, path: "/sandboxes/sbx-123/fork", want: true},
 		{name: "sandbox network update", method: http.MethodPut, path: "/sandboxes/sbx-123/network", want: true},
@@ -689,64 +692,68 @@ func TestSandboxIDExtractionPathPreferredOverHeader(t *testing.T) {
 }
 
 func TestSandboxControlPlaneRequestWithE2BHeadersUsesPathRoute(t *testing.T) {
-	type upstreamRequestSnapshot struct {
-		path      string
-		sandboxID string
-	}
-
-	requests := make(chan upstreamRequestSnapshot, 1)
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests <- upstreamRequestSnapshot{
-			path:      r.URL.Path,
-			sandboxID: r.Header.Get(headerE2BSandboxID),
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusCreated)
-		_, _ = w.Write([]byte(`{"sandboxID":"sbx-path"}`))
-	}))
-	defer upstream.Close()
-
-	server := newTestServer(t, stubSchedulerClient{
-		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
-			if req.GetSandboxId() != "sbx-path" {
-				return nil, fmt.Errorf("lookup sandbox id = %q, want %q", req.GetSandboxId(), "sbx-path")
+	for _, path := range []string{"/sandboxes/sbx-path/connect", "/v2/sandboxes/sbx-path/connect"} {
+		t.Run(path, func(t *testing.T) {
+			type upstreamRequestSnapshot struct {
+				path      string
+				sandboxID string
 			}
-			return &schedulerv1.LookupNodeResponse{
-				Node: &schedulerv1.Node{
-					NodeId:   "node-1",
-					Endpoint: upstream.URL,
+
+			requests := make(chan upstreamRequestSnapshot, 1)
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests <- upstreamRequestSnapshot{
+					path:      r.URL.Path,
+					sandboxID: r.Header.Get(headerE2BSandboxID),
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = w.Write([]byte(`{"sandboxID":"sbx-path"}`))
+			}))
+			defer upstream.Close()
+
+			server := newTestServer(t, stubSchedulerClient{
+				lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+					if req.GetSandboxId() != "sbx-path" {
+						return nil, fmt.Errorf("lookup sandbox id = %q, want %q", req.GetSandboxId(), "sbx-path")
+					}
+					return &schedulerv1.LookupNodeResponse{
+						Node: &schedulerv1.Node{
+							NodeId:   "node-1",
+							Endpoint: upstream.URL,
+						},
+					}, nil
 				},
-			}, nil
-		},
-	}, time.Second, 1024)
+			}, time.Second, 1024)
 
-	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
-	defer gatewayServer.Close()
+			gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
+			defer gatewayServer.Close()
 
-	req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+"/sandboxes/sbx-path/connect", strings.NewReader(`{"timeout":60}`))
-	if err != nil {
-		t.Fatalf("build connect request failed: %v", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set(headerE2BSandboxID, "sbx-path")
-	req.Header.Set(headerE2BTargetPort, "49983")
+			req, err := http.NewRequest(http.MethodPost, gatewayServer.URL+path, strings.NewReader(`{"timeout":60}`))
+			if err != nil {
+				t.Fatalf("build connect request failed: %v", err)
+			}
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set(headerE2BSandboxID, "sbx-path")
+			req.Header.Set(headerE2BTargetPort, "49983")
 
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("connect request failed: %v", err)
-	}
-	defer resp.Body.Close()
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("connect request failed: %v", err)
+			}
+			defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusCreated {
-		t.Fatalf("connect status = %d, want %d", resp.StatusCode, http.StatusCreated)
-	}
+			if resp.StatusCode != http.StatusCreated {
+				t.Fatalf("connect status = %d, want %d", resp.StatusCode, http.StatusCreated)
+			}
 
-	upstreamReq := <-requests
-	if upstreamReq.path != "/sandboxes/sbx-path/connect" {
-		t.Fatalf("upstream path = %q, want %q", upstreamReq.path, "/sandboxes/sbx-path/connect")
-	}
-	if upstreamReq.sandboxID != "sbx-path" {
-		t.Fatalf("forwarded e2b sandbox id = %q, want %q", upstreamReq.sandboxID, "sbx-path")
+			upstreamReq := <-requests
+			if upstreamReq.path != path {
+				t.Fatalf("upstream path = %q, want %q", upstreamReq.path, path)
+			}
+			if upstreamReq.sandboxID != "sbx-path" {
+				t.Fatalf("forwarded e2b sandbox id = %q, want %q", upstreamReq.sandboxID, "sbx-path")
+			}
+		})
 	}
 }
 
@@ -761,6 +768,8 @@ func TestShouldRecordAssignment(t *testing.T) {
 	}{
 		{name: "create sandbox", method: http.MethodPost, path: "/sandboxes", route: routeSourceSchedule, hasSandbox: false, want: true},
 		{name: "create sandbox with trailing slash", method: http.MethodPost, path: "/sandboxes/", route: routeSourceSchedule, hasSandbox: false, want: true},
+		{name: "create v2 sandbox", method: http.MethodPost, path: "/v2/sandboxes", route: routeSourceSchedule, hasSandbox: false, want: true},
+		{name: "create v2 sandbox with trailing slash", method: http.MethodPost, path: "/v2/sandboxes/", route: routeSourceSchedule, hasSandbox: false, want: true},
 		{name: "create cold sandbox", method: http.MethodPost, path: "/sandboxes-cold", route: routeSourceSchedule, hasSandbox: false, want: true},
 		{name: "create cold sandbox with trailing slash", method: http.MethodPost, path: "/sandboxes-cold/", route: routeSourceSchedule, hasSandbox: false, want: true},
 		{name: "fork sandbox records child assignment", method: http.MethodPost, path: "/sandboxes/sbx-1/fork", route: routeSourcePath, hasSandbox: true, want: true},

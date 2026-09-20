@@ -551,7 +551,7 @@ func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox
 	}
 	path := strings.TrimRight(r.URL.Path, "/")
 	if !hasSandbox {
-		return path == "/sandboxes" || path == "/sandboxes-cold"
+		return path == "/sandboxes" || path == "/v2/sandboxes" || path == "/sandboxes-cold"
 	}
 	if routeSource != routeSourcePath {
 		return false
@@ -631,6 +631,9 @@ func sandboxIDFromPath(path string) (string, bool) {
 
 func isSandboxControlPlaneRequest(r *http.Request) bool {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) == 4 && parts[0] == "v2" && parts[1] == "sandboxes" && strings.TrimSpace(parts[2]) != "" && parts[3] == "connect" {
+		return r.Method == http.MethodPost
+	}
 	if len(parts) < 2 || parts[0] != "sandboxes" || strings.TrimSpace(parts[1]) == "" {
 		return false
 	}

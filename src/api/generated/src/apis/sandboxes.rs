@@ -276,6 +276,45 @@ pub enum V2SandboxesGetResponse {
     Status500_ServerError(models::Error),
 }
 
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum V2SandboxesPostResponse {
+    /// The sandbox was created successfully
+    Status201_TheSandboxWasCreatedSuccessfully {
+        body: models::Sandbox,
+        x_agentenv_sandbox_id: Option<String>,
+    },
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum V2SandboxesSandboxIdConnectPostResponse {
+    /// The sandbox was already running
+    Status200_TheSandboxWasAlreadyRunning(models::Sandbox),
+    /// The sandbox was resumed successfully
+    Status201_TheSandboxWasResumedSuccessfully(models::Sandbox),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
 /// Sandboxes
 #[async_trait]
 #[allow(clippy::ptr_arg)]
@@ -493,4 +532,31 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         claims: &Self::Claims,
         query_params: &models::V2SandboxesGetQueryParams,
     ) -> Result<V2SandboxesGetResponse, E>;
+
+    /// Create sandbox (v2).
+    ///
+    /// V2SandboxesPost - POST /v2/sandboxes
+    async fn v2_sandboxes_post(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        body: &models::NewSandboxV2,
+    ) -> Result<V2SandboxesPostResponse, E>;
+
+    /// Connect sandbox (v2).
+    ///
+    /// V2SandboxesSandboxIdConnectPost - POST /v2/sandboxes/{sandboxID}/connect
+    async fn v2_sandboxes_sandbox_id_connect_post(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::V2SandboxesSandboxIdConnectPostPathParams,
+        body: &Option<models::ConnectSandboxV2>,
+    ) -> Result<V2SandboxesSandboxIdConnectPostResponse, E>;
 }

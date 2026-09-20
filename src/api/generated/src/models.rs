@@ -209,6 +209,12 @@ pub struct V2SandboxesGetQueryParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct V2SandboxesSandboxIdConnectPostPathParams {
+    pub sandbox_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SnapshotsGetQueryParams {
     #[serde(rename = "sandboxID")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1183,6 +1189,140 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ConnectSandb
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into ConnectSandbox - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ConnectSandboxV2 {
+    /// Timeout in seconds from the current time after which the sandbox should expire
+    #[serde(rename = "timeout")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+}
+
+impl ConnectSandboxV2 {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new() -> ConnectSandboxV2 {
+        ConnectSandboxV2 { timeout: Some(300) }
+    }
+}
+
+/// Converts the ConnectSandboxV2 value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ConnectSandboxV2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            self.timeout
+                .as_ref()
+                .map(|timeout| ["timeout".to_string(), timeout.to_string()].join(",")),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ConnectSandboxV2 value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ConnectSandboxV2 {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub timeout: Vec<u32>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ConnectSandboxV2".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "timeout" => intermediate_rep.timeout.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ConnectSandboxV2".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ConnectSandboxV2 {
+            timeout: intermediate_rep.timeout.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ConnectSandboxV2> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ConnectSandboxV2>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ConnectSandboxV2>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ConnectSandboxV2 - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ConnectSandboxV2> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ConnectSandboxV2 as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ConnectSandboxV2 - {err}"#
                     )),
                 }
             }
@@ -3253,6 +3393,313 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<NewSandbox> 
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into NewSandbox - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Sandbox creation request. All system communication with the sandbox is always secured; the template's envd version must support secured access.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct NewSandboxV2 {
+    /// Identifier of the required template
+    #[serde(rename = "templateID")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub template_id: String,
+
+    /// Time to live for the sandbox in seconds.
+    #[serde(rename = "timeout")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+
+    /// Automatically pauses the sandbox after the timeout
+    #[serde(rename = "autoPause")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_pause: Option<bool>,
+
+    #[serde(rename = "autoResume")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_resume: Option<models::SandboxAutoResumeConfig>,
+
+    /// Allow sandbox to access the internet. When set to false, it behaves the same as specifying denyOut to 0.0.0.0/0 in the network config.
+    #[serde(rename = "allow_internet_access")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_internet_access: Option<bool>,
+
+    #[serde(rename = "network")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<models::SandboxNetworkConfig>,
+
+    #[serde(rename = "metadata")]
+    #[validate(custom(function = "check_xss_map_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<std::collections::HashMap<String, String>>,
+
+    #[serde(rename = "envVars")]
+    #[validate(custom(function = "check_xss_map_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_vars: Option<std::collections::HashMap<String, String>>,
+
+    /// Opaque JSON object interpreted only by the custom extension. An absent value and an empty object are equivalent: both mean empty params.
+    #[serde(rename = "customExtensionParams")]
+    #[validate(custom(function = "check_xss_map"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub custom_extension_params: Option<std::collections::HashMap<String, crate::types::Object>>,
+
+    /// MCP configuration for the sandbox
+    #[serde(rename = "mcp")]
+    #[serde(deserialize_with = "deserialize_optional_nullable")]
+    #[serde(default = "default_optional_nullable")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<Nullable<std::collections::HashMap<String, crate::types::Object>>>,
+
+    #[serde(rename = "volumeMounts")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
+}
+
+impl NewSandboxV2 {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(template_id: String) -> NewSandboxV2 {
+        NewSandboxV2 {
+            template_id,
+            timeout: Some(300),
+            auto_pause: Some(true),
+            auto_resume: None,
+            allow_internet_access: None,
+            network: None,
+            metadata: None,
+            env_vars: None,
+            custom_extension_params: None,
+            mcp: None,
+            volume_mounts: None,
+        }
+    }
+}
+
+/// Converts the NewSandboxV2 value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for NewSandboxV2 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("templateID".to_string()),
+            Some(self.template_id.to_string()),
+            self.timeout
+                .as_ref()
+                .map(|timeout| ["timeout".to_string(), timeout.to_string()].join(",")),
+            self.auto_pause
+                .as_ref()
+                .map(|auto_pause| ["autoPause".to_string(), auto_pause.to_string()].join(",")),
+            // Skipping autoResume in query parameter serialization
+            self.allow_internet_access
+                .as_ref()
+                .map(|allow_internet_access| {
+                    [
+                        "allow_internet_access".to_string(),
+                        allow_internet_access.to_string(),
+                    ]
+                    .join(",")
+                }),
+            // Skipping network in query parameter serialization
+
+            // Skipping metadata in query parameter serialization
+
+            // Skipping envVars in query parameter serialization
+
+            // Skipping customExtensionParams in query parameter serialization
+            // Skipping customExtensionParams in query parameter serialization
+
+            // Skipping mcp in query parameter serialization
+            // Skipping mcp in query parameter serialization
+
+            // Skipping volumeMounts in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a NewSandboxV2 value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for NewSandboxV2 {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub template_id: Vec<String>,
+            pub timeout: Vec<u32>,
+            pub auto_pause: Vec<bool>,
+            pub auto_resume: Vec<models::SandboxAutoResumeConfig>,
+            pub allow_internet_access: Vec<bool>,
+            pub network: Vec<models::SandboxNetworkConfig>,
+            pub metadata: Vec<std::collections::HashMap<String, String>>,
+            pub env_vars: Vec<std::collections::HashMap<String, String>>,
+            pub custom_extension_params:
+                Vec<std::collections::HashMap<String, crate::types::Object>>,
+            pub mcp: Vec<std::collections::HashMap<String, crate::types::Object>>,
+            pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing NewSandboxV2".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "templateID" => intermediate_rep.template_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "timeout" => intermediate_rep.timeout.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "autoPause" => intermediate_rep.auto_pause.push(
+                        <bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "autoResume" => intermediate_rep.auto_resume.push(
+                        <models::SandboxAutoResumeConfig as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "allow_internet_access" => intermediate_rep.allow_internet_access.push(
+                        <bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "network" => intermediate_rep.network.push(
+                        <models::SandboxNetworkConfig as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    "metadata" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in NewSandboxV2"
+                                .to_string(),
+                        );
+                    }
+                    "envVars" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in NewSandboxV2"
+                                .to_string(),
+                        );
+                    }
+                    "customExtensionParams" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in NewSandboxV2"
+                                .to_string(),
+                        );
+                    }
+                    "mcp" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in NewSandboxV2"
+                                .to_string(),
+                        );
+                    }
+                    "volumeMounts" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in NewSandboxV2"
+                                .to_string(),
+                        );
+                    }
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing NewSandboxV2".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(NewSandboxV2 {
+            template_id: intermediate_rep
+                .template_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "templateID missing in NewSandboxV2".to_string())?,
+            timeout: intermediate_rep.timeout.into_iter().next(),
+            auto_pause: intermediate_rep.auto_pause.into_iter().next(),
+            auto_resume: intermediate_rep.auto_resume.into_iter().next(),
+            allow_internet_access: intermediate_rep.allow_internet_access.into_iter().next(),
+            network: intermediate_rep.network.into_iter().next(),
+            metadata: intermediate_rep.metadata.into_iter().next(),
+            env_vars: intermediate_rep.env_vars.into_iter().next(),
+            custom_extension_params: intermediate_rep.custom_extension_params.into_iter().next(),
+            mcp: std::result::Result::Err(
+                "Nullable types not supported in NewSandboxV2".to_string(),
+            )?,
+            volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<NewSandboxV2> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<NewSandboxV2>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<NewSandboxV2>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for NewSandboxV2 - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<NewSandboxV2> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <NewSandboxV2 as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into NewSandboxV2 - {err}"#
                     )),
                 }
             }

@@ -1051,6 +1051,103 @@ impl Sandboxes<()> for ApiImpl {
         }
     }
 
+    async fn v2_sandboxes_post(
+        &self,
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        body: &models::NewSandboxV2,
+    ) -> Result<V2SandboxesPostResponse, ()> {
+        let body = models::NewSandbox {
+            template_id: body.template_id.clone(),
+            timeout: Some(body.timeout.unwrap_or(300)),
+            auto_pause: body.auto_pause,
+            auto_resume: body.auto_resume.clone(),
+            secure: Some(true),
+            allow_internet_access: body.allow_internet_access,
+            network: body.network.clone(),
+            metadata: body.metadata.clone(),
+            env_vars: body.env_vars.clone(),
+            custom_extension_params: body.custom_extension_params.clone(),
+            mcp: body.mcp.clone(),
+            volume_mounts: body.volume_mounts.clone(),
+        };
+        Ok(
+            match self
+                .sandboxes_post(method, host, cookies, claims, &body)
+                .await?
+            {
+                SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                    body,
+                    x_agentenv_sandbox_id,
+                } => V2SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                    body,
+                    x_agentenv_sandbox_id,
+                },
+                SandboxesPostResponse::Status400_BadRequest(error) => {
+                    V2SandboxesPostResponse::Status400_BadRequest(error)
+                }
+                SandboxesPostResponse::Status401_AuthenticationError(error) => {
+                    V2SandboxesPostResponse::Status401_AuthenticationError(error)
+                }
+                SandboxesPostResponse::Status409_Conflict(error) => {
+                    V2SandboxesPostResponse::Status409_Conflict(error)
+                }
+                SandboxesPostResponse::Status500_ServerError(error) => {
+                    V2SandboxesPostResponse::Status500_ServerError(error)
+                }
+            },
+        )
+    }
+
+    async fn v2_sandboxes_sandbox_id_connect_post(
+        &self,
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::V2SandboxesSandboxIdConnectPostPathParams,
+        body: &Option<models::ConnectSandboxV2>,
+    ) -> Result<V2SandboxesSandboxIdConnectPostResponse, ()> {
+        use SandboxesSandboxIdConnectPostResponse as V1;
+        use V2SandboxesSandboxIdConnectPostResponse as V2;
+
+        let path_params = models::SandboxesSandboxIdConnectPostPathParams {
+            sandbox_id: path_params.sandbox_id.clone(),
+        };
+        let body = models::ConnectSandbox {
+            timeout: body.as_ref().and_then(|body| body.timeout).unwrap_or(300),
+        };
+        Ok(
+            match self
+                .sandboxes_sandbox_id_connect_post(
+                    method,
+                    host,
+                    cookies,
+                    claims,
+                    &path_params,
+                    &body,
+                )
+                .await?
+            {
+                V1::Status200_TheSandboxWasAlreadyRunning(body) => {
+                    V2::Status200_TheSandboxWasAlreadyRunning(body)
+                }
+                V1::Status201_TheSandboxWasResumedSuccessfully(body) => {
+                    V2::Status201_TheSandboxWasResumedSuccessfully(body)
+                }
+                V1::Status400_BadRequest(error) => V2::Status400_BadRequest(error),
+                V1::Status401_AuthenticationError(error) => {
+                    V2::Status401_AuthenticationError(error)
+                }
+                V1::Status404_NotFound(error) => V2::Status404_NotFound(error),
+                V1::Status409_Conflict(error) => V2::Status409_Conflict(error),
+                V1::Status500_ServerError(error) => V2::Status500_ServerError(error),
+            },
+        )
+    }
+
     async fn sandboxes_sandbox_id_connect_post(
         &self,
         _method: &Method,

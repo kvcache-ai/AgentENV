@@ -23,26 +23,30 @@ func newHintRequest(t *testing.T, method, target, body string) *http.Request {
 }
 
 func TestBuildScheduleHintNewSandbox(t *testing.T) {
-	r := newHintRequest(t, http.MethodPost, "/sandboxes", `{"templateID":"tmpl"}`)
+	for _, path := range []string{"/sandboxes", "/v2/sandboxes"} {
+		t.Run(path, func(t *testing.T) {
+			r := newHintRequest(t, http.MethodPost, path, `{"templateID":"tmpl"}`)
 
-	hint, err := buildScheduleHint(r)
-	if err != nil {
-		t.Fatalf("buildScheduleHint returned error: %v", err)
-	}
-	if hint.GetNewSandbox() == nil {
-		t.Fatalf("expected new_sandbox hint, got %v", hint)
-	}
-	if hint.GetNewColdSandbox() != nil {
-		t.Fatalf("did not expect cold sandbox hint")
-	}
+			hint, err := buildScheduleHint(r)
+			if err != nil {
+				t.Fatalf("buildScheduleHint returned error: %v", err)
+			}
+			if hint.GetNewSandbox() == nil {
+				t.Fatalf("expected new_sandbox hint, got %v", hint)
+			}
+			if hint.GetNewColdSandbox() != nil {
+				t.Fatalf("did not expect cold sandbox hint")
+			}
 
-	// Body must remain available for the upstream request.
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		t.Fatalf("read restored body failed: %v", err)
-	}
-	if string(body) != `{"templateID":"tmpl"}` {
-		t.Fatalf("restored body = %q", string(body))
+			// Body must remain available for the upstream request.
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read restored body failed: %v", err)
+			}
+			if string(body) != `{"templateID":"tmpl"}` {
+				t.Fatalf("restored body = %q", string(body))
+			}
+		})
 	}
 }
 

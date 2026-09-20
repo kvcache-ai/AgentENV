@@ -31,7 +31,7 @@ func buildScheduleHint(r *http.Request) (*schedulerv1.ScheduleRequestHint, error
 				NewColdSandbox: parseNewColdSandboxHint(body),
 			},
 		}, nil
-	case "/sandboxes":
+	case "/sandboxes", "/v2/sandboxes":
 		body, err := captureRequestBody(r)
 		if err != nil {
 			return nil, err
