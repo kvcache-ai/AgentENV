@@ -14,6 +14,7 @@ use agentenv::snapshot::{
 use anyhow::Result;
 use envd::process::{ListRequest, ProcessClient};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tempfile::tempdir;
 use tokio::time::{timeout, Duration};
 use tonic::Request;
@@ -105,6 +106,8 @@ async fn orchestrator_lifecycle() -> Result<()> {
             .expect("secure sandbox access token");
 
         let sandbox_id = created.id;
+        assert!(paused_store.join(sandbox_id.to_string()).is_dir());
+        assert!(!paused_store.join("artifacts").exists());
         let lookup = orchestrator.proxy_lookup_for(&sandbox_id).await?;
         assert!(
             matches!(lookup, ProxyLookupResult::Ready(_)),
@@ -188,7 +191,22 @@ async fn orchestrator_lifecycle() -> Result<()> {
 
         // Reload the paused records while the node runtime remains available.
         // shutdown() permanently stops its process-global network manager.
-        drop(orchestrator);
+        // Background work can briefly retain an Arc and the RocksDB lock.
+        timeout(Duration::from_secs(30), async move {
+            let mut shared = orchestrator;
+            loop {
+                match Arc::try_unwrap(shared) {
+                    Ok(orchestrator) => {
+                        drop(orchestrator);
+                        break;
+                    }
+                    Err(orchestrator) => shared = orchestrator,
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("previous orchestrator still holds the paused store"))?;
 
         let restarted = Orchestrator::new(
             InMemoryMetadataStore::new(),

@@ -25,8 +25,7 @@ being replaced.
 | Managed sandbox access-token seed | `$AENV_HOME/secrets/sandbox-access-token-hash-seed` | `src/sandbox/access.rs` | Node-local secret used to derive envd and traffic tokens when `[sandbox].access_token_hash_seed` is unset. It must be preserved with persisted secure or private-ingress sandboxes. |
 | Firecracker sandbox work dirs | `$AENV_HOME/firecracker-work` with `agentenv-fc-` children | `src/sandbox/firecracker/*` | Per-sandbox runtime directories for sockets, symlinks, ublk runtime dirs, local logs, and writable OverlayBD upper layer data (`overlaybd/upper.data`, `overlaybd/upper.index`). An explicit `[firecracker].work_dir` overrides the root. |
 | `firecracker.serial_dir` | `$AENV_HOME/logs/serial` | `src/sandbox/firecracker/*` | Durable Firecracker stdout/stderr root, grouped by sandbox ID. An explicit `[firecracker].serial_dir` overrides the root. |
-| `managed_snapshot_root` | `<firecracker-work-base>/managed-snapshots` | `src/sandbox/firecracker/*` | In-process live snapshot artifact root used to keep captured snapshots alive until publish or drop. |
-| `persisted_sandbox_store_path` | `$AENV_HOME/persisted-sandboxes` | `src/orchestrator/persistence/*` | Durable paused sandbox records and artifacts. |
+| `persisted_sandbox_store_path` | `$AENV_HOME/sandboxes` | `src/orchestrator/persistence/*` | Durable paused sandbox records and artifacts. |
 | `snapshot_store` | `$AENV_HOME/snapshot-store` | `src/repository/*` | Durable committed snapshot repository root. The configured backend uses `<snapshot_store>/repository`. Relative explicit paths are resolved against the config file directory. |
 | `snapshot.local_root` | `$AENV_HOME/snapshots` | `src/snapshot/artifact_cache.rs`, runtime resolvers | Node-local cache for materialized runtime artifacts. Relative explicit paths are resolved against the config file directory. |
 | `image.cache.root_dir` | `$AENV_HOME/image-cache` | `src/image/*`, overlaybd runtime | Node-local image cache root. Contains `configs/`, `indexes/`, `commits/`, and `remote-blocks/`. The offline C++ tools own isolated sibling cache roots: `convert-blocks/` (`overlaybd-apply`) and `resize-blocks/` (`overlaybd-resize`). |
@@ -97,7 +96,7 @@ Snapshot data passes through three storage layers with different ownership and
 lifetime rules:
 
 1. **Builder staging** is a manager-owned temporary workspace under
-   `<snapshot.local_cache_path>/snapshots/<id>/`. It holds local rootfs,
+   `<snapshot.local_root>/<id>/`. It holds local rootfs,
    memory, VM-state, and attached-drive artifacts while a build or capture is
    in progress. It is not the durable snapshot record.
 2. **The committed snapshot repository** stores the snapshot catalog,
@@ -106,7 +105,7 @@ lifetime rules:
    the template and snapshot APIs.
 3. **The node-local runtime cache** materializes runnable rootfs, memory, and
    drive `image.json` files under
-   `<snapshot.local_cache_path>/runtime/<id>/` before launch. These files are
+   `<snapshot.local_root>/cache/runtime/<id>/` before launch. These files are
    derived runtime inputs and can be rebuilt from committed state.
 
 The committed `snapshot.json` records the captured runtime context, startup
@@ -171,9 +170,13 @@ Owned by `src/orchestrator/persistence/*`.
 | Artifact | Location | Contents | Purpose | Lifecycle |
 | --- | --- | --- | --- | --- |
 | Paused sandbox record DB | `<persisted_sandbox_store_path>/records.db` | RocksDB keyed by sandbox ID; values are compact JSON records containing version, lifecycle, sandbox metadata, artifact root, and backend state | Restores paused sandboxes after server restart | Record written after pause succeeds. Marked `resuming` before resume. Rolled back on resume failure. Deleted on resume/delete. |
-| Sandbox runtime storage | `<persisted_sandbox_store_path>/artifacts/{sandbox_id}/runtime/...` | Runtime disks, sparse memory and VM state saved by pause | Stable storage owned by one logical sandbox | Prepared before launch and reused across pause/resume. A successful resume removes only the paused record. Explicit deletion retires the artifact directory before asynchronous reclamation; `load_all` also cleans up orphans. |
+| Sandbox runtime storage | `<persisted_sandbox_store_path>/{sandbox_id}/...` | Runtime disks, sparse memory and VM state saved by pause | Stable storage owned by one logical sandbox | Prepared before launch and reused across pause/resume. A successful resume removes only the paused record. Explicit deletion retires the artifact directory before asynchronous reclamation; `load_all` also cleans up orphans. |
 
 Paused sandbox artifacts are not committed snapshot repository artifacts. They are owned by the sandbox persister and should not be shared as snapshot truth.
+
+On startup after the previous runtime has stopped, the server removes old UUID snapshot directories and known Firecracker/temporary-persister workspaces before starting a new daemon or warm pool. Snapshot `cache/`, external logs, and unknown entries are retained; directory symlinks are not followed. The persister restores valid Paused records and removes invalid/Resuming records, orphan UUID sandbox directories, and `.retired-<uuid>` directories. Cleanup failure aborts startup. Restarting the server while its old child processes remain alive is unsupported.
+
+The sandbox, snapshot and Firecracker work roots must be disjoint and separate from image cache, repository, dependency, P2P, volume and serial-log roots. Existing symlinked ancestors are resolved when checking these boundaries. No old-layout migration is performed.
 
 ## P2P Artifact Transport
 

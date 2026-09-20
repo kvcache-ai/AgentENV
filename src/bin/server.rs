@@ -16,6 +16,9 @@ use clap::Parser;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
+#[path = "server/recovery.rs"]
+mod recovery;
+
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -81,6 +84,8 @@ async fn main() -> anyhow::Result<()> {
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
+    recovery::cleanup_previous_runtime(config).await?;
+
     let api_key = ApiKey::resolve(config)?;
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
@@ -92,17 +97,6 @@ async fn main() -> anyhow::Result<()> {
         OverlaybdP2pRuntime::start_from_app_config(config, Arc::clone(&p2p_transport)).await;
 
     agentenv::setup::ensure_environment(config, overlaybd_p2p.read_facade_address()).await?;
-
-    // Initialize the global ublk device manager (spawns daemon if configured).
-    UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
-        config,
-        overlaybd_p2p.publish_address(),
-    )
-    .await?;
-
-    if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
-        warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
-    }
 
     let snapshot_p2p_transport = config
         .snapshot
@@ -134,6 +128,16 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&volume_manager),
     )
     .await?;
+    // Restore paused state and its image protection before opening new devices.
+    UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
+        config,
+        overlaybd_p2p.publish_address(),
+    )
+    .await?;
+    if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
+        warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
+    }
+
     let observability_config = &config.observability;
     let observability = if observability_config.enabled {
         Some(Arc::new(

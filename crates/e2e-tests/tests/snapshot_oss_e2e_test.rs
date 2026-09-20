@@ -164,7 +164,7 @@ fn ensure_test_config() -> Result<()> {
         .join("target")
         .join("snapshot-oss-e2e-config");
     let deps_path = config_root.join("env");
-    let local_cache = config_root.join("snapshot-local-cache");
+    let local_cache = config_root.join("snapshots");
     std::fs::create_dir_all(&config_root)?;
     let config_path = workspace_root.join("config").join("default.toml");
     std::env::set_var("AENV_CONFIG_PATH", &config_path);

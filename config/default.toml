@@ -211,7 +211,8 @@ default_sandbox_timeout_secs = 15
 # Minimum auto-resumed lifetime in seconds (300 = 5 minutes).
 auto_resume_min_sandbox_timeout_secs = 300
 # Durable paused-sandbox metadata restored after a server restart.
-# persisted_sandbox_store_path = "$AENV_HOME/persisted-sandboxes"
+# One state directory per sandbox, beside records.db.
+# persisted_sandbox_store_path = "$AENV_HOME/sandboxes"
 
 [snapshot]
 # Reusable local snapshot artifacts live in local_root/<snapshot-id>; caches use cache/.

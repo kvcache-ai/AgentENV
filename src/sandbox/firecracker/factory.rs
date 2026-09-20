@@ -4,7 +4,7 @@
 //! reading configuration from the global [`ConfigManager`]. It also handles
 //! launches from committed snapshots and resumes from snapshot configs.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
@@ -139,15 +139,8 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         Ok(Box::new(sandbox))
     }
 
-    fn decode_paused_state(
-        &self,
-        artifact_root: PathBuf,
-        state: Value,
-    ) -> Result<Arc<dyn PausedSandboxState>> {
-        Ok(Arc::new(FirecrackerPausedState::decode(
-            artifact_root,
-            state,
-        )?))
+    fn decode_paused_state(&self, state: Value) -> Result<Arc<dyn PausedSandboxState>> {
+        Ok(Arc::new(FirecrackerPausedState::decode(state)?))
     }
 
     fn build_from_paused_state(

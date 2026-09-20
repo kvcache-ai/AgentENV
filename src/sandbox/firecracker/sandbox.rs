@@ -163,8 +163,8 @@ fn volume_drive_slot_id(index: usize) -> String {
 }
 
 fn canonicalize_runtime_root(root: PathBuf) -> PathBuf {
-    // A pause resume may precede the first managed generation. Resolve
-    // existing symlinked ancestors even when the root itself is not created yet.
+    // Resolve existing symlinked ancestors before the first sandbox creates
+    // the configured state root.
     for ancestor in root.ancestors() {
         if let Ok(resolved) = fs::canonicalize(ancestor) {
             return resolved.join(root.strip_prefix(ancestor).expect("root ancestor"));
@@ -228,7 +228,7 @@ impl FirecrackerPausedState {
         Self { snapshot_config }
     }
 
-    pub fn decode(_artifact_root: PathBuf, state: serde_json::Value) -> Result<Self> {
+    pub fn decode(state: serde_json::Value) -> Result<Self> {
         let snapshot_config: FirecrackerSnapshotConfig =
             serde_json::from_value(state).context("deserialize Firecracker paused state")?;
         snapshot_config
@@ -3280,7 +3280,7 @@ mod tests {
             serde_json::Value::String("/legacy/node/tools.ext4".to_string()),
         );
 
-        let state = FirecrackerPausedState::decode(PathBuf::new(), value)?;
+        let state = FirecrackerPausedState::decode(value)?;
 
         assert!(state
             .snapshot_config()
@@ -3597,16 +3597,16 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn future_generation_root_resolves_symlinked_ancestors() -> Result<()> {
+    fn future_runtime_root_resolves_symlinked_ancestors() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let work = temp.path().join("work");
         fs::create_dir(&work)?;
         let alias = temp.path().join("alias");
         std::os::unix::fs::symlink(&work, &alias)?;
-        let generation_root = alias.join("not-created/managed-snapshots");
-        let resolved = canonicalize_runtime_root(generation_root.clone());
-        fs::create_dir_all(&generation_root)?;
-        assert_eq!(resolved, fs::canonicalize(&generation_root)?);
+        let runtime_root = alias.join("not-created/sandboxes");
+        let resolved = canonicalize_runtime_root(runtime_root.clone());
+        fs::create_dir_all(&runtime_root)?;
+        assert_eq!(resolved, fs::canonicalize(&runtime_root)?);
         Ok(())
     }
 
