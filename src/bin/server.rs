@@ -100,9 +100,11 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
-        warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
-    }
+    tokio::spawn(async move {
+        if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
+            warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
+        }
+    });
 
     let snapshot_p2p_transport = config
         .snapshot

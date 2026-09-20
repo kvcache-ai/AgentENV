@@ -362,6 +362,8 @@ Group=${SERVICE_GROUP}
 SupplementaryGroups=kvm
 EnvironmentFile=${ENV_FILE}
 ExecStart=${INSTALL_DIR}/server
+# Poll API readiness every 100 ms, allowing up to 900 attempts.
+ExecStartPost=/bin/sh -c 'for i in \$(seq 1 900); do curl -fsS --max-time 0.1 "http://\${API_ADDR}/health" >/dev/null 2>&1 && exit 0; sleep 0.1; done; exit 1'
 RuntimeDirectory=aenv
 RuntimeDirectoryMode=0750
 AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN
