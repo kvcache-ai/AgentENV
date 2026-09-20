@@ -320,7 +320,7 @@ Sandbox lifecycle management.
 | `metrics_prometheus_max_age_secs` | integer | `60` | Stop exporting resource values at this local sample age; also bounded by `metrics_retention_secs`. Zero makes every sample unavailable. |
 | `default_sandbox_timeout_secs` | integer | `15` | Default keep-alive timeout for sandboxes |
 | `auto_resume_min_sandbox_timeout_secs` | integer | `300` | When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration |
-| `persisted_sandbox_store_path` | string | `"$AENV_HOME/persisted-sandboxes"` | Directory for persisted sandbox state |
+| `persisted_sandbox_store_path` | string | `"$AENV_HOME/sandboxes"` | Directory for persisted sandbox state |
 
 ## `[pool]`
 

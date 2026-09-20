@@ -89,7 +89,7 @@ pub trait SandboxPersister: Send + Sync {
     async fn delete_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
 
     /// Delete the record and detach its artifacts. Physical reclamation may
-    /// finish after this returns, without touching a later pause generation.
+    /// finish after this returns, without touching subsequently recreated state for the same sandbox.
     async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()>;
 }
 
@@ -106,7 +106,8 @@ impl Default for DisabledSandboxPersister {
             .expect("resolved Firecracker work directory");
         std::fs::create_dir_all(parent).expect("prepare temporary sandbox storage");
         Self {
-            root: tempfile::tempdir_in(parent).expect("create temporary sandbox storage"),
+            root: tempfile::TempDir::with_prefix_in("agentenv-sandboxes-", parent)
+                .expect("create temporary sandbox storage"),
         }
     }
 }
@@ -121,11 +122,7 @@ impl SandboxPersister for DisabledSandboxPersister {
     }
 
     async fn prepare_runtime_root(&self, sandbox_id: &SandboxId) -> PersistenceResult<PathBuf> {
-        let root = self
-            .root
-            .path()
-            .join(sandbox_id.to_string())
-            .join("runtime");
+        let root = self.root.path().join(sandbox_id.to_string());
         tokio::fs::create_dir_all(&root).await.map_err(|source| {
             SandboxPersistenceError::io("prepare runtime storage", &root, source)
         })?;
