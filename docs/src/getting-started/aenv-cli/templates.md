@@ -18,7 +18,7 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 | `--cpu <count>` | CPU cores for the template. Defaults to `[machine].vcpu_count` on the server. Alias: `--cpu-count`. |
 | `--memory <MiB>` | Memory for the template. Defaults to `[machine].mem_size_mib` on the server. Aliases: `--memory-mb`, `--mem`. |
 | `--start-cmd <cmd>` | Shell command to run inside the sandbox before capturing the template snapshot |
-| `--ready-cmd <cmd>` | Shell command polled until it exits 0. Defaults to `sleep 20` when `--start-cmd` is set; otherwise unset. |
+| `--ready-cmd <cmd>` | Shell command polled until it exits 0. Defaults to `/agentenv/bin/busybox sleep 20` when `--start-cmd` is set; otherwise unset. |
 | `--probe <PORT>` | Wait until `localhost:<PORT>` accepts TCP connections. Conflicts with `--ready-cmd`. |
 | `-d, --detach` | Submit the build and return immediately without waiting |
 | `--timeout <SECS>` | Maximum seconds to wait for the build to complete. No timeout by default. Conflicts with `--detach`. |

@@ -31,7 +31,7 @@ template name can be used anywhere a template ID is accepted.
 | `--cpu <count>` | `[machine].vcpu_count` from your config file | Set the template's vCPU count. Alias: `--cpu-count`. |
 | `--memory <MiB>` | `[machine].mem_size_mib` from your config file | Set the template's memory. Aliases: `--memory-mb`, `--mem`. |
 | `--start-cmd <cmd>` | None | Run a command before capturing the template snapshot. |
-| `--ready-cmd <cmd>` | `sleep 20` when `--start-cmd` is set; otherwise none | Poll a shell command every two seconds until it exits successfully. |
+| `--ready-cmd <cmd>` | `/agentenv/bin/busybox sleep 20` when `--start-cmd` is set; otherwise none | Poll a shell command every two seconds until it exits successfully. |
 | `--probe <port>` | None | Wait for TCP on `localhost:<port>`. Cannot be combined with `--ready-cmd`. |
 | `-d, --detach` | Off | Submit the build and return immediately instead of waiting. |
 | `--timeout <seconds>` | No timeout | Limit how long the CLI waits for the build. Cannot be combined with `--detach`. |

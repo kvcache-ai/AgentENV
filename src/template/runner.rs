@@ -26,7 +26,7 @@ use crate::virtualization::VirtualizationMode;
 
 /// Default command to use for ready check when start command is provided but ready command is not.
 /// Use the same default ready command as E2B
-const DEFAULT_READY_WITH_START_CMD: &str = "sleep 20";
+const DEFAULT_READY_WITH_START_CMD: &str = "/agentenv/bin/busybox sleep 20";
 const READY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const READY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -745,7 +745,7 @@ mod tests {
         let startup = prepare_startup(Some(startup), true, &build_context)
             .expect("startup should remain enabled");
 
-        assert_eq!(startup.ready_cmd, "sleep 20");
+        assert_eq!(startup.ready_cmd, "/agentenv/bin/busybox sleep 20");
         assert_eq!(startup.context.workdir, "/work");
     }
 
