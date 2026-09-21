@@ -80,7 +80,7 @@ impl Default for SandboxMetadata {
             state: SandboxState::Creating,
             created_at: SystemTime::now(),
             timeout: None,
-            timeout_action: SandboxTimeoutAction::Pause,
+            timeout_action: SandboxTimeoutAction::Delete,
             expires_at: None,
             auto_resume: false,
             virtualization_mode: VirtualizationMode::default(),

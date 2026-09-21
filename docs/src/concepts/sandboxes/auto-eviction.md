@@ -11,13 +11,13 @@ reclaimed.
 When a sandbox reaches its TTL, AgentENV performs its configured timeout
 action:
 
-- **Pause** (`autoPause: true`, the default): preserve the sandbox so it can be
-  resumed later.
-- **Delete** (`autoPause: false`): permanently remove the sandbox.
+- **Delete** (`autoPause: false`, the default): permanently remove the sandbox.
+- **Pause** (`autoPause: true`): preserve the sandbox so it can be resumed
+  later. Its snapshot occupies storage until it is resumed or deleted.
 
-The timeout action is selected when the sandbox is created. The `aenv start` command uses the default action,
-`autoPause: true`. To delete on expiration instead, create the sandbox through
-the API with `autoPause: false`.
+The timeout action is selected when the sandbox is created. The `aenv start`
+command uses the default action, `autoPause: false`. To pause on expiration
+instead, create the sandbox through the API with `autoPause: true`.
 
 Warm start from a template or snapshot:
 
@@ -28,7 +28,7 @@ curl -X POST \
   -d '{
     "templateID": "my-template",
     "timeout": 600,
-    "autoPause": false
+    "autoPause": true
   }' \
   http://127.0.0.1:8000/sandboxes
 ```
@@ -42,7 +42,7 @@ curl -X POST \
   -d '{
     "image": "ubuntu:24.04",
     "timeout": 600,
-    "autoPause": false
+    "autoPause": true
   }' \
   http://127.0.0.1:8000/sandboxes-cold
 ```

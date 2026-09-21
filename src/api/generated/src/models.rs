@@ -2799,7 +2799,7 @@ impl NewColdSandbox {
         NewColdSandbox {
             image,
             timeout: Some(15),
-            auto_pause: Some(true),
+            auto_pause: Some(false),
             auto_resume: None,
             secure: None,
             allow_internet_access: None,
@@ -3156,7 +3156,7 @@ impl NewSandbox {
         NewSandbox {
             template_id,
             timeout: Some(15),
-            auto_pause: Some(true),
+            auto_pause: Some(false),
             auto_resume: None,
             secure: None,
             allow_internet_access: None,
@@ -3473,7 +3473,7 @@ impl NewSandboxV2 {
         NewSandboxV2 {
             template_id,
             timeout: Some(300),
-            auto_pause: Some(true),
+            auto_pause: Some(false),
             auto_resume: None,
             allow_internet_access: None,
             network: None,

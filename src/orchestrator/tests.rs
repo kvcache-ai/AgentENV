@@ -3339,12 +3339,15 @@ async fn auto_evict_sandboxes_skips_non_running_and_non_expired_and_continues_on
     let paused_id = SandboxId::new();
     let non_expired_id = SandboxId::new();
 
+    // The pause path is under test: a handle-less running sandbox cannot be
+    // paused, so eviction has to skip it rather than fail the pass.
     let running_expired = SandboxMetadata {
         id: running_id,
         state: SandboxState::Running,
         created_at: now,
         timeout: Some(Duration::from_secs(1)),
         expires_at: now.checked_sub(Duration::from_secs(1)),
+        timeout_action: SandboxTimeoutAction::Pause,
         ..Default::default()
     };
     let paused_expired = SandboxMetadata {

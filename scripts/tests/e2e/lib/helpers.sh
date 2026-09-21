@@ -286,6 +286,15 @@ if [[ -z "${E2E_HELPERS_SH_LOADED:-}" ]]; then
     echo "$HTTP_BODY" | jq -r '.sandboxID // empty'
   }
 
+  # Create a sandbox without naming autoPause, which is how every E2B SDK
+  # sends a create the caller did not configure a pause for.
+  create_sandbox_without_auto_pause() {
+    local template="${1:-$AENV_TEMPLATE_ID}"
+    local timeout="${2:-60}"
+    api_post "/sandboxes" "$(jq -nc --arg t "$template" --argjson to "$timeout" '{templateID: $t, timeout: $to}')"
+    echo "$HTTP_BODY" | jq -r '.sandboxID // empty'
+  }
+
   create_sandbox_at() {
     local base_url="$1"
     local template="${2:-$AENV_TEMPLATE_ID}"

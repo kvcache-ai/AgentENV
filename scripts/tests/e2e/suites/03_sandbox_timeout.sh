@@ -33,12 +33,49 @@ track_sandbox "$short_id"
 wait_for_sandbox_state "$short_id" "running" 30
 
 log "Waiting for auto-pause (up to 20s) ..."
-# The auto-evict task pauses expired sandboxes (not deletes).
+# create_sandbox sends autoPause: true; the API's default for a missing
+# autoPause is to delete the expired sandbox.
 if wait_for_sandbox_state "$short_id" "paused" 20; then
   _pass "short-lived sandbox was auto-paused after TTL"
 else
   _fail "short-lived sandbox was auto-paused after TTL" "paused" "still running"
 fi
+
+# -- Verify what a missing autoPause means, on both create paths --
+# The action a sandbox will take at its TTL is readable as lifecycle.onTimeout,
+# so the mapping is asserted directly instead of by waiting out a deadline.
+assert_on_timeout() {
+  local id="$1" expected="$2" what="$3"
+  api_get "/sandboxes/${id}"
+  local on_timeout
+  on_timeout=$(echo "$HTTP_BODY" | jq -r '.lifecycle.onTimeout // empty')
+  if [[ "$on_timeout" == "$expected" ]]; then
+    _pass "$what"
+  else
+    _fail "$what" "$expected" "${on_timeout:-absent}"
+  fi
+}
+
+default_id=$(create_sandbox_without_auto_pause "$AENV_TEMPLATE_ID" 300); _sync_http
+assert_status "$HTTP_STATUS" "201" "create sandbox without autoPause"
+track_sandbox "$default_id"
+assert_on_timeout "$default_id" "kill" "a create without autoPause is killed at its TTL"
+delete_sandbox "$default_id"
+
+paused_id=$(create_sandbox "$AENV_TEMPLATE_ID" 300); _sync_http
+assert_status "$HTTP_STATUS" "201" "create sandbox with autoPause: true"
+track_sandbox "$paused_id"
+assert_on_timeout "$paused_id" "pause" "a create with autoPause: true is paused at its TTL"
+delete_sandbox "$paused_id"
+
+cold_payload=$(jq -nc --arg image "${E2E_DEFAULT_USER_IMAGE}" '{image: $image, timeout: 300}')
+api_post "/sandboxes-cold" "${cold_payload}"
+assert_status "$HTTP_STATUS" "201" "create cold sandbox without autoPause"
+cold_id=$(echo "$HTTP_BODY" | jq -r '.sandboxID // empty')
+assert_not_empty "$cold_id" "cold sandbox ID present"
+track_sandbox "$cold_id"
+assert_on_timeout "$cold_id" "kill" "a cold create without autoPause is killed at its TTL"
+delete_sandbox "$cold_id"
 
 # Clean up the long-lived sandbox
 delete_sandbox "$sandbox_id"

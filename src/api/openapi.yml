@@ -571,7 +571,7 @@ components:
           description: Time to live for the sandbox in seconds.
         autoPause:
           type: boolean
-          default: true
+          default: false
           description: Automatically pauses the sandbox after the timeout
         autoResume:
           $ref: "#/components/schemas/SandboxAutoResumeConfig"
@@ -616,7 +616,7 @@ components:
           description: Time to live for the sandbox in seconds.
         autoPause:
           type: boolean
-          default: true
+          default: false
           description: Automatically pauses the sandbox after the timeout
         autoResume:
           $ref: "#/components/schemas/SandboxAutoResumeConfig"
@@ -667,7 +667,7 @@ components:
           description: Time to live for the sandbox in seconds.
         autoPause:
           type: boolean
-          default: true
+          default: false
           description: Automatically pauses the sandbox after the timeout
         autoResume:
           $ref: "#/components/schemas/SandboxAutoResumeConfig"

@@ -781,8 +781,8 @@ impl Sandboxes<()> for ApiImpl {
             extra_drives_in_snapshot: false,
             timeout: duration_from_secs(body.timeout),
             timeout_action: match body.auto_pause {
-                Some(false) => SandboxTimeoutAction::Delete,
-                _ => SandboxTimeoutAction::Pause,
+                Some(true) => SandboxTimeoutAction::Pause,
+                _ => SandboxTimeoutAction::Delete,
             },
             auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),
             user_metadata: body.metadata.clone(),
@@ -986,8 +986,8 @@ impl Sandboxes<()> for ApiImpl {
             extra_drives_in_snapshot,
             timeout: duration_from_secs(body.timeout),
             timeout_action: match body.auto_pause {
-                Some(false) => SandboxTimeoutAction::Delete,
-                _ => SandboxTimeoutAction::Pause,
+                Some(true) => SandboxTimeoutAction::Pause,
+                _ => SandboxTimeoutAction::Delete,
             },
             auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),
             user_metadata: body.metadata.clone(),

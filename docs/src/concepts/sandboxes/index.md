@@ -27,7 +27,7 @@ stateDiagram-v2
 | **Creating** | VM is booting, block devices are being attached, networking is being configured |
 | **Running** | VM is ready. Commands can be executed, proxy traffic is routed, timeout is ticking |
 | **Pausing** | Memory and disk snapshots are being captured |
-| **Paused** | VM is stopped. Snapshot artifacts are stored. No resources consumed |
+| **Paused** | VM is stopped, so it uses no CPU or memory. Its snapshot artifacts occupy storage until the sandbox is resumed or deleted |
 | **Resuming** | Sandbox is being restored from its paused snapshot |
 | **Snapshotting** | A persistent snapshot is being captured; sandbox returns to Running after |
 | **Forking** | Sandbox is being cloned into child sandboxes; source returns to Running after |
