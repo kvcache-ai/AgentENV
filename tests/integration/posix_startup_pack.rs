@@ -51,6 +51,7 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
                 ))?),
                 source: SnapshotPublishSource::Sandbox {
                     source_sandbox_id: source_id.to_string(),
+                    source_sandbox_metadata: None,
                 },
                 context: agentenv::snapshot::CommandContext::default(),
                 startup: None,

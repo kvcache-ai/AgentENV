@@ -1848,6 +1848,7 @@ impl Sandboxes<()> for ApiImpl {
                         alias: alias.clone(),
                         source: SnapshotPublishSource::Sandbox {
                             source_sandbox_id: capture.metadata.id.to_string(),
+                            source_sandbox_metadata: capture.metadata.user_metadata.clone(),
                         },
                         context: capture.metadata.context.clone(),
                         startup: capture.metadata.startup.clone(),

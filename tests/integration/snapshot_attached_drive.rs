@@ -167,6 +167,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
         alias: Some(SnapshotAlias::parse(alias)?),
         source: agentenv::snapshot::SnapshotPublishSource::Sandbox {
             source_sandbox_id: "test-sandbox".to_string(),
+            source_sandbox_metadata: None,
         },
         context: agentenv::snapshot::CommandContext::default(),
         startup: None,

@@ -114,9 +114,13 @@ fn ready_record(metadata: SnapshotPublishMetadata, committed: CommittedSnapshot)
     record.resources = metadata.resources;
     let source = match metadata.source {
         SnapshotPublishSource::Template => record.source,
-        SnapshotPublishSource::Sandbox { source_sandbox_id } => {
-            SnapshotSource::Sandbox { source_sandbox_id }
-        }
+        SnapshotPublishSource::Sandbox {
+            source_sandbox_id,
+            source_sandbox_metadata,
+        } => SnapshotSource::Sandbox {
+            source_sandbox_id,
+            source_sandbox_metadata,
+        },
     };
     record.source = source;
     record

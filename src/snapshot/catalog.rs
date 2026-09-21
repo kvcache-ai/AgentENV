@@ -460,9 +460,13 @@ fn new_committed_record(
                 error_reason: None,
             },
         },
-        SnapshotPublishSource::Sandbox { source_sandbox_id } => {
-            SnapshotSource::Sandbox { source_sandbox_id }
-        }
+        SnapshotPublishSource::Sandbox {
+            source_sandbox_id,
+            source_sandbox_metadata,
+        } => SnapshotSource::Sandbox {
+            source_sandbox_id,
+            source_sandbox_metadata,
+        },
     };
     SnapshotRecord {
         id: metadata.id.clone(),
@@ -725,6 +729,7 @@ fn matches_filter(record: &SnapshotRecord, filter: &SnapshotListFilter) -> bool 
         match &record.source {
             SnapshotSource::Sandbox {
                 source_sandbox_id: record_source_sandbox_id,
+                ..
             } if record_source_sandbox_id == source_sandbox_id => {}
             _ => return false,
         }
@@ -809,6 +814,7 @@ mod tests {
         let template = SnapshotPublishSource::Template;
         let sandbox = |id: &str| SnapshotPublishSource::Sandbox {
             source_sandbox_id: id.to_owned(),
+            source_sandbox_metadata: None,
         };
         let template_alpha = committed(repository, Some("template-alpha"), template.clone())
             .await

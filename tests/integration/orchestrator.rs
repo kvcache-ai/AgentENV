@@ -249,7 +249,10 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 extra_drives_in_snapshot: false,
                 timeout: Some(Duration::from_secs(30)),
                 timeout_action: SandboxTimeoutAction::Pause,
-                user_metadata: None,
+                user_metadata: Some(std::collections::HashMap::from([(
+                    "team".to_string(),
+                    "capture-test".to_string(),
+                )])),
                 env_vars: None,
                 network_policy: SandboxNetworkPolicy::default(),
                 auto_resume: false,
@@ -293,6 +296,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 alias: Some(SnapshotAlias::parse(&published_alias)?),
                 source: SnapshotPublishSource::Sandbox {
                     source_sandbox_id: sandbox_id_str.clone(),
+                    source_sandbox_metadata: capture.metadata.user_metadata.clone(),
                 },
                 context: capture.metadata.context.clone(),
                 startup: capture.metadata.startup.clone(),
@@ -313,8 +317,10 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
         assert!(matches!(
             &record.source,
             SnapshotSource::Sandbox {
-                source_sandbox_id
+                source_sandbox_id,
+                source_sandbox_metadata: Some(metadata),
             } if source_sandbox_id == &sandbox_id_str
+                && metadata.get("team").map(String::as_str) == Some("capture-test")
         ));
         let committed = record
             .committed

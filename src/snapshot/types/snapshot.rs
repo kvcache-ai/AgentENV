@@ -73,7 +73,14 @@ impl SnapshotPublishMetadata {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SnapshotPublishSource {
     Template,
-    Sandbox { source_sandbox_id: String },
+    Sandbox {
+        source_sandbox_id: String,
+        /// User metadata of the source sandbox at capture time. Informational
+        /// provenance only; it is persisted into the snapshot record but never
+        /// affects launching.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_sandbox_metadata: Option<HashMap<String, String>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,8 +169,16 @@ impl TemplateBuildInfo {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SnapshotSource {
-    Template { build: TemplateBuildInfo },
-    Sandbox { source_sandbox_id: String },
+    Template {
+        build: TemplateBuildInfo,
+    },
+    Sandbox {
+        source_sandbox_id: String,
+        /// User metadata of the source sandbox at capture time. Informational
+        /// provenance only; it never affects launching.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_sandbox_metadata: Option<HashMap<String, String>>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,8 +431,15 @@ impl SnapshotRecord {
         source: SnapshotPublishSource,
         now_unix_ms: i64,
     ) {
-        if let SnapshotPublishSource::Sandbox { source_sandbox_id } = source {
-            self.source = SnapshotSource::Sandbox { source_sandbox_id };
+        if let SnapshotPublishSource::Sandbox {
+            source_sandbox_id,
+            source_sandbox_metadata,
+        } = source
+        {
+            self.source = SnapshotSource::Sandbox {
+                source_sandbox_id,
+                source_sandbox_metadata,
+            };
         }
         if let SnapshotSource::Template { build } = &mut self.source {
             build.status = TemplateBuildStatus::Ready;
@@ -617,8 +639,8 @@ mod tests {
 
     use super::{
         rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ManagedLayer,
-        OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotRecord, SnapshotVolume,
-        TemplateBuildErrorReason,
+        OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotRecord, SnapshotSource,
+        SnapshotVolume, TemplateBuildErrorReason,
     };
     use std::collections::HashMap;
 
@@ -632,6 +654,38 @@ mod tests {
             manifest_digest: "sha256:manifest".to_string(),
             repo_blob_url: "https://registry.example/v2/ns/app/blobs".to_string(),
         }
+    }
+
+    #[test]
+    fn sandbox_source_metadata_serde_is_backward_compatible() {
+        let legacy = r#"{"Sandbox":{"source_sandbox_id":"sandbox-1"}}"#;
+        let source: SnapshotSource = serde_json::from_str(legacy).expect("parse legacy source");
+        let SnapshotSource::Sandbox {
+            ref source_sandbox_id,
+            ref source_sandbox_metadata,
+        } = source
+        else {
+            panic!("expected sandbox source");
+        };
+        assert_eq!(source_sandbox_id, "sandbox-1");
+        assert_eq!(*source_sandbox_metadata, None);
+        // Serializing a metadata-less source keeps the legacy shape.
+        assert_eq!(serde_json::to_string(&source).unwrap(), legacy);
+
+        let with_metadata = r#"{"Sandbox":{"source_sandbox_id":"sandbox-1","source_sandbox_metadata":{"team":"alpha"}}}"#;
+        let source: SnapshotSource =
+            serde_json::from_str(with_metadata).expect("parse metadata source");
+        let SnapshotSource::Sandbox {
+            source_sandbox_metadata,
+            ..
+        } = source
+        else {
+            panic!("expected sandbox source");
+        };
+        assert_eq!(
+            source_sandbox_metadata.as_ref().and_then(|m| m.get("team")),
+            Some(&"alpha".to_string()),
+        );
     }
 
     #[test]

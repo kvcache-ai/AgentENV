@@ -277,6 +277,7 @@ async fn snapshot_oss_publish_retains_dense_delta_for_p2p() -> Result<()> {
             alias: None,
             source: SnapshotPublishSource::Sandbox {
                 source_sandbox_id: "source".to_string(),
+                source_sandbox_metadata: None,
             },
             context: agentenv::snapshot::CommandContext::default(),
             startup: None,
