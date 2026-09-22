@@ -854,7 +854,13 @@ mod tests {
     async fn promotion_retries_failed_publish_and_keeps_existing_readers() -> anyhow::Result<()> {
         let root = TempDir::new()?;
         let manager = local_manager(root.path());
-        let (metadata, capture) = local_capture(&root.path().join("capture"));
+        let (mut metadata, capture) = local_capture(&root.path().join("capture"));
+        let source_metadata =
+            std::collections::HashMap::from([("team".to_string(), "infra".to_string())]);
+        metadata.source = SnapshotPublishSource::Sandbox {
+            source_sandbox_id: "sandbox-source".to_string(),
+            source_sandbox_metadata: Some(source_metadata.clone()),
+        };
         let local = crate::sandbox::publish_captured(&manager, metadata, capture).await?;
         let reader = manager.resolve_runnable(local.clone()).await?;
         let config = &reader.manifest().memory.image_config_path;
@@ -872,13 +878,23 @@ mod tests {
         let (first, repeated) =
             tokio::join!(manager.promote(&reference), manager.promote(&reference));
         let promoted = first?.unwrap();
+        let repeated = repeated?.unwrap();
+        let stored = manager.repository.get(&reference).await?.unwrap();
+        for record in [&promoted, &repeated, &stored] {
+            let SnapshotSource::Sandbox {
+                source_sandbox_id,
+                source_sandbox_metadata,
+            } = &record.source
+            else {
+                panic!("promotion must preserve the sandbox source");
+            };
+            assert_eq!(source_sandbox_id, "sandbox-source");
+            assert_eq!(source_sandbox_metadata.as_ref(), Some(&source_metadata));
+        }
         assert_eq!(promoted.id, local.id);
         assert_eq!(promoted.snapshot_type, SnapshotPlacement::Distributed);
         assert!(promoted.owner_node_id.is_none());
-        assert_eq!(
-            repeated?.unwrap().updated_at_unix_ms,
-            promoted.updated_at_unix_ms
-        );
+        assert_eq!(repeated.updated_at_unix_ms, promoted.updated_at_unix_ms);
         assert_eq!(std::fs::read(config)?, original);
         assert!(manager
             .local_store
