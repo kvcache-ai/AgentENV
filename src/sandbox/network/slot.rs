@@ -293,7 +293,7 @@ impl Slot {
         let (connection, handle, _) = new_connection().context("Failed to connect to netlink")?;
         tokio::spawn(connection);
 
-        // Create Veth Pair (veth-{idx} and vpeer)
+        // Create Veth Pair (aenv-{idx} and vpeer)
         let veth_name = Self::host_veth_name(idx);
         let vpeer_name = "vpeer";
 

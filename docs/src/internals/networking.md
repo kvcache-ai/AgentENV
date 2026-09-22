@@ -8,7 +8,7 @@ This page explains how that contract is implemented.
 
 ## Topology
 
-Each running sandbox has a dedicated network namespace. The Firecracker VM is connected to the namespace through a TAP device. The namespace is connected to the host through a veth pair; the namespace side is named `vpeer` and the host side is named `veth-{slot}`.
+Each running sandbox has a dedicated network namespace. The Firecracker VM is connected to the namespace through a TAP device. The namespace is connected to the host through a veth pair; the namespace side is named `vpeer` and the host side is named `aenv-{slot}`.
 
 ```mermaid
 flowchart LR
@@ -30,7 +30,7 @@ flowchart LR
 
     subgraph host["Host network namespace"]
         direction LR
-        veth["veth-{slot}\n10.12.0.0/16\n/31 per slot"]
+        veth["aenv-{slot}\n10.12.0.0/16\n/31 per slot"]
         host-interaction["Host interaction IP\n10.11.0.0/16\n/31 per slot"]
         internet["Internet"]
         veth <-- "Host routing" --> host-interaction
@@ -61,7 +61,7 @@ The process contains one global `NetworkManager` and one global `EgressProxy` re
 `NetworkAddressPlan` derives addresses from `[network.internal]` and allocates them from the slot index:
 
 - `host_interaction_ip`: one address per slot from `host_interaction_cidr`. Host routes use this address to reach the VM through the namespace.
-- `veth_host_ip` and `veth_vm_ip`: the two endpoints of the slot's `/31` veth link. The host endpoint is assigned to `veth-{slot}` and the namespace endpoint is assigned to `vpeer`.
+- `veth_host_ip` and `veth_vm_ip`: the two endpoints of the slot's `/31` veth link. The host endpoint is assigned to `aenv-{slot}` and the namespace endpoint is assigned to `vpeer`.
 - `vm_ip` and `tap_ip`: fixed endpoints of the VM link on `vm_link_cidr`. The VM receives `vm_ip`; the namespace TAP interface receives `tap_ip`.
 
 The namespace adds a default route through `veth_host_ip`. Firecracker receives an `ip=` boot argument containing the VM address, TAP link, netmask, and the guest DNS server selected from the host resolver configuration.
@@ -111,7 +111,7 @@ flowchart TB
 
 ### Return traffic
 
-Return packets are classified as `ESTABLISHED,RELATED` and are accepted before the user egress chain in the namespace. The host also accepts established traffic returning to `veth-{slot}`. This preserves host/envd/proxy responses and existing outbound flows while policy rules are replaced.
+Return packets are classified as `ESTABLISHED,RELATED` and are accepted before the user egress chain in the namespace. The host also accepts established traffic returning to `aenv-{slot}`. This preserves host/envd/proxy responses and existing outbound flows while policy rules are replaced.
 
 ### Host-to-VM traffic
 
@@ -122,10 +122,10 @@ Host-side proxy and envd traffic targets the slot's `host_interaction_ip`. Names
 `NetworkManager` installs one process-wide set of host rules for the configured host interaction CIDR. The rules are inserted/appended symmetrically and removed during manager shutdown:
 
 ```text
-INPUT      -i veth-+ -s <host_interaction_cidr> -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-INPUT      -i veth-+ -s <host_interaction_cidr> -j REJECT
-FORWARD    -i veth-+ -s <host_interaction_cidr> -j ACCEPT
-FORWARD    -o veth-+ -d <host_interaction_cidr> --state ESTABLISHED,RELATED -j ACCEPT
+INPUT      -i aenv-+ -s <host_interaction_cidr> -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+INPUT      -i aenv-+ -s <host_interaction_cidr> -j REJECT
+FORWARD    -i aenv-+ -s <host_interaction_cidr> -j ACCEPT
+FORWARD    -o aenv-+ -d <host_interaction_cidr> --state ESTABLISHED,RELATED -j ACCEPT
 POSTROUTING -s <host_interaction_cidr> -j MASQUERADE
 ```
 

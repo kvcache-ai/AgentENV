@@ -1,4 +1,5 @@
 mod deps;
+mod hotplug;
 mod kvm;
 mod network_capacity;
 pub mod overlaybd;
@@ -59,6 +60,12 @@ pub fn ensure_host(config: &AppConfig, runtime_user: &str, runtime_group: &str) 
     network_capacity::install_persistent_config().context("install /etc/sysctl.d/99-aenv.conf")?;
     fs::write("/proc/sys/net/ipv4/ip_forward", "1\n").context("enable host IPv4 forwarding")?;
     network_capacity::check_and_adjust();
+
+    // Suppress the ifupdown hotplug triggered by AENV NICs to avoid an
+    // ifquery process storm during large-scale sandbox creation.
+    hotplug::patch_ifupdown_hotplug()
+        .context("patch /lib/udev/ifupdown-hotplug to suppress ifquery for aenv-*")?;
+
     Ok(())
 }
 

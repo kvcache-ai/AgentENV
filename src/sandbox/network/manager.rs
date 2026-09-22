@@ -910,21 +910,21 @@ mod tests {
 
     #[test]
     fn slot_index_from_host_veth_name_parses_valid_slot() {
-        assert_eq!(slot_index_from_host_veth_name("veth-42"), Some(42));
+        assert_eq!(slot_index_from_host_veth_name("aenv-42"), Some(42));
     }
 
     #[test]
     fn slot_index_from_host_veth_name_rejects_non_matching_names() {
         assert_eq!(slot_index_from_host_veth_name("eth0"), None);
-        assert_eq!(slot_index_from_host_veth_name("veth-nope"), None);
-        assert_eq!(slot_index_from_host_veth_name("veth-0"), None);
+        assert_eq!(slot_index_from_host_veth_name("aenv-nope"), None);
+        assert_eq!(slot_index_from_host_veth_name("aenv-0"), None);
     }
 
     #[test]
     fn collect_conflict_report_keeps_samples_and_total_count() {
         let output = "\
-            10.11.0.1 via 10.12.0.3 dev veth-1\n\
-            iifname \"veth-1\" tcp dport 443 redirect to :5017\n\
+            10.11.0.1 via 10.12.0.3 dev aenv-1\n\
+            iifname \"aenv-1\" tcp dport 443 redirect to :5017\n\
             unrelated line\n\
             ip saddr 10.11.0.2 oifname \"eth0\" masquerade\n\
         ";
@@ -937,7 +937,7 @@ mod tests {
         assert_eq!(report.total_matches, 3);
         assert_eq!(report.samples.len(), 3);
         assert!(report.samples[0].contains("10.11.0.1"));
-        assert!(report.samples[1].contains("veth-1"));
+        assert!(report.samples[1].contains("aenv-1"));
         assert!(report.samples[2].contains("10.11.0.2"));
     }
 

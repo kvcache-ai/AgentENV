@@ -20,7 +20,7 @@ pub(crate) use slot::Slot;
 
 pub(crate) const MAX_SLOTS: usize = crate::cfg::network::NETWORK_MAX_SLOTS;
 const NETNS_PREFIX: &str = "agentenv-ns-";
-const HOST_VETH_PREFIX: &str = "veth-";
+const HOST_VETH_PREFIX: &str = "aenv-";
 
 pub(crate) fn prepare_runtime(runtime_path: &Path) -> anyhow::Result<()> {
     let directory = runtime_path.join("netns");
