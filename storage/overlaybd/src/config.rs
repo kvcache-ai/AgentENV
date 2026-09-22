@@ -1,6 +1,8 @@
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use url::Url;
 
 pub const MAX_LAYER_CNT: usize = 256;
 const DEFAULT_LOG_SIZE_MB: u32 = 10;
@@ -339,6 +341,43 @@ pub struct CertConfig {
     pub key_file: String,
 }
 
+pub(crate) fn registry_authority(url: &Url) -> &str {
+    &url[url::Position::BeforeHost..url::Position::AfterPort]
+}
+
+fn validate_registry_mirror_endpoint(url: &Url) -> Result<()> {
+    let local_http = url.scheme() == "http"
+        && matches!(url.host_str(), Some("127.0.0.1" | "[::1]" | "localhost"));
+    anyhow::ensure!(
+        url.scheme() == "https" || local_http,
+        "registry mirrors require HTTPS (HTTP is allowed only on loopback)"
+    );
+    anyhow::ensure!(url.host_str().is_some() && url.username().is_empty() && url.password().is_none()
+        && url.path() == "/" && url.query().is_none() && url.fragment().is_none(),
+        "registry mirror endpoints must be origins without credentials, paths, queries or fragments");
+    Ok(())
+}
+
+/// Validate mirror routing before any runtime readers are initialized.
+pub fn validate_registry_mirror_hosts(hosts: &HashMap<String, Vec<String>>) -> Result<()> {
+    for (host, mirrors) in hosts {
+        let origin = Url::parse(&format!("https://{host}"))?;
+        validate_registry_mirror_endpoint(&origin)?;
+        anyhow::ensure!(
+            registry_authority(&origin) == host,
+            "registry mirror keys must be canonical origin authorities"
+        );
+        anyhow::ensure!(
+            !mirrors.is_empty(),
+            "registry mirror endpoint list cannot be empty"
+        );
+        for mirror in mirrors {
+            validate_registry_mirror_endpoint(&Url::parse(mirror)?)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct GlobalConfig {
@@ -368,6 +407,7 @@ pub struct GlobalConfig {
     pub cert_config: CertConfig,
     pub user_agent: String,
     pub credential_config: CredentialConfig,
+    pub registry_mirrors: HashMap<String, Vec<String>>,
 
     /// Legacy compatibility field. Local files no longer allocate io_uring
     /// workers through `ImageService`; ublk owns its queue-local rings.
@@ -406,6 +446,7 @@ impl Default for GlobalConfig {
             cert_config: CertConfig::default(),
             user_agent: env!("CARGO_PKG_VERSION").to_string(),
             credential_config: CredentialConfig::default(),
+            registry_mirrors: HashMap::new(),
 
             nr_io_rings: 4,
             remote_io_workers: 0,
@@ -591,6 +632,7 @@ fn validate_download_scheduler_caps(cfg: &DownloadConfig, field: &str) -> Result
 }
 
 pub fn validate_global_config(cfg: &GlobalConfig) -> Result<()> {
+    validate_registry_mirror_hosts(&cfg.registry_mirrors)?;
     ensure!(cfg.io_engine <= 2, "unknown ioEngine {}", cfg.io_engine);
     validate_download_chunk_knobs(&cfg.download, "download.concurrency")?;
     validate_download_scheduler_caps(&cfg.download, "download")?;

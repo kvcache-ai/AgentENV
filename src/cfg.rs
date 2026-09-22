@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -10,7 +11,7 @@ pub use image::{
     ResolvedImageCacheConfig, ResolvedImageCacheGcConfig,
 };
 pub use network::{NetworkConfig, NetworkEgressConfig, NetworkInternalConfig};
-use overlaybd::config::UpperMode;
+use overlaybd::config::{validate_registry_mirror_hosts, UpperMode};
 use serde::Deserialize;
 
 use crate::virtualization::VirtualizationMode;
@@ -484,6 +485,9 @@ pub struct UblkTomlConfig {
 
 #[derive(Debug, Config, Clone)]
 pub struct UblkOverlaybdTomlConfig {
+    /// Native OCI read mirrors; keys are origin authorities, values are HTTPS origins.
+    #[config(default = {})]
+    pub registry_mirrors: HashMap<String, Vec<String>>,
     #[config(default = "$AENV_HOME/overlaybd/overlaybd-global.json")]
     pub global_config_path: PathBuf,
     #[config(default = false)]
@@ -1014,6 +1018,8 @@ impl AppConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        let mirrors = &self.ublk.overlaybd.registry_mirrors;
+        validate_registry_mirror_hosts(mirrors)?;
         self.validate_pool_config()?;
         self.image.cache.gc.validate()?;
         NetworkConfig::validate(&self.network)?;

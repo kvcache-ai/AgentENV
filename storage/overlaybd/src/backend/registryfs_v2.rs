@@ -21,6 +21,9 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify};
 
+mod mirrors;
+use mirrors::MirrorEndpoint;
+
 const MIN_TOKEN_LIFE: Duration = Duration::from_secs(30);
 const MIN_URL_INFO_LIFE: Duration = Duration::from_secs(300);
 const MIN_META_LIFE: Duration = Duration::from_secs(300);
@@ -34,6 +37,7 @@ const HTTP_CLIENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
 pub struct RegistryFsV2Options {
+    pub registry_mirrors: HashMap<String, Vec<String>>,
     pub timeout: Duration,
     pub retry_count: u32,
     pub user_agent: String,
@@ -46,6 +50,7 @@ pub struct RegistryFsV2Options {
 impl Default for RegistryFsV2Options {
     fn default() -> Self {
         Self {
+            registry_mirrors: HashMap::new(),
             timeout: DEFAULT_TIMEOUT,
             retry_count: DEFAULT_RETRY_COUNT,
             user_agent: env!("CARGO_PKG_VERSION").to_string(),
@@ -70,6 +75,7 @@ impl RegistryFsV2Options {
             String::new()
         };
         Self {
+            registry_mirrors: cfg.registry_mirrors.clone(),
             timeout: DEFAULT_TIMEOUT,
             retry_count,
             user_agent: cfg.user_agent.clone(),
@@ -206,6 +212,7 @@ impl PreparedAuth {
 
 #[derive(Debug)]
 struct RegistryFSImplV2 {
+    mirrors: HashMap<String, Vec<MirrorEndpoint>>,
     client: Client,
     credential_mode: CredentialMode,
     timeout: Duration,
@@ -533,6 +540,7 @@ impl RegistryFSImplV2 {
         url: &str,
         auth_header: &str,
     ) -> Result<ActualUrlResponse> {
+        // A whole-blob probe can trigger eager downloads in a registry mirror.
         let mut req = self
             .client
             .get(url)
@@ -799,6 +807,9 @@ impl RegistryFSImplV2 {
 
     async fn read_range_inner(&self, url: &str, offset: u64, count: usize) -> Result<Bytes> {
         let deadline = Instant::now() + self.timeout;
+        if let Some(read) = self.try_mirrors(url, offset, count, deadline).await? {
+            return Ok(read.body);
+        }
         for attempt in 0..=self.retry_count {
             let remaining = remaining_timeout(deadline)?;
             let result =
@@ -809,10 +820,10 @@ impl RegistryFSImplV2 {
                     ))?;
             match result {
                 Ok(resp) => {
-                    let body = resp
-                        .bytes()
+                    let read = tokio::time::timeout(remaining_timeout(deadline)?, resp.bytes())
                         .await
-                        .context("read range response body failed")?;
+                        .context("registry read deadline expired")?;
+                    let body = read.context("read range response body failed")?;
                     return Ok(body);
                 }
                 Err(err) => {
@@ -842,6 +853,10 @@ impl RegistryFSImplV2 {
 
     async fn read_range_into_inner(&self, url: &str, offset: u64, dst: &mut [u8]) -> Result<usize> {
         let deadline = Instant::now() + self.timeout;
+        if let Some(read) = self.try_mirrors(url, offset, dst.len(), deadline).await? {
+            dst[..read.body.len()].copy_from_slice(&read.body);
+            return Ok(read.body.len());
+        }
         for attempt in 0..=self.retry_count {
             let remaining = remaining_timeout(deadline)?;
             let result =
@@ -854,11 +869,13 @@ impl RegistryFSImplV2 {
             match result {
                 Ok(mut resp) => {
                     let mut filled = 0usize;
-                    while let Some(chunk) = resp
-                        .chunk()
-                        .await
-                        .context("read range response body failed")?
-                    {
+                    loop {
+                        let read = tokio::time::timeout(remaining_timeout(deadline)?, resp.chunk())
+                            .await
+                            .context("registry read deadline expired")?;
+                        let Some(chunk) = read.context("read range response body failed")? else {
+                            break;
+                        };
                         let received = filled + chunk.len();
                         if received > dst.len() {
                             bail!("range response larger than requested for {url} at {offset}");
@@ -896,6 +913,18 @@ impl RegistryFSImplV2 {
         }
 
         let deadline = Instant::now() + self.timeout;
+        if let Some(read) = self.try_mirrors(url, 0, 1, deadline).await? {
+            let size = read.total;
+            self.meta_sizes.insert(
+                url.to_string(),
+                CachedMetaSize {
+                    size,
+                    expire_at: Instant::now() + Self::meta_ttl(),
+                },
+            );
+            return Ok(size);
+        }
+
         for attempt in 0..=self.retry_count {
             let remaining = remaining_timeout(deadline)?;
             let result = tokio::time::timeout(remaining, self.fetch_range_response(url, 0, 1))
@@ -905,10 +934,10 @@ impl RegistryFSImplV2 {
                 Ok(resp) => {
                     let status = resp.status();
                     let headers = resp.headers().clone();
-                    let body = resp
-                        .bytes()
+                    let read = tokio::time::timeout(remaining_timeout(deadline)?, resp.bytes())
                         .await
-                        .context("read length response body failed")?;
+                        .context("registry read deadline expired")?;
+                    let body = read.context("read length response body failed")?;
                     if let Some(total) = parse_content_range_total(&headers) {
                         self.meta_sizes.insert(
                             url.to_string(),
@@ -989,9 +1018,11 @@ impl RegistryFsV2 {
         options: RegistryFsV2Options,
         credential_mode: CredentialMode,
     ) -> Result<Self> {
+        let mirrors = mirrors::build_endpoints(&options, &credential_mode)?;
         let client = build_http_client(&options)?;
         Ok(Self {
             inner: Arc::new(RegistryFSImplV2 {
+                mirrors,
                 client,
                 credential_mode,
                 timeout: options.timeout,
@@ -1144,6 +1175,7 @@ impl UploadSession {
         };
 
         let backend_options = RegistryFsV2Options {
+            registry_mirrors: HashMap::new(),
             timeout: options.timeout,
             retry_count: DEFAULT_RETRY_COUNT,
             user_agent: options.user_agent,
@@ -2097,6 +2129,7 @@ mod tests {
 
     fn registry_test_options() -> RegistryFsV2Options {
         RegistryFsV2Options {
+            registry_mirrors: HashMap::new(),
             timeout: Duration::from_secs(3),
             retry_count: 2,
             user_agent: "registry-test".to_string(),
@@ -2123,6 +2156,7 @@ mod tests {
 
         let backend = RegistryFsV2::with_static_credentials(
             RegistryFsV2Options {
+                registry_mirrors: HashMap::new(),
                 timeout: Duration::from_secs(3),
                 retry_count: 2,
                 user_agent: "registry-test".to_string(),
@@ -2165,6 +2199,7 @@ mod tests {
 
         let backend = RegistryFsV2::with_static_credentials(
             RegistryFsV2Options {
+                registry_mirrors: HashMap::new(),
                 timeout: Duration::from_secs(3),
                 retry_count: 2,
                 user_agent: "registry-test".to_string(),
@@ -2290,6 +2325,7 @@ mod tests {
 
         let backend = RegistryFsV2::with_static_credentials(
             RegistryFsV2Options {
+                registry_mirrors: HashMap::new(),
                 timeout: Duration::from_secs(3),
                 retry_count: 2,
                 user_agent: "registry-test".to_string(),
@@ -2384,6 +2420,7 @@ mod tests {
 
         let backend = RegistryFsV2::with_static_credentials(
             RegistryFsV2Options {
+                registry_mirrors: HashMap::new(),
                 timeout: Duration::from_secs(3),
                 retry_count: 2,
                 user_agent: "registry-test".to_string(),
@@ -2492,6 +2529,7 @@ mod tests {
 
         let backend = RegistryFsV2::with_static_credentials(
             RegistryFsV2Options {
+                registry_mirrors: HashMap::new(),
                 timeout: Duration::from_secs(3),
                 retry_count: 3,
                 user_agent: "registry-test".to_string(),
