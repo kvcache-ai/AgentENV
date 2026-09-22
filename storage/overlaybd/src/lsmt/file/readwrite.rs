@@ -988,21 +988,15 @@ impl LSMTFile {
 
         let virtual_size = self.virtual_size.load(Ordering::Acquire);
         let query = Segment::new(0, (virtual_size.div_ceil(ALIGNMENT)) as u32);
-        let mut mappings = Vec::new();
+        let mut compact_index = Vec::new();
         {
             let idx = self.index.read().await;
-            idx.lookup(query, &mut mappings);
+            idx.upper.lookup(query, &mut compact_index);
         }
-
-        let mut compact_index: Vec<SegmentMapping> = Vec::new();
-        for m in mappings {
-            if m.tag as usize == self.rw_tag {
-                let mut cm = m;
-                cm.tag = 0;
-                if cm.zeroed {
-                    cm.moffset = NO_PHYSICAL_OFFSET;
-                }
-                compact_index.push(cm);
+        for m in &mut compact_index {
+            m.tag = 0;
+            if m.zeroed {
+                m.moffset = NO_PHYSICAL_OFFSET;
             }
         }
 
