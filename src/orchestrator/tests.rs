@@ -2,8 +2,9 @@ use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -17,6 +18,7 @@ use super::super::persistence::{
     DisabledSandboxPersister, RecordingCall, RecordingPersister, SandboxPersister,
 };
 use super::super::types::SandboxLaunchSource;
+use super::sandbox_metrics::metrics_concurrency;
 use super::*;
 use crate::cfg::ResolvedImageCacheConfig;
 use crate::image::cache::test_support::{
@@ -30,7 +32,7 @@ use crate::sandbox::mock::{
 };
 use crate::sandbox::{
     BaseSandboxNetworkPolicy, PausedSandboxState, RuntimeArtifactSet, SandboxLaunchConfig,
-    SandboxNetworkEgressPolicy, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    SandboxMetric, SandboxNetworkEgressPolicy, SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
 use crate::snapshot::RunnableSnapshot;
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
@@ -114,6 +116,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         proxy_routes: RwLock::new(ProxyRouteTable::default()),
         next_proxy_route_version: AtomicU64::new(1),
         counters: Default::default(),
+        sandbox_metrics: Mutex::new(SandboxMetrics::default()),
         sandbox_event_tx,
         default_sandbox_timeout: Duration::from_secs(15),
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
@@ -5583,4 +5586,223 @@ async fn fork_sandbox_register_failure_cleans_up_metrics() -> Result<()> {
     orchestrator.delete_sandbox(child.id).await?;
     orchestrator.delete_sandbox(source.id).await?;
     Ok(())
+}
+fn sandbox_metric_sample(timestamp: i64) -> SandboxMetric {
+    SandboxMetric {
+        timestamp: chrono::DateTime::from_timestamp(timestamp, 0).unwrap(),
+        cpu_count: 2,
+        cpu_used_pct: 25.0,
+        mem_used: 4_000_000_000,
+        mem_total: 8_000_000_000,
+        mem_cache: 3_000_000_000,
+        disk_used: 9_000_000_000,
+        disk_total: 20_000_000_000,
+    }
+}
+
+async fn add_metrics_runtime(
+    orchestrator: &TestOrchestrator,
+    id: SandboxId,
+    behavior: Arc<MockBehavior>,
+) {
+    orchestrator
+        .store
+        .add(SandboxMetadata {
+            id,
+            state: SandboxState::Running,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    orchestrator.sandboxes.write().await.insert(
+        id,
+        Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(behavior)))),
+    );
+    orchestrator.proxy_routes.write().await.upsert(
+        id,
+        ProxyTarget::new(std::net::Ipv4Addr::LOCALHOST),
+        1,
+    );
+}
+
+#[tokio::test]
+async fn sandbox_metrics_history_latest_pause_generation_and_retention() {
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let id = SandboxId::new();
+    add_metrics_runtime(&orchestrator, id, Arc::new(MockBehavior::new())).await;
+    let now = Instant::now();
+    for timestamp in [10, 30, 20] {
+        orchestrator.sandbox_metrics.lock().await.insert(
+            id,
+            1,
+            now,
+            sandbox_metric_sample(timestamp),
+        );
+    }
+    let history = orchestrator
+        .sandbox_metrics_history(id, Some(20), Some(30))
+        .await
+        .unwrap();
+    assert_eq!(
+        history
+            .iter()
+            .map(|sample| sample.timestamp.timestamp())
+            .collect::<Vec<_>>(),
+        vec![20, 30]
+    );
+    assert_eq!(
+        orchestrator
+            .latest_sandbox_metrics(&[id, SandboxId::new()])
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let mut metadata = orchestrator.store.get(&id).await.unwrap().unwrap();
+    metadata.state = SandboxState::Paused;
+    orchestrator.store.update(metadata.clone()).await.unwrap();
+    assert!(orchestrator
+        .latest_sandbox_metrics(&[id])
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        orchestrator
+            .sandbox_metrics_history(id, None, None)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+
+    metadata.state = SandboxState::Running;
+    orchestrator.store.update(metadata).await.unwrap();
+    orchestrator.proxy_routes.write().await.upsert(
+        id,
+        ProxyTarget::new(std::net::Ipv4Addr::LOCALHOST),
+        2,
+    );
+    assert!(orchestrator
+        .latest_sandbox_metrics(&[id])
+        .await
+        .unwrap()
+        .is_empty());
+
+    orchestrator
+        .sandbox_metrics
+        .lock()
+        .await
+        .prune(now + Duration::from_secs(61), Duration::from_secs(60));
+    assert!(orchestrator
+        .sandbox_metrics_history(id, None, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        orchestrator
+            .sandbox_metrics_history(SandboxId::new(), None, None)
+            .await,
+        Err(OrchestratorError::SandboxNotFound(_))
+    ));
+}
+
+#[test]
+fn metrics_parallelism_matches_running_sandbox_count() {
+    for (running, expected) in [(0, 0), (1, 1), (5, 1), (6, 2), (10, 2), (11, 3)] {
+        assert_eq!(metrics_concurrency(running), expected);
+    }
+}
+
+#[tokio::test]
+async fn sandbox_metrics_collects_without_holding_runtime_lock_and_discards_old_response() {
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let id = SandboxId::new();
+    let behavior = Arc::new(MockBehavior::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    behavior.set_metrics_sampler(Arc::new({
+        let entered = entered.clone();
+        let release = release.clone();
+        move || {
+            let entered = entered.clone();
+            let release = release.clone();
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+                Ok(sandbox_metric_sample(100))
+            })
+        }
+    }));
+    add_metrics_runtime(&orchestrator, id, behavior.clone()).await;
+    let task = tokio::spawn({
+        let orchestrator = orchestrator.clone();
+        async move {
+            orchestrator.collect_sandbox_metrics(None).await;
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    let handle = orchestrator.sandboxes.read().await[&id].clone();
+    assert!(
+        handle.try_lock().is_ok(),
+        "HTTP sampling must not hold the runtime lock"
+    );
+    orchestrator.proxy_routes.write().await.upsert(
+        id,
+        ProxyTarget::new(std::net::Ipv4Addr::LOCALHOST),
+        2,
+    );
+    release.notify_one();
+    task.await.unwrap();
+    assert!(orchestrator
+        .sandbox_metrics_history(id, None, None)
+        .await
+        .unwrap()
+        .is_empty());
+
+    behavior.set_metrics_sampler(Arc::new(|| {
+        Box::pin(async { Ok(sandbox_metric_sample(101)) })
+    }));
+    orchestrator.collect_sandbox_metrics(None).await;
+    assert_eq!(
+        orchestrator.latest_sandbox_metrics(&[id]).await.unwrap()[&id]
+            .timestamp
+            .timestamp(),
+        101
+    );
+}
+
+#[tokio::test]
+async fn sandbox_metrics_failure_is_not_zero_and_paused_guests_are_not_polled() {
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let id = SandboxId::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_metrics_sampler(Arc::new({
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { anyhow::bail!("unreachable guest") })
+        }
+    }));
+    add_metrics_runtime(&orchestrator, id, behavior).await;
+    orchestrator.collect_sandbox_metrics(None).await;
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    assert!(orchestrator
+        .sandbox_metrics_history(id, None, None)
+        .await
+        .unwrap()
+        .is_empty());
+
+    let mut metadata = orchestrator.store.get(&id).await.unwrap().unwrap();
+    metadata.state = SandboxState::Paused;
+    let expiration = metadata.expires_at;
+    orchestrator.store.update(metadata).await.unwrap();
+    orchestrator.collect_sandbox_metrics(None).await;
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let metadata = orchestrator.store.get(&id).await.unwrap().unwrap();
+    assert_eq!(metadata.state, SandboxState::Paused);
+    assert_eq!(metadata.expires_at, expiration);
 }

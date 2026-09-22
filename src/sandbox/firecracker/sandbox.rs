@@ -342,6 +342,13 @@ fn snapshot_config_for_fork(
 
 #[async_trait]
 impl SandboxBackend for FirecrackerSandbox {
+    fn metrics_sample(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, Result<crate::sandbox::SandboxMetric>>> {
+        let envd = self.envd_instance.clone()?;
+        Some(Box::pin(async move { envd.metrics().await }))
+    }
+
     async fn start(&mut self) -> Result<()> {
         FirecrackerSandbox::start(self).await
     }

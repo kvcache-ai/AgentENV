@@ -861,6 +861,72 @@ impl Sandboxes<()> for ApiImpl {
         }
     }
 
+    async fn sandboxes_metrics_get(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        query: &models::SandboxesMetricsGetQueryParams,
+    ) -> Result<SandboxesMetricsGetResponse, ()> {
+        use SandboxesMetricsGetResponse::*;
+        let ids = match parse_metrics_ids(&query.sandbox_ids) {
+            Ok(ids) => ids,
+            Err(message) => return Ok(Status400_BadRequest(ApiImpl::error(400, message))),
+        };
+        match self.orchestrator.latest_sandbox_metrics(&ids).await {
+            Ok(samples) => Ok(
+                Status200_SuccessfullyReturnedAllRunningSandboxesWithMetrics(
+                    models::SandboxesWithMetrics {
+                        sandboxes: samples
+                            .into_iter()
+                            .map(|(id, metric)| (id.to_string(), metric.into()))
+                            .collect(),
+                    },
+                ),
+            ),
+            Err(error) => Ok(Status500_ServerError(error.into())),
+        }
+    }
+
+    async fn sandboxes_sandbox_id_metrics_get(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path: &models::SandboxesSandboxIdMetricsGetPathParams,
+        query: &models::SandboxesSandboxIdMetricsGetQueryParams,
+    ) -> Result<SandboxesSandboxIdMetricsGetResponse, ()> {
+        use SandboxesSandboxIdMetricsGetResponse::*;
+        if !valid_metrics_interval(query.start, query.end) {
+            return Ok(Status400_BadRequest(ApiImpl::error(
+                400,
+                "start/end must be non-negative and start must not exceed end",
+            )));
+        }
+        let Ok(id) = SandboxId::parse_str(&path.sandbox_id) else {
+            return Ok(Status404_NotFound(sandbox_not_found(&path.sandbox_id)));
+        };
+        match self
+            .orchestrator
+            .sandbox_metrics_history(
+                id,
+                query.start.map(|t| t as i64),
+                query.end.map(|t| t as i64),
+            )
+            .await
+        {
+            Ok(samples) => Ok(Status200_SuccessfullyReturnedTheSandboxMetrics(
+                samples.into_iter().map(Into::into).collect(),
+            )),
+            Err(OrchestratorError::SandboxNotFound(_)) => {
+                Ok(Status404_NotFound(sandbox_not_found(&path.sandbox_id)))
+            }
+            Err(error) => Ok(Status500_ServerError(error.into())),
+        }
+    }
+
     async fn sandboxes_get(
         &self,
         _method: &Method,
@@ -2256,5 +2322,83 @@ mod tests {
         };
         let error = network_policy_from_update(&body).unwrap_err();
         assert!(error.to_string().contains("0.0.0.0/0"));
+    }
+}
+
+impl From<crate::sandbox::SandboxMetric> for models::SandboxMetric {
+    fn from(sample: crate::sandbox::SandboxMetric) -> Self {
+        Self::new(
+            sample.timestamp,
+            sample.timestamp.timestamp(),
+            sample.cpu_count,
+            sample.cpu_used_pct,
+            sample.mem_used,
+            sample.mem_total,
+            sample.mem_cache,
+            sample.disk_used,
+            sample.disk_total,
+        )
+    }
+}
+
+fn valid_metrics_interval(start: Option<u64>, end: Option<u64>) -> bool {
+    start.is_none_or(|s| s <= i64::MAX as u64)
+        && end.is_none_or(|e| e <= i64::MAX as u64)
+        && !matches!((start, end), (Some(s), Some(e)) if s > e)
+}
+
+fn parse_metrics_ids(values: &[String]) -> Result<Vec<SandboxId>, &'static str> {
+    if values.len() != 1 {
+        return Err("sandbox_ids must be a single comma-separated list");
+    }
+    let ids: Vec<_> = values[0].split(',').collect();
+    if ids.len() > 100 {
+        return Err("sandbox_ids must contain at most 100 IDs");
+    }
+    let mut seen = HashSet::new();
+    let mut parsed = Vec::new();
+    for id in ids {
+        let id =
+            SandboxId::parse_str(id).map_err(|_| "sandbox_ids must contain valid sandbox IDs")?;
+        if !seen.insert(id) {
+            return Err("sandbox_ids must contain distinct IDs");
+        }
+        parsed.push(id);
+    }
+    Ok(parsed)
+}
+
+#[cfg(test)]
+mod metrics_contract_tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_metrics_validates_csv_and_interval() {
+        let a = SandboxId::new();
+        let b = SandboxId::new();
+        assert_eq!(
+            parse_metrics_ids(&[format!("{a},{b}")]).unwrap(),
+            vec![a, b]
+        );
+        let alternate_a = a.to_string().replace('-', "");
+        for values in [
+            vec![],
+            vec!["".into()],
+            vec!["not-a-uuid".into()],
+            vec![format!("{a},not-a-uuid")],
+            vec![format!("{a},{a}")],
+            vec![format!("{a},{alternate_a}")],
+            vec![format!("{a},")],
+            vec![a.to_string(), b.to_string()],
+            vec![(0..101)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")],
+        ] {
+            assert!(parse_metrics_ids(&values).is_err());
+        }
+        assert!(valid_metrics_interval(Some(0), Some(i64::MAX as u64)));
+        assert!(!valid_metrics_interval(Some(u64::MAX), None));
+        assert!(!valid_metrics_interval(Some(2), Some(1)));
     }
 }

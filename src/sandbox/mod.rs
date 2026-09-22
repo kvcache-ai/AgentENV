@@ -5,6 +5,7 @@ mod envd;
 mod extra_drive;
 mod firecracker;
 pub mod manifest;
+mod metrics;
 #[cfg(test)]
 pub(crate) mod mock;
 mod network;
@@ -37,6 +38,7 @@ pub use firecracker::{
     FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
 };
 pub use manifest::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
+pub use metrics::SandboxMetric;
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
 pub use network::{
     BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,

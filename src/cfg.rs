@@ -634,6 +634,11 @@ pub struct NodeIdentityConfig {
 
 #[derive(Debug, Config, Clone)]
 pub struct OrchestratorConfig {
+    #[config(default = 15u64)]
+    pub metrics_interval_secs: u64,
+    #[config(default = 3600u64)]
+    pub metrics_retention_secs: u64,
+
     #[config(default = 1000u64)]
     pub auto_evict_interval_ms: u64,
     #[config(default = 15u64)]

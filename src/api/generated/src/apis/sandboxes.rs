@@ -44,6 +44,20 @@ pub enum SandboxesGetResponse {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+pub enum SandboxesMetricsGetResponse {
+    /// Successfully returned all running sandboxes with metrics
+    Status200_SuccessfullyReturnedAllRunningSandboxesWithMetrics(models::SandboxesWithMetrics),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum SandboxesPostResponse {
     /// The sandbox was created successfully
     Status201_TheSandboxWasCreatedSuccessfully {
@@ -158,6 +172,22 @@ pub enum SandboxesSandboxIdGetResponse {
     Status404_NotFound(models::Error),
     /// Authentication error
     Status401_AuthenticationError(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum SandboxesSandboxIdMetricsGetResponse {
+    /// Successfully returned the sandbox metrics
+    Status200_SuccessfullyReturnedTheSandboxMetrics(Vec<models::SandboxMetric>),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -347,6 +377,19 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         query_params: &models::SandboxesGetQueryParams,
     ) -> Result<SandboxesGetResponse, E>;
 
+    /// List sandbox metrics.
+    ///
+    /// SandboxesMetricsGet - GET /sandboxes/metrics
+    async fn sandboxes_metrics_get(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        query_params: &models::SandboxesMetricsGetQueryParams,
+    ) -> Result<SandboxesMetricsGetResponse, E>;
+
     /// Create sandbox.
     ///
     /// SandboxesPost - POST /sandboxes
@@ -436,6 +479,20 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         claims: &Self::Claims,
         path_params: &models::SandboxesSandboxIdGetPathParams,
     ) -> Result<SandboxesSandboxIdGetResponse, E>;
+
+    /// Sandbox metrics.
+    ///
+    /// SandboxesSandboxIdMetricsGet - GET /sandboxes/{sandboxID}/metrics
+    async fn sandboxes_sandbox_id_metrics_get(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdMetricsGetPathParams,
+        query_params: &models::SandboxesSandboxIdMetricsGetQueryParams,
+    ) -> Result<SandboxesSandboxIdMetricsGetResponse, E>;
 
     /// Update sandbox network.
     ///

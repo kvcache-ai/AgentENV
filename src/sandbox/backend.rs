@@ -190,6 +190,14 @@ impl fmt::Debug for CapturedSandboxSnapshot {
 /// `Arc<Mutex<Box<dyn SandboxBackend>>>` handles managed by the Orchestrator.
 #[async_trait]
 pub trait SandboxBackend: Send + 'static {
+    /// Capture an owned sampling future under the runtime lock, then poll it
+    /// after releasing the lock. Unsupported backends return None.
+    fn metrics_sample(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, Result<super::SandboxMetric>>> {
+        None
+    }
+
     /// Start the sandbox and block until readiness.
     async fn start(&mut self) -> Result<()>;
 

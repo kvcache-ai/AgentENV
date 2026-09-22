@@ -69,17 +69,26 @@ pub enum MockAction {
     FailAfter { delay: Duration, message: String },
 }
 
+pub type MetricsSampler = Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, Result<super::SandboxMetric>> + Send + Sync,
+>;
+
 #[derive(Default)]
 pub struct MockBehavior {
     actions: Mutex<HashMap<MockOperation, VecDeque<MockAction>>>,
     on_operation: Mutex<HashMap<MockOperation, Arc<dyn Fn() + Send + Sync>>>,
     runtime_info: Mutex<SandboxRuntimeInfo>,
+    metrics_sampler: Mutex<Option<MetricsSampler>>,
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
 }
 
 impl MockBehavior {
+    pub fn set_metrics_sampler(&self, sampler: MetricsSampler) {
+        *self.metrics_sampler.lock().unwrap() = Some(sampler);
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -269,6 +278,13 @@ impl MockSandboxBackend {
 
 #[async_trait]
 impl SandboxBackend for MockSandboxBackend {
+    fn metrics_sample(
+        &self,
+    ) -> Option<futures::future::BoxFuture<'static, Result<super::SandboxMetric>>> {
+        let sampler = self.behavior.metrics_sampler.lock().unwrap().clone();
+        sampler.map(|sample| sample())
+    }
+
     async fn start(&mut self) -> Result<()> {
         self.behavior.apply_async(MockOperation::Start).await
     }

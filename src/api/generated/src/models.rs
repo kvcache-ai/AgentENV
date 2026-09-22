@@ -103,6 +103,15 @@ pub struct SandboxesGetQueryParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxesMetricsGetQueryParams {
+    /// Comma-separated sandbox IDs.
+    #[serde(rename = "sandbox_ids")]
+    #[validate(length(max = 100))]
+    pub sandbox_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxesSandboxIdConnectPostPathParams {
     pub sandbox_id: String,
 }
@@ -135,6 +144,27 @@ pub struct SandboxesSandboxIdForkPostPathParams {
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxesSandboxIdGetPathParams {
     pub sandbox_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxesSandboxIdMetricsGetPathParams {
+    pub sandbox_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxesSandboxIdMetricsGetQueryParams {
+    /// Unix timestamp in seconds, inclusive.
+    #[serde(rename = "start")]
+    #[validate(range(min = 0u64))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<u64>,
+    /// Unix timestamp in seconds, inclusive.
+    #[serde(rename = "end")]
+    #[validate(range(min = 0u64))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
@@ -6507,6 +6537,290 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxLifec
     }
 }
 
+/// Metric entry with timestamp and line
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxMetric {
+    /// Timestamp of the metric entry
+    #[serde(rename = "timestamp")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+
+    /// Timestamp of the metric entry in Unix time (seconds since epoch)
+    #[serde(rename = "timestampUnix")]
+    pub timestamp_unix: i64,
+
+    /// Number of CPU cores
+    #[serde(rename = "cpuCount")]
+    pub cpu_count: i32,
+
+    /// CPU usage percentage
+    #[serde(rename = "cpuUsedPct")]
+    pub cpu_used_pct: f32,
+
+    /// Memory used in bytes
+    #[serde(rename = "memUsed")]
+    pub mem_used: i64,
+
+    /// Total memory in bytes
+    #[serde(rename = "memTotal")]
+    pub mem_total: i64,
+
+    /// Cached memory (page cache) in bytes
+    #[serde(rename = "memCache")]
+    pub mem_cache: i64,
+
+    /// Disk used in bytes
+    #[serde(rename = "diskUsed")]
+    pub disk_used: i64,
+
+    /// Total disk space in bytes
+    #[serde(rename = "diskTotal")]
+    pub disk_total: i64,
+}
+
+impl SandboxMetric {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        timestamp: chrono::DateTime<chrono::Utc>,
+        timestamp_unix: i64,
+        cpu_count: i32,
+        cpu_used_pct: f32,
+        mem_used: i64,
+        mem_total: i64,
+        mem_cache: i64,
+        disk_used: i64,
+        disk_total: i64,
+    ) -> SandboxMetric {
+        SandboxMetric {
+            timestamp,
+            timestamp_unix,
+            cpu_count,
+            cpu_used_pct,
+            mem_used,
+            mem_total,
+            mem_cache,
+            disk_used,
+            disk_total,
+        }
+    }
+}
+
+/// Converts the SandboxMetric value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxMetric {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping timestamp in query parameter serialization
+            Some("timestampUnix".to_string()),
+            Some(self.timestamp_unix.to_string()),
+            Some("cpuCount".to_string()),
+            Some(self.cpu_count.to_string()),
+            Some("cpuUsedPct".to_string()),
+            Some(self.cpu_used_pct.to_string()),
+            Some("memUsed".to_string()),
+            Some(self.mem_used.to_string()),
+            Some("memTotal".to_string()),
+            Some(self.mem_total.to_string()),
+            Some("memCache".to_string()),
+            Some(self.mem_cache.to_string()),
+            Some("diskUsed".to_string()),
+            Some(self.disk_used.to_string()),
+            Some("diskTotal".to_string()),
+            Some(self.disk_total.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxMetric value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxMetric {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub timestamp: Vec<chrono::DateTime<chrono::Utc>>,
+            pub timestamp_unix: Vec<i64>,
+            pub cpu_count: Vec<i32>,
+            pub cpu_used_pct: Vec<f32>,
+            pub mem_used: Vec<i64>,
+            pub mem_total: Vec<i64>,
+            pub mem_cache: Vec<i64>,
+            pub disk_used: Vec<i64>,
+            pub disk_total: Vec<i64>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxMetric".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "timestamp" => intermediate_rep.timestamp.push(
+                        <chrono::DateTime<chrono::Utc> as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "timestampUnix" => intermediate_rep.timestamp_unix.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "cpuCount" => intermediate_rep.cpu_count.push(
+                        <i32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "cpuUsedPct" => intermediate_rep.cpu_used_pct.push(
+                        <f32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "memUsed" => intermediate_rep.mem_used.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "memTotal" => intermediate_rep.mem_total.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "memCache" => intermediate_rep.mem_cache.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "diskUsed" => intermediate_rep.disk_used.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "diskTotal" => intermediate_rep.disk_total.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing SandboxMetric".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxMetric {
+            timestamp: intermediate_rep
+                .timestamp
+                .into_iter()
+                .next()
+                .ok_or_else(|| "timestamp missing in SandboxMetric".to_string())?,
+            timestamp_unix: intermediate_rep
+                .timestamp_unix
+                .into_iter()
+                .next()
+                .ok_or_else(|| "timestampUnix missing in SandboxMetric".to_string())?,
+            cpu_count: intermediate_rep
+                .cpu_count
+                .into_iter()
+                .next()
+                .ok_or_else(|| "cpuCount missing in SandboxMetric".to_string())?,
+            cpu_used_pct: intermediate_rep
+                .cpu_used_pct
+                .into_iter()
+                .next()
+                .ok_or_else(|| "cpuUsedPct missing in SandboxMetric".to_string())?,
+            mem_used: intermediate_rep
+                .mem_used
+                .into_iter()
+                .next()
+                .ok_or_else(|| "memUsed missing in SandboxMetric".to_string())?,
+            mem_total: intermediate_rep
+                .mem_total
+                .into_iter()
+                .next()
+                .ok_or_else(|| "memTotal missing in SandboxMetric".to_string())?,
+            mem_cache: intermediate_rep
+                .mem_cache
+                .into_iter()
+                .next()
+                .ok_or_else(|| "memCache missing in SandboxMetric".to_string())?,
+            disk_used: intermediate_rep
+                .disk_used
+                .into_iter()
+                .next()
+                .ok_or_else(|| "diskUsed missing in SandboxMetric".to_string())?,
+            disk_total: intermediate_rep
+                .disk_total
+                .into_iter()
+                .next()
+                .ok_or_else(|| "diskTotal missing in SandboxMetric".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxMetric> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxMetric>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxMetric>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxMetric - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxMetric> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxMetric as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxMetric - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxNetworkConfig {
@@ -7509,6 +7823,137 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxVolum
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into SandboxVolumeMount - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxesWithMetrics {
+    #[serde(rename = "sandboxes")]
+    #[validate(custom(function = "check_xss_map_nested"))]
+    pub sandboxes: std::collections::HashMap<String, models::SandboxMetric>,
+}
+
+impl SandboxesWithMetrics {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        sandboxes: std::collections::HashMap<String, models::SandboxMetric>,
+    ) -> SandboxesWithMetrics {
+        SandboxesWithMetrics { sandboxes }
+    }
+}
+
+/// Converts the SandboxesWithMetrics value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxesWithMetrics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping sandboxes in query parameter serialization
+            // Skipping sandboxes in query parameter serialization
+
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxesWithMetrics value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxesWithMetrics {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub sandboxes: Vec<std::collections::HashMap<String, models::SandboxMetric>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxesWithMetrics".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    "sandboxes" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxesWithMetrics".to_string()),
+                    _ => return std::result::Result::Err("Unexpected key while parsing SandboxesWithMetrics".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxesWithMetrics {
+            sandboxes: intermediate_rep
+                .sandboxes
+                .into_iter()
+                .next()
+                .ok_or_else(|| "sandboxes missing in SandboxesWithMetrics".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxesWithMetrics> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxesWithMetrics>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxesWithMetrics>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxesWithMetrics - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxesWithMetrics> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxesWithMetrics as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxesWithMetrics - {err}"#
                     )),
                 }
             }

@@ -140,6 +140,57 @@ IDs. A non-201 response means the request failed before any child was attempted.
 See the [API Reference](../../api/index.md) for the complete fork request and
 response schemas.
 
+## View Resource Metrics
+
+Get the retained metrics for one sandbox:
+
+```bash
+curl -H "X-API-Key: $AENV_API_KEY" \
+  "$AENV_URL/sandboxes/$SANDBOX_ID/metrics?start=1700000000&end=1700003600"
+```
+
+`start` and `end` are optional Unix timestamps in seconds and define an inclusive
+time range. When omitted, the endpoint returns all retained samples for the
+sandbox in timestamp order.
+
+Get the latest metric for several sandboxes:
+
+```bash
+curl -H "X-API-Key: $AENV_API_KEY" \
+  "$AENV_URL/sandboxes/metrics?sandbox_ids=$SANDBOX_ID,$OTHER_SANDBOX_ID"
+```
+
+`sandbox_ids` is required and accepts a comma-separated list of up to 100 unique
+sandbox IDs. The response contains the latest available metric for each requested
+running sandbox. Sandboxes without an available metric are omitted.
+
+Each metric contains:
+
+| Field | Description |
+| --- | --- |
+| `timestampUnix` | Sample time as Unix seconds. |
+| `cpuCount` | Number of CPU cores. |
+| `cpuUsedPct` | CPU usage percentage. |
+| `memUsed` | Memory used in bytes. |
+| `memTotal` | Total memory in bytes. |
+| `memCache` | Cached memory in bytes. |
+| `diskUsed` | Disk space used in bytes. |
+| `diskTotal` | Total disk space in bytes. |
+
+See the [API Reference](../../api/index.md) for complete request, response, and
+error schemas.
+
+Configure collection under `[orchestrator]` in your config file:
+
+```toml
+[orchestrator]
+metrics_interval_secs = 15
+metrics_retention_secs = 3600
+```
+
+`metrics_interval_secs` sets the collection interval in seconds; `0` disables
+collection. `metrics_retention_secs` sets how long samples remain available.
+
 ## Manage Sandboxes
 
 List sandboxes:

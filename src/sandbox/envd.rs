@@ -40,6 +40,12 @@ pub(crate) struct EnvdInstance {
 }
 
 impl EnvdInstance {
+    pub(crate) async fn metrics(&self) -> Result<super::SandboxMetric> {
+        self.ensure_live()?;
+        let raw = default_api::metrics_get(&self.config).await?;
+        raw.try_into()
+    }
+
     pub(crate) fn new(base_path: String, access_token: Option<EnvdAccessToken>) -> Self {
         let grpc_address = base_path.clone();
         Self {
@@ -222,6 +228,36 @@ mod tests {
     ) -> StatusCode {
         sender.send((headers, body)).await.unwrap();
         StatusCode::NO_CONTENT
+    }
+
+    #[tokio::test]
+    async fn sandbox_metrics_uses_guest_auth_and_rejects_invalidated_runtime() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let token = crate::sandbox::SandboxAccessTokenGenerator::new("metrics-test-seed")?
+            .generate(crate::types::SandboxId::new());
+        let expected_token = token.clone();
+        let app = Router::new().route(
+            "/metrics",
+            get(move |headers: HeaderMap| async move {
+                assert_eq!(headers["x-access-token"], expected_token.expose());
+                Json(serde_json::json!({
+                    "ts": 1700000000, "cpu_count": 2, "cpu_used_pct": 25.0,
+                    "mem_used": 4000000000i64, "mem_total": 8000000000i64,
+                    "mem_cache": 3000000000i64, "disk_used": 9000000000i64,
+                    "disk_total": 20000000000i64
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let envd = EnvdInstance::new(format!("http://{address}"), Some(token));
+        let sample = envd.metrics().await?;
+        assert_eq!(sample.mem_total, 8000000000);
+        assert_eq!(sample.disk_total, 20000000000);
+        envd.invalidate();
+        assert!(envd.metrics().await.is_err());
+        server.abort();
+        Ok(())
     }
 
     #[tokio::test]

@@ -25,13 +25,13 @@ pub struct Metrics {
     pub cpu_used_pct: Option<f32>,
     /// Total virtual memory in bytes
     #[serde(rename = "mem_total", skip_serializing_if = "Option::is_none")]
-    pub mem_total: Option<i32>,
+    pub mem_total: Option<i64>,
     /// Used virtual memory in bytes
     #[serde(rename = "mem_used", skip_serializing_if = "Option::is_none")]
-    pub mem_used: Option<i32>,
+    pub mem_used: Option<i64>,
     /// Cached memory (page cache) in bytes
     #[serde(rename = "mem_cache", skip_serializing_if = "Option::is_none")]
-    pub mem_cache: Option<i32>,
+    pub mem_cache: Option<i64>,
     /// Total virtual memory in MiB
     #[serde(rename = "mem_total_mib", skip_serializing_if = "Option::is_none")]
     pub mem_total_mib: Option<i32>,
@@ -40,10 +40,10 @@ pub struct Metrics {
     pub mem_used_mib: Option<i32>,
     /// Used disk space in bytes
     #[serde(rename = "disk_used", skip_serializing_if = "Option::is_none")]
-    pub disk_used: Option<i32>,
+    pub disk_used: Option<i64>,
     /// Total disk space in bytes
     #[serde(rename = "disk_total", skip_serializing_if = "Option::is_none")]
-    pub disk_total: Option<i32>,
+    pub disk_total: Option<i64>,
 }
 
 impl Metrics {

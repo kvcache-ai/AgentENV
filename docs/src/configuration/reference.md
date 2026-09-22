@@ -289,6 +289,8 @@ Sandbox lifecycle management.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `auto_evict_interval_ms` | integer | `1000` | Poll interval (ms) for background timeout eviction |
+| `metrics_interval_secs` | integer | `15` | Guest metrics scan interval; 0 disables collection |
+| `metrics_retention_secs` | integer | `3600` | Node-local in-memory guest sample retention (seconds) |
 | `default_sandbox_timeout_secs` | integer | `15` | Default keep-alive timeout for sandboxes |
 | `auto_resume_min_sandbox_timeout_secs` | integer | `300` | When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration |
 | `persisted_sandbox_store_path` | string | `"$AENV_HOME/persisted-sandboxes"` | Directory for persisted sandbox state |

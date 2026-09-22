@@ -389,6 +389,57 @@ components:
         onTimeout:
           $ref: "#/components/schemas/SandboxOnTimeout"
 
+    SandboxMetric:
+      description: Metric entry with timestamp and line
+      required:
+        - timestamp
+        - timestampUnix
+        - cpuCount
+        - cpuUsedPct
+        - memUsed
+        - memTotal
+        - memCache
+        - diskUsed
+        - diskTotal
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+          deprecated: true
+          description: Timestamp of the metric entry
+        timestampUnix:
+          type: integer
+          format: int64
+          description: Timestamp of the metric entry in Unix time (seconds since epoch)
+        cpuCount:
+          type: integer
+          format: int32
+          description: Number of CPU cores
+        cpuUsedPct:
+          type: number
+          format: float
+          description: CPU usage percentage
+        memUsed:
+          type: integer
+          format: int64
+          description: Memory used in bytes
+        memTotal:
+          type: integer
+          format: int64
+          description: Total memory in bytes
+        memCache:
+          type: integer
+          format: int64
+          description: Cached memory (page cache) in bytes
+        diskUsed:
+          type: integer
+          format: int64
+          description: Disk used in bytes
+        diskTotal:
+          type: integer
+          format: int64
+          description: Total disk space in bytes
+
     SandboxVolumeMount:
       type: object
       properties:
@@ -552,6 +603,14 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
+
+    SandboxesWithMetrics:
+      required:
+        - sandboxes
+      properties:
+        sandboxes:
+          additionalProperties:
+            $ref: "#/components/schemas/SandboxMetric"
 
     NewSandbox:
       required:
@@ -1763,6 +1822,40 @@ paths:
         "500":
           $ref: "#/components/responses/500"
 
+  /sandboxes/metrics:
+    get:
+      summary: List sandbox metrics
+      x-api-group: list
+      description: Latest fresh samples for requested running sandboxes. Missing, paused, or unavailable sandboxes are omitted.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: sandbox_ids
+          in: query
+          required: true
+          description: Comma-separated sandbox IDs.
+          explode: false
+          schema:
+            type: array
+            maxItems: 100
+            uniqueItems: true
+            items:
+              type: string
+      responses:
+        '200':
+          description: Successfully returned all running sandboxes with metrics
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SandboxesWithMetrics'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '500':
+          $ref: '#/components/responses/500'
+
   /sandboxes/{sandboxID}:
     get:
       summary: Sandbox
@@ -1811,6 +1904,47 @@ paths:
           $ref: "#/components/responses/401"
         "500":
           $ref: "#/components/responses/500"
+
+  /sandboxes/{sandboxID}/metrics:
+    get:
+      summary: Sandbox metrics
+      description: Samples in the inclusive start/end interval, in ascending time order. Defaults to all retained samples. History is node-local, bounded, and lost on restart.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/sandboxID'
+        - name: start
+          in: query
+          description: Unix timestamp in seconds, inclusive.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: end
+          in: query
+          description: Unix timestamp in seconds, inclusive.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        '200':
+          description: Successfully returned the sandbox metrics
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SandboxMetric'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '404':
+          $ref: '#/components/responses/404'
+        '500':
+          $ref: '#/components/responses/500'
 
   # TODO: Pause and resume might be exposed as POST /sandboxes/{sandboxID}/snapshot and then POST /sandboxes with specified snapshotting setup
   /sandboxes/{sandboxID}/pause:

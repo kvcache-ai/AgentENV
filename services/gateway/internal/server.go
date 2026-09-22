@@ -185,6 +185,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if hostRoute == nil && !hasProxyRoutingHeaders(r.Header) {
+		if isSandboxMetricsListRequest(r) {
+			setGatewayRouteSource(w, routeSourceGateway)
+			s.handleSandboxMetricsList(w, r, routingCtx)
+			return
+		}
 		if isClusterListRequest(r) {
 			setGatewayRouteSource(w, routeSourceGateway)
 			s.handleClusterList(w, r, routingCtx)
@@ -646,6 +651,8 @@ func isSandboxControlPlaneRequest(r *http.Request) bool {
 	}
 
 	switch parts[2] {
+	case "metrics":
+		return r.Method == http.MethodGet
 	case "pause", "resume", "fork", "connect", "timeout", "refreshes", "snapshots":
 		return r.Method == http.MethodPost
 	case "network":

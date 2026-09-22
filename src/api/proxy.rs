@@ -1973,6 +1973,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_metrics_http_contract_auth_csv_and_time_validation() {
+        let app = server::new(build_api().await);
+        let a = SandboxId::new();
+        let b = SandboxId::new();
+        let auth = [(API_KEY_HEADER, TEST_API_KEY)];
+        for (uri, expected) in [
+            (
+                format!("/sandboxes/metrics?sandbox_ids={a},{b}"),
+                StatusCode::OK,
+            ),
+            ("/sandboxes/metrics".into(), StatusCode::BAD_REQUEST),
+            (
+                "/sandboxes/metrics?sandbox_ids=".into(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "/sandboxes/metrics?sandbox_ids=not-a-uuid".into(),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("/sandboxes/metrics?sandbox_ids={a},not-a-uuid"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("/sandboxes/metrics?sandbox_ids={a},{a}"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("/sandboxes/metrics?sandbox_ids={a}&sandbox_ids={b}"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (format!("/sandboxes/{a}/metrics"), StatusCode::NOT_FOUND),
+            (
+                format!("/sandboxes/{a}/metrics?start=-1"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("/sandboxes/{a}/metrics?start=2&end=1"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                format!("/sandboxes/{a}/metrics?end=18446744073709551615"),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            assert_eq!(get_status(&app, &uri, &auth).await, expected, "{uri}");
+        }
+        assert_eq!(
+            get_status(&app, &format!("/sandboxes/{a}/metrics"), &[]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_status(&app, &format!("/sandboxes/metrics?sandbox_ids={a}"), &[]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        let response = control_plane_request(
+            &app,
+            Method::GET,
+            format!("/sandboxes/metrics?sandbox_ids={a},{b}"),
+            Body::empty(),
+        )
+        .await;
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            json!({"sandboxes": {}})
+        );
+    }
+
+    #[tokio::test]
     async fn control_plane_auth_is_separate_from_sandbox_auth() {
         let app = server::new(build_api().await);
 

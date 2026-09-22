@@ -37,8 +37,11 @@ use super::types::{
 };
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
-type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
+#[path = "sandbox_metrics.rs"]
+mod sandbox_metrics;
+use sandbox_metrics::SandboxMetrics;
 
+type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
 #[derive(Default)]
 enum DeleteProgress {
     #[default]
@@ -116,6 +119,7 @@ pub struct Orchestrator<
     proxy_routes: RwLock<ProxyRouteTable>,
     next_proxy_route_version: AtomicU64,
     counters: OrchestratorCounters,
+    sandbox_metrics: Mutex<SandboxMetrics>,
     sandbox_event_tx: broadcast::Sender<SandboxLifecycleEvent>,
     default_sandbox_timeout: Duration,
     is_shutting_down: std::sync::atomic::AtomicBool,
@@ -234,6 +238,7 @@ where
             proxy_routes: RwLock::new(ProxyRouteTable::default()),
             next_proxy_route_version: AtomicU64::new(1),
             counters: OrchestratorCounters::default(),
+            sandbox_metrics: Mutex::new(SandboxMetrics::default()),
             sandbox_event_tx,
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
@@ -243,6 +248,8 @@ where
             access_tokens,
             volume_manager,
         });
+
+        Self::start_metrics_task(&orchestrator);
 
         // Start the auto-evict task.
         let evict_interval = Duration::from_millis(config.auto_evict_interval_ms);

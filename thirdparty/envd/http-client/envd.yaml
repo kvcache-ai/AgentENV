@@ -348,12 +348,15 @@ components:
           description: CPU usage percentage
         mem_total:
           type: integer
+          format: int64
           description: Total virtual memory in bytes
         mem_used:
           type: integer
+          format: int64
           description: Used virtual memory in bytes
         mem_cache:
           type: integer
+          format: int64
           description: Cached memory (page cache) in bytes
         mem_total_mib:
           type: integer
@@ -363,9 +366,11 @@ components:
           description: Used virtual memory in MiB
         disk_used:
           type: integer
+          format: int64
           description: Used disk space in bytes
         disk_total:
           type: integer
+          format: int64
           description: Total disk space in bytes
     ComposeRequest:
       type: object
