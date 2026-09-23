@@ -28,6 +28,22 @@ func TestGatewayRouteLabelSandboxActions(t *testing.T) {
 	}
 }
 
+func TestGatewayRouteLabelSnapshots(t *testing.T) {
+	cases := map[string]string{
+		"/snapshots":                "/snapshots",
+		"/snapshots/":               "/snapshots",
+		"/snapshots/snap-1":         "/snapshots/{snapshot_id}",
+		"/snapshots/snap-1/":        "/snapshots/{snapshot_id}",
+		"/snapshots/snap-1/promote": "/snapshots/{snapshot_id}/promote",
+		"/snapshots/a/b/c":          "unmatched",
+	}
+	for path, want := range cases {
+		if got := gatewayRouteLabel(path); got != want {
+			t.Fatalf("gatewayRouteLabel(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
 func TestStatusRecorderRouteSourceLabel(t *testing.T) {
 	recorder := &statusRecorder{}
 	if got := recorder.routeSourceLabel(); got != "unknown" {
