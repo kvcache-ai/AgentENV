@@ -306,8 +306,26 @@ pub struct SnapshotsSnapshotIdDeletePathParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SnapshotsSnapshotIdDeleteQueryParams {
+    /// Optional hint declaring the snapshot's storage type, used only as an optimization. Behavior is undefined if the given type differs from the snapshot's actual type.
+    #[serde(rename = "type")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<models::SnapshotType>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SnapshotsSnapshotIdGetPathParams {
     pub snapshot_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SnapshotsSnapshotIdGetQueryParams {
+    /// Optional hint declaring the snapshot's storage type, used only as an optimization. Behavior is undefined if the given type differs from the snapshot's actual type.
+    #[serde(rename = "type")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<models::SnapshotType>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
@@ -403,6 +421,15 @@ pub struct TemplatesTemplateIdBuildsBuildIdStatusGetQueryParams {
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct TemplatesTemplateIdDeletePathParams {
     pub template_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct TemplatesTemplateIdDeleteQueryParams {
+    /// Optional hint declaring the snapshot's storage type, used only as an optimization. Behavior is undefined if the given type differs from the snapshot's actual type.
+    #[serde(rename = "type")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#type: Option<models::SnapshotType>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]

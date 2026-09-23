@@ -142,6 +142,9 @@ impl Snapshots<()> for ApiImpl {
         _cookies: &CookieJar,
         _claims: &Self::Claims,
         path_params: &models::SnapshotsSnapshotIdDeletePathParams,
+        // The type hint only guides upstream request routing; the API
+        // semantics do not depend on it.
+        _query_params: &models::SnapshotsSnapshotIdDeleteQueryParams,
     ) -> Result<SnapshotsSnapshotIdDeleteResponse, ()> {
         // Mirror the scoping of the get/list endpoints: only sandbox-sourced
         // snapshots are exposed here. Template records must be deleted through
@@ -188,6 +191,9 @@ impl Snapshots<()> for ApiImpl {
         _cookies: &CookieJar,
         _claims: &Self::Claims,
         path_params: &models::SnapshotsSnapshotIdGetPathParams,
+        // The type hint only guides upstream request routing; the API
+        // semantics do not depend on it.
+        _query_params: &models::SnapshotsSnapshotIdGetQueryParams,
     ) -> Result<SnapshotsSnapshotIdGetResponse, ()> {
         match self.snapshot_manager.get(&path_params.snapshot_id).await {
             // Scope this endpoint to sandbox-sourced snapshots so it stays

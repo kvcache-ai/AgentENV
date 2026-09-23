@@ -74,6 +74,16 @@ components:
       schema:
         type: string
         description: Identifier of the snapshot (template ID)
+    snapshotTypeHint:
+      name: type
+      in: query
+      required: false
+      schema:
+        $ref: "#/components/schemas/SnapshotType"
+      description: >-
+        Optional hint declaring the snapshot's storage type, used only as an
+        optimization. Behavior is undefined if the given type differs from
+        the snapshot's actual type.
     tag:
       name: tag
       in: path
@@ -2663,6 +2673,7 @@ paths:
           AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/snapshotID"
+        - $ref: "#/components/parameters/snapshotTypeHint"
       responses:
         "200":
           description: Successfully returned the snapshot
@@ -2692,6 +2703,7 @@ paths:
           AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/snapshotID"
+        - $ref: "#/components/parameters/snapshotTypeHint"
       responses:
         "204":
           description: The snapshot was deleted successfully
@@ -2883,6 +2895,7 @@ paths:
           AdminTeamAuth: []
       parameters:
         - $ref: "#/components/parameters/templateID"
+        - $ref: "#/components/parameters/snapshotTypeHint"
       responses:
         "204":
           description: The template was deleted successfully
