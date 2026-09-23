@@ -812,6 +812,7 @@ async fn active_build_rejects_template_deletion_by_id_and_alias() -> Result<()> 
                 &models::TemplatesTemplateIdDeletePathParams {
                     template_id: reference,
                 },
+                &models::TemplatesTemplateIdDeleteQueryParams { r#type: None },
             )
             .await
             .unwrap();
@@ -831,6 +832,7 @@ async fn active_build_rejects_template_deletion_by_id_and_alias() -> Result<()> 
             &models::TemplatesTemplateIdDeletePathParams {
                 template_id: id.clone(),
             },
+            &models::TemplatesTemplateIdDeleteQueryParams { r#type: None },
         )
         .await
         .unwrap();
@@ -869,6 +871,7 @@ async fn template_deletion_by_id_finishes_an_interrupted_delete() -> Result<()> 
             &models::TemplatesTemplateIdDeletePathParams {
                 template_id: record.id.to_string(),
             },
+            &models::TemplatesTemplateIdDeleteQueryParams { r#type: None },
         )
         .await
         .unwrap();

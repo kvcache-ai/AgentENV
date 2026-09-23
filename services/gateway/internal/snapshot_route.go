@@ -24,7 +24,8 @@ const (
 	snapshotOperationNone snapshotOperation = iota
 	snapshotOperationPromote
 	snapshotOperationDelete
-	snapshotOperationMetadata
+	snapshotOperationGet
+	snapshotOperationList
 )
 
 type snapshotPlacement struct {
@@ -44,8 +45,12 @@ func snapshotRequestOperation(r *http.Request) (snapshotOperation, string) {
 		parts[index] = segment
 	}
 	switch {
-	case r.Method == http.MethodGet && parts[0] == "snapshots" && len(parts) <= 2:
-		return snapshotOperationMetadata, ""
+	case r.Method == http.MethodGet && parts[0] == "snapshots" && len(parts) == 1:
+		return snapshotOperationList, ""
+	case r.Method == http.MethodGet && parts[0] == "snapshots" && len(parts) == 2:
+		if strings.TrimSpace(parts[1]) != "" {
+			return snapshotOperationGet, parts[1]
+		}
 	case r.Method == http.MethodDelete && len(parts) == 2 && (parts[0] == "templates" || parts[0] == "snapshots"):
 		if strings.TrimSpace(parts[1]) != "" {
 			return snapshotOperationDelete, parts[1]
@@ -56,6 +61,17 @@ func snapshotRequestOperation(r *http.Request) (snapshotOperation, string) {
 		}
 	}
 	return snapshotOperationNone, ""
+}
+
+// snapshotTypeHintSkipsPlacement reports whether a client-supplied
+// type=distributed query hint lets the request skip the placement lookup.
+// The single-record snapshot/template APIs (GET /snapshots/{ref}, DELETE
+// /snapshots/{ref}, DELETE /templates/{ref}) accept the hint.
+func snapshotTypeHintSkipsPlacement(r *http.Request, operation snapshotOperation) bool {
+	if r.URL.Query().Get("type") != "distributed" {
+		return false
+	}
+	return operation == snapshotOperationGet || operation == snapshotOperationDelete
 }
 
 func (s *Server) routeSnapshotRequest(
@@ -75,7 +91,13 @@ func (s *Server) routeSnapshotRequest(
 		return nil, false, schedulerResponseError(err)
 	}
 	metadataNode := resp.GetNode()
-	if operation == snapshotOperationMetadata {
+	if operation == snapshotOperationList {
+		return metadataNode, false, nil
+	}
+	// A type=distributed query hint asserts the snapshot lives in the shared
+	// repository, so any active node can serve it and the placement lookup is
+	// skipped.
+	if snapshotTypeHintSkipsPlacement(incoming, operation) {
 		return metadataNode, false, nil
 	}
 	placement, placementErr := s.lookupSnapshotPlacement(ctx, incoming, metadataNode, snapshotRef)
