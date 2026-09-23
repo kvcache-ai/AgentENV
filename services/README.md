@@ -121,6 +121,8 @@ General config notes:
 
 The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). Current built-in strategies ignore the snapshot, but custom strategy implementations can use it for load-aware decisions.
 
+Requests with no sandbox affinity bypass this pipeline: when `ScheduleRequest.sandbox_agnostic` is true (the gateway sets it when selecting a node for `/snapshots/...` operations served from the shared snapshot repository), the scheduler returns a uniformly random active (non-lingering) node directly, skipping resource filters and the placement strategy.
+
 ### Node resource limit
 
 `scheduler.node_resource_limit` defines per-node resource thresholds that are evaluated **before** the strategy runs. Any node whose heartbeat snapshot exceeds a configured limit is removed from the candidate list, regardless of which strategy is in use. This is a generic guard-rail that sits above the strategy layer — strategies only see nodes that already passed the resource filter.

@@ -402,10 +402,15 @@ func (x *NewSandboxHint) GetMetadata() map[string]string {
 }
 
 type ScheduleRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Hint          *ScheduleRequestHint   `protobuf:"bytes,2,opt,name=hint,proto3" json:"hint,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Hint  *ScheduleRequestHint   `protobuf:"bytes,2,opt,name=hint,proto3" json:"hint,omitempty"`
+	// sandbox_agnostic marks requests that have no sandbox affinity (e.g.
+	// selecting a node to serve /snapshots/... operations against the shared
+	// snapshot repository). When true, the scheduler picks a random active node
+	// directly, skipping all placement filters and rate-limit quota consumption.
+	SandboxAgnostic bool `protobuf:"varint,3,opt,name=sandbox_agnostic,json=sandboxAgnostic,proto3" json:"sandbox_agnostic,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *ScheduleRequest) Reset() {
@@ -443,6 +448,13 @@ func (x *ScheduleRequest) GetHint() *ScheduleRequestHint {
 		return x.Hint
 	}
 	return nil
+}
+
+func (x *ScheduleRequest) GetSandboxAgnostic() bool {
+	if x != nil {
+		return x.SandboxAgnostic
+	}
+	return false
 }
 
 type ScheduleResponse struct {
@@ -490,9 +502,7 @@ func (x *ScheduleResponse) GetNode() *Node {
 }
 
 type ListNodesRequest struct {
-	state protoimpl.MessageState `protogen:"open.v1"`
-	// Read-only discovery for control-plane requests; does not consume quota.
-	ActiveOnly    bool `protobuf:"varint,1,opt,name=active_only,json=activeOnly,proto3" json:"active_only,omitempty"`
+	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -525,13 +535,6 @@ func (x *ListNodesRequest) ProtoReflect() protoreflect.Message {
 // Deprecated: Use ListNodesRequest.ProtoReflect.Descriptor instead.
 func (*ListNodesRequest) Descriptor() ([]byte, []int) {
 	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{6}
-}
-
-func (x *ListNodesRequest) GetActiveOnly() bool {
-	if x != nil {
-		return x.ActiveOnly
-	}
-	return false
 }
 
 type ListNodesResponse struct {
@@ -2341,14 +2344,13 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\bmetadata\x18\x01 \x03(\v2*.scheduler.v1.NewSandboxHint.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"f\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"y\n" +
 	"\x0fScheduleRequest\x125\n" +
-	"\x04hint\x18\x02 \x01(\v2!.scheduler.v1.ScheduleRequestHintR\x04hintJ\x04\b\x01\x10\x02J\x04\b\x03\x10\x04R\x10required_node_id\":\n" +
+	"\x04hint\x18\x02 \x01(\v2!.scheduler.v1.ScheduleRequestHintR\x04hint\x12)\n" +
+	"\x10sandbox_agnostic\x18\x03 \x01(\bR\x0fsandboxAgnosticJ\x04\b\x01\x10\x02\":\n" +
 	"\x10ScheduleResponse\x12&\n" +
-	"\x04node\x18\x01 \x01(\v2\x12.scheduler.v1.NodeR\x04node\"3\n" +
-	"\x10ListNodesRequest\x12\x1f\n" +
-	"\vactive_only\x18\x01 \x01(\bR\n" +
-	"activeOnly\"=\n" +
+	"\x04node\x18\x01 \x01(\v2\x12.scheduler.v1.NodeR\x04node\"%\n" +
+	"\x10ListNodesRequestJ\x04\b\x01\x10\x02R\vactive_only\"=\n" +
 	"\x11ListNodesResponse\x12(\n" +
 	"\x05nodes\x18\x01 \x03(\v2\x12.scheduler.v1.NodeR\x05nodes\"2\n" +
 	"\x11LookupNodeRequest\x12\x1d\n" +
