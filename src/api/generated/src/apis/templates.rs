@@ -289,6 +289,7 @@ pub trait Templates<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         cookies: &CookieJar,
         claims: &Self::Claims,
         path_params: &models::TemplatesTemplateIdDeletePathParams,
+        query_params: &models::TemplatesTemplateIdDeleteQueryParams,
     ) -> Result<TemplatesTemplateIdDeleteResponse, E>;
 
     /// List template builds.

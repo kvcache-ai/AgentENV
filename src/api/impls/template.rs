@@ -775,6 +775,9 @@ impl Templates<()> for ApiImpl {
         _cookies: &CookieJar,
         _claims: &Self::Claims,
         path_params: &models::TemplatesTemplateIdDeletePathParams,
+        // The type hint only guides upstream request routing; the API
+        // semantics do not depend on it.
+        _query_params: &models::TemplatesTemplateIdDeleteQueryParams,
     ) -> Result<TemplatesTemplateIdDeleteResponse, ()> {
         let record =
             match self.snapshot_manager.get(&path_params.template_id).await {
