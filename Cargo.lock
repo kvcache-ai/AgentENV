@@ -53,6 +53,7 @@ dependencies = [
  "prost",
  "reqwest 0.13.3",
  "rpassword",
+ "rustls 0.23.37",
  "serde",
  "serde_json",
  "shell-util",

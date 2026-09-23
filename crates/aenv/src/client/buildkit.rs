@@ -241,4 +241,22 @@ mod tests {
         result??;
         Ok(())
     }
+
+    /// With the provider main installs, a `wss://` tunnel over an HTTPS API
+    /// URL fails like any bad connection; without it, setting up TLS panics.
+    #[tokio::test]
+    async fn wss_connection_fails_instead_of_panicking() -> Result<()> {
+        crate::install_crypto_provider();
+        // Accept and hang up, so the client gets as far as setting up TLS.
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let result = connect_async(format!("wss://{address}/")).await;
+        assert!(result.is_err(), "a hung-up TLS handshake must fail");
+        Ok(())
+    }
 }
