@@ -146,6 +146,17 @@ func TestScheduleZeroFreshObservationsReturnsUnavailable(t *testing.T) {
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("want Unavailable with zero fresh observations, got %v", err)
 	}
+
+	request := &schedulerv1.ScheduleRequest{SandboxAgnostic: true}
+	if _, err := svc.Schedule(context.Background(), request); status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("sandbox-agnostic schedule accepted a node awaiting its first report: %v", err)
+	}
+	if _, err := svc.Heartbeat(context.Background(), heartbeatFor("node-a", "inst-a")); err != nil {
+		t.Fatalf("heartbeat failed: %v", err)
+	}
+	if resp, err := svc.Schedule(context.Background(), request); err != nil || resp.GetNode().GetNodeId() != "node-a" {
+		t.Fatalf("sandbox-agnostic schedule did not select the reporting node: %v, %v", resp, err)
+	}
 }
 
 // Case D4: a node whose rebuild pull fails stays unobserved (and is kept out

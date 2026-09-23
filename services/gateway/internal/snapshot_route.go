@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"strings"
@@ -65,17 +64,17 @@ func (s *Server) routeSnapshotRequest(
 	operation snapshotOperation,
 	snapshotRef string,
 ) (*schedulerv1.Node, bool, *proxyResponseError) {
-	// Metadata discovery must not spend a sandbox launch's admission quota.
+	// Snapshot node selection carries no sandbox placement signal: ask the
+	// scheduler for a random active node directly (skipping placement
+	// filters) so metadata discovery does not spend a sandbox launch's
+	// admission quota.
 	rpcStart := time.Now()
-	nodes, err := s.scheduler.ListNodes(ctx, &schedulerv1.ListNodesRequest{ActiveOnly: true})
-	recordGatewaySchedulerRPC("ListNodes", rpcStart, err)
+	resp, err := s.scheduler.Schedule(ctx, &schedulerv1.ScheduleRequest{SandboxAgnostic: true})
+	recordGatewaySchedulerRPC("Schedule", rpcStart, err)
 	if err != nil {
 		return nil, false, schedulerResponseError(err)
 	}
-	if len(nodes.GetNodes()) == 0 {
-		return nil, false, unavailableSnapshotPlacement(errors.New("no active node can resolve snapshot metadata"))
-	}
-	metadataNode := nodes.GetNodes()[rand.IntN(len(nodes.GetNodes()))]
+	metadataNode := resp.GetNode()
 	if operation == snapshotOperationMetadata {
 		return metadataNode, false, nil
 	}
