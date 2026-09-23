@@ -17,6 +17,12 @@ use crate::client::{
 use crate::progress::BuildProgress;
 
 #[derive(Clone, ClapArgs)]
+#[command(after_help = "\
+Examples:
+  aenv build --name my-ubuntu .
+  aenv build --name my-python ./my-python
+  aenv build --name my-app -f ./my-app/Dockerfile.custom ./my-app
+")]
 pub struct Args {
     /// Local build context directory
     context: PathBuf,
