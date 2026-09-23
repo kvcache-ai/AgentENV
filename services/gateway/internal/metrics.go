@@ -208,7 +208,7 @@ func gatewayRouteLabel(path string) string {
 	}
 
 	switch trimmed {
-	case "/sandboxes", "/sandboxes-cold", "/v2/sandboxes", "/nodes":
+	case "/sandboxes", "/sandboxes-cold", "/v2/sandboxes", "/nodes", "/snapshots":
 		return trimmed
 	}
 
@@ -230,6 +230,13 @@ func gatewayRouteLabel(path string) string {
 	case "nodes":
 		if len(parts) == 2 {
 			return "/nodes/{node_id}"
+		}
+	case "snapshots":
+		if len(parts) == 2 {
+			return "/snapshots/{snapshot_id}"
+		}
+		if len(parts) == 3 && parts[2] == "promote" {
+			return "/snapshots/{snapshot_id}/promote"
 		}
 	case "proxy":
 		return "/proxy/*"
