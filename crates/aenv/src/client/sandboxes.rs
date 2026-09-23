@@ -55,6 +55,8 @@ pub struct Sandbox {
     pub sandbox_id: String,
     #[serde(default, rename = "envdAccessToken")]
     pub envd_access_token: Option<String>,
+    #[serde(default, rename = "trafficAccessToken")]
+    pub traffic_access_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -54,6 +54,28 @@ pub struct Args {
     timeout: u32,
 }
 
+/// Build the executor bundled with the Codex command using the normal builder.
+#[cfg(target_os = "linux")]
+pub(super) fn codex_template(context: PathBuf, name: String) -> Result<()> {
+    run(Args {
+        context,
+        dockerfile: None,
+        name,
+        resources: super::CpuMemoryArgs {
+            cpu_count: Some(2),
+            memory_mb: Some(1024),
+        },
+        start_cmd: Some(String::new()),
+        ready_cmd: Some("true".into()),
+        build_args: vec![],
+        secret: vec![],
+        no_cache: false,
+        buildctl: None,
+        progress: "auto".into(),
+        timeout: 3600,
+    })
+}
+
 pub fn run(mut args: Args) -> Result<()> {
     ensure!(
         cfg!(unix),

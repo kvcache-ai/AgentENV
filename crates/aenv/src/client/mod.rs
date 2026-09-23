@@ -20,6 +20,10 @@ pub struct Client {
 }
 
 impl Client {
+    pub fn base_url(&self) -> &str {
+        &self.base
+    }
+
     pub fn from_env() -> Result<Self> {
         let creds = Credentials::load()?;
         Self::new(&creds.url, &creds.api_key)

@@ -21,6 +21,8 @@ struct Cli {
 enum Cmd {
     /// Save server URL and API key
     Auth,
+    /// Work on a project with native Codex in an AgentENV sandbox
+    Codex(commands::codex::Args),
     /// Build a template from a base image.
     /// Waits for the build to complete by default; exits non-zero on failure. Use -d to return immediately.
     Pull(commands::pull::Args),
@@ -67,6 +69,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Auth => commands::auth::run(),
+        Cmd::Codex(a) => commands::codex::run(a),
         Cmd::Pull(a) => commands::pull::run(a),
         Cmd::Build(a) => commands::build::run(*a),
         Cmd::Start(a) => commands::start::run(a),

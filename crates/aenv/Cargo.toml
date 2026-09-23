@@ -20,7 +20,9 @@ crossterm = "0.28"
 directories = "5"
 envd = { path = "../../thirdparty/envd" }
 futures = "0.3"
+flate2 = "1"
 indicatif = "0.17"
+libc = "0.2"
 openssl-sys = { version = "0.9", optional = true }
 prost = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["multipart", "rustls", "stream"] }
@@ -28,6 +30,7 @@ rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tabled = "0.16"
+tar = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
@@ -36,4 +39,4 @@ toml = "0.9"
 ureq = { version = "2", features = ["json", "tls"] }
 walkdir = "2"
 shell-util = { path = "../../crates/shell-util" }
-uuid = "1"
+uuid = { version = "1", features = ["v4"] }

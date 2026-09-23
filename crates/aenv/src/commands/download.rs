@@ -381,7 +381,7 @@ fn destination_parent(destination: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-async fn save_stream<S, E>(
+pub(super) async fn save_stream<S, E>(
     stream: S,
     destination: &Path,
     force: bool,
