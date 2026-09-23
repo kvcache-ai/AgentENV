@@ -56,7 +56,7 @@ func TestLocalSnapshotMutationsRouteToOwner(t *testing.T) {
 			ownerPath := make(chan string, 1)
 			ownerNode := ownerPathServer(t, ownerPath, http.StatusNoContent)
 			server := newTestServer(t, stubSchedulerClient{
-				listNodesFunc: snapshotMetadataNodes(t, "node-a", metadataNode.URL),
+				scheduleFunc: snapshotMetadataNodeSchedule(t, "node-a", metadataNode.URL),
 				getNodeFunc: func(context.Context, *schedulerv1.GetNodeRequest, ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
 					return observedNodeResponse("node-b", ownerNode.URL, schedulerv1.NodeStatus_NODE_STATUS_READY), nil
 				},
@@ -76,7 +76,7 @@ func TestLocalSnapshotMutationsRouteToOwner(t *testing.T) {
 	}
 }
 
-func TestDistributedSnapshotPromotionUsesMetadataNodeWithoutScheduling(t *testing.T) {
+func TestDistributedSnapshotPromotionUsesSandboxAgnosticMetadataNode(t *testing.T) {
 	originalRequest := make(chan string, 1)
 	metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == snapshotPlacementPath {
@@ -89,7 +89,7 @@ func TestDistributedSnapshotPromotionUsesMetadataNodeWithoutScheduling(t *testin
 	defer metadataNode.Close()
 
 	server := newTestServer(t, stubSchedulerClient{
-		listNodesFunc: snapshotMetadataNodes(t, "node-a", metadataNode.URL),
+		scheduleFunc: snapshotMetadataNodeSchedule(t, "node-a", metadataNode.URL),
 	}, time.Second, 1024)
 
 	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/snapshots/snap-1/promote", nil)
@@ -117,7 +117,7 @@ func TestSnapshotPromotionPlacementFailureDoesNotProxy(t *testing.T) {
 	defer metadataNode.Close()
 
 	server := newTestServer(t, stubSchedulerClient{
-		listNodesFunc: snapshotMetadataNodes(t, "node-a", metadataNode.URL),
+		scheduleFunc: snapshotMetadataNodeSchedule(t, "node-a", metadataNode.URL),
 	}, time.Second, 1024)
 
 	req := httptest.NewRequest(http.MethodPost, "http://gateway.test/snapshots/snap-1/promote", nil)
@@ -151,7 +151,7 @@ func TestSnapshotOwnerDialFailureReturnsServiceUnavailable(t *testing.T) {
 	metadataNode := snapshotPlacementServer(t, `{"snapshotType":"local","ownerNodeID":"node-b"}`)
 
 	server := newTestServer(t, stubSchedulerClient{
-		listNodesFunc: snapshotMetadataNodes(t, "node-a", metadataNode.URL),
+		scheduleFunc: snapshotMetadataNodeSchedule(t, "node-a", metadataNode.URL),
 		getNodeFunc: func(context.Context, *schedulerv1.GetNodeRequest, ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
 			return observedNodeResponse("node-b", "http://127.0.0.1:1", schedulerv1.NodeStatus_NODE_STATUS_READY), nil
 		},
@@ -199,12 +199,12 @@ func ownerPathServer(t *testing.T, path chan<- string, status int) *httptest.Ser
 	return server
 }
 
-func snapshotMetadataNodes(t *testing.T, id, endpoint string) func(context.Context, *schedulerv1.ListNodesRequest, ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
+func snapshotMetadataNodeSchedule(t *testing.T, id, endpoint string) func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
 	t.Helper()
-	return func(_ context.Context, req *schedulerv1.ListNodesRequest, _ ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
-		if !req.GetActiveOnly() {
-			t.Error("snapshot discovery must exclude lingering nodes")
+	return func(_ context.Context, req *schedulerv1.ScheduleRequest, _ ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+		if !req.GetSandboxAgnostic() {
+			t.Error("snapshot metadata node selection must use the sandbox-agnostic schedule fast path")
 		}
-		return &schedulerv1.ListNodesResponse{Nodes: []*schedulerv1.Node{{NodeId: id, Endpoint: endpoint}}}, nil
+		return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: id, Endpoint: endpoint}}, nil
 	}
 }

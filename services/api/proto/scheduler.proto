@@ -56,8 +56,11 @@ message NewSandboxHint {
 message ScheduleRequest {
   reserved 1;  // formerly: string hint = 1
   ScheduleRequestHint hint = 2;
-  reserved 3;  // formerly: string required_node_id = 3
-  reserved "required_node_id";
+  // sandbox_agnostic marks requests that have no sandbox affinity (e.g.
+  // selecting a node to serve /snapshots/... operations against the shared
+  // snapshot repository). When true, the scheduler picks a random active node
+  // directly, skipping all placement filters and rate-limit quota consumption.
+  bool sandbox_agnostic = 3;
 }
 
 message ScheduleResponse {
@@ -65,8 +68,7 @@ message ScheduleResponse {
 }
 
 message ListNodesRequest {
-  // Read-only discovery for control-plane requests; does not consume quota.
-  bool active_only = 1;
+  reserved 1; reserved "active_only";
 }
 
 message ListNodesResponse {

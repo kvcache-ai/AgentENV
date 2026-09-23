@@ -7,6 +7,7 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/config"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -107,10 +108,6 @@ func TestListNodesReturnsActiveAndLingeringNodes(t *testing.T) {
 	}
 	if !ids["node-a"] || !ids["node-b"] {
 		t.Fatalf("expected node-a and node-b, got %v", ids)
-	}
-	active, err := service.ListNodes(context.Background(), &schedulerv1.ListNodesRequest{ActiveOnly: true})
-	if err != nil || len(active.GetNodes()) != 1 || active.GetNodes()[0].GetNodeId() != "node-a" {
-		t.Fatalf("active discovery = %v, error=%v", active, err)
 	}
 }
 
@@ -263,6 +260,50 @@ func TestScheduleOnlyConsidersReadyNodes(t *testing.T) {
 		if got := resp.GetNode().GetNodeId(); got != "node-a" {
 			t.Fatalf("iteration %d: expected node-a, got %s", i, got)
 		}
+	}
+}
+
+func TestScheduleSandboxAgnosticSkipsFilters(t *testing.T) {
+	registry := NewAtomicNodeRegistry(nil, defaultObservedReportTTL)
+	// node-a: active, node-b: lingering
+	registry.Set(
+		[]Node{{ID: "node-a", Endpoint: "http://node-a"}},
+		[]Node{{ID: "node-b", Endpoint: "http://node-b"}},
+	)
+	service := NewService(
+		zap.NewNop(),
+		registry,
+		NewStrategy("round_robin"),
+		NewInMemoryBindingStore(defaultObservedReportTTL),
+		WithNodeResourceLimit(&config.NodeResourceLimit{MaxSandboxCount: uint32Ptr(0)}),
+	)
+
+	registerObservedNodeForTest(t, service, "node-a", "svc-a")
+	if _, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{}); status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected unavailable for sandbox placement, got %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		resp, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{SandboxAgnostic: true})
+		if err != nil {
+			t.Fatalf("sandbox-agnostic schedule %d failed: %v", i, err)
+		}
+		if got := resp.GetNode().GetNodeId(); got != "node-a" {
+			t.Fatalf("iteration %d: expected only active node-a, got %s", i, got)
+		}
+	}
+}
+
+func TestScheduleSandboxAgnosticEmptyRegistry(t *testing.T) {
+	service := NewService(
+		zap.NewNop(),
+		NewAtomicNodeRegistry(nil, defaultObservedReportTTL),
+		NewStrategy("round_robin"),
+		NewInMemoryBindingStore(defaultObservedReportTTL),
+	)
+
+	_, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{SandboxAgnostic: true})
+	if status.Code(err) != codes.ResourceExhausted {
+		t.Fatalf("expected resource exhausted, got %v", err)
 	}
 }
 

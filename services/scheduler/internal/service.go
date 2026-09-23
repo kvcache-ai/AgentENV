@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -84,6 +85,13 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		recordSchedulerSchedule(s.strategy.Name(), start, err)
 	}()
 
+	// Sandbox-agnostic requests (e.g. /snapshots/... operations against the
+	// shared snapshot repository) carry no placement signal: pick a random
+	// active node directly, skipping placement filters.
+	if req.GetSandboxAgnostic() {
+		return s.scheduleSandboxAgnostic()
+	}
+
 	discovered := s.nodes.Snapshot( /* allowLingering */ false)
 	rich := make([]RichNode, 0, len(discovered))
 	for _, n := range discovered {
@@ -122,6 +130,23 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	return &schedulerv1.ScheduleResponse{Node: node.Node.ToProto()}, nil
 }
 
+// scheduleSandboxAgnostic handles Schedule requests flagged as
+// sandbox-agnostic: it returns a random active (non-lingering) node without
+// applying placement filters.
+func (s *Service) scheduleSandboxAgnostic() (*schedulerv1.ScheduleResponse, error) {
+	nodes := s.nodes.Snapshot( /* allowLingering */ false)
+	if len(nodes) == 0 {
+		return nil, status.Error(codes.ResourceExhausted, "no nodes available")
+	}
+	node := nodes[rand.Intn(len(nodes))]
+	s.logger.Debug("scheduler selected random active node for sandbox-agnostic request",
+		zap.String("node_id", node.ID),
+		zap.String("endpoint", node.Endpoint),
+		zap.Int("active_nodes", len(nodes)),
+	)
+	return &schedulerv1.ScheduleResponse{Node: node.ToProto()}, nil
+}
+
 // summarizeScheduleHint renders a compact, log-friendly description of a
 // scheduling hint.
 func summarizeScheduleHint(hint *schedulerv1.ScheduleRequestHint) string {
@@ -136,8 +161,8 @@ func summarizeScheduleHint(hint *schedulerv1.ScheduleRequestHint) string {
 	}
 }
 
-func (s *Service) ListNodes(_ context.Context, req *schedulerv1.ListNodesRequest) (*schedulerv1.ListNodesResponse, error) {
-	snapshot := s.nodes.Snapshot(!req.GetActiveOnly())
+func (s *Service) ListNodes(_ context.Context, _ *schedulerv1.ListNodesRequest) (*schedulerv1.ListNodesResponse, error) {
+	snapshot := s.nodes.Snapshot( /* allowLingering */ true)
 	nodes := make([]*schedulerv1.Node, 0, len(snapshot))
 	for _, node := range snapshot {
 		nodes = append(nodes, node.ToProto())
