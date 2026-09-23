@@ -76,6 +76,88 @@ func TestLocalSnapshotMutationsRouteToOwner(t *testing.T) {
 	}
 }
 
+func TestDistributedSnapshotTypeHintSkipsPlacementLookup(t *testing.T) {
+	for _, test := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/snapshots/snap-1?type=distributed"},
+		{http.MethodDelete, "/snapshots/snap-1?type=distributed"},
+		{http.MethodDelete, "/templates/tmpl-1?type=distributed"},
+	} {
+		t.Run(test.method+" "+test.path, func(t *testing.T) {
+			metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == snapshotPlacementPath {
+					t.Error("type=distributed must skip the placement lookup")
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				if got := r.URL.RequestURI(); got != test.path {
+					t.Errorf("proxied request = %q, want the type hint forwarded upstream", got)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			t.Cleanup(metadataNode.Close)
+			server := newTestServer(t, stubSchedulerClient{
+				scheduleFunc: snapshotMetadataNodeSchedule(t, "node-a", metadataNode.URL),
+			}, time.Second, 1024)
+
+			req := httptest.NewRequest(test.method, "http://gateway.test"+test.path, nil)
+			resp := httptest.NewRecorder()
+			authenticatedTestHandler(server).ServeHTTP(resp, req)
+			if resp.Code != http.StatusNoContent {
+				t.Fatalf("status = %d, want 204; body=%q", resp.Code, resp.Body.String())
+			}
+		})
+	}
+}
+
+func TestSnapshotSingleRecordResolvesPlacementWithoutDistributedHint(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		method      string
+		path        string
+		snapshotRef string
+	}{
+		{"get without hint", http.MethodGet, "/snapshots/snap-1", "snap-1"},
+		{"get local hint", http.MethodGet, "/snapshots/snap-1?type=local", "snap-1"},
+		{"delete local hint", http.MethodDelete, "/snapshots/snap-1?type=local", "snap-1"},
+		{"template delete without hint", http.MethodDelete, "/templates/tmpl-1", "tmpl-1"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != snapshotPlacementPath || r.URL.Query().Get("snapshotID") != test.snapshotRef {
+					t.Errorf("placement request = %s, want reference %q", r.URL, test.snapshotRef)
+				}
+				_, _ = w.Write([]byte(`{"snapshotType":"local","ownerNodeID":"node-b"}`))
+			}))
+			t.Cleanup(metadataNode.Close)
+			ownerPath := make(chan string, 1)
+			ownerNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				ownerPath <- r.URL.RequestURI()
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			t.Cleanup(ownerNode.Close)
+			server := newTestServer(t, stubSchedulerClient{
+				scheduleFunc: snapshotMetadataNodeSchedule(t, "node-a", metadataNode.URL),
+				getNodeFunc: func(context.Context, *schedulerv1.GetNodeRequest, ...grpc.CallOption) (*schedulerv1.GetNodeResponse, error) {
+					return observedNodeResponse("node-b", ownerNode.URL, schedulerv1.NodeStatus_NODE_STATUS_READY), nil
+				},
+			}, time.Second, 1024)
+
+			req := httptest.NewRequest(test.method, "http://gateway.test"+test.path, nil)
+			resp := httptest.NewRecorder()
+			authenticatedTestHandler(server).ServeHTTP(resp, req)
+			if resp.Code != http.StatusNoContent {
+				t.Fatalf("status = %d, want 204; body=%q", resp.Code, resp.Body.String())
+			}
+			if got := <-ownerPath; got != test.path {
+				t.Fatalf("owner request = %q, want %q", got, test.path)
+			}
+		})
+	}
+}
+
 func TestDistributedSnapshotPromotionUsesSandboxAgnosticMetadataNode(t *testing.T) {
 	originalRequest := make(chan string, 1)
 	metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

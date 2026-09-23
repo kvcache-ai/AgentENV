@@ -109,6 +109,7 @@ pub trait Snapshots<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         cookies: &CookieJar,
         claims: &Self::Claims,
         path_params: &models::SnapshotsSnapshotIdDeletePathParams,
+        query_params: &models::SnapshotsSnapshotIdDeleteQueryParams,
     ) -> Result<SnapshotsSnapshotIdDeleteResponse, E>;
 
     /// SnapshotsSnapshotIdGet - GET /snapshots/{snapshotID}
@@ -120,6 +121,7 @@ pub trait Snapshots<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         cookies: &CookieJar,
         claims: &Self::Claims,
         path_params: &models::SnapshotsSnapshotIdGetPathParams,
+        query_params: &models::SnapshotsSnapshotIdGetQueryParams,
     ) -> Result<SnapshotsSnapshotIdGetResponse, E>;
 
     /// Promote a Local snapshot.
