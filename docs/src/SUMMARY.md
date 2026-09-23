@@ -25,6 +25,7 @@
 # Use Cases
 
 - [Run Python Code](./use-cases/python.md)
+- [Run Codex in AgentENV](./use-cases/codex.md)
 - [Train Terminal-Bench-2 with Miles](./use-cases/miles.md)
 
 # Core Concepts

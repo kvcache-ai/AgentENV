@@ -2,7 +2,8 @@
 
 `aenv` is the native CLI for AgentENV. It wraps the HTTP API and envd gRPC
 endpoints into a developer-friendly interface for managing templates,
-sandboxes, persistent volumes, and snapshots.
+sandboxes, persistent volumes, and snapshots. It also runs native Codex sessions
+on sandbox copies of your projects with [`aenv codex`](../../use-cases/codex.md).
 
 ## Installation
 
