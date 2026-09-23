@@ -4729,10 +4729,18 @@ where
 #[tracing::instrument(skip_all)]
 fn snapshots_snapshot_id_delete_validation(
     path_params: models::SnapshotsSnapshotIdDeletePathParams,
-) -> std::result::Result<(models::SnapshotsSnapshotIdDeletePathParams,), ValidationErrors> {
+    query_params: models::SnapshotsSnapshotIdDeleteQueryParams,
+) -> std::result::Result<
+    (
+        models::SnapshotsSnapshotIdDeletePathParams,
+        models::SnapshotsSnapshotIdDeleteQueryParams,
+    ),
+    ValidationErrors,
+> {
     path_params.validate()?;
+    query_params.validate()?;
 
-    Ok((path_params,))
+    Ok((path_params, query_params))
 }
 /// SnapshotsSnapshotIdDelete - DELETE /snapshots/{snapshotID}
 #[tracing::instrument(skip_all)]
@@ -4742,6 +4750,7 @@ async fn snapshots_snapshot_id_delete<I, A, E, C>(
     cookies: CookieJar,
     headers: HeaderMap,
     Path(path_params): Path<models::SnapshotsSnapshotIdDeletePathParams>,
+    QueryExtra(query_params): QueryExtra<models::SnapshotsSnapshotIdDeleteQueryParams>,
     State(api_impl): State<I>,
 ) -> Result<Response, StatusCode>
 where
@@ -4768,12 +4777,13 @@ where
     };
 
     #[allow(clippy::redundant_closure)]
-    let validation =
-        tokio::task::spawn_blocking(move || snapshots_snapshot_id_delete_validation(path_params))
-            .await
-            .unwrap();
+    let validation = tokio::task::spawn_blocking(move || {
+        snapshots_snapshot_id_delete_validation(path_params, query_params)
+    })
+    .await
+    .unwrap();
 
-    let Ok((path_params,)) = validation else {
+    let Ok((path_params, query_params)) = validation else {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Body::from(validation.unwrap_err().to_string()))
@@ -4782,7 +4792,14 @@ where
 
     let result = api_impl
         .as_ref()
-        .snapshots_snapshot_id_delete(&method, &host, &cookies, &claims, &path_params)
+        .snapshots_snapshot_id_delete(
+            &method,
+            &host,
+            &cookies,
+            &claims,
+            &path_params,
+            &query_params,
+        )
         .await;
 
     let mut response = Response::builder();
@@ -4883,10 +4900,18 @@ where
 #[tracing::instrument(skip_all)]
 fn snapshots_snapshot_id_get_validation(
     path_params: models::SnapshotsSnapshotIdGetPathParams,
-) -> std::result::Result<(models::SnapshotsSnapshotIdGetPathParams,), ValidationErrors> {
+    query_params: models::SnapshotsSnapshotIdGetQueryParams,
+) -> std::result::Result<
+    (
+        models::SnapshotsSnapshotIdGetPathParams,
+        models::SnapshotsSnapshotIdGetQueryParams,
+    ),
+    ValidationErrors,
+> {
     path_params.validate()?;
+    query_params.validate()?;
 
-    Ok((path_params,))
+    Ok((path_params, query_params))
 }
 /// SnapshotsSnapshotIdGet - GET /snapshots/{snapshotID}
 #[tracing::instrument(skip_all)]
@@ -4896,6 +4921,7 @@ async fn snapshots_snapshot_id_get<I, A, E, C>(
     cookies: CookieJar,
     headers: HeaderMap,
     Path(path_params): Path<models::SnapshotsSnapshotIdGetPathParams>,
+    QueryExtra(query_params): QueryExtra<models::SnapshotsSnapshotIdGetQueryParams>,
     State(api_impl): State<I>,
 ) -> Result<Response, StatusCode>
 where
@@ -4922,12 +4948,13 @@ where
     };
 
     #[allow(clippy::redundant_closure)]
-    let validation =
-        tokio::task::spawn_blocking(move || snapshots_snapshot_id_get_validation(path_params))
-            .await
-            .unwrap();
+    let validation = tokio::task::spawn_blocking(move || {
+        snapshots_snapshot_id_get_validation(path_params, query_params)
+    })
+    .await
+    .unwrap();
 
-    let Ok((path_params,)) = validation else {
+    let Ok((path_params, query_params)) = validation else {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Body::from(validation.unwrap_err().to_string()))
@@ -4936,7 +4963,14 @@ where
 
     let result = api_impl
         .as_ref()
-        .snapshots_snapshot_id_get(&method, &host, &cookies, &claims, &path_params)
+        .snapshots_snapshot_id_get(
+            &method,
+            &host,
+            &cookies,
+            &claims,
+            &path_params,
+            &query_params,
+        )
         .await;
 
     let mut response = Response::builder();
@@ -6318,10 +6352,18 @@ where
 #[tracing::instrument(skip_all)]
 fn templates_template_id_delete_validation(
     path_params: models::TemplatesTemplateIdDeletePathParams,
-) -> std::result::Result<(models::TemplatesTemplateIdDeletePathParams,), ValidationErrors> {
+    query_params: models::TemplatesTemplateIdDeleteQueryParams,
+) -> std::result::Result<
+    (
+        models::TemplatesTemplateIdDeletePathParams,
+        models::TemplatesTemplateIdDeleteQueryParams,
+    ),
+    ValidationErrors,
+> {
     path_params.validate()?;
+    query_params.validate()?;
 
-    Ok((path_params,))
+    Ok((path_params, query_params))
 }
 /// TemplatesTemplateIdDelete - DELETE /templates/{templateID}
 #[tracing::instrument(skip_all)]
@@ -6331,6 +6373,7 @@ async fn templates_template_id_delete<I, A, E, C>(
     cookies: CookieJar,
     headers: HeaderMap,
     Path(path_params): Path<models::TemplatesTemplateIdDeletePathParams>,
+    QueryExtra(query_params): QueryExtra<models::TemplatesTemplateIdDeleteQueryParams>,
     State(api_impl): State<I>,
 ) -> Result<Response, StatusCode>
 where
@@ -6357,12 +6400,13 @@ where
     };
 
     #[allow(clippy::redundant_closure)]
-    let validation =
-        tokio::task::spawn_blocking(move || templates_template_id_delete_validation(path_params))
-            .await
-            .unwrap();
+    let validation = tokio::task::spawn_blocking(move || {
+        templates_template_id_delete_validation(path_params, query_params)
+    })
+    .await
+    .unwrap();
 
-    let Ok((path_params,)) = validation else {
+    let Ok((path_params, query_params)) = validation else {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Body::from(validation.unwrap_err().to_string()))
@@ -6371,7 +6415,14 @@ where
 
     let result = api_impl
         .as_ref()
-        .templates_template_id_delete(&method, &host, &cookies, &claims, &path_params)
+        .templates_template_id_delete(
+            &method,
+            &host,
+            &cookies,
+            &claims,
+            &path_params,
+            &query_params,
+        )
         .await;
 
     let mut response = Response::builder();
