@@ -34,6 +34,7 @@ version = "0.2.2"
 path = "src/lib.rs"
 
 [features]
+jemalloc = ["dep:tikv-jemallocator"]
 vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
 
 [dev-dependencies]
@@ -96,7 +97,7 @@ chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 url = "2.5"
 clap = { version = "4", features = ["derive"] }
-tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+tikv-jemallocator = { version = "0.6", features = ["background_threads"], optional = true }
 uvm-ublk = { path = "storage/ublk" }
 uvm-ublk-daemon = { path = "storage/ublk-daemon" }
 shell-util = { path = "crates/shell-util" }
