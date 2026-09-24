@@ -113,6 +113,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         sandboxes: RwLock::new(HashMap::new()),
         template_build_ids: RwLock::new(HashSet::new()),
         deletions: tokio::sync::Mutex::new(HashMap::new()),
+        memory_resize_statuses: RwLock::new(HashMap::new()),
         proxy_routes: RwLock::new(ProxyRouteTable::default()),
         next_proxy_route_version: AtomicU64::new(1),
         counters: Default::default(),
@@ -1374,6 +1375,659 @@ async fn sandbox_network_policy_is_applied_and_persisted() -> Result<()> {
         .expect("sandbox metadata should exist");
     assert_eq!(updated.network_policy, expected_policy);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_resize_updates_accounting_only_at_safe_boundaries() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+
+    let resized = orchestrator.resize_sandbox_memory(created.id, 128).await?;
+    assert_eq!(resized.previous_requested_size_mib, 0);
+    assert_eq!(resized.plugged_size_mib, 128);
+    let converged = orchestrator.get_sandbox(&created.id).await?.unwrap();
+    assert_eq!(converged.state, SandboxState::Running);
+    assert_eq!(
+        converged.resources.memory_mib,
+        created.resources.memory_mib + 128
+    );
+
+    behavior.push_action(
+        MockOperation::ResizeMemory,
+        MockAction::Fail {
+            message: "injected partial expansion".to_string(),
+        },
+    );
+    let err = orchestrator
+        .resize_sandbox_memory(created.id, 256)
+        .await
+        .expect_err("failed expansion must be reported");
+    assert!(matches!(
+        err,
+        OrchestratorError::SandboxOperationFailed {
+            operation: SandboxOperation::ResizeMemory,
+            ..
+        }
+    ));
+    let failed = orchestrator.get_sandbox(&created.id).await?.unwrap();
+    assert_eq!(failed.state, SandboxState::Running);
+    assert_eq!(
+        failed.resources.memory_mib, converged.resources.memory_mib,
+        "a stable observed rollback restores the previous accounting grant"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_resize_reports_rollback_and_partial_accounting() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    behavior.set_boot_memory_mib(created.resources.memory_mib);
+    let converged = orchestrator.resize_sandbox_memory(created.id, 128).await?;
+
+    behavior.push_action(
+        MockOperation::ResizeMemory,
+        MockAction::MemoryResizeRolledBack { elapsed_ms: 31 },
+    );
+    let rolled_back = orchestrator
+        .resize_sandbox_memory(created.id, 256)
+        .await
+        .expect_err("rollback must be exposed as incomplete");
+    let OrchestratorError::MemoryResizeIncomplete { status, .. } = rolled_back else {
+        panic!("expected typed rollback result");
+    };
+    assert_eq!(status.state, SandboxMemoryResizeState::RolledBack);
+    assert_eq!(status.rollback_target_size_mib, Some(128));
+    assert_eq!(status.accounted_memory_mib, converged.accounted_memory_mib);
+    let metadata = orchestrator.get_sandbox(&created.id).await?.unwrap();
+    assert_eq!(metadata.state, SandboxState::Running);
+    assert_eq!(
+        metadata.resources.memory_mib,
+        converged.accounted_memory_mib
+    );
+
+    behavior.push_action(
+        MockOperation::ResizeMemory,
+        MockAction::MemoryResizePartial {
+            observed_requested_size_mib: 256,
+            observed_plugged_size_mib: 192,
+            elapsed_ms: 73,
+            reason: "rollback remained partial".to_string(),
+        },
+    );
+    let partial = orchestrator
+        .resize_sandbox_memory(created.id, 256)
+        .await
+        .expect_err("partial rollback must be exposed as incomplete");
+    let OrchestratorError::MemoryResizeIncomplete { status, .. } = partial else {
+        panic!("expected typed partial result");
+    };
+    assert_eq!(status.state, SandboxMemoryResizeState::Partial);
+    assert_eq!(status.requested_size_mib, 256);
+    assert_eq!(status.plugged_size_mib, 192);
+    assert_eq!(
+        status.accounted_memory_mib,
+        created.resources.memory_mib + 256,
+        "partial expansion retains the target accounting grant"
+    );
+    let metadata = orchestrator.get_sandbox(&created.id).await?.unwrap();
+    assert_eq!(
+        metadata.state,
+        SandboxState::Running,
+        "a failed resize returns the lifecycle to Running"
+    );
+    assert_eq!(metadata.resources.memory_mib, status.accounted_memory_mib);
+    // A non-terminal record is re-confirmed against the live device. The
+    // backend reports the rollback as converged, so the GET reconciles the
+    // accounting and closes the partial record.
+    let reconciled = orchestrator.get_sandbox_memory_status(created.id).await?;
+    assert_eq!(reconciled.state, SandboxMemoryResizeState::Converged);
+    assert_eq!(reconciled.plugged_size_mib, 128);
+    assert_eq!(
+        reconciled.accounted_memory_mib,
+        created.resources.memory_mib + 128
+    );
+    let metadata = orchestrator.get_sandbox(&created.id).await?.unwrap();
+    assert_eq!(
+        metadata.resources.memory_mib,
+        reconciled.accounted_memory_mib
+    );
+    // The reconciled sandbox accepts new resizes again.
+    behavior.push_action(MockOperation::ResizeMemory, MockAction::Succeed);
+    orchestrator.resize_sandbox_memory(created.id, 256).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_resize_reports_unsupported_without_changing_accounting() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::ResizeMemory,
+        MockAction::MemoryHotplugUnsupported {
+            reason: "virtio-mem disabled".to_string(),
+        },
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let error = orchestrator
+        .resize_sandbox_memory(created.id, 128)
+        .await
+        .expect_err("unsupported resize must fail");
+    assert!(matches!(
+        error,
+        OrchestratorError::MemoryHotplugUnsupported { .. }
+    ));
+    let metadata = orchestrator.get_sandbox(&created.id).await?.unwrap();
+    assert_eq!(metadata.state, SandboxState::Running);
+    assert_eq!(metadata.resources.memory_mib, created.resources.memory_mib);
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_resize_preserves_preexisting_partial_state() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_memory_hotplug_status(crate::sandbox::MemoryHotplugStatus {
+        total_size_mib: 512,
+        slot_size_mib: 128,
+        block_size_mib: 2,
+        requested_size_mib: 256,
+        plugged_size_mib: 128,
+    });
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let error = orchestrator
+        .resize_sandbox_memory(created.id, 512)
+        .await
+        .expect_err("a preexisting partial state must fail closed");
+    let OrchestratorError::MemoryResizeIncomplete { status, .. } = error else {
+        panic!("expected structured partial status");
+    };
+    assert_eq!(status.state, SandboxMemoryResizeState::Partial);
+    assert_eq!(status.target_size_mib, 256);
+    assert_eq!(status.requested_size_mib, 256);
+    assert_eq!(status.plugged_size_mib, 128);
+    let metadata = orchestrator.get_sandbox(&created.id).await?.unwrap();
+    assert_eq!(
+        metadata.state,
+        SandboxState::Running,
+        "a preexisting partial state returns the lifecycle to Running"
+    );
+    assert_eq!(metadata.resources.memory_mib, status.accounted_memory_mib);
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_resize_unknown_outcome_keeps_conservative_accounting() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    behavior.set_boot_memory_mib(created.resources.memory_mib);
+    behavior.push_action(MockOperation::ReadMemoryStatus, MockAction::Succeed);
+    behavior.push_action(
+        MockOperation::ReadMemoryStatus,
+        MockAction::Fail {
+            message: "status unreadable".to_string(),
+        },
+    );
+    behavior.push_action(
+        MockOperation::ResizeMemory,
+        MockAction::Fail {
+            message: "resize request lost".to_string(),
+        },
+    );
+    let error = orchestrator
+        .resize_sandbox_memory(created.id, 256)
+        .await
+        .expect_err("an unreadable resize outcome must fail closed");
+    let OrchestratorError::MemoryResizeIncomplete { status, .. } = error else {
+        panic!("expected structured partial status");
+    };
+    assert_eq!(status.state, SandboxMemoryResizeState::Partial);
+    assert_eq!(
+        status.accounted_memory_mib,
+        created.resources.memory_mib + 256,
+        "an unknown outcome retains the conservative accounting grant"
+    );
+    let metadata = orchestrator.get_sandbox(&created.id).await?.unwrap();
+    assert_eq!(metadata.state, SandboxState::Running);
+    assert_eq!(metadata.resources.memory_mib, status.accounted_memory_mib);
+    // The device later confirms the request never took effect, and the next
+    // read reconciles the conservative grant.
+    let reconciled = orchestrator.get_sandbox_memory_status(created.id).await?;
+    assert_eq!(reconciled.state, SandboxMemoryResizeState::Converged);
+    assert_eq!(
+        reconciled.accounted_memory_mib,
+        created.resources.memory_mib
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_resize_owns_the_lifecycle_transition() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::ResizeMemory,
+        MockAction::SucceedAfter(Duration::from_millis(250)),
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+
+    let resize_orchestrator = Arc::clone(&orchestrator);
+    let resize = tokio::spawn(async move {
+        resize_orchestrator
+            .resize_sandbox_memory(created.id, 128)
+            .await
+    });
+    wait_for_state(&orchestrator, &created.id, SandboxState::Resizing).await?;
+    let active = tokio::time::timeout(
+        Duration::from_millis(100),
+        orchestrator.get_sandbox_memory_status(created.id),
+    )
+    .await
+    .expect("status GET must not wait for the backend resize mutex")?;
+    assert_eq!(active.state, SandboxMemoryResizeState::Resizing);
+    assert_eq!(active.target_size_mib, 128);
+    let concurrent_resize = orchestrator
+        .resize_sandbox_memory(created.id, 256)
+        .await
+        .expect_err("concurrent resize must conflict");
+    assert!(matches!(
+        concurrent_resize,
+        OrchestratorError::SandboxOperationConflict {
+            operation: SandboxOperation::ResizeMemory,
+            ..
+        }
+    ));
+    let pause_err = orchestrator
+        .pause_sandbox(created.id)
+        .await
+        .expect_err("pause must conflict with an active memory resize");
+    assert!(matches!(
+        pause_err,
+        OrchestratorError::InvalidSandboxState {
+            state: SandboxState::Resizing,
+            ..
+        }
+    ));
+    let snapshot_err = orchestrator
+        .capture_snapshot(created.id)
+        .await
+        .expect_err("snapshot must conflict with an active memory resize");
+    assert!(matches!(
+        snapshot_err,
+        OrchestratorError::InvalidSandboxState {
+            state: SandboxState::Resizing,
+            ..
+        }
+    ));
+    resize.await.expect("resize task should not panic")?;
+    assert_eq!(
+        orchestrator.get_sandbox(&created.id).await?.unwrap().state,
+        SandboxState::Running
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_during_memory_resize_serializes_and_cleans_status() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::ResizeMemory,
+        MockAction::SucceedAfter(Duration::from_millis(250)),
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let resize_orchestrator = Arc::clone(&orchestrator);
+    let resize = tokio::spawn(async move {
+        resize_orchestrator
+            .resize_sandbox_memory(created.id, 128)
+            .await
+    });
+    wait_for_state(&orchestrator, &created.id, SandboxState::Resizing).await?;
+    orchestrator.delete_sandbox(created.id).await?;
+    let resized = resize.await.expect("resize task should not panic");
+    assert!(
+        resized.is_ok(),
+        "delete waits for the resize commit instead of interrupting the operation"
+    );
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    assert!(matches!(
+        orchestrator.get_sandbox_memory_status(created.id).await,
+        Err(OrchestratorError::SandboxNotFound(_))
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_during_memory_resize_seals_volumes() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::ResizeMemory,
+        MockAction::SucceedAfter(Duration::from_millis(250)),
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let mut request = create_request(Some(60), &[]);
+    request
+        .volume_mounts
+        .insert("/data".to_string(), "vol-1".to_string());
+    let created = orchestrator.create_sandbox(request).await?;
+    let resize_orchestrator = Arc::clone(&orchestrator);
+    let resize = tokio::spawn(async move {
+        resize_orchestrator
+            .resize_sandbox_memory(created.id, 128)
+            .await
+    });
+    wait_for_state(&orchestrator, &created.id, SandboxState::Resizing).await?;
+    orchestrator.delete_sandbox(created.id).await?;
+    assert!(
+        resize.await.expect("resize task should not panic").is_ok(),
+        "delete waits for the resize commit before sealing volumes"
+    );
+    assert_eq!(
+        behavior.freeze_volume_calls(),
+        1,
+        "a resizing sandbox is still running and must seal its volumes"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_delete_during_memory_resize_restores_running() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::ResizeMemory,
+        MockAction::SucceedAfter(Duration::from_millis(250)),
+    );
+    behavior.push_action(
+        MockOperation::SnapshotVolumes,
+        MockAction::Fail {
+            message: "volume seal failed".to_string(),
+        },
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let mut request = create_request(Some(60), &[]);
+    request
+        .volume_mounts
+        .insert("/data".to_string(), "vol-1".to_string());
+    let created = orchestrator.create_sandbox(request).await?;
+    let resize_orchestrator = Arc::clone(&orchestrator);
+    let resize = tokio::spawn(async move {
+        resize_orchestrator
+            .resize_sandbox_memory(created.id, 128)
+            .await
+    });
+    wait_for_state(&orchestrator, &created.id, SandboxState::Resizing).await?;
+    let delete_error = orchestrator
+        .delete_sandbox(created.id)
+        .await
+        .expect_err("a recoverable volume seal failure fails the delete");
+    assert!(matches!(
+        delete_error,
+        OrchestratorError::SandboxOperationFailed {
+            operation: SandboxOperation::Stop,
+            ..
+        }
+    ));
+    assert!(
+        resize.await.expect("resize task should not panic").is_ok(),
+        "delete waits for the resize commit before attempting the seal"
+    );
+    let metadata = orchestrator.get_sandbox(&created.id).await?.unwrap();
+    assert_eq!(
+        metadata.state,
+        SandboxState::Running,
+        "a failed delete restores the confirmed stable state"
+    );
+    // The sandbox accepts new operations again.
+    behavior.push_action(MockOperation::ResizeMemory, MockAction::Succeed);
+    orchestrator.resize_sandbox_memory(created.id, 128).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_resize_unknown_sandbox_returns_not_found() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let unknown = SandboxId::new();
+    let error = orchestrator
+        .resize_sandbox_memory(unknown, 128)
+        .await
+        .expect_err("a missing sandbox must be reported as not found");
+    assert!(matches!(error, OrchestratorError::SandboxNotFound(_)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_resize_convergence_error_skips_status_read_back() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    behavior.push_action(
+        MockOperation::ResizeMemory,
+        MockAction::MemoryResizeRolledBack { elapsed_ms: 31 },
+    );
+    let _ = orchestrator
+        .resize_sandbox_memory(created.id, 128)
+        .await
+        .expect_err("rollback must be reported");
+    assert_eq!(
+        behavior.read_memory_status_calls(),
+        1,
+        "a convergence error carries its observation, so no read-back is needed"
+    );
+    Ok(())
+}
+
+#[test]
+fn resize_transition_wait_budget_covers_all_resize_phases() {
+    setup();
+    let hotplug = &crate::cfg::ConfigManager::global_config()
+        .firecracker
+        .memory_hotplug;
+    let budget = crate::orchestrator::service::resize_transition_wait_budget();
+    assert!(
+        budget > Duration::from_secs(hotplug.resize_timeout_secs.saturating_mul(2)),
+        "the delete wait budget must outlast forward and rollback phases"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn get_memory_status_blocked_on_resize_returns_committed_accounting() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+
+    // Freeze the resize after it claimed Resizing and took the backend
+    // handle, before it records anything. Every rendezvous below is bounded
+    // by a timeout so a failed assertion can never wedge the test.
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_fired = Arc::clone(&fired);
+    behavior.set_on_operation(
+        MockOperation::ReadMemoryStatus,
+        Arc::new(move || {
+            if hook_fired.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let _ = entered_tx.send(());
+            let _ = release_rx
+                .lock()
+                .expect("release receiver mutex poisoned")
+                .recv_timeout(Duration::from_secs(10));
+        }),
+    );
+    let resize_orchestrator = Arc::clone(&orchestrator);
+    let resize = tokio::spawn(async move {
+        resize_orchestrator
+            .resize_sandbox_memory(created.id, 256)
+            .await
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("resize must reach its first status read");
+    assert_eq!(
+        orchestrator.get_sandbox(&created.id).await?.unwrap().state,
+        SandboxState::Resizing
+    );
+    assert!(orchestrator.memory_resize_statuses.read().await.is_empty());
+
+    // Poll the real status read once from this task. It runs through the
+    // metadata read and the provably-empty cache check, so the only point it
+    // can be pending on is the backend handle the frozen resize holds.
+    // Pending here is the deterministic proof that the read straddles the
+    // commit; no helper task, channel, or sleep can fake it.
+    let get = orchestrator.get_sandbox_memory_status(created.id);
+    futures::pin_mut!(get);
+    let first_poll = {
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        std::future::Future::poll(get.as_mut(), &mut context)
+    };
+    assert!(
+        first_poll.is_pending(),
+        "status read must be waiting on the backend handle"
+    );
+
+    release_tx.send(()).expect("release the resize");
+    let resized = tokio::time::timeout(Duration::from_secs(10), resize)
+        .await
+        .expect("resize must finish")
+        .expect("resize task should not panic");
+    assert!(resized.is_ok());
+    let status = tokio::time::timeout(Duration::from_secs(10), get)
+        .await
+        .expect("status read must finish")?;
+    // The status read parked through the commit must surface the committed
+    // result; before the under-lock re-read it answered with the pre-grant
+    // accounting instead.
+    assert_eq!(status.state, SandboxMemoryResizeState::Converged);
+    assert_eq!(status.plugged_size_mib, 256);
+    assert_eq!(
+        status.accounted_memory_mib,
+        created.resources.memory_mib + 256,
+        "a status read that blocked on the resize must reflect the committed accounting"
+    );
+    assert_eq!(status.accounted_memory_mib, status.effective_memory_mib);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_pause_after_resize_cleans_memory_status() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Pause,
+        MockAction::FailTerminal {
+            message: "pause exploded".to_string(),
+        },
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    orchestrator.resize_sandbox_memory(created.id, 128).await?;
+    assert_eq!(orchestrator.memory_resize_statuses.read().await.len(), 1);
+    orchestrator
+        .pause_sandbox(created.id)
+        .await
+        .expect_err("terminal pause must fail");
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    assert!(
+        orchestrator.memory_resize_statuses.read().await.is_empty(),
+        "a terminal lifecycle failure must not leave the resize status behind"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_pause_persist_failure_after_resize_cleans_memory_status() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let persister = RecordingPersister::default();
+    persister.fail_next(RecordingCall::PersistPaused);
+    behavior.push_action(
+        MockOperation::Resume,
+        MockAction::Fail {
+            message: "resume after persist failure exploded".to_string(),
+        },
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    orchestrator.resize_sandbox_memory(created.id, 128).await?;
+    assert_eq!(orchestrator.memory_resize_statuses.read().await.len(), 1);
+    orchestrator
+        .pause_sandbox(created.id)
+        .await
+        .expect_err("persist failure must fail the pause");
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    assert!(
+        orchestrator.memory_resize_statuses.read().await.is_empty(),
+        "a terminal pause-persist failure must not leave the resize status behind"
+    );
     Ok(())
 }
 

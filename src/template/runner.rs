@@ -173,7 +173,10 @@ impl TemplateBuildRunner {
             FirecrackerSandboxConfig::from_global_config_with_user_image(user_image_config.clone())
                 .context("load sandbox config for snapshot build")?;
         config.vcpu_count = context.resources.cpu_count;
-        config.mem_size_mib = context.resources.memory_mib;
+        config.mem_size_mib = config
+            .common
+            .memory_hotplug
+            .boot_memory_mib(context.resources.memory_mib)?;
         config.common.ublk_config = ublk_config;
         config.common.cpu_config_json = context.cpu_config_json.clone();
         config.common.env_vars = (!context.initial_context.env_vars.is_empty())

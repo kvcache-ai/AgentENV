@@ -10,12 +10,13 @@ use http::Method;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::cfg::ConfigManager;
+use crate::cfg::{ConfigManager, MemoryHotplugPolicy};
 use crate::image::ResolvedBlockImage;
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
     CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxForkChildSpec, SandboxLaunchSource,
-    SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
+    SandboxListFilter, SandboxMemoryHotplugStatus, SandboxMetadata, SandboxState,
+    SandboxTimeoutAction,
 };
 use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
@@ -47,6 +48,29 @@ fn default_sandbox_timeout() -> Duration {
                 .default_sandbox_timeout_secs,
         )
     })
+}
+
+fn memory_hotplug_status_model(
+    result: &SandboxMemoryHotplugStatus,
+) -> models::SandboxMemoryHotplugStatus {
+    let mut model = models::SandboxMemoryHotplugStatus::new(
+        result.previous_requested_size_mib,
+        result.target_size_mib,
+        result.requested_size_mib,
+        result.plugged_size_mib,
+        result.total_size_mib,
+        result.slot_size_mib,
+        result.block_size_mib,
+        result.boot_memory_mib,
+        result.effective_memory_mib,
+        result.accounted_memory_mib,
+        result.elapsed_ms,
+        result.state.to_string(),
+    );
+    model.rollback_target_hotplug_memory_mb =
+        result.rollback_target_size_mib.map(Nullable::Present);
+    model.reason = result.reason.clone().map(Nullable::Present);
+    model
 }
 
 impl From<OrchestratorError> for models::Error {
@@ -500,6 +524,16 @@ fn duration_from_secs(secs: Option<u32>) -> Option<Duration> {
     secs.map(|s| Duration::from_secs(s as u64))
 }
 
+fn validate_cold_start_memory(memory_mib: u32, policy: &MemoryHotplugPolicy) -> Result<(), String> {
+    if memory_mib < 128 {
+        return Err("memoryMB must be at least 128".to_string());
+    }
+    policy
+        .boot_memory_mib(memory_mib)
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(())
+}
+
 fn cold_start_resources(body: &models::NewColdSandbox) -> Result<SandboxResources, models::Error> {
     let config = ConfigManager::global_config();
     let default_cpu = config.machine.vcpu_count;
@@ -512,11 +546,9 @@ fn cold_start_resources(body: &models::NewColdSandbox) -> Result<SandboxResource
         ));
     }
     let memory_mib = body.memory_mb.unwrap_or(default_mem);
-    if memory_mib < 128 {
-        return Err(ApiImpl::error(
-            400,
-            "memoryMB must be at least 128".to_string(),
-        ));
+    if let Err(reason) = validate_cold_start_memory(memory_mib, &config.firecracker.memory_hotplug)
+    {
+        return Err(ApiImpl::error(400, reason));
     }
     let disk_size_mib = body.disk_size_mb.unwrap_or(0);
     if body.disk_size_mb.is_some() && (disk_size_mib < 1024 || !disk_size_mib.is_multiple_of(1024))
@@ -1247,6 +1279,7 @@ impl Sandboxes<()> for ApiImpl {
             SandboxState::Creating
             | SandboxState::Resuming
             | SandboxState::Running
+            | SandboxState::Resizing
             | SandboxState::Snapshotting
             | SandboxState::Forking => {
                 match self
@@ -1537,6 +1570,107 @@ impl Sandboxes<()> for ApiImpl {
                 self.sandbox_detail_model(metadata),
             ),
         )
+    }
+
+    async fn sandboxes_sandbox_id_memory_get(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdMemoryGetPathParams,
+    ) -> Result<SandboxesSandboxIdMemoryGetResponse, ()> {
+        let path_id = &path_params.sandbox_id;
+        let Ok(sandbox_id) = SandboxId::parse_str(path_id) else {
+            return Ok(SandboxesSandboxIdMemoryGetResponse::Status404_NotFound(
+                sandbox_not_found(path_id),
+            ));
+        };
+        match self
+            .orchestrator
+            .get_sandbox_memory_status(sandbox_id)
+            .await
+        {
+            Ok(status) => Ok(
+                SandboxesSandboxIdMemoryGetResponse::Status200_MemoryHotplugStatus(
+                    memory_hotplug_status_model(&status),
+                ),
+            ),
+            Err(OrchestratorError::SandboxNotFound(id)) => Ok(
+                SandboxesSandboxIdMemoryGetResponse::Status404_NotFound(sandbox_not_found(id)),
+            ),
+            Err(err @ OrchestratorError::InvalidSandboxState { .. })
+            | Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
+                Ok(SandboxesSandboxIdMemoryGetResponse::Status409_Conflict(
+                    Self::error(409, err.to_string()),
+                ))
+            }
+            Err(err @ OrchestratorError::MemoryHotplugUnsupported { .. }) => Ok(
+                SandboxesSandboxIdMemoryGetResponse::Status422_UnprocessableEntity(Self::error(
+                    422,
+                    err.to_string(),
+                )),
+            ),
+            Err(err) => Ok(SandboxesSandboxIdMemoryGetResponse::Status500_ServerError(
+                err.into(),
+            )),
+        }
+    }
+
+    async fn sandboxes_sandbox_id_memory_patch(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path_params: &models::SandboxesSandboxIdMemoryPatchPathParams,
+        body: &models::SandboxMemoryHotplugResize,
+    ) -> Result<SandboxesSandboxIdMemoryPatchResponse, ()> {
+        let path_id = &path_params.sandbox_id;
+        let Ok(sandbox_id) = SandboxId::parse_str(path_id) else {
+            return Ok(SandboxesSandboxIdMemoryPatchResponse::Status404_NotFound(
+                sandbox_not_found(path_id),
+            ));
+        };
+        match self
+            .orchestrator
+            .resize_sandbox_memory(sandbox_id, body.requested_hotplug_memory_mb)
+            .await
+        {
+            Ok(result) => Ok(
+                SandboxesSandboxIdMemoryPatchResponse::Status200_MemoryResizeConverged(
+                    memory_hotplug_status_model(&result),
+                ),
+            ),
+            Err(OrchestratorError::SandboxNotFound(id)) => Ok(
+                SandboxesSandboxIdMemoryPatchResponse::Status404_NotFound(sandbox_not_found(id)),
+            ),
+            Err(err @ OrchestratorError::InvalidMemoryResize { .. }) => {
+                Ok(SandboxesSandboxIdMemoryPatchResponse::Status400_BadRequest(
+                    Self::error(400, err.to_string()),
+                ))
+            }
+            Err(err @ OrchestratorError::InvalidSandboxState { .. })
+            | Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
+                Ok(SandboxesSandboxIdMemoryPatchResponse::Status409_Conflict(
+                    Self::error(409, err.to_string()),
+                ))
+            }
+            Err(err @ OrchestratorError::MemoryHotplugUnsupported { .. }) => Ok(
+                SandboxesSandboxIdMemoryPatchResponse::Status422_UnprocessableEntity(Self::error(
+                    422,
+                    err.to_string(),
+                )),
+            ),
+            Err(OrchestratorError::MemoryResizeIncomplete { status, .. }) => Ok(
+                SandboxesSandboxIdMemoryPatchResponse::Status504_GatewayTimeout(
+                    memory_hotplug_status_model(&status),
+                ),
+            ),
+            Err(err) => {
+                Ok(SandboxesSandboxIdMemoryPatchResponse::Status500_ServerError(err.into()))
+            }
+        }
     }
 
     async fn sandboxes_sandbox_id_network_put(
@@ -2096,6 +2230,33 @@ mod tests {
     }
 
     #[test]
+    fn memory_hotplug_response_keeps_memory_terms_distinct() {
+        let model = memory_hotplug_status_model(&SandboxMemoryHotplugStatus {
+            previous_requested_size_mib: 128,
+            target_size_mib: 256,
+            requested_size_mib: 256,
+            plugged_size_mib: 256,
+            total_size_mib: 512,
+            slot_size_mib: 128,
+            block_size_mib: 2,
+            boot_memory_mib: 256,
+            effective_memory_mib: 512,
+            accounted_memory_mib: 512,
+            elapsed_ms: 17,
+            state: crate::orchestrator::SandboxMemoryResizeState::Converged,
+            rollback_target_size_mib: None,
+            reason: None,
+        });
+        assert_eq!(model.boot_memory_mb, 256);
+        assert_eq!(model.target_hotplug_memory_mb, 256);
+        assert_eq!(model.requested_hotplug_memory_mb, 256);
+        assert_eq!(model.plugged_hotplug_memory_mb, 256);
+        assert_eq!(model.effective_memory_mb, 512);
+        assert_eq!(model.accounted_memory_mb, 512);
+        assert_eq!(model.status, "converged");
+    }
+
+    #[test]
     fn parse_metadata_filter_with_none_returns_none() {
         assert_eq!(parse_metadata_filter(&None), None);
     }
@@ -2164,6 +2325,29 @@ mod tests {
 
         body.disk_size_mb = Some(1536);
         assert!(cold_start_resources(&body).is_err());
+    }
+
+    #[test]
+    fn cold_start_memory_reserves_minimum_boot_memory_with_hotplug() {
+        let policy = MemoryHotplugPolicy {
+            enabled: true,
+            total_size_mib: 512,
+            requested_size_mib: 128,
+            ..MemoryHotplugPolicy::default()
+        };
+        assert!(validate_cold_start_memory(768, &policy).is_ok());
+        assert_eq!(
+            validate_cold_start_memory(639, &policy).unwrap_err(),
+            "sandbox boot memory must be at least 128 MiB after subtracting the virtio-mem total size: total=639 MiB hotplug_total=512 MiB"
+        );
+        assert_eq!(
+            validate_cold_start_memory(400, &policy).unwrap_err(),
+            "sandbox memoryMB must exceed the virtio-mem total size"
+        );
+        assert_eq!(
+            validate_cold_start_memory(64, &policy).unwrap_err(),
+            "memoryMB must be at least 128"
+        );
     }
 
     #[test]

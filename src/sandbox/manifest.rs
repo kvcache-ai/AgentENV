@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::cfg::MemoryHotplugPolicy;
+
 use super::ExtraDrive;
 
 pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 1;
@@ -55,6 +57,10 @@ pub struct SandboxSnapshotManifest {
     /// snapshots, v1 packs, POSIX backends, and disabled consumption.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_startup_pack: Option<crate::snapshot::ResolvedStartupPack>,
+    /// Snapshot-time virtio-mem policy and requested size. Older manifests did
+    /// not contain this field and therefore restore with hotplug disabled.
+    #[serde(default)]
+    pub memory_hotplug: MemoryHotplugPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -129,6 +135,7 @@ impl SandboxSnapshotManifest {
             volume_drive_slots: 0,
             physical_extra_drive_count: attached_drives.len(),
             memory_startup_pack: None,
+            memory_hotplug: MemoryHotplugPolicy::default(),
         }
         .with_extra_drives(attached_drives)
     }
@@ -218,6 +225,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_manifest_defaults_memory_hotplug_to_disabled() {
+        let decoded: SandboxSnapshotManifest = serde_json::from_str(include_str!(
+            "../../tests/fixtures/firecracker_manifest_v1_legacy.json"
+        ))
+        .unwrap();
+        assert!(!decoded.memory_hotplug.enabled);
+    }
+
+    #[test]
     fn attached_drive_virtual_size_is_required() {
         let err = serde_json::from_value::<SnapshotAttachedDriveArtifacts>(serde_json::json!({
             "driveId": "data",
@@ -261,6 +277,7 @@ mod tests {
             volume_drive_slots: 0,
             physical_extra_drive_count: 1,
             memory_startup_pack: None,
+            memory_hotplug: MemoryHotplugPolicy::default(),
         };
 
         let drives = manifest.extra_drives();

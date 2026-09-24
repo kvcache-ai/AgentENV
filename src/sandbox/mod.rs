@@ -35,7 +35,7 @@ pub(crate) use firecracker::record_startup_pack;
 pub use firecracker::{
     FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
-    FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
+    FirecrackerSandboxFactory, FirecrackerSnapshotConfig, MemoryHotplugStatus, MemoryResizeResult,
 };
 pub use manifest::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
 pub use metrics::SandboxMetric;
@@ -47,6 +47,39 @@ pub use network::{
 pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
 pub(crate) use ublk::{compact_layers, OverlaybdCompactOutput};
 pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
+
+#[derive(Debug, thiserror::Error)]
+#[error("memory hotplug is unsupported: {reason}")]
+pub struct MemoryHotplugUnsupported {
+    pub reason: String,
+}
+
+impl MemoryHotplugUnsupported {
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum MemoryResizeConvergenceError {
+    #[error("virtio-mem resize to {target_size_mib} MiB timed out and rolled back to {rollback_target_size_mib} MiB")]
+    RolledBack {
+        target_size_mib: u32,
+        rollback_target_size_mib: u32,
+        observed: MemoryHotplugStatus,
+        elapsed_ms: u64,
+    },
+    #[error("virtio-mem resize to {target_size_mib} MiB did not converge and rollback to {rollback_target_size_mib} MiB remains partial: {reason}")]
+    Partial {
+        target_size_mib: u32,
+        rollback_target_size_mib: u32,
+        observed: MemoryHotplugStatus,
+        elapsed_ms: u64,
+        reason: String,
+    },
+}
 
 #[derive(Clone, Debug)]
 pub struct FreshSandboxBuildSpec {

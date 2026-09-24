@@ -105,7 +105,10 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
             runtime_upper_mode,
         ));
         config.vcpu_count = build_spec.resources.cpu_count;
-        config.mem_size_mib = build_spec.resources.memory_mib;
+        config.mem_size_mib = config
+            .common
+            .memory_hotplug
+            .boot_memory_mib(build_spec.resources.memory_mib)?;
         config.common.rootfs_virtual_size = if build_spec.resources.disk_size_mib == 0 {
             None
         } else {
@@ -172,8 +175,16 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         let paused_state = state
             .downcast_ref::<FirecrackerPausedState>()
             .context("The provided PausedSandboxState is not a Firecracker paused state")?;
+        let mut snapshot_config = paused_state.snapshot_config().clone();
+        let current_hotplug = &ConfigManager::global_config().firecracker.memory_hotplug;
+        snapshot_config.common.memory_hotplug.resize_timeout_secs =
+            current_hotplug.resize_timeout_secs;
+        snapshot_config
+            .common
+            .memory_hotplug
+            .resize_poll_interval_ms = current_hotplug.resize_poll_interval_ms;
         let sandbox = FirecrackerSandbox::from_snapshot_config_with_override(
-            paused_state.snapshot_config().clone(),
+            snapshot_config,
             sandbox_id,
             envd_access_token,
         )?;

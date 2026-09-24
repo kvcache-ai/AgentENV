@@ -657,6 +657,8 @@ func isSandboxControlPlaneRequest(r *http.Request) bool {
 		return r.Method == http.MethodPost
 	case "network":
 		return r.Method == http.MethodPut
+	case "memory":
+		return r.Method == http.MethodGet || r.Method == http.MethodPatch
 	case "custom-extension-params":
 		return r.Method == http.MethodGet || r.Method == http.MethodPatch
 	default:

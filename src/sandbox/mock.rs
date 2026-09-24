@@ -21,7 +21,10 @@ use super::backend::{
     SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult, SandboxForkSpec,
     SandboxRuntimeInfo,
 };
-use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
+use super::{
+    FreshSandboxBuildSpec, MemoryHotplugStatus, MemoryHotplugUnsupported,
+    MemoryResizeConvergenceError, MemoryResizeResult, SandboxCaptureError, SandboxLaunchConfig,
+};
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::RunnableSnapshot;
 
@@ -58,30 +61,83 @@ pub enum MockOperation {
     ForkChild,
     Stop,
     UpdateNetwork,
+    ResizeMemory,
+    ReadMemoryStatus,
 }
 
 #[derive(Clone, Debug)]
 pub enum MockAction {
     Succeed,
     SucceedAfter(Duration),
-    Fail { message: String },
-    FailTerminal { message: String },
-    FailAfter { delay: Duration, message: String },
+    Fail {
+        message: String,
+    },
+    FailTerminal {
+        message: String,
+    },
+    FailAfter {
+        delay: Duration,
+        message: String,
+    },
+    MemoryHotplugUnsupported {
+        reason: String,
+    },
+    MemoryResizeRolledBack {
+        elapsed_ms: u64,
+    },
+    MemoryResizePartial {
+        observed_requested_size_mib: u32,
+        observed_plugged_size_mib: u32,
+        elapsed_ms: u64,
+        reason: String,
+    },
 }
 
 pub type MetricsSampler = Arc<
     dyn Fn() -> futures::future::BoxFuture<'static, Result<super::SandboxMetric>> + Send + Sync,
 >;
 
-#[derive(Default)]
 pub struct MockBehavior {
     actions: Mutex<HashMap<MockOperation, VecDeque<MockAction>>>,
     on_operation: Mutex<HashMap<MockOperation, Arc<dyn Fn() + Send + Sync>>>,
     runtime_info: Mutex<SandboxRuntimeInfo>,
     metrics_sampler: Mutex<Option<MetricsSampler>>,
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
+    /// Template for the virtio-mem status each backend gets its own copy of,
+    /// so sandboxes built from one behavior never share resize state.
+    memory_hotplug_status: Mutex<MemoryHotplugStatus>,
+    boot_memory_mib: Mutex<Option<u32>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
+    freeze_volume_calls: AtomicUsize,
+    read_memory_status_calls: AtomicUsize,
+}
+
+impl Default for MockBehavior {
+    fn default() -> Self {
+        Self {
+            actions: Mutex::new(HashMap::new()),
+            on_operation: Mutex::new(HashMap::new()),
+            runtime_info: Mutex::new(SandboxRuntimeInfo::default()),
+            source_config_paths: Mutex::new(Vec::new()),
+            memory_hotplug_status: Mutex::new(MemoryHotplugStatus {
+                total_size_mib: 512,
+                slot_size_mib: 128,
+                block_size_mib: 2,
+                requested_size_mib: 0,
+                plugged_size_mib: 0,
+            }),
+            // Matches the default mock snapshot's memory so resize accounting
+            // works out of the box; override per test when a scenario needs a
+            // different boot memory.
+            boot_memory_mib: Mutex::new(Some(128)),
+            stop_calls: AtomicUsize::new(0),
+            update_network_calls: AtomicUsize::new(0),
+            freeze_volume_calls: AtomicUsize::new(0),
+            read_memory_status_calls: AtomicUsize::new(0),
+            metrics_sampler: Mutex::new(None),
+        }
+    }
 }
 
 impl MockBehavior {
@@ -133,12 +189,50 @@ impl MockBehavior {
             .clone()
     }
 
+    /// The status template a new backend copies; later writes only affect
+    /// backends constructed afterwards.
+    pub fn set_memory_hotplug_status(&self, status: MemoryHotplugStatus) {
+        *self
+            .memory_hotplug_status
+            .lock()
+            .expect("memory hotplug status mutex poisoned") = status;
+    }
+
+    fn memory_hotplug_status_template(&self) -> MemoryHotplugStatus {
+        self.memory_hotplug_status
+            .lock()
+            .expect("memory hotplug status mutex poisoned")
+            .clone()
+    }
+
+    pub fn set_boot_memory_mib(&self, boot_memory_mib: u32) {
+        *self
+            .boot_memory_mib
+            .lock()
+            .expect("boot memory mutex poisoned") = Some(boot_memory_mib);
+    }
+
+    fn boot_memory_mib(&self) -> Option<u32> {
+        *self
+            .boot_memory_mib
+            .lock()
+            .expect("boot memory mutex poisoned")
+    }
+
     pub fn stop_calls(&self) -> usize {
         self.stop_calls.load(Ordering::Relaxed)
     }
 
     pub fn update_network_calls(&self) -> usize {
         self.update_network_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn freeze_volume_calls(&self) -> usize {
+        self.freeze_volume_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn read_memory_status_calls(&self) -> usize {
+        self.read_memory_status_calls.load(Ordering::Relaxed)
     }
 
     fn pop_action(&self, operation: MockOperation) -> MockAction {
@@ -182,6 +276,12 @@ impl MockBehavior {
                 sleep(delay).await;
                 Err(fail(message))
             }
+            MockAction::MemoryHotplugUnsupported { reason } => Err(fail(reason)),
+            MockAction::MemoryResizeRolledBack { .. } | MockAction::MemoryResizePartial { .. } => {
+                Err(fail(
+                    "memory resize action used by non-resize operation".to_string(),
+                ))
+            }
         }
     }
 
@@ -205,6 +305,60 @@ impl MockBehavior {
             MockAction::FailAfter { delay, message } => {
                 thread::sleep(delay);
                 Err(fail(message))
+            }
+            MockAction::MemoryHotplugUnsupported { reason } => Err(fail(reason)),
+            MockAction::MemoryResizeRolledBack { .. } | MockAction::MemoryResizePartial { .. } => {
+                Err(fail(
+                    "memory resize action used by non-resize operation".to_string(),
+                ))
+            }
+        }
+    }
+
+    async fn apply_memory_resize(
+        &self,
+        target_size_mib: u32,
+        previous: &MemoryHotplugStatus,
+    ) -> Result<()> {
+        self.run_operation_hook(MockOperation::ResizeMemory);
+        match self.pop_action(MockOperation::ResizeMemory) {
+            MockAction::MemoryHotplugUnsupported { reason } => {
+                Err(MemoryHotplugUnsupported::new(reason).into())
+            }
+            MockAction::MemoryResizeRolledBack { elapsed_ms } => {
+                Err(MemoryResizeConvergenceError::RolledBack {
+                    target_size_mib,
+                    rollback_target_size_mib: previous.requested_size_mib,
+                    observed: previous.clone(),
+                    elapsed_ms,
+                }
+                .into())
+            }
+            MockAction::MemoryResizePartial {
+                observed_requested_size_mib,
+                observed_plugged_size_mib,
+                elapsed_ms,
+                reason,
+            } => {
+                let mut observed = previous.clone();
+                observed.requested_size_mib = observed_requested_size_mib;
+                observed.plugged_size_mib = observed_plugged_size_mib;
+                Err(MemoryResizeConvergenceError::Partial {
+                    target_size_mib,
+                    rollback_target_size_mib: previous.requested_size_mib,
+                    observed,
+                    elapsed_ms,
+                    reason,
+                }
+                .into())
+            }
+            action => {
+                Self::run_async_action(
+                    action,
+                    |message| anyhow!(message),
+                    |message| anyhow!(message),
+                )
+                .await
             }
         }
     }
@@ -257,6 +411,7 @@ pub struct MockSandboxBackend {
     behavior: Arc<MockBehavior>,
     host_ip: Option<std::net::Ipv4Addr>,
     volumes_frozen: bool,
+    memory_hotplug_status: Mutex<MemoryHotplugStatus>,
 }
 
 impl MockSandboxBackend {
@@ -269,9 +424,10 @@ impl MockSandboxBackend {
         host_ip: Option<std::net::Ipv4Addr>,
     ) -> Self {
         Self {
-            behavior,
+            behavior: Arc::clone(&behavior),
             host_ip,
             volumes_frozen: false,
+            memory_hotplug_status: Mutex::new(behavior.memory_hotplug_status_template()),
         }
     }
 }
@@ -295,6 +451,78 @@ impl SandboxBackend for MockSandboxBackend {
 
     async fn wait_for_ready(&self) -> Result<()> {
         self.behavior.apply_async(MockOperation::WaitForReady).await
+    }
+
+    async fn resize_memory_hotplug(
+        &mut self,
+        requested_size_mib: u32,
+    ) -> Result<MemoryResizeResult> {
+        let previous = self
+            .memory_hotplug_status
+            .lock()
+            .expect("mock memory hotplug mutex poisoned")
+            .clone();
+        // Mirror the production preconditions so tests cannot resize past
+        // the configured geometry.
+        anyhow::ensure!(
+            requested_size_mib <= previous.total_size_mib,
+            "requested virtio-mem size {requested_size_mib} MiB exceeds total {} MiB",
+            previous.total_size_mib
+        );
+        anyhow::ensure!(
+            requested_size_mib.is_multiple_of(previous.block_size_mib),
+            "requested virtio-mem size {requested_size_mib} MiB is not aligned to block size {} MiB",
+            previous.block_size_mib
+        );
+        self.behavior
+            .apply_memory_resize(requested_size_mib, &previous)
+            .await?;
+        let mut status = self
+            .memory_hotplug_status
+            .lock()
+            .expect("mock memory hotplug mutex poisoned");
+        let previous_requested_size_mib = status.requested_size_mib;
+        status.requested_size_mib = requested_size_mib;
+        status.plugged_size_mib = requested_size_mib;
+        Ok(MemoryResizeResult {
+            previous_requested_size_mib,
+            requested_size_mib,
+            plugged_size_mib: requested_size_mib,
+            total_size_mib: status.total_size_mib,
+            slot_size_mib: status.slot_size_mib,
+            block_size_mib: status.block_size_mib,
+            elapsed_ms: 0,
+        })
+    }
+
+    async fn memory_hotplug_status(&mut self) -> Result<MemoryHotplugStatus> {
+        self.behavior
+            .read_memory_status_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.behavior
+            .run_operation_hook(MockOperation::ReadMemoryStatus);
+        match self.behavior.pop_action(MockOperation::ReadMemoryStatus) {
+            MockAction::MemoryHotplugUnsupported { reason } => {
+                Err(MemoryHotplugUnsupported::new(reason).into())
+            }
+            action => {
+                MockBehavior::run_async_action(
+                    action,
+                    |message| anyhow!(message),
+                    |message| anyhow!(message),
+                )
+                .await?;
+                Ok(self
+                    .memory_hotplug_status
+                    .lock()
+                    .expect("mock memory hotplug mutex poisoned")
+                    .clone())
+            }
+        }
+    }
+
+    async fn boot_memory_mib(&mut self) -> Result<Option<u32>> {
+        Ok(self.behavior.boot_memory_mib())
     }
 
     async fn pause(
@@ -385,6 +613,9 @@ impl SandboxBackend for MockSandboxBackend {
 
     async fn freeze_and_snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
         assert!(!self.volumes_frozen, "volumes already frozen");
+        self.behavior
+            .freeze_volume_calls
+            .fetch_add(1, Ordering::Relaxed);
         let result = self.snapshot_volumes().await;
         self.volumes_frozen = result
             .as_ref()

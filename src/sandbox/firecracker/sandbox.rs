@@ -22,7 +22,7 @@ use super::overlaybd_snapshot::{
     restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
 };
 use super::pool::{warm_stdio_paths, FirecrackerPool};
-use super::FirecrackerInstance;
+use super::{FirecrackerInstance, MemoryHotplugStatus, MemoryResizeResult};
 use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
 };
@@ -46,9 +46,10 @@ use crate::sandbox::ublk::{
     OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, PackRecordingWindow,
     SharedReadOnlyDevice, UblkBackend, UblkCreateSpec, UblkDevice, UblkDeviceManager,
 };
-use crate::sandbox::SandboxLaunchConfig;
+use crate::sandbox::{MemoryHotplugUnsupported, MemoryResizeConvergenceError, SandboxLaunchConfig};
 use crate::snapshot::RunnableSnapshot;
 use crate::types::SandboxId;
+use tokio::time::{sleep, Duration, Instant};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -60,6 +61,96 @@ const USER_ROOTFS_DRIVE_PATH: &str = "user-rootfs";
 /// `refill_time`, not a per-second rate. Pinning the refill period to 1000 ms
 /// makes the configured `*_per_sec` values equal the sustained per-second rate.
 const RATE_LIMIT_REFILL_TIME_MS: i64 = 1000;
+
+#[derive(Debug)]
+enum MemoryResizeWait {
+    Converged(MemoryHotplugStatus),
+    TimedOut(MemoryHotplugStatus),
+    ReadFailed(MemoryHotplugStatus, anyhow::Error),
+}
+
+fn memory_resize_converged(status: &MemoryHotplugStatus, target_size_mib: u32) -> bool {
+    status.requested_size_mib == target_size_mib && status.plugged_size_mib == target_size_mib
+}
+
+fn ensure_memory_hotplug_boot_arg(
+    boot_args: Option<String>,
+    enabled: bool,
+) -> Result<Option<String>> {
+    if !enabled {
+        return Ok(boot_args);
+    }
+    let mut args = boot_args.unwrap_or_default();
+    let values = args
+        .split_whitespace()
+        .filter_map(|arg| arg.strip_prefix("memhp_default_state="))
+        .collect::<Vec<_>>();
+    if !values.is_empty() {
+        anyhow::ensure!(
+            values.len() == 1,
+            "virtio-mem requires exactly one memhp_default_state argument; found {values:?}"
+        );
+        anyhow::ensure!(
+            values.iter().all(|value| *value == "online_movable"),
+            "virtio-mem requires memhp_default_state=online_movable; found values {values:?}"
+        );
+        return Ok(Some(args));
+    }
+    if !args.is_empty() {
+        args.push(' ');
+    }
+    args.push_str("memhp_default_state=online_movable");
+    Ok(Some(args))
+}
+
+fn validate_memory_hotplug_status(
+    policy: &crate::cfg::MemoryHotplugPolicy,
+    status: &MemoryHotplugStatus,
+) -> Result<()> {
+    anyhow::ensure!(
+        status.total_size_mib == policy.total_size_mib
+            && status.slot_size_mib == policy.slot_size_mib
+            && status.block_size_mib == policy.block_size_mib,
+        "virtio-mem status does not match persisted policy: expected total/slot/block={}/{}/{}, got {}/{}/{}",
+        policy.total_size_mib,
+        policy.slot_size_mib,
+        policy.block_size_mib,
+        status.total_size_mib,
+        status.slot_size_mib,
+        status.block_size_mib
+    );
+    // Runtime sizes feed accounting, the API, and snapshots, so they must
+    // hold the same invariants as the policy.
+    anyhow::ensure!(
+        status.block_size_mib > 0,
+        "virtio-mem status returned zero block_size_mib"
+    );
+    anyhow::ensure!(
+        status.requested_size_mib <= status.total_size_mib,
+        "virtio-mem requested size {} MiB exceeds total {} MiB",
+        status.requested_size_mib,
+        status.total_size_mib
+    );
+    anyhow::ensure!(
+        status
+            .requested_size_mib
+            .is_multiple_of(status.block_size_mib),
+        "virtio-mem requested size {} MiB is not aligned to block size {} MiB",
+        status.requested_size_mib,
+        status.block_size_mib
+    );
+    anyhow::ensure!(
+        status.plugged_size_mib <= status.total_size_mib
+            && status
+                .plugged_size_mib
+                .is_multiple_of(status.block_size_mib),
+        "virtio-mem plugged size {} MiB is invalid for total {} MiB and block size {} MiB",
+        status.plugged_size_mib,
+        status.total_size_mib,
+        status.block_size_mib
+    );
+    Ok(())
+}
 
 fn bandwidth_bucket(
     cfg: &crate::cfg::DiskRateLimitConfig,
@@ -359,6 +450,46 @@ impl SandboxBackend for FirecrackerSandbox {
 
     async fn wait_for_ready(&self) -> Result<()> {
         FirecrackerSandbox::wait_for_ready(self).await
+    }
+
+    async fn resize_memory_hotplug(
+        &mut self,
+        requested_size_mib: u32,
+    ) -> Result<MemoryResizeResult> {
+        FirecrackerSandbox::resize_memory_hotplug(self, requested_size_mib).await
+    }
+
+    async fn memory_hotplug_status(&mut self) -> Result<MemoryHotplugStatus> {
+        FirecrackerSandbox::memory_hotplug_status(self).await
+    }
+
+    async fn boot_memory_mib(&mut self) -> Result<Option<u32>> {
+        match &self.launch {
+            LaunchMode::Fresh(config) => Ok(Some(config.mem_size_mib)),
+            LaunchMode::Resume(config) => {
+                // The memory image spans the whole guest physical address
+                // space. With virtio-mem that is the boot memory plus the
+                // entire hotplug region, not just the plugged part.
+                anyhow::ensure!(
+                    config.mem_virtual_size % MIB == 0,
+                    "snapshot memory span {} bytes is not MiB-aligned",
+                    config.mem_virtual_size
+                );
+                let span_mib = u32::try_from(config.mem_virtual_size / MIB)
+                    .context("snapshot memory span exceeds u32 MiB range")?;
+                let hotplug_span_mib = if config.common.memory_hotplug.enabled {
+                    config.common.memory_hotplug.total_size_mib
+                } else {
+                    0
+                };
+                let boot_memory_mib = span_mib.checked_sub(hotplug_span_mib).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "snapshot memory span {span_mib} MiB is smaller than the virtio-mem region {hotplug_span_mib} MiB"
+                    )
+                })?;
+                Ok(Some(boot_memory_mib))
+            }
+        }
     }
 
     /// Pauses the VM and returns the paused state wrapped as a [`PausedSandboxState`].
@@ -900,6 +1031,13 @@ impl FirecrackerSandbox {
                 .notify_sandbox_ready(tools.image_config_path())
                 .await;
         }
+        if let LaunchMode::Fresh(config) = &self.launch {
+            if config.common.memory_hotplug.enabled {
+                self.resize_memory_hotplug(config.common.memory_hotplug.requested_size_mib)
+                    .await
+                    .context("apply initial virtio-mem requested size after guest readiness")?;
+            }
+        }
         if let Some(device_key) = &self.mem_snapshot_image_config_path {
             // envd is up: release held background downloads for this memory
             // device. Best-effort — downloads would also start after the
@@ -1120,6 +1258,270 @@ impl FirecrackerSandbox {
         )
     }
 
+    /// Resize the Firecracker virtio-mem region and wait for exact
+    /// convergence. Callers serialize it against pause/snapshot capture
+    /// through the backend handle.
+    #[tracing::instrument(skip(self), fields(requested_size_mib))]
+    pub async fn resize_memory_hotplug(
+        &self,
+        requested_size_mib: u32,
+    ) -> Result<MemoryResizeResult> {
+        let policy = &self.launch.common().memory_hotplug;
+        if !policy.enabled {
+            return Err(MemoryHotplugUnsupported::new(
+                "sandbox was created without a virtio-mem device",
+            )
+            .into());
+        }
+        policy
+            .validate()
+            .context("validate virtio-mem resize policy")?;
+        anyhow::ensure!(
+            requested_size_mib <= policy.total_size_mib,
+            "requested virtio-mem size {requested_size_mib} MiB exceeds total {} MiB",
+            policy.total_size_mib
+        );
+        anyhow::ensure!(
+            requested_size_mib.is_multiple_of(policy.block_size_mib),
+            "requested virtio-mem size {requested_size_mib} MiB is not aligned to block size {} MiB",
+            policy.block_size_mib
+        );
+
+        let started = Instant::now();
+        let timeout = Duration::from_secs(policy.resize_timeout_secs);
+        let poll_interval = Duration::from_millis(policy.resize_poll_interval_ms);
+
+        // The forward phase (status read, PATCH, convergence wait) shares one
+        // absolute deadline, and the rollback phase gets another, so a stuck
+        // Firecracker API can never stretch the operation past two budgets
+        // while holding the transaction lock.
+        let previous = tokio::time::timeout(
+            timeout.saturating_sub(started.elapsed()),
+            self.fc_instance.get_memory_hotplug(),
+        )
+        .await
+        .context("timed out reading virtio-mem status")??;
+        validate_memory_hotplug_status(policy, &previous)?;
+        if memory_resize_converged(&previous, requested_size_mib) {
+            return Ok(MemoryResizeResult {
+                previous_requested_size_mib: previous.requested_size_mib,
+                requested_size_mib: previous.requested_size_mib,
+                plugged_size_mib: previous.plugged_size_mib,
+                total_size_mib: previous.total_size_mib,
+                slot_size_mib: previous.slot_size_mib,
+                block_size_mib: previous.block_size_mib,
+                elapsed_ms: 0,
+            });
+        }
+
+        // A PATCH timeout means the request may have reached Firecracker, so
+        // fall through to the compensating rollback instead of trusting the
+        // failure. An explicit rejection is returned as-is.
+        let patch = tokio::time::timeout(
+            timeout.saturating_sub(started.elapsed()),
+            self.fc_instance.patch_memory_hotplug(requested_size_mib),
+        )
+        .await;
+        let (status, reason) = match patch {
+            Ok(Ok(())) => {
+                match self
+                    .wait_memory_resize_converged(
+                        policy,
+                        previous.clone(),
+                        requested_size_mib,
+                        started,
+                        timeout,
+                        poll_interval,
+                    )
+                    .await?
+                {
+                    MemoryResizeWait::Converged(status) => {
+                        let elapsed_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        debug!(
+                            requested_size_mib = status.requested_size_mib,
+                            plugged_size_mib = status.plugged_size_mib,
+                            total_size_mib = status.total_size_mib,
+                            slot_size_mib = status.slot_size_mib,
+                            block_size_mib = status.block_size_mib,
+                            elapsed_ms,
+                            status = "converged",
+                            "virtio-mem resize completed"
+                        );
+                        return Ok(MemoryResizeResult {
+                            previous_requested_size_mib: previous.requested_size_mib,
+                            requested_size_mib: status.requested_size_mib,
+                            plugged_size_mib: status.plugged_size_mib,
+                            total_size_mib: status.total_size_mib,
+                            slot_size_mib: status.slot_size_mib,
+                            block_size_mib: status.block_size_mib,
+                            elapsed_ms,
+                        });
+                    }
+                    MemoryResizeWait::TimedOut(status) => (
+                        status,
+                        "requested and plugged sizes did not converge before deadline".to_string(),
+                    ),
+                    MemoryResizeWait::ReadFailed(status, error) => {
+                        (status, format!("failed to observe resize: {error:#}"))
+                    }
+                }
+            }
+            Ok(Err(error)) => return Err(error),
+            Err(_) => (
+                previous.clone(),
+                "timed out requesting virtio-mem resize".to_string(),
+            ),
+        };
+
+        let elapsed_ms_field = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        warn!(
+            requested_size_mib = status.requested_size_mib,
+            plugged_size_mib = status.plugged_size_mib,
+            target_size_mib = requested_size_mib,
+            total_size_mib = status.total_size_mib,
+            slot_size_mib = status.slot_size_mib,
+            block_size_mib = status.block_size_mib,
+            elapsed_ms = elapsed_ms_field,
+            status = "timeout",
+            reason = reason.as_str(),
+            "virtio-mem resize failed"
+        );
+        let rollback_started = Instant::now();
+        let rollback_request = tokio::time::timeout(
+            timeout.saturating_sub(rollback_started.elapsed()),
+            self.fc_instance
+                .patch_memory_hotplug(previous.requested_size_mib),
+        )
+        .await
+        .context("timed out requesting virtio-mem rollback")
+        .and_then(|result| result);
+        if let Err(error) = rollback_request {
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            return Err(MemoryResizeConvergenceError::Partial {
+                target_size_mib: requested_size_mib,
+                rollback_target_size_mib: previous.requested_size_mib,
+                observed: status,
+                elapsed_ms,
+                reason: format!("failed to request rollback: {error:#}"),
+            }
+            .into());
+        }
+        match self
+            .wait_memory_resize_converged(
+                policy,
+                status,
+                previous.requested_size_mib,
+                rollback_started,
+                timeout,
+                poll_interval,
+            )
+            .await?
+        {
+            MemoryResizeWait::Converged(rollback) => {
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                Err(MemoryResizeConvergenceError::RolledBack {
+                    target_size_mib: requested_size_mib,
+                    rollback_target_size_mib: previous.requested_size_mib,
+                    observed: rollback,
+                    elapsed_ms,
+                }
+                .into())
+            }
+            MemoryResizeWait::TimedOut(rollback) => {
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                Err(MemoryResizeConvergenceError::Partial {
+                    target_size_mib: requested_size_mib,
+                    rollback_target_size_mib: previous.requested_size_mib,
+                    observed: rollback,
+                    elapsed_ms,
+                    reason: "rollback did not converge before deadline".to_string(),
+                }
+                .into())
+            }
+            MemoryResizeWait::ReadFailed(rollback, error) => {
+                let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                Err(MemoryResizeConvergenceError::Partial {
+                    target_size_mib: requested_size_mib,
+                    rollback_target_size_mib: previous.requested_size_mib,
+                    observed: rollback,
+                    elapsed_ms,
+                    reason: format!("failed to observe rollback: {error:#}"),
+                }
+                .into())
+            }
+        }
+    }
+
+    /// Poll the virtio-mem status until requested and plugged sizes converge
+    /// exactly on `target_size_mib`, or `timeout` measured from
+    /// `phase_started` expires. Each status read is bounded by the remaining
+    /// deadline so a stuck Firecracker API cannot outwait it. `initial_status`
+    /// is the last known status and becomes the evidence when no fresher read
+    /// succeeds.
+    async fn wait_memory_resize_converged(
+        &self,
+        policy: &crate::cfg::MemoryHotplugPolicy,
+        initial_status: MemoryHotplugStatus,
+        target_size_mib: u32,
+        phase_started: Instant,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<MemoryResizeWait> {
+        let mut last_status = initial_status;
+        loop {
+            let Some(remaining) = timeout.checked_sub(phase_started.elapsed()) else {
+                return Ok(MemoryResizeWait::TimedOut(last_status));
+            };
+            let status = match tokio::time::timeout(
+                remaining,
+                self.fc_instance.get_memory_hotplug(),
+            )
+            .await
+            {
+                Ok(Ok(status)) => status,
+                Ok(Err(error)) => {
+                    return Ok(MemoryResizeWait::ReadFailed(last_status, error));
+                }
+                Err(_) => return Ok(MemoryResizeWait::TimedOut(last_status)),
+            };
+            // A status that fails validation is evidence of an inconsistent
+            // device, not a reason to abandon the VM state: report it through
+            // the observed-failure path so the caller can run its
+            // compensating rollback with the latest known-good status.
+            if let Err(error) = validate_memory_hotplug_status(policy, &status) {
+                return Ok(MemoryResizeWait::ReadFailed(last_status, error));
+            }
+            if memory_resize_converged(&status, target_size_mib) {
+                return Ok(MemoryResizeWait::Converged(status));
+            }
+            last_status = status;
+            // Recompute the budget at sleep time since the read above may
+            // have consumed most of it. The sleep must not overshoot the
+            // phase deadline either.
+            let remaining = timeout.saturating_sub(phase_started.elapsed());
+            sleep(poll_interval.min(remaining)).await;
+        }
+    }
+
+    pub async fn memory_hotplug_status(&self) -> Result<MemoryHotplugStatus> {
+        let policy = &self.launch.common().memory_hotplug;
+        if !policy.enabled {
+            return Err(MemoryHotplugUnsupported::new(
+                "sandbox was created without a virtio-mem device",
+            )
+            .into());
+        }
+        let status = tokio::time::timeout(
+            Duration::from_secs(policy.resize_timeout_secs),
+            self.fc_instance.get_memory_hotplug(),
+        )
+        .await
+        .context("timed out reading virtio-mem status")??;
+        validate_memory_hotplug_status(policy, &status)?;
+        Ok(status)
+    }
+
     /// Pause the running sandbox and create a snapshot for later resume.
     ///
     /// This produces `vm_state.bin`, an overlaybd memory layer, and rootfs state
@@ -1270,6 +1672,19 @@ impl FirecrackerSandbox {
             .cloned()
             .collect::<Vec<_>>();
         let mut snapshot_common = self.launch.common().clone();
+        if snapshot_common.memory_hotplug.enabled {
+            let status = self
+                .memory_hotplug_status()
+                .await
+                .context("read virtio-mem status while capturing snapshot")?;
+            anyhow::ensure!(
+                status.plugged_size_mib == status.requested_size_mib,
+                "refusing snapshot with partially converged virtio-mem state: requested={} plugged={}",
+                status.requested_size_mib,
+                status.plugged_size_mib
+            );
+            snapshot_common.memory_hotplug.requested_size_mib = status.requested_size_mib;
+        }
         snapshot_common.network_policy = self.current_network_policy.clone();
         snapshot_common.custom_extension_params = self.current_custom_extension_params.clone();
         snapshot_common.extra_drives = snapshot_extra_drives.clone();
@@ -1308,6 +1723,7 @@ impl FirecrackerSandbox {
         .context("build firecracker snapshot manifest")?;
         manifest.volume_drive_slots = snapshot_common.volume_drive_slots;
         manifest.physical_extra_drive_count = manifest_extra_drives.len();
+        manifest.memory_hotplug = snapshot_common.memory_hotplug.clone();
 
         let snapshot = FirecrackerSnapshotConfig {
             common: snapshot_common,
@@ -1870,6 +2286,8 @@ impl FirecrackerSandbox {
 
         boot_args =
             add_damon_monitor_region(boot_args, config.mem_size_mib, std::env::consts::ARCH);
+        boot_args =
+            ensure_memory_hotplug_boot_arg(boot_args, config.common.memory_hotplug.enabled)?;
 
         // ── Spawn Firecracker inside the network namespace so it can access tap0 ──
         let firecracker_binary = config.common.firecracker_binary.clone();
@@ -2242,6 +2660,22 @@ impl FirecrackerSandbox {
                     })?;
             }
         }
+
+        if config.common.memory_hotplug.enabled {
+            let status = self
+                .memory_hotplug_status()
+                .await
+                .context("read restored virtio-mem status")?;
+            anyhow::ensure!(
+                status.requested_size_mib == config.common.memory_hotplug.requested_size_mib
+                    && status.plugged_size_mib == config.common.memory_hotplug.requested_size_mib,
+                "restored virtio-mem size mismatch: expected requested/plugged={}, got requested={} plugged={}",
+                config.common.memory_hotplug.requested_size_mib,
+                status.requested_size_mib,
+                status.plugged_size_mib
+            );
+        }
+
         let mmds_metadata = self.mmds_metadata(&config.common);
         self.fc_instance.set_mmds(&mmds_metadata).await?;
 
@@ -2346,6 +2780,17 @@ impl FirecrackerSandbox {
                 config.common.track_dirty_pages,
             )
             .await?;
+
+        if config.common.memory_hotplug.enabled {
+            let policy = &config.common.memory_hotplug;
+            self.fc_instance
+                .put_memory_hotplug(
+                    policy.total_size_mib,
+                    policy.slot_size_mib,
+                    policy.block_size_mib,
+                )
+                .await?;
+        }
 
         if let Some(cpu_json) = config.common.cpu_config_json.as_deref() {
             if !cpu_json.is_empty() {
@@ -3023,6 +3468,56 @@ mod tests {
         assert!(common.volume_drive_slots >= 1);
         assert_eq!(common.extra_drives, vec![physical_drive, volume_drive]);
         Ok(())
+    }
+
+    fn memory_status(requested: u32, plugged: u32) -> MemoryHotplugStatus {
+        MemoryHotplugStatus {
+            total_size_mib: 512,
+            slot_size_mib: 128,
+            block_size_mib: 2,
+            requested_size_mib: requested,
+            plugged_size_mib: plugged,
+        }
+    }
+
+    #[test]
+    fn memory_hotplug_boot_arg_is_added_and_conflicts_fail() {
+        let added = ensure_memory_hotplug_boot_arg(Some("console=ttyS0".into()), true)
+            .unwrap()
+            .unwrap();
+        assert!(added.contains("memhp_default_state=online_movable"));
+        let unchanged =
+            ensure_memory_hotplug_boot_arg(Some("memhp_default_state=online_movable".into()), true)
+                .unwrap();
+        assert_eq!(
+            unchanged.as_deref(),
+            Some("memhp_default_state=online_movable")
+        );
+        assert!(
+            ensure_memory_hotplug_boot_arg(Some("memhp_default_state=online".into()), true)
+                .is_err()
+        );
+        assert!(ensure_memory_hotplug_boot_arg(
+            Some("memhp_default_state=online_movable memhp_default_state=online_movable".into()),
+            true
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn memory_resize_converged_requires_exact_requested_and_plugged() {
+        assert!(memory_resize_converged(&memory_status(256, 256), 256));
+        assert!(!memory_resize_converged(&memory_status(256, 128), 256));
+        assert!(!memory_resize_converged(&memory_status(256, 512), 256));
+        assert!(!memory_resize_converged(&memory_status(128, 128), 256));
+    }
+
+    #[tokio::test]
+    async fn boot_memory_mib_reports_fresh_boot_memory() {
+        let mut config = fresh_config();
+        config.mem_size_mib = 256;
+        let mut sandbox = FirecrackerSandbox::new(config).expect("sandbox");
+        assert_eq!(sandbox.boot_memory_mib().await.unwrap(), Some(256));
     }
 
     fn overlaybd_config() -> FirecrackerSandboxConfig {
