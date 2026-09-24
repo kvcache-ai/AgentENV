@@ -25,7 +25,7 @@ use crate::snapshot::repository::{RepositoryError, RepositoryResult};
 /// exactly the bytes that will be uploaded.
 ///
 /// Owns the temporary recontainerized copy (when one was produced) so it is
-/// removed once the upload completes.
+/// removed once upload and post-commit P2P publication complete.
 #[derive(Debug)]
 pub(crate) struct PreparedLayerUpload {
     path: PathBuf,
@@ -44,6 +44,14 @@ impl PreparedLayerUpload {
     /// `sha256:<hex>` digest of the bytes at [`Self::path`].
     pub(crate) fn digest(&self) -> &str {
         &self.digest
+    }
+
+    /// Keep a dense-export temporary file alive when preparation passed it
+    /// through unchanged. A compressed output already owns its own temporary.
+    pub(crate) fn retain_source(&mut self, source: NamedTempFile) {
+        if self._temp.is_none() {
+            self._temp = Some(source);
+        }
     }
 
     /// Byte size of the file at [`Self::path`].
@@ -364,6 +372,36 @@ mod tests {
         assert!(path.exists());
         drop(prepared);
         assert!(!path.exists(), "temporary zfile must be removed on drop");
+    }
+
+    #[tokio::test]
+    async fn retained_source_lives_until_prepared_upload_is_dropped() {
+        let dir = TempDir::new().expect("tempdir");
+        let raw = create_sealed_layer(dir.path(), "raw", false).await;
+        for mode in [OverlaybdCompactOutput::Raw, zfile_mode()] {
+            let source = NamedTempFile::new().expect("temporary source");
+            std::fs::copy(&raw, source.path()).expect("copy source");
+            let source_path = source.path().to_path_buf();
+            let mut prepared = prepare_layer_upload(source.path(), mode, None)
+                .await
+                .expect("prepare upload");
+            let upload_path = prepared.path().to_path_buf();
+            prepared.retain_source(source);
+
+            assert_eq!(
+                read_layer_contents(&upload_path).await,
+                read_layer_contents(&raw).await
+            );
+            if upload_path != source_path {
+                assert!(
+                    !source_path.exists(),
+                    "compressed output no longer needs its source"
+                );
+            }
+            drop(prepared);
+            assert!(!upload_path.exists(), "upload temporary must be cleaned up");
+            assert!(!source_path.exists(), "source temporary must be cleaned up");
+        }
     }
 
     #[tokio::test]

@@ -2,15 +2,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use agentenv::cfg::{
-    ConfigManager, OssBackendConfig, OverlaybdCompressionAlgorithm,
+    AppConfig, ConfigManager, OssBackendConfig, OverlaybdCompressionAlgorithm,
     SnapshotPublishCompressionConfig,
 };
-use agentenv::sandbox::SandboxSnapshotManifest;
+use agentenv::identity::NodeIdentity;
+use agentenv::p2p::{transport_from_config, P2pArtifactProviderHint, P2pTransport};
+use agentenv::sandbox::{CapturedSandboxSnapshot, SandboxSnapshotManifest};
 use agentenv::snapshot::mock::write_mock_built_artifacts;
 use agentenv::snapshot::repository::backends::OssBackend;
 use agentenv::snapshot::{
     OverlaybdLayerRef, RepositoryError, SnapshotAlias, SnapshotId, SnapshotListFilter,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRuntimeVersions,
+    SnapshotManager, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRuntimeVersions,
     SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use agentenv::types::SandboxResources;
@@ -194,8 +196,132 @@ fn test_oss_config(fixture: &MinioFixture, prefix: &str) -> OssBackendConfig {
     }
 }
 
+async fn test_p2p_transport(root: &Path, node_id: &str) -> Result<Arc<dyn P2pTransport>> {
+    let mut config = AppConfig::default();
+    config.p2p.enabled = true;
+    config.p2p.store_dir = root.join(node_id);
+    config.p2p.listen_addr = "127.0.0.1:0".to_string();
+    config.node_identity.node_id = Some(node_id.to_string());
+    transport_from_config(&config, &NodeIdentity::from_config(&config.node_identity)).await
+}
+
+async fn assert_peer_layer(
+    provider: &Arc<dyn P2pTransport>,
+    consumer: &Arc<dyn P2pTransport>,
+    digest: &str,
+    expected: &[u8],
+) -> Result<()> {
+    let key = format!("overlaybd-layer/v1/{digest}");
+    let hints = [P2pArtifactProviderHint {
+        node_id: Some("provider".to_string()),
+        endpoint: provider.local_endpoint(),
+    }];
+    let descriptor = consumer
+        .lookup_with_hints(&key, &hints)
+        .await?
+        .with_context(|| format!("committed layer {digest} was not published to the peer"))?;
+    let bytes = consumer.fetch_bytes(&descriptor).await?;
+    assert_eq!(
+        bytes.as_ref(),
+        expected,
+        "peer must serve the exact committed bytes"
+    );
+    assert_eq!(digest_for_bytes(&bytes), digest);
+    Ok(())
+}
+
 fn prefixed_key(prefix: &str, relative: &str) -> String {
     format!("{prefix}/{relative}")
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn snapshot_oss_publish_retains_dense_delta_for_p2p() -> Result<()> {
+    let fixture = MinioFixture::start().await?;
+    ensure_test_config()?;
+    for enabled in [false, true] {
+        let workspace = TempDir::new()?;
+        let prefix = format!("snapshots/e2e-dense-{enabled}");
+        let oss = test_oss_config(&fixture, &prefix);
+        let (repository, resolver) = OssBackend::new_with_publish_compression(
+            &oss,
+            workspace.path().join("oss-cache"),
+            &SnapshotPublishCompressionConfig {
+                enabled,
+                algorithm: OverlaybdCompressionAlgorithm::Lz4,
+                workers: 1,
+            },
+        )?
+        .into_parts();
+        let provider = test_p2p_transport(workspace.path(), "provider").await?;
+        let consumer = test_p2p_transport(workspace.path(), "consumer").await?;
+        let manager = SnapshotManager::from_parts(repository, resolver, Some(provider.clone()));
+        let capture_root = TempDir::new_in(workspace.path())?;
+        let (_, _, manifest) = write_raw_built_artifacts(capture_root.path()).await?;
+        let delta_path = capture_root.path().join("snapshot.commit");
+        let data: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&delta_path)?);
+        let delta = LSMTFile::create(data, None, 2 * 4096, true).await?;
+        delta.write_at(0, &[0xBC; 4096]).await?;
+        delta.close_seal().await?;
+        drop(delta);
+        // A captured sparse rootfs delta has neither digest nor size in image.json.
+        std::fs::write(
+            &manifest.rootfs.image_config_path,
+            serde_json::to_vec(&serde_json::json!({"lowers": [{"file": delta_path}]}))?,
+        )?;
+        let metadata = SnapshotPublishMetadata {
+            id: SnapshotId::generate(),
+            alias: None,
+            source: SnapshotPublishSource::Sandbox {
+                source_sandbox_id: "source".to_string(),
+            },
+            context: agentenv::snapshot::CommandContext::default(),
+            startup: None,
+            resources: SandboxResources::default(),
+            runtime_versions: test_runtime_versions(),
+            virtualization_mode: ConfigManager::global_config().virtualization_mode,
+            image_configs: agentenv::types::ImageConfigs::new(),
+            volume_snapshots: Vec::new(),
+            custom_extension_params: None,
+        };
+        let stored = manager
+            .publish_captured(
+                metadata,
+                CapturedSandboxSnapshot::new(manifest, capture_root),
+            )
+            .await?;
+        assert!(
+            !delta_path.exists(),
+            "capture guard should be released after publication"
+        );
+        let committed = stored.committed.as_ref().context("committed snapshot")?;
+        let rootfs = match committed.rootfs_layers.as_slice() {
+            [OverlaybdLayerRef::Managed(layer)] => layer,
+            other => panic!("expected a managed dense delta, got {other:?}"),
+        };
+        assert!(
+            rootfs.uuid.is_none(),
+            "dense exports rely on their committed digest"
+        );
+        for managed in [rootfs, &committed.memory_layers[0]] {
+            let object = fixture
+                .client
+                .get_object()
+                .bucket(&fixture.bucket)
+                .key(format!("{prefix}/managed-layers/{}", managed.digest))
+                .send()
+                .await?
+                .body
+                .collect()
+                .await?
+                .into_bytes();
+            assert_eq!(object.len() as u64, managed.size);
+            assert_peer_layer(&provider, &consumer, &managed.digest, &object).await?;
+        }
+        consumer.shutdown().await?;
+        provider.shutdown().await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
@@ -217,12 +343,15 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
         },
     )?
     .into_parts();
+    let provider = test_p2p_transport(workspace.path(), "provider").await?;
+    let consumer = test_p2p_transport(workspace.path(), "consumer").await?;
+    let manager = SnapshotManager::from_parts(repository, resolver.clone(), Some(provider.clone()));
     let artifacts_root = workspace.path().join("local-artifacts");
     let (rootfs_digest, memory_digest, memory_lower_path, manifest) =
         write_built_artifacts(&artifacts_root).await?;
     let snapshot_id = SnapshotId::generate();
 
-    let stored = repository
+    let stored = manager
         .publish(
             SnapshotPublishMetadata {
                 id: snapshot_id.clone(),
@@ -280,6 +409,7 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
         .await?
         .into_bytes();
     assert_eq!(object_bytes.as_ref(), source_zfile_bytes.as_slice());
+    assert_peer_layer(&provider, &consumer, &memory_digest, &object_bytes).await?;
     assert!(
         fixture
             .object_exists(&format!("{prefix}/artifacts/{snapshot_id}/vm_state.bin"))
@@ -323,6 +453,8 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
         source_zfile_bytes.len() as u64
     );
 
+    consumer.shutdown().await?;
+    provider.shutdown().await?;
     Ok(())
 }
 
@@ -350,6 +482,9 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
         },
     )?
     .into_parts();
+    let provider = test_p2p_transport(workspace.path(), "provider").await?;
+    let consumer = test_p2p_transport(workspace.path(), "consumer").await?;
+    let manager = SnapshotManager::from_parts(repository, resolver.clone(), Some(provider.clone()));
     let artifacts_root = workspace.path().join("local-artifacts");
     let (rootfs_lower, memory_lower, manifest) = write_raw_built_artifacts(&artifacts_root).await?;
     let raw_rootfs_digest = digest_for_file(&rootfs_lower)?;
@@ -357,7 +492,7 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
     let raw_memory_size = std::fs::metadata(&memory_lower)?.len();
     let snapshot_id = SnapshotId::generate();
 
-    let stored = repository
+    let stored = manager
         .publish(
             SnapshotPublishMetadata {
                 id: snapshot_id,
@@ -420,6 +555,7 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
             .into_bytes();
         assert_eq!(object_bytes.len() as u64, managed.size);
         assert_eq!(digest_for_bytes(&object_bytes), managed.digest);
+        assert_peer_layer(&provider, &consumer, &managed.digest, &object_bytes).await?;
         let object_path = workspace.path().join(format!(
             "uploaded-{}.commit",
             managed.digest.replace(':', "_")
@@ -453,6 +589,8 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
     assert_eq!(rootfs_config["lowers"][0]["digest"], managed_rootfs.digest);
     assert_eq!(rootfs_config["lowers"][0]["file"], "");
 
+    consumer.shutdown().await?;
+    provider.shutdown().await?;
     Ok(())
 }
 

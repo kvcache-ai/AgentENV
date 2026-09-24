@@ -12,7 +12,9 @@ use crate::sandbox::{
     CapturedSandboxSnapshot, FirecrackerCaptureArtifacts, SandboxSnapshotManifest,
 };
 use crate::snapshot::repository::backends::build_snapshot_backend;
-use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
+use crate::snapshot::repository::interfaces::{
+    SnapshotPublication, SnapshotRepository, SnapshotRuntimeResolver,
+};
 use crate::snapshot::repository::SnapshotListFilter;
 use crate::snapshot::{
     ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
@@ -113,12 +115,12 @@ impl SnapshotManager {
         manifest: SandboxSnapshotManifest,
         recording: Option<crate::snapshot::StartupRecording>,
     ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
-        let record = self
+        let publication = self
             .repository
-            .publish(metadata.clone(), manifest.clone(), recording)
+            .publish_with_local_layers(metadata, manifest.clone(), recording)
             .await?;
-        self.publish_p2p_artifacts(&record, &manifest).await;
-        Ok(record)
+        self.publish_p2p_artifacts(&publication, &manifest).await;
+        Ok(publication.record)
     }
 
     #[tracing::instrument(skip(self, metadata), fields(snapshot_id = %metadata.id))]
@@ -145,24 +147,25 @@ impl SnapshotManager {
                 keep_alive: Box::new(artifacts.snapshot_root_guard()),
             });
 
-        let record = self
+        let publication = self
             .repository
-            .publish(metadata.clone(), manifest.clone(), recording)
+            .publish_with_local_layers(metadata, manifest.clone(), recording)
             .await?;
-        self.publish_p2p_artifacts(&record, &manifest).await;
-        Ok(record)
+        self.publish_p2p_artifacts(&publication, &manifest).await;
+        Ok(publication.record)
     }
 
     /// Best effort attempt to publish snapshot artifacts to P2P.
-    #[tracing::instrument(skip(self, record, manifest), fields(snapshot_id = %record.id))]
+    #[tracing::instrument(skip(self, publication, manifest), fields(snapshot_id = %publication.record.id))]
     async fn publish_p2p_artifacts(
         &self,
-        record: &SnapshotRecord,
+        publication: &SnapshotPublication,
         manifest: &SandboxSnapshotManifest,
     ) {
         let Some(transport) = self.p2p_transport.as_ref() else {
             return;
         };
+        let record = &publication.record;
         let snapshot_id = &record.id;
         let Some(committed) = record.committed.as_ref() else {
             return;
@@ -182,6 +185,16 @@ impl SnapshotManager {
                 manifest_bytes,
             ),
         ];
+
+        // Uploaded descriptors describe the committed bytes, including compressed
+        // and dense-exported layers. Keep their files alive until P2P copies finish.
+        artifacts.extend(publication.local_layers.iter().map(|layer| {
+            SnapshotP2pArtifact::content_addressed_overlaybd_layer(
+                layer.path(),
+                layer.digest(),
+                layer.size(),
+            )
+        }));
 
         // Collect any overlaybd layers referenced by this snapshot's runtime images.
         let rootfs_uuids = managed_layer_uuids(&committed.rootfs_layers);
@@ -217,6 +230,10 @@ impl SnapshotManager {
                 &drive_uuids,
             ));
         }
+
+        // An unchanged local layer may appear in both the uploads and image config.
+        let mut keys = HashSet::new();
+        artifacts.retain(|artifact| keys.insert(artifact.key.clone()));
 
         // Publish all artifacts concurrently, but don't fail if any individual artifact fails to publish.
         stream::iter(artifacts)
@@ -464,5 +481,45 @@ mod tests {
             .await
             .expect("lookup rootfs layer")
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_repository_commit_does_not_publish_to_p2p() {
+        let p2p = Arc::new(MockTransport::default());
+        let manager = SnapshotManager::from_parts(
+            Arc::new(crate::snapshot::mock::MockSnapshotRepository),
+            Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver),
+            Some(p2p.clone()),
+        );
+        let workspace = TempDir::new().expect("tempdir");
+        let (_, _, manifest) = write_mock_built_artifacts(workspace.path()).expect("artifacts");
+        manager
+            .publish(SnapshotPublishMetadata::mock(), manifest, None)
+            .await
+            .expect_err("repository rejects publication");
+        assert_eq!(
+            p2p.publish_count.load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_p2p_publication_does_not_undo_repository_commit() {
+        let workspace = TempDir::new().expect("tempdir");
+        let mut manager = test_manager(workspace.path());
+        let p2p = Arc::new(MockTransport::default());
+        p2p.fail_publish
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        manager.p2p_transport = Some(p2p.clone());
+        let (_, _, manifest) =
+            write_mock_built_artifacts(&workspace.path().join("artifacts")).expect("artifacts");
+        let stored = manager
+            .publish(SnapshotPublishMetadata::mock(), manifest, None)
+            .await
+            .expect("P2P failure must not fail the commit");
+        assert!(p2p.publish_count.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        let loaded = manager.get(stored.id.to_string()).await.unwrap().unwrap();
+        assert_eq!(loaded.id, stored.id);
+        assert!(loaded.committed.is_some());
     }
 }

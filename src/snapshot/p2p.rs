@@ -134,10 +134,8 @@ impl SnapshotP2pArtifact {
                         // recontainerized the local raw layer as zfile during
                         // upload. Publishing the raw file under its raw digest
                         // would create a key no consumer ever looks up.
-                        // TODO: propagate the uploaded (compressed) layer
-                        // paths out of repository publish so digest-keyed P2P
-                        // publication can advertise the same bytes the
-                        // committed manifest records.
+                        // The manager publishes the prepared upload separately,
+                        // using its committed descriptor and retained file.
                         debug!(
                             path = %layer.file,
                             digest = %layer.digest,

@@ -10,6 +10,14 @@ use crate::snapshot::types::{
     TemplateBuildErrorReason, TemplateBuildStatus,
 };
 
+/// A committed snapshot and the local upload files kept alive for post-commit
+/// publication. Temporary paths are never stored in the durable record.
+#[derive(Debug)]
+pub struct SnapshotPublication {
+    pub record: SnapshotRecord,
+    pub(crate) local_layers: Vec<super::backends::common::recontainerize::PreparedLayerUpload>,
+}
+
 /// Snapshot record list filter.
 ///
 /// When multiple fields are present they combine with AND semantics.
@@ -161,6 +169,20 @@ pub trait SnapshotRepository: Send + Sync {
         manifest: SandboxSnapshotManifest,
         recording: Option<crate::snapshot::StartupRecording>,
     ) -> RepositoryResult<SnapshotRecord>;
+
+    /// Like `publish`, retaining any transformed local layer files until the
+    /// caller finishes best-effort P2P publication after the durable commit.
+    async fn publish_with_local_layers(
+        &self,
+        metadata: SnapshotPublishMetadata,
+        manifest: SandboxSnapshotManifest,
+        recording: Option<crate::snapshot::StartupRecording>,
+    ) -> RepositoryResult<SnapshotPublication> {
+        Ok(SnapshotPublication {
+            record: self.publish(metadata, manifest, recording).await?,
+            local_layers: Vec::new(),
+        })
+    }
 
     /// Loads one snapshot record by repository id or alias.
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>>;
