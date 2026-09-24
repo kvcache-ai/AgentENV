@@ -36,10 +36,10 @@
             const path_to_root = "../../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../../searchindex-980902f7.js";
+            window.path_to_searchindex_js = "../../searchindex-e14be1b7.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../../toc-c8205cda.js"></script>
+        <script src="../../toc-d7504e7d.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -297,6 +297,48 @@ Each entry contains either a <code>sandbox</code> object—including its <code>s
 IDs. A non-201 response means the request failed before any child was attempted.
 See the <a href="../../api/index.html">API Reference</a> for the complete fork request and
 response schemas.</p>
+<h2 id="view-resource-metrics"><a class="header" href="#view-resource-metrics">View Resource Metrics</a></h2>
+<p>Get the retained metrics for one sandbox:</p>
+<pre><code class="language-bash">curl -H "X-API-Key: $AENV_API_KEY" \
+  "$AENV_URL/sandboxes/$SANDBOX_ID/metrics?start=1700000000&amp;end=1700003600"
+</code></pre>
+<p><code>start</code> and <code>end</code> are optional Unix timestamps in seconds and define an inclusive
+time range. When omitted, the endpoint returns all retained samples for the
+sandbox in timestamp order.</p>
+<p>Get the latest metric for several sandboxes:</p>
+<pre><code class="language-bash">curl -H "X-API-Key: $AENV_API_KEY" \
+  "$AENV_URL/sandboxes/metrics?sandbox_ids=$SANDBOX_ID,$OTHER_SANDBOX_ID"
+</code></pre>
+<p><code>sandbox_ids</code> is required and accepts a comma-separated list of up to 100 unique
+sandbox IDs. The response contains the latest available metric for each requested
+running sandbox. Sandboxes without an available metric are omitted.</p>
+<p>Each metric contains:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>timestampUnix</code></td><td>Sample time as Unix seconds.</td></tr>
+<tr><td><code>cpuCount</code></td><td>Number of CPU cores.</td></tr>
+<tr><td><code>cpuUsedPct</code></td><td>CPU usage percentage.</td></tr>
+<tr><td><code>memUsed</code></td><td>Memory used in bytes.</td></tr>
+<tr><td><code>memTotal</code></td><td>Total memory in bytes.</td></tr>
+<tr><td><code>memCache</code></td><td>Cached memory in bytes.</td></tr>
+<tr><td><code>diskUsed</code></td><td>Disk space used in bytes.</td></tr>
+<tr><td><code>diskTotal</code></td><td>Total disk space in bytes.</td></tr>
+</tbody>
+</table>
+</div>
+<p>See the <a href="../../api/index.html">API Reference</a> for complete request, response, and
+error schemas.</p>
+<p>Configure collection under <code>[orchestrator]</code> in your config file:</p>
+<pre><code class="language-toml">[orchestrator]
+metrics_interval_secs = 15
+metrics_retention_secs = 3600
+</code></pre>
+<p><code>metrics_interval_secs</code> sets the collection interval in seconds; <code>0</code> disables
+collection. <code>metrics_retention_secs</code> sets how long samples remain available.</p>
 <h2 id="manage-sandboxes"><a class="header" href="#manage-sandboxes">Manage Sandboxes</a></h2>
 <p>List sandboxes:</p>
 <pre><code class="language-bash">aenv list  # alias: aenv ls
