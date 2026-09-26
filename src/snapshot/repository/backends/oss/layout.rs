@@ -18,6 +18,10 @@ impl<'a> OssSnapshotArtifactLayout<'a> {
         format!("catalog/records/{id}.json")
     }
 
+    pub(super) fn build_log_key(id: &SnapshotId) -> String {
+        format!("snapshots/build-logs/{id}.json")
+    }
+
     pub(super) fn volume_record_key(volume_id: &str) -> String {
         format!("volumes/records/{volume_id}.json")
     }

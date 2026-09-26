@@ -1,5 +1,6 @@
 use std::{net::SocketAddr, time::Duration};
 
+use crate::template::logs::{BuildLogLevel, BuildLogger};
 use anyhow::{bail, Context, Result};
 use tonic::transport::{Channel, Endpoint};
 
@@ -29,8 +30,14 @@ impl BuildkitHistory {
 
     /// Replay completed records as well as live events, including after reconnect.
     /// Cache seeds contain old history; only this build's unique exporter name counts.
-    pub(crate) async fn wait_for_image(&self, build_id: &str) -> Result<String> {
+    pub(crate) async fn wait_for_image(
+        &self,
+        build_id: &str,
+        logger: &BuildLogger,
+    ) -> Result<String> {
         let image_name = build_image_name(build_id);
+        let mut collectors = tokio::task::JoinSet::new();
+        let mut collecting = false;
         loop {
             let result = async {
                 let mut stream = self
@@ -40,6 +47,32 @@ impl BuildkitHistory {
                     .await?
                     .into_inner();
                 while let Some(event) = stream.message().await? {
+                    let ours = event.record.as_ref().is_some_and(|record| {
+                        record.exporters.iter().any(|exporter| {
+                            exporter.r#type == "image"
+                                && exporter.attrs.get("name") == Some(&image_name)
+                        })
+                    });
+                    if ours && !collecting {
+                        let client = self.client.clone();
+                        let reference = event.record.as_ref().unwrap().r#ref.clone();
+                        let logger = logger.clone();
+                        collectors
+                            .spawn(async move { collect_status(client, reference, logger).await });
+                        collecting = true;
+                    }
+                    if ours && event.r#type == 1 {
+                        match tokio::time::timeout(Duration::from_secs(10), collectors.join_next())
+                            .await
+                        {
+                            Ok(Some(Ok(Ok(())))) => {}
+                            other => logger.log(
+                                BuildLogLevel::Warn,
+                                None,
+                                format!("BuildKit log collection did not finish: {other:?}"),
+                            ),
+                        }
+                    }
                     if let Some(digest) = completed_image(event, &image_name)? {
                         return Ok(digest);
                     }
@@ -66,6 +99,119 @@ impl BuildkitHistory {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
+}
+
+#[derive(Default)]
+struct VertexProgress {
+    started: bool,
+    finished: bool,
+    cached: bool,
+    error: Option<String>,
+}
+
+fn vertex_updates(
+    vertex: &proto::Vertex,
+    progress: &mut VertexProgress,
+) -> Vec<(BuildLogLevel, String)> {
+    let mut updates = Vec::new();
+    if vertex.started.is_some() && !progress.started && !progress.finished {
+        progress.started = true;
+        updates.push((BuildLogLevel::Info, "started".to_owned()));
+    }
+    if !vertex.error.is_empty() {
+        if progress.error.as_deref() != Some(&vertex.error) {
+            progress.error = Some(vertex.error.clone());
+            updates.push((BuildLogLevel::Error, vertex.error.clone()));
+        }
+        progress.finished = true;
+    } else if vertex.cached {
+        if !progress.cached {
+            progress.cached = true;
+            updates.push((BuildLogLevel::Info, "cached".to_owned()));
+        }
+        progress.finished = true;
+    } else if vertex.completed.is_some() && !progress.finished {
+        progress.finished = true;
+        updates.push((BuildLogLevel::Info, "completed".to_owned()));
+    }
+    updates
+}
+
+/// Status replays both active and historical solves. Keep occurrence counts so
+/// reconnects do not duplicate logs, including repeated identical output.
+async fn collect_status(
+    mut client: proto::control_client::ControlClient<Channel>,
+    reference: String,
+    logger: BuildLogger,
+) -> Result<()> {
+    use std::collections::HashMap;
+    let mut seen = HashMap::new();
+    let mut vertices = HashMap::new();
+    for attempt in 0..4 {
+        let mut occurrences = HashMap::new();
+        let result = async {
+            let mut stream = client
+                .status(proto::StatusRequest {
+                    r#ref: reference.clone(),
+                })
+                .await?
+                .into_inner();
+            while let Some(status) = stream.message().await? {
+                for vertex in status.vertexes {
+                    if vertex.started.is_none() && vertex.completed.is_none() {
+                        continue;
+                    }
+                    if !vertices.contains_key(&vertex.digest) && vertices.len() >= 32_768 {
+                        continue;
+                    }
+                    let progress = vertices.entry(vertex.digest.clone()).or_default();
+                    for (level, phase) in vertex_updates(&vertex, progress) {
+                        logger.log(level, None, format!("{}: {phase}", vertex.name));
+                    }
+                }
+                for entry in status.logs {
+                    if seen.len() >= 32_768 {
+                        continue;
+                    }
+                    let timestamp = entry.timestamp.map(|t| (t.seconds, t.nanos));
+                    // Hash message bytes rather than retaining a second copy of output.
+                    use sha2::Digest;
+                    let key = (
+                        entry.vertex,
+                        timestamp,
+                        entry.stream,
+                        <[u8; 32]>::from(sha2::Sha256::digest(&entry.msg)),
+                    );
+                    let count = occurrences.entry(key.clone()).or_insert(0usize);
+                    *count += 1;
+                    let previous = seen.entry(key).or_insert(0);
+                    if *count > *previous {
+                        logger.output(None, entry.stream == 2, &entry.msg);
+                        *previous = *count;
+                    }
+                }
+                // Warnings are emitted only on the initial subscription; replayed
+                // process output and vertex errors above retain their severity.
+                if attempt == 0 {
+                    for warning in status.warnings {
+                        logger.log(
+                            BuildLogLevel::Warn,
+                            None,
+                            String::from_utf8_lossy(&warning.short),
+                        );
+                    }
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt == 3 => return Err(error),
+            Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+    unreachable!()
 }
 
 fn completed_image(event: proto::BuildHistoryEvent, image_name: &str) -> Result<Option<String>> {
@@ -109,6 +255,37 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    #[test]
+    fn vertex_progress_does_not_regress_or_repeat_replayed_states() {
+        let timestamp = || prost_types::Timestamp {
+            seconds: 1,
+            nanos: 0,
+        };
+        let mut progress = VertexProgress::default();
+        let completed = proto::Vertex {
+            digest: "vertex".into(),
+            name: "load .dockerignore".into(),
+            started: Some(timestamp()),
+            completed: Some(timestamp()),
+            ..Default::default()
+        };
+        assert_eq!(
+            vertex_updates(&completed, &mut progress),
+            vec![
+                (BuildLogLevel::Info, "started".to_owned()),
+                (BuildLogLevel::Info, "completed".to_owned()),
+            ]
+        );
+        let replayed_start = proto::Vertex {
+            digest: "vertex".into(),
+            name: "load .dockerignore".into(),
+            started: Some(timestamp()),
+            ..Default::default()
+        };
+        assert!(vertex_updates(&replayed_start, &mut progress).is_empty());
+        assert!(vertex_updates(&completed, &mut progress).is_empty());
+    }
 
     fn completed(name: &str) -> BuildHistoryEvent {
         BuildHistoryEvent {
@@ -195,9 +372,47 @@ mod tests {
         );
     }
 
-    struct History(Arc<AtomicUsize>);
+    struct History(Arc<AtomicUsize>, Arc<AtomicUsize>);
     #[tonic::async_trait]
     impl Control for History {
+        type StatusStream =
+            futures::stream::Iter<std::vec::IntoIter<Result<proto::StatusResponse, tonic::Status>>>;
+        async fn status(
+            &self,
+            request: tonic::Request<proto::StatusRequest>,
+        ) -> Result<tonic::Response<Self::StatusStream>, tonic::Status> {
+            assert_eq!(request.get_ref().r#ref, "solve-id");
+            let output = proto::VertexLog {
+                vertex: "vertex".into(),
+                timestamp: Some(prost_types::Timestamp {
+                    seconds: 1,
+                    nanos: 2,
+                }),
+                stream: 2,
+                msg: b"output\n".to_vec(),
+            };
+            let mut events = vec![Ok(proto::StatusResponse {
+                logs: vec![output.clone(), output],
+                ..Default::default()
+            })];
+            if self.1.fetch_add(1, Ordering::SeqCst) == 0 {
+                events.push(Err(tonic::Status::unavailable("status disconnected")));
+            } else {
+                events.push(Ok(proto::StatusResponse {
+                    logs: vec![proto::VertexLog {
+                        vertex: "vertex".into(),
+                        timestamp: Some(prost_types::Timestamp {
+                            seconds: 2,
+                            nanos: 0,
+                        }),
+                        stream: 1,
+                        msg: b"last\n".to_vec(),
+                    }],
+                    ..Default::default()
+                }));
+            }
+            Ok(tonic::Response::new(futures::stream::iter(events)))
+        }
         type ListenBuildHistoryStream =
             futures::stream::Iter<std::vec::IntoIter<Result<BuildHistoryEvent, tonic::Status>>>;
         async fn listen_build_history(
@@ -229,7 +444,8 @@ mod tests {
         let incoming = futures::stream::unfold(listener, |listener| async {
             Some((listener.accept().await.map(|(socket, _)| socket), listener))
         });
-        let service = ControlServer::new(History(calls.clone()));
+        let status_calls = Arc::new(AtomicUsize::new(0));
+        let service = ControlServer::new(History(calls.clone(), status_calls.clone()));
         let server = tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(service)
@@ -238,10 +454,38 @@ mod tests {
                 .unwrap();
         });
         let client = BuildkitHistory::connect(address).await?;
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), client.wait_for_image("current")).await;
+        let root = tempfile::tempdir()?;
+        let repository = crate::snapshot::repository::backends::PosixFsBackend::new(
+            crate::snapshot::repository::backends::PosixFsBackendConfig {
+                root: root.path().join("repository"),
+                cache_root: Some(root.path().join("cache")),
+                runtime_cache_root: None,
+            },
+        )?
+        .repository();
+        let logs = crate::template::logs::BuildLogs::default();
+        let id = crate::snapshot::SnapshotId::generate();
+        let session = logs.start(id.clone(), repository);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.wait_for_image("current", &session.logger),
+        )
+        .await;
         server.abort();
         assert_eq!(result??, crate::digest::sha256_digest(b"image"));
+        let entries = logs.temporary(&id).unwrap();
+        session.finish().await?;
+        assert!(logs.temporary(&id).is_none());
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["output", "output", "last"]
+        );
+        assert_eq!(entries[0].level, BuildLogLevel::Warn);
+        assert_eq!(entries[2].level, BuildLogLevel::Info);
+        assert_eq!(status_calls.load(Ordering::SeqCst), 2);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         Ok(())
     }

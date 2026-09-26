@@ -39,6 +39,37 @@ impl PosixFsCatalogStore {
         Self { root }
     }
 
+    pub(crate) fn write_build_logs(
+        &self,
+        id: &SnapshotId,
+        entries: &[crate::template::logs::BuildLogEntry],
+    ) -> RepositoryResult<()> {
+        self.write_json(
+            &PosixFsSnapshotArtifactLayout::build_log_path(&self.root, id),
+            &entries,
+        )
+    }
+
+    pub(crate) fn read_build_logs(
+        &self,
+        id: &SnapshotId,
+    ) -> RepositoryResult<Vec<crate::template::logs::BuildLogEntry>> {
+        let path = PosixFsSnapshotArtifactLayout::build_log_path(&self.root, id);
+        match self.read_json(&path) {
+            Ok(entries) => Ok(entries),
+            Err(RepositoryError::Backend {
+                source: Some(error),
+                ..
+            }) if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                Ok(Vec::new())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn layout(&self, snapshot_id: &SnapshotId) -> PosixFsSnapshotArtifactLayout {
         PosixFsSnapshotArtifactLayout::new(&self.root, snapshot_id)
     }
@@ -251,6 +282,9 @@ impl PosixFsCatalogStore {
             // Idempotent: already doesn't exist
             return Ok(());
         };
+        self.remove_file_if_exists(&PosixFsSnapshotArtifactLayout::build_log_path(
+            &self.root, id,
+        ))?;
         if let Some(alias) = record.alias.as_ref() {
             self.with_alias_lock(alias, |store| {
                 let snapshot_layout = PosixFsSnapshotArtifactLayout::new(&store.root, id);

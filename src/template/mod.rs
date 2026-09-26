@@ -1,6 +1,7 @@
 mod build_spec;
 mod builder;
 mod errors;
+pub mod logs;
 mod runner;
 mod step_executor;
 

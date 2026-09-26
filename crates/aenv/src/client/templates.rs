@@ -99,8 +99,16 @@ pub struct TemplateBuildInfo {
     #[serde(rename = "buildID")]
     pub build_id: String,
     pub status: String,
+    #[serde(default, rename = "logEntries")]
+    pub log_entries: Vec<BuildLogEntry>,
     #[serde(default)]
     pub reason: Option<BuildStatusReason>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct BuildLogEntry {
+    pub level: String,
+    pub message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,10 +157,11 @@ impl Client {
         &self,
         template_id: &str,
         build_id: &str,
+        logs_offset: usize,
     ) -> Result<TemplateBuildInfo> {
         let resp = handle_status(
             self.get(&format!(
-                "/templates/{template_id}/builds/{build_id}/status"
+                "/templates/{template_id}/builds/{build_id}/status?logsOffset={logs_offset}"
             ))
             .call(),
         )?;
