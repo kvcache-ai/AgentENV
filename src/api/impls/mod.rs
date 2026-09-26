@@ -40,6 +40,7 @@ pub struct ApiImpl {
     sandbox_proxy_domains: Vec<String>,
     api_key: ApiKey,
     build_sessions: Arc<image_build::BuildSessions>,
+    build_logs: crate::template::logs::BuildLogs,
 }
 
 impl ApiImpl {
@@ -65,6 +66,7 @@ impl ApiImpl {
             sandbox_proxy_domains,
             api_key,
             build_sessions: Arc::new(image_build::BuildSessions::default()),
+            build_logs: Default::default(),
         }
     }
 

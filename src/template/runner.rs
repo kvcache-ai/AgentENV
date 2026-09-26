@@ -58,6 +58,7 @@ pub(crate) enum TemplateBuildBase {
 
 #[derive(Debug)]
 pub(crate) struct TemplateBuildContext {
+    pub logger: super::logs::BuildLogger,
     pub build_snapshot_id: SnapshotId,
     pub alias: Option<SnapshotAlias>,
     pub initial_context: CommandContext,
@@ -254,6 +255,7 @@ impl TemplateBuildRunner {
             tools_drive_version,
         } = inputs;
         let worker_span = tracing::debug_span!("template_build_sandbox", sandbox_id = %sandbox_id);
+        let logger = context.logger.clone();
         let step_executor = self.step_executor.clone();
         let steps = context.steps.clone();
         let output_dir = context.local_dir().to_path_buf();
@@ -279,11 +281,11 @@ impl TemplateBuildRunner {
                         debug!("template build sandbox started");
 
                         let build_context = step_executor
-                            .execute(&sandbox, &steps, initial_context)
+                            .execute(&sandbox, &steps, initial_context, &logger)
                             .await?;
                         ensure_default_user(&sandbox, &build_context).await?;
                         let startup = prepare_startup(startup, override_startup, &build_context);
-                        run_startup_commands(&sandbox, startup.as_ref()).await?;
+                        run_startup_commands(&sandbox, startup.as_ref(), &logger).await?;
                         let runtime_versions = SnapshotRuntimeVersions::probe(
                             &sandbox,
                             vmm_binary,
@@ -531,6 +533,7 @@ fn prepare_startup(
 async fn run_startup_commands(
     sandbox: &impl SandboxExecutor,
     startup: Option<&StartupCommand>,
+    logger: &super::logs::BuildLogger,
 ) -> Result<()> {
     let Some(startup) = startup else {
         return Ok(());
@@ -541,6 +544,7 @@ async fn run_startup_commands(
     } else {
         debug!(command = %startup.start_cmd, "starting startup command");
         let (shell, flag) = startup.shell_command();
+        let output_logger = logger.clone();
         let handle = sandbox
             .start_process(
                 shell,
@@ -549,7 +553,10 @@ async fn run_startup_commands(
                     envs: startup.context.env_vars.clone(),
                     cwd: Some(startup.context.workdir.clone()),
                     ..ProcessOpts::default()
-                },
+                }
+                .with_output_callback(move |stderr, bytes| {
+                    output_logger.output(Some("finalize"), stderr, bytes)
+                }),
             )
             .await
             .with_context(|| {
@@ -563,7 +570,7 @@ async fn run_startup_commands(
     };
 
     if !startup.ready_cmd.trim().is_empty() {
-        run_ready_command(sandbox, startup, &mut start_handle).await?;
+        run_ready_command_with_logs(sandbox, startup, &mut start_handle, logger).await?;
     }
 
     if let Some(handle) = start_handle.as_mut() {
@@ -573,21 +580,36 @@ async fn run_startup_commands(
     Ok(())
 }
 
+#[cfg(test)]
 #[tracing::instrument(skip(sandbox, startup, start_cmd_handle))]
 async fn run_ready_command(
     sandbox: &impl SandboxExecutor,
     startup: &StartupCommand,
     start_cmd_handle: &mut Option<ProcessHandle>,
 ) -> Result<()> {
+    run_ready_command_with_logs(sandbox, startup, start_cmd_handle, &Default::default()).await
+}
+
+async fn run_ready_command_with_logs(
+    sandbox: &impl SandboxExecutor,
+    startup: &StartupCommand,
+    start_cmd_handle: &mut Option<ProcessHandle>,
+    logger: &super::logs::BuildLogger,
+) -> Result<()> {
     let deadline = Instant::now() + READY_TIMEOUT;
     let mut attempt = 0_u64;
     let (shell, flag) = startup.shell_command();
 
+    let output_logger = logger.clone();
     let mut opts = ProcessOpts {
         envs: startup.context.env_vars.clone(),
         cwd: Some(startup.context.workdir.clone()),
         timeout: Some(READY_TIMEOUT),
-    };
+        ..ProcessOpts::default()
+    }
+    .with_output_callback(move |stderr, bytes| {
+        output_logger.output(Some("finalize"), stderr, bytes)
+    });
 
     loop {
         let now = Instant::now();

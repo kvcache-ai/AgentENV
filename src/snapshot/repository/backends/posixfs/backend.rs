@@ -316,6 +316,27 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         .await
     }
 
+    async fn write_build_logs(
+        &self,
+        id: &SnapshotId,
+        entries: Vec<crate::template::logs::BuildLogEntry>,
+    ) -> RepositoryResult<()> {
+        let id = id.clone();
+        self.run_catalog("write build logs", move |store| {
+            store.write_build_logs(&id, &entries)
+        })
+        .await
+    }
+
+    async fn read_build_logs(
+        &self,
+        id: &SnapshotId,
+    ) -> RepositoryResult<Vec<crate::template::logs::BuildLogEntry>> {
+        let id = id.clone();
+        self.run_catalog("read build logs", move |store| store.read_build_logs(&id))
+            .await
+    }
+
     async fn get_build_cache_state(
         &self,
     ) -> RepositoryResult<crate::snapshot::repository::BuildCacheState> {

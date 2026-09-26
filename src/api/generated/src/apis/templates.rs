@@ -78,6 +78,22 @@ pub enum TemplatesTemplateIdBuildsBuildIdBuilderPutResponse {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+pub enum TemplatesTemplateIdBuildsBuildIdLogsGetResponse {
+    /// Successfully returned the template build logs
+    Status200_SuccessfullyReturnedTheTemplateBuildLogs(models::TemplateBuildLogsResponse),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum TemplatesTemplateIdBuildsBuildIdStatusGetResponse {
     /// Successfully returned the template
     Status200_SuccessfullyReturnedTheTemplate(models::TemplateBuildInfo),
@@ -232,6 +248,20 @@ pub trait Templates<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         body: &models::TemplateBuilderRequest,
     ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderPutResponse, E>;
 
+    /// Template build logs.
+    ///
+    /// TemplatesTemplateIdBuildsBuildIdLogsGet - GET /templates/{templateID}/builds/{buildID}/logs
+    async fn templates_template_id_builds_build_id_logs_get(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::TemplatesTemplateIdBuildsBuildIdLogsGetPathParams,
+        query_params: &models::TemplatesTemplateIdBuildsBuildIdLogsGetQueryParams,
+    ) -> Result<TemplatesTemplateIdBuildsBuildIdLogsGetResponse, E>;
+
     /// Template build status.
     ///
     /// TemplatesTemplateIdBuildsBuildIdStatusGet - GET /templates/{templateID}/builds/{buildID}/status
@@ -243,6 +273,7 @@ pub trait Templates<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         cookies: &CookieJar,
         claims: &Self::Claims,
         path_params: &models::TemplatesTemplateIdBuildsBuildIdStatusGetPathParams,
+        query_params: &models::TemplatesTemplateIdBuildsBuildIdStatusGetQueryParams,
     ) -> Result<TemplatesTemplateIdBuildsBuildIdStatusGetResponse, E>;
 
     /// Delete template.

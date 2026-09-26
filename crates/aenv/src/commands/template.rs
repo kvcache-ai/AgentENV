@@ -106,9 +106,10 @@ pub(crate) fn wait_for_build(
 ) -> Result<()> {
     let mut last_status = None::<String>;
     let mut last_line_len = 0usize;
+    let mut logs_offset = 0usize;
 
     loop {
-        let info = client.template_build_status(template_id, build_id)?;
+        let info = client.template_build_status(template_id, build_id, logs_offset)?;
         if info.template_id != template_id || info.build_id != build_id {
             bail!(
                 "Build status response mismatch: expected template {template_id} build {build_id}, got template {} build {}",
@@ -116,11 +117,25 @@ pub(crate) fn wait_for_build(
                 info.build_id
             );
         }
+        if !info.log_entries.is_empty() {
+            clear_status_line(last_line_len)?;
+            last_line_len = 0;
+            logs_offset += info.log_entries.len();
+            for entry in &info.log_entries {
+                print_build_log(entry);
+            }
+        }
         let status_changed = last_status.as_deref() != Some(info.status.as_str());
         if status_changed {
             last_line_len =
                 print_status_line(&format!("Build status: {}", info.status), last_line_len)?;
             last_status = Some(info.status.clone());
+        }
+
+        // The status endpoint returns at most 100 entries. Drain an existing
+        // backlog before sleeping or handling a terminal status.
+        if info.log_entries.len() == 100 {
+            continue;
         }
 
         match info.status.as_str() {
@@ -159,6 +174,14 @@ pub(crate) fn wait_for_build(
             );
         }
         thread::sleep(BUILD_STATUS_POLL_INTERVAL);
+    }
+}
+
+fn print_build_log(entry: &crate::client::templates::BuildLogEntry) {
+    match entry.level.as_str() {
+        "debug" => {}
+        "info" => println!("{}", entry.message),
+        level => println!("[{level}] {}", entry.message),
     }
 }
 

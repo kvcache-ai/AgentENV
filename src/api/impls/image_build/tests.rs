@@ -289,7 +289,10 @@ async fn buildkit_worker_panic_releases_journal_and_scheduler_binding() -> Resul
     api.orchestrator
         .register_template_build(SandboxId::parse_str(&id)?)
         .await;
-    api.supervise_image_build(&record, &session, async {
+    let logs = api
+        .build_logs
+        .start(record.id.clone(), api.snapshot_manager.repository());
+    api.supervise_image_build(&record, &session, logs, async {
         panic!("injected worker panic");
     })
     .await;
@@ -679,4 +682,247 @@ async fn saturated_builder_api_leaves_template_waiting_without_allocating() -> R
         .records
         .is_empty());
     Ok(())
+}
+
+mod build_logs {
+    use super::*;
+    use crate::template::logs::{BuildLogLevel, BuildLogs};
+    use axum::body::{to_bytes, Body};
+    use http::{Request, StatusCode};
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    async fn get(
+        app: &axum::Router,
+        uri: &str,
+        authenticated: bool,
+    ) -> Result<(StatusCode, Value)> {
+        let mut request = Request::builder().uri(uri).header("host", "localhost");
+        if authenticated {
+            request = request.header("x-api-key", "build-cleanup-test-api-key-0123456789");
+        }
+        let response = app.clone().oneshot(request.body(Body::empty())?).await?;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024).await?;
+        Ok((
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        ))
+    }
+
+    #[tokio::test]
+    async fn build_logs_http_pagination_filtering_and_persistent_fallback() -> Result<()> {
+        let (_root, api, record) = test_api(VolumeLimits::default()).await?;
+        let record =
+            SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.resources);
+        api.snapshot_manager.create(record.clone()).await?;
+        let id = &record.id;
+        let session = api
+            .build_logs
+            .start(id.clone(), api.snapshot_manager.repository());
+        for n in 0..230 {
+            session.logger.log(
+                if n % 2 == 0 {
+                    BuildLogLevel::Info
+                } else {
+                    BuildLogLevel::Warn
+                },
+                Some("2"),
+                format!("line {n}"),
+            );
+        }
+        let app = crate::api::server::new(Arc::new(api.clone()));
+        let path = format!("/templates/{id}/builds/{id}");
+        let (code, status) = get(&app, &format!("{path}/status"), true).await?;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(status["logs"], json!([]));
+        assert_eq!(status["logEntries"].as_array().unwrap().len(), 100);
+        assert_eq!(status["logEntries"][0]["message"], "line 0");
+        let (_, next) = get(
+            &app,
+            &format!("{path}/status?logsOffset=100&limit=100"),
+            true,
+        )
+        .await?;
+        assert_eq!(next["logEntries"][0]["message"], "line 100");
+        let (_, filtered) = get(
+            &app,
+            &format!("{path}/status?logsOffset=1&limit=1&level=warn"),
+            true,
+        )
+        .await?;
+        assert_eq!(filtered["logEntries"][0]["message"], "line 3");
+        let (_, backward) = get(
+            &app,
+            &format!("{path}/logs?direction=backward&limit=2&level=warn"),
+            true,
+        )
+        .await?;
+        assert_eq!(backward["logs"][0]["message"], "line 229");
+        let (_, empty) = get(&app, &format!("{path}/logs?limit=0"), true).await?;
+        assert_eq!(empty, json!({"logs": []}));
+        let (_, memory) = get(&app, &format!("{path}/logs?source=temporary"), true).await?;
+        assert_eq!(memory["logs"].as_array().unwrap().len(), 100);
+        assert_eq!(memory["logs"][0]["message"], "line 0");
+
+        // Explicit persistent reads bypass the active local buffer. Default and
+        // temporary reads prefer the live buffer on the build node.
+        let repository = api.snapshot_manager.repository();
+        let mut persisted = api.build_logs.temporary(id).unwrap();
+        persisted[0].message = "persisted replacement".into();
+        repository.write_build_logs(id, persisted).await?;
+        for suffix in ["logs", "logs?source=temporary"] {
+            let (_, result) = get(&app, &format!("{path}/{suffix}"), true).await?;
+            assert_eq!(result["logs"][0]["message"], "line 0");
+        }
+        let (_, result) = get(&app, &format!("{path}/logs?source=persistent"), true).await?;
+        assert_eq!(result["logs"][0]["message"], "persisted replacement");
+        let (_, result) = get(&app, &format!("{path}/status"), true).await?;
+        assert_eq!(result["logEntries"][0]["message"], "line 0");
+
+        // A final new entry guarantees finish performs a final flush even if a
+        // periodic flush raced with the persistent replacement above.
+        session
+            .logger
+            .log(BuildLogLevel::Info, Some("2"), "line 230");
+        session.finish().await?;
+        assert_eq!(
+            get(&app, &format!("{path}/logs?source=temporary"), true)
+                .await?
+                .1,
+            json!({"logs": []})
+        );
+        let (_, persistent) = get(&app, &format!("{path}/logs?source=persistent"), true).await?;
+        assert_eq!(persistent["logs"][0]["message"], "line 0");
+        assert_eq!(
+            get(&app, &format!("{path}/logs"), true).await?.1,
+            persistent
+        );
+
+        let mut other_node = api.clone();
+        other_node.build_logs = BuildLogs::default();
+        let other = crate::api::server::new(Arc::new(other_node));
+        assert_eq!(
+            get(&other, &format!("{path}/logs"), true).await?.1,
+            persistent
+        );
+        assert_eq!(
+            get(&other, &format!("{path}/logs?source=temporary"), true)
+                .await?
+                .1,
+            json!({"logs": []})
+        );
+        let (_, tail) = get(&other, &format!("{path}/status?logsOffset=200"), true).await?;
+        assert_eq!(tail["logEntries"].as_array().unwrap().len(), 31);
+        assert_eq!(
+            get(&other, &format!("{path}/status?logsOffset=231"), true)
+                .await?
+                .1["logEntries"],
+            json!([])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_logs_http_validation_and_authentication() -> Result<()> {
+        let (_root, api, record) = test_api(VolumeLimits::default()).await?;
+        let record =
+            SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.resources);
+        api.snapshot_manager.create(record.clone()).await?;
+        let id = record.id;
+        let app = crate::api::server::new(Arc::new(api));
+        let path = format!("/templates/{id}/builds/{id}");
+        for suffix in [
+            "logs?cursor=-1",
+            "logs?cursor=9223372036854775808",
+            "logs?limit=-1",
+            "logs?limit=101",
+            "logs?direction=sideways",
+            "logs?source=stdout",
+            "logs?level=trace",
+            "status?logsOffset=-1",
+            "status?limit=101",
+            "status?level=trace",
+        ] {
+            assert_eq!(
+                get(&app, &format!("{path}/{suffix}"), true).await?.0,
+                StatusCode::BAD_REQUEST,
+                "{suffix}"
+            );
+        }
+        for endpoint in ["logs", "status"] {
+            assert_eq!(
+                get(&app, &format!("{path}/{endpoint}"), false).await?.0,
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                get(
+                    &app,
+                    &format!("/templates/other/builds/{id}/{endpoint}"),
+                    true
+                )
+                .await?
+                .0,
+                StatusCode::NOT_FOUND
+            );
+            let absent = SnapshotId::generate();
+            assert_eq!(
+                get(
+                    &app,
+                    &format!("/templates/{absent}/builds/{absent}/{endpoint}"),
+                    true
+                )
+                .await?
+                .0,
+                StatusCode::NOT_FOUND
+            );
+            assert_eq!(
+                get(&app, &format!("/templates/bad/builds/bad/{endpoint}"), true)
+                    .await?
+                    .0,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn build_logs_terminal_status_does_not_wait_for_flush_and_includes_failed_step(
+    ) -> Result<()> {
+        let (_root, api, record) = test_api(VolumeLimits::default()).await?;
+        let record =
+            SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.resources);
+        api.snapshot_manager.create(record.clone()).await?;
+        let id = &record.id;
+        let session = api
+            .build_logs
+            .start(id.clone(), api.snapshot_manager.repository());
+        session
+            .logger
+            .log(BuildLogLevel::Info, Some("2"), "step started");
+        session
+            .logger
+            .log(BuildLogLevel::Error, Some("1"), "other step");
+        session
+            .logger
+            .log(BuildLogLevel::Warn, Some("2"), "failed output");
+        api.snapshot_manager
+            .mark_build_error(
+                id,
+                TemplateBuildErrorReason {
+                    message: "failed".into(),
+                    step: Some("2".into()),
+                },
+            )
+            .await?;
+        let app = crate::api::server::new(Arc::new(api.clone()));
+        let path = format!("/templates/{id}/builds/{id}/status");
+        assert_eq!(get(&app, &path, true).await?.1["status"], "error");
+        session.finish().await?;
+        let (_, info) = get(&app, &path, true).await?;
+        assert_eq!(info["status"], "error");
+        assert_eq!(info["reason"]["logEntries"].as_array().unwrap().len(), 1);
+        assert_eq!(info["reason"]["logEntries"][0]["message"], "failed output");
+        Ok(())
+    }
 }

@@ -206,7 +206,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sandboxID, hasSandbox := "", false
-	buildStatusRequest := false
+	buildReadRequest := false
 	routeSource := routeSourceHeader
 	if hostRoute != nil {
 		s.logHostRoutingHeaderConflicts(r, hostRoute)
@@ -220,7 +220,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		routeSource = routeSourceSchedule
 	} else if buildID, ok := templateBuildIDFromPath(r.URL.Path); ok {
 		sandboxID, hasSandbox = buildID, true
-		buildStatusRequest = r.Method == http.MethodGet && strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/status")
+		buildReadRequest = r.Method == http.MethodGet && (strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/status") || strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/logs"))
 		routeSource = routeSourcePath
 	} else {
 		sandboxID, hasSandbox = sandboxIDFromHeaders(r.Header)
@@ -235,7 +235,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		rpcStart := time.Now()
 		resp, err := s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
 		recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
-		if buildStatusRequest && status.Code(err) == codes.NotFound {
+		if buildReadRequest && status.Code(err) == codes.NotFound {
 			// Completed and legacy builds use the shared template repository.
 			hasSandbox = false
 			routeSource = routeSourceSchedule
@@ -441,6 +441,12 @@ func (e *proxyResponseError) Error() string {
 func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestPath string) error {
 	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
 	defer cancelRecord()
+	if buildID, ok := v2TemplateBuildIDFromPath(requestPath); ok {
+		if err := s.recordAssignment(recordCtx, buildID, node, "template_build"); err != nil {
+			return &proxyResponseError{statusCode: http.StatusServiceUnavailable, message: "failed to route allocated build", cause: err}
+		}
+		return nil
+	}
 	if expectedID, ok := templateBuildIDFromPath(requestPath); ok && strings.HasSuffix(strings.TrimRight(requestPath, "/"), "/builder") {
 		buildID := strings.TrimSpace(resp.Header.Get("x-agentenv-build-id"))
 		if buildID == "" {
@@ -665,8 +671,19 @@ func isSandboxControlPlaneRequest(r *http.Request) bool {
 }
 
 func isTemplateBuilderAllocation(r *http.Request) bool {
+	if _, ok := v2TemplateBuildIDFromPath(r.URL.Path); ok {
+		return r.Method == http.MethodPost
+	}
 	_, ok := templateBuildIDFromPath(r.URL.Path)
 	return ok && r.Method == http.MethodPut && strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/builder")
+}
+
+func v2TemplateBuildIDFromPath(path string) (string, bool) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) != 5 || parts[0] != "v2" || parts[1] != "templates" || parts[2] == "" || parts[3] != "builds" || parts[4] == "" {
+		return "", false
+	}
+	return parts[4], true
 }
 
 // Build sessions use scheduler bindings internally without exposing worker IDs.
@@ -675,7 +692,7 @@ func templateBuildIDFromPath(path string) (string, bool) {
 	if len(parts) != 5 {
 		return "", false
 	}
-	if parts[0] != "templates" || parts[1] == "" || parts[2] != "builds" || parts[3] == "" || (parts[4] != "builder" && parts[4] != "status") {
+	if parts[0] != "templates" || parts[1] == "" || parts[2] != "builds" || parts[3] == "" || (parts[4] != "builder" && parts[4] != "status" && parts[4] != "logs") {
 		return "", false
 	}
 	return parts[3], true
