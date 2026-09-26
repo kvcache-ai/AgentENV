@@ -83,6 +83,12 @@ impl PosixFsSnapshotArtifactLayout {
         root.join("snapshots")
     }
 
+    pub(super) fn build_log_path(root: &Path, id: &SnapshotId) -> PathBuf {
+        Self::snapshots_dir(root)
+            .join("build-logs")
+            .join(format!("{id}.json"))
+    }
+
     pub(super) fn managed_layers_dir(root: &Path) -> PathBuf {
         root.join("managed-layers")
     }

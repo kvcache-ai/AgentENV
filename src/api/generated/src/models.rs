@@ -300,9 +300,57 @@ pub struct TemplatesTemplateIdBuildsBuildIdBuilderPutPathParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct TemplatesTemplateIdBuildsBuildIdLogsGetPathParams {
+    pub template_id: String,
+    pub build_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct TemplatesTemplateIdBuildsBuildIdLogsGetQueryParams {
+    /// Inclusive starting timestamp in milliseconds
+    #[serde(rename = "cursor")]
+    #[validate(range(min = 0u64, max = 9223372036854775807u64))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u64>,
+    #[serde(rename = "limit")]
+    #[validate(range(min = 0u32, max = 100u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(rename = "level")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<models::LogLevel>,
+    #[serde(rename = "direction")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<models::LogsDirection>,
+    /// Source of the logs that should be returned from
+    #[serde(rename = "source")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<models::LogsSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct TemplatesTemplateIdBuildsBuildIdStatusGetPathParams {
     pub template_id: String,
     pub build_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct TemplatesTemplateIdBuildsBuildIdStatusGetQueryParams {
+    /// Index of the starting log after level filtering
+    #[serde(rename = "logsOffset")]
+    #[validate(range(min = 0u32, max = 2147483647u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logs_offset: Option<u32>,
+    #[serde(rename = "limit")]
+    #[validate(range(min = 0u32, max = 100u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(rename = "level")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<models::LogLevel>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
@@ -2413,6 +2461,94 @@ impl std::str::FromStr for LogLevel {
             "info" => std::result::Result::Ok(LogLevel::Info),
             "warn" => std::result::Result::Ok(LogLevel::Warn),
             "error" => std::result::Result::Ok(LogLevel::Error),
+            _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
+        }
+    }
+}
+
+/// Direction of the logs that should be returned
+/// Enumeration of values.
+/// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
+/// which helps with FFI.
+#[allow(non_camel_case_types, clippy::large_enum_variant)]
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[cfg_attr(feature = "conversion", derive(frunk_enum_derive::LabelledGenericEnum))]
+pub enum LogsDirection {
+    #[serde(rename = "forward")]
+    LogsDirectionForward,
+    #[serde(rename = "backward")]
+    LogsDirectionBackward,
+}
+
+impl validator::Validate for LogsDirection {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        std::result::Result::Ok(())
+    }
+}
+
+impl std::fmt::Display for LogsDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            LogsDirection::LogsDirectionForward => write!(f, "forward"),
+            LogsDirection::LogsDirectionBackward => write!(f, "backward"),
+        }
+    }
+}
+
+impl std::str::FromStr for LogsDirection {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "forward" => std::result::Result::Ok(LogsDirection::LogsDirectionForward),
+            "backward" => std::result::Result::Ok(LogsDirection::LogsDirectionBackward),
+            _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
+        }
+    }
+}
+
+/// Source of the logs that should be returned
+/// Enumeration of values.
+/// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
+/// which helps with FFI.
+#[allow(non_camel_case_types, clippy::large_enum_variant)]
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[cfg_attr(feature = "conversion", derive(frunk_enum_derive::LabelledGenericEnum))]
+pub enum LogsSource {
+    #[serde(rename = "temporary")]
+    LogsSourceTemporary,
+    #[serde(rename = "persistent")]
+    LogsSourcePersistent,
+}
+
+impl validator::Validate for LogsSource {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        std::result::Result::Ok(())
+    }
+}
+
+impl std::fmt::Display for LogsSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            LogsSource::LogsSourceTemporary => write!(f, "temporary"),
+            LogsSource::LogsSourcePersistent => write!(f, "persistent"),
+        }
+    }
+}
+
+impl std::str::FromStr for LogsSource {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "temporary" => std::result::Result::Ok(LogsSource::LogsSourceTemporary),
+            "persistent" => std::result::Result::Ok(LogsSource::LogsSourcePersistent),
             _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
         }
     }
@@ -9069,7 +9205,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<TemplateBuil
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct TemplateBuildInfo {
-    /// Build logs
+    /// Deprecated; always empty, use logEntries
     #[serde(rename = "logs")]
     #[validate(custom(function = "check_xss_vec_string"))]
     pub logs: Vec<String>,
@@ -9291,6 +9427,135 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<TemplateBuil
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into TemplateBuildInfo - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct TemplateBuildLogsResponse {
+    /// Build logs structured
+    #[serde(rename = "logs")]
+    #[validate(nested)]
+    pub logs: Vec<models::BuildLogEntry>,
+}
+
+impl TemplateBuildLogsResponse {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(logs: Vec<models::BuildLogEntry>) -> TemplateBuildLogsResponse {
+        TemplateBuildLogsResponse { logs }
+    }
+}
+
+/// Converts the TemplateBuildLogsResponse value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for TemplateBuildLogsResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping logs in query parameter serialization
+
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a TemplateBuildLogsResponse value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for TemplateBuildLogsResponse {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub logs: Vec<Vec<models::BuildLogEntry>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing TemplateBuildLogsResponse".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    "logs" => return std::result::Result::Err("Parsing a container in this style is not supported in TemplateBuildLogsResponse".to_string()),
+                    _ => return std::result::Result::Err("Unexpected key while parsing TemplateBuildLogsResponse".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(TemplateBuildLogsResponse {
+            logs: intermediate_rep
+                .logs
+                .into_iter()
+                .next()
+                .ok_or_else(|| "logs missing in TemplateBuildLogsResponse".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<TemplateBuildLogsResponse> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<TemplateBuildLogsResponse>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<TemplateBuildLogsResponse>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for TemplateBuildLogsResponse - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<TemplateBuildLogsResponse> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <TemplateBuildLogsResponse as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into TemplateBuildLogsResponse - {err}"#
                     )),
                 }
             }

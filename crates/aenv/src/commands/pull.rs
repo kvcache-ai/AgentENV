@@ -2,6 +2,7 @@ use crate::client::{
     templates::{CreateTemplateV3, StartTemplateBuildV2},
     Client,
 };
+use crate::progress::{format_elapsed, BuildProgress};
 use anyhow::Result;
 use clap::Args as ClapArgs;
 use std::time::{Duration, Instant};
@@ -34,6 +35,14 @@ pub struct Args {
 
 pub fn run(args: Args) -> Result<()> {
     let client = Client::from_env()?;
+    let started = Instant::now();
+    let progress = if args.detach {
+        None
+    } else {
+        let progress = BuildProgress::with_steps(true, 6)?;
+        progress.stage(0, "Creating template");
+        Some(progress)
+    };
     let image = args.image;
     let name = args.name.unwrap_or_else(|| default_name(&image));
     let ready_cmd = args.ready_cmd.or_else(|| args.probe.map(probe_ready_cmd));
@@ -55,10 +64,20 @@ pub fn run(args: Args) -> Result<()> {
             ready_cmd,
         },
     )?;
-    println!(
+    let created = format!(
         "Created template {} (build {})",
         resp.template_id, resp.build_id
     );
+    if let Some(progress) = &progress {
+        progress.println(&created);
+        progress.println(&format!(
+            "✓ Creating template [{}]",
+            format_elapsed(started.elapsed())
+        ));
+        progress.stage(1, "Resolving base image");
+    } else {
+        println!("{created}");
+    }
     if args.detach {
         println!("Build started.");
         println!("Watch with: aenv template watch {}", name);
@@ -73,6 +92,8 @@ pub fn run(args: Args) -> Result<()> {
         &resp.build_id,
         &name,
         deadline,
+        progress.as_ref().expect("attached pull has progress"),
+        Some(started),
     )
 }
 

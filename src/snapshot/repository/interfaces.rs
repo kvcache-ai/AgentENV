@@ -195,6 +195,23 @@ pub trait SnapshotRepository: Send + Sync {
         reason: TemplateBuildErrorReason,
     ) -> RepositoryResult<()>;
 
+    /// Atomically replaces the complete build log file.
+    async fn write_build_logs(
+        &self,
+        _id: &SnapshotId,
+        _entries: Vec<crate::template::logs::BuildLogEntry>,
+    ) -> RepositoryResult<()> {
+        unsupported("template build logs")
+    }
+
+    /// Reads the complete build log file; supporting backends return an empty list when absent.
+    async fn read_build_logs(
+        &self,
+        _id: &SnapshotId,
+    ) -> RepositoryResult<Vec<crate::template::logs::BuildLogEntry>> {
+        unsupported("template build logs")
+    }
+
     /// Resolves a volume by ID first, then by its unique name.
     async fn get_volume(
         &self,

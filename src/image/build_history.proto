@@ -2,8 +2,10 @@
 // https://github.com/moby/buildkit/blob/v0.33.0/api/services/control/control.proto
 syntax = "proto3";
 package moby.buildkit.v1;
+import "google/protobuf/timestamp.proto";
 
 service Control {
+  rpc Status(StatusRequest) returns (stream StatusResponse);
   rpc ListenBuildHistory(BuildHistoryRequest) returns (stream BuildHistoryEvent);
 }
 message BuildHistoryRequest {
@@ -35,4 +37,31 @@ message BuildResultInfo {
 }
 message Descriptor {
   string digest = 2;
+}
+
+message StatusRequest { string Ref = 1; }
+message StatusResponse {
+  repeated Vertex vertexes = 1;
+  repeated VertexLog logs = 3;
+  repeated VertexWarning warnings = 4;
+}
+message Vertex {
+  string digest = 1;
+  string name = 3;
+  bool cached = 4;
+  google.protobuf.Timestamp started = 5;
+  google.protobuf.Timestamp completed = 6;
+  string error = 7;
+}
+message VertexLog {
+  string vertex = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  int64 stream = 3;
+  bytes msg = 4;
+}
+message VertexWarning {
+  string vertex = 1;
+  int64 level = 2;
+  bytes short = 3;
+  repeated bytes detail = 4;
 }

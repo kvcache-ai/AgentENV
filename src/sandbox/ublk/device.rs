@@ -683,7 +683,7 @@ impl UblkDeviceManager {
                 return Err(error).context("keep shared read-only device open");
             }
         };
-        info!(
+        debug!(
             key = %key.display(),
             dev_id = device.dev_id,
             path = %device.device_path.display(),

@@ -4,7 +4,7 @@ use std::sync::Once;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{fmt, EnvFilter, Layer};
+use tracing_subscriber::{filter::filter_fn, fmt, EnvFilter, Layer};
 
 const DEFAULT_FILTER: &str = "agentenv=info,envd=info,uvm_ublk=info";
 const LOG_FORMAT_ENV: &str = "AENV_LOG_FORMAT";
@@ -102,9 +102,13 @@ pub fn init() {
             LogFormat::Json => base.json().boxed(),
         };
 
+        let build_filter = filter_fn(|metadata| {
+            metadata.target().starts_with("agentenv::")
+                && *metadata.level() <= tracing::Level::DEBUG
+        });
         let _ = tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer)
+            .with(fmt_layer.with_filter(filter))
+            .with(crate::template::logs::BuildLogLayer.with_filter(build_filter))
             .try_init();
     });
 }
@@ -130,9 +134,13 @@ pub fn init_for_tests() {
             LogFormat::Json => base.json().boxed(),
         };
 
+        let build_filter = filter_fn(|metadata| {
+            metadata.target().starts_with("agentenv::")
+                && *metadata.level() <= tracing::Level::DEBUG
+        });
         let _ = tracing_subscriber::registry()
-            .with(filter)
-            .with(fmt_layer)
+            .with(fmt_layer.with_filter(filter))
+            .with(crate::template::logs::BuildLogLayer.with_filter(build_filter))
             .try_init();
     });
 }

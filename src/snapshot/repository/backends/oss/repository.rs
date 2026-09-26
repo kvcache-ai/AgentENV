@@ -512,8 +512,16 @@ impl SnapshotRepository for OssSnapshotRepository {
     async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
         // Resolve the actual id + metadata.
         let record = match self.get(id_or_alias).await? {
-            Some(t) => t,
-            None => return Ok(()), // Idempotent.
+            Some(record) => record,
+            None => {
+                if let Ok(id) = SnapshotId::parse(id_or_alias) {
+                    self.client
+                        .delete(&OssSnapshotArtifactLayout::build_log_key(&id))
+                        .await
+                        .map_err(|error| RepositoryError::backend("delete build logs", error))?;
+                }
+                return Ok(());
+            }
         };
         let id = &record.id;
         let layout = self.layout(id);
@@ -530,6 +538,11 @@ impl SnapshotRepository for OssSnapshotRepository {
                 }
             }
         }
+
+        self.client
+            .delete(&OssSnapshotArtifactLayout::build_log_key(id))
+            .await
+            .map_err(|error| RepositoryError::backend("delete build logs", error))?;
 
         // 2. Delete the catalog record.
         self.client
@@ -764,6 +777,37 @@ impl SnapshotRepository for OssSnapshotRepository {
             ),
             source: None,
         })
+    }
+
+    async fn write_build_logs(
+        &self,
+        id: &SnapshotId,
+        entries: Vec<crate::template::logs::BuildLogEntry>,
+    ) -> RepositoryResult<()> {
+        let bytes = serde_json::to_vec(&entries)
+            .map_err(|error| RepositoryError::backend("encode build logs", error))?;
+        self.client
+            .put_bytes(
+                &OssSnapshotArtifactLayout::build_log_key(id),
+                bytes,
+                OssUploadArtifact::BuildLog,
+            )
+            .await
+            .map_err(|error| RepositoryError::backend("write build logs", error))
+    }
+
+    async fn read_build_logs(
+        &self,
+        id: &SnapshotId,
+    ) -> RepositoryResult<Vec<crate::template::logs::BuildLogEntry>> {
+        let key = OssSnapshotArtifactLayout::build_log_key(id);
+        let bytes = match self.client.get_bytes(&key).await {
+            Ok(bytes) => bytes,
+            Err(error) if OssClient::is_not_found_error(&error) => return Ok(Vec::new()),
+            Err(error) => return Err(RepositoryError::backend("read build logs", error)),
+        };
+        serde_json::from_slice(&bytes)
+            .map_err(|error| RepositoryError::backend("decode build logs", error))
     }
 
     async fn get_build_cache_state(&self) -> RepositoryResult<BuildCacheState> {

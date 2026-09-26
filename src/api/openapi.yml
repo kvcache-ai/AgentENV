@@ -1196,7 +1196,8 @@ components:
       properties:
         logs:
           default: []
-          description: Build logs
+          deprecated: true
+          description: Deprecated; always empty, use logEntries
           type: array
           items:
             type: string
@@ -1216,6 +1217,37 @@ components:
           $ref: "#/components/schemas/TemplateBuildStatus"
         reason:
           $ref: "#/components/schemas/BuildStatusReason"
+
+    TemplateBuildLogsResponse:
+      required:
+        - logs
+      properties:
+        logs:
+          default: []
+          description: Build logs structured
+          type: array
+          items:
+            $ref: "#/components/schemas/BuildLogEntry"
+
+    LogsDirection:
+      type: string
+      description: Direction of the logs that should be returned
+      enum:
+        - forward
+        - backward
+      x-enum-varnames:
+        - LogsDirectionForward
+        - LogsDirectionBackward
+
+    LogsSource:
+      type: string
+      description: Source of the logs that should be returned
+      enum:
+        - temporary
+        - persistent
+      x-enum-varnames:
+        - LogsSourceTemporary
+        - LogsSourcePersistent
 
     NodeStatus:
       type: string
@@ -2627,6 +2659,27 @@ paths:
       parameters:
         - $ref: "#/components/parameters/templateID"
         - $ref: "#/components/parameters/buildID"
+        - in: query
+          name: logsOffset
+          schema:
+            type: integer
+            format: int32
+            minimum: 0
+            maximum: 2147483647
+            default: 0
+          description: Index of the starting log after level filtering
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            format: int32
+            minimum: 0
+            maximum: 100
+            default: 100
+        - in: query
+          name: level
+          schema:
+            $ref: "#/components/schemas/LogLevel"
       responses:
         "200":
           description: Successfully returned the template
@@ -2634,6 +2687,65 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TemplateBuildInfo"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /templates/{templateID}/builds/{buildID}/logs:
+    get:
+      summary: Template build logs
+      description: Get template build logs
+      tags: [templates]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/templateID"
+        - $ref: "#/components/parameters/buildID"
+        - in: query
+          name: cursor
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            maximum: 9223372036854775807
+          description: Inclusive starting timestamp in milliseconds
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            format: int32
+            minimum: 0
+            maximum: 100
+            default: 100
+        - in: query
+          name: level
+          schema:
+            $ref: "#/components/schemas/LogLevel"
+        - in: query
+          name: direction
+          schema:
+            $ref: "#/components/schemas/LogsDirection"
+        - in: query
+          name: source
+          description: Source of the logs that should be returned from
+          schema:
+            $ref: "#/components/schemas/LogsSource"
+      responses:
+        "200":
+          description: Successfully returned the template build logs
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TemplateBuildLogsResponse"
         "400":
           $ref: "#/components/responses/400"
         "401":

@@ -251,6 +251,20 @@ func TestGatewayRequiresExactAPIKey(t *testing.T) {
 	}
 }
 
+func TestV2TemplateBuildRequiresAPIKeyWithProxyHeaders(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
+	req := httptest.NewRequest(http.MethodPost, "/v2/templates/build-123/builds/build-123", strings.NewReader(`{}`))
+	req.Header.Set(headerE2BSandboxID, "unrelated-sandbox")
+	req.Header.Set(headerE2BTargetPort, "49983")
+	recorder := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusUnauthorized)
+	}
+}
+
 func TestGatewayMetricsPathDoesNotRequireAPIKey(t *testing.T) {
 	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
 	recorder := httptest.NewRecorder()
@@ -1689,6 +1703,7 @@ func TestTemplateBuilderRoutingAndAssignment(t *testing.T) {
 		{http.MethodPut, "/templates/build-123/builds/build-123/builder"},
 		{http.MethodGet, "/templates/build-123/builds/build-123/builder"},
 		{http.MethodGet, "/templates/build-123/builds/build-123/status"},
+		{http.MethodGet, "/templates/build-123/builds/build-123/logs"},
 		{http.MethodDelete, "/templates/build-123/builds/build-123/builder"},
 	} {
 		req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(`{}`))
@@ -1724,6 +1739,8 @@ func TestTemplateBuildStatusFallsBackOnlyForMissingBindings(t *testing.T) {
 		wantSchedule bool
 	}{
 		{"finished build", "status", codes.NotFound, http.StatusOK, true},
+		{"finished build logs", "logs", codes.NotFound, http.StatusOK, true},
+		{"logs scheduler unavailable", "logs", codes.Unavailable, http.StatusServiceUnavailable, false},
 		{"scheduler unavailable", "status", codes.Unavailable, http.StatusServiceUnavailable, false},
 		{"missing builder", "builder", codes.NotFound, http.StatusNotFound, false},
 	} {
@@ -2692,5 +2709,33 @@ func TestGatewayClassifiesClientCanceledProxyErrors(t *testing.T) {
 	getReq := httptest.NewRequest(http.MethodGet, "/process.Process/StreamInput", nil)
 	if isStreamInputProxyRequest(getReq) {
 		t.Fatalf("GET StreamInput should not be classified as stream input")
+	}
+}
+
+func TestV2TemplateBuildBindsFromPathWithoutResponseHeader(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer upstream.Close()
+	recorded := make(chan *schedulerv1.RecordAssignmentRequest, 1)
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{NodeId: "builder", Endpoint: upstream.URL}}, nil
+		},
+		recordAssignmentFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			recorded <- req
+			return &schedulerv1.RecordAssignmentResponse{}, nil
+		},
+	}, time.Second, 1024)
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/v2/templates/build-123/builds/build-123", strings.NewReader(`{}`)))
+	if response.Code != http.StatusAccepted {
+		t.Fatalf("got %d: %s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("x-agentenv-build-id") != "" {
+		t.Fatal("unexpected build routing header")
+	}
+	if got := (<-recorded).GetSandboxId(); got != "build-123" {
+		t.Fatalf("recorded build %q, want build-123", got)
 	}
 }

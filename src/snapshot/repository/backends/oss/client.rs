@@ -49,6 +49,7 @@ pub(crate) enum OssUploadArtifact {
     FirecrackerManifest,
     StartupPack,
     CatalogRecord,
+    BuildLog,
     Alias,
 }
 
@@ -62,6 +63,7 @@ impl OssUploadArtifact {
             Self::FirecrackerManifest => "manifest",
             Self::StartupPack => "startup_pack",
             Self::CatalogRecord => "record",
+            Self::BuildLog => "build_log",
             Self::Alias => "alias",
         }
     }

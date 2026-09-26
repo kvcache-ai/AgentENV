@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::{bail, Context, Result};
 use futures::{FutureExt, StreamExt};
@@ -27,6 +27,18 @@ fn guest_request<T>(message: T, root_user: bool) -> Request<T> {
     request
 }
 
+/// Receives stdout/stderr chunks while the process is being awaited.
+#[derive(Clone)]
+pub struct ProcessOutputCallback(Arc<OutputCallback>);
+
+type OutputCallback = dyn Fn(bool, &[u8]) + Send + Sync;
+
+impl std::fmt::Debug for ProcessOutputCallback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ProcessOutputCallback")
+    }
+}
+
 /// Options for starting a process inside the sandbox.
 #[derive(Clone, Debug, Default)]
 pub struct ProcessOpts {
@@ -36,9 +48,18 @@ pub struct ProcessOpts {
     pub cwd: Option<String>,
     /// Maximum time to wait for the process to complete.
     pub timeout: Option<Duration>,
+    pub output_callback: Option<ProcessOutputCallback>,
 }
 
 impl ProcessOpts {
+    pub fn with_output_callback(
+        mut self,
+        callback: impl Fn(bool, &[u8]) + Send + Sync + 'static,
+    ) -> Self {
+        self.output_callback = Some(ProcessOutputCallback(Arc::new(callback)));
+        self
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -81,6 +102,7 @@ pub struct ProcessHandle {
     pid: u32,
     client: ProcessClient,
     stream: tonic::Streaming<StartResponse>,
+    output_callback: Option<ProcessOutputCallback>,
     timeout: Option<Duration>,
     root_user: bool,
 }
@@ -104,6 +126,17 @@ impl ProcessHandle {
                 };
                 match event_wrapper.event {
                     Some(process_event::Event::Data(data_event)) => {
+                        if let Some(callback) = &self.output_callback {
+                            match &data_event.output {
+                                Some(process_event::data_event::Output::Stdout(bytes)) => {
+                                    (callback.0)(false, bytes)
+                                }
+                                Some(process_event::data_event::Output::Stderr(bytes)) => {
+                                    (callback.0)(true, bytes)
+                                }
+                                _ => {}
+                            }
+                        }
                         Self::collect_output(&data_event, &mut stdout, &mut stderr);
                         if stdout.len() + stderr.len() > MAX_OUTPUT_BYTES {
                             bail!("process output exceeded maximum allowed size ({MAX_OUTPUT_BYTES} bytes)");
@@ -318,6 +351,7 @@ impl Executor {
             client,
             stream,
             timeout: opts.timeout,
+            output_callback: opts.output_callback.clone(),
             root_user: self.root_user,
         })
     }

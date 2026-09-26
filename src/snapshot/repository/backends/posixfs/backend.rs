@@ -220,6 +220,9 @@ impl PosixFsSnapshotRepository {
 
     fn delete_sync(&self, id_or_alias: &str) -> RepositoryResult<()> {
         let Some(record) = self.catalog_store.get(id_or_alias)? else {
+            if let Ok(id) = SnapshotId::parse(id_or_alias) {
+                self.catalog_store.delete_record(&id)?;
+            }
             return Ok(());
         };
         self.catalog_store.delete_record(&record.id)
@@ -314,6 +317,27 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
             repository.mark_error_sync(&id, reason)
         })
         .await
+    }
+
+    async fn write_build_logs(
+        &self,
+        id: &SnapshotId,
+        entries: Vec<crate::template::logs::BuildLogEntry>,
+    ) -> RepositoryResult<()> {
+        let id = id.clone();
+        self.run_catalog("write build logs", move |store| {
+            store.write_build_logs(&id, &entries)
+        })
+        .await
+    }
+
+    async fn read_build_logs(
+        &self,
+        id: &SnapshotId,
+    ) -> RepositoryResult<Vec<crate::template::logs::BuildLogEntry>> {
+        let id = id.clone();
+        self.run_catalog("read build logs", move |store| store.read_build_logs(&id))
+            .await
     }
 
     async fn get_build_cache_state(

@@ -25,6 +25,7 @@ impl TemplateStepExecutor {
         sandbox: &impl SandboxExecutor,
         steps: &[TemplateBuildStep],
         initial_context: CommandContext,
+        logger: &super::logs::BuildLogger,
     ) -> Result<CommandContext> {
         let mut context = initial_context;
 
@@ -72,8 +73,15 @@ impl TemplateStepExecutor {
                     context = context.with_labels(labels);
                 }
                 TemplateBuildStepKind::Run { cmd } => {
-                    self.run_step(sandbox, &context.workdir, &context.env_vars, cmd, step_no)
-                        .await?;
+                    self.run_step(
+                        sandbox,
+                        &context.workdir,
+                        &context.env_vars,
+                        cmd,
+                        step_no,
+                        logger,
+                    )
+                    .await?;
                 }
             }
         }
@@ -111,12 +119,17 @@ impl TemplateStepExecutor {
         env: &HashMap<String, String>,
         cmd: &str,
         step_no: usize,
+        logger: &super::logs::BuildLogger,
     ) -> Result<()> {
+        let logger = logger.clone();
         let opts = ProcessOpts {
             envs: env.clone(),
             cwd: Some(workdir.to_string()),
             ..ProcessOpts::default()
-        };
+        }
+        .with_output_callback(move |stderr, bytes| {
+            logger.output(Some(&step_no.to_string()), stderr, bytes)
+        });
 
         let output = sandbox
             .run_command_with_opts("/bin/bash", &["-lc", cmd], &opts)
@@ -286,7 +299,12 @@ mod tests {
 
     async fn run(steps: Vec<TemplateBuildStep>) -> CommandContext {
         TemplateStepExecutor::new()
-            .execute(&NoopSandbox, &steps, CommandContext::default())
+            .execute(
+                &NoopSandbox,
+                &steps,
+                CommandContext::default(),
+                &Default::default(),
+            )
             .await
             .expect("steps should execute without error")
     }
@@ -301,7 +319,12 @@ mod tests {
     async fn user_step_overrides_base_image_user() {
         let initial = CommandContext::default().with_user(Some("root".to_string()));
         let ctx = TemplateStepExecutor::new()
-            .execute(&NoopSandbox, &[TemplateBuildStep::user("zzz")], initial)
+            .execute(
+                &NoopSandbox,
+                &[TemplateBuildStep::user("zzz")],
+                initial,
+                &Default::default(),
+            )
             .await
             .unwrap();
         assert_eq!(ctx.user.as_deref(), Some("zzz"));
@@ -326,6 +349,7 @@ mod tests {
                 &NoopSandbox,
                 &[TemplateBuildStep::exposed_port("8080")],
                 initial,
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -357,6 +381,7 @@ mod tests {
                 &sandbox,
                 &[TemplateBuildStep::workdir("/workspace")],
                 CommandContext::default(),
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -373,6 +398,7 @@ mod tests {
                 &sandbox,
                 &[TemplateBuildStep::workdir("/app")],
                 CommandContext::default(),
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -397,6 +423,7 @@ mod tests {
                     TemplateBuildStep::workdir("nested"),
                 ],
                 CommandContext::default(),
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -419,6 +446,7 @@ mod tests {
                     TemplateBuildStep::workdir("../app"),
                 ],
                 CommandContext::default(),
+                &Default::default(),
             )
             .await
             .unwrap();
@@ -435,6 +463,7 @@ mod tests {
                 &sandbox,
                 &[TemplateBuildStep::workdir("/app")],
                 CommandContext::default(),
+                &Default::default(),
             )
             .await
             .expect_err("a failed directory creation should fail the build");
@@ -458,6 +487,7 @@ mod tests {
                     TemplateBuildStep::run("false"),
                 ],
                 CommandContext::default(),
+                &Default::default(),
             )
             .await
             .expect_err("a non-zero exit should fail the build");
@@ -483,7 +513,12 @@ mod tests {
         steps[1].source_step = Some(1);
         steps[2].source_step = Some(2);
         let error = TemplateStepExecutor::new()
-            .execute(&sandbox, &steps, CommandContext::default())
+            .execute(
+                &sandbox,
+                &steps,
+                CommandContext::default(),
+                &Default::default(),
+            )
             .await
             .expect_err("a non-zero exit should fail the build");
         let failure = error

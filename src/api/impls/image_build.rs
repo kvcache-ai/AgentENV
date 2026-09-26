@@ -28,7 +28,7 @@ use crate::{
     snapshot::{
         CommandContext, RunnableSnapshot, SnapshotId, SnapshotRecord, TemplateBuildErrorReason,
     },
-    template::TemplateBuildSpec,
+    template::{logs::BuildLogSession, TemplateBuildSpec},
     types::{ImageConfigs, SandboxId},
 };
 
@@ -351,6 +351,7 @@ impl ApiImpl {
         })?
     }
 
+    #[tracing::instrument(skip_all, fields(build_id = %record.id))]
     async fn run_image_build(
         &self,
         record: SnapshotRecord,
@@ -360,10 +361,14 @@ impl ApiImpl {
     ) {
         let id = record.id.to_string();
         let deadline = Instant::now() + Duration::from_secs(body.timeout.unwrap_or(3600).into());
+        let logs = self
+            .build_logs
+            .start(record.id.clone(), self.snapshot_manager.repository());
         info!(build_id = %id, "template build starting");
+        let logger = logs.logger.clone();
         let work = async {
             let (address, digest) = self
-                .wait_for_image_build(&record, &body, &session, &entry, deadline)
+                .wait_for_image_build(&record, &body, &session, &entry, deadline, &logger)
                 .await?;
             let content = BuildkitContent::connect(address).await?;
             let resolved = tokio::time::timeout(
@@ -385,6 +390,7 @@ impl ApiImpl {
                 configs.add(None::<String>, "/", config);
             }
             let mut spec = TemplateBuildSpec::new()
+                .with_logger(logger.clone())
                 .alias(
                     record
                         .alias
@@ -412,13 +418,15 @@ impl ApiImpl {
             }
             Ok::<_, anyhow::Error>(())
         };
-        self.supervise_image_build(&record, &session, work).await;
+        self.supervise_image_build(&record, &session, logs, work)
+            .await;
     }
 
     async fn supervise_image_build(
         &self,
         record: &SnapshotRecord,
         session: &BuildSession,
+        logs: BuildLogSession,
         work: impl std::future::Future<Output = Result<()>>,
     ) {
         let result = std::panic::AssertUnwindSafe(work)
@@ -426,6 +434,9 @@ impl ApiImpl {
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("build worker panicked")));
         self.finish_image_build(record, session, result).await;
+        if let Err(error) = logs.finish().await {
+            warn!(build_id = %record.id, %error, "failed to persist final build logs");
+        }
     }
 
     async fn finish_image_build(

@@ -122,6 +122,10 @@ where
                 .put(templates_template_id_builds_build_id_builder_put::<I, A, E, C>),
         )
         .route(
+            "/templates/{template_id}/builds/{build_id}/logs",
+            get(templates_template_id_builds_build_id_logs_get::<I, A, E, C>),
+        )
+        .route(
             "/templates/{template_id}/builds/{build_id}/status",
             get(templates_template_id_builds_build_id_status_get::<I, A, E, C>),
         )
@@ -5128,24 +5132,32 @@ where
 }
 
 #[tracing::instrument(skip_all)]
-fn templates_template_id_builds_build_id_status_get_validation(
-    path_params: models::TemplatesTemplateIdBuildsBuildIdStatusGetPathParams,
+fn templates_template_id_builds_build_id_logs_get_validation(
+    path_params: models::TemplatesTemplateIdBuildsBuildIdLogsGetPathParams,
+    query_params: models::TemplatesTemplateIdBuildsBuildIdLogsGetQueryParams,
 ) -> std::result::Result<
-    (models::TemplatesTemplateIdBuildsBuildIdStatusGetPathParams,),
+    (
+        models::TemplatesTemplateIdBuildsBuildIdLogsGetPathParams,
+        models::TemplatesTemplateIdBuildsBuildIdLogsGetQueryParams,
+    ),
     ValidationErrors,
 > {
     path_params.validate()?;
+    query_params.validate()?;
 
-    Ok((path_params,))
+    Ok((path_params, query_params))
 }
-/// TemplatesTemplateIdBuildsBuildIdStatusGet - GET /templates/{templateID}/builds/{buildID}/status
+/// TemplatesTemplateIdBuildsBuildIdLogsGet - GET /templates/{templateID}/builds/{buildID}/logs
 #[tracing::instrument(skip_all)]
-async fn templates_template_id_builds_build_id_status_get<I, A, E, C>(
+async fn templates_template_id_builds_build_id_logs_get<I, A, E, C>(
     method: Method,
     TypedHeader(host): TypedHeader<Host>,
     cookies: CookieJar,
     headers: HeaderMap,
-    Path(path_params): Path<models::TemplatesTemplateIdBuildsBuildIdStatusGetPathParams>,
+    Path(path_params): Path<models::TemplatesTemplateIdBuildsBuildIdLogsGetPathParams>,
+    QueryExtra(query_params): QueryExtra<
+        models::TemplatesTemplateIdBuildsBuildIdLogsGetQueryParams,
+    >,
     State(api_impl): State<I>,
 ) -> Result<Response, StatusCode>
 where
@@ -5173,12 +5185,198 @@ where
 
     #[allow(clippy::redundant_closure)]
     let validation = tokio::task::spawn_blocking(move || {
-        templates_template_id_builds_build_id_status_get_validation(path_params)
+        templates_template_id_builds_build_id_logs_get_validation(path_params, query_params)
     })
     .await
     .unwrap();
 
-    let Ok((path_params,)) = validation else {
+    let Ok((path_params, query_params)) = validation else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(validation.unwrap_err().to_string()))
+            .map_err(|_| StatusCode::BAD_REQUEST);
+    };
+
+    let result = api_impl
+        .as_ref()
+        .templates_template_id_builds_build_id_logs_get(
+            &method,
+            &host,
+            &cookies,
+            &claims,
+            &path_params,
+            &query_params,
+        )
+        .await;
+
+    let mut response = Response::builder();
+
+    let resp = match result {
+                                            Ok(rsp) => match rsp {
+                                                apis::templates::TemplatesTemplateIdBuildsBuildIdLogsGetResponse::Status200_SuccessfullyReturnedTheTemplateBuildLogs
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(200);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::templates::TemplatesTemplateIdBuildsBuildIdLogsGetResponse::Status400_BadRequest
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(400);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::templates::TemplatesTemplateIdBuildsBuildIdLogsGetResponse::Status401_AuthenticationError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(401);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::templates::TemplatesTemplateIdBuildsBuildIdLogsGetResponse::Status404_NotFound
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(404);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::templates::TemplatesTemplateIdBuildsBuildIdLogsGetResponse::Status500_ServerError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(500);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                            },
+                                            Err(why) => {
+                                                    // Application code returned an error. This should not happen, as the implementation should
+                                                    // return a valid response.
+                                                    return api_impl.as_ref().handle_error(&method, &host, &cookies, why).await;
+                                            },
+                                        };
+
+    resp.map_err(|e| {
+        error!(error = ?e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[tracing::instrument(skip_all)]
+fn templates_template_id_builds_build_id_status_get_validation(
+    path_params: models::TemplatesTemplateIdBuildsBuildIdStatusGetPathParams,
+    query_params: models::TemplatesTemplateIdBuildsBuildIdStatusGetQueryParams,
+) -> std::result::Result<
+    (
+        models::TemplatesTemplateIdBuildsBuildIdStatusGetPathParams,
+        models::TemplatesTemplateIdBuildsBuildIdStatusGetQueryParams,
+    ),
+    ValidationErrors,
+> {
+    path_params.validate()?;
+    query_params.validate()?;
+
+    Ok((path_params, query_params))
+}
+/// TemplatesTemplateIdBuildsBuildIdStatusGet - GET /templates/{templateID}/builds/{buildID}/status
+#[tracing::instrument(skip_all)]
+async fn templates_template_id_builds_build_id_status_get<I, A, E, C>(
+    method: Method,
+    TypedHeader(host): TypedHeader<Host>,
+    cookies: CookieJar,
+    headers: HeaderMap,
+    Path(path_params): Path<models::TemplatesTemplateIdBuildsBuildIdStatusGetPathParams>,
+    QueryExtra(query_params): QueryExtra<
+        models::TemplatesTemplateIdBuildsBuildIdStatusGetQueryParams,
+    >,
+    State(api_impl): State<I>,
+) -> Result<Response, StatusCode>
+where
+    I: AsRef<A> + Send + Sync,
+    A: apis::templates::Templates<E, Claims = C>
+        + apis::ApiKeyAuthHeader<Claims = C>
+        + apis::ApiAuthBasic<Claims = C>
+        + Send
+        + Sync,
+    E: std::fmt::Debug + Send + Sync + 'static,
+{
+    // Authentication
+    let claims_in_header = api_impl
+        .as_ref()
+        .extract_claims_from_header(&headers, "X-Team-ID")
+        .await;
+    let claims_in_auth_header = api_impl
+        .as_ref()
+        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
+        .await;
+    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let Some(claims) = claims else {
+        return response_with_status_code_only(StatusCode::UNAUTHORIZED);
+    };
+
+    #[allow(clippy::redundant_closure)]
+    let validation = tokio::task::spawn_blocking(move || {
+        templates_template_id_builds_build_id_status_get_validation(path_params, query_params)
+    })
+    .await
+    .unwrap();
+
+    let Ok((path_params, query_params)) = validation else {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Body::from(validation.unwrap_err().to_string()))
@@ -5193,6 +5391,7 @@ where
             &cookies,
             &claims,
             &path_params,
+            &query_params,
         )
         .await;
 

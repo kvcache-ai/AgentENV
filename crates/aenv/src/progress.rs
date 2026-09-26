@@ -7,15 +7,20 @@ use std::time::Duration;
 /// Overall build phases; Dockerfile output is printed above the live bar.
 pub struct BuildProgress {
     bar: ProgressBar,
+    steps: u64,
 }
 
 impl BuildProgress {
     pub fn new(enabled: bool) -> Result<Self> {
+        Self::with_steps(enabled, 3)
+    }
+
+    pub fn with_steps(enabled: bool, steps: u64) -> Result<Self> {
         let bar = if enabled
             && std::io::stderr().is_terminal()
             && std::env::var_os("TERM").is_none_or(|term| term != "dumb")
         {
-            ProgressBar::with_draw_target(Some(3), ProgressDrawTarget::stderr_with_hz(10))
+            ProgressBar::with_draw_target(Some(steps), ProgressDrawTarget::stderr_with_hz(10))
         } else {
             ProgressBar::hidden()
         };
@@ -28,7 +33,7 @@ impl BuildProgress {
         if !bar.is_hidden() {
             bar.enable_steady_tick(Duration::from_millis(100));
         }
-        Ok(Self { bar })
+        Ok(Self { bar, steps })
     }
 
     pub fn visible(&self) -> bool {
@@ -52,8 +57,18 @@ impl BuildProgress {
     }
 
     pub fn finish(&self) {
-        self.bar.set_position(3);
+        self.bar.set_position(self.steps);
         self.bar.finish_and_clear();
+    }
+}
+
+pub(crate) fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f64();
+    if seconds < 60.0 {
+        format!("{seconds:.1}s")
+    } else {
+        let minutes = (seconds / 60.0).floor() as u64;
+        format!("{minutes}m {:.1}s", seconds - minutes as f64 * 60.0)
     }
 }
 

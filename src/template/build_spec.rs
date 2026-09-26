@@ -110,9 +110,15 @@ pub struct TemplateBuildSpec {
     ready_cmd: Option<String>,
     startup_shell: Option<String>,
     base_context: Option<CommandContext>,
+    pub(crate) logger: super::logs::BuildLogger,
 }
 
 impl TemplateBuildSpec {
+    pub(crate) fn with_logger(mut self, logger: super::logs::BuildLogger) -> Self {
+        self.logger = logger;
+        self
+    }
+
     /// Creates an empty template build description.
     pub fn new() -> Self {
         Self::default()

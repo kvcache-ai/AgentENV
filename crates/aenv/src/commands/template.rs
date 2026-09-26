@@ -3,10 +3,11 @@ use crate::client::{
     Client,
 };
 use crate::output::{self, Format};
+use crate::progress::{format_elapsed, BuildProgress};
 use anyhow::{bail, Result};
+use chrono::{DateTime, Utc};
 use clap::{Args as ClapArgs, Subcommand};
 use std::{
-    io::{self, Write},
     thread,
     time::{Duration, Instant},
 };
@@ -94,7 +95,9 @@ fn delete(client: &Client, arg: &str) -> Result<()> {
 
 fn watch(client: &Client, arg: &str) -> Result<()> {
     let id = crate::commands::resolve_template(client, arg)?;
-    wait_for_build(client, &id, &id, arg, None)
+    let progress = BuildProgress::with_steps(true, 6)?;
+    progress.stage(1, "Resolving base image");
+    wait_for_build(client, &id, &id, arg, None, &progress, None)
 }
 
 pub(crate) fn wait_for_build(
@@ -103,12 +106,16 @@ pub(crate) fn wait_for_build(
     build_id: &str,
     name: &str,
     deadline: Option<Instant>,
+    progress: &BuildProgress,
+    overall_started: Option<Instant>,
 ) -> Result<()> {
-    let mut last_status = None::<String>;
-    let mut last_line_len = 0usize;
+    let mut logs_offset = 0usize;
+    let mut phase = Some(BuildPhase::new(1, "Resolving base image", None));
+    let mut build_started = None;
+    let mut build_finished = None;
 
     loop {
-        let info = client.template_build_status(template_id, build_id)?;
+        let info = client.template_build_status(template_id, build_id, logs_offset)?;
         if info.template_id != template_id || info.build_id != build_id {
             bail!(
                 "Build status response mismatch: expected template {template_id} build {build_id}, got template {} build {}",
@@ -116,43 +123,65 @@ pub(crate) fn wait_for_build(
                 info.build_id
             );
         }
-        let status_changed = last_status.as_deref() != Some(info.status.as_str());
-        if status_changed {
-            last_line_len =
-                print_status_line(&format!("Build status: {}", info.status), last_line_len)?;
-            last_status = Some(info.status.clone());
+        logs_offset += info.log_entries.len();
+        for entry in &info.log_entries {
+            if entry.message.starts_with("template build started") {
+                build_started.get_or_insert(entry.timestamp);
+            }
+            if let Some((stage, message)) = build_phase(&entry.message) {
+                advance_build_phase(progress, &mut phase, stage, message, entry.timestamp);
+                continue;
+            }
+            if entry.message.starts_with("template build completed") {
+                build_finished = Some(entry.timestamp);
+                finish_build_phase(progress, &mut phase, Some(entry.timestamp));
+                continue;
+            }
+            if is_build_lifecycle_log(&entry.message) {
+                continue;
+            }
+            print_build_log(entry, progress);
+        }
+
+        // The status endpoint returns at most 100 entries. Drain an existing
+        // backlog before sleeping or handling a terminal status.
+        if info.log_entries.len() == 100 {
+            continue;
         }
 
         match info.status.as_str() {
             build_status::READY => {
-                finish_status_line(
-                    &format!("Build succeeded: template {template_id} is ready."),
-                    last_line_len,
-                )?;
+                finish_build_phase(progress, &mut phase, build_finished);
+                progress.finish();
+                let elapsed = overall_started
+                    .map(|started| started.elapsed())
+                    .or_else(|| {
+                        timestamp_elapsed(build_started, build_finished.unwrap_or_else(Utc::now))
+                    });
+                if let Some(elapsed) = elapsed {
+                    println!(
+                        "Template {template_id} is ready in {}.",
+                        format_elapsed(elapsed)
+                    );
+                } else {
+                    println!("Template {template_id} is ready.");
+                }
                 return Ok(());
             }
             build_status::ERROR => {
+                progress.finish();
                 let reason = info
                     .reason
                     .map(format_build_failure_reason)
                     .unwrap_or_else(|| "unknown error".to_string());
-                clear_status_line(last_line_len)?;
                 bail!("Build failed: {reason}");
             }
             build_status::WAITING | build_status::BUILDING => {}
-            other => {
-                if status_changed {
-                    finish_status_line(
-                        &format!("Build returned unknown status: {other}"),
-                        last_line_len,
-                    )?;
-                    last_line_len = 0;
-                }
-            }
+            other => progress.println(&format!("Build returned unknown status: {other}")),
         }
 
         if deadline.is_some_and(|dl| Instant::now() >= dl) {
-            clear_status_line(last_line_len)?;
+            progress.finish();
             bail!(
                 "Timed out waiting for build. Resume with: aenv template watch {}",
                 name
@@ -160,6 +189,98 @@ pub(crate) fn wait_for_build(
         }
         thread::sleep(BUILD_STATUS_POLL_INTERVAL);
     }
+}
+
+struct BuildPhase {
+    stage: u64,
+    message: &'static str,
+    timestamp: Option<DateTime<Utc>>,
+    observed_at: Instant,
+}
+
+impl BuildPhase {
+    fn new(stage: u64, message: &'static str, timestamp: Option<DateTime<Utc>>) -> Self {
+        Self {
+            stage,
+            message,
+            timestamp,
+            observed_at: Instant::now(),
+        }
+    }
+}
+
+fn build_phase(message: &str) -> Option<(u64, &'static str)> {
+    if message.starts_with("template build started") {
+        Some((1, "Resolving base image"))
+    } else if message.starts_with("template build base image resolved")
+        || message.starts_with("template build base template resolved")
+        || message.starts_with("executing template build")
+    {
+        Some((2, "Starting template build sandbox"))
+    } else if message.starts_with("template build sandbox started") {
+        Some((3, "Running build and startup checks"))
+    } else if message.starts_with("capturing template snapshot") {
+        Some((4, "Capturing template snapshot"))
+    } else if message.starts_with("publishing template snapshot") {
+        Some((5, "Publishing template snapshot"))
+    } else {
+        None
+    }
+}
+
+fn is_build_lifecycle_log(message: &str) -> bool {
+    message.starts_with("template snapshot published")
+}
+
+fn advance_build_phase(
+    progress: &BuildProgress,
+    phase: &mut Option<BuildPhase>,
+    stage: u64,
+    message: &'static str,
+    timestamp: DateTime<Utc>,
+) {
+    if let Some(current) = phase.as_mut() {
+        if current.stage == stage {
+            current.timestamp.get_or_insert(timestamp);
+            return;
+        }
+        if current.stage > stage {
+            return;
+        }
+    }
+    finish_build_phase(progress, phase, Some(timestamp));
+    progress.stage(stage, message);
+    *phase = Some(BuildPhase::new(stage, message, Some(timestamp)));
+}
+
+fn finish_build_phase(
+    progress: &BuildProgress,
+    phase: &mut Option<BuildPhase>,
+    finished_at: Option<DateTime<Utc>>,
+) {
+    if let Some(phase) = phase.take() {
+        let elapsed = finished_at
+            .and_then(|finished| timestamp_elapsed(phase.timestamp, finished))
+            .unwrap_or_else(|| phase.observed_at.elapsed());
+        progress.println(&format!(
+            "✓ {} [{}]",
+            phase.message,
+            format_elapsed(elapsed)
+        ));
+    }
+}
+
+fn timestamp_elapsed(started: Option<DateTime<Utc>>, finished: DateTime<Utc>) -> Option<Duration> {
+    (finished - started?).to_std().ok()
+}
+
+fn print_build_log(entry: &crate::client::templates::BuildLogEntry, progress: &BuildProgress) {
+    let line = match entry.level.as_str() {
+        "debug" => return,
+        "info" => entry.message.clone(),
+        level => format!("[{level}] {}", entry.message),
+    };
+    progress.println(&line);
 }
 
 fn format_build_failure_reason(reason: crate::client::templates::BuildStatusReason) -> String {
@@ -173,25 +294,4 @@ fn format_build_failure_reason(reason: crate::client::templates::BuildStatusReas
         Some(step) => format!("{message} (step: {step})"),
         None => message,
     }
-}
-
-fn print_status_line(line: &str, previous_len: usize) -> Result<usize> {
-    let clear_padding = " ".repeat(previous_len.saturating_sub(line.len()));
-    print!("\r{line}{clear_padding}");
-    io::stdout().flush()?;
-    Ok(line.len())
-}
-
-fn finish_status_line(line: &str, previous_len: usize) -> Result<()> {
-    let clear_padding = " ".repeat(previous_len.saturating_sub(line.len()));
-    println!("\r{line}{clear_padding}");
-    Ok(())
-}
-
-fn clear_status_line(previous_len: usize) -> Result<()> {
-    if previous_len > 0 {
-        print!("\r{}\r", " ".repeat(previous_len));
-        io::stdout().flush()?;
-    }
-    Ok(())
 }

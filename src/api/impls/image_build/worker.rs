@@ -33,6 +33,7 @@ impl ApiImpl {
         session: &BuildSession,
         entry: &BuildJournal,
         deadline: Instant,
+        logger: &crate::template::logs::BuildLogger,
     ) -> Result<(SocketAddr, String)> {
         let mut cancellation = session.state.subscribe();
         let solve = async {
@@ -52,7 +53,9 @@ impl ApiImpl {
             worker_command(&executor, START_BUILDKIT, 90).await?;
             let history = BuildkitHistory::connect(address).await?;
             ensure!(session.ready(address), "build cancelled");
-            let digest = history.wait_for_image(&record.id.to_string()).await?;
+            let digest = history
+                .wait_for_image(&record.id.to_string(), logger)
+                .await?;
             session
                 .publish()
                 .map_err(|error| anyhow::anyhow!(error.message))?;

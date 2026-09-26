@@ -249,6 +249,7 @@ impl TemplateBuilder {
         let workspace = self.create_local_dir(&snapshot_id)?;
 
         Ok(TemplateBuildContext {
+            logger: spec.logger.clone(),
             build_snapshot_id: snapshot_id,
             alias,
             initial_context: spec.base_context_ref().cloned().unwrap_or_default(),
@@ -320,6 +321,7 @@ impl TemplateBuilder {
         let workspace = self.create_local_dir(&snapshot_id)?;
 
         Ok(TemplateBuildContext {
+            logger: spec.logger.clone(),
             build_snapshot_id: snapshot_id,
             alias,
             initial_context,
