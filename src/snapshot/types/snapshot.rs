@@ -341,9 +341,9 @@ pub struct CommittedSnapshot {
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<CustomExtensionParams>,
-    /// Optional startup memory pack descriptor. Present only when the pack
-    /// was recorded AND uploaded successfully; absent on older snapshots and
-    /// on POSIX-backend snapshots (pack acceleration is OSS-only for now).
+    /// Optional startup memory pack descriptor. Present only when the recording succeeded and its
+    /// repository backend persisted the manifest; absent on older snapshots and best-effort
+    /// recording failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_startup: Option<crate::snapshot::MemoryStartupPackInfo>,
 }

@@ -137,12 +137,13 @@ impl SnapshotManager {
         // the whole continuation.
         let recording = captured_snapshot
             .downcast_artifacts_ref::<FirecrackerCaptureArtifacts>()
-            .map(|artifacts| crate::snapshot::StartupRecording {
-                trace: tokio::spawn(crate::sandbox::record_startup_pack(
-                    artifacts.snapshot_config().clone(),
-                    artifacts.snapshot_dir().to_path_buf(),
-                )),
-                keep_alive: Box::new(artifacts.snapshot_root_guard()),
+            .map(|artifacts| {
+                let snapshot_config = artifacts.snapshot_config().clone();
+                let snapshot_dir = artifacts.snapshot_dir().to_path_buf();
+                crate::snapshot::StartupRecording::spawn_with_capture_lease(
+                    crate::sandbox::record_startup_pack(snapshot_config, snapshot_dir),
+                    artifacts.snapshot_root_guard(),
+                )
             });
 
         let record = self

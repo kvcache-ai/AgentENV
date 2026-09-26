@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,8 +12,8 @@ use serde::Serialize;
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::snapshot::repository::{SnapshotListFilter, VolumeRecordPage};
 use crate::snapshot::{
-    CommittedSnapshot, RepositoryError, RepositoryResult, SnapshotAlias, SnapshotId,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
+    CommittedSnapshot, MemoryStartupPackInfo, RepositoryError, RepositoryResult, SnapshotAlias,
+    SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
     SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };
 use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord};
@@ -247,8 +247,8 @@ impl PosixFsCatalogStore {
     }
 
     pub(crate) fn delete_record(&self, id: &SnapshotId) -> RepositoryResult<()> {
+        let _record_guard = self.acquire_record_lock(id)?;
         let Some(record) = self.load_record_by_id_unlocked(id)? else {
-            // Idempotent: already doesn't exist
             return Ok(());
         };
         if let Some(alias) = record.alias.as_ref() {
@@ -680,6 +680,85 @@ impl PosixFsCatalogStore {
             return Err(RepositoryError::InvalidRequest {
                 reason: format!("invalid volume {kind} '{value}'"),
             });
+        }
+        Ok(())
+    }
+    /// Persist a verified manifest before attaching its descriptor under the record lock.
+    /// A crash between the two renames may leave an orphan artifact or a descriptor
+    /// with a missing artifact; retry with the same descriptor repairs either state.
+    /// This is not a multi-file durable transaction.
+    pub(crate) fn attach_memory_startup(
+        &self,
+        id: &SnapshotId,
+        info: MemoryStartupPackInfo,
+        bytes: &[u8],
+    ) -> RepositoryResult<()> {
+        let _guard = self.acquire_record_lock(id)?;
+        let Some(mut record) = self.load_record_by_id_unlocked(id)? else {
+            return Ok(());
+        };
+        let Some(committed) = record.committed.as_mut() else {
+            return Ok(());
+        };
+        if info.pack_size != bytes.len() as u64
+            || info.index_sha256 != crate::snapshot::startup_pack::hex_sha256(bytes)
+            || overlaybd::startup_manifest::decode_manifest(bytes).map_or(true, |manifest| {
+                manifest.mem_virtual_size != info.mem_virtual_size
+            })
+        {
+            return Err(RepositoryError::InvalidRequest {
+                reason: "startup manifest descriptor does not match artifact".into(),
+            });
+        }
+        let path = self
+            .layout(id)
+            .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
+        if let Some(existing) = committed.memory_startup.as_ref() {
+            if existing != &info {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: "startup manifest descriptor already differs".into(),
+                });
+            }
+            let artifact_matches = fs::File::open(&path).is_ok_and(|file| {
+                let mut artifact = Vec::new();
+                file.take(bytes.len() as u64 + 1)
+                    .read_to_end(&mut artifact)
+                    .is_ok_and(|_| artifact == bytes)
+            });
+            if artifact_matches {
+                return Ok(());
+            }
+            // A matching descriptor with a missing or corrupt artifact can be
+            // repaired only by supplying bytes verified against that descriptor.
+        }
+        let already_attached = committed.memory_startup.is_some();
+        let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
+            message: format!("resolve parent for {}", path.display()),
+            source: None,
+        })?;
+        fs::create_dir_all(parent).map_err(|error| {
+            RepositoryError::backend(format!("create {}", parent.display()), error)
+        })?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
+            RepositoryError::backend(
+                format!("create manifest temp in {}", parent.display()),
+                error,
+            )
+        })?;
+        temp.write_all(bytes)
+            .and_then(|()| temp.as_file().sync_all())
+            .map_err(|error| {
+                RepositoryError::backend(format!("write manifest {}", path.display()), error)
+            })?;
+        temp.persist(&path).map_err(|error| {
+            RepositoryError::backend(format!("persist manifest {}", path.display()), error.error)
+        })?;
+        if !already_attached {
+            committed.memory_startup = Some(info);
+            record.updated_at_unix_ms = now_unix_ms();
+            // Keep a verified orphan artifact on record-write failure: a retry
+            // can reuse it, while readers see no descriptor until commit.
+            self.write_record_unlocked(&record)?;
         }
         Ok(())
     }
@@ -1150,8 +1229,9 @@ mod tests {
     use super::PosixFsCatalogStore;
     use crate::snapshot::RepositoryError;
     use crate::snapshot::{
-        CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotPublishMetadata,
-        SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind, TemplateBuildStatus,
+        CommittedSnapshot, MemoryStartupPackInfo, SnapshotAlias, SnapshotId, SnapshotListFilter,
+        SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind,
+        TemplateBuildStatus,
     };
     use crate::volume::{VolumeMode, VolumeRecord};
 
@@ -1265,6 +1345,152 @@ mod tests {
             .commit_publish(&session, metadata, CommittedSnapshot::mock())
             .expect("commit should work");
         snapshot_id
+    }
+
+    #[test]
+    fn startup_manifest_attach_is_idempotent_and_cannot_revive_a_delete() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().to_path_buf();
+        let store = PosixFsCatalogStore::new(root.clone());
+        let id = SnapshotId::generate();
+        let session = store.begin_publish(&id).unwrap();
+        store
+            .commit_publish(
+                &session,
+                SnapshotPublishMetadata {
+                    id: id.clone(),
+                    source: SnapshotPublishSource::Template,
+                    ..SnapshotPublishMetadata::mock()
+                },
+                CommittedSnapshot::mock(),
+            )
+            .unwrap();
+        let first_bytes = overlaybd::startup_manifest::encode_manifest(
+            &overlaybd::startup_manifest::StartupManifest {
+                mem_virtual_size: 4096,
+                prefix_pages: Vec::new(),
+                ranges: vec![(0, 4096)],
+            },
+        )
+        .unwrap();
+        let first = MemoryStartupPackInfo {
+            pack_size: first_bytes.len() as u64,
+            mem_virtual_size: 4096,
+            index_sha256: crate::snapshot::startup_pack::hex_sha256(&first_bytes),
+        };
+        assert!(store
+            .attach_memory_startup(
+                &id,
+                MemoryStartupPackInfo {
+                    pack_size: first.pack_size + 1,
+                    ..first.clone()
+                },
+                &first_bytes,
+            )
+            .is_err());
+        assert!(store
+            .attach_memory_startup(
+                &id,
+                MemoryStartupPackInfo {
+                    index_sha256: "wrong hash".into(),
+                    ..first.clone()
+                },
+                &first_bytes,
+            )
+            .is_err());
+        assert!(store
+            .attach_memory_startup(
+                &id,
+                MemoryStartupPackInfo {
+                    mem_virtual_size: 8192,
+                    ..first.clone()
+                },
+                &first_bytes,
+            )
+            .is_err());
+        let artifact = PosixFsSnapshotArtifactLayout::new(&root, &id)
+            .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
+        std::fs::write(&artifact, b"orphan from interrupted attach").unwrap();
+        store
+            .attach_memory_startup(&id, first.clone(), &first_bytes)
+            .unwrap();
+        assert_eq!(std::fs::read(&artifact).unwrap(), first_bytes);
+        std::fs::remove_file(&artifact).unwrap();
+        store
+            .attach_memory_startup(&id, first.clone(), &first_bytes)
+            .unwrap();
+        assert_eq!(std::fs::read(&artifact).unwrap(), first_bytes);
+        std::fs::write(&artifact, b"corrupt after descriptor attach").unwrap();
+        store
+            .attach_memory_startup(&id, first.clone(), &first_bytes)
+            .unwrap();
+        assert_eq!(std::fs::read(&artifact).unwrap(), first_bytes);
+        let second_bytes = overlaybd::startup_manifest::encode_manifest(
+            &overlaybd::startup_manifest::StartupManifest {
+                mem_virtual_size: 8192,
+                prefix_pages: Vec::new(),
+                ranges: vec![(4096, 4096)],
+            },
+        )
+        .unwrap();
+        assert!(store
+            .attach_memory_startup(
+                &id,
+                MemoryStartupPackInfo {
+                    pack_size: second_bytes.len() as u64,
+                    mem_virtual_size: 8192,
+                    index_sha256: crate::snapshot::startup_pack::hex_sha256(&second_bytes),
+                },
+                &second_bytes,
+            )
+            .is_err());
+        assert_eq!(std::fs::read(&artifact).unwrap(), first_bytes);
+        assert_eq!(
+            store
+                .get(&id.to_string())
+                .unwrap()
+                .unwrap()
+                .committed
+                .unwrap()
+                .memory_startup,
+            Some(first.clone())
+        );
+
+        let race_id = SnapshotId::generate();
+        let race_session = store.begin_publish(&race_id).unwrap();
+        store
+            .commit_publish(
+                &race_session,
+                SnapshotPublishMetadata {
+                    id: race_id.clone(),
+                    source: SnapshotPublishSource::Template,
+                    ..SnapshotPublishMetadata::mock()
+                },
+                CommittedSnapshot::mock(),
+            )
+            .unwrap();
+        let attach_root = root.clone();
+        let race_bytes = first_bytes.clone();
+        let race_info = first.clone();
+        let delete_root = root.clone();
+        let attach_id = race_id.clone();
+        let delete_id = race_id.clone();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                PosixFsCatalogStore::new(attach_root)
+                    .attach_memory_startup(&attach_id, race_info, &race_bytes)
+                    .unwrap();
+            });
+            scope.spawn(move || {
+                PosixFsCatalogStore::new(delete_root)
+                    .delete_record(&delete_id)
+                    .unwrap();
+            });
+        });
+        assert!(store.get(&race_id.to_string()).unwrap().is_none());
+        assert!(!PosixFsSnapshotArtifactLayout::new(&root, &race_id)
+            .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT)
+            .exists());
     }
 
     fn listed_ids(store: &PosixFsCatalogStore, filter: SnapshotListFilter) -> Vec<SnapshotId> {

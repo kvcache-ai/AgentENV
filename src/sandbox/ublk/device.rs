@@ -426,13 +426,16 @@ impl UblkDeviceManager {
             .snapshot
             .memory_startup_pack
             .consume_timeout_secs;
+        let crate::snapshot::ResolvedStartupPackSource::OssUrl(url) = &pack.source else {
+            return;
+        };
         let result = async {
             let client = self.require_client()?;
             client
                 .prefetch_startup_pack(
                     image_config,
                     global_config,
-                    &pack.url,
+                    url,
                     pack.pack_size,
                     &pack.index_sha256,
                     pack.mem_virtual_size,
@@ -834,6 +837,12 @@ pub(crate) struct SharedReadOnlyDevice {
 }
 
 impl SharedReadOnlyDevice {
+    /// Identity of this live device generation, not a recyclable kernel ID.
+    /// The caller must retain a clone while using this identity.
+    pub(crate) fn prefetch_identity(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
+    }
+
     pub fn image_config_path(&self) -> &Path {
         &self.inner.image_config_key
     }
@@ -866,7 +875,6 @@ impl SharedReadOnlyDevice {
         release_shared_readonly_device(key, device, notify).await
     }
 }
-
 /// A handle to a single `/dev/ublkb<N>` device.
 ///
 /// This is a pure data struct. All lifecycle operations (create, delete,

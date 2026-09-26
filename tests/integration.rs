@@ -15,5 +15,8 @@ mod snapshot;
 #[path = "integration/snapshot_attached_drive.rs"]
 mod snapshot_attached_drive;
 
+#[path = "integration/posix_startup_pack.rs"]
+mod posix_startup_pack;
+
 #[path = "integration/ublk.rs"]
 mod ublk;

@@ -184,6 +184,7 @@ pub struct FirecrackerSandbox {
     envd_instance: Option<EnvdInstance>,
     rootfs_runtime: Option<OverlaybdRuntimeHandle>,
     mem_ublk_device: Option<SharedReadOnlyDevice>,
+    startup_prefetch_task: Option<super::startup_pack::LocalStartupPrefetch>,
     tools_ublk_device: Option<SharedReadOnlyDevice>,
     /// Dedicated, non-shared memory device used only by startup-pack
     /// recording VMs (`pack_recording = true`). Released with
@@ -636,6 +637,11 @@ impl SandboxExecutor for FirecrackerSandbox {
 // ── FirecrackerSandbox public API ────────────────────────────────────────────
 
 impl FirecrackerSandbox {
+    /// Identity of this sandbox, including for capture provenance.
+    pub fn sandbox_id(&self) -> SandboxId {
+        self.id
+    }
+
     async fn recover_capture_failure<T>(
         &mut self,
         operation: &'static str,
@@ -843,7 +849,8 @@ impl FirecrackerSandbox {
     pub async fn start(&mut self) -> Result<()> {
         debug!("starting firecracker sandbox");
         self.start_nowait().await?;
-        self.wait_for_ready().await
+        self.wait_for_ready().await?;
+        Ok(())
     }
 
     /// Start the sandbox WITHOUT waiting for envd's readiness.
@@ -855,9 +862,10 @@ impl FirecrackerSandbox {
         self.launch.validate()?;
         trace!("launch config validated");
         match &self.launch {
-            LaunchMode::Fresh(config) => self.start_fresh(config.clone()).await,
-            LaunchMode::Resume(config) => self.start_resume(config.clone()).await,
+            LaunchMode::Fresh(config) => self.start_fresh(config.clone()).await?,
+            LaunchMode::Resume(config) => self.start_resume(config.clone()).await?,
         }
+        Ok(())
     }
 
     async fn prepare_tools_drive(&mut self) -> Result<()> {
@@ -1378,9 +1386,23 @@ impl FirecrackerSandbox {
     pub async fn stop(&mut self) -> Result<()> {
         debug!("stopping firecracker sandbox");
 
-        self.fc_instance
+        let prefetch = self.startup_prefetch_task.take();
+        if let Some(task) = prefetch.as_ref() {
+            task.cancel();
+        }
+        let vm_stop = self
+            .fc_instance
             .stop(self.runtime_policy.socket_timeout)
-            .await?;
+            .await;
+        if let Err(error) = vm_stop {
+            // If a future Firecracker stop implementation can fail, the VM
+            // may still own its devices. Drain the reader, but retain the
+            // sandbox/device handles for a later stop attempt.
+            if let Some(task) = prefetch {
+                task.stop().await;
+            }
+            return Err(error);
+        }
 
         // Clear envd instance
         if let Some(envd) = self.envd_instance.as_ref() {
@@ -1406,12 +1428,6 @@ impl FirecrackerSandbox {
                 warn!(error = %error, "failed to release shared tools device during stop");
             }
         }
-        if let Some(mem_device) = self.mem_ublk_device.take() {
-            if let Err(e) = mem_device.release().await {
-                warn!(error = %e, "failed to release shared memory ublk device during stop");
-            }
-        }
-
         // Dedicated pack-recording memory device: delete, never pool-release.
         if let Some(device) = self.mem_dedicated_device.take() {
             if let Err(e) = UblkDeviceManager::global().delete_device(&device).await {
@@ -1435,12 +1451,31 @@ impl FirecrackerSandbox {
         }
 
         // Cleanup network resources
+        let mut network_error = None;
         if let Some(slot) = self.network_slot.take() {
             let idx = slot.idx;
-            NetworkManager::global()
+            match NetworkManager::global()
                 .release(slot)
-                .context("Failed to release network slot")?;
-            debug!(slot = idx, "network slot released");
+                .context("Failed to release network slot")
+            {
+                Ok(()) => debug!(slot = idx, "network slot released"),
+                Err(error) => network_error = Some(error),
+            }
+        }
+
+        // The reader retains its own shared-device lease. Stop the VM and
+        // release unrelated resources first; only the final memory-device
+        // release waits for a possibly blocked in-kernel prefetch read.
+        if let Some(task) = prefetch {
+            task.stop().await;
+        }
+        if let Some(mem_device) = self.mem_ublk_device.take() {
+            if let Err(error) = mem_device.release().await {
+                warn!(%error, "failed to release shared memory ublk device during stop");
+            }
+        }
+        if let Some(error) = network_error {
+            return Err(error);
         }
 
         debug!("firecracker sandbox stopped");
@@ -1712,6 +1747,7 @@ impl FirecrackerSandbox {
             current_custom_extension_params,
             envd_instance: None,
             rootfs_runtime: None,
+            startup_prefetch_task: None,
             mem_ublk_device: None,
             tools_ublk_device: None,
             mem_dedicated_device: None,
@@ -2166,18 +2202,22 @@ impl FirecrackerSandbox {
                 .context("arm startup pack recorder")?;
             device_path
         } else {
-            // Register the startup manifest prefetch BEFORE opening the
-            // memory image: the prefetch then refills into the same cache
-            // the device opens, racing guest faults from the very first
-            // metadata read. Registration itself never blocks the resume.
             if let Some(pack) = &config.memory_startup_pack {
-                UblkDeviceManager::global()
-                    .prefetch_startup_pack(
-                        &config.mem_overlaybd_config.image_config_path,
-                        &mem_global_config,
-                        pack,
-                    )
-                    .await;
+                match &pack.source {
+                    crate::snapshot::ResolvedStartupPackSource::OssUrl(_) => {
+                        UblkDeviceManager::global()
+                            .prefetch_startup_pack(
+                                &config.mem_overlaybd_config.image_config_path,
+                                &mem_global_config,
+                                pack,
+                            )
+                            .await;
+                    }
+                    crate::snapshot::ResolvedStartupPackSource::LocalPath(_) => {
+                        // Local prefetch needs the actual shared memory device,
+                        // acquired below. Warming lower files is insufficient.
+                    }
+                }
             }
             let mem_device = UblkDeviceManager::global()
                 .get_or_create_shared_mem(
@@ -2190,6 +2230,23 @@ impl FirecrackerSandbox {
                 .await
                 .context("create or reuse shared memory ublk device for resume")?;
             let device_path = mem_device.device_path().to_path_buf();
+
+            if let Some(pack) = &config.memory_startup_pack {
+                if matches!(
+                    &pack.source,
+                    crate::snapshot::ResolvedStartupPackSource::LocalPath(_)
+                ) {
+                    if let Some(task) = self.startup_prefetch_task.take() {
+                        task.stop().await;
+                    }
+                    self.startup_prefetch_task =
+                        Some(super::startup_pack::submit_local_startup_prefetch(
+                            mem_device.clone(),
+                            mem_global_config.clone(),
+                            pack.clone(),
+                        ));
+                }
+            }
 
             self.mem_snapshot_image_config_path =
                 Some(config.mem_overlaybd_config.image_config_path.clone());

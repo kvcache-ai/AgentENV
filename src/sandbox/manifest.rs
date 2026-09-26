@@ -51,8 +51,8 @@ pub struct SandboxSnapshotManifest {
     #[serde(default)]
     pub physical_extra_drive_count: usize,
     /// Runtime-only startup pack reference resolved from the committed
-    /// record (OSS backend, consumption enabled). Absent for older
-    /// snapshots, v1 packs, POSIX backends, and disabled consumption.
+    /// record when consumption is enabled. It is absent for older snapshots,
+    /// disabled consumption, and best-effort manifest resolution failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_startup_pack: Option<crate::snapshot::ResolvedStartupPack>,
 }

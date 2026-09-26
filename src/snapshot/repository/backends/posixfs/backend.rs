@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::task;
+use tracing::{debug, warn};
 
 use super::super::{common::materialize_volume_image_config, shared_runtime_cache_root};
 use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
@@ -241,6 +242,91 @@ impl PosixFsSnapshotRepository {
         self.catalog_store.mark_error(id, reason)
     }
 }
+async fn finish_posix_startup_manifest(
+    catalog: Arc<PosixFsCatalogStore>,
+    id: SnapshotId,
+    recording: crate::snapshot::StartupRecording,
+    _guard: crate::snapshot::startup_pack::StartupManifestTaskGuard,
+) {
+    let crate::snapshot::StartupRecording {
+        mut trace,
+        keep_alive,
+    } = recording;
+    let _keep_alive = keep_alive;
+    let trace_path = match tokio::select! {
+        joined = &mut trace => joined,
+        _ = crate::snapshot::startup_pack::startup_manifest_abort_notify() => {
+            // The recorder owns a VM/device cleanup path. Keep its capture
+            // lease until it has actually finished, even during shutdown.
+            let _ = trace.await;
+            return;
+        }
+    } {
+        Ok(Some(path)) => path,
+        Ok(None) => return,
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "POSIX startup trace join failed");
+            return;
+        }
+    };
+    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+        return;
+    }
+    use tokio::io::AsyncReadExt;
+    let max_trace_bytes = overlaybd::startup_pack::TRACE_HEADER_BYTES
+        + overlaybd::startup_pack::MAX_TRACE_PAGES as usize * 8;
+    let bytes = match async {
+        let mut file = tokio::fs::File::open(&trace_path).await?;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(max_trace_bytes as u64 + 1)
+            .read_to_end(&mut bytes)
+            .await?;
+        anyhow::ensure!(bytes.len() <= max_trace_bytes, "startup trace too large");
+        Ok::<_, anyhow::Error>(bytes)
+    }
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            debug!(%error, snapshot_id = %id, "POSIX startup trace unavailable");
+            return;
+        }
+    };
+    let built = tokio::task::spawn_blocking(move || {
+        let (memory_size, offsets) = overlaybd::startup_pack::decode_trace(&bytes)?;
+        let manifest = overlaybd::startup_manifest::build_manifest(memory_size, &offsets)?;
+        let bytes = overlaybd::startup_manifest::encode_manifest(&manifest)?;
+        let info = crate::snapshot::MemoryStartupPackInfo {
+            pack_size: bytes.len() as u64,
+            mem_virtual_size: memory_size,
+            index_sha256: crate::snapshot::startup_pack::hex_sha256(&bytes),
+        };
+        Ok::<_, anyhow::Error>((info, bytes))
+    })
+    .await;
+    let (info, manifest) = match built {
+        Ok(Ok(result)) => result,
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "POSIX startup manifest builder failed");
+            return;
+        }
+        Ok(Err(error)) => {
+            warn!(%error, snapshot_id = %id, "POSIX startup manifest invalid");
+            return;
+        }
+    };
+    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+        return;
+    }
+    let attached = run_repository_blocking("attach POSIX startup manifest", move || {
+        catalog.attach_memory_startup(&id, info, &manifest)
+    })
+    .await;
+    if let Err(error) = attached {
+        warn!(%error, "POSIX startup manifest attach failed");
+    }
+}
 
 #[async_trait]
 impl SnapshotRepository for PosixFsSnapshotRepository {
@@ -256,13 +342,34 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         &self,
         metadata: SnapshotPublishMetadata,
         manifest: SandboxSnapshotManifest,
-        _recording: Option<crate::snapshot::StartupRecording>,
+        recording: Option<crate::snapshot::StartupRecording>,
     ) -> RepositoryResult<SnapshotRecord> {
+        let id = metadata.id.clone();
+        let catalog = Arc::clone(&self.catalog_store);
         let repository = self.clone();
-        run_repository_blocking("publish snapshot", move || {
+        let record = run_repository_blocking("publish snapshot", move || {
             repository.publish_sync(metadata, manifest)
         })
-        .await
+        .await?;
+        if crate::cfg::ConfigManager::global_config()
+            .snapshot
+            .memory_startup_pack
+            .enabled
+        {
+            if let Some(recording) = recording {
+                if let Some(guard) =
+                    crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()
+                {
+                    tokio::spawn(finish_posix_startup_manifest(catalog, id, recording, guard));
+                } else {
+                    // During shutdown, keep capture artifacts alive until the
+                    // already-started recorder has completed its own cleanup.
+                    let _ = recording.trace.await;
+                    drop(recording.keep_alive);
+                }
+            }
+        }
+        Ok(record)
     }
 
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
@@ -477,7 +584,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::runtime::PosixFsRuntimeResolver;
-    use super::{PosixFsBackend, PosixFsBackendConfig, PosixFsSnapshotRepository};
+    use super::{
+        finish_posix_startup_manifest, PosixFsBackend, PosixFsBackendConfig,
+        PosixFsSnapshotRepository,
+    };
     use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
     use crate::sandbox::{ExtraDrive, SandboxSnapshotManifest};
     use crate::snapshot::artifact_cache::LocalArtifactCache;
@@ -625,6 +735,189 @@ mod tests {
         .expect("parse overlaybd image config");
         assert_eq!(image_config.repo_blob_url, "");
         assert_eq!(image_config.lowers.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_publish_keeps_capture_lease_until_pending_recorder_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct LeaseProbe(Arc<AtomicBool>);
+        impl Drop for LeaseProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let tempdir = TempDir::new().unwrap();
+        let repository = test_repository(tempdir.path());
+        let mut manifest = seed_built_snapshot(tempdir.path());
+        manifest.vm_state.path = tempdir.path().join("missing-vm-state");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let recording = crate::snapshot::StartupRecording::spawn_with_capture_lease(
+            async move {
+                let _ = wait.await;
+                None
+            },
+            Arc::new(LeaseProbe(Arc::clone(&dropped))),
+        );
+        assert!(repository
+            .publish(
+                sample_metadata(SnapshotId::generate(), None),
+                manifest,
+                Some(recording)
+            )
+            .await
+            .is_err());
+        assert!(!dropped.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recorder release");
+    }
+
+    #[tokio::test]
+    async fn cancelled_publish_keeps_capture_lease_until_pending_recorder_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct LeaseProbe(Arc<AtomicBool>);
+        impl Drop for LeaseProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let tempdir = TempDir::new().unwrap();
+        let repository = test_repository(tempdir.path());
+        let manifest = seed_built_snapshot(tempdir.path());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let recording = crate::snapshot::StartupRecording::spawn_with_capture_lease(
+            async move {
+                let _ = wait.await;
+                None
+            },
+            Arc::new(LeaseProbe(Arc::clone(&dropped))),
+        );
+        let publish = repository.publish(
+            sample_metadata(SnapshotId::generate(), None),
+            manifest,
+            Some(recording),
+        );
+        // Cancel before the first poll; the recorder is already detached.
+        drop(publish);
+        assert!(!dropped.load(Ordering::SeqCst));
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recorder release");
+    }
+
+    #[tokio::test]
+    async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let backend = test_backend(tempdir.path());
+        let repository = backend.repository();
+        let snapshot_id = SnapshotId::generate();
+        let mut local_artifacts = seed_built_snapshot(tempdir.path());
+        let memory_size = overlaybd::startup_pack::PACK_PAGE_BYTES;
+        local_artifacts.memory.virtual_size = memory_size;
+        repository
+            .publish(
+                sample_metadata(snapshot_id.clone(), None),
+                local_artifacts,
+                None,
+            )
+            .await
+            .expect("publish");
+
+        let trace_path = tempdir.path().join("synthetic.trace");
+        let trace = overlaybd::startup_pack::encode_trace(memory_size, &[0]).expect("trace");
+        tokio::fs::write(&trace_path, trace)
+            .await
+            .expect("write trace");
+        let recording = crate::snapshot::StartupRecording {
+            trace: tokio::spawn(async move { Some(trace_path) }),
+            keep_alive: Box::new(()),
+        };
+        let guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()
+            .expect("register continuation");
+        finish_posix_startup_manifest(
+            Arc::new(PosixFsCatalogStore::new(tempdir.path().to_path_buf())),
+            snapshot_id.clone(),
+            recording,
+            guard,
+        )
+        .await;
+
+        let committed = repository
+            .get(&snapshot_id.to_string())
+            .await
+            .expect("get")
+            .expect("published record");
+        let descriptor = committed
+            .committed
+            .as_ref()
+            .and_then(|value| value.memory_startup.as_ref())
+            .expect("descriptor attached")
+            .clone();
+        let resolver = PosixFsRuntimeResolver::new(
+            tempdir.path().to_path_buf(),
+            tempdir.path().join("runtime-consume"),
+            test_overlaybd_layer_store(),
+            LocalArtifactCache::new(tempdir.path().join("cache-consume"), None)
+                .expect("local cache"),
+        )
+        .with_test_consume_enabled(true);
+        let runnable = resolver
+            .resolve(Arc::new(committed))
+            .await
+            .expect("resolve");
+        let pack = runnable
+            .manifest()
+            .memory_startup_pack
+            .as_ref()
+            .expect("LocalPath manifest");
+        let crate::snapshot::ResolvedStartupPackSource::LocalPath(path) = &pack.source else {
+            panic!("expected LocalPath");
+        };
+        assert_eq!(pack.index_sha256, descriptor.index_sha256);
+        assert_eq!(
+            std::fs::read(path).unwrap().len() as u64,
+            descriptor.pack_size
+        );
+        let disabled = PosixFsRuntimeResolver::new(
+            tempdir.path().to_path_buf(),
+            tempdir.path().join("runtime-disabled"),
+            test_overlaybd_layer_store(),
+            LocalArtifactCache::new(tempdir.path().join("cache-disabled"), None).unwrap(),
+        )
+        .with_test_consume_enabled(false);
+        let record = repository
+            .get(&snapshot_id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(disabled
+            .resolve(Arc::new(record.clone()))
+            .await
+            .unwrap()
+            .manifest()
+            .memory_startup_pack
+            .is_none());
+        let mut legacy = record;
+        legacy.committed.as_mut().unwrap().memory_startup = None;
+        assert!(resolver
+            .resolve(Arc::new(legacy))
+            .await
+            .unwrap()
+            .manifest()
+            .memory_startup_pack
+            .is_none());
     }
 
     #[tokio::test]

@@ -445,14 +445,21 @@ impl SnapshotRepository for OssSnapshotRepository {
             .snapshot
             .memory_startup_pack
             .enabled
-            && !crate::snapshot::startup_pack::startup_manifest_shutdown_requested()
         {
             if let Some(recording) = recording {
-                tokio::spawn(finish_startup_manifest(
-                    self.client.clone(),
-                    metadata.id.clone(),
-                    recording,
-                ));
+                if let Some(guard) =
+                    crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()
+                {
+                    tokio::spawn(finish_startup_manifest(
+                        self.client.clone(),
+                        metadata.id.clone(),
+                        recording,
+                        guard,
+                    ));
+                } else {
+                    let _ = recording.trace.await;
+                    drop(recording.keep_alive);
+                }
             }
         }
 
@@ -1855,18 +1862,43 @@ async fn finish_startup_manifest(
     client: std::sync::Arc<OssClient>,
     id: SnapshotId,
     recording: crate::snapshot::StartupRecording,
+    guard: crate::snapshot::startup_pack::StartupManifestTaskGuard,
 ) {
-    let crate::snapshot::StartupRecording { trace, keep_alive } = recording;
+    finish_startup_manifest_with_abort(
+        client,
+        id,
+        recording,
+        guard,
+        crate::snapshot::startup_pack::startup_manifest_abort_requested,
+    )
+    .await;
+}
+
+async fn finish_startup_manifest_with_abort(
+    client: std::sync::Arc<OssClient>,
+    id: SnapshotId,
+    recording: crate::snapshot::StartupRecording,
+    _guard: crate::snapshot::startup_pack::StartupManifestTaskGuard,
+    abort_requested: impl Fn() -> bool + Send,
+) {
+    let crate::snapshot::StartupRecording {
+        mut trace,
+        keep_alive,
+    } = recording;
     // Hold the captured artifacts alive until the manifest is uploaded, and
     // count this continuation for the shutdown drain.
     let _keep_alive = keep_alive;
-    let _guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::new();
-    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+    if abort_requested() {
+        // The recorder may still be using captured VM/device artifacts.
+        let _ = trace.await;
         return;
     }
     let trace_path = match tokio::select! {
-        joined = trace => joined,
-        _ = crate::snapshot::startup_pack::startup_manifest_abort_notify() => return,
+        joined = &mut trace => joined,
+        _ = crate::snapshot::startup_pack::startup_manifest_abort_notify() => {
+            let _ = trace.await;
+            return;
+        },
     } {
         Ok(Some(path)) => path,
         Ok(None) => {
@@ -1878,14 +1910,14 @@ async fn finish_startup_manifest(
             return;
         }
     };
-    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+    if abort_requested() {
         return;
     }
     let layout = OssSnapshotArtifactLayout::new(&id);
     let Some(info) = build_and_upload_manifest(&client, &layout, &id, &trace_path).await else {
         return;
     };
-    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
+    if abort_requested() {
         return;
     }
     attach_memory_startup_descriptor(&client, &id, info).await;
@@ -2116,6 +2148,55 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    #[tokio::test]
+    async fn abort_before_oss_continuation_keeps_capture_lease_until_trace_finishes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct LeaseProbe(Arc<AtomicBool>);
+        impl Drop for LeaseProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let lease_dropped = Arc::new(AtomicBool::new(false));
+        let trace_finished = Arc::new(AtomicBool::new(false));
+        let (release_trace, trace_release) = tokio::sync::oneshot::channel::<()>();
+        let trace_finished_in_task = Arc::clone(&trace_finished);
+        let recording = crate::snapshot::StartupRecording {
+            trace: tokio::spawn(async move {
+                trace_release.await.expect("release trace");
+                trace_finished_in_task.store(true, Ordering::SeqCst);
+                None
+            }),
+            keep_alive: Box::new(LeaseProbe(Arc::clone(&lease_dropped))),
+        };
+        let guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()
+            .expect("register continuation");
+        let repository = test_repository();
+        let mut continuation = tokio::spawn(finish_startup_manifest_with_abort(
+            Arc::clone(&repository.client),
+            SnapshotId::generate(),
+            recording,
+            guard,
+            || true,
+        ));
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut continuation)
+                .await
+                .is_err(),
+            "aborted continuation must wait for the pending recorder"
+        );
+        assert!(!trace_finished.load(Ordering::SeqCst));
+        assert!(!lease_dropped.load(Ordering::SeqCst));
+
+        release_trace.send(()).expect("release pending trace");
+        continuation.await.expect("continuation");
+        assert!(trace_finished.load(Ordering::SeqCst));
+        assert!(lease_dropped.load(Ordering::SeqCst));
     }
 
     #[test]

@@ -439,6 +439,43 @@ local raw layers whose digest is absent from the committed record — the
 record names the compressed bytes, so the raw digest key would never be
 looked up by consumers.
 
+
+## `[snapshot.memory_startup_pack]`
+
+Optional startup-memory trace recording and best-effort prefetch for both
+`oss` and `posix_fs` repositories. It is disabled by default. Publishing never
+waits for recording: a completed trace is encoded as a SHA-256-verified
+manifest and attached to the already committed snapshot. Snapshots without a
+descriptor, with a missing/corrupt manifest, or with a failed prefetch always
+resume through the ordinary on-demand path.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Record a first-touch trace after capture and persist a manifest when recording succeeds. |
+| `record_min_window_ms` | integer | `200` | Minimum recorder observation window after its first read. |
+| `record_quiet_ms` | integer | `300` | Stop recording after this quiet interval. |
+| `record_max_window_ms` | integer | `2000` | Hard recorder observation-window cap. |
+| `record_budget_secs` | integer | `10` | Best-effort recording budget; it never blocks the snapshot publish. |
+| `max_pack_bytes` | integer | `1073741824` | Maximum recorded page-data budget and POSIX logical prefetch budget. |
+| `consume_enabled` | boolean | `false` | Enable resume-time prefetch; leave disabled for rollout and A/B comparisons. |
+| `consume_timeout_secs` | integer | `30` | Deadline for queueing and dispatching further prefetch reads; an in-kernel read may outlive it. |
+
+For POSIX, the resolver hands the normal sandbox start path a `LocalPath`
+manifest. After acquiring the actual shared memory ublk device, the executor
+reads its logical manifest ranges through a buffered device handle, concurrently
+with recovery. This warms the device page cache used by Firecracker, rather
+than the separate cache of lower-layer files. Each run uses one reader and a
+1 MiB buffer; at most four readers run process-wide. In-flight sharing includes
+the manifest digest, layer identities, and live device generation.
+
+Cancellation and the time budget stop dispatch of subsequent reads. An already
+executing kernel read cannot be interrupted: teardown drains it before releasing
+the device lease, so a stalled storage read can delay teardown. `O_DIRECT`
+(`io_engine = 2`) remains explicitly skipped pending validation of that lower-I/O
+configuration with device prefetch; this is not a claim that device page cache
+is bypassed. The configured I/O engine is never changed. OSS retains its existing
+physical-range planner and executor. Prefetch is not a correctness dependency.
+
 ## `[backend.posix_fs]`
 
 POSIX filesystem-backed snapshot repository configuration. This section is used when `snapshot.repository_backend = "posix_fs"`.
