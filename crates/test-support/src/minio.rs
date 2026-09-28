@@ -11,10 +11,12 @@ pub const MINIO_PASS: &str = "minioadmin";
 pub const REGION: &str = "us-east-1";
 pub const BUCKET: &str = "test-bucket";
 
-// The minio/minio repository on Docker Hub was removed; MinIO now publishes to
-// quay.io. Pin a release tag so tests do not drift with `latest`.
-const MINIO_IMAGE: &str = "quay.io/minio/minio";
-const MINIO_TAG: &str = "RELEASE.2025-09-07T16-13-09Z";
+// MinIO community distribution ended: Docker Hub removed minio/minio and
+// quay.io/minio/minio no longer allows anonymous pulls. Silo is the maintained
+// community fork, wire- and env-compatible (MINIO_*, `server /data`). Pin a
+// release tag so tests do not drift with `latest`.
+const MINIO_IMAGE: &str = "pgsty/silo";
+const MINIO_TAG: &str = "RELEASE.2026-09-16T00-00-00Z";
 
 pub struct MinioFixture {
     pub endpoint: String,
@@ -26,8 +28,8 @@ pub struct MinioFixture {
 
 impl MinioFixture {
     pub async fn start() -> Result<Self> {
-        // Current MinIO images print the startup banner (including the "API:"
-        // line) to stderr, so readiness must watch stderr, not stdout.
+        // The server prints its startup banner (including the "API:" line) to
+        // stderr, so readiness must watch stderr, not stdout.
         let container = GenericImage::new(MINIO_IMAGE, MINIO_TAG)
             .with_wait_for(WaitFor::message_on_stderr("API:"))
             .with_env_var("MINIO_ROOT_USER", MINIO_USER)
