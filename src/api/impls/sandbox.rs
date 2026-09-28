@@ -924,10 +924,7 @@ impl ApiImpl {
             volume_mounts,
         };
 
-        match timer
-            .time("create_sandbox", self.orchestrator.create_sandbox(request))
-            .await
-        {
+        match self.orchestrator.create_sandbox(request).await {
             Ok(metadata) => {
                 if let Err(error) = finish_volume_reservation(
                     &self.volume_manager,
@@ -1119,10 +1116,7 @@ impl Sandboxes<()> for ApiImpl {
             volume_mounts,
         };
 
-        match timer
-            .time("create_sandbox", self.orchestrator.create_sandbox(request))
-            .await
-        {
+        match self.orchestrator.create_sandbox(request).await {
             Ok(metadata) => {
                 if let Err(error) = finish_volume_reservation(
                     &self.volume_manager,
@@ -1680,13 +1674,9 @@ impl Sandboxes<()> for ApiImpl {
             .map_or(NewTimeout::UseExisting, |timeout| {
                 NewTimeout::Set(Duration::from_secs(timeout as u64))
             });
-        let timer = SandboxStageTimer::new("fork");
-        match timer
-            .time(
-                "fork",
-                self.orchestrator
-                    .fork_sandbox_with_specs(sandbox_id, child_specs, new_timeout),
-            )
+        match self
+            .orchestrator
+            .fork_sandbox_with_specs(sandbox_id, child_specs, new_timeout)
             .await
         {
             Ok(outcomes) => {
@@ -1945,10 +1935,7 @@ impl Sandboxes<()> for ApiImpl {
                 sandbox_not_found(path_id),
             ));
         };
-        let timer = SandboxStageTimer::new("pause");
-        match timer
-            .time("pause", self.orchestrator.pause_sandbox(sandbox_id))
-            .await
+        match self.orchestrator.pause_sandbox(sandbox_id).await
         {
             Ok(_) => Ok(
                 SandboxesSandboxIdPausePostResponse::Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
@@ -2012,12 +1999,9 @@ impl Sandboxes<()> for ApiImpl {
             None => None,
         };
 
-        let capture = match timer
-            .time(
-                "capture",
-                self.orchestrator
-                    .capture_snapshot(sandbox_id, SnapshotId::generate(), placement),
-            )
+        let capture = match self
+            .orchestrator
+            .capture_snapshot(sandbox_id, SnapshotId::generate(), placement)
             .await
         {
             Ok(capture) => capture,
@@ -2162,13 +2146,9 @@ impl Sandboxes<()> for ApiImpl {
         };
         let timeout = duration_from_secs(body.timeout).unwrap_or(default_sandbox_timeout());
 
-        let timer = SandboxStageTimer::new("resume");
-        match timer
-            .time(
-                "resume",
-                self.orchestrator
-                    .resume_sandbox(sandbox_id, NewTimeout::Set(timeout)),
-            )
+        match self
+            .orchestrator
+            .resume_sandbox(sandbox_id, NewTimeout::Set(timeout))
             .await
         {
             Ok(metadata) => {
