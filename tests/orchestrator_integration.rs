@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 mod common;
 
 // Orchestrator shutdown permanently stops process-global runtime managers, so
