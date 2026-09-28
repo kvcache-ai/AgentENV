@@ -9,6 +9,34 @@ use super::{RunnableSnapshot, SnapshotManager, SnapshotRecord, SNAPSHOT_ARTIFACT
 use crate::repository::{Repository, RepositoryError, RepositoryResult};
 use crate::snapshot::SandboxSnapshotManifest;
 
+pub fn publish_metadata_for_test(
+    id: super::SnapshotId,
+    alias: Option<super::SnapshotAlias>,
+    source: super::SnapshotPublishSource,
+) -> super::SnapshotPublishMetadata {
+    super::SnapshotPublishMetadata {
+        id,
+        snapshot_type: super::SnapshotPlacement::Distributed,
+        alias,
+        source,
+        context: super::CommandContext::default(),
+        startup: None,
+        resources: crate::types::SandboxResources::default(),
+        runtime_versions: super::SnapshotRuntimeVersions {
+            kernel_version: "kernel".to_string(),
+            firecracker_version: "firecracker".to_string(),
+            envd_version: "envd".to_string(),
+            tools_drive_version: crate::cfg::ConfigManager::global_config()
+                .resolved_tools_version()
+                .to_string(),
+        },
+        virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
+        image_configs: crate::types::ImageConfigs::new(),
+        volume_snapshots: Vec::new(),
+        custom_extension_params: None,
+    }
+}
+
 /// Test double for repository interactions that should stay unreachable:
 /// every operation reports itself unsupported.
 #[derive(Clone, Debug, Default)]

@@ -442,6 +442,7 @@ pub struct SnapshotRecord {
 
 impl SnapshotRecord {
     pub(crate) fn new_committed(
+        id: SnapshotId,
         metadata: &SnapshotPublishMetadata,
         committed: CommittedSnapshot,
         now_unix_ms: i64,
@@ -464,7 +465,7 @@ impl SnapshotRecord {
             },
         };
         Self {
-            id: metadata.id.clone(),
+            id,
             snapshot_type: metadata.snapshot_type,
             owner_node_id: None,
             alias: metadata.alias.clone(),
@@ -610,36 +611,96 @@ pub(crate) fn rootfs_snapshot_image_tag(snapshot_id: &SnapshotId) -> String {
     format!("{SNAPSHOT_IMAGE_TAG_PREFIX}{snapshot_id}")
 }
 
-pub(crate) type RuntimeArtifactLease = dyn Send + Sync;
+/// A complete set of node-local snapshot files and the resources keeping them usable.
+pub struct Snapshot {
+    id: SnapshotId,
+    manifest: SandboxSnapshotManifest,
+    _keepalive: Box<dyn Send + Sync>,
+    /// In-flight startup-manifest recording stashed at capture time; the
+    /// publish flow takes it exactly once. Interior mutability because the
+    /// capture travels as `Arc<Snapshot>`.
+    startup_recording: std::sync::Mutex<Option<crate::snapshot::StartupRecording>>,
+}
 
-#[derive(Clone)]
-/// Runtime-ready snapshot with node-local artifact paths.
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        // The final reference may be released by an API task or device teardown.
+        // TempDir recursively deletes files, so move that work off async workers.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let keepalive = std::mem::replace(&mut self._keepalive, Box::new(()));
+            runtime.spawn_blocking(move || drop(keepalive));
+        }
+    }
+}
+
+impl Snapshot {
+    pub fn new(
+        id: SnapshotId,
+        manifest: SandboxSnapshotManifest,
+        keepalive: impl Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            id,
+            manifest,
+            _keepalive: Box::new(keepalive),
+            startup_recording: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn id(&self) -> &SnapshotId {
+        &self.id
+    }
+
+    pub fn manifest(&self) -> &SandboxSnapshotManifest {
+        &self.manifest
+    }
+
+    /// Stash the in-flight startup-manifest recording for this capture. Only
+    /// the publish flow consumes it (exactly once, via [`Self::take_startup_recording`]).
+    pub(crate) fn set_startup_recording(&self, recording: crate::snapshot::StartupRecording) {
+        *self
+            .startup_recording
+            .lock()
+            .expect("startup recording lock poisoned") = Some(recording);
+    }
+
+    /// Take the stashed startup-manifest recording (publish consumes it once).
+    pub(crate) fn take_startup_recording(&self) -> Option<crate::snapshot::StartupRecording> {
+        self.startup_recording
+            .lock()
+            .expect("startup recording lock poisoned")
+            .take()
+    }
+}
+
+impl fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("id", &self.id)
+            .field("manifest", &self.manifest)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Debug)]
+/// A public snapshot record paired with its node-local files.
 pub struct RunnableSnapshot {
     record: SnapshotRecord,
-    manifest: SandboxSnapshotManifest,
-    _lease: Arc<RuntimeArtifactLease>,
+    snapshot: Arc<Snapshot>,
 }
 
 impl RunnableSnapshot {
-    pub(crate) fn lease(&self) -> Arc<RuntimeArtifactLease> {
-        Arc::clone(&self._lease)
+    pub(crate) fn snapshot(&self) -> Arc<Snapshot> {
+        Arc::clone(&self.snapshot)
     }
 
-    pub(crate) fn new(
-        record: SnapshotRecord,
-        manifest: SandboxSnapshotManifest,
-        lease: Arc<RuntimeArtifactLease>,
-    ) -> Self {
-        Self {
-            record,
-            manifest,
-            _lease: lease,
-        }
+    pub(crate) fn new(record: SnapshotRecord, snapshot: Arc<Snapshot>) -> Self {
+        Self { record, snapshot }
     }
 
     /// Returns the runtime-resolved attached drives for this snapshot.
     pub fn attached_drives(&self) -> Vec<ResolvedAttachedDrive> {
-        self.manifest
+        self.manifest()
             .attached_drives
             .iter()
             .map(|drive| ResolvedAttachedDrive::Overlaybd {
@@ -658,7 +719,7 @@ impl RunnableSnapshot {
     }
 
     pub fn manifest(&self) -> &SandboxSnapshotManifest {
-        &self.manifest
+        self.snapshot.manifest()
     }
 
     /// Returns the committed snapshot record backing this runnable snapshot.
@@ -697,21 +758,24 @@ impl RunnableSnapshot {
             .map(ResolvedAttachedDrive::to_extra_drive)
             .collect();
 
-        Self {
-            record,
-            manifest: SandboxSnapshotManifest::for_test(0, &extra_drives),
-            _lease: Arc::new(()),
-        }
+        let snapshot = Arc::new(Snapshot::new(
+            record.id.clone(),
+            SandboxSnapshotManifest::for_test(0, &extra_drives),
+            (),
+        ));
+        Self::new(record, snapshot)
     }
-
     #[cfg(test)]
     pub(crate) fn from_test_legacy_manifest(
         record: SnapshotRecord,
         attached_drives: Vec<ResolvedAttachedDrive>,
     ) -> Self {
-        let mut snapshot = Self::from_test_manifest(record, attached_drives);
-        snapshot.manifest.volume_drive_slots = 0;
-        snapshot
+        let mut runnable = Self::from_test_manifest(record, attached_drives);
+        Arc::get_mut(&mut runnable.snapshot)
+            .unwrap()
+            .manifest
+            .volume_drive_slots = 0;
+        runnable
     }
 
     /// Snapshot whose attached drives all occupy reserved slots.
@@ -720,18 +784,12 @@ impl RunnableSnapshot {
         record: SnapshotRecord,
         attached_drives: Vec<ResolvedAttachedDrive>,
     ) -> Self {
-        let mut snapshot = Self::from_test_manifest(record, attached_drives);
-        snapshot.manifest.physical_extra_drive_count = 0;
-        snapshot
-    }
-}
-
-impl fmt::Debug for RunnableSnapshot {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RunnableSnapshot")
-            .field("record", &self.record)
-            .field("manifest", &self.manifest)
-            .finish_non_exhaustive()
+        let mut runnable = Self::from_test_manifest(record, attached_drives);
+        Arc::get_mut(&mut runnable.snapshot)
+            .unwrap()
+            .manifest
+            .physical_extra_drive_count = 0;
+        runnable
     }
 }
 
@@ -746,6 +804,31 @@ mod tests {
         SnapshotVolume, TemplateBuildErrorReason,
     };
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn final_snapshot_owner_releases_resources_off_async_worker() {
+        struct DropThread(std::sync::mpsc::Sender<std::thread::ThreadId>);
+        impl Drop for DropThread {
+            fn drop(&mut self) {
+                let _ = self.0.send(std::thread::current().id());
+            }
+        }
+        let worker = std::thread::current().id();
+        let (sent, received) = std::sync::mpsc::channel();
+        let snapshot = std::sync::Arc::new(super::Snapshot::new(
+            super::SnapshotId::generate(),
+            crate::snapshot::SandboxSnapshotManifest::for_test(4096, &[]),
+            DropThread(sent),
+        ));
+        let reader = std::sync::Arc::clone(&snapshot);
+        drop(snapshot);
+        assert!(received.try_recv().is_err());
+        drop(reader);
+        let released_on = received
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_ne!(released_on, worker);
+    }
 
     fn publication(
         image_ref: impl Into<String>,

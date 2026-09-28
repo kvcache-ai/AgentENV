@@ -1996,8 +1996,11 @@ impl Sandboxes<()> for ApiImpl {
         let capture = match timer
             .time(
                 "capture",
-                self.orchestrator
-                    .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed),
+                self.orchestrator.capture_snapshot(
+                    sandbox_id,
+                    SnapshotId::generate(),
+                    crate::snapshot::SnapshotPlacement::Distributed,
+                ),
             )
             .await
         {
@@ -2041,7 +2044,7 @@ impl Sandboxes<()> for ApiImpl {
                     &self.snapshot_manager,
                     SnapshotPublishMetadata {
                         snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
-                        id: SnapshotId::generate(),
+                        id: capture.captured_snapshot.id().clone(),
                         alias: alias.clone(),
                         source: SnapshotPublishSource::Sandbox {
                             source_sandbox_id: capture.metadata.id.to_string(),

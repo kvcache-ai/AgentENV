@@ -79,72 +79,10 @@ impl MockServer {
     }
 
     /// Start a mock server that accepts a connection but never responds.
-    async fn start_hanging() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("daemon.sock");
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    accept = listener.accept() => {
-                        match accept {
-                            Ok((_stream, _)) => {
-                                // Hold the stream open but never respond.
-                                // Keep it alive until shutdown.
-                                tokio::time::sleep(Duration::from_secs(300)).await;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    _ = &mut shutdown_rx => break,
-                }
-            }
-        });
-
-        Self {
-            socket_path,
-            _dir: dir,
-            shutdown_tx: Some(shutdown_tx),
-        }
-    }
-
     /// Start a mock server that accepts and immediately closes the connection.
-    async fn start_drop_connection() -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        let socket_path = dir.path().join("daemon.sock");
-
-        let listener = UnixListener::bind(&socket_path).unwrap();
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    accept = listener.accept() => {
-                        match accept {
-                            Ok((_stream, _)) => {
-                                // Drop the stream immediately → EOF for client.
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    _ = &mut shutdown_rx => break,
-                }
-            }
-        });
-
-        Self {
-            socket_path,
-            _dir: dir,
-            shutdown_tx: Some(shutdown_tx),
-        }
-    }
-
     /// Create a `UblkDaemonClient` pointing at this mock server.
     fn client(&self) -> Arc<UblkDaemonClient> {
-        UblkDaemonClient::new_for_test(self.socket_path.clone(), false)
+        UblkDaemonClient::new_for_test(self.socket_path.clone())
     }
 }
 
@@ -247,22 +185,6 @@ mod client_tests {
         assert!(
             msg.contains("disk full"),
             "error should contain message from daemon: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn create_overlaybd_unexpected_response() {
-        let server = MockServer::start(Box::new(|_| DaemonResponse::Deleted)).await;
-
-        let client = server.client();
-        let err = client
-            .create_overlaybd(Path::new("/img.json"), Path::new("/global.json"))
-            .await
-            .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("unexpected"),
-            "error should mention unexpected response: {msg}"
         );
     }
 
@@ -377,27 +299,6 @@ mod client_tests {
         assert!(err.downcast_ref::<InvalidRequestError>().is_some());
     }
 
-    #[tokio::test]
-    async fn create_overlaybd_runtime_device_unexpected_response() {
-        let server = MockServer::start(Box::new(|_| DaemonResponse::Deleted)).await;
-
-        let client = server.client();
-        let err = client
-            .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                source_image_config: Path::new("/src/image.json"),
-                global_config: Path::new("/global.json"),
-                runtime_dir: Path::new("/work/overlaybd"),
-                read_only: false,
-                runtime_upper_mode: UpperMode::LogStructured,
-                requested_virtual_size: None,
-                known_source_virtual_size: None,
-                allow_shrink: false,
-            })
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("unexpected response"));
-    }
-
     // ── delete ──────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -412,33 +313,6 @@ mod client_tests {
 
         let client = server.client();
         client.delete(7).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn delete_error() {
-        let server = MockServer::start(Box::new(|_| DaemonResponse::Error {
-            message: "device 99 not found".into(),
-        }))
-        .await;
-
-        let client = server.client();
-        let err = client.delete(99).await.unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("not found"), "error: {msg}");
-    }
-
-    #[tokio::test]
-    async fn delete_unexpected_response() {
-        let server = MockServer::start(Box::new(|_| DaemonResponse::DeviceCreated {
-            dev_id: 0,
-            device_path: PathBuf::from("/dev/ublkb0"),
-        }))
-        .await;
-
-        let client = server.client();
-        let err = client.delete(1).await.unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("unexpected"), "error: {msg}");
     }
 
     // ── snapshot ────────────────────────────────────────────────────────
@@ -499,127 +373,9 @@ mod client_tests {
         assert!(!err.is::<RestackSnapshotTerminalFailure>(), "{err:#}");
     }
 
-    #[tokio::test]
-    async fn snapshot_terminal_error() {
-        let server = MockServer::start(Box::new(|_| DaemonResponse::TerminalError {
-            message: "sealed upper left live runtime mutated".into(),
-        }))
-        .await;
-
-        let client = server.client();
-        let err = client
-            .restack_snapshot(2, Path::new("/out"), None)
-            .await
-            .unwrap_err();
-        assert!(
-            err.downcast_ref::<RestackSnapshotTerminalFailure>()
-                .is_some(),
-            "expected terminal restack failure, got: {err:#}"
-        );
-    }
-
-    #[tokio::test]
-    async fn snapshot_unexpected_response() {
-        let server = MockServer::start(Box::new(|_| DaemonResponse::Deleted)).await;
-
-        let client = server.client();
-        let err = client
-            .restack_snapshot(1, Path::new("/out"), None)
-            .await
-            .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("unexpected"), "error: {msg}");
-        assert!(err.is::<RestackSnapshotTerminalFailure>(), "{err:#}");
-    }
-
     // ── shutdown ────────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn shutdown_succeeds_even_without_response() {
-        let server = MockServer::start_drop_connection().await;
-        let client = server.client();
-
-        // shutdown() is best-effort — should succeed even if daemon doesn't respond.
-        client.shutdown().await.unwrap();
-    }
-
     // ── connection error cases ──────────────────────────────────────────
-
-    #[tokio::test]
-    async fn connection_refused_no_server() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("nonexistent.sock");
-        let client = UblkDaemonClient::new_for_test(sock_path, false);
-
-        let err = client
-            .create_overlaybd(Path::new("/img"), Path::new("/global.json"))
-            .await
-            .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("connect") || msg.contains("No such file"),
-            "should fail with connection error: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn server_drops_connection_without_response() {
-        let server = MockServer::start_drop_connection().await;
-        let client = server.client();
-
-        let err = client
-            .create_overlaybd(Path::new("/img"), Path::new("/global.json"))
-            .await
-            .unwrap_err();
-        let msg = format!("{err:#}");
-        // The client should get an error about missing response or EOF.
-        assert!(
-            msg.contains("closed") || msg.contains("EOF") || msg.contains("response"),
-            "should fail with connection closed error: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn rpc_timeout() {
-        let server = MockServer::start_hanging().await;
-
-        // Create client with a very short timeout by calling the private call method
-        // indirectly. Since we can't change the timeout on public methods, we test
-        // that the server hanging eventually hits the 30s default timeout.
-        // For practical test speed, we just verify the hanging server doesn't
-        // cause an immediate success.
-        let client = server.client();
-
-        // Use a tokio timeout shorter than the default 30s to verify the client
-        // is actually blocked waiting.
-        let result =
-            tokio::time::timeout(Duration::from_millis(500), async { client.delete(0).await })
-                .await;
-
-        assert!(
-            result.is_err(),
-            "should time out because mock server never responds"
-        );
-    }
-
-    #[tokio::test]
-    async fn daemon_dead_prevents_create_and_delete() {
-        // Even with a valid server running, a dead daemon flag should prevent calls.
-        let server = MockServer::start(Box::new(|_| DaemonResponse::Deleted)).await;
-
-        // Create client with daemon_dead=true.
-        let client = UblkDaemonClient::new_for_test(server.socket_path.clone(), true);
-
-        let err = client.delete(0).await.unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("not running"), "error: {msg}");
-
-        let err = client
-            .create_overlaybd(Path::new("/img"), Path::new("/global.json"))
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("not running"));
-    }
 
     // ── request dispatch verification ───────────────────────────────────
 

@@ -1,6 +1,6 @@
 mod common;
 
 // Orchestrator shutdown permanently stops process-global runtime managers, so
-// this suite must not share a test process with sandboxes started by other suites.
+// run all scenarios in one test runtime and shut it down only after the last VM.
 #[path = "integration/orchestrator.rs"]
 mod orchestrator;
