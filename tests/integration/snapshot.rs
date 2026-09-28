@@ -4,10 +4,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentenv::cfg::ConfigManager;
-use agentenv::sandbox::{
-    CapturedSandboxSnapshot, FirecrackerSandbox, SandboxBackend, SandboxExecutor,
-    SandboxLaunchConfig,
-};
+use agentenv::sandbox::{FirecrackerSandbox, SandboxBackend, SandboxExecutor, SandboxLaunchConfig};
 use agentenv::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
     SnapshotRuntimeVersions,
@@ -77,13 +74,13 @@ async fn publish_captured_snapshot_for_test(
     snapshot_manager: &agentenv::snapshot::SnapshotManager,
     alias: &str,
     source_sandbox_id: SandboxId,
-    captured_snapshot: CapturedSandboxSnapshot,
+    captured_snapshot: std::sync::Arc<agentenv::snapshot::Snapshot>,
 ) -> Result<SnapshotRecord> {
     Ok(agentenv::sandbox::publish_captured(
         snapshot_manager,
         SnapshotPublishMetadata {
             snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-            id: SnapshotId::generate(),
+            id: captured_snapshot.id().clone(),
             alias: Some(SnapshotAlias::parse(alias)?),
             source: SnapshotPublishSource::Sandbox {
                 source_sandbox_id: source_sandbox_id.to_string(),
@@ -131,7 +128,7 @@ impl DeterministicRng {
 
 enum ScenarioSandboxRuntime {
     Running(Box<FirecrackerSandbox>),
-    Paused(Box<agentenv::sandbox::FirecrackerSnapshotConfig>),
+    Paused(std::sync::Arc<agentenv::snapshot::Snapshot>),
 }
 
 struct ScenarioSandbox {
@@ -275,6 +272,13 @@ async fn built_and_derived_snapshot_can_be_launched() -> Result<()> {
     );
 
     let runnable = snapshot_manager.resolve_runnable(derived.clone()).await?;
+    // A successful resolve must survive deletion before Firecracker opens VM state.
+    snapshot_manager.delete(&derived_alias).await?;
+    assert!(!store
+        .path()
+        .join("repository/snapshots")
+        .join(derived_id.to_string())
+        .exists());
     let mut sandbox =
         FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default(), None)?;
     sandbox.start().await?;
@@ -327,8 +331,12 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
 
     write_guest_file(&original, "/tmp/agentenv-lifecycle/base.txt", "base").await?;
     let first_alias = unique_alias_for_test("lifecycle_first");
-    let first_capture =
-        SandboxBackend::snapshot(&mut original, SnapshotPlacement::Distributed).await?;
+    let first_capture = SandboxBackend::snapshot(
+        &mut original,
+        agentenv::snapshot::SnapshotId::generate(),
+        SnapshotPlacement::Distributed,
+    )
+    .await?;
     assert_guest_file(&original, "/tmp/agentenv-lifecycle/base.txt", "base").await?;
     write_guest_file(
         &original,
@@ -345,8 +353,12 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
     .await?;
 
     let second_alias = unique_alias_for_test("lifecycle_second");
-    let second_capture =
-        SandboxBackend::snapshot(&mut original, SnapshotPlacement::Distributed).await?;
+    let second_capture = SandboxBackend::snapshot(
+        &mut original,
+        agentenv::snapshot::SnapshotId::generate(),
+        SnapshotPlacement::Distributed,
+    )
+    .await?;
     assert_guest_file(&original, "/tmp/agentenv-lifecycle/base.txt", "base").await?;
     assert_guest_file(
         &original,
@@ -407,7 +419,10 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
     }
 
     let paused_original = original
-        .capture_snapshot(SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
         .await?;
     original.stop().await?;
     drop(original);
@@ -423,8 +438,13 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
     drop(first_snapshot);
     drop(second_snapshot);
 
-    let mut resumed_original =
-        FirecrackerSandbox::from_snapshot_config(&paused_original, SandboxId::new(), None)?;
+    let mut resumed_original = FirecrackerSandbox::from_snapshot_files(
+        std::sync::Arc::clone(&paused_original),
+        agentenv::sandbox::FirecrackerCommonConfig::from_global_config()
+            .expect("snapshot launch config"),
+        SandboxId::new(),
+        None,
+    )?;
     resumed_original.start().await?;
     assert_guest_file(
         &resumed_original,
@@ -452,9 +472,14 @@ async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> 
     source.start().await?;
     write_guest_file(&source, "/tmp/local-child-marker.txt", "local-child").await?;
 
-    let captured = SandboxBackend::snapshot(&mut source, SnapshotPlacement::Local).await?;
+    let captured = SandboxBackend::snapshot(
+        &mut source,
+        agentenv::snapshot::SnapshotId::generate(),
+        SnapshotPlacement::Local,
+    )
+    .await?;
     let mut metadata = publish_metadata_for_test(
-        SnapshotId::generate(),
+        captured.id().clone(),
         None,
         SnapshotPublishSource::Sandbox {
             source_sandbox_id: SandboxId::new().to_string(),
@@ -494,7 +519,12 @@ async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> 
     child.start().await?;
     assert_guest_file(&child, "/tmp/local-child-marker.txt", "local-child").await?;
 
-    let checkpoint = child.capture_snapshot(SnapshotPlacement::Local).await?;
+    let checkpoint = child
+        .capture_snapshot(
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Local,
+        )
+        .await?;
     child.resume().await?;
 
     let paused = SandboxBackend::pause(&mut child).await?;
@@ -509,7 +539,13 @@ async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> 
         result => result?,
     }
 
-    let mut forked = FirecrackerSandbox::from_snapshot_config(&checkpoint, SandboxId::new(), None)?;
+    let mut forked = FirecrackerSandbox::from_snapshot_files(
+        std::sync::Arc::clone(&checkpoint),
+        agentenv::sandbox::FirecrackerCommonConfig::from_global_config()
+            .expect("snapshot launch config"),
+        SandboxId::new(),
+        None,
+    )?;
     forked.start().await?;
     assert_guest_file(&forked, "/tmp/local-child-marker.txt", "local-child").await?;
     forked.stop().await?;
@@ -521,6 +557,7 @@ async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> 
     let mut resumed = FirecrackerSandbox::from_paused_state(
         &decoded,
         launch_config.sandbox_id,
+        None,
         child_root.path(),
     )?;
     resumed.start().await?;
@@ -537,9 +574,14 @@ async fn promoted_snapshot_launches_on_another_owner_and_preserves_local_child()
     let mut source = FirecrackerSandbox::new(common::default_sandbox_config()?, source_id, None)?;
     source.start().await?;
     write_guest_file(&source, "/tmp/promoted.txt", "promoted").await?;
-    let captured = SandboxBackend::snapshot(&mut source, SnapshotPlacement::Local).await?;
+    let captured = SandboxBackend::snapshot(
+        &mut source,
+        agentenv::snapshot::SnapshotId::generate(),
+        SnapshotPlacement::Local,
+    )
+    .await?;
     let mut metadata = publish_metadata_for_test(
-        SnapshotId::generate(),
+        captured.id().clone(),
         None,
         SnapshotPublishSource::Sandbox {
             source_sandbox_id: source_id.to_string(),
@@ -701,9 +743,12 @@ async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() 
                     else {
                         unreachable!("candidate must be running");
                     };
-                    let captured =
-                        SandboxBackend::snapshot(sandbox.as_mut(), SnapshotPlacement::Distributed)
-                            .await?;
+                    let captured = SandboxBackend::snapshot(
+                        sandbox.as_mut(),
+                        agentenv::snapshot::SnapshotId::generate(),
+                        SnapshotPlacement::Distributed,
+                    )
+                    .await?;
                     assert_expected_files(sandbox, &expected_files_at_capture).await?;
                     let record = publish_captured_snapshot_for_test(
                         &snapshot_manager,
@@ -778,7 +823,10 @@ async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() 
                         unreachable!("candidate must be running");
                     };
                     let paused = sandbox
-                        .capture_snapshot(SnapshotPlacement::Distributed)
+                        .capture_snapshot(
+                            agentenv::snapshot::SnapshotId::generate(),
+                            SnapshotPlacement::Distributed,
+                        )
                         .await?;
                     sandbox.stop().await?;
                     if scenario.captures > 0 {
@@ -786,7 +834,7 @@ async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() 
                         coverage.captured_sandbox_paused = true;
                     }
                     let name = scenario.name.clone();
-                    scenario.runtime = ScenarioSandboxRuntime::Paused(Box::new(paused));
+                    scenario.runtime = ScenarioSandboxRuntime::Paused(paused);
                     sandboxes.push(scenario);
                     operation_log.push(format!("step {step}: completed pause {name}"));
                     Ok(())
@@ -798,8 +846,9 @@ async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() 
                     let ScenarioSandboxRuntime::Paused(paused) = scenario.runtime else {
                         unreachable!("candidate must be paused");
                     };
-                    let mut sandbox = FirecrackerSandbox::from_snapshot_config(
-                        paused.as_ref(),
+                    let mut sandbox = FirecrackerSandbox::from_snapshot_files(
+                        paused,
+                        agentenv::sandbox::FirecrackerCommonConfig::from_global_config()?,
                         SandboxId::new(),
                         None,
                     )?;

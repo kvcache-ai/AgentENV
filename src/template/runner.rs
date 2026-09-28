@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ use super::step_executor::TemplateStepExecutor;
 use crate::cfg::ConfigManager;
 use crate::sandbox::{
     FirecrackerSandbox, FirecrackerSandboxConfig, ProcessHandle, ProcessOpts, SandboxBackend,
-    SandboxExecutor, SandboxLaunchConfig, SandboxSnapshotManifest, UblkConfig,
+    SandboxExecutor, SandboxLaunchConfig,
 };
 use crate::snapshot::{
     CommandContext, RunnableSnapshot, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions,
@@ -48,7 +49,6 @@ where
 pub(crate) enum TemplateBuildBase {
     Rootfs {
         launch_rootfs_path: PathBuf,
-        ublk_config: Option<UblkConfig>,
         image_configs: ImageConfigs,
     },
     Snapshot {
@@ -66,7 +66,7 @@ pub(crate) struct TemplateBuildContext {
     pub override_startup: bool,
     pub resources: SandboxResources,
     // Keep the tempdir owner alive for the duration of build + publish.
-    pub workspace: TempDir,
+    pub _workspace: TempDir,
     pub steps: Vec<TemplateBuildStep>,
     pub base: TemplateBuildBase,
     pub cpu_config_json: Option<String>,
@@ -74,8 +74,9 @@ pub(crate) struct TemplateBuildContext {
 }
 
 impl TemplateBuildContext {
+    #[cfg(test)]
     pub(crate) fn local_dir(&self) -> &Path {
-        self.workspace.path()
+        self._workspace.path()
     }
 }
 
@@ -100,25 +101,18 @@ struct TemplateBuildInputs {
 
 pub(crate) struct TemplateBuildExecution {
     pub runtime_versions: SnapshotRuntimeVersions,
-    pub manifest: SandboxSnapshotManifest,
+    pub snapshot: Arc<crate::snapshot::Snapshot>,
     pub build_context: CommandContext,
     pub startup: Option<StartupCommand>,
     pub image_configs: ImageConfigs,
-    /// Backend capture payload from `capture_to_dir` (the build VM is already
-    /// stopped when this returns; startup-pack recording downcasts it to the
-    /// backend's snapshot config to re-boot from the capture).
-    pub capture_artifacts: Option<Box<dyn std::any::Any + Send>>,
-    /// Local capture output directory (holds vm_state.bin and the pack).
-    pub output_dir: PathBuf,
 }
 
 impl std::fmt::Debug for TemplateBuildExecution {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TemplateBuildExecution")
             .field("runtime_versions", &self.runtime_versions)
-            .field("manifest", &self.manifest)
+            .field("snapshot", &self.snapshot)
             .field("startup", &self.startup)
-            .field("output_dir", &self.output_dir)
             .finish_non_exhaustive()
     }
 }
@@ -134,26 +128,19 @@ impl TemplateBuildRunner {
         match &context.base {
             TemplateBuildBase::Rootfs {
                 launch_rootfs_path,
-                ublk_config,
                 image_configs,
-            } => self.build_template(
-                context,
-                launch_rootfs_path,
-                ublk_config.clone(),
-                image_configs,
-            ),
+            } => self.build_template(context, launch_rootfs_path, image_configs),
             TemplateBuildBase::Snapshot { base_snapshot } => {
                 self.build_template_from_snapshot(context, base_snapshot)
             }
         }
     }
 
-    #[tracing::instrument(skip(self, context, launch_rootfs_path, ublk_config, image_configs))]
+    #[tracing::instrument(skip(self, context, launch_rootfs_path, image_configs))]
     fn build_template(
         &self,
         context: &TemplateBuildContext,
         launch_rootfs_path: &Path,
-        ublk_config: Option<UblkConfig>,
         image_configs: &ImageConfigs,
     ) -> Result<TemplateBuildExecution> {
         if !launch_rootfs_path.exists() {
@@ -171,11 +158,10 @@ impl TemplateBuildRunner {
             runtime_upper_mode: UpperMode::LogStructured,
         };
         let mut config =
-            FirecrackerSandboxConfig::from_global_config_with_user_image(user_image_config.clone())
+            FirecrackerSandboxConfig::from_global_config_with_user_image(user_image_config)
                 .context("load sandbox config for snapshot build")?;
         config.vcpu_count = context.resources.cpu_count;
         config.mem_size_mib = context.resources.memory_mib;
-        config.common.ublk_config = ublk_config;
         config.common.cpu_config_json = context.cpu_config_json.clone();
         config.common.env_vars = (!context.initial_context.env_vars.is_empty())
             .then_some(context.initial_context.env_vars.clone());
@@ -258,7 +244,7 @@ impl TemplateBuildRunner {
         let logger = context.logger.clone();
         let step_executor = self.step_executor.clone();
         let steps = context.steps.clone();
-        let output_dir = context.local_dir().to_path_buf();
+        let snapshot_id = context.build_snapshot_id.clone();
         let initial_context = context.initial_context.clone();
         let startup = context.startup.clone();
         let override_startup = context.override_startup;
@@ -294,18 +280,17 @@ impl TemplateBuildRunner {
                         .await?;
 
                         info!("capturing template snapshot");
-                        let (manifest, capture_artifacts) =
-                            sandbox.capture_to_dir(&output_dir).await?;
+                        let snapshot = sandbox
+                            .snapshot(snapshot_id, crate::snapshot::SnapshotPlacement::Distributed)
+                            .await?;
                         debug!("template snapshot captured");
 
                         Ok(TemplateBuildExecution {
                             runtime_versions,
-                            manifest,
+                            snapshot,
                             build_context,
                             startup,
                             image_configs,
-                            capture_artifacts,
-                            output_dir: output_dir.clone(),
                         })
                     }
                     .await;

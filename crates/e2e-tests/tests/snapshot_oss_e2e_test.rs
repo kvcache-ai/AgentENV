@@ -8,12 +8,12 @@ use agentenv::cfg::{
 use agentenv::identity::NodeIdentity;
 use agentenv::p2p::{transport_from_config, P2pArtifactProviderHint, P2pTransport};
 use agentenv::repository::{BuildCacheStore, RepositoryError};
-use agentenv::sandbox::{CapturedSandboxSnapshot, SandboxSnapshotManifest};
+use agentenv::sandbox::SandboxSnapshotManifest;
 use agentenv::snapshot::backends::OssBackend;
 use agentenv::snapshot::mock::write_mock_built_artifacts;
 use agentenv::snapshot::SnapshotCatalog;
 use agentenv::snapshot::{
-    OverlaybdLayerRef, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotManager,
+    OverlaybdLayerRef, Snapshot, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotManager,
     SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRuntimeVersions,
     SNAPSHOT_ARTIFACT_LAYOUT,
 };
@@ -170,7 +170,7 @@ fn ensure_test_config() -> Result<()> {
     std::env::set_var("AENV_CONFIG_PATH", &config_path);
     std::env::set_var("AENV_HOME_PATH", &config_root);
     std::env::set_var("AENV_DEPS_PATH", &deps_path);
-    std::env::set_var("AENV_SNAPSHOT_LOCAL_CACHE_PATH", &local_cache);
+    std::env::set_var("AENV_SNAPSHOT_LOCAL_ROOT", &local_cache);
 
     let manager = ConfigManager::init_global()?;
     let overlaybd_global = manager.config().ublk.overlaybd.global_config_path.clone();
@@ -289,16 +289,15 @@ async fn snapshot_oss_publish_retains_dense_delta_for_p2p() -> Result<()> {
             volume_snapshots: Vec::new(),
             custom_extension_params: None,
         };
-        let stored = agentenv::sandbox::publish_captured(
-            &manager,
-            metadata,
-            CapturedSandboxSnapshot::new(manifest, capture_root),
-        )
-        .await?;
-        assert!(
-            !delta_path.exists(),
-            "capture guard should be released after publication"
-        );
+        let captured = Arc::new(Snapshot::new(metadata.id.clone(), manifest, capture_root));
+        let stored = agentenv::sandbox::publish_captured(&manager, metadata, captured).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while delta_path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("capture guard should be released after publication")?;
         let committed = stored.committed.as_ref().context("committed snapshot")?;
         let rootfs = match committed.rootfs_layers.as_slice() {
             [OverlaybdLayerRef::Managed(layer)] => layer,
@@ -627,8 +626,8 @@ async fn snapshot_oss_resolve_alias_cleans_up_stale_binding() -> Result<()> {
     let stored = repository
         .publish(
             SnapshotPublishMetadata {
-                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
                 id: snapshot_id.clone(),
+                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
                 alias: Some(alias.clone()),
                 source: SnapshotPublishSource::Template,
                 context: agentenv::snapshot::CommandContext::default(),
@@ -692,8 +691,8 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
     let stored = repository
         .publish(
             SnapshotPublishMetadata {
+                id: snapshot_id.clone(),
                 snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-                id: snapshot_id,
                 alias: None,
                 source: SnapshotPublishSource::Template,
                 context: agentenv::snapshot::CommandContext::default(),
@@ -761,8 +760,8 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
     let stored = repository
         .publish(
             SnapshotPublishMetadata {
-                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
                 id: snapshot_id.clone(),
+                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
                 alias: Some(alias.clone()),
                 source: SnapshotPublishSource::Template,
                 context: agentenv::snapshot::CommandContext::default(),

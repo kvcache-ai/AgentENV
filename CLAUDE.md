@@ -187,7 +187,7 @@ Reuse shared helpers: `src/local_store.rs` (`LocalKvStore`, explicit
   importing upward.
 - **Lifecycle:** Recoverable capture/fork errors restore `Running`; terminal
   errors require teardown. Graceful shutdown persists sandboxes as `Paused`.
-  Keep `CapturedSandboxSnapshot` alive until repository publication completes.
+  Keep the captured `Arc<Snapshot>` alive until repository publication completes.
 - **Storage:** Commit logical layer references, not node-local paths. Cache GC
   must not delete durable artifacts or live writable uppers. Use
   `UblkDeviceManager`; preserve shared-memory device reference counts and COW.

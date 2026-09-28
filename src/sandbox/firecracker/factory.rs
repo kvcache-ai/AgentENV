@@ -15,7 +15,7 @@ use super::sandbox::{FirecrackerPausedState, FirecrackerSandbox};
 use crate::cfg::ConfigManager;
 use crate::sandbox::backend::{PausedSandboxState, SandboxBackend, SandboxBackendFactory};
 use crate::sandbox::{
-    EnvdAccessToken, FreshSandboxBuildSpec, OverlaybdConfig, SandboxLaunchConfig, UblkConfig,
+    EnvdAccessToken, FreshSandboxBuildSpec, OverlaybdConfig, SandboxLaunchConfig,
 };
 use crate::snapshot::RunnableSnapshot;
 use crate::types::SandboxId;
@@ -88,23 +88,6 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         };
         let mut config =
             FirecrackerSandboxConfig::from_global_config_with_user_image(user_image_config)?;
-        let (rootfs_image_config_path, rootfs_read_only, runtime_upper_mode) = {
-            let rootfs_image_config = config
-                .common
-                .rootfs_image_config
-                .as_ref()
-                .context("fresh sandbox rootfs image config is missing")?;
-            (
-                rootfs_image_config.image_config_path.clone(),
-                rootfs_image_config.read_only,
-                rootfs_image_config.runtime_upper_mode,
-            )
-        };
-        config.common.ublk_config = Some(UblkConfig::overlaybd_with_runtime_upper_mode(
-            rootfs_image_config_path,
-            rootfs_read_only,
-            runtime_upper_mode,
-        ));
         config.vcpu_count = build_spec.resources.cpu_count;
         config.mem_size_mib = build_spec.resources.memory_mib;
         config.common.rootfs_virtual_size = if build_spec.resources.disk_size_mib == 0 {
