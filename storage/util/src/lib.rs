@@ -1,6 +1,7 @@
 pub mod aligned_buffer;
 mod always_send;
 pub mod compact_writer;
+mod fail_stop;
 mod id_allocator;
 // `io_ring` is built on the `io-uring` crate, which `Cargo.toml` only pulls in
 // for Linux targets, so enabling this feature anywhere else is a build
@@ -18,6 +19,7 @@ mod sparse_file;
 pub use aligned_buffer::AlignedBuffer;
 pub use always_send::AlwaysSend;
 pub use compact_writer::{CompactBuffer, CompactWriter};
+pub use fail_stop::{abort_on_drop, fatal_exit, AbortOnDrop};
 pub use id_allocator::ReloadableIDAllocator;
 pub use mmap_region::{MMapRegion, MMapRegionSlice};
 pub use sparse_file::{copy_sparse_file, copy_sparse_file_blocking};

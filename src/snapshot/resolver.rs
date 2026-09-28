@@ -19,7 +19,7 @@ use super::runtime_support::{
 };
 use super::{
     CommittedAttachedDrive, CommittedSnapshot, OverlaybdLayerRef, ResolvedAttachedDrive,
-    RunnableSnapshot, RuntimeArtifactLease, SnapshotId, SnapshotRecord,
+    RunnableSnapshot, SnapshotId, SnapshotRecord,
 };
 use crate::image::cache::OverlaybdLayerStore;
 use crate::p2p::P2pTransport;
@@ -153,13 +153,13 @@ impl SnapshotRuntimeResolver for RepositoryRuntimeResolver {
         // Runtime artifacts are protected by the sandbox start-window lease (over
         // local-only commits) + the orchestrator running set; the resolved-handle
         // needs no separate local image ref pin.
-        let cache_lease: Arc<RuntimeArtifactLease> = Arc::new(handles);
-        debug!(snapshot_id = %id, "resolved snapshot to local runnable paths");
-        Ok(RunnableSnapshot::new(
-            (*snapshot).clone(),
+        let artifacts = Arc::new(crate::snapshot::Snapshot::new(
+            id.clone(),
             runtime_manifest,
-            cache_lease,
-        ))
+            handles,
+        ));
+        debug!(snapshot_id = %id, "resolved snapshot to local runnable paths");
+        Ok(RunnableSnapshot::new((*snapshot).clone(), artifacts))
     }
 }
 
@@ -171,12 +171,42 @@ impl RepositoryRuntimeResolver {
     ) -> RepositoryResult<PathBuf> {
         let key = BlobKey::Snapshot(id.clone(), SnapshotFile::VmState);
         let name = SnapshotFile::VmState.name();
-        if let BlobLocation::Local(path) = self.repository.locate_blob(&key)? {
-            if !path.exists() {
-                return Err(RepositoryError::ArtifactNotFound {
-                    artifact: format!("vm state at {}", path.display()),
-                });
-            }
+        if let BlobLocation::Local(source) = self.repository.locate_blob(&key)? {
+            let handle = self
+                .cache
+                .ensure_cached(
+                    &format!("runtime/{id}/vm_state.bin"),
+                    |destination| async move {
+                        match tokio::fs::hard_link(&source, &destination).await {
+                            Ok(()) => Ok(tokio::fs::metadata(&destination).await?.len()),
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::NotFound
+                                        | std::io::ErrorKind::AlreadyExists
+                                ) =>
+                            {
+                                Err(error.into())
+                            }
+                            Err(_) => Ok(tokio::fs::copy(&source, &destination).await?),
+                        }
+                    },
+                )
+                .await
+                .map_err(|error| {
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    {
+                        RepositoryError::ArtifactNotFound {
+                            artifact: format!("vm state for snapshot '{id}'"),
+                        }
+                    } else {
+                        RepositoryError::backend("retain resolved POSIX vm state", error)
+                    }
+                })?;
+            let path = handle.path().to_path_buf();
+            handles.push(handle);
             return Ok(path);
         }
         let cache_key = format!("artifacts/{id}/{name}");

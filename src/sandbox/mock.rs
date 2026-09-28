@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 
 use super::backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend, SandboxBackendFactory,
-    SandboxCaptureResult, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    PausedSandboxState, SandboxBackend, SandboxBackendFactory, SandboxCaptureResult,
+    SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
@@ -37,9 +37,6 @@ impl PausedSandboxState for MockSnapshot {
         RuntimeArtifactSet::empty()
     }
 }
-
-#[derive(Debug)]
-pub struct MockCapturedSnapshot;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MockOperation {
@@ -315,15 +312,17 @@ impl SandboxBackend for MockSandboxBackend {
 
     async fn snapshot(
         &mut self,
+        snapshot_id: crate::snapshot::SnapshotId,
         _placement: crate::snapshot::SnapshotPlacement,
-    ) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
+    ) -> SandboxCaptureResult<Arc<crate::snapshot::Snapshot>> {
         self.behavior
             .apply_capture_result(MockOperation::Snapshot)
             .await?;
-        Ok(CapturedSandboxSnapshot::new(
+        Ok(Arc::new(crate::snapshot::Snapshot::new(
+            snapshot_id,
             crate::snapshot::SandboxSnapshotManifest::for_test(4096, &[]),
-            MockCapturedSnapshot,
-        ))
+            (),
+        )))
     }
 
     async fn capture_to_dir(
