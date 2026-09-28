@@ -10,7 +10,7 @@ x-agentenv-base: &agentenv-base
     AENV_UBLK_DAEMON_BINARY_PATH: /usr/local/bin/uvm-ublk-daemon
     AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED: "true"
     AENV_OBSERVABILITY_SCHEDULER_ENDPOINT: http://scheduler:9090
-    AENV_SNAPSHOT_LOCAL_CACHE_PATH: /var/cache/agentenv/snapshot-local-cache
+    AENV_SNAPSHOT_LOCAL_ROOT: /var/cache/agentenv/snapshot-local-cache/snapshots
     AENV_SANDBOX_PROXY_DOMAINS: ${SANDBOX_PROXY_DOMAINS:-}
     RUST_LOG: ${RUST_LOG:-agentenv=info,envd=info,uvm_ublk=info}
   volumes:

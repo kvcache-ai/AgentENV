@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use warm_pool::{PoolConfig, PoolMaintenanceAction, WarmPool};
 
+use storage_util::fatal_exit;
 use storage_util::io_ring::IoRingHandle;
 use uvm_ublk::{
     delete_dev, tmp_pack_path, ublk_caps, wait_for_ublk_dev, OverlaybdTarget, StartupPackRecorder,
@@ -1350,16 +1351,11 @@ async fn quiesce_ublk_device<T: UVMUblkTarget>(dev: &mut UVMUblkDev<T>) {
     let dev_id = dev.dev_id();
 
     if let Err(err) = dev.ctrl.stop_dev().await {
-        tracing::warn!(dev_id, ?err, "failed to stop ublk device before delete");
-        return;
+        fatal_exit(&format!("stop ublk device {dev_id}: {err:#}"));
     }
 
     if let Err(err) = tokio::time::timeout(Duration::from_secs(5), dev.wait_for_bg_tasks()).await {
-        tracing::warn!(
-            dev_id,
-            ?err,
-            "timed out waiting for ublk queue workers to exit after stop_dev"
-        );
+        fatal_exit(&format!("ublk {dev_id} queue workers did not stop: {err}"));
     }
 }
 
@@ -1384,20 +1380,16 @@ async fn cleanup_failed_ublk_start<T: UVMUblkTarget>(
             return;
         }
         Err(err) => {
-            tracing::warn!(
-                dev_id,
-                ?err,
-                "failed to stop ublk device after startup failure"
-            );
+            fatal_exit(&format!(
+                "stop ublk {dev_id} after startup failure: {err:#}"
+            ));
         }
     }
 
     if let Err(err) = tokio::time::timeout(Duration::from_secs(5), dev.wait_for_bg_tasks()).await {
-        tracing::warn!(
-            dev_id,
-            ?err,
-            "timed out waiting for ublk queue workers after startup failure"
-        );
+        fatal_exit(&format!(
+            "ublk {dev_id} startup rollback could not stop its workers: {err}"
+        ));
     }
 
     drop(dev);
@@ -1405,12 +1397,9 @@ async fn cleanup_failed_ublk_start<T: UVMUblkTarget>(
     let mut ctrl = match UVMUblkCtrlBuilder::new().dev_id(dev_id).build(ctrl_ring) {
         Ok(ctrl) => ctrl,
         Err(err) => {
-            tracing::warn!(
-                dev_id,
-                ?err,
-                "failed to build ublk ctrl for startup cleanup; kernel device may remain active"
-            );
-            return;
+            fatal_exit(&format!(
+                "open ublk {dev_id} control for startup rollback: {err:#}"
+            ));
         }
     };
 
@@ -1429,11 +1418,9 @@ async fn cleanup_failed_ublk_start<T: UVMUblkTarget>(
             tracing::info!(dev_id, "ublk device already deleted after startup failure");
         }
         Err(err) => {
-            tracing::warn!(
-                dev_id,
-                ?err,
-                "failed to delete ublk device after startup failure; kernel device may remain active"
-            );
+            fatal_exit(&format!(
+                "delete ublk {dev_id} after startup failure: {err:#}"
+            ));
         }
     }
 }
@@ -1612,20 +1599,28 @@ async fn prepare_overlaybd_device(
         let dev_id = p.dev.dev_id();
         tracing::debug!(dev_id, mode, "reusing warm device from pool");
 
-        let discard_supported = !image.is_read_only().await;
-        p.dev
-            .target()
-            .swap_state(
-                image_config.to_path_buf(),
-                Arc::clone(image),
-                discard_supported,
-            )
-            .with_context(|| format!("swap {mode} target state"))?;
+        let prepared = async {
+            let discard_supported = !image.is_read_only().await;
+            p.dev
+                .target()
+                .swap_state(
+                    image_config.to_path_buf(),
+                    Arc::clone(image),
+                    discard_supported,
+                )
+                .with_context(|| format!("swap {mode} target state"))?;
 
-        if pool.supports_update_size() && p.dev_sectors != new_sectors {
-            update_device_size(&p.dev, new_sectors)
-                .await
-                .with_context(|| format!("update {mode} device size for dev_id={dev_id}"))?;
+            if pool.supports_update_size() && p.dev_sectors != new_sectors {
+                update_device_size(&p.dev, new_sectors)
+                    .await
+                    .with_context(|| format!("update {mode} device size for dev_id={dev_id}"))?;
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(err) = prepared {
+            cleanup_failed_ublk_start(ctrl_ring.clone(), p.dev).await;
+            return Err(err);
         }
 
         Ok((p.dev, true))
@@ -2344,6 +2339,55 @@ mod tests {
             .expect("failed refill should eventually allow another attempt");
             assert!(started.elapsed() >= Duration::from_secs(1));
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires root and the Linux ublk driver"]
+    async fn rejected_pool_acquire_removes_the_device_before_returning() -> Result<()> {
+        let dir = TempDir::new()?;
+        let pool = PoolState::new(
+            test_pool_config(),
+            0,
+            test_image_service(dir.path()).await,
+            dir.path().join("placeholders"),
+        );
+        let (config, image) = pool.placeholder_for(8 * 1024 * 1024).await?;
+        let (ctrl_ring, _worker) = storage_util::io_ring::spawn_io_ring_worker(0);
+        let dev = create_new_device(ctrl_ring.clone(), &config, &image).await?;
+        let dev_id = dev.dev_id();
+        assert!(
+            return_or_stop_idle_device(&pool, ctrl_ring.clone(), dev, Arc::clone(&image)).await
+        );
+
+        let mut invalid = ImageFile::open(
+            serde_json::from_slice(&std::fs::read(&config)?)?,
+            pool.image_service.clone(),
+            Some(config.clone()),
+        )
+        .await?;
+        invalid.block_size = 3;
+        let result =
+            prepare_overlaybd_device(&pool, &ctrl_ring, &config, &Arc::new(invalid), "exclusive")
+                .await;
+        let rejected = result.is_err();
+        drop(result);
+        let mut ctrl = UVMUblkCtrlBuilder::new()
+            .dev_id(dev_id)
+            .build(ctrl_ring.clone())?;
+        let retained = ctrl.get_dev_info().await.is_ok();
+        if retained {
+            // Leave no device behind when this regression check fails.
+            ctrl.stop_dev().await?;
+            delete_dev(ctrl_ring.clone(), dev_id).await?;
+        }
+        assert!(rejected);
+        assert!(!retained, "rejected acquire left an unmanaged ublk device");
+        assert_eq!(pool.idle.len(), 0);
+
+        let (dev, _) =
+            prepare_overlaybd_device(&pool, &ctrl_ring, &config, &image, "exclusive").await?;
+        stop_overlaybd_device(ctrl_ring, dev).await;
+        Ok(())
     }
 
     #[tokio::test]

@@ -7,13 +7,10 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use super::mmds::MmdsMetadata;
 use crate::cfg::{AppConfig, ConfigManager, EnvdConfig, ToolsConfig};
-use crate::sandbox::ublk::UblkConfig;
 use crate::sandbox::SandboxNetworkPolicy;
-use crate::sandbox::UblkBackend;
 use crate::sandbox::{
     validate_drive_id, EnvdAccessToken, ExtraDrive, OverlaybdConfig, SandboxLaunchConfig,
     FIRECRACKER_BACKEND,
@@ -53,35 +50,6 @@ const DEFAULT_BOOT_ARGS: &str = "\
     damon_reclaim.skip_anon=Y \
     damon_reclaim.wmarks_interval=1000000";
 pub(super) const MAX_EXTRA_DRIVES: usize = (b'z' - b'c' + 1) as usize;
-
-#[derive(Debug)]
-pub(crate) struct PersistentSnapshotRootGuard {
-    path: PathBuf,
-}
-
-impl PersistentSnapshotRootGuard {
-    pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for PersistentSnapshotRootGuard {
-    fn drop(&mut self) {
-        if let Err(err) = std::fs::remove_dir_all(&self.path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    snapshot_root = %self.path.display(),
-                    error = %err,
-                    "failed to clean up managed snapshot root"
-                );
-            }
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct FirecrackerRuntimePolicy {
@@ -152,7 +120,6 @@ pub struct FirecrackerCommonConfig {
     /// Existing placeholder drives that can be rebound to launch-time volumes.
     #[serde(default)]
     pub volume_drive_slots: usize,
-    pub ublk_config: Option<UblkConfig>,
     /// Cluster-wide CPU intersection received from the scheduler.
     /// When set, applied via `PUT /cpu-config` before the VM boots.
     pub cpu_config_json: Option<String>,
@@ -201,7 +168,6 @@ impl FirecrackerCommonConfig {
             extra_drives: Vec::new(),
             physical_extra_drive_count: 0,
             volume_drive_slots: 0,
-            ublk_config: None,
             cpu_config_json: None,
             network_policy: None,
             custom_extension_params: None,
@@ -274,15 +240,6 @@ impl FirecrackerCommonConfig {
         validate_overlaybd_extra_drive_set(&self.extra_drives)?;
         if matches!(self.rootfs_virtual_size, Some(0)) {
             anyhow::bail!("rootfs virtual size must be non-zero");
-        }
-        if let Some(ublk_config) = &self.ublk_config {
-            let UblkBackend::Overlaybd(overlaybd_cfg) = &ublk_config.backend;
-            if !overlaybd_cfg.image_config_path.exists() {
-                anyhow::bail!(
-                    "overlaybd image config not found at {}",
-                    overlaybd_cfg.image_config_path.display()
-                );
-            }
         }
         Ok(())
     }
@@ -370,17 +327,10 @@ impl FirecrackerSandboxConfig {
     ) -> Result<Self> {
         let kernel_image = config.resolved_kernel_image_path();
 
-        let ublk = &config.ublk;
-        let runtime_upper_mode = ublk.overlaybd.runtime_upper_mode;
-        user_image_config.runtime_upper_mode = runtime_upper_mode;
+        user_image_config.runtime_upper_mode = config.ublk.overlaybd.runtime_upper_mode;
 
         let mut common = FirecrackerCommonConfig::from_app_config(config)?;
-        common.rootfs_image_config = Some(user_image_config.clone());
-        common.ublk_config = Some(UblkConfig::overlaybd_with_runtime_upper_mode(
-            user_image_config.image_config_path.clone(),
-            user_image_config.read_only,
-            runtime_upper_mode,
-        ));
+        common.rootfs_image_config = Some(user_image_config);
 
         Ok(Self {
             common,
@@ -456,10 +406,6 @@ pub struct FirecrackerSnapshotConfig {
     pub mem_overlaybd_config: OverlaybdConfig,
     /// Virtual size of the memory image in bytes.
     pub mem_virtual_size: u64,
-    /// If `None`, the caller is responsible for managing the snapshot directory lifecycle.
-    /// `Some` is used for keeping the snapshot directory alive across multiple pause/resume cycles.
-    #[serde(skip)]
-    pub(super) managed_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
     /// Marks a throwaway VM booted only to record the startup memory pack at
     /// publish time: the memory device becomes dedicated (never shared or
     /// pooled), the pack recorder is armed before the snapshot loads, and
@@ -537,11 +483,6 @@ impl FirecrackerSnapshotConfig {
             read_only: app_config.ublk.overlaybd.read_only,
             runtime_upper_mode: app_config.ublk.overlaybd.runtime_upper_mode,
         };
-        let overlaybd_ublk_config = UblkConfig::overlaybd_with_runtime_upper_mode(
-            rootfs_image_config.image_config_path.clone(),
-            rootfs_image_config.read_only,
-            rootfs_image_config.runtime_upper_mode,
-        );
 
         let build_context = &snapshot.committed().context;
         let env_vars = build_context.env_vars.clone();
@@ -553,7 +494,6 @@ impl FirecrackerSnapshotConfig {
         let extra_drives = manifest.extra_drives();
         let physical_extra_drive_count = manifest.effective_physical_extra_drive_count();
         let snapshot_common = FirecrackerCommonConfig {
-            ublk_config: Some(overlaybd_ublk_config),
             envd_version: snapshot.committed().runtime_versions.envd_version.clone(),
             env_vars: (!env_vars.is_empty()).then_some(env_vars),
             default_workdir: Some(build_context.workdir.clone()),
@@ -577,7 +517,6 @@ impl FirecrackerSnapshotConfig {
             vm_state_path: manifest.vm_state.path.clone(),
             mem_overlaybd_config,
             mem_virtual_size: manifest.memory.virtual_size,
-            managed_snapshot_root: None,
             pack_recording: false,
             memory_startup_pack: manifest.memory_startup_pack.clone(),
         })
@@ -752,25 +691,6 @@ mod tests {
     }
 
     #[test]
-    fn from_app_config_does_not_bind_ublk_without_user_image() -> Result<()> {
-        let mut config = base_app_config();
-        config.ublk = UblkTomlConfig {
-            daemon_binary_path: None,
-            daemon_log_path: None,
-            overlaybd: UblkOverlaybdTomlConfig {
-                global_config_path: "overlaybd_global.json".into(),
-                read_only: true,
-                ..Default::default()
-            },
-            ..UblkTomlConfig::default()
-        };
-
-        let common_config = FirecrackerCommonConfig::from_app_config(&config)?;
-        assert!(common_config.ublk_config.is_none());
-        Ok(())
-    }
-
-    #[test]
     fn sandbox_config_binds_overlaybd_to_user_image() -> Result<()> {
         let mut config = base_app_config();
         config.ublk = UblkTomlConfig {
@@ -778,7 +698,7 @@ mod tests {
             daemon_log_path: None,
             overlaybd: UblkOverlaybdTomlConfig {
                 global_config_path: "overlaybd_global.json".into(),
-                read_only: false,
+                read_only: true,
                 runtime_upper_mode: UpperMode::Sparse,
                 ..Default::default()
             },
@@ -793,22 +713,32 @@ mod tests {
                 runtime_upper_mode: UpperMode::LogStructured,
             },
         )?;
-        match sandbox_config
-            .common
-            .ublk_config
-            .as_ref()
-            .map(|cfg| &cfg.backend)
-        {
-            Some(UblkBackend::Overlaybd(overlaybd)) => {
-                assert_eq!(
-                    overlaybd.image_config_path,
-                    PathBuf::from("custom-image.json")
-                );
-                assert!(!overlaybd.read_only);
-                assert_eq!(overlaybd.runtime_upper_mode, UpperMode::Sparse);
-            }
-            other => panic!("expected overlaybd backend, got {other:?}"),
-        }
+        let rootfs = sandbox_config.common.rootfs_image_config.as_ref().unwrap();
+        assert_eq!(rootfs.image_config_path, PathBuf::from("custom-image.json"));
+        assert!(!rootfs.read_only);
+        assert_eq!(rootfs.runtime_upper_mode, UpperMode::Sparse);
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_common_config_accepts_removed_ublk_field() -> Result<()> {
+        let mut common = FirecrackerCommonConfig::from_app_config(&base_app_config())?;
+        common.rootfs_image_config = Some(OverlaybdConfig {
+            image_config_path: "rootfs/image.json".into(),
+            read_only: true,
+            runtime_upper_mode: UpperMode::Sparse,
+        });
+        let mut persisted = serde_json::to_value(common)?;
+        persisted["ublk_config"] = serde_json::json!({
+            "backend": { "Overlaybd": persisted["rootfs_image_config"].clone() }
+        });
+
+        let restored: FirecrackerCommonConfig = serde_json::from_value(persisted)?;
+        let rootfs = restored.rootfs_image_config.as_ref().unwrap();
+        assert_eq!(rootfs.image_config_path, PathBuf::from("rootfs/image.json"));
+        assert!(rootfs.read_only);
+        assert_eq!(rootfs.runtime_upper_mode, UpperMode::Sparse);
+        assert!(serde_json::to_value(restored)?.get("ublk_config").is_none());
         Ok(())
     }
 
@@ -912,7 +842,6 @@ mod tests {
                 runtime_upper_mode: UpperMode::LogStructured,
             },
             mem_virtual_size: 4096,
-            managed_snapshot_root: None,
             pack_recording: false,
         };
 

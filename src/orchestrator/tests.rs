@@ -995,7 +995,7 @@ async fn proxy_lookup_reports_paused_for_paused_sandbox() {
 }
 
 #[tokio::test]
-async fn cleanup_failed_launch_removes_created_running_metadata() {
+async fn cleanup_failed_launch_removes_created_metadata() {
     let orchestrator = make_orchestrator().await;
     let sandbox_id = SandboxId::new();
     let plan = create_launch_plan_with_resources(sandbox_id);
@@ -1007,14 +1007,14 @@ async fn cleanup_failed_launch_removes_created_running_metadata() {
         .store
         .add(SandboxMetadata {
             id: sandbox_id,
-            state: SandboxState::Running,
+            state: SandboxState::Creating,
             ..Default::default()
         })
         .await
         .unwrap();
 
     orchestrator
-        .cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
+        .cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
         .await;
 
     assert!(orchestrator.store.get(&sandbox_id).await.unwrap().is_none());
@@ -1025,17 +1025,17 @@ async fn cleanup_failed_launch_invalidates_resumed_state() {
     let orchestrator = make_orchestrator().await;
     let sandbox_id = SandboxId::new();
     let rollback_metadata = paused_resume_metadata(sandbox_id);
-    let mut running_metadata = rollback_metadata.clone();
-    running_metadata.state = SandboxState::Running;
+    let mut resuming_metadata = rollback_metadata.clone();
+    resuming_metadata.state = SandboxState::Resuming;
     let plan = resume_launch_plan(sandbox_id);
     let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(Arc::new(
         MockBehavior::new(),
     )))));
 
-    orchestrator.store.add(running_metadata).await.unwrap();
+    orchestrator.store.add(resuming_metadata).await.unwrap();
 
     orchestrator
-        .cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
+        .cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
         .await;
 
     assert!(orchestrator.store.get(&sandbox_id).await.unwrap().is_none());
@@ -1106,7 +1106,11 @@ async fn cleanup_failed_launch_does_not_remove_replacement_runtime_state() {
         .await;
 
     orchestrator
-        .cleanup_failed_launch(&plan, stale_handle, FailedLaunchStage::RunningPersisted)
+        .cleanup_failed_launch(
+            &plan,
+            stale_handle,
+            FailedLaunchStage::TransitionalPersisted,
+        )
         .await;
 
     let current_handle = orchestrator
@@ -1606,37 +1610,6 @@ async fn pause_resume_transitions_and_is_idempotent() -> Result<()> {
 }
 
 #[tokio::test]
-async fn pause_succeeds_and_releases_metrics_even_when_stop_fails_after_snapshot() -> Result<()> {
-    setup();
-    let behavior = Arc::new(MockBehavior::new());
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "stop failed".to_string(),
-        },
-    );
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
-    let created = orchestrator
-        .create_sandbox(create_request(Some(60), &[]))
-        .await?;
-
-    orchestrator.pause_sandbox(created.id).await?;
-
-    let paused = orchestrator
-        .get_sandbox(&created.id)
-        .await?
-        .expect("sandbox should still exist after pause");
-    assert_eq!(paused.state, SandboxState::Paused);
-
-    // Resource metrics are derived from the current metadata state, so a
-    // sandbox that is logically Paused no longer counts toward allocated
-    // CPU/memory regardless of whether the backing VM `stop()` succeeded.
-    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
-    Ok(())
-}
-
-#[tokio::test]
 async fn pause_terminal_failure_removes_sandbox_and_metrics() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
@@ -1823,18 +1796,17 @@ async fn capture_snapshot_returns_snapshot_and_preserves_running_sandbox() -> Re
         .await?;
     let sandbox_id = created.id;
 
+    let snapshot_id = crate::snapshot::SnapshotId::generate();
     let result = orchestrator
-        .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            sandbox_id,
+            snapshot_id.clone(),
+            crate::snapshot::SnapshotPlacement::Distributed,
+        )
         .await?;
     assert_eq!(result.metadata.id, sandbox_id);
     assert_eq!(result.metadata.state, SandboxState::Running);
-    assert!(
-        result
-            .captured_snapshot
-            .downcast_artifacts_ref::<crate::sandbox::mock::MockCapturedSnapshot>()
-            .is_some(),
-        "capture_snapshot should return the backend-provided snapshot payload"
-    );
+    assert_eq!(result.captured_snapshot.id(), &snapshot_id);
 
     let persisted = orchestrator
         .get_sandbox(&sandbox_id)
@@ -1877,7 +1849,11 @@ async fn capture_snapshot_recoverable_failure_rolls_back_to_running_and_allows_r
     let baseline_metrics = current_metrics(&orchestrator).await;
 
     let err = orchestrator
-        .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            sandbox_id,
+            crate::snapshot::SnapshotId::generate(),
+            crate::snapshot::SnapshotPlacement::Distributed,
+        )
         .await
         .expect_err("recoverable snapshot failure should be returned to the caller");
     assert!(matches!(
@@ -1896,63 +1872,18 @@ async fn capture_snapshot_recoverable_failure_rolls_back_to_running_and_allows_r
     assert_proxy_ready(&orchestrator, &sandbox_id).await?;
     assert_metrics_snapshot(&orchestrator, &baseline_metrics).await;
 
+    let snapshot_id = crate::snapshot::SnapshotId::generate();
     let retry = orchestrator
-        .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            sandbox_id,
+            snapshot_id.clone(),
+            crate::snapshot::SnapshotPlacement::Distributed,
+        )
         .await?;
     assert_eq!(retry.metadata.state, SandboxState::Running);
-    assert!(
-        retry
-            .captured_snapshot
-            .downcast_artifacts_ref::<crate::sandbox::mock::MockCapturedSnapshot>()
-            .is_some(),
-        "retry should produce a captured snapshot"
-    );
+    assert_eq!(retry.captured_snapshot.id(), &snapshot_id);
 
     orchestrator.delete_sandbox(sandbox_id).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn capture_snapshot_terminal_failure_removes_sandbox_and_releases_metrics() -> Result<()> {
-    setup();
-    let behavior = Arc::new(MockBehavior::new());
-    behavior.push_action(
-        MockOperation::Snapshot,
-        MockAction::FailTerminal {
-            message: "snapshot capture became unrecoverable".to_string(),
-        },
-    );
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "stop failed after terminal snapshot error".to_string(),
-        },
-    );
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
-    let created = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "snapshot-terminal")]))
-        .await?;
-    let sandbox_id = created.id;
-
-    let err = orchestrator
-        .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed)
-        .await
-        .expect_err("terminal snapshot failure should fail the operation");
-    assert!(matches!(
-        err,
-        OrchestratorError::SandboxOperationFailed {
-            operation: SandboxOperation::Snapshot,
-            ..
-        }
-    ));
-
-    assert!(
-        orchestrator.get_sandbox(&sandbox_id).await?.is_none(),
-        "terminal snapshot failure should remove sandbox metadata"
-    );
-    assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
-    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
     Ok(())
 }
 
@@ -1987,7 +1918,11 @@ async fn capture_snapshot_without_runtime_handle_removes_sandbox_and_releases_me
     );
 
     let err = orchestrator
-        .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            sandbox_id,
+            crate::snapshot::SnapshotId::generate(),
+            crate::snapshot::SnapshotPlacement::Distributed,
+        )
         .await
         .expect_err("capture_snapshot should fail when persisted running sandbox has no handle");
     assert!(matches!(err, OrchestratorError::SandboxNotFound(_)));
@@ -2015,7 +1950,11 @@ async fn capture_snapshot_rejects_non_running_states() -> Result<()> {
     orchestrator.pause_sandbox(sandbox_id).await?;
 
     let err = orchestrator
-        .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            sandbox_id,
+            crate::snapshot::SnapshotId::generate(),
+            crate::snapshot::SnapshotPlacement::Distributed,
+        )
         .await
         .expect_err("capture_snapshot should reject paused sandboxes");
     assert!(matches!(
@@ -2039,7 +1978,11 @@ async fn capture_snapshot_maps_killing_state_to_not_found() -> Result<()> {
         .await?;
 
     let err = orchestrator
-        .capture_snapshot(sandbox_id, crate::snapshot::SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            sandbox_id,
+            crate::snapshot::SnapshotId::generate(),
+            crate::snapshot::SnapshotPlacement::Distributed,
+        )
         .await
         .expect_err("capture_snapshot should treat killing sandboxes as gone");
     assert!(matches!(err, OrchestratorError::SandboxNotFound(id) if id == sandbox_id));
@@ -3944,92 +3887,125 @@ async fn concurrent_resume_when_leader_build_fails_is_consistent() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn resume_start_failure_invalidates_paused_state() -> Result<()> {
+async fn failed_resume_stops_runtime_before_reclaiming_storage() -> Result<()> {
     setup();
-    let behavior = Arc::new(MockBehavior::new());
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone())).await;
-
-    let created = orchestrator
-        .create_sandbox(create_request(
-            Some(60),
-            &[("team", "resume-start-failure")],
-        ))
-        .await?;
-    let sandbox_id = created.id;
-    orchestrator.pause_sandbox(sandbox_id).await?;
-    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
-    behavior.push_action(
-        MockOperation::StartNowait,
-        MockAction::Fail {
-            message: "forced resume start_nowait failure".to_string(),
-        },
-    );
-
-    let err = orchestrator
-        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
-        .await
-        .expect_err("resume should fail when start_nowait fails after snapshot restore");
-    assert!(matches!(
-        err,
-        OrchestratorError::SandboxOperationFailed {
-            operation: SandboxOperation::Start,
-            ..
-        }
-    ));
-
-    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
-    assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
-    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
-    assert!(matches!(
-        orchestrator.resume_sandbox(sandbox_id, NewTimeout::UseExisting).await,
-        Err(OrchestratorError::SandboxNotFound(id)) if id == sandbox_id
-    ));
+    for operation in [MockOperation::StartNowait, MockOperation::WaitForReady] {
+        let behavior = Arc::new(MockBehavior::new());
+        let persister = RecordingPersister::default();
+        let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+            persister.clone(),
+        );
+        let created = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+        orchestrator.pause_sandbox(created.id).await?;
+        persister.clear_calls();
+        behavior.push_action(
+            operation,
+            MockAction::Fail {
+                message: "resume failed".into(),
+            },
+        );
+        assert!(orchestrator
+            .resume_sandbox(created.id, NewTimeout::UseExisting)
+            .await
+            .is_err());
+        assert_eq!(behavior.stop_calls(), 2);
+        assert!(persister
+            .calls()
+            .contains(&RecordingCall::DeleteRecordAndArtifacts));
+        assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+        assert_proxy_not_found(&orchestrator, &created.id).await?;
+    }
     Ok(())
 }
 
 #[tokio::test]
-async fn resume_readiness_failure_invalidates_paused_state() -> Result<()> {
-    setup();
-    let behavior = Arc::new(MockBehavior::new());
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone())).await;
-
-    let created = orchestrator
-        .create_sandbox(create_request(
-            Some(60),
-            &[("team", "resume-ready-failure")],
-        ))
-        .await?;
-    let sandbox_id = created.id;
-    orchestrator.pause_sandbox(sandbox_id).await?;
-    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
-    behavior.push_action(
-        MockOperation::WaitForReady,
-        MockAction::Fail {
-            message: "forced resume wait_for_ready failure".to_string(),
-        },
-    );
-
-    let err = orchestrator
-        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
-        .await
-        .expect_err("resume should fail when wait_for_ready fails after snapshot restore");
-    assert!(matches!(
-        err,
-        OrchestratorError::SandboxOperationFailed {
-            operation: SandboxOperation::WaitReady,
-            ..
+async fn failed_teardown_terminates_instance() -> anyhow::Result<()> {
+    const CASE: &str = "AENV_TEST_FAILED_TEARDOWN";
+    const ROOT: &str = "AENV_TEST_TEARDOWN_ROOT";
+    if let Ok(case) = std::env::var(CASE) {
+        setup();
+        let root = PathBuf::from(std::env::var(ROOT)?);
+        let _backing = tempfile::Builder::new()
+            .prefix("backing")
+            .rand_bytes(0)
+            .tempdir_in(&root)?;
+        let behavior = Arc::new(MockBehavior::new());
+        let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+            RecordingPersister::default(),
+        );
+        let sandbox = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+        if case == "resume" {
+            orchestrator.pause_sandbox(sandbox.id).await?;
+            behavior.push_action(
+                MockOperation::StartNowait,
+                MockAction::Fail {
+                    message: "resume rejected".into(),
+                },
+            );
         }
-    ));
-
-    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
-    assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
-    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
-    assert!(matches!(
-        orchestrator.resume_sandbox(sandbox_id, NewTimeout::UseExisting).await,
-        Err(OrchestratorError::SandboxNotFound(id)) if id == sandbox_id
-    ));
+        behavior.push_action(
+            MockOperation::Stop,
+            MockAction::Fail {
+                message: "cannot confirm teardown".into(),
+            },
+        );
+        match case.as_str() {
+            "pause" => {
+                let _ = orchestrator.pause_sandbox(sandbox.id).await;
+            }
+            "resume" => {
+                let _ = orchestrator
+                    .resume_sandbox(sandbox.id, NewTimeout::UseExisting)
+                    .await;
+            }
+            "capture" => {
+                behavior.push_action(
+                    MockOperation::Snapshot,
+                    MockAction::FailTerminal {
+                        message: "capture failed terminally".into(),
+                    },
+                );
+                let _ = orchestrator
+                    .capture_snapshot(
+                        sandbox.id,
+                        crate::snapshot::SnapshotId::generate(),
+                        crate::snapshot::SnapshotPlacement::Local,
+                    )
+                    .await;
+            }
+            _ => unreachable!(),
+        }
+        std::fs::write(root.join("returned"), b"operation returned")?;
+        panic!("failed stop returned to caller");
+    }
+    for case in ["pause", "resume", "capture"] {
+        let root = tempfile::tempdir()?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "orchestrator::service::tests::failed_teardown_terminates_instance",
+                "--nocapture",
+            ])
+            .env(CASE, case)
+            .env(ROOT, root.path())
+            .output()?;
+        assert_eq!(
+            output.status.code(),
+            Some(70),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(root.path().join("backing").is_dir(), "{case}");
+        assert!(!root.path().join("returned").exists(), "{case}");
+    }
     Ok(())
 }
 
@@ -4628,51 +4604,6 @@ async fn shutdown_pauses_running_sandboxes_and_rejects_new_lifecycle_operations(
 }
 
 #[tokio::test]
-async fn shutdown_succeeds_when_stop_after_pause_fails() -> Result<()> {
-    setup();
-    let behavior = Arc::new(MockBehavior::new());
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown stop failure 1".to_string(),
-        },
-    );
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown stop failure 2".to_string(),
-        },
-    );
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown stop failure 3".to_string(),
-        },
-    );
-    let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
-
-    let created = orchestrator
-        .create_sandbox(create_request(
-            Some(60),
-            &[("team", "shutdown-stop-failure")],
-        ))
-        .await?;
-    let sandbox_id = created.id;
-
-    orchestrator.shutdown().await?;
-
-    let metadata = orchestrator
-        .get_sandbox(&sandbox_id)
-        .await?
-        .expect("paused sandbox metadata should remain after shutdown");
-    assert_eq!(metadata.state, SandboxState::Paused);
-
-    orchestrator.delete_sandbox(sandbox_id).await?;
-    Ok(())
-}
-
-#[tokio::test]
 async fn shutdown_retries_pause_failures_and_preserves_sandbox_on_success() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
@@ -4745,26 +4676,9 @@ async fn shutdown_returns_error_after_exhausting_pause_retries() -> Result<()> {
 async fn shutdown_reuses_recorded_success_instead_of_running_cleanup_again() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown memoized failure 1".to_string(),
-        },
-    );
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown memoized failure 2".to_string(),
-        },
-    );
-    behavior.push_action(
-        MockOperation::Stop,
-        MockAction::Fail {
-            message: "shutdown memoized failure 3".to_string(),
-        },
-    );
     let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
 
     let created = orchestrator
         .create_sandbox(create_request(
@@ -4775,7 +4689,9 @@ async fn shutdown_reuses_recorded_success_instead_of_running_cleanup_again() -> 
     let sandbox_id = created.id;
 
     orchestrator.shutdown().await?;
+    let stop_calls = behavior.stop_calls();
     orchestrator.shutdown().await?;
+    assert_eq!(behavior.stop_calls(), stop_calls);
 
     let metadata = orchestrator
         .get_sandbox(&sandbox_id)
@@ -5010,11 +4926,19 @@ async fn launch_sandbox_create_running_metadata_persist_failure_rolls_back() -> 
 }
 
 #[tokio::test]
-async fn launch_sandbox_create_missing_proxy_target_rolls_back_running_state() -> Result<()> {
+async fn launch_sandbox_create_missing_proxy_target_never_publishes_running() -> Result<()> {
     setup();
     let backend_control = Arc::new(MockBehavior::new());
+    let store_control = Arc::new(ScriptedStoreControl::default());
+    *store_control.on_update.lock().unwrap() = Some(Arc::new(|metadata| {
+        assert_ne!(
+            metadata.state,
+            SandboxState::Running,
+            "a launch without a proxy target is not ready"
+        );
+    }));
     let orchestrator = make_orchestrator_without_background_with_factory(
-        InMemoryMetadataStore::new(),
+        ScriptedStore::new(store_control),
         MockBackendFactory::with_behavior_and_host_ip(backend_control.clone(), None),
     );
 
@@ -6098,5 +6022,42 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
     );
     release.notify_one();
     assert!(task.await.unwrap()?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn fork_storage_failure_reclaims_unstarted_child_and_keeps_source_running() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_on_operation(
+        MockOperation::Fork,
+        Arc::new(|| panic!("fork must not start after storage preparation fails")),
+    );
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        persister.clone(),
+    );
+    let source = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    persister.clear_calls();
+    persister.fail_next(RecordingCall::PrepareRuntimeRoot);
+    assert!(orchestrator
+        .fork_sandbox(source.id, 1, NewTimeout::UseExisting)
+        .await
+        .is_err());
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::PrepareRuntimeRoot,
+            RecordingCall::DeleteRecordAndArtifacts
+        ]
+    );
+    assert_eq!(
+        orchestrator.get_sandbox(&source.id).await?.unwrap().state,
+        SandboxState::Running
+    );
     Ok(())
 }

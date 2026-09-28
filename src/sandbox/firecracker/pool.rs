@@ -329,7 +329,7 @@ impl FirecrackerPool {
         .await;
 
         if let Err(err) = spawn_result {
-            let _ = fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT).await;
+            fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT).await;
             let _ = NetworkManager::global().release(slot);
             return Err(err);
         }
@@ -356,24 +356,14 @@ impl FirecrackerPool {
             mut fc_instance,
             work_dir,
         } = warm;
-        let slot_idx = slot.idx;
-
         if sync_network_cleanup {
             // Process-exit hooks can run after Tokio runtime thread-local state
             // has been destroyed. Avoid Runtime::block_on here; Drop kills the
             // child process without entering Tokio.
             drop(fc_instance);
         } else {
-            let stop_result = self
-                .runtime
+            self.runtime
                 .block_on(fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT));
-            if let Err(err) = stop_result {
-                warn!(
-                    slot = slot_idx,
-                    error = %err,
-                    "firecracker pool: stop warm process failed"
-                );
-            }
         }
 
         drop(work_dir);
@@ -389,15 +379,7 @@ impl FirecrackerPool {
             mut fc_instance,
             work_dir,
         } = warm;
-        let slot_idx = slot.idx;
-
-        if let Err(err) = fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT).await {
-            warn!(
-                slot = slot_idx,
-                error = %err,
-                "firecracker pool: stop warm process failed"
-            );
-        }
+        fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT).await;
 
         drop(work_dir);
 

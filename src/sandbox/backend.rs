@@ -14,15 +14,14 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    record_startup_pack, EnvdAccessToken, EnvdApi, Executor, FirecrackerCaptureArtifacts,
-    FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput, SandboxLaunchConfig,
-    SandboxNetworkPolicy,
+    EnvdAccessToken, EnvdApi, Executor, FreshSandboxBuildSpec, ProcessHandle, ProcessOpts,
+    ProcessOutput, SandboxLaunchConfig, SandboxNetworkPolicy,
 };
 use crate::repository::RepositoryResult;
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::{
     RunnableSnapshot, SandboxSnapshotManifest, SnapshotManager, SnapshotPublishMetadata,
-    SnapshotRecord, StartupRecording,
+    SnapshotRecord,
 };
 use crate::types::{RuntimeArtifactSet, SandboxId};
 
@@ -105,97 +104,16 @@ pub struct SandboxRuntimeInfo {
     pub runtime_artifacts: RuntimeArtifactSet,
 }
 
-/// Opaque captured snapshot artifacts produced from a running sandbox.
-///
-/// Unlike [`PausedSandboxState`], this value is intended for one-shot
-/// consumption by snapshot publication code. Concrete backends may use it to
-/// keep temporary artifact directories alive until publication finishes.
-pub struct CapturedSandboxSnapshot {
-    manifest: SandboxSnapshotManifest,
-    artifacts: Box<dyn Any + Send>,
-}
-
-impl CapturedSandboxSnapshot {
-    /// Take a capture, with whatever the backend has to hold on to until
-    /// publication is over. A backend which writes its artifacts under a
-    /// temporary root passes the guard of that root as `artifacts`, and one
-    /// which writes them somewhere durable passes `()`.
-    pub fn new<T>(manifest: SandboxSnapshotManifest, artifacts: T) -> Self
-    where
-        T: Send + 'static,
-    {
-        Self {
-            manifest,
-            artifacts: Box::new(artifacts),
-        }
-    }
-
-    /// What was captured, in the form the snapshot layer publishes.
-    pub fn manifest(&self) -> &SandboxSnapshotManifest {
-        &self.manifest
-    }
-
-    /// The backend which took the capture.
-    pub fn backend(&self) -> &str {
-        &self.manifest.backend
-    }
-
-    pub fn downcast_artifacts_ref<T>(&self) -> Option<&T>
-    where
-        T: Send + 'static,
-    {
-        self.artifacts.downcast_ref::<T>()
-    }
-}
-
-impl fmt::Debug for CapturedSandboxSnapshot {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CapturedSandboxSnapshot")
-            .field("backend", &self.manifest.backend)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Publishes `captured_snapshot` through `snapshots`. Its artifacts stay
-/// alive until publication is over.
-#[tracing::instrument(skip(snapshots, metadata), fields(snapshot_id = %metadata.id))]
+/// Publish an owned capture while keeping its artifacts alive through publication.
+#[tracing::instrument(skip(snapshots, metadata, captured_snapshot), fields(snapshot_id = %metadata.id))]
 pub async fn publish_captured(
     snapshots: &SnapshotManager,
     metadata: SnapshotPublishMetadata,
-    captured_snapshot: CapturedSandboxSnapshot,
+    captured_snapshot: Arc<crate::snapshot::Snapshot>,
 ) -> RepositoryResult<SnapshotRecord> {
-    let manifest = captured_snapshot.manifest().clone();
-    if metadata.snapshot_type == crate::snapshot::SnapshotPlacement::Local {
-        let manager = snapshots.clone();
-        return tokio::spawn(async move {
-            let result = manager.publish_local(metadata, manifest).await;
-            drop(captured_snapshot);
-            result
-        })
+    snapshots
+        .publish_snapshot(captured_snapshot, metadata)
         .await
-        .map_err(|error| {
-            crate::repository::RepositoryError::backend("finish Local snapshot publication", error)
-        })?;
-    }
-
-    // Spawn the startup-manifest recording up front (a no-op task when
-    // the feature is disabled): the throwaway recording VM overlaps the
-    // backend's layer uploads, and a detached continuation uploads the
-    // manifest once the trace lands — publish never waits on it. The
-    // capture root guard travels with the task so the artifacts outlive
-    // the whole continuation.
-    let recording = captured_snapshot
-        .downcast_artifacts_ref::<FirecrackerCaptureArtifacts>()
-        .map(|artifacts| {
-            let snapshot_config = artifacts.snapshot_config().clone();
-            let snapshot_dir = artifacts.snapshot_dir().to_path_buf();
-            StartupRecording::spawn_with_capture_lease(
-                record_startup_pack(snapshot_config, snapshot_dir),
-                artifacts.snapshot_root_guard(),
-            )
-        });
-
-    snapshots.publish(metadata, manifest, recording).await
 }
 
 /// Lifecycle interface for a single sandbox instance.
@@ -249,8 +167,9 @@ pub trait SandboxBackend: Send + 'static {
     /// as safely runnable.
     async fn snapshot(
         &mut self,
+        snapshot_id: crate::snapshot::SnapshotId,
         placement: crate::snapshot::SnapshotPlacement,
-    ) -> SandboxCaptureResult<CapturedSandboxSnapshot>;
+    ) -> SandboxCaptureResult<Arc<crate::snapshot::Snapshot>>;
 
     /// Flush and seal writable persistent-volume upper layers while keeping
     /// the sandbox running.

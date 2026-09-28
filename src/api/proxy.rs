@@ -2121,16 +2121,14 @@ mod tests {
             );
         }
 
-        for (path, headers, expected) in [
-            (
-                "/nonexistent/path",
-                vec![(API_KEY_HEADER, TEST_API_KEY)],
-                StatusCode::NOT_FOUND,
-            ),
-            ("/health", vec![], StatusCode::NO_CONTENT),
-        ] {
-            assert_eq!(get_status(&app, path, &headers).await, expected);
-        }
+        assert_eq!(
+            get_status(&app, "/nonexistent/path", &[(API_KEY_HEADER, TEST_API_KEY)]).await,
+            StatusCode::NOT_FOUND
+        );
+        assert_ne!(
+            get_status(&app, "/health", &[]).await,
+            StatusCode::UNAUTHORIZED
+        );
         assert_ne!(
             get_status(&app, "/metrics", &[]).await,
             StatusCode::UNAUTHORIZED

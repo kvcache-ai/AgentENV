@@ -1,9 +1,7 @@
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use overlaybd::config::UpperMode;
-use tracing::warn;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
 use crate::sandbox::ublk::{OverlaybdRuntimeHandle, UblkDeviceManager};
@@ -14,12 +12,6 @@ pub(crate) struct DriveMount {
     pub(crate) drive_id: String,
     pub(crate) attachment_path: PathBuf,
     pub(crate) read_only: bool,
-}
-
-pub(crate) struct PreparedDrives {
-    mounts: Vec<DriveMount>,
-    cleanup_paths: Vec<PathBuf>,
-    runtimes: Vec<OverlaybdRuntimeHandle>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,39 +49,8 @@ impl ExtraDrivePrepareMode {
     }
 }
 
-impl PreparedDrives {
-    pub(crate) fn into_parts(self) -> (Vec<DriveMount>, Vec<OverlaybdRuntimeHandle>) {
-        (self.mounts, self.runtimes)
-    }
-
-    async fn cleanup(self) {
-        for runtime in self.runtimes {
-            if let Err(err) = UblkDeviceManager::global()
-                .release_device(&runtime.device)
-                .await
-            {
-                warn!(
-                    error = %err,
-                    "failed to delete prepared extra drive device during rollback"
-                );
-            }
-        }
-
-        for path in self.cleanup_paths {
-            if let Err(err) = fs::remove_file(&path) {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    warn!(
-                        path = %path.display(),
-                        error = %err,
-                        "failed to remove prepared extra drive attachment during rollback"
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// Prepares each drive with the mode `mode` returns for its index.
+/// Append devices as soon as they are acquired so sandbox stop owns rollback,
+/// including failures that occur before the attachment is ready.
 pub(crate) async fn prepare_extra_drives(
     extra_drives: &[ExtraDrive],
     global_config_path: &Path,
@@ -97,103 +58,64 @@ pub(crate) async fn prepare_extra_drives(
     storage_root: &Path,
     runtime_upper_mode: UpperMode,
     mode: impl Fn(usize) -> ExtraDrivePrepareMode,
-) -> Result<PreparedDrives> {
+    runtimes: &mut Vec<OverlaybdRuntimeHandle>,
+) -> Result<Vec<DriveMount>> {
     let mut mounts = Vec::with_capacity(extra_drives.len());
-    let mut cleanup_paths = Vec::with_capacity(extra_drives.len());
-    let mut runtimes = Vec::with_capacity(extra_drives.len());
-
     for (index, drive) in extra_drives.iter().enumerate() {
         let mode = mode(index);
-        let result = async {
-            let runtime_dir = drive.runtime_dir(storage_root);
-            let (requested_virtual_size, known_source_virtual_size) = mode.device_sizes(drive);
-            let allow_shrink = mode.allow_shrink();
-            if matches!(mode, ExtraDrivePrepareMode::Snapshot) {
-                match tokio::fs::remove_dir_all(&runtime_dir).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
-                }
+        let runtime_dir = drive.runtime_dir(storage_root);
+        let (requested_virtual_size, known_source_virtual_size) = mode.device_sizes(drive);
+        let allow_shrink = mode.allow_shrink();
+        if matches!(mode, ExtraDrivePrepareMode::Snapshot) {
+            match tokio::fs::remove_dir_all(&runtime_dir).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
             }
-            let manager = UblkDeviceManager::global();
-            let runtime_device = match mode {
-                ExtraDrivePrepareMode::Paused => {
-                    manager
-                        .open_overlaybd_runtime(
-                            drive.image_config_path(),
-                            global_config_path,
-                            drive.virtual_size().context("paused drive size")?,
-                        )
-                        .await?
-                }
-                _ => manager
-                    .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                        source_image_config: drive.image_config_path(),
-                        global_config: global_config_path,
-                        runtime_dir: &runtime_dir,
-                        read_only: drive.read_only(),
-                        runtime_upper_mode,
-                        requested_virtual_size,
-                        known_source_virtual_size,
-                        allow_shrink,
-                    })
-                    .await
-                    .context("create overlaybd extra drive runtime device")?,
-            };
-            let symlink_name = drive.attachment_symlink_name();
-            let symlink_path = sandbox_work_dir.join(&symlink_name);
-            let device_path = runtime_device.device.device_path().to_path_buf();
-            let symlink_result = std::os::unix::fs::symlink(&device_path, &symlink_path)
-                .with_context(|| {
-                    format!(
-                        "symlink extra drive {} -> {}",
-                        symlink_path.display(),
-                        device_path.display()
+        }
+        let manager = UblkDeviceManager::global();
+        let runtime_device = match mode {
+            ExtraDrivePrepareMode::Paused => {
+                manager
+                    .open_overlaybd_runtime(
+                        drive.image_config_path(),
+                        global_config_path,
+                        drive.virtual_size().context("paused drive size")?,
                     )
-                });
-            if let Err(err) = symlink_result {
-                if let Err(release_err) = UblkDeviceManager::global()
-                    .release_device(&runtime_device.device)
-                    .await
-                {
-                    warn!(
-                        error = %release_err,
-                        "failed to release extra drive ublk device after symlink failure"
-                    );
-                }
-                return Err(err);
+                    .await?
             }
-            Ok::<_, anyhow::Error>((runtime_device, symlink_name, symlink_path))
-        }
-        .await;
-
-        match result {
-            Ok((runtime, symlink_name, symlink_path)) => {
-                mounts.push(DriveMount {
-                    drive_id: drive.drive_id().to_string(),
-                    attachment_path: PathBuf::from(symlink_name),
+            _ => manager
+                .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
+                    source_image_config: drive.image_config_path(),
+                    global_config: global_config_path,
+                    runtime_dir: &runtime_dir,
                     read_only: drive.read_only(),
-                });
-                cleanup_paths.push(symlink_path);
-                runtimes.push(runtime);
-            }
-            Err(err) => {
-                let prepared = PreparedDrives {
-                    mounts,
-                    cleanup_paths,
-                    runtimes,
-                };
-                prepared.cleanup().await;
-                return Err(err);
-            }
-        }
+                    runtime_upper_mode,
+                    requested_virtual_size,
+                    known_source_virtual_size,
+                    allow_shrink,
+                })
+                .await
+                .context("create overlaybd extra drive runtime device")?,
+        };
+        let symlink_name = drive.attachment_symlink_name();
+        let symlink_path = sandbox_work_dir.join(&symlink_name);
+        let device_path = runtime_device.device.device_path().to_path_buf();
+        runtimes.push(runtime_device);
+        std::os::unix::fs::symlink(&device_path, &symlink_path).with_context(|| {
+            format!(
+                "symlink extra drive {} -> {}",
+                symlink_path.display(),
+                device_path.display()
+            )
+        })?;
+        mounts.push(DriveMount {
+            drive_id: drive.drive_id().to_string(),
+            attachment_path: PathBuf::from(symlink_name),
+            read_only: drive.read_only(),
+        });
     }
-
-    Ok(PreparedDrives {
-        mounts,
-        cleanup_paths,
-        runtimes,
-    })
+    Ok(mounts)
 }
 
 #[cfg(test)]

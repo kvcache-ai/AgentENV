@@ -2,8 +2,7 @@ use std::time::Duration;
 
 use agentenv::sandbox::{FirecrackerSandbox, SandboxBackend, SandboxLaunchConfig};
 use agentenv::snapshot::{
-    ResolvedStartupPackSource, SnapshotAlias, SnapshotId, SnapshotPublishMetadata,
-    SnapshotPublishSource,
+    ResolvedStartupPackSource, SnapshotAlias, SnapshotPublishMetadata, SnapshotPublishSource,
 };
 use agentenv::types::{SandboxId, SandboxResources};
 use anyhow::{bail, Context, Result};
@@ -43,6 +42,7 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
             .context("source sandbox has no rootfs virtual size")?;
         let captured = SandboxBackend::snapshot(
             &mut original,
+            agentenv::snapshot::SnapshotId::generate(),
             agentenv::snapshot::SnapshotPlacement::Distributed,
         )
         .await?;
@@ -50,7 +50,7 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
             &manager,
             SnapshotPublishMetadata {
                 snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-                id: SnapshotId::generate(),
+                id: captured.id().clone(),
                 alias: Some(SnapshotAlias::parse(&format!(
                     "posix-startup-pack-{}",
                     std::process::id()

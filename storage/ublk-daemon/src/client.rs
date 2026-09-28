@@ -1,18 +1,19 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::AsyncBufReadExt;
+use storage_util::{abort_on_drop, fatal_exit};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::time::{Duration, Instant};
 use warm_pool::PoolConfig;
 
 use crate::protocol::{
-    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
+    recv_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
     RestackSnapshotResult, SourceStateStrategy,
 };
-use overlaybd::config::UpperMode;
+use overlaybd::{config::UpperMode, RestackSnapshotTerminalFailure};
 
 /// Default timeout for daemon RPC calls.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -39,11 +40,6 @@ fn configure_daemon_capabilities(command: &mut tokio::process::Command) -> Resul
         });
     }
     Ok(())
-}
-
-#[derive(Debug)]
-pub struct RestackSnapshotTerminalFailure {
-    message: String,
 }
 
 #[derive(Debug, Clone)]
@@ -87,28 +83,11 @@ impl std::fmt::Display for InvalidRequestError {
 
 impl std::error::Error for InvalidRequestError {}
 
-impl RestackSnapshotTerminalFailure {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for RestackSnapshotTerminalFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for RestackSnapshotTerminalFailure {}
-
 /// Client for communicating with the `uvm-ublk-daemon` process.
 ///
-/// Owns the daemon child process. Spawns a background watchdog task that
-/// monitors whether the daemon is alive. If the daemon exits unexpectedly,
-/// all subsequent RPC calls fail immediately with a clear error message
-/// instead of attempting a socket connection to a dead process.
+/// Owns the daemon child process. Spawns a background watchdog thread that
+/// monitors whether the daemon is alive. An unexpected exit terminates the
+/// owner process before its destructors can remove device backing files.
 pub struct UblkDaemonClient {
     inner: Arc<UblkDaemonClientInner>,
 }
@@ -128,15 +107,10 @@ pub struct UblkDaemonSpawnConfig<'a> {
 
 struct UblkDaemonClientInner {
     socket_path: PathBuf,
-    /// Set to `true` when the daemon process exits (expected or unexpected).
-    daemon_dead: AtomicBool,
-    /// Retains completion so shutdown callers cannot miss the watchdog's exit.
-    daemon_exited: tokio::sync::watch::Sender<bool>,
-    /// Set to `true` when `shutdown()` is called, so the watchdog task
-    /// doesn't log the expected exit as an error.
+    exited: tokio::sync::watch::Sender<bool>,
+    /// Set to `true` when `shutdown()` is called, so the watchdog accepts a successful
+    /// exit after all device owners have released their resources.
     shutting_down: AtomicBool,
-    /// Populated with the exit status description when the daemon dies.
-    death_reason: Mutex<Option<String>>,
     runtime_device_timeout: Duration,
 }
 
@@ -146,10 +120,10 @@ impl UblkDaemonClient {
     /// This is the primary constructor. It:
     /// 1. Spawns the daemon binary as a child process.
     /// 2. Waits for `"ready"` on stdout (with a 30s timeout).
-    /// 3. Spawns a background watchdog task that monitors the child process
-    ///    and sets `daemon_dead` if it exits unexpectedly.
+    /// 3. Spawns a background watchdog thread that monitors the child process
+    ///    and terminates the owner if it exits unexpectedly.
     ///
-    /// Returns `Arc<Self>` because the watchdog task needs a reference.
+    /// Returns a shared client for device owners.
     pub async fn new(config: UblkDaemonSpawnConfig<'_>) -> Result<Arc<Self>> {
         tracing::info!(
             binary = %config.binary_path.display(),
@@ -213,6 +187,7 @@ impl UblkDaemonClient {
         }
 
         let mut child = cmd
+            .as_std_mut()
             .spawn()
             .with_context(|| format!("spawn ublk daemon: {}", config.binary_path.display()))?;
 
@@ -221,20 +196,18 @@ impl UblkDaemonClient {
             .stdout
             .take()
             .context("ublk daemon child process has no stdout")?;
-        Self::wait_for_ready(stdout, &mut child).await?;
+        Self::wait_for_ready(tokio::process::ChildStdout::from_std(stdout)?, &mut child).await?;
 
         let client = Arc::new(Self {
             inner: Arc::new(UblkDaemonClientInner {
                 socket_path: config.socket_path,
-                daemon_dead: AtomicBool::new(false),
-                daemon_exited: tokio::sync::watch::channel(false).0,
+                exited: tokio::sync::watch::channel(false).0,
                 shutting_down: AtomicBool::new(false),
-                death_reason: Mutex::new(None),
                 runtime_device_timeout: config.runtime_device_timeout,
             }),
         });
 
-        // Spawn the watchdog task to monitor the child process.
+        // Monitor daemon exit independently of the async runtime.
         Self::spawn_watchdog(client.inner.clone(), child);
 
         tracing::info!("ublk daemon ready");
@@ -272,7 +245,7 @@ impl UblkDaemonClient {
     /// Wait for the daemon to print "ready" on stdout.
     async fn wait_for_ready(
         stdout: tokio::process::ChildStdout,
-        child: &mut tokio::process::Child,
+        child: &mut std::process::Child,
     ) -> Result<()> {
         let mut reader = tokio::io::BufReader::new(stdout);
         let mut line = String::new();
@@ -285,7 +258,7 @@ impl UblkDaemonClient {
                     .await
                     .context("read ublk daemon stdout")?;
                 if n == 0 {
-                    let status = child.wait().await.ok();
+                    let status = child.try_wait().ok().flatten();
                     bail!("ublk daemon exited before ready (status={status:?})");
                 }
                 if line.trim() == "ready" {
@@ -299,36 +272,26 @@ impl UblkDaemonClient {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(e),
             Err(_) => {
-                let _ = child.kill().await;
+                let _ = child.kill();
                 bail!("ublk daemon did not become ready within {READY_TIMEOUT:?}");
             }
         }
     }
 
-    /// Spawn a background task that waits for the child process to exit.
-    ///
-    /// When the daemon dies, the task sets `daemon_dead` so that subsequent
-    /// RPC calls fail immediately instead of trying to connect to a dead socket.
-    fn spawn_watchdog(inner: Arc<UblkDaemonClientInner>, mut child: tokio::process::Child) {
-        tokio::spawn(async move {
-            let status = child.wait().await;
-            let is_shutdown = inner.shutting_down.load(Ordering::Acquire);
-
-            let reason = match &status {
-                Ok(exit) => format!("ublk daemon exited: {exit}"),
-                Err(err) => format!("ublk daemon wait failed: {err}"),
-            };
-
-            if is_shutdown {
-                tracing::info!(%reason, "ublk daemon stopped (expected shutdown)");
-            } else {
-                tracing::error!(%reason, "ublk daemon exited unexpectedly");
-            }
-
-            *inner.death_reason.lock().unwrap() = Some(reason);
-            inner.daemon_dead.store(true, Ordering::Release);
-            inner.daemon_exited.send_replace(true);
-        });
+    /// A blocking wait survives caller cancellation and Tokio runtime teardown.
+    fn spawn_watchdog(inner: Arc<UblkDaemonClientInner>, mut child: std::process::Child) {
+        std::thread::Builder::new()
+            .name("ublk-watchdog".into())
+            .spawn(move || {
+                let status = child
+                    .wait()
+                    .unwrap_or_else(|error| fatal_exit(&format!("wait for ublk daemon: {error}")));
+                if !inner.shutting_down.load(Ordering::Acquire) || !status.success() {
+                    fatal_exit(&format!("ublk daemon exited unexpectedly: {status}"));
+                }
+                inner.exited.send_replace(true);
+            })
+            .unwrap_or_else(|error| fatal_exit(&format!("start ublk watchdog: {error}")));
     }
 
     /// The socket path this client connects to.
@@ -372,13 +335,7 @@ impl UblkDaemonClient {
                 dev_id,
                 device_path,
             } => Ok((dev_id, device_path)),
-            DaemonResponse::TerminalError { message } => {
-                bail!("daemon: create overlaybd failed terminally: {message}")
-            }
-            DaemonResponse::Error { message } => {
-                bail!("daemon: create overlaybd failed: {message}")
-            }
-            other => bail!("daemon: unexpected response for create overlaybd: {other:?}"),
+            response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
 
@@ -392,18 +349,10 @@ impl UblkDaemonClient {
         };
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::Ok => Ok(()),
-            DaemonResponse::TerminalError { message } => {
-                bail!("daemon: notify sandbox ready failed terminally: {message}")
-            }
-            DaemonResponse::Error { message } => {
-                bail!("daemon: notify sandbox ready failed: {message}")
-            }
-            other => bail!("daemon: unexpected response for notify sandbox ready: {other:?}"),
+            response => bail!("unexpected ublk response: {response:?}"),
         }
     }
 
-    /// Arm a startup-pack first-touch recorder on `dev_id`. When the
-    /// recording window ends the daemon packages the recorded pages into
     /// `output` and reports the result through [`Self::pack_recording_status`].
     #[allow(clippy::too_many_arguments)]
     pub async fn start_pack_recording(
@@ -540,18 +489,7 @@ impl UblkDaemonClient {
                 actual_virtual_size,
                 runtime_image_config_path,
             }),
-            DaemonResponse::TerminalError { message } => {
-                bail!("daemon: create overlaybd runtime device failed terminally: {message}")
-            }
-            DaemonResponse::InvalidRequest { message } => {
-                Err(InvalidRequestError::new(message).into())
-            }
-            DaemonResponse::Error { message } => {
-                bail!("daemon: create overlaybd runtime device failed: {message}")
-            }
-            other => {
-                bail!("daemon: unexpected response for create overlaybd runtime device: {other:?}")
-            }
+            response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
 
@@ -560,13 +498,7 @@ impl UblkDaemonClient {
         let request = DaemonRequest::Delete { dev_id };
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::Deleted => Ok(()),
-            DaemonResponse::TerminalError { message } => {
-                bail!("daemon: delete dev_id={dev_id} failed terminally: {message}")
-            }
-            DaemonResponse::Error { message } => {
-                bail!("daemon: delete dev_id={dev_id} failed: {message}")
-            }
-            other => bail!("daemon: unexpected response for delete: {other:?}"),
+            response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
 
@@ -595,19 +527,7 @@ impl UblkDaemonClient {
                 data_stat,
                 ext4_used_bytes,
             }),
-            DaemonResponse::TerminalError { message } => Err(
-                RestackSnapshotTerminalFailure::new(format!(
-                    "daemon: restack snapshot dev_id={dev_id} failed after mutating live state: {message}"
-                ))
-                .into(),
-            ),
-            DaemonResponse::Error { message } => {
-                bail!("daemon: restack snapshot dev_id={dev_id} failed: {message}")
-            }
-            other => Err(RestackSnapshotTerminalFailure::new(format!(
-                "daemon: unexpected response for restack snapshot: {other:?}"
-            ))
-            .into()),
+            response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
 
@@ -616,33 +536,34 @@ impl UblkDaemonClient {
         let request = DaemonRequest::FlushForCheckpoint { dev_id };
         match self.call(request, SNAPSHOT_TIMEOUT).await? {
             DaemonResponse::Ok => Ok(()),
-            DaemonResponse::TerminalError { message } => {
-                bail!("daemon: checkpoint flush dev_id={dev_id} failed terminally: {message}")
-            }
-            DaemonResponse::Error { message } => {
-                bail!("daemon: checkpoint flush dev_id={dev_id} failed: {message}")
-            }
-            other => bail!("daemon: unexpected response for checkpoint flush: {other:?}"),
+            response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
 
-    /// Request graceful daemon shutdown.
-    ///
-    /// Signals the watchdog that this is an expected exit so it does not
-    /// log at error level.
-    pub async fn shutdown(&self) -> Result<()> {
+    /// Stop the daemon after all normal device owners have released their resources.
+    pub async fn shutdown(&self) {
+        let shutdown = abort_on_drop((), "daemon shutdown was cancelled");
         self.inner.shutting_down.store(true, Ordering::Release);
-        // Best-effort: daemon may close connection before responding.
-        let _ = self
-            .call(DaemonRequest::Shutdown, Duration::from_secs(5))
-            .await;
-        self.inner
-            .daemon_exited
-            .subscribe()
-            .wait_for(|exited| *exited)
-            .await
-            .context("wait for ublk daemon exit")?;
-        Ok(())
+        let stopped = tokio::time::timeout(Duration::from_secs(10), async {
+            // The daemon may close its socket before replying; process exit is decisive.
+            match self
+                .call(DaemonRequest::Shutdown, Duration::from_secs(5))
+                .await
+            {
+                Ok(DaemonResponse::Ok) | Err(_) => {}
+                Ok(response) => fatal_exit(&format!("unexpected ublk response: {response:?}")),
+            }
+            let mut exited = self.inner.exited.subscribe();
+            exited
+                .wait_for(|exited| *exited)
+                .await
+                .expect("client owns exit sender");
+        })
+        .await;
+        if stopped.is_err() {
+            fatal_exit("ublk daemon shutdown did not complete within 10 seconds");
+        }
+        shutdown.complete();
     }
 
     /// Query daemon capabilities.
@@ -652,10 +573,7 @@ impl UblkDaemonClient {
         let request = DaemonRequest::GetFeatures;
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::Features { flags } => Ok(flags),
-            DaemonResponse::Error { message } => {
-                bail!("daemon: get features failed: {message}")
-            }
-            other => bail!("daemon: unexpected response for get features: {other:?}"),
+            response => bail!("unexpected ublk response: {response:?}"),
         }
     }
 
@@ -700,13 +618,7 @@ impl UblkDaemonClient {
                 device_path,
                 image_config_path,
             } => Ok((dev_id, device_path, image_config_path)),
-            DaemonResponse::TerminalError { message } => {
-                bail!("daemon: acquire overlaybd failed terminally: {message}")
-            }
-            DaemonResponse::Error { message } => {
-                bail!("daemon: acquire overlaybd failed: {message}")
-            }
-            other => bail!("daemon: unexpected response for acquire overlaybd: {other:?}"),
+            response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
 
@@ -715,13 +627,7 @@ impl UblkDaemonClient {
         let request = DaemonRequest::ReleaseOverlaybd { dev_id };
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::Released => Ok(()),
-            DaemonResponse::TerminalError { message } => {
-                bail!("daemon: release overlaybd dev_id={dev_id} failed terminally: {message}")
-            }
-            DaemonResponse::Error { message } => {
-                bail!("daemon: release overlaybd dev_id={dev_id} failed: {message}")
-            }
-            other => bail!("daemon: unexpected response for release overlaybd: {other:?}"),
+            response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
 
@@ -735,65 +641,94 @@ impl UblkDaemonClient {
         };
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::SizeUpdated => Ok(()),
-            DaemonResponse::TerminalError { message } => {
-                bail!("daemon: update size dev_id={dev_id} failed terminally: {message}")
-            }
-            DaemonResponse::Error { message } => {
-                bail!("daemon: update size dev_id={dev_id} failed: {message}")
-            }
-            other => bail!("daemon: unexpected response for update size: {other:?}"),
+            response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
 
-    /// Check if the daemon is alive, then send a request and wait for a response.
+    /// Fail stop on uncertain device changes; callers handle confirmed failures.
     async fn call(&self, request: DaemonRequest, timeout: Duration) -> Result<DaemonResponse> {
-        // Fail fast if daemon is dead.
-        if self.inner.daemon_dead.load(Ordering::Acquire) {
-            let reason = self.inner.death_reason.lock().unwrap();
-            bail!(
-                "ublk daemon is not running: {}",
-                reason.as_deref().unwrap_or("unknown reason")
-            );
+        let shutdown = matches!(request, DaemonRequest::Shutdown);
+        let best_effort = matches!(
+            request,
+            DaemonRequest::GetFeatures
+                | DaemonRequest::NotifySandboxReady { .. }
+                | DaemonRequest::StartPackRecording { .. }
+                | DaemonRequest::PackRecordingStatus { .. }
+                | DaemonRequest::AbortPackRecording { .. }
+                | DaemonRequest::PrefetchStartupPack { .. }
+        );
+        let creating = matches!(
+            request,
+            DaemonRequest::CreateOverlaybd { .. }
+                | DaemonRequest::CreateOverlaybdRuntimeDevice { .. }
+                | DaemonRequest::AcquireOverlaybd { .. }
+        );
+        let releasing = matches!(
+            request,
+            DaemonRequest::Delete { .. } | DaemonRequest::ReleaseOverlaybd { .. }
+        );
+        if !shutdown && self.inner.shutting_down.load(Ordering::Acquire) {
+            if releasing {
+                fatal_exit("device release attempted after daemon shutdown began");
+            }
+            bail!("ublk daemon is shutting down");
         }
-
-        let is_restack = matches!(&request, DaemonRequest::RestackSnapshot { .. });
+        // Encoding cannot have changed daemon state, so invalid input remains an error.
+        let payload = serde_json::to_vec(&request).context("encode daemon request")?;
         let mut request_started = false;
-        let result = match tokio::time::timeout(timeout, async {
+        let exchange = async {
             let mut stream = UnixStream::connect(&self.inner.socket_path)
                 .await
-                .with_context(|| {
-                    format!(
-                        "connect to ublk daemon socket: {}",
-                        self.inner.socket_path.display()
-                    )
-                })?;
-            // A failed send or missing response cannot prove that restack did not run.
+                .context("connect to ublk daemon")?;
+            // A partial write can already leave the operation's outcome unknown.
             request_started = true;
-            send_message(&mut stream, &request)
-                .await
-                .context("send daemon request")?;
-            recv_message(&mut stream)
-                .await
-                .context("receive daemon response")?
-                .context("daemon closed connection without response")
-        })
-        .await
-        {
-            Ok(inner) => inner,
-            Err(_) => Err(anyhow::anyhow!(
-                "daemon RPC timed out after {timeout:?} (socket={})",
-                self.inner.socket_path.display()
-            )),
+            let response = async {
+                stream
+                    .write_all(&(payload.len() as u32).to_be_bytes())
+                    .await?;
+                stream.write_all(&payload).await?;
+                recv_message(&mut stream)
+                    .await?
+                    .context("daemon closed without a response")
+            };
+            if shutdown || best_effort {
+                response.await
+            } else {
+                let pending = abort_on_drop((), "device RPC was cancelled before confirmation");
+                let response = response.await;
+                pending.complete();
+                response
+            }
         };
-        if is_restack && request_started {
-            return result.map_err(|err| {
-                RestackSnapshotTerminalFailure::new(format!(
-                    "daemon: restack snapshot outcome is unknown: {err:#}"
-                ))
-                .into()
-            });
+        let result = tokio::time::timeout(timeout, exchange).await;
+        let can_return = shutdown || best_effort || (creating && !request_started);
+        let response = match result {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) if can_return => return Err(error),
+            Err(error) if can_return => return Err(error.into()),
+            Ok(Err(error)) => fatal_exit(&format!("ublk control connection failed: {error:#}")),
+            Err(_) => fatal_exit(&format!("ublk control request timed out after {timeout:?}")),
+        };
+        match response {
+            DaemonResponse::TerminalError { message }
+                if matches!(request, DaemonRequest::RestackSnapshot { .. }) =>
+            {
+                Err(RestackSnapshotTerminalFailure::new(message).into())
+            }
+            DaemonResponse::TerminalError { message } if !best_effort => fatal_exit(&message),
+            DaemonResponse::Error { message } | DaemonResponse::InvalidRequest { message }
+                if releasing =>
+            {
+                fatal_exit(&message)
+            }
+            DaemonResponse::Error { message } | DaemonResponse::TerminalError { message } => {
+                bail!("daemon: {message}")
+            }
+            DaemonResponse::InvalidRequest { message } => {
+                Err(InvalidRequestError::new(message).into())
+            }
+            response => Ok(response),
         }
-        result
     }
 }
 
@@ -802,8 +737,8 @@ impl std::fmt::Debug for UblkDaemonClient {
         f.debug_struct("UblkDaemonClient")
             .field("socket_path", &self.inner.socket_path)
             .field(
-                "daemon_dead",
-                &self.inner.daemon_dead.load(Ordering::Relaxed),
+                "shutting_down",
+                &self.inner.shutting_down.load(Ordering::Relaxed),
             )
             .finish()
     }
@@ -812,44 +747,37 @@ impl std::fmt::Debug for UblkDaemonClient {
 impl UblkDaemonClient {
     /// Test-only constructor that creates a client pointing at a given socket
     /// path without spawning a real daemon process. Useful for testing RPC
-    /// logic against a mock server or verifying dead-daemon fast-fail.
+    /// logic against a mock server without starting a daemon process.
     #[doc(hidden)]
-    pub fn new_for_test(socket_path: PathBuf, daemon_dead: bool) -> Arc<Self> {
+    pub fn new_for_test(socket_path: PathBuf) -> Arc<Self> {
         Arc::new(Self {
             inner: Arc::new(UblkDaemonClientInner {
                 socket_path,
-                daemon_dead: AtomicBool::new(daemon_dead),
-                daemon_exited: tokio::sync::watch::channel(true).0,
+                exited: tokio::sync::watch::channel(false).0,
                 shutting_down: AtomicBool::new(false),
-                death_reason: Mutex::new(if daemon_dead {
-                    Some("test: daemon marked dead".into())
-                } else {
-                    None
-                }),
                 runtime_device_timeout: Duration::from_secs(360),
             }),
         })
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::send_message;
 
     #[tokio::test]
     async fn shutdown_waits_for_child_exit_after_rpc_ack() {
-        use tokio::io::AsyncWriteExt;
+        use std::io::Write;
 
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("shutdown.sock");
         let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
-        let client = UblkDaemonClient::new_for_test(sock_path, false);
+        let client = UblkDaemonClient::new_for_test(sock_path);
         // The child cannot exit until the test releases its stdin gate.
-        client.inner.daemon_exited.send_replace(false);
-        let mut child = tokio::process::Command::new("/bin/sh")
+        client.inner.exited.send_replace(false);
+        let mut child = std::process::Command::new("/bin/sh")
             .args(["-c", "read line"])
             .stdin(std::process::Stdio::piped())
-            .kill_on_drop(true)
             .spawn()
             .unwrap();
         let mut gate = child.stdin.take().unwrap();
@@ -870,11 +798,10 @@ mod tests {
         let returned_early = tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
             .await
             .is_ok();
-        gate.write_all(b"exit\n").await.unwrap();
+        gate.write_all(b"exit\n").unwrap();
         if !returned_early {
             tokio::time::timeout(Duration::from_secs(3), shutdown)
                 .await
-                .unwrap()
                 .unwrap()
                 .unwrap();
         }
@@ -882,199 +809,228 @@ mod tests {
             !returned_early,
             "shutdown returned before daemon cleanup/exit"
         );
-        assert!(client.inner.daemon_dead.load(Ordering::Acquire));
+        assert!(*client.inner.exited.borrow());
         // Repeated shutdown must also observe the already-completed exit.
-        client.shutdown().await.unwrap();
+        client.shutdown().await;
     }
 
     #[tokio::test]
-    async fn daemon_dead_fails_immediately() {
-        let client = UblkDaemonClient::new_for_test(
-            PathBuf::from("/nonexistent/test.sock"),
-            true, // daemon marked dead
-        );
+    async fn request_failures_leave_the_client_healthy() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let socket = root.path().join("daemon.sock");
+        let client = UblkDaemonClient::new_for_test(socket.clone());
+        assert!(client
+            .create_overlaybd(Path::new("image"), Path::new("global"))
+            .await
+            .is_err());
+        let listener = tokio::net::UnixListener::bind(&socket)?;
+        for response in [
+            DaemonResponse::InvalidRequest {
+                message: "invalid size".into(),
+            },
+            DaemonResponse::Error {
+                message: "invalid image".into(),
+            },
+        ] {
+            let invalid = matches!(response, DaemonResponse::InvalidRequest { .. });
+            let server = async {
+                let (mut stream, _) = listener.accept().await?;
+                recv_message::<DaemonRequest>(&mut stream).await?;
+                send_message(&mut stream, &response).await
+            };
+            let (result, served) = tokio::join!(
+                client.create_overlaybd(Path::new("image"), Path::new("global")),
+                server
+            );
+            served?;
+            assert_eq!(result.unwrap_err().is::<InvalidRequestError>(), invalid);
+        }
+        let server = async {
+            let (mut stream, _) = listener.accept().await?;
+            recv_message::<DaemonRequest>(&mut stream).await?;
+            send_message(
+                &mut stream,
+                &DaemonResponse::TerminalError {
+                    message: "upper already sealed".into(),
+                },
+            )
+            .await
+        };
+        let (result, served) =
+            tokio::join!(client.restack_snapshot(1, Path::new("layer"), None), server);
+        assert!(result.unwrap_err().is::<RestackSnapshotTerminalFailure>());
+        served?;
+        let server = async {
+            let (mut stream, _) = listener.accept().await?;
+            assert!(matches!(
+                recv_message::<DaemonRequest>(&mut stream).await?,
+                Some(DaemonRequest::GetFeatures)
+            ));
+            send_message(&mut stream, &DaemonResponse::Features { flags: 0 }).await
+        };
+        let (health, served) = tokio::join!(client.get_features(), server);
+        assert_eq!(health?, 0);
+        served?;
+        assert!(client
+            .call(DaemonRequest::GetFeatures, Duration::from_millis(10))
+            .await
+            .is_err());
+        Ok(())
+    }
 
-        let err = client
-            .create_overlaybd(Path::new("/img.json"), Path::new("/global.json"))
-            .await;
-        assert!(err.is_err());
-        let msg = format!("{:#}", err.unwrap_err());
-        assert!(
-            msg.contains("not running"),
-            "expected 'not running' in error: {msg}"
-        );
-
-        let err = client.delete(0).await;
-        assert!(err.is_err());
-
-        let err = client.restack_snapshot(0, Path::new("/out"), None).await;
-        assert!(err.is_err());
+    #[tokio::test]
+    async fn intentional_shutdown_waits_for_the_child_and_keeps_the_owner_alive() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let socket = root.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket)?;
+        let client = UblkDaemonClient::new_for_test(socket);
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "read line; exit 0"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        let input = child.stdin.take();
+        UblkDaemonClient::spawn_watchdog(Arc::clone(&client.inner), child);
+        let server = async {
+            let (mut stream, _) = listener.accept().await?;
+            assert!(matches!(
+                recv_message::<DaemonRequest>(&mut stream).await?,
+                Some(DaemonRequest::Shutdown)
+            ));
+            drop(input);
+            Ok::<_, anyhow::Error>(())
+        };
+        let ((), served) = tokio::join!(client.shutdown(), server);
+        served?;
+        assert!(*client.inner.exited.borrow());
+        Ok(())
     }
 
     #[test]
-    fn debug_format_shows_socket_and_status() {
-        let client = UblkDaemonClient::new_for_test(PathBuf::from("/tmp/test.sock"), false);
-        let debug = format!("{:?}", client);
-        assert!(
-            debug.contains("UblkDaemonClient"),
-            "debug should contain struct name"
-        );
-        assert!(
-            debug.contains("/tmp/test.sock"),
-            "debug should contain socket path"
-        );
-        assert!(
-            debug.contains("false"),
-            "debug should contain daemon_dead status"
-        );
-    }
-
-    #[tokio::test]
-    async fn connection_refused_when_no_server() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("nonexistent.sock");
-        let client = UblkDaemonClient::new_for_test(sock_path, false);
-
-        let err = client
-            .create_overlaybd(Path::new("/img.json"), Path::new("/global.json"))
-            .await;
-        assert!(err.is_err(), "should fail when no server is listening");
-    }
-
-    #[tokio::test]
-    async fn restack_lost_reply_is_terminal() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("restack.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let client = UblkDaemonClient::new_for_test(socket, false);
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            assert!(matches!(
-                recv_message::<DaemonRequest>(&mut stream).await.unwrap(),
-                Some(DaemonRequest::RestackSnapshot { .. })
-            ));
-            // Consume the request, then close without replying: the client
-            // cannot know whether the live upper was already sealed.
-        });
-
-        let error = client
-            .restack_snapshot(0, Path::new("/snapshot.commit"), None)
-            .await
-            .unwrap_err();
-        server.await.unwrap();
-        assert!(error.is::<RestackSnapshotTerminalFailure>(), "{error:#}");
-    }
-
-    #[tokio::test]
-    async fn shutdown_sets_shutting_down_flag() {
-        // Create a mock server that accepts one connection and returns nothing,
-        // to simulate the daemon receiving shutdown and closing.
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("shutdown.sock");
-        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
-
-        let client = UblkDaemonClient::new_for_test(sock_path, false);
-
-        // Accept connection in background (shutdown is best-effort).
-        tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            // Read the request, don't send response — simulating daemon closing.
-            let _: Option<DaemonRequest> =
-                crate::protocol::recv_message(&mut stream).await.unwrap();
-        });
-
-        // shutdown() should not return an error even if the daemon doesn't respond.
-        let result = client.shutdown().await;
-        assert!(result.is_ok());
-        assert!(client.inner.shutting_down.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn restack_failure_before_sending_is_recoverable() {
-        let dir = tempfile::tempdir().unwrap();
-        for (dead, expected) in [
-            (true, "not running"),
-            (false, "connect to ublk daemon socket"),
-        ] {
-            let client = UblkDaemonClient::new_for_test(dir.path().join("missing.sock"), dead);
-            let err = client
-                .restack_snapshot(0, Path::new("/out"), None)
-                .await
-                .unwrap_err();
-            assert!(!err.is::<RestackSnapshotTerminalFailure>(), "{err:#}");
-            assert!(format!("{err:#}").contains(expected), "{err:#}");
-        }
-    }
-
-    #[tokio::test]
-    async fn restack_response_loss_is_terminal_but_rejection_is_recoverable() {
-        for response in [
-            None,
-            Some(DaemonResponse::Error {
-                message: "device is read-only".into(),
-            }),
-        ] {
-            let terminal = response.is_none();
-            let dir = tempfile::tempdir().unwrap();
-            let socket = dir.path().join("restack.sock");
-            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-            let server = tokio::spawn(async move {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let request: Option<DaemonRequest> = recv_message(&mut stream).await.unwrap();
-                assert!(matches!(
-                    request,
-                    Some(DaemonRequest::RestackSnapshot { .. })
-                ));
-                if let Some(response) = response {
-                    send_message(&mut stream, &response).await.unwrap();
-                }
-            });
-            let client = UblkDaemonClient::new_for_test(socket, false);
-            let err = client
-                .restack_snapshot(0, Path::new("/out"), None)
-                .await
-                .unwrap_err();
-            assert_eq!(
-                err.is::<RestackSnapshotTerminalFailure>(),
-                terminal,
-                "{err:#}"
-            );
-            if !terminal {
-                assert!(err.to_string().contains("device is read-only"));
+    fn control_faults_exit_before_backing_files_or_exit_hooks() -> Result<()> {
+        const CASE: &str = "AENV_TEST_FATAL_RPC";
+        const ROOT: &str = "AENV_TEST_FATAL_ROOT";
+        if let Ok(case) = std::env::var(CASE) {
+            extern "C" fn exit_hook() {
+                let _ = std::fs::write(
+                    PathBuf::from(std::env::var("AENV_TEST_FATAL_ROOT").unwrap()).join("exit-hook"),
+                    b"ran",
+                );
             }
-            server.await.unwrap();
+            unsafe {
+                libc::atexit(exit_hook);
+            }
+            let root = PathBuf::from(std::env::var(ROOT)?);
+            let backing = tempfile::Builder::new()
+                .prefix("backing")
+                .rand_bytes(0)
+                .tempdir_in(&root)?;
+            std::fs::write(backing.path().join("data"), b"must survive")?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(async move {
+                let socket = root.join("daemon.sock");
+                let client = UblkDaemonClient::new_for_test(socket.clone());
+                if case == "watchdog" {
+                    let child = std::process::Command::new("sh")
+                        .args(["-c", "exit 23"])
+                        .spawn()?;
+                    UblkDaemonClient::spawn_watchdog(Arc::clone(&client.inner), child);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    panic!("watchdog did not terminate owner");
+                }
+                let listener = tokio::net::UnixListener::bind(&socket)?;
+                let operation = case.clone();
+                let request = tokio::spawn(async move {
+                    let _backing = backing;
+                    match operation.as_str() {
+                        "shutdown" => {
+                            client.shutdown().await;
+                        }
+                        "release" => {
+                            client.release_overlaybd(12).await?;
+                        }
+                        "response" => {
+                            client
+                                .create_overlaybd(Path::new("image"), Path::new("global"))
+                                .await?;
+                        }
+                        _ => {
+                            client
+                                .call(
+                                    DaemonRequest::CreateOverlaybd {
+                                        image_config: "image".into(),
+                                        global_config: "global".into(),
+                                        read_only_upper: false,
+                                    },
+                                    Duration::from_millis(100),
+                                )
+                                .await?;
+                        }
+                    }
+                    panic!("fatal operation returned to its owner");
+                    #[allow(unreachable_code)]
+                    Ok::<_, anyhow::Error>(())
+                });
+                let (mut stream, _) = listener.accept().await?;
+                recv_message::<DaemonRequest>(&mut stream).await?;
+                match case.as_str() {
+                    "disconnect" | "shutdown" => drop(stream),
+                    "cancel" => {
+                        request.abort();
+                    }
+                    "release" => {
+                        send_message(
+                            &mut stream,
+                            &DaemonResponse::Error {
+                                message: "device still active".into(),
+                            },
+                        )
+                        .await?
+                    }
+                    "response" => send_message(&mut stream, &DaemonResponse::Deleted).await?,
+                    "timeout" => {
+                        tokio::time::sleep(Duration::from_secs(4)).await;
+                    }
+                    _ => unreachable!(),
+                }
+                request.await??;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            panic!("fatal case returned");
         }
-    }
-
-    #[tokio::test]
-    async fn restack_timeout_after_sending_is_terminal() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = dir.path().join("restack.sock");
-        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let request: Option<DaemonRequest> = recv_message(&mut stream).await.unwrap();
-            assert!(matches!(
-                request,
-                Some(DaemonRequest::RestackSnapshot { .. })
-            ));
-            std::future::pending::<()>().await;
-        });
-        let client = UblkDaemonClient::new_for_test(socket, false);
-        let err = client
-            .call(
-                DaemonRequest::RestackSnapshot {
-                    dev_id: 0,
-                    output_layer_path: "/out".into(),
-                    compact_from: None,
-                },
-                Duration::from_secs(1),
-            )
-            .await
-            .unwrap_err();
-        assert!(err.is::<RestackSnapshotTerminalFailure>(), "{err:#}");
-        assert!(err.to_string().contains("timed out"), "{err:#}");
-        server.abort();
-        assert!(server.await.unwrap_err().is_cancelled());
+        for case in [
+            "disconnect",
+            "timeout",
+            "cancel",
+            "response",
+            "release",
+            "watchdog",
+            "shutdown",
+        ] {
+            let root = tempfile::tempdir()?;
+            let output = std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "client::tests::control_faults_exit_before_backing_files_or_exit_hooks",
+                    "--nocapture",
+                ])
+                .env(CASE, case)
+                .env(ROOT, root.path())
+                .output()?;
+            assert_eq!(
+                output.status.code(),
+                Some(70),
+                "{case}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read(root.path().join("backing/data"))?,
+                b"must survive",
+                "{case}"
+            );
+            assert!(!root.path().join("exit-hook").exists(), "{case}");
+        }
+        Ok(())
     }
 }

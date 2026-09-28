@@ -2,43 +2,33 @@ use crate::common;
 use agentenv::snapshot::SnapshotPlacement;
 use agentenv::types::SandboxId;
 
-use agentenv::sandbox::{
-    FirecrackerSandbox, FirecrackerSandboxConfig, SandboxExecutor, UblkBackend, UblkConfig,
-};
-use anyhow::{Context, Result};
-
-async fn sandbox_config_with_overlaybd_ublk() -> Result<FirecrackerSandboxConfig> {
-    let mut config = common::default_sandbox_config()?;
-    if matches!(
-        config.common.ublk_config.as_ref().map(|cfg| &cfg.backend),
-        Some(UblkBackend::Overlaybd(_))
-    ) {
-        return Ok(config);
-    }
-
-    let image_config_path = config
-        .common
-        .rootfs_image_config
-        .as_ref()
-        .context("default rootfs image config is missing")?
-        .image_config_path
-        .clone();
-
-    if !image_config_path.exists() {
-        anyhow::bail!(
-            "missing default user image overlaybd config {}. Resolve the default template image first",
-            image_config_path.display()
-        );
-    }
-
-    config.common.ublk_config = Some(UblkConfig::overlaybd(image_config_path, false));
-    Ok(config)
-}
+use agentenv::sandbox::{FirecrackerSandbox, SandboxExecutor};
+use anyhow::Result;
 
 #[tokio::test]
 async fn overlaybd_ublk_lifecycle() -> Result<()> {
     common::setup().await;
-    let config = sandbox_config_with_overlaybd_ublk().await?;
+    let config = common::default_sandbox_config()?;
+    let mut invalid_config = config.clone();
+    invalid_config.common.rootfs_virtual_size = Some(1);
+    invalid_config.common.rootfs_allow_shrink = false;
+    let mut rejected = FirecrackerSandbox::new(invalid_config, SandboxId::new(), None)?;
+    let rejected_workspace = rejected.work_rootfs_path().parent().unwrap().to_path_buf();
+    let error = rejected
+        .start()
+        .await
+        .expect_err("a non-GiB-aligned size must fail validation");
+    assert!(
+        error.is::<uvm_ublk_daemon::InvalidRequestError>(),
+        "{error:#}"
+    );
+    rejected.stop().await?;
+    drop(rejected);
+    assert!(
+        !rejected_workspace.exists(),
+        "a confirmed rejection must not retain the workspace"
+    );
+
     let mut sandbox = FirecrackerSandbox::new(config, SandboxId::new(), None)?;
     sandbox.start().await?;
 
@@ -62,11 +52,20 @@ async fn overlaybd_ublk_lifecycle() -> Result<()> {
     assert_eq!(output.exit_code, 0);
 
     let snapshot = sandbox
-        .capture_snapshot(SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
         .await?;
     sandbox.stop().await?;
 
-    let mut resumed = FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+    let mut resumed = FirecrackerSandbox::from_snapshot_files(
+        std::sync::Arc::clone(&snapshot),
+        agentenv::sandbox::FirecrackerCommonConfig::from_global_config()
+            .expect("snapshot launch config"),
+        SandboxId::new(),
+        None,
+    )?;
     resumed.start().await?;
 
     let output = resumed
