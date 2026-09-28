@@ -25,5 +25,4 @@ pub use config::{
 pub use factory::FirecrackerSandboxFactory;
 pub(super) use instance::FirecrackerInstance;
 pub use pool::FirecrackerPool;
-pub use sandbox::{FirecrackerCaptureArtifacts, FirecrackerPausedState, FirecrackerSandbox};
-pub(crate) use startup_pack::record_startup_pack;
+pub use sandbox::{FirecrackerPausedState, FirecrackerSandbox};

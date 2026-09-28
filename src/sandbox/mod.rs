@@ -32,16 +32,15 @@ pub use crate::types::{
 pub use ::envd::process::Signal;
 pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
-    publish_captured, CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend,
-    SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
-    SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    publish_captured, PausedSandboxState, SandboxBackend, SandboxBackendFactory,
+    SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec,
+    SandboxRuntimeInfo,
 };
 pub use envd::EnvdApi;
-pub(crate) use firecracker::record_startup_pack;
 pub use firecracker::{
-    FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
-    FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
-    FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
+    FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool, FirecrackerRuntimePolicy,
+    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSandboxFactory,
+    FirecrackerSnapshotConfig,
 };
 pub use logs::SandboxLogEntry;
 pub use metrics::SandboxMetric;
@@ -53,7 +52,7 @@ pub use network::{
 pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
 pub use runtime_versions::probe_runtime_versions;
 pub(crate) use tools_image::resolve_tools_image;
-pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
+pub use ublk::{OverlaybdConfig, UblkDaemonConfig, UblkDeviceManager};
 
 #[derive(Clone, Debug)]
 pub struct FreshSandboxBuildSpec {

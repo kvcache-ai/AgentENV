@@ -25,11 +25,11 @@ async fn builders_share_a_private_catalog_across_node_local_caches() -> Result<(
     node_a.backend.posix_fs = Some(PosixConfig {
         snapshot_store: dir.path().join("shared"),
     });
-    node_a.snapshot.local_cache_path = dir.path().join("node-a/cache");
+    node_a.snapshot.local_root = dir.path().join("node-a/cache");
     node_a.image.cache.root_dir = dir.path().join("node-a/images");
     let mut node_b = node_a.clone();
     node_b.home_path = dir.path().join("node-b");
-    node_b.snapshot.local_cache_path = dir.path().join("node-b/cache");
+    node_b.snapshot.local_root = dir.path().join("node-b/cache");
     node_b.image.cache.root_dir = dir.path().join("node-b/images");
     let (a, _) = build_snapshot_backend_from_config(&builder_snapshot_config(&node_a), None)?;
     let (b, _) = build_snapshot_backend_from_config(&builder_snapshot_config(&node_b), None)?;
