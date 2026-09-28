@@ -2,6 +2,19 @@
 
 This document lists AgentENV artifacts that can remain on disk or in object storage beyond a single function call. It is organized by the module that owns each artifact's lifecycle.
 
+## Upgrading node-local state to 0.3
+
+Paused sandboxes and process-local snapshots from earlier versions are not guaranteed to
+resume directly with the 0.3 node-state layout. Before replacing a node, finish or drain
+its running sandboxes. Resume paused instances and publish a Distributed snapshot when
+their state must be kept; promote any Local snapshots that must survive the upgrade.
+Start the upgraded node with fresh runtime, persisted-sandbox and local snapshot state
+directories. Configuration-name aliases do not imply compatibility of the old files.
+
+Published snapshot records/artifacts and persistent volumes remain compatible. Keep
+the durable repository and volume data; they are separate from the node-local state
+being replaced.
+
 ## Path Roots
 
 | Root | Default | Owner | Notes |
@@ -15,7 +28,7 @@ This document lists AgentENV artifacts that can remain on disk or in object stor
 | `managed_snapshot_root` | `<firecracker-work-base>/managed-snapshots` | `src/sandbox/firecracker/*` | In-process live snapshot artifact root used to keep captured snapshots alive until publish or drop. |
 | `persisted_sandbox_store_path` | `$AENV_HOME/persisted-sandboxes` | `src/orchestrator/persistence/*` | Durable paused sandbox records and artifacts. |
 | `snapshot_store` | `$AENV_HOME/snapshot-store` | `src/repository/*` | Durable committed snapshot repository root. The configured backend uses `<snapshot_store>/repository`. Relative explicit paths are resolved against the config file directory. |
-| `snapshot.local_cache_path` | `$AENV_HOME/snapshot-local-cache` | `src/snapshot/artifact_cache.rs`, runtime resolvers | Node-local cache for materialized runtime artifacts. Relative explicit paths are resolved against the config file directory. |
+| `snapshot.local_root` | `$AENV_HOME/snapshots` | `src/snapshot/artifact_cache.rs`, runtime resolvers | Node-local cache for materialized runtime artifacts. Relative explicit paths are resolved against the config file directory. |
 | `image.cache.root_dir` | `$AENV_HOME/image-cache` | `src/image/*`, overlaybd runtime | Node-local image cache root. Contains `configs/`, `indexes/`, `commits/`, and `remote-blocks/`. The offline C++ tools own isolated sibling cache roots: `convert-blocks/` (`overlaybd-apply`) and `resize-blocks/` (`overlaybd-resize`). |
 | `p2p.store_dir` | `$AENV_HOME/p2p/store` | `src/p2p/*`, `src/cfg.rs` | Local store for P2P artifact transport backends. Relative explicit paths are resolved against the config file directory. |
 | `image.cache.remote_blocks` | `<image.cache.root_dir>/remote-blocks` | overlaybd runtime config | Remote block cache root. Overlaybd also stores `premerged-index/` under this cache dir. Its size limit comes from `image.cache.remote_blocks.max_size_gb`. |
@@ -47,7 +60,7 @@ Owned by `src/sandbox/firecracker/*`.
 
 | Artifact                     | Location                                                     | Contents                                                  | Purpose                                                      | Lifecycle                                                    | Rebuildable                                                  |
 | ---------------------------- | ------------------------------------------------------------ | --------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| Managed live snapshot root   | `<firecracker-work-base>/managed-snapshots/{sandbox_id}/{uuid}/...` | Firecracker snapshot artifacts kept alive in-process      | Holds captured running-sandbox snapshots until publish, and supports in-process pause state | Created by `FirecrackerSandbox::pause()` or `snapshot()`. Removed when `PersistentSnapshotRootGuard` drops. | No.                                                          |
+| Managed live snapshot root   | `<snapshot.local_root>/<snapshot-id>/...` | Firecracker snapshot artifacts kept alive in-process      | Holds captured running-sandbox snapshots until publish, and supports in-process pause state | Created by `FirecrackerSandbox::pause()` or `snapshot()`. Removed when the last `Arc<Snapshot>` releases its owned directory. | No.                                                          |
 | Snapshot VM state            | snapshot artifact dir `vm_state.bin`                         | Firecracker VM state                                      | Pause/resume and snapshot publish input                      | Created by Firecracker's state-only diff snapshot. Owner depends on caller: persister, managed root, or repository publish input. | No.                                                          |
 | Memory overlaybd layer       | snapshot artifact dir `mem_overlaybd/overlaybd.commit`       | Sealed OverlayBD layer for memory pages                   | Runtime memory restore and publish input                     | Created directly from Firecracker dirty/present memory ranges read with `process_vm_readv`. Imported into repository managed layers during publish. | No.                                                          |
 | Memory image config          | snapshot artifact dir `mem_image.json`                       | Overlaybd image config stacking memory layers             | Resume paused sandbox and publish memory layers              | Written after memory conversion. Later repository resolvers regenerate runtime memory configs from committed layers. | Yes after publish; no for paused sandbox unless layers are known. |
@@ -143,11 +156,11 @@ Owned by `src/snapshot/artifact_cache.rs`, `src/snapshot/runtime_support.rs`, an
 
 | Artifact | Location | Contents | Purpose | Lifecycle | Rebuildable |
 | --- | --- | --- | --- | --- | --- |
-| Runtime rootfs config | `<snapshot_local_cache_path>/runtime/{snapshot_id}/rootfs/image.json` | Node-local overlaybd config for committed rootfs layers | Launch committed snapshot on the current node | Materialized during snapshot resolve and pinned by `RunnableSnapshot` lease. LRU-evictable after unpinned. | Yes. |
-| Runtime memory config | `<snapshot_local_cache_path>/runtime/{snapshot_id}/memory/image.json` | Node-local overlaybd config for committed memory layers | Provides memory backend image to Firecracker resume | Materialized during snapshot resolve and pinned by lease. LRU-evictable after unpinned. | Yes. |
-| Runtime attached-drive configs | `<snapshot_local_cache_path>/runtime/{snapshot_id}/drives/{drive_id}/image.json` | Node-local overlaybd configs for attached drives | Launch committed snapshot with attached drives | Materialized during snapshot resolve and pinned by lease. LRU-evictable after unpinned. | Yes. |
-| OSS cached VM state | `<snapshot_local_cache_path>/artifacts/{id}/vm_state.bin` | Downloaded VM state object | Avoids repeated object-store download while pinned/cached | Downloaded by OSS resolver through `LocalArtifactCache`. LRU-evictable after unpinned. | Yes, by downloading again. |
-| POSIX VM state reference | Repository `vm_state.bin` path | Direct path into POSIX repository | Avoids copying VM state into local runtime cache | Checked during resolve. Lifetime follows repository artifact. | No; repository artifact is source. |
+| Runtime rootfs config | `<snapshot.local_root>/cache/runtime/{id}/rootfs/image.json` | Node-local config for committed rootfs layers | Distributed snapshot launch | Pinned by cache handles held inside Snapshot; LRU-evictable after release. | Yes. |
+| Runtime memory config | `<snapshot.local_root>/cache/runtime/{id}/memory/image.json` | Node-local config for committed memory layers | Shared read-only memory backing | Pinned by cache handles held inside Snapshot; LRU-evictable after release. | Yes. |
+| Runtime attached-drive configs | `<snapshot.local_root>/cache/runtime/{id}/drives/{drive_id}/image.json` | Node-local configs for committed attached drives | Distributed snapshot launch | Pinned by cache handles held inside Snapshot; LRU-evictable after release. | Yes. |
+| OSS cached VM state | `<snapshot.local_root>/cache/artifacts/{id}/vm_state.bin` | Downloaded VM state | Avoid repeated downloads while pinned | Downloaded through LocalArtifactCache and held by Snapshot. | Yes, while the repository object exists. |
+| POSIX cached VM state | `<snapshot.local_root>/cache/runtime/{id}/vm_state.bin` | Independent name for repository VM state | Keep a successful resolve usable after repository deletion | Hard-linked into the cache, with copy fallback when hard links are unavailable; held by a cache handle inside Snapshot. | From the repository while it exists; an acquired handle remains valid after deletion. |
 
 `LocalArtifactCache` owns pinning, in-flight materialization deduplication, and LRU eviction for files it manages. It does not own the durable snapshot repository.
 

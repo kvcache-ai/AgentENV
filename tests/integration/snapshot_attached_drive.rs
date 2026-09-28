@@ -165,7 +165,12 @@ async fn publish_sandbox_snapshot_with_attached_drive(
     let setup = sandbox.run_command("sh", &["-lc", setup_cmd]).await?;
     assert_eq!(setup.exit_code, 0);
 
-    let captured = SandboxBackend::snapshot(&mut sandbox, SnapshotPlacement::Distributed).await?;
+    let captured = SandboxBackend::snapshot(
+        &mut sandbox,
+        agentenv::snapshot::SnapshotId::generate(),
+        SnapshotPlacement::Distributed,
+    )
+    .await?;
     sandbox.stop().await?;
     drop(sandbox);
     publish_capture(snapshot_manager, alias, captured).await
@@ -174,11 +179,11 @@ async fn publish_sandbox_snapshot_with_attached_drive(
 async fn publish_capture(
     snapshot_manager: &SnapshotManager,
     alias: &str,
-    captured: agentenv::sandbox::CapturedSandboxSnapshot,
+    captured: std::sync::Arc<agentenv::snapshot::Snapshot>,
 ) -> Result<SnapshotRecord> {
     let metadata = SnapshotPublishMetadata {
         snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-        id: SnapshotId::generate(),
+        id: captured.id().clone(),
         alias: Some(SnapshotAlias::parse(alias)?),
         source: agentenv::snapshot::SnapshotPublishSource::Sandbox {
             source_sandbox_id: "test-sandbox".to_string(),
@@ -427,14 +432,24 @@ async fn capture_export_failure_keeps_restacked_runtime_usable() -> Result<()> {
     let saved_drive_config = fs::read(&drive_config)?;
     fs::remove_file(&drive_config)?;
     let err = sandbox
-        .capture_snapshot(SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
         .await
         .expect_err("missing drive config must fail after rootfs restack");
     assert!(!err.is_terminal(), "{err:#}");
     assert_eq!(overlaybd_lower_count(&rootfs_config)?, lower_count + 1);
     fs::write(drive_config, saved_drive_config)?;
     assert_eq!(sandbox.run_command("true", &[]).await?.exit_code, 0);
-    drop(SandboxBackend::snapshot(&mut sandbox, SnapshotPlacement::Distributed).await?);
+    drop(
+        SandboxBackend::snapshot(
+            &mut sandbox,
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
+        .await?,
+    );
     sandbox.stop().await?;
     Ok(())
 }
@@ -461,13 +476,25 @@ async fn parallel_drive_capture_failure_preserves_completed_restack() -> Result<
     let broken_config = work_dir.join("extra-drive-runtime-broken/image.json");
     let saved_config = fs::read(&broken_config)?;
     fs::remove_file(&broken_config)?;
-    let capture = SandboxBackend::snapshot(&mut sandbox, SnapshotPlacement::Distributed).await;
+    let capture = SandboxBackend::snapshot(
+        &mut sandbox,
+        agentenv::snapshot::SnapshotId::generate(),
+        SnapshotPlacement::Distributed,
+    )
+    .await;
     let good_lowers = overlaybd_lower_count(&good_config)?;
     let error = capture.expect_err("one attached drive must fail capture");
     assert_eq!(good_lowers, initial_lowers + 1);
     assert!(!error.is_terminal(), "{error:#}");
     fs::write(broken_config, saved_config)?;
-    drop(SandboxBackend::snapshot(&mut sandbox, SnapshotPlacement::Distributed).await?);
+    drop(
+        SandboxBackend::snapshot(
+            &mut sandbox,
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
+        .await?,
+    );
     sandbox.stop().await?;
     Ok(())
 }
@@ -501,7 +528,14 @@ async fn forked_drive_snapshots_survive_parent_and_child_backend_drop() -> Resul
         )
         .await?;
     assert_eq!(output.exit_code, 0);
-    drop(SandboxBackend::snapshot(&mut parent, SnapshotPlacement::Distributed).await?);
+    drop(
+        SandboxBackend::snapshot(
+            &mut parent,
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
+        .await?,
+    );
     let child_storage = tempdir()?;
     let mut children = SandboxBackend::fork(
         &mut parent,
@@ -526,11 +560,32 @@ async fn forked_drive_snapshots_survive_parent_and_child_backend_drop() -> Resul
         )
         .await?;
     assert_eq!(output.exit_code, 0);
-    drop(SandboxBackend::snapshot(&mut parent, SnapshotPlacement::Distributed).await?);
-    drop(child.snapshot(SnapshotPlacement::Distributed).await?);
+    drop(
+        SandboxBackend::snapshot(
+            &mut parent,
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
+        .await?,
+    );
+    drop(
+        child
+            .snapshot(
+                agentenv::snapshot::SnapshotId::generate(),
+                SnapshotPlacement::Distributed,
+            )
+            .await?,
+    );
     parent.stop().await?;
     drop(parent);
-    drop(child.snapshot(SnapshotPlacement::Distributed).await?);
+    drop(
+        child
+            .snapshot(
+                agentenv::snapshot::SnapshotId::generate(),
+                SnapshotPlacement::Distributed,
+            )
+            .await?,
+    );
 
     let paused = child.pause().await?;
     child.stop().await?;
@@ -739,9 +794,15 @@ async fn launch_time_attached_drive_keeps_its_slot_across_captures() -> Result<(
     let (_, snapshot_manager) = test_parts(store.path());
     let (_, image_config) = common::default_rootfs_template_build_spec_with_image_config();
 
-    let mut base = FirecrackerSandbox::new(small_sandbox_config(&image_config)?)?;
+    let mut base =
+        FirecrackerSandbox::new(small_sandbox_config(&image_config)?, SandboxId::new(), None)?;
     base.start().await?;
-    let captured = SandboxBackend::snapshot(&mut base).await?;
+    let captured = SandboxBackend::snapshot(
+        &mut base,
+        SnapshotId::generate(),
+        SnapshotPlacement::Distributed,
+    )
+    .await?;
     base.stop().await?;
     let base_alias = unique_alias_for_test("launch_drive_base");
     publish_capture(&snapshot_manager, &base_alias, captured).await?;
@@ -757,11 +818,16 @@ async fn launch_time_attached_drive_keeps_its_slot_across_captures() -> Result<(
         ],
         ..SandboxLaunchConfig::default()
     };
-    let mut first = FirecrackerSandbox::from_snapshot(&runnable, &launch_config)?;
+    let mut first = FirecrackerSandbox::from_snapshot(&runnable, &launch_config, None)?;
     first.start().await?;
     assert_snapshot_attached_drive_is_visible(&first, "data", false).await?;
     write_guest_file(&first, "first").await?;
-    let captured = SandboxBackend::snapshot(&mut first).await?;
+    let captured = SandboxBackend::snapshot(
+        &mut first,
+        SnapshotId::generate(),
+        SnapshotPlacement::Distributed,
+    )
+    .await?;
     first.stop().await?;
     let first_alias = unique_alias_for_test("launch_drive_first");
     publish_capture(&snapshot_manager, &first_alias, captured).await?;
@@ -775,22 +841,36 @@ async fn launch_time_attached_drive_keeps_its_slot_across_captures() -> Result<(
     assert_eq!(manifest.effective_physical_extra_drive_count(), 0);
     assert_eq!(manifest.free_drive_slots() + 1, manifest.volume_drive_slots);
 
-    let mut second = FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default())?;
+    let mut second =
+        FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default(), None)?;
     second.start().await?;
     let second_result: Result<()> = async {
         assert_snapshot_attached_drive_is_visible(&second, "data", false).await?;
         assert_guest_files(&second, &["first"]).await?;
         write_guest_file(&second, "second").await?;
 
-        // A fork child resumes from the paused state while its parent runs on.
-        let paused = second.pause().await?;
+        // A fork child owns an immutable capture while its parent runs on.
+        let captured = second
+            .capture_snapshot(SnapshotId::generate(), SnapshotPlacement::Local)
+            .await?;
         second.resume().await?;
-        let mut child = FirecrackerSandbox::resume_from_snapshot_config(&paused).await?;
+        let mut child = FirecrackerSandbox::from_snapshot_files(
+            captured,
+            agentenv::sandbox::FirecrackerCommonConfig::from_global_config()?,
+            SandboxId::new(),
+            None,
+        )?;
+        child.start().await?;
         let child_result = assert_guest_files(&child, &["first", "second"]).await;
         child.stop().await?;
         child_result?;
 
-        let captured = SandboxBackend::snapshot(&mut second).await?;
+        let captured = SandboxBackend::snapshot(
+            &mut second,
+            SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
+        .await?;
         let second_alias = unique_alias_for_test("launch_drive_second");
         publish_capture(&snapshot_manager, &second_alias, captured).await?;
         let runnable = snapshot_manager
@@ -802,7 +882,7 @@ async fn launch_time_attached_drive_keeps_its_slot_across_captures() -> Result<(
             0
         );
         let mut third =
-            FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default())?;
+            FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default(), None)?;
         third.start().await?;
         let third_result = assert_guest_files(&third, &["first", "second"]).await;
         third.stop().await?;

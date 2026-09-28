@@ -48,7 +48,6 @@ Firecracker VM binary and boot configuration.
 | `work_dir` | string | `"$AENV_HOME/firecracker-work"` | Parent directory for per-sandbox Firecracker work directories. These dirs contain runtime sockets, symlinks, local logs, and writable OverlayBD upper layer data such as `overlaybd/upper.data` and `overlaybd/upper.index` |
 | `serial_dir` | string | `"$AENV_HOME/logs/serial"` | Directory for persistent Firecracker logs when enabled (per-sandbox subdirectories). Setting this path alone does not enable logging |
 | `log_level` | string | unset (disabled) | Optional Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`, case-insensitive). A non-empty value enables `firecracker.log` and stdout/stderr capture in each sandbox's log directory. Empty/unset discards stdout/stderr and creates no log files or per-sandbox log directories. Explicit Rust stdout/stderr destinations still enable the requested stream |
-| `managed_snapshot_max_total_bytes` | integer | unset (unlimited) | Reject new managed snapshot/fork captures when allocated bytes under the sandbox managed root reach this limit; existing artifacts are retained |
 
 ## `[kernel]`
 
@@ -430,13 +429,25 @@ Snapshot storage/build configuration.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `local_cache_path` | string | `"$AENV_HOME/snapshot-local-cache"` | Manager-owned node-local snapshot artifact/cache root. Relative explicit paths are resolved against the config file directory. |
+| `local_root` | string | `"$AENV_HOME/snapshots"` | Manager-owned node-local snapshot artifact/cache root. Relative explicit paths are resolved against the config file directory. |
+| `max_local_artifact_bytes` | integer | unset | Node-wide soft admission limit for retained snapshot artifacts, excluding cache. Counts allocated bytes once per inode. Capture requests scan before pausing the VM and reuse a successful result for 60 seconds; concurrent requests share the check. In-flight captures and the reuse window can exceed the limit. Failed scans also remain cached until the next check. Does not reserve capacity or block pause/resume. |
 | `repository_backend` | string | `"posix_fs"` | Snapshot repository backend. Supported values: `"posix_fs"` and `"oss"` |
 | `p2p_enabled` | boolean | `true` | When enabled, the snapshot manager publishes committed snapshots to the P2P transport and attempts to resolve from it before falling back to the repository backend. |
 
 Environment variable overrides:
 
-- `AENV_SNAPSHOT_LOCAL_CACHE_PATH`
+- `AENV_SNAPSHOT_LOCAL_ROOT`
+- `AENV_SNAPSHOT_MAX_LOCAL_ARTIFACT_BYTES`
+
+The older `snapshot.local_cache_path` and
+`firecracker.managed_snapshot_max_total_bytes` keys are accepted as aliases for
+`snapshot.local_root` and `snapshot.max_local_artifact_bytes`. Their environment
+variables, `AENV_SNAPSHOT_LOCAL_CACHE_PATH` and
+`AENV_FIRECRACKER_MANAGED_SNAPSHOT_MAX_TOTAL_BYTES`, are also accepted.
+Environment values take precedence over file values; within either source, the
+current name takes precedence over its alias. The old capacity setting now uses
+the node-wide soft admission semantics described above. Defaults and on-disk
+directory layout follow the current configuration; aliases do not migrate files.
 
 ## `[snapshot.image_publish]`
 

@@ -7,7 +7,7 @@ use agentenv::orchestrator::{
 };
 use agentenv::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
 use agentenv::snapshot::{
-    SnapshotAlias, SnapshotId, SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource,
+    SnapshotAlias, SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource,
     SnapshotSource, StartupCommand,
 };
 
@@ -289,7 +289,11 @@ async fn orchestrator_lifecycle() -> Result<()> {
                 for _ in 0..3 {
                     drop(
                         orchestrator
-                            .capture_snapshot(sandbox_id, SnapshotPlacement::Distributed)
+                            .capture_snapshot(
+                                sandbox_id,
+                                agentenv::snapshot::SnapshotId::generate(),
+                                SnapshotPlacement::Distributed,
+                            )
                             .await?,
                     );
                     orchestrator.pause_sandbox(sandbox_id).await?;
@@ -406,8 +410,8 @@ async fn orchestrator_lifecycle() -> Result<()> {
         assert!(deleted.is_none(), "sandbox should be removed after delete");
         let lookup = restarted.proxy_lookup_for(&sandbox_id).await?;
         assert_eq!(lookup, ProxyLookupResult::NotFound);
+        restarted.shutdown().await?;
         std::fs::write(root.join("resume-complete"), b"ok")?;
-
         Ok(())
     })
     .await
@@ -488,7 +492,11 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
             .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
             .await?;
         let capture = orchestrator
-            .capture_snapshot(sandbox_id, SnapshotPlacement::Distributed)
+            .capture_snapshot(
+                sandbox_id,
+                agentenv::snapshot::SnapshotId::generate(),
+                SnapshotPlacement::Distributed,
+            )
             .await?;
         assert_eq!(capture.metadata.id, sandbox_id);
         assert_eq!(capture.metadata.state, SandboxState::Running);
@@ -520,7 +528,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
             &snapshot_manager,
             SnapshotPublishMetadata {
                 snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-                id: SnapshotId::generate(),
+                id: capture.captured_snapshot.id().clone(),
                 alias: Some(SnapshotAlias::parse(&published_alias)?),
                 source: SnapshotPublishSource::Sandbox {
                     source_sandbox_id: sandbox_id_str.clone(),

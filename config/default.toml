@@ -49,13 +49,6 @@ socket_poll_ms = 1
 # Warning, Info, Debug, and Trace; unset or empty disables all Firecracker logs.
 # Setting serial_dir alone does not enable logging.
 # log_level = "Info"
-# Optional cap on the total on-disk size (in bytes) of one sandbox's managed
-# snapshots (managed-snapshots/<sandbox_id>/). Once the current total reaches
-# this limit, further snapshot requests that write under the managed snapshot
-# root are rejected: snapshot capture and fork. Temporal pause retains its
-# existing runtime state outside this root. Existing snapshots are never evicted
-# automatically. Unset (default) = unlimited.
-# managed_snapshot_max_total_bytes = 53687091200
 
 [kernel]
 # Use an existing uncompressed Linux kernel image instead of downloading one.
@@ -221,8 +214,13 @@ auto_resume_min_sandbox_timeout_secs = 300
 # persisted_sandbox_store_path = "$AENV_HOME/persisted-sandboxes"
 
 [snapshot]
-# Node-local cache for snapshot artifacts.
-# local_cache_path = "$AENV_HOME/snapshot-local-cache"
+# Reusable local snapshot artifacts live in local_root/<snapshot-id>; caches use cache/.
+# local_root = "$AENV_HOME/snapshots"
+# Optional node-wide soft admission limit, deduplicated by allocated inode bytes.
+# Capture requests scan before pausing the VM and reuse the result for 60 seconds.
+# In-flight captures and the reuse window can exceed the limit; failed scans are cached too.
+# Excludes cache; never evicts snapshots or blocks pause/resume. Unset = unlimited.
+# max_local_artifact_bytes = 53687091200
 
 # Durable repository backend:
 # - "posix_fs" stores snapshots on a local or shared filesystem.

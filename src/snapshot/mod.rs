@@ -2,7 +2,7 @@ pub(crate) mod artifact_cache;
 pub mod backends;
 mod catalog;
 pub mod image_export;
-mod local_store;
+pub(crate) mod local;
 mod manager;
 #[doc(hidden)]
 pub mod mock;
@@ -24,13 +24,13 @@ pub use startup_pack::{
     ResolvedStartupPackSource, StartupRecording, MEMORY_STARTUP_PACK_ARTIFACT,
     MEMORY_STARTUP_TRACE_ARTIFACT,
 };
-pub(crate) use types::{rootfs_snapshot_image_tag, RuntimeArtifactLease};
+pub(crate) use types::rootfs_snapshot_image_tag;
 pub use types::{
     CommandContext, CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer,
     OverlaybdLayerRef, PersistedDiskImagePublication, ResolvedAttachedDrive, RunnableSnapshot,
-    SnapshotAlias, SnapshotId, SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource,
-    SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind, SnapshotVolume,
-    StartupCommand, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
-    SNAPSHOT_ARTIFACT_LAYOUT,
+    Snapshot, SnapshotAlias, SnapshotId, SnapshotPlacement, SnapshotPublishMetadata,
+    SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource,
+    SnapshotSourceKind, SnapshotVolume, StartupCommand, TemplateBuildErrorReason,
+    TemplateBuildInfo, TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 pub use types::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};

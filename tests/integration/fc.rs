@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{
-    BaseSandboxNetworkPolicy, FirecrackerPausedState, FirecrackerSandbox,
-    FirecrackerSnapshotConfig, PausedSandboxState, ProcessOutput, SandboxBackend, SandboxExecutor,
-    SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+    BaseSandboxNetworkPolicy, FirecrackerPausedState, FirecrackerSandbox, PausedSandboxState,
+    ProcessOutput, SandboxBackend, SandboxExecutor, SandboxNetworkEgressPolicy,
+    SandboxNetworkPolicy,
 };
 use agentenv::snapshot::SnapshotPlacement;
 use agentenv::types::SandboxId;
@@ -105,8 +105,7 @@ async fn verify_disk_marker(sandbox: &mut FirecrackerSandbox) -> Result<()> {
 ///
 /// Image config lowers are ordered bottom-to-top (oldest base layer first), so
 /// the newest local lower is the last entry with a `file` path.
-async fn assert_memory_layer_is_raw(snapshot: &FirecrackerSnapshotConfig) -> Result<()> {
-    let image_config_path = &snapshot.mem_overlaybd_config.image_config_path;
+async fn assert_memory_layer_is_raw(image_config_path: &Path) -> Result<()> {
     let image_config: ImageConfig = serde_json::from_slice(
         &fs::read(image_config_path)
             .with_context(|| format!("read image config {}", image_config_path.display()))?,
@@ -153,20 +152,32 @@ async fn microvm_lifecycle_and_snapshot_preserve_disk_state() -> Result<()> {
 
     write_disk_marker(&mut sandbox).await?;
     let snapshot = sandbox
-        .capture_snapshot(SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
         .await?;
-    assert!(snapshot.vm_state_path.exists());
-    assert!(snapshot.mem_overlaybd_config.image_config_path.exists());
+    assert!(snapshot.manifest().vm_state.path.exists());
+    assert!(snapshot.manifest().memory.image_config_path.exists());
 
     sandbox.resume().await?;
     verify_disk_marker(&mut sandbox).await?;
 
     let snapshot = sandbox
-        .capture_snapshot(SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
         .await?;
     sandbox.stop().await?;
 
-    let mut resumed = FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+    let mut resumed = FirecrackerSandbox::from_snapshot_files(
+        std::sync::Arc::clone(&snapshot),
+        agentenv::sandbox::FirecrackerCommonConfig::from_global_config()
+            .expect("snapshot launch config"),
+        SandboxId::new(),
+        None,
+    )?;
     resumed.start().await?;
     verify_disk_marker(&mut resumed).await?;
     resumed.stop().await?;
@@ -388,7 +399,7 @@ async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
         !snapshot_dir.path().join("mem.bin").exists(),
         "direct OverlayBD snapshot should not create mem.bin"
     );
-    assert_memory_layer_is_raw(&snapshot).await?;
+    assert_memory_layer_is_raw(&snapshot.mem_overlaybd_config.image_config_path).await?;
 
     let mut resumed = FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
     resumed.start().await?;
@@ -460,14 +471,29 @@ async fn consecutive_captures_keep_memory_baseline_and_release_generations() -> 
         .await?;
     assert_eq!(output.exit_code, 0, "{}", output.stderr);
     let baseline = sandbox
-        .capture_snapshot(SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
         .await?;
     sandbox.stop().await?;
     drop(sandbox);
-    let baseline_dir = baseline.vm_state_path.parent().unwrap().to_path_buf();
+    let baseline_dir = baseline
+        .manifest()
+        .vm_state
+        .path
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let baseline_layers =
-        lower_file_paths_from_image_config(&baseline.mem_overlaybd_config.image_config_path)?;
-    let mut running = FirecrackerSandbox::from_snapshot_config(&baseline, SandboxId::new(), None)?;
+        lower_file_paths_from_image_config(&baseline.manifest().memory.image_config_path)?;
+    let mut running = FirecrackerSandbox::from_snapshot_files(
+        std::sync::Arc::clone(&baseline),
+        agentenv::sandbox::FirecrackerCommonConfig::from_global_config()
+            .expect("snapshot launch config"),
+        SandboxId::new(),
+        None,
+    )?;
     running.start().await?;
     drop(baseline);
 
@@ -483,6 +509,7 @@ async fn consecutive_captures_keep_memory_baseline_and_release_generations() -> 
         assert_eq!(output.stdout, expected);
         let captured = SandboxBackend::snapshot(
             &mut running,
+            agentenv::snapshot::SnapshotId::generate(),
             agentenv::snapshot::SnapshotPlacement::Distributed,
         )
         .await?;
@@ -491,7 +518,13 @@ async fn consecutive_captures_keep_memory_baseline_and_release_generations() -> 
         let memory_layers = lower_file_paths_from_image_config(&manifest.memory.image_config_path)?;
         assert_eq!(memory_layers.len(), baseline_layers.len() + 1);
         drop(captured);
-        assert!(!generation_dir.exists(), "unused capture must be reclaimed");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while generation_dir.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .context("unused capture must be reclaimed")?;
         assert!(
             baseline_dir.exists(),
             "running memory still needs its baseline"
@@ -499,15 +532,27 @@ async fn consecutive_captures_keep_memory_baseline_and_release_generations() -> 
     }
 
     let paused = running
-        .capture_snapshot(SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
         .await?;
     running.stop().await?;
     drop(running);
-    assert!(
-        !baseline_dir.exists(),
-        "stopped baseline has no remaining owner"
-    );
-    let mut resumed = FirecrackerSandbox::from_snapshot_config(&paused, SandboxId::new(), None)?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while baseline_dir.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("stopped baseline has no remaining owner")?;
+    let mut resumed = FirecrackerSandbox::from_snapshot_files(
+        std::sync::Arc::clone(&paused),
+        agentenv::sandbox::FirecrackerCommonConfig::from_global_config()
+            .expect("snapshot launch config"),
+        SandboxId::new(),
+        None,
+    )?;
     resumed.start().await?;
     let output = resumed
         .run_command("sh", &["-c", MEMORY_REQUEST, "memory-request", "report"])
@@ -548,7 +593,12 @@ async fn repeated_capture_and_pause_compacts_live_disks_without_losing_old_snaps
             .await?;
         assert_eq!(output.exit_code, 0, "{}", output.stderr);
         let old_paths = lower_file_paths_from_image_config(&runtime_config)?;
-        let snapshot = sandbox.capture_snapshot(SnapshotPlacement::Local).await?;
+        let snapshot = sandbox
+            .capture_snapshot(
+                agentenv::snapshot::SnapshotId::generate(),
+                SnapshotPlacement::Local,
+            )
+            .await?;
         let new_paths = lower_file_paths_from_image_config(&runtime_config)?;
         if new_paths.len() < previous_layers {
             compactions += 1;
@@ -586,8 +636,13 @@ async fn repeated_capture_and_pause_compacts_live_disks_without_losing_old_snaps
     drop(sandbox);
     fs::remove_dir_all(runtime)?;
     for (snapshot, marker) in retained {
-        let mut restored =
-            FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+        let mut restored = FirecrackerSandbox::from_snapshot_files(
+            std::sync::Arc::clone(&snapshot),
+            agentenv::sandbox::FirecrackerCommonConfig::from_global_config()
+                .expect("snapshot launch config"),
+            SandboxId::new(),
+            None,
+        )?;
         restored.start().await?;
         let output = restored.run_command("cat", &[DISK_MARKER_PATH]).await?;
         assert_eq!(output.stdout.trim(), marker);
@@ -664,29 +719,28 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
 
     write_disk_marker(&mut sandbox).await?;
     let first_snapshot = sandbox
-        .capture_snapshot(SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
         .await?;
-    assert_memory_layer_is_raw(&first_snapshot).await?;
+    assert_memory_layer_is_raw(&first_snapshot.manifest().memory.image_config_path).await?;
     sandbox.stop().await?;
     drop(sandbox);
-    let first_snapshot_dir = fs::canonicalize(first_snapshot.vm_state_path.parent().unwrap())?;
+    let first_snapshot_dir =
+        fs::canonicalize(first_snapshot.manifest().vm_state.path.parent().unwrap())?;
     let first_persistent_generation = fs::canonicalize(
         first_snapshot
-            .mem_overlaybd_config
+            .manifest()
+            .memory
             .image_config_path
             .parent()
             .context("first memory image should live under a persistent generation dir")?,
     )?;
-    let first_rootfs_commit = lower_file_paths_from_image_config(
-        &first_snapshot
-            .common
-            .rootfs_image_config
-            .as_ref()
-            .context("first snapshot rootfs image config should exist")?
-            .image_config_path,
-    )?
-    .pop()
-    .context("first snapshot should contain a captured rootfs layer")?;
+    let first_rootfs_commit =
+        lower_file_paths_from_image_config(&first_snapshot.manifest().rootfs.image_config_path)?
+            .pop()
+            .context("first snapshot should contain a captured rootfs layer")?;
     assert!(
         first_snapshot_dir.exists(),
         "first snapshot tempdir should exist at {}",
@@ -694,20 +748,27 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     );
 
     // Resume from first, write additional data, pause again.
-    let mut resumed =
-        FirecrackerSandbox::from_snapshot_config(&first_snapshot, SandboxId::new(), None)?;
+    let mut resumed = FirecrackerSandbox::from_snapshot_files(
+        Arc::clone(&first_snapshot),
+        agentenv::sandbox::FirecrackerCommonConfig::from_global_config()?,
+        SandboxId::new(),
+        None,
+    )?;
     resumed.start().await?;
     verify_disk_marker(&mut resumed).await?;
     let second_snapshot = resumed
-        .capture_snapshot(SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
         .await?;
-    assert_memory_layer_is_raw(&second_snapshot).await?;
+    assert_memory_layer_is_raw(&second_snapshot.manifest().memory.image_config_path).await?;
     resumed.stop().await?;
     drop(resumed);
-    let second_snapshot_dir = fs::canonicalize(second_snapshot.vm_state_path.parent().unwrap())?;
-    let second_mem_lowers = lower_file_paths_from_image_config(
-        &second_snapshot.mem_overlaybd_config.image_config_path,
-    )?;
+    let second_snapshot_dir =
+        fs::canonicalize(second_snapshot.manifest().vm_state.path.parent().unwrap())?;
+    let second_mem_lowers =
+        lower_file_paths_from_image_config(&second_snapshot.manifest().memory.image_config_path)?;
     assert!(
         second_mem_lowers
             .iter()
@@ -726,20 +787,12 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
         "second memory snapshot should reference existing lower files",
     );
 
-    let second_rootfs_lowers = lower_file_paths_from_image_config(
-        &second_snapshot
-            .common
-            .rootfs_image_config
-            .as_ref()
-            .context("second snapshot rootfs image config should exist")?
-            .image_config_path,
-    )?;
+    let second_rootfs_lowers =
+        lower_file_paths_from_image_config(&second_snapshot.manifest().rootfs.image_config_path)?;
     let second_rootfs_dir = fs::canonicalize(
         second_snapshot
-            .common
-            .rootfs_image_config
-            .as_ref()
-            .context("second snapshot rootfs image config should exist")?
+            .manifest()
+            .rootfs
             .image_config_path
             .parent()
             .context("second rootfs image should have a parent dir")?,
@@ -764,68 +817,54 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
 
     // Drop first snapshot handle — second snapshot's layers should still be valid.
     drop(first_snapshot);
-    assert!(!first_snapshot_dir.exists());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while first_snapshot_dir.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("first snapshot must be reclaimed before testing the next generation")?;
 
-    let mut resumed_again =
-        FirecrackerSandbox::from_snapshot_config(&second_snapshot, SandboxId::new(), None)?;
+    let mut resumed_again = FirecrackerSandbox::from_snapshot_files(
+        std::sync::Arc::clone(&second_snapshot),
+        agentenv::sandbox::FirecrackerCommonConfig::from_global_config()
+            .expect("snapshot launch config"),
+        SandboxId::new(),
+        None,
+    )?;
     resumed_again.start().await?;
     verify_disk_marker(&mut resumed_again).await?;
 
-    // Also test caller-managed immutable capture with snapshot-owned inherited layer adoption.
-    let expected_snapshot_dir = tempfile::tempdir()?;
+    // A subsequent capture owns its closure in the directory named by its ID.
+    let next_id = agentenv::snapshot::SnapshotId::generate();
     let dir_snapshot = resumed_again
-        .capture_snapshot_to_dir(expected_snapshot_dir.path(), SnapshotPlacement::Distributed)
+        .capture_snapshot(next_id.clone(), SnapshotPlacement::Distributed)
         .await?;
     resumed_again.stop().await?;
     drop(resumed_again);
-    let managed_snapshot_base_root = ConfigManager::global_config()
-        .firecracker
-        .work_dir
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join("agentenv"))
-        .join("managed-snapshots");
-    let dir_snapshot_mem_lowers =
-        lower_file_paths_from_image_config(&dir_snapshot.mem_overlaybd_config.image_config_path)?;
-    assert_no_lower_paths_under(
-        &dir_snapshot_mem_lowers,
-        &managed_snapshot_base_root,
-        "caller-managed memory snapshot",
+    let actual_snapshot_dir = dir_snapshot.manifest().vm_state.path.parent().unwrap();
+    assert_eq!(
+        actual_snapshot_dir,
+        ConfigManager::global_config()
+            .snapshot
+            .local_root
+            .join(next_id.to_string())
     );
-
-    let dir_snapshot_rootfs_lowers = lower_file_paths_from_image_config(
-        &dir_snapshot
-            .common
-            .rootfs_image_config
-            .as_ref()
-            .context("dir snapshot rootfs image config should exist")?
-            .image_config_path,
-    )?;
-    assert_no_lower_paths_under(
-        &dir_snapshot_rootfs_lowers,
-        &managed_snapshot_base_root,
-        "caller-managed rootfs snapshot",
-    );
-    let actual_snapshot_dir = dir_snapshot.vm_state_path.parent().unwrap();
-    assert!(
-        actual_snapshot_dir == expected_snapshot_dir.path(),
-        "snapshot_to_dir should use the provided directory"
-    );
-    assert!(
-        actual_snapshot_dir.exists(),
-        "the provided snapshot directory should exist after snapshot_to_dir"
-    );
-    assert!(
-        dir_snapshot_mem_lowers.iter().all(|path| path.exists()),
-        "caller-managed memory snapshot should keep all lower files after dropping the snapshot handle"
-    );
-    assert!(
-        dir_snapshot_rootfs_lowers.iter().all(|path| path.exists()),
-        "caller-managed rootfs snapshot should keep all lower files after dropping the snapshot handle"
-    );
+    let memory_lowers =
+        lower_file_paths_from_image_config(&dir_snapshot.manifest().memory.image_config_path)?;
+    let disk_lowers =
+        lower_file_paths_from_image_config(&dir_snapshot.manifest().rootfs.image_config_path)?;
+    for paths in [&memory_lowers, &disk_lowers] {
+        assert_no_lower_paths_under(paths, &second_snapshot_dir, "independent captured snapshot");
+        assert!(paths.iter().all(|path| path.exists()));
+    }
     drop(second_snapshot);
-
-    let mut resumed_from_dir =
-        FirecrackerSandbox::from_snapshot_config(&dir_snapshot, SandboxId::new(), None)?;
+    let mut resumed_from_dir = FirecrackerSandbox::from_snapshot_files(
+        Arc::clone(&dir_snapshot),
+        agentenv::sandbox::FirecrackerCommonConfig::from_global_config()?,
+        SandboxId::new(),
+        None,
+    )?;
     resumed_from_dir.start().await?;
     verify_disk_marker(&mut resumed_from_dir).await?;
     resumed_from_dir.stop().await?;
@@ -843,7 +882,10 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
 
     write_disk_marker(&mut sandbox).await?;
     let snapshot = sandbox
-        .capture_snapshot(SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
         .await?;
     sandbox.stop().await?;
 
@@ -852,8 +894,13 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
     let vm_count = 2;
     let mut snapshots = Vec::new();
     for i in 0..vm_count {
-        let mut resumed =
-            FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+        let mut resumed = FirecrackerSandbox::from_snapshot_files(
+            std::sync::Arc::clone(&snapshot),
+            agentenv::sandbox::FirecrackerCommonConfig::from_global_config()
+                .expect("snapshot launch config"),
+            SandboxId::new(),
+            None,
+        )?;
         resumed.start().await?;
         verify_disk_marker(&mut resumed).await?;
         // Write a per-instance marker to prove writable state is independent.
@@ -867,7 +914,10 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
             output.stderr
         );
         let snap = resumed
-            .capture_snapshot(SnapshotPlacement::Distributed)
+            .capture_snapshot(
+                agentenv::snapshot::SnapshotId::generate(),
+                SnapshotPlacement::Distributed,
+            )
             .await?;
         resumed.stop().await?;
         snapshots.push(snap);
@@ -875,7 +925,13 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
 
     // Verify each snapshot still has the original marker.
     for snap in &snapshots {
-        let mut sandbox = FirecrackerSandbox::from_snapshot_config(snap, SandboxId::new(), None)?;
+        let mut sandbox = FirecrackerSandbox::from_snapshot_files(
+            std::sync::Arc::clone(snap),
+            agentenv::sandbox::FirecrackerCommonConfig::from_global_config()
+                .expect("snapshot launch config"),
+            SandboxId::new(),
+            None,
+        )?;
         sandbox.start().await?;
         verify_disk_marker(&mut sandbox).await?;
         sandbox.stop().await?;
@@ -991,12 +1047,20 @@ async fn microvm_can_access_internet() -> Result<()> {
     sandbox.start().await?;
     test_network(&mut sandbox, false).await?;
     let snapshot = sandbox
-        .capture_snapshot(SnapshotPlacement::Distributed)
+        .capture_snapshot(
+            agentenv::snapshot::SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+        )
         .await?;
     sandbox.stop().await?;
 
-    let mut resumed_sandbox =
-        FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
+    let mut resumed_sandbox = FirecrackerSandbox::from_snapshot_files(
+        std::sync::Arc::clone(&snapshot),
+        agentenv::sandbox::FirecrackerCommonConfig::from_global_config()
+            .expect("snapshot launch config"),
+        SandboxId::new(),
+        None,
+    )?;
     resumed_sandbox.start().await?;
     test_network(&mut resumed_sandbox, true).await?;
     resumed_sandbox.stop().await?;

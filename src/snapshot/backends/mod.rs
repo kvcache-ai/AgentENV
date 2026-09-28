@@ -50,7 +50,7 @@ fn builder_snapshot_config(config: &AppConfig) -> AppConfig {
             format!("{prefix}/{namespace}")
         });
     }
-    config.snapshot.local_cache_path = config.snapshot.local_cache_path.join(namespace);
+    config.snapshot.local_root = config.snapshot.local_root.join(namespace);
     config
 }
 
@@ -58,7 +58,7 @@ fn build_snapshot_backend_from_config(
     config: &AppConfig,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
 ) -> Result<(Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>)> {
-    let shared_cache_root = config.snapshot.local_cache_path.clone();
+    let shared_cache_root = config.snapshot.local_root.join("cache");
     let overlaybd_layers = local_image_services_from_app_config(config).overlaybd_layers;
     match config.snapshot.repository_backend {
         SnapshotRepositoryBackendKind::PosixFs => {
@@ -111,8 +111,8 @@ fn build_snapshot_backend_from_config(
 fn shared_runtime_cache_root() -> PathBuf {
     ConfigManager::global_config()
         .snapshot
-        .local_cache_path
-        .clone()
+        .local_root
+        .join("cache")
 }
 
 #[derive(Clone, Debug)]

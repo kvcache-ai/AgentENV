@@ -219,13 +219,14 @@ impl FirecrackerInstance {
     /// This method first tries to send `SIGTERM` to allow for graceful stop,
     /// but if the process does not exit within the specified timeout, it will send `SIGKILL` to force termination.
     #[tracing::instrument(skip(self))]
-    pub async fn stop(&mut self, timeout: Duration) -> Result<()> {
+    pub async fn stop(&mut self, timeout: Duration) {
+        let stopping = storage_util::abort_on_drop((), "Firecracker stop was cancelled");
         debug!(
             timeout_ms = timeout.as_millis(),
             "stopping firecracker process"
         );
 
-        if let Some(mut child) = self.process.take() {
+        if let Some(child) = self.process.as_mut() {
             // First try a graceful stop with SIGTERM
             if let Some(pid) = child.id() {
                 trace!(pid, "sending SIGTERM to firecracker");
@@ -233,18 +234,33 @@ impl FirecrackerInstance {
             }
 
             // Wait for the process to exit, but if it doesn't within the timeout, force kill it with SIGKILL
-            if time::timeout(timeout, child.wait()).await.is_err() {
-                warn!("firecracker stop timed out; sending SIGKILL");
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+            match time::timeout(timeout, child.wait()).await {
+                Ok(status) => {
+                    status.unwrap_or_else(|error| {
+                        storage_util::fatal_exit(&format!(
+                            "Firecracker exit is unconfirmed: {error}"
+                        ))
+                    });
+                }
+                Err(_) => {
+                    warn!("firecracker stop timed out; sending SIGKILL");
+                    if !matches!(time::timeout(timeout, child.kill()).await, Ok(Ok(()))) {
+                        storage_util::fatal_exit("Firecracker did not exit after SIGKILL");
+                    }
+                }
             }
+            self.process.take();
         }
 
         if self.socket_path.exists() {
             let _ = fs::remove_file(&self.socket_path);
         }
         debug!("firecracker process stopped");
-        Ok(())
+        stopping.complete();
+    }
+
+    pub(super) fn take_process(&mut self) -> Option<tokio::process::Child> {
+        self.process.take()
     }
 
     /// Applies a CPU configuration template.
@@ -569,25 +585,32 @@ impl FirecrackerInstance {
 
 impl Drop for FirecrackerInstance {
     fn drop(&mut self) {
-        let mut had_child = false;
-        if let Some(mut child) = self.process.take() {
-            had_child = true;
-            if let Err(err) = child.start_kill() {
-                warn!(error = %err, "failed to kill sandbox process on drop");
+        // Only remove the socket if we actually spawned/owned the process.
+        let Some(mut child) = self.process.take() else {
+            return;
+        };
+        if let Err(err) = child.start_kill() {
+            storage_util::fatal_exit(&format!("kill Firecracker during drop: {err}"));
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                _ => storage_util::fatal_exit("Firecracker drop could not confirm process exit"),
             }
         }
 
-        // Only remove the socket if we actually spawned/owned the process.
-        if had_child {
-            if let Err(err) = fs::remove_file(&self.socket_path) {
-                // Ignore NotFound error as the file might have been removed already
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    warn!(
-                        path = %self.socket_path.display(),
-                        error = %err,
-                        "failed to remove sandbox socket on drop"
-                    );
-                }
+        if let Err(err) = fs::remove_file(&self.socket_path) {
+            // Ignore NotFound error as the file might have been removed already
+            if err.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    path = %self.socket_path.display(),
+                    error = %err,
+                    "failed to remove sandbox socket on drop"
+                );
             }
         }
     }
@@ -683,7 +706,7 @@ mod tests {
         let mut instance = FirecrackerInstance::new(temp.path().to_path_buf());
         fs::write(&instance.socket_path, b"stale socket")?;
 
-        instance.stop(Duration::from_millis(10)).await?;
+        instance.stop(Duration::from_millis(10)).await;
 
         assert!(!instance.socket_path.exists());
         Ok(())
@@ -704,7 +727,7 @@ mod tests {
             .expect_err("second spawn should fail");
 
         assert!(err.to_string().contains("already started"));
-        instance.stop(Duration::from_millis(10)).await?;
+        instance.stop(Duration::from_millis(10)).await;
         Ok(())
     }
 

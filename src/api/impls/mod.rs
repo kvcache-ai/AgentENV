@@ -201,6 +201,11 @@ impl apis::default::Default<()> for ApiImpl {
         _host: &headers::Host,
         _cookies: &axum_extra::extract::CookieJar,
     ) -> Result<apis::default::HealthGetResponse, ()> {
+        crate::sandbox::UblkDeviceManager::check_health()
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "node is not healthy");
+            })?;
         Ok(apis::default::HealthGetResponse::Status204_TheServiceIsHealthy)
     }
 }
