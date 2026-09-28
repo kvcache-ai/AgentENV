@@ -7,7 +7,7 @@ use agentenv::orchestrator::{
 };
 use agentenv::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
 use agentenv::snapshot::{
-    SnapshotAlias, SnapshotId, SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource,
+    SnapshotAlias, SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource,
     SnapshotSource, StartupCommand,
 };
 
@@ -52,6 +52,7 @@ fn host_file_persister(root: PathBuf) -> FileBackedSandboxPersister {
 #[tokio::test]
 async fn orchestrator_lifecycle() -> Result<()> {
     common::setup().await;
+    capture_snapshot_can_be_published_and_relaunched().await?;
     timeout(TEST_TIMEOUT, async {
         let root = tempdir()?;
         let (builder, snapshot_manager, _) = common::snapshot_test_parts(root.path());
@@ -153,7 +154,11 @@ async fn orchestrator_lifecycle() -> Result<()> {
         for _ in 0..3 {
             drop(
                 orchestrator
-                    .capture_snapshot(sandbox_id, SnapshotPlacement::Distributed)
+                    .capture_snapshot(
+                        sandbox_id,
+                        agentenv::snapshot::SnapshotId::generate(),
+                        SnapshotPlacement::Distributed,
+                    )
                     .await?,
             );
             orchestrator.pause_sandbox(sandbox_id).await?;
@@ -181,7 +186,8 @@ async fn orchestrator_lifecycle() -> Result<()> {
             ProxyLookupResult::Paused { auto_resume: false }
         );
 
-        orchestrator.shutdown().await?;
+        // Reload the paused records while the node runtime remains available.
+        // shutdown() permanently stops its process-global network manager.
         drop(orchestrator);
 
         let restarted = Orchestrator::new(
@@ -233,15 +239,14 @@ async fn orchestrator_lifecycle() -> Result<()> {
         let lookup = restarted.proxy_lookup_for(&sandbox_id).await?;
         assert_eq!(lookup, ProxyLookupResult::NotFound);
 
+        restarted.shutdown().await?;
         Ok(())
     })
     .await
     .map_err(|_| anyhow::anyhow!("test timed out"))?
 }
 
-#[tokio::test]
-async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Result<()> {
-    common::setup().await;
+async fn capture_snapshot_can_be_published_and_relaunched() -> Result<()> {
     timeout(TEST_TIMEOUT, async {
         let root = tempdir()?;
         let (builder, snapshot_manager, _) = common::snapshot_test_parts(root.path());
@@ -287,7 +292,11 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
             .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
             .await?;
         let capture = orchestrator
-            .capture_snapshot(sandbox_id, SnapshotPlacement::Distributed)
+            .capture_snapshot(
+                sandbox_id,
+                agentenv::snapshot::SnapshotId::generate(),
+                SnapshotPlacement::Distributed,
+            )
             .await?;
         assert_eq!(capture.metadata.id, sandbox_id);
         assert_eq!(capture.metadata.state, SandboxState::Running);
@@ -319,7 +328,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
             &snapshot_manager,
             SnapshotPublishMetadata {
                 snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-                id: SnapshotId::generate(),
+                id: capture.captured_snapshot.id().clone(),
                 alias: Some(SnapshotAlias::parse(&published_alias)?),
                 source: SnapshotPublishSource::Sandbox {
                     source_sandbox_id: sandbox_id_str.clone(),

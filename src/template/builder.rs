@@ -1,5 +1,8 @@
+#[cfg(test)]
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Error as AnyhowError;
@@ -14,7 +17,6 @@ use super::runner::{
     TemplateBuildBase, TemplateBuildContext, TemplateBuildExecution, TemplateBuildRunner,
 };
 use crate::cfg::ConfigManager;
-use crate::sandbox::UblkConfig;
 use crate::snapshot::{
     CommandContext, RunnableSnapshot, SnapshotId, SnapshotManager, SnapshotPublishMetadata,
     SnapshotPublishSource, SnapshotRecord, StartupCommand, TemplateBuildErrorReason,
@@ -24,6 +26,7 @@ use crate::types::SandboxResources;
 /// Tie a template startup recording to its temporary build workspace. Both
 /// the recorder task and the detached repository continuation receive a lease,
 /// so either can safely outlive synchronous publication.
+#[cfg(test)]
 fn spawn_template_startup_recording<F>(
     recorder: F,
     workspace: Arc<TempDir>,
@@ -135,10 +138,10 @@ impl TemplateBuilder {
                 .into());
             }
         };
-        let workspace_lease = Arc::new(context.workspace);
         let mut resources = context.resources;
         resources.disk_size_mib = build_execution
-            .manifest
+            .snapshot
+            .manifest()
             .rootfs
             .virtual_size
             .div_ceil(1 << 20)
@@ -146,29 +149,9 @@ impl TemplateBuilder {
             .unwrap_or(u32::MAX);
 
         info!("publishing template snapshot");
-        // Best-effort: spawn the startup-manifest recording now so the
-        // throwaway recording VM overlaps the backend's layer uploads (a
-        // no-op task when the feature is disabled or the backend carries no
-        // capture payload); a detached continuation uploads the manifest once
-        // the trace lands.
-        let recording = build_execution
-            .capture_artifacts
-            .and_then(|artifacts| {
-                artifacts
-                    .downcast::<crate::sandbox::FirecrackerSnapshotConfig>()
-                    .ok()
-            })
-            .map(|snapshot_config| {
-                spawn_template_startup_recording(
-                    crate::sandbox::record_startup_pack(
-                        *snapshot_config,
-                        build_execution.output_dir.clone(),
-                    ),
-                    Arc::clone(&workspace_lease),
-                )
-            });
         let record = snapshot_manager
-            .publish(
+            .publish_snapshot(
+                Arc::clone(&build_execution.snapshot),
                 SnapshotPublishMetadata {
                     id: context.build_snapshot_id.clone(),
                     snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
@@ -186,8 +169,6 @@ impl TemplateBuilder {
                     // user setting, not part of the built image content.
                     custom_extension_params: None,
                 },
-                build_execution.manifest,
-                recording,
             )
             .await?;
 
@@ -274,7 +255,7 @@ impl TemplateBuilder {
             startup: Self::startup_from_spec(spec),
             override_startup: spec.overrides_startup(),
             resources,
-            workspace,
+            _workspace: workspace,
             steps: spec.steps().to_vec(),
             base,
             cpu_config_json: self.current_cpu_config(),
@@ -346,7 +327,7 @@ impl TemplateBuilder {
             startup,
             override_startup,
             resources,
-            workspace,
+            _workspace: workspace,
             steps: spec.steps().to_vec(),
             base: TemplateBuildBase::Snapshot {
                 base_snapshot: Box::new(base_snapshot.clone()),
@@ -377,23 +358,12 @@ impl TemplateBuilder {
                 image_configs,
             } => {
                 Self::ensure_path_exists(image_config_path, "overlaybd image config")?;
-                let ublk_config = Self::load_overlaybd_build_ublk_config(image_config_path);
                 Ok(TemplateBuildBase::Rootfs {
                     launch_rootfs_path: image_config_path.clone(),
-                    ublk_config: Some(ublk_config),
                     image_configs: image_configs.clone(),
                 })
             }
         }
-    }
-
-    fn load_overlaybd_build_ublk_config(image_config_path: &Path) -> UblkConfig {
-        let ublk = &ConfigManager::global_config().ublk;
-        UblkConfig::overlaybd_with_runtime_upper_mode(
-            image_config_path.to_path_buf(),
-            ublk.overlaybd.read_only,
-            ublk.overlaybd.runtime_upper_mode,
-        )
     }
 
     fn ensure_path_exists(path: &Path, kind: &str) -> TemplateBuildResult<()> {

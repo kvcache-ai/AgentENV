@@ -35,7 +35,7 @@ pub(super) struct SandboxResources {
     /// no extension is configured).
     pub(super) custom_extension_hook_guard: Option<CustomExtensionHookGuard>,
     /// Declared last so resource handles drop before source files are unpinned.
-    pub(super) source_lease: Option<Arc<crate::snapshot::RuntimeArtifactLease>>,
+    pub(super) source_snapshot: Option<Arc<crate::snapshot::Snapshot>>,
 }
 
 impl SandboxResources {
@@ -56,17 +56,15 @@ impl SandboxResources {
 
     /// Release everything after the Firecracker process has stopped.
     ///
-    /// Device release failures are logged; only a network release failure is
-    /// returned, after every other resource has been released.
+    /// Keep each owned device and source snapshot until its release succeeds.
+    /// A failure leaves the remaining handles available to the teardown owner.
     pub(super) async fn release(&mut self, prefetch_timeout: Duration) -> Result<()> {
         // ublk devices go after FC stop and before network cleanup.
-        if let Some(runtime) = self.rootfs_runtime.take() {
-            if let Err(e) = UblkDeviceManager::global()
+        if let Some(runtime) = self.rootfs_runtime.as_ref() {
+            UblkDeviceManager::global()
                 .release_device(&runtime.device)
-                .await
-            {
-                warn!(error = %e, "failed to release ublk device during stop");
-            }
+                .await?;
+            self.rootfs_runtime.take();
         }
 
         // Release shared devices explicitly so a following resume for the same
@@ -77,19 +75,16 @@ impl SandboxResources {
             }
         }
         // Dedicated pack-recording memory device: delete, never pool-release.
-        if let Some(device) = self.mem_dedicated_device.take() {
-            if let Err(e) = UblkDeviceManager::global().delete_device(&device).await {
-                warn!(error = %e, "failed to delete dedicated memory ublk device during stop");
-            }
+        if let Some(device) = self.mem_dedicated_device.as_ref() {
+            UblkDeviceManager::global().delete_device(device).await?;
+            self.mem_dedicated_device.take();
         }
 
-        for runtime in self.extra_drive_runtimes.drain(..) {
-            if let Err(e) = UblkDeviceManager::global()
+        while let Some(runtime) = self.extra_drive_runtimes.last() {
+            UblkDeviceManager::global()
                 .release_device(&runtime.device)
-                .await
-            {
-                warn!(error = %e, "failed to release extra drive device during stop");
-            }
+                .await?;
+            self.extra_drive_runtimes.pop();
         }
 
         // Invoke the stop hook before releasing network resources. Delivery
@@ -118,11 +113,11 @@ impl SandboxResources {
                 warn!(%error, "failed to release shared memory ublk device during stop");
             }
         }
-        self.source_lease.take();
-        match network_error {
-            Some(error) => Err(error),
-            None => Ok(()),
+        self.source_snapshot.take();
+        if let Some(error) = network_error {
+            warn!(%error, "failed to release network slot after stopping sandbox");
         }
+        Ok(())
     }
 }
 

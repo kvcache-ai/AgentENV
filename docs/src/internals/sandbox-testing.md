@@ -220,7 +220,7 @@ default_sandbox_timeout_secs = 15
 
 [snapshot]
 repository_backend = "posix_fs"
-local_cache_path = "$AENV_HOME/snapshot-local-cache"
+local_root = "$AENV_HOME/snapshots"
 
 [backend.posix_fs]
 snapshot_store = "$AENV_HOME/snapshot-store"
@@ -292,7 +292,7 @@ enabled = false
   - `[pool.firecracker].enabled`: Enables pre-spawned Firecracker processes for snapshot resume.
 
 - `[snapshot]`
-  - `local_cache_path`: Manager-owned node-local snapshot artifact/cache root. Defaults to `$AENV_HOME/snapshot-local-cache`.
+  - `local_root`: Manager-owned node-local snapshot artifact/cache root. Defaults to `$AENV_HOME/snapshots`.
   - `repository_backend`: Snapshot repository backend. Defaults to `posix_fs`.
 
 - `[backend.posix_fs]`
@@ -374,7 +374,7 @@ config), it returns an error and the test fails.
   - Returns orchestrator settings when configured.
 - `AppConfig::resolved_snapshot_store()` -> `PathBuf`
   - Resolves the effective committed snapshot store root.
-- `AppConfig::resolved_snapshot_local_cache_path()` -> `PathBuf`
+- `AppConfig::snapshot.local_root` -> `PathBuf`
   - Resolves the effective manager-owned node-local snapshot cache root.
 
 ### Typical test setup flow
@@ -569,45 +569,9 @@ client API and the binary that setup downloads:
    cargo test -p agentenv --lib
    ```
 
-## 5) Running Custom Scripts
+## Guest execution after snapshot launch
 
-### Run commands via envd
-
-Once the sandbox is started (with a rootfs that includes the envd daemon), you
-can execute commands inside the VM using the process API:
-
-```rust
-// Simple command
-let output = sandbox.run_command("ls", &["-la", "/tmp"]).await?;
-println!("exit={} stdout={}", output.exit_code, output.stdout);
-
-// Command with options
-use agentenv::sandbox::ProcessOpts;
-let opts = ProcessOpts::new()
-    .with_cwd("/tmp")
-    .with_envs([("KEY".into(), "value".into())].into());
-let output = sandbox.run_command_with_opts("env", &[], opts).await?;
-
-// Interactive / long-running process
-let mut handle = sandbox.start_process("cat", &[], ProcessOpts::default()).await?;
-handle.send_stdin(b"hello\n").await?;
-handle.kill().await?;
-let output = handle.wait().await?;
-```
-
-The process API uses envd's gRPC `ProcessClient` under the hood. It requires
-the envd daemon to be running inside the guest VM.
-
-### Run different scripts for multiple snapshot resumes
-
-`/init` is not re-executed after resume, so per-instance behavior must come
-from per-instance disk contents.
-
-A typical pattern:
-1) Start a base VM and `pause()` to create a snapshot.
-2) For each instance, copy the snapshot rootfs and write a per-instance file
-   into it (for example using `debugfs`).
-3) Create a `FirecrackerSnapshotConfig` that points to that per-instance rootfs and resume.
-
-The guest must keep a long-running dispatcher (started during the initial
-boot) that watches for these per-instance files and executes them after resume.
+A restored VM does not rerun its original kernel boot or `/init`. Apply per-instance
+work through `SandboxExecutor`/envd after readiness, or through a guest dispatcher
+already running in the captured VM. Each child owns its writable disk state;
+shared source artifacts remain immutable.

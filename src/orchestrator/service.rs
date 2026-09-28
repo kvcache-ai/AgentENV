@@ -93,21 +93,6 @@ impl ShutdownOutcome {
 enum FailedLaunchStage {
     Registered,
     TransitionalPersisted,
-    RunningPersisted,
-}
-
-impl FailedLaunchStage {
-    fn rollback_expected_state(self, plan: &LaunchPlan) -> Option<SandboxState> {
-        match self {
-            Self::Registered => None,
-            Self::TransitionalPersisted => Some(plan.transitional_state()),
-            Self::RunningPersisted => Some(SandboxState::Running),
-        }
-    }
-
-    fn should_detach_proxy_route(self) -> bool {
-        matches!(self, Self::RunningPersisted)
-    }
 }
 
 pub struct Orchestrator<
@@ -756,19 +741,18 @@ where
             Ok(forked_backends) => forked_backends,
             Err(err) => {
                 warn!(error = ?err, "failed to fork sandbox");
-                for id in &child_ids {
-                    if let Err(error) = self.persister.delete_record_and_artifacts(id).await {
-                        warn!(%error, "failed to reclaim aborted fork storage");
+                // Backend failure returns only after its children have stopped.
+                for child_id in &child_ids {
+                    if let Err(error) = self.persister.delete_record_and_artifacts(child_id).await {
+                        warn!(%child_id, %error, "failed to reclaim fork child storage");
                     }
                 }
                 self.counters.record_create_fail(u64::from(count));
                 if err.is_terminal() {
                     self.detach_sandbox_handle_and_route(&source_sandbox_id)
                         .await;
-                    let _ = {
-                        let mut sandbox = source_handle.lock().await;
-                        sandbox.stop().await
-                    };
+                    self.stop_detached_sandbox(source_sandbox_id, source_handle)
+                        .await;
                     self.discard_unrecoverable_sandbox(source_sandbox_id).await;
                 } else {
                     let _ = self
@@ -894,9 +878,11 @@ where
     }
 
     async fn stop_failed_fork(mut backend: Box<dyn SandboxBackend>, sandbox_id: SandboxId) {
-        if let Err(err) = backend.stop().await {
-            warn!(%sandbox_id, error = ?err, "failed to stop unsuccessful fork");
-        }
+        backend.stop().await.unwrap_or_else(|error| {
+            storage_util::fatal_exit(&format!(
+                "failed fork {sandbox_id} teardown failed: {error:#}"
+            ))
+        });
     }
 
     /// Retrieves the metadata for a sandbox by its ID.
@@ -1155,7 +1141,7 @@ where
                             .await
                         {
                             Ok(_) => {
-                                // The in-flight delete rolled back to a stable state.
+                                // A recoverable deletion failure restored a stable state.
                                 // Retry the Killing CAS rather than letting multiple
                                 // deleters run concurrently.
                                 continue;
@@ -1550,17 +1536,9 @@ where
             Err(err) => {
                 warn!(error = ?err, "failed to pause sandbox");
                 if err.is_terminal() {
-                    // The handle was already detached from `self.sandboxes`
-                    // before `pause()`. Do not reinsert it here: the live
-                    // runtime may have been mutated and is no longer safe to
-                    // keep serving as a running sandbox.
-                    let stop_result = {
-                        let mut sandbox = handle.lock().await;
-                        sandbox.stop().await
-                    };
-                    if let Err(stop_err) = stop_result {
-                        warn!(error = ?stop_err, "failed to stop sandbox after terminal pause failure");
-                    }
+                    // The runtime may have been mutated. Keep it unavailable
+                    // until stop confirms its storage can be reclaimed.
+                    self.stop_detached_sandbox(sandbox_id, handle).await;
                     self.discard_unrecoverable_sandbox(sandbox_id).await;
                 } else {
                     self.sandboxes.write().await.insert(sandbox_id, handle);
@@ -1612,13 +1590,7 @@ where
             };
             if let Err(resume_err) = resume_result {
                 warn!(error = ?resume_err, "failed to resume sandbox after pause failure");
-                let stop_result = {
-                    let mut sandbox = handle.lock().await;
-                    sandbox.stop().await
-                };
-                if let Err(stop_err) = stop_result {
-                    warn!(error = ?stop_err, "failed to stop sandbox after pause failure");
-                }
+                self.stop_detached_sandbox(sandbox_id, handle).await;
                 self.discard_unrecoverable_sandbox(sandbox_id).await;
             } else {
                 self.sandboxes.write().await.insert(sandbox_id, handle);
@@ -1642,13 +1614,7 @@ where
         let resources = persisted_metadata.resources;
 
         // Release the old devices before HTTP callers can resume the same storage.
-        let stop_result = {
-            let mut sandbox = handle.lock().await;
-            sandbox.stop().await
-        };
-        if let Err(err) = stop_result {
-            warn!(error = ?err, "failed to stop sandbox after pausing");
-        }
+        self.stop_detached_sandbox(sandbox_id, handle).await;
         self.store.update(persisted_metadata).await?;
         self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
         info!("sandbox paused");
@@ -1798,11 +1764,13 @@ where
     pub async fn capture_snapshot(
         self: &Arc<Self>,
         sandbox_id: SandboxId,
+        snapshot_id: crate::snapshot::SnapshotId,
         placement: crate::snapshot::SnapshotPlacement,
     ) -> Result<SnapshotCaptureResult> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("snapshot", sandbox_id, async move {
-            this.capture_snapshot_inner(sandbox_id, placement).await
+            this.capture_snapshot_inner(sandbox_id, snapshot_id, placement)
+                .await
         })
         .await
     }
@@ -1852,13 +1820,8 @@ where
         warn!(?error, ?operation, "sandbox snapshot operation failed");
         if error.is_terminal() {
             self.detach_sandbox_handle_and_route(&sandbox_id).await;
-            if let Err(stop_error) = handle.lock().await.stop().await {
-                warn!(
-                    ?stop_error,
-                    ?operation,
-                    "failed to stop sandbox after terminal snapshot failure"
-                );
-            }
+            self.stop_detached_sandbox(sandbox_id, Arc::clone(handle))
+                .await;
             self.discard_unrecoverable_sandbox(sandbox_id).await;
         } else {
             let _ = self
@@ -1929,13 +1892,14 @@ where
     async fn capture_snapshot_inner(
         self: Arc<Self>,
         sandbox_id: SandboxId,
+        snapshot_id: crate::snapshot::SnapshotId,
         placement: crate::snapshot::SnapshotPlacement,
     ) -> Result<SnapshotCaptureResult> {
         info!("capturing sandbox snapshot");
         let handle = self.begin_snapshot_operation(sandbox_id).await?;
         let result = {
             let mut sandbox = handle.lock().await;
-            sandbox.snapshot(placement).await
+            sandbox.snapshot(snapshot_id, placement).await
         };
         let captured_snapshot = match result {
             Ok(captured_snapshot) => captured_snapshot,
@@ -2178,7 +2142,8 @@ where
     ) -> Result<SandboxMetadata> {
         let states = [transitional_state];
         let wait = self.store.wait_while_in_states(&sandbox_id, &states);
-        match tokio::time::timeout(WAIT_TRANSITION_TIMEOUT, wait).await {
+        let result = tokio::time::timeout(WAIT_TRANSITION_TIMEOUT, wait).await;
+        match result {
             Ok(Ok(Some(m))) => Ok(m),
             Ok(Ok(None)) => Err(OrchestratorError::SandboxNotFound(sandbox_id)),
             Ok(Err(e)) => Err(OrchestratorError::from(e)),
@@ -2425,7 +2390,13 @@ where
 
     #[tracing::instrument(skip(self, plan))]
     async fn launch_sandbox(self: &Arc<Self>, plan: LaunchPlan) -> Result<SandboxMetadata> {
-        self.ensure_accepting_lifecycle_operations()?;
+        if let Err(error) = self.ensure_accepting_lifecycle_operations() {
+            if matches!(&plan, LaunchPlan::Resume(_)) {
+                self.finalize_failed_launch_metadata(&plan, plan.transitional_state(), false)
+                    .await;
+            }
+            return Err(error);
+        }
 
         let sandbox_id = plan.sandbox_id();
         let transitional_state = plan.transitional_state();
@@ -2467,9 +2438,9 @@ where
         }
         if let Err(source) = sandbox.start_nowait().await {
             warn!(error = %format_args!("{source:#}"), "failed to start sandbox");
-            if let Err(stop_err) = sandbox.stop().await {
-                warn!(error = %format_args!("{stop_err:#}"), "failed to stop sandbox after start failure");
-            }
+            sandbox.stop().await.unwrap_or_else(|error| {
+                storage_util::fatal_exit(&format!("failed launch teardown: {error:#}"))
+            });
             self.finalize_failed_launch_metadata(&plan, transitional_state, true)
                 .await;
             return Err(OrchestratorError::SandboxOperationFailed {
@@ -2483,9 +2454,9 @@ where
         // If the orchestrator started shutting down, stop here before we persist any state.
         if self.is_shutting_down() {
             info!("orchestrator started shutting down just after starting the sandbox");
-            if let Err(err) = sandbox.stop().await {
-                warn!(error = %format_args!("{err:#}"), "failed to stop sandbox");
-            }
+            sandbox.stop().await.unwrap_or_else(|error| {
+                storage_util::fatal_exit(&format!("failed launch teardown: {error:#}"))
+            });
             self.finalize_failed_launch_metadata(&plan, transitional_state, true)
                 .await;
             return Err(OrchestratorError::ShuttingDown);
@@ -2551,6 +2522,24 @@ where
             return Err(OrchestratorError::ShuttingDown);
         }
 
+        let proxy_target = {
+            let sandbox = handle.lock().await;
+            match Self::proxy_target_from_sandbox(sandbox.as_ref()) {
+                Ok(proxy_target) => proxy_target,
+                Err(err) => {
+                    warn!(error = %format_args!("{err:#}"), "sandbox became ready without a proxy target; rolling back launch");
+                    drop(sandbox);
+                    self.cleanup_failed_launch(
+                        &plan,
+                        handle,
+                        FailedLaunchStage::TransitionalPersisted,
+                    )
+                    .await;
+                    return Err(err);
+                }
+            }
+        };
+
         let launch_timeout = plan.timeout();
         let is_resume = matches!(plan, LaunchPlan::Resume(_));
         if is_resume {
@@ -2583,19 +2572,6 @@ where
             }
         };
 
-        let proxy_target = {
-            let sandbox = handle.lock().await;
-            match Self::proxy_target_from_sandbox(sandbox.as_ref()) {
-                Ok(proxy_target) => proxy_target,
-                Err(err) => {
-                    warn!(error = %format_args!("{err:#}"), "sandbox became ready without a proxy target; rolling back launch");
-                    drop(sandbox);
-                    self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
-                        .await;
-                    return Err(err);
-                }
-            }
-        };
         if !self
             .upsert_proxy_route_if_current_handle(sandbox_id, &handle, proxy_target)
             .await
@@ -2649,31 +2625,25 @@ where
         stage: FailedLaunchStage,
     ) {
         let should_rollback_shared_state = self
-            .detach_launch_runtime_if_current(
-                &plan.sandbox_id(),
-                &handle,
-                stage.should_detach_proxy_route(),
-                stage,
-            )
+            .detach_launch_runtime_if_current(&plan.sandbox_id(), &handle)
             .await;
 
-        // Stop the sandbox before restoring or consuming shared lifecycle state.
-        let stop_result = {
-            let mut sandbox = handle.lock().await;
-            sandbox.stop().await
-        };
-        if let Err(err) = stop_result {
-            warn!(error = %format_args!("{err:#}"), "failed to stop sandbox while cleaning up failed launch");
-        }
-
         if !should_rollback_shared_state {
+            self.stop_detached_sandbox(plan.sandbox_id(), handle).await;
             return;
         }
 
-        if let Some(expected_state) = stage.rollback_expected_state(plan) {
-            self.finalize_failed_launch_metadata(plan, expected_state, true)
+        self.stop_detached_sandbox(plan.sandbox_id(), handle).await;
+        if stage == FailedLaunchStage::TransitionalPersisted {
+            self.finalize_failed_launch_metadata(plan, plan.transitional_state(), true)
                 .await;
         }
+    }
+
+    async fn stop_detached_sandbox(&self, sandbox_id: SandboxId, handle: SandboxHandle) {
+        handle.lock().await.stop().await.unwrap_or_else(|error| {
+            storage_util::fatal_exit(&format!("sandbox {sandbox_id} stop failed: {error:#}"))
+        });
     }
 
     async fn finalize_failed_launch_metadata(
@@ -2753,8 +2723,6 @@ where
         &self,
         sandbox_id: &SandboxId,
         handle: &SandboxHandle,
-        detach_proxy_route: bool,
-        stage: FailedLaunchStage,
     ) -> bool {
         let mut sandboxes = self.sandboxes.write().await;
         let Some(current_handle) = sandboxes.get(sandbox_id) else {
@@ -2763,20 +2731,12 @@ where
 
         if !Arc::ptr_eq(current_handle, handle) {
             warn!(
-                stage = ?stage,
                 "sandbox handle was replaced during failed launch cleanup; skipping shared state rollback"
             );
             return false;
         }
 
         sandboxes.remove(sandbox_id);
-
-        if detach_proxy_route {
-            let removed_route = self.proxy_routes.write().await.remove(sandbox_id);
-            if let Some(route) = removed_route.as_ref() {
-                debug!(version = route.version(), "removed runtime proxy route");
-            }
-        }
 
         drop(sandboxes);
         true
@@ -2947,18 +2907,18 @@ where
             );
         }
 
-        if !last_failures.is_empty() {
-            return Err(OrchestratorError::InternalError(format!(
-                "failed to preserve all sandboxes during shutdown after {MAX_SHUTDOWN_PASSES} passes: {}",
-                last_failures.join(", ")
-            )));
-        }
-
         // Clean up remaining network resources.
         if let Some(manager) = crate::sandbox::NetworkManager::global_if_initialized() {
             if let Err(err) = manager.shutdown() {
                 warn!(error = ?err, "failed to clean up network resources during orchestrator shutdown");
             }
+        }
+
+        if !last_failures.is_empty() {
+            return Err(OrchestratorError::InternalError(format!(
+                "failed to preserve all sandboxes during shutdown after {MAX_SHUTDOWN_PASSES} passes: {}",
+                last_failures.join(", ")
+            )));
         }
 
         info!("orchestrator shutdown completed");

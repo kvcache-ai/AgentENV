@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 pub(crate) mod image;
 pub(crate) mod network;
 use anyhow::{anyhow, bail, Context, Result};
-use confique::Config;
+use confique::{Config, Layer};
 pub use image::{
     ImageCacheConfig, ImageConfig, ImageRemoteBlocksCacheConfig, ImageResolverConfig,
     ResolvedImageCacheConfig, ResolvedImageCacheGcConfig,
@@ -183,13 +183,6 @@ pub struct FirecrackerConfig {
     /// When set (non-empty), enables stdout/stderr capture and Firecracker logging
     /// to `firecracker.log` in the same directory. Unset/empty disables all three.
     pub log_level: Option<String>,
-    /// Optional cap on the total on-disk size (in bytes) of one sandbox's managed
-    /// snapshots under `managed-snapshots/<sandbox_id>/`. Once the current total
-    /// reaches this limit, all further snapshot requests that would write under the
-    /// managed snapshot root (snapshot capture, fork) are rejected;
-    /// existing snapshots are never evicted automatically. Unset = unlimited.
-    #[config(env = "AENV_FIRECRACKER_MANAGED_SNAPSHOT_MAX_TOTAL_BYTES")]
-    pub managed_snapshot_max_total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -351,11 +344,16 @@ pub struct DiskRateLimitConfig {
 #[derive(Debug, Config, Clone)]
 pub struct SnapshotConfig {
     #[config(
-        env = "AENV_SNAPSHOT_LOCAL_CACHE_PATH",
+        env = "AENV_SNAPSHOT_LOCAL_ROOT",
         parse_env = parse_required_path,
-        default = "$AENV_HOME/snapshot-local-cache"
+        default = "$AENV_HOME/snapshots"
     )]
-    pub local_cache_path: PathBuf,
+    pub local_root: PathBuf,
+    /// Soft admission limit on retained snapshot artifacts, excluding cache.
+    /// Capture requests check allocated bytes, deduplicated by inode, at most
+    /// once per minute. Concurrent captures can exceed it; unset is unlimited.
+    #[config(env = "AENV_SNAPSHOT_MAX_LOCAL_ARTIFACT_BYTES")]
+    pub max_local_artifact_bytes: Option<u64>,
     #[config(default = "posix_fs")]
     pub repository_backend: SnapshotRepositoryBackendKind,
     /// When true, snapshot artifacts are published to and fetched from the P2P
@@ -988,8 +986,8 @@ impl AppConfig {
             &self.orchestrator.persisted_sandbox_store_path,
         );
 
-        self.snapshot.local_cache_path =
-            resolve_path(&self.home_path, config_dir, &self.snapshot.local_cache_path);
+        self.snapshot.local_root =
+            resolve_path(&self.home_path, config_dir, &self.snapshot.local_root);
 
         if self.snapshot.repository_backend == SnapshotRepositoryBackendKind::PosixFs {
             let posix_fs = self
@@ -1364,15 +1362,67 @@ impl ConfigManager {
 
     fn load_config_file(path: &Path) -> Result<AppConfig> {
         let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut environment = <AppConfig as Config>::Layer::from_env()?;
+        if environment.snapshot.local_root.is_none() {
+            environment.snapshot.local_root = Self::env_path("AENV_SNAPSHOT_LOCAL_CACHE_PATH");
+        }
+        if environment.snapshot.max_local_artifact_bytes.is_none() {
+            environment.snapshot.max_local_artifact_bytes =
+                std::env::var("AENV_FIRECRACKER_MANAGED_SNAPSHOT_MAX_TOTAL_BYTES")
+                    .ok()
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.parse())
+                    .transpose()
+                    .context("parse AENV_FIRECRACKER_MANAGED_SNAPSHOT_MAX_TOTAL_BYTES")?;
+        }
         let mut config = AppConfig::builder()
-            .env()
-            .file(path)
+            .preloaded(environment)
+            .preloaded(Self::config_file_layer(path)?)
             .load()
             .with_context(|| format!("load config {}", path.display()))?;
         config.normalize(config_dir)?;
         config.validate()?;
 
         Ok(config)
+    }
+
+    fn config_file_layer(path: &Path) -> Result<<AppConfig as Config>::Layer> {
+        confique::File::new(path)?;
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read config {}", path.display()))
+            }
+        };
+        let mut values: toml::Table = toml::from_str(&contents)
+            .with_context(|| format!("parse config {}", path.display()))?;
+        // Normalize old names before deserializing; runtime config keeps only current fields.
+        for (section, old, new) in [
+            ("snapshot", "local_cache_path", "local_root"),
+            (
+                "firecracker",
+                "managed_snapshot_max_total_bytes",
+                "max_local_artifact_bytes",
+            ),
+        ] {
+            if let Some(value) = values
+                .get_mut(section)
+                .and_then(toml::Value::as_table_mut)
+                .and_then(|table| table.remove(old))
+            {
+                values
+                    .entry("snapshot")
+                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                    .as_table_mut()
+                    .context("snapshot configuration must be a table")?
+                    .entry(new)
+                    .or_insert(value);
+            }
+        }
+        values
+            .try_into()
+            .with_context(|| format!("load config {}", path.display()))
     }
 
     fn env_path(name: &str) -> Option<PathBuf> {
@@ -1496,34 +1546,87 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn firecracker_managed_snapshot_quota_parses_from_toml() -> Result<()> {
+    fn snapshot_storage_settings_accept_legacy_names() -> Result<()> {
         let temp = tempdir()?;
         let path = temp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            r#"
-[firecracker]
-managed_snapshot_max_total_bytes = 53687091200
-"#,
-        )?;
-        let config = ConfigManager::new_from_path(&path)?;
-        assert_eq!(
-            config.config().firecracker.managed_snapshot_max_total_bytes,
-            Some(53687091200)
-        );
+        let legacy = "[firecracker]\nmanaged_snapshot_max_total_bytes = 53687091200\n\
+                      [snapshot]\nlocal_cache_path = './legacy'\n";
+        for (settings, directory, limit) in [
+            (String::new(), None, None),
+            (
+                "[firecracker]\nmanaged_snapshot_max_total_bytes = 53687091200\n".to_string(),
+                None,
+                Some(53687091200),
+            ),
+            (legacy.to_string(), Some("legacy"), Some(53687091200)),
+            (
+                format!(
+                    "{legacy}local_root = './current'\nmax_local_artifact_bytes = 107374182400\n"
+                ),
+                Some("current"),
+                Some(107374182400),
+            ),
+        ] {
+            std::fs::write(&path, settings)?;
+            let config = ConfigManager::new_from_path(&path)?;
+            if let Some(directory) = directory {
+                assert_eq!(
+                    config.config().snapshot.local_root,
+                    temp.path().join(directory)
+                );
+            }
+            assert_eq!(config.config().snapshot.max_local_artifact_bytes, limit);
+        }
         Ok(())
     }
 
     #[test]
-    fn firecracker_managed_snapshot_quota_defaults_to_unlimited() -> Result<()> {
+    fn snapshot_environment_aliases_preserve_source_precedence() -> Result<()> {
+        const CHILD_CONFIG: &str = "AENV_TEST_SNAPSHOT_COMPAT_CONFIG";
+        if let Some(path) = std::env::var_os(CHILD_CONFIG) {
+            let config = ConfigManager::new_from_path(Path::new(&path))?;
+            let modern = std::env::var_os("AENV_SNAPSHOT_LOCAL_ROOT").is_some();
+            assert_eq!(
+                config.config().snapshot.local_root,
+                Path::new(&path)
+                    .parent()
+                    .unwrap()
+                    .join(if modern { "new-env" } else { "old-env" })
+            );
+            assert_eq!(
+                config.config().snapshot.max_local_artifact_bytes,
+                Some(if modern { 300 } else { 200 })
+            );
+            return Ok(());
+        }
+
         let temp = tempdir()?;
         let path = temp.path().join("config.toml");
-        std::fs::write(&path, "")?;
-        let config = ConfigManager::new_from_path(&path)?;
-        assert_eq!(
-            config.config().firecracker.managed_snapshot_max_total_bytes,
-            None
-        );
+        std::fs::write(
+            &path,
+            "[snapshot]\nlocal_root = './file'\nmax_local_artifact_bytes = 100\n",
+        )?;
+        for modern in [false, true] {
+            // Use child processes so environment overrides cannot affect parallel tests.
+            let mut command = std::process::Command::new(std::env::current_exe()?);
+            command
+                .args([
+                    "--exact",
+                    "cfg::tests::snapshot_environment_aliases_preserve_source_precedence",
+                    "--nocapture",
+                ])
+                .env(CHILD_CONFIG, &path)
+                .env("AENV_SNAPSHOT_LOCAL_CACHE_PATH", "./old-env")
+                .env("AENV_FIRECRACKER_MANAGED_SNAPSHOT_MAX_TOTAL_BYTES", "200")
+                .env_remove("AENV_SNAPSHOT_LOCAL_ROOT")
+                .env_remove("AENV_SNAPSHOT_MAX_LOCAL_ARTIFACT_BYTES");
+            if modern {
+                command
+                    .env("AENV_SNAPSHOT_LOCAL_ROOT", "./new-env")
+                    .env("AENV_SNAPSHOT_MAX_LOCAL_ARTIFACT_BYTES", "300");
+            }
+            assert!(command.status()?.success());
+        }
         Ok(())
     }
 
@@ -1984,7 +2087,7 @@ managed_snapshot_max_total_bytes = 53687091200
         config.kernel.image_path = Some("./kernel/vmlinux.bin".into());
         config.tools.drive_path = Some("./tools.ext4".into());
         config.image.cache.root_dir = "./custom-image-cache".into();
-        config.snapshot.local_cache_path = "./snapshot-local-cache".into();
+        config.snapshot.local_root = "./snapshot-local-cache".into();
         config.backend.posix_fs = Some(PosixFsBackendConfig {
             snapshot_store: "./snapshot-store".into(),
         });
@@ -2020,7 +2123,7 @@ managed_snapshot_max_total_bytes = 53687091200
             config_dir.join("custom-image-cache")
         );
         assert_eq!(
-            config.snapshot.local_cache_path,
+            config.snapshot.local_root,
             config_dir.join("snapshot-local-cache")
         );
         assert_eq!(config.p2p.store_dir, config_dir.join("p2p-store"));
@@ -2146,7 +2249,7 @@ managed_snapshot_max_total_bytes = 53687091200
         config.ublk.daemon_socket_path = "$AENV_RUNTIME/ublk-daemon.sock".into();
         config.firecracker.serial_dir = Some("$AENV_HOME/logs/serial".into());
         config.image.cache.root_dir = "$AENV_HOME/image-cache".into();
-        config.snapshot.local_cache_path = "$AENV_HOME/snapshot-local-cache".into();
+        config.snapshot.local_root = "$AENV_HOME/snapshots".into();
         config.p2p.store_dir = "$AENV_HOME/p2p/store".into();
         config.ublk.overlaybd.global_config_path =
             "$AENV_HOME/overlaybd/overlaybd-global.json".into();
@@ -2166,10 +2269,7 @@ managed_snapshot_max_total_bytes = 53687091200
         );
         assert_eq!(config.deps_path, home_path.join("deps"));
         assert_eq!(config.image.cache.root_dir, home_path.join("image-cache"));
-        assert_eq!(
-            config.snapshot.local_cache_path,
-            home_path.join("snapshot-local-cache")
-        );
+        assert_eq!(config.snapshot.local_root, home_path.join("snapshots"));
         assert_eq!(config.p2p.store_dir, home_path.join("p2p").join("store"));
         assert_eq!(
             config.ublk.overlaybd.global_config_path,
@@ -2207,10 +2307,7 @@ managed_snapshot_max_total_bytes = 53687091200
             Some(home_path.join("logs/serial"))
         );
         assert_eq!(config.image.cache.root_dir, home_path.join("image-cache"));
-        assert_eq!(
-            config.snapshot.local_cache_path,
-            home_path.join("snapshot-local-cache")
-        );
+        assert_eq!(config.snapshot.local_root, home_path.join("snapshots"));
         assert_eq!(config.p2p.store_dir, home_path.join("p2p/store"));
         assert_eq!(
             config.ublk.overlaybd.global_config_path,
