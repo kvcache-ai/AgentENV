@@ -159,7 +159,7 @@ func TestNodesFromEndpointSlicesNotServingTerminatingIsLingering(t *testing.T) {
 
 func TestReadinessTransitionsPreserveSandboxRouting(t *testing.T) {
 	registry := NewAtomicNodeRegistry(nil, defaultObservedReportTTL)
-	service := NewService(zap.NewNop(), registry, NewStrategy("round_robin"), NewInMemoryBindingStore(defaultObservedReportTTL))
+	service := NewService(zap.NewNop(), registry, &RoundRobinStrategy{}, NewInMemoryBindingStore(defaultObservedReportTTL))
 	endpoint := servingEndpoint("node-a", "10.0.0.1")
 	for _, serving := range []bool{true, false, true} {
 		endpoint.Conditions.Serving = boolPtr(serving)

@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"math/rand"
 	"strings"
@@ -107,7 +108,7 @@ func (s *WeightedImageAffinityStrategy) Select(nodes []RichNode, hint *scheduler
 		}
 	}
 	if bestIndex < 0 {
-		return s.fallbackRR.Select(nodes, hint)
+		return RichNode{}, fmt.Errorf("%w: no eligible node matches image affinity weights", ErrNoNodes)
 	}
 	return nodes[bestIndex], nil
 }
@@ -162,19 +163,19 @@ func isHex(value string) bool {
 	return true
 }
 
-func NewStrategy(name string, imageAffinityWeights ...map[string]float64) Strategy {
-	switch name {
+func NewStrategy(name string, imageAffinityWeights ...map[string]float64) (Strategy, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "random":
-		return NewRandomStrategy()
+		return NewRandomStrategy(), nil
 	case "weighted_image_affinity":
 		var weights map[string]float64
 		if len(imageAffinityWeights) > 0 {
 			weights = imageAffinityWeights[0]
 		}
-		return NewWeightedImageAffinityStrategy(weights)
+		return NewWeightedImageAffinityStrategy(weights), nil
 	case "round_robin":
-		fallthrough
+		return &RoundRobinStrategy{}, nil
 	default:
-		return &RoundRobinStrategy{}
+		return nil, fmt.Errorf("unknown scheduler strategy %q", name)
 	}
 }

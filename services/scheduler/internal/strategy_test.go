@@ -3,6 +3,7 @@ package scheduler
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	schedulerv1 "agentenv/services/api/proto"
@@ -173,5 +174,31 @@ func coldSandboxHint(image string) *schedulerv1.ScheduleRequestHint {
 		Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
 			NewColdSandbox: &schedulerv1.NewColdSandboxHint{Images: []string{image}},
 		},
+	}
+}
+
+func TestNewStrategyNormalizesNamesAndRejectsUnknown(t *testing.T) {
+	for _, name := range []string{"round_robin", "random", "weighted_image_affinity"} {
+		strategy, err := NewStrategy("  "+strings.ToUpper(name)+"  ", map[string]float64{"host": 1})
+		if err != nil || strategy.Name() != name {
+			t.Fatalf("strategy %q: got %v, %v", name, strategy, err)
+		}
+	}
+	for _, name := range []string{"", "round-robin", "weighted_image_affinty"} {
+		if strategy, err := NewStrategy(name); err == nil || strategy != nil {
+			t.Fatalf("unknown strategy %q: got %v, %v", name, strategy, err)
+		}
+	}
+}
+
+func TestWeightedImageAffinityDoesNotFallBackWhenConfiguredHostsAreUnavailable(t *testing.T) {
+	strategy := NewWeightedImageAffinityStrategy(map[string]float64{"configured": 1})
+	nodes := []RichNode{{Node: Node{ID: "pod", AffinityID: "unconfigured"}}}
+	if _, err := strategy.Select(nodes, coldSandboxHint("repo:latest")); !errors.Is(err, ErrNoNodes) {
+		t.Fatalf("expected ErrNoNodes for unmatched weights, got %v", err)
+	}
+	// Requests without an image key intentionally use all eligible nodes.
+	if node, err := strategy.Select(nodes, nil); err != nil || node.ID != "pod" {
+		t.Fatalf("no-image fallback: got %v, %v", node, err)
 	}
 }
