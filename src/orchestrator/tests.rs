@@ -1267,6 +1267,7 @@ async fn pause_uses_runtime_config_when_source_config_was_evicted() -> Result<()
             root_dir: root_dir.clone(),
             remote_blocks_size_gb: 10,
             capacity_bytes: None,
+            open_evict_idle_secs: 600,
         },
     ));
 

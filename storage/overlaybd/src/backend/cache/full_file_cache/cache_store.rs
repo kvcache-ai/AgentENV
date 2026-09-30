@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, ensure, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::future::FutureExt as _;
 use nix::errno::Errno;
 use parking_lot::RwLock;
 use std::fmt;
@@ -42,6 +43,17 @@ impl Drop for RefillGuard<'_> {
         self.active_refills.fetch_sub(1, Ordering::Relaxed);
         self.entry.finish_refill(self.block_id);
     }
+}
+
+fn is_enospc(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<Errno>()
+            .is_some_and(|errno| *errno == Errno::ENOSPC)
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.raw_os_error() == Some(Errno::ENOSPC as i32))
+    })
 }
 
 impl FileCacheBackend {
@@ -332,16 +344,24 @@ impl FileCacheBackend {
         if cache_only {
             bail!("cache miss while cache-only flag is set");
         } else if let Some(source) = source {
-            let block_size_usize = usize::try_from(self.options.block_size)
-                .map_err(|_| anyhow!("block_size too large"))?;
-            self.pread_from_source_generic(
-                reader,
-                source,
-                ctx.source_size,
-                block_id,
-                block_size_usize,
-            )
-            .await
+            // Deduplicate concurrent uncached reads of this block while the
+            // entry still exists (typical under pool pressure); read directly
+            // otherwise.
+            if let Some(entry) = self.get_cache_entry(cache_id) {
+                self.pread_from_source_dedup(&entry, source, ctx.source_size, block_id)
+                    .await
+            } else {
+                let block_size_usize = usize::try_from(self.options.block_size)
+                    .map_err(|_| anyhow!("block_size too large"))?;
+                self.pread_from_source_generic(
+                    reader,
+                    source,
+                    ctx.source_size,
+                    block_id,
+                    block_size_usize,
+                )
+                .await
+            }
         } else {
             bail!("cache miss without source file");
         }
@@ -374,6 +394,72 @@ impl FileCacheBackend {
             );
         }
         Ok(bytes)
+    }
+
+    /// Read one block from the source, deduplicating concurrent readers of the
+    /// same block: the first reader publishes a shared future for the fetch
+    /// and every concurrent reader awaits a clone of it, so the source is
+    /// read once. Any awaiter's poll drives the fetch, so a cancelled creator
+    /// does not stall the others. Used when the block cannot be admitted to
+    /// the cache (pool full); errors reach every waiter (Arc-wrapped so the
+    /// shared output is `Clone`). A reader arriving after the fetch was
+    /// unregistered starts a fresh round.
+    ///
+    /// The fetch goes through `VirtualFile::read_at` rather than the caller's
+    /// [`FileReader`]: the shared future must be `'static`, so it cannot
+    /// borrow the io-uring context. This matches the trade-off the background
+    /// downloader already makes for remote sources.
+    async fn pread_from_source_dedup(
+        &self,
+        entry: &Arc<CacheEntry>,
+        source: &Arc<dyn VirtualFile>,
+        source_size: u64,
+        block_id: u64,
+    ) -> Result<Bytes> {
+        let block_size = self.options.block_size;
+        let offset = block_id
+            .checked_mul(block_size)
+            .ok_or_else(|| anyhow!("block offset overflow"))?;
+        if offset >= source_size {
+            return Ok(Bytes::new());
+        }
+        let want = source_size
+            .saturating_sub(offset)
+            .min(block_size)
+            .min(usize::MAX as u64) as usize;
+
+        let (shared, elected) = {
+            let mut fanouts = entry.miss_fanouts.lock();
+            match fanouts.entry(block_id) {
+                std::collections::hash_map::Entry::Occupied(slot) => (slot.get().clone(), false),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let source = source.clone();
+                    let fetch = async move {
+                        let bytes = source.read_at(offset, want).await.map_err(Arc::new)?;
+                        if bytes.len() != want {
+                            return Err(Arc::new(anyhow!(
+                                "short read from source at offset {offset}: got {}, want {want}",
+                                bytes.len()
+                            )));
+                        }
+                        Ok(bytes)
+                    }
+                    .boxed()
+                    .shared();
+                    slot.insert(fetch.clone());
+                    (fetch, true)
+                }
+            }
+        };
+
+        let result = shared.await;
+        if elected {
+            // The fetch has concluded; unregister so later readers start a
+            // fresh round instead of joining a finished one. Waiters already
+            // holding a clone still receive the output.
+            entry.miss_fanouts.lock().remove(&block_id);
+        }
+        result.map_err(|err| anyhow!("{err:#}"))
     }
 
     // -------------------------------------------------------------------
@@ -523,29 +609,49 @@ impl FileCacheBackend {
         // Use the waker-based acquire pattern per block. The entry-owned read
         // permit spans source I/O, mmap write, bitmap publication, and refill
         // guard cleanup, so logical eviction cannot interleave with a refill.
+        // On ENOSPC the loop runs eviction once and retries the block once, so
+        // an incoming template still gets its blocks cached under pressure.
         for block_id in group_start..group_end {
-            let _barrier = entry.refill_eviction_barrier.read().await;
-            let result = entry.acquire_refill(block_id).await;
-            match result {
-                AcquireRefillResult::InCache => continue,
-                AcquireRefillResult::ShouldLoad => {
-                    self.active_refills.fetch_add(1, Ordering::Relaxed);
-                    let _guard = RefillGuard {
-                        entry: entry.as_ref(),
-                        block_id,
-                        active_refills: &self.active_refills,
-                    };
-                    self.do_refill_block_generic(
-                        reader,
-                        entry.as_ref(),
-                        cache_id,
-                        source,
-                        source_size,
-                        block_id,
-                    )
-                    .await?;
-                    // NOTE: _guard will drop before _barrier, decrementing
-                    // active_refills and calling finish_refill while protected.
+            let mut retried_after_eviction = false;
+            loop {
+                let Ok(_barrier) = entry.refill_eviction_barrier.clone().try_read_owned() else {
+                    // An eviction is pending or running for this entry: skip the
+                    // refill instead of queueing behind the writer. The caller
+                    // falls back to the source.
+                    return Ok(());
+                };
+                match entry.acquire_refill(block_id).await {
+                    AcquireRefillResult::InCache => break,
+                    AcquireRefillResult::ShouldLoad => {
+                        self.active_refills.fetch_add(1, Ordering::Relaxed);
+                        let _guard = RefillGuard {
+                            entry: entry.as_ref(),
+                            block_id,
+                            active_refills: &self.active_refills,
+                        };
+                        match self
+                            .do_refill_block_generic(
+                                reader,
+                                entry.as_ref(),
+                                cache_id,
+                                source,
+                                source_size,
+                                block_id,
+                            )
+                            .await
+                        {
+                            Ok(()) => break,
+                            Err(err) if !retried_after_eviction && is_enospc(&err) => {
+                                retried_after_eviction = true;
+                                drop(_guard);
+                                drop(_barrier);
+                                self.eviction_inner().await;
+                            }
+                            Err(err) => return Err(err),
+                        }
+                        // NOTE: _guard drops before _barrier, decrementing
+                        // active_refills and calling finish_refill while protected.
+                    }
                 }
             }
         }
@@ -1571,6 +1677,10 @@ impl VirtualFile for CachedFile {
         }
     }
 
+    // NOTE: do not call evict_range/evict_all while this task still holds a
+    // `Bytes` returned by a read on this same file. Read results hold a read
+    // permit on the entry's eviction barrier for their lifetime, and eviction
+    // waits for all read permits — one task holding both deadlocks.
     async fn evict_range(&self, _offset: u64, _len: u64) -> Result<()> {
         // We only support whole-file eviction; partial evict_range
         // delegates to evict_all.

@@ -1,4 +1,4 @@
-use super::super::meta::EntryPaths;
+use super::super::meta::{now_unix_nanos, EntryPaths};
 use super::super::{
     cache_key_digest, div_round_up, CacheFnTransFunc, DEFAULT_BLOCK_SIZE, DEFAULT_CACHE_DIR,
     DEFAULT_CAPACITY_BYTES, DEFAULT_CHECKPOINT_PERIOD, DEFAULT_DISK_AVAIL_BYTES,
@@ -47,6 +47,11 @@ pub struct FileCacheBackendOptions {
     /// Per-block read timeout for background downloads; a slow read is
     /// dropped and reissued instead of holding a block slot forever.
     pub bk_download_hedge_timeout: std::time::Duration,
+    /// Entries held open whose last access is older than this may have their
+    /// cached blocks reclaimed under capacity pressure; the entry itself
+    /// survives and refills on demand. `Duration::ZERO` disables open-entry
+    /// eviction.
+    pub open_evict_idle: std::time::Duration,
 }
 
 impl Default for FileCacheBackendOptions {
@@ -60,6 +65,7 @@ impl Default for FileCacheBackendOptions {
             bk_download_max_concurrent_files: download.max_concurrent_files,
             bk_download_block_size: download.block_size,
             bk_download_hedge_timeout: super::super::bk_download::DEFAULT_HEDGE_TIMEOUT,
+            open_evict_idle: std::time::Duration::from_secs(600),
         }
     }
 }
@@ -82,6 +88,7 @@ impl FileCacheBackendOptions {
             bk_download_max_concurrent_files: download.max_concurrent_files,
             bk_download_block_size: download.block_size,
             bk_download_hedge_timeout: super::super::bk_download::DEFAULT_HEDGE_TIMEOUT,
+            open_evict_idle: std::time::Duration::from_secs(cfg.open_evict_idle_secs),
         };
         opt.normalize()?;
         Ok(opt)
@@ -543,6 +550,75 @@ impl FileCacheBackend {
             .collect()
     }
 
+    /// Open entries whose last access is older than `idle_cutoff` (unix
+    /// nanos), ordered by last access, oldest first. Entries with in-flight
+    /// refills are skipped.
+    fn idle_open_cache_ids_by_lru(state: &BackendState, idle_cutoff: u64) -> Vec<String> {
+        let mut candidates = Vec::new();
+        for slot_ref in state.cache_entries.iter() {
+            let Some(entry) = slot_ref.value().as_active() else {
+                continue;
+            };
+            if entry.open_count.load(Ordering::SeqCst) == 0 {
+                continue;
+            }
+            if entry.last_access() >= idle_cutoff {
+                continue;
+            }
+            if !entry.block_states.lock().is_empty() {
+                continue;
+            }
+            if entry.total_cached_bytes() == 0 {
+                continue;
+            }
+            candidates.push((entry.last_access(), entry.cache_id.clone()));
+        }
+        candidates.sort_unstable_by_key(|(last_access, _)| *last_access);
+        candidates
+            .into_iter()
+            .map(|(_, cache_id)| cache_id)
+            .collect()
+    }
+
+    /// Reclaim the cached blocks of an open entry without removing the entry:
+    /// open handles keep working (reads miss and fall back to the source) and
+    /// later reads refill the entry normally.
+    async fn evict_open_entry_blocks(
+        state: &BackendState,
+        options: &FileCacheBackendOptions,
+        cache_id: &str,
+        counter: EvictionCounter,
+    ) -> u64 {
+        let Some(entry) = state
+            .cache_entries
+            .get(cache_id)
+            .and_then(|slot_ref| slot_ref.value().as_active().cloned())
+        else {
+            return 0;
+        };
+        // Re-validate after the lookup: the entry may have been closed (making
+        // it a closed-tier candidate) or started a refill.
+        if entry.open_count.load(Ordering::SeqCst) == 0 || !entry.block_states.lock().is_empty() {
+            return 0;
+        }
+        let released = match entry.evict_all_blocks().await {
+            Ok(bytes) => bytes,
+            Err(_) => return 0,
+        };
+        if released > 0 {
+            Self::subtract_current_bytes_for(state, options, released);
+            match counter {
+                EvictionCounter::Global => {
+                    state.evict_global.fetch_add(released, Ordering::Relaxed);
+                }
+                EvictionCounter::User => {
+                    state.evict_user.fetch_add(released, Ordering::Relaxed);
+                }
+            }
+        }
+        released
+    }
+
     async fn evict_entry(
         state: &BackendState,
         options: &FileCacheBackendOptions,
@@ -610,6 +686,28 @@ impl FileCacheBackend {
                 let bytes =
                     Self::evict_entry(state, options, &cache_id, EvictionCounter::Global).await;
                 actual_evict = actual_evict.saturating_sub(bytes);
+            }
+
+            // Tier 2: entries held open but idle give up their cached blocks.
+            // The entry survives so open files keep working and refill on
+            // their next read.
+            if actual_evict > 0 && !options.open_evict_idle.is_zero() {
+                let idle_nanos =
+                    u64::try_from(options.open_evict_idle.as_nanos()).unwrap_or(u64::MAX);
+                let idle_cutoff = now_unix_nanos().saturating_sub(idle_nanos);
+                for cache_id in Self::idle_open_cache_ids_by_lru(state, idle_cutoff) {
+                    if actual_evict == 0 {
+                        break;
+                    }
+                    let bytes = Self::evict_open_entry_blocks(
+                        state,
+                        options,
+                        &cache_id,
+                        EvictionCounter::Global,
+                    )
+                    .await;
+                    actual_evict = actual_evict.saturating_sub(bytes);
+                }
             }
         }
 

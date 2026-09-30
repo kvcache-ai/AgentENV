@@ -1251,6 +1251,9 @@ async fn test_open_entry_is_not_removed_by_eviction() {
     let mut opt = test_options(tmp.path());
     opt.capacity_bytes = 6 * 1024;
     opt.block_size = 4096;
+    // Open-entry block eviction disabled: capacity eviction must skip open
+    // entries entirely (the pre-existing behavior).
+    opt.open_evict_idle = std::time::Duration::ZERO;
     let backend = FileCacheBackend::with_options(opt).await.expect("backend");
 
     let payload_a = uniform_char_random_data(8192, 0xaaa1);
@@ -1438,6 +1441,10 @@ async fn test_ro_cached_fs_basic() {
         .expect("read full refill");
     assert_eq!(full.as_ref(), refill_payload.as_slice());
 
+    // Cached read results hold a read permit on the entry's refill/eviction
+    // barrier for their lifetime; release them before evicting the entry.
+    drop((got, got_again, mixed, mixed_again));
+
     // Ported from C++ commonTest refill(2) + fadvise(POSIX_FADV_WILLNEED).
     cached.evict_all().await.expect("evict all");
     assert_eq!(
@@ -1456,6 +1463,9 @@ async fn test_ro_cached_fs_basic() {
         .await
         .expect("read prefetched from cache-only");
     assert_eq!(prefetched.as_ref(), &payload[page_size..page_size * 3]);
+    // Same as above: release the read permit held by the cached read result
+    // before evicting the entry.
+    drop(prefetched);
 
     cached
         .fadvise(234, (5000 * page_size) as u64, CacheAdvice::WillNeed)
@@ -1783,6 +1793,9 @@ async fn test_cache_pool_style_rename_and_evict() {
         .await
         .expect("read renamed cache");
     assert_eq!(got.as_ref(), &payload[..4096]);
+    // The read result holds a read permit on the entry's barrier; release it
+    // before the entry is evicted below.
+    drop(got);
     drop(cache_only);
 
     backend
@@ -2085,6 +2098,9 @@ async fn test_cached_fs_facade_open_access_rename_and_unlink() {
     let got = cached.read_at(0, 4096).await.expect("cached read");
     assert_eq!(got.as_ref(), &payload[..4096]);
     assert!(backend.contains_src_name("/dir/file"));
+    // Release the read permit held by the cached read result before the
+    // entry is renamed and evicted below.
+    drop(got);
     drop(cached);
 
     cached_fs
@@ -2114,6 +2130,9 @@ async fn test_cached_fs_facade_open_access_rename_and_unlink() {
         .await
         .expect("read renamed cache");
     assert_eq!(got.as_ref(), &payload[..4096]);
+    // The read result holds a read permit on the entry's barrier; release it
+    // before the entry is evicted below.
+    drop(got);
     drop(cache_only);
 
     cached_fs
@@ -2261,6 +2280,9 @@ async fn test_cached_file_evict_does_not_forward_to_source() {
 
     let got = file.read_at(0, payload.len()).await.expect("fill cache");
     assert_eq!(got.as_ref(), payload.as_slice());
+    // The read result holds a read permit on the entry's barrier; release it
+    // before evicting below.
+    drop(got);
 
     file.evict_range(0, 4096).await.expect("evict range");
     file.evict_all().await.expect("evict all");
@@ -2755,5 +2777,203 @@ async fn test_failed_foreground_refill_leaves_no_reserved_blocks() {
             .blocks(),
         0,
         "failed refill must leave the data file fully sparse"
+    );
+}
+
+#[tokio::test]
+async fn test_read_falls_back_to_source_while_eviction_holds_write_lock() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut opt = test_options(tmp.path());
+    opt.block_size = 4096;
+    let backend = FileCacheBackend::with_options(opt).await.expect("backend");
+
+    let payload = uniform_char_random_data(4096, 0xdada);
+    let src = Arc::new(MockSource::new(payload.clone(), Duration::ZERO));
+    let file = backend
+        .open_file("guarded", src.clone())
+        .await
+        .expect("open");
+    let first = file.read_at(0, 4096).await.expect("fill");
+    assert_eq!(first.as_ref(), payload.as_slice());
+    assert_eq!(src.read_calls(), 1);
+    // The cached read holds a read permit on the barrier for its whole
+    // lifetime; release it before taking the write side below.
+    drop(first);
+
+    // 驱逐者持有写许可期间,读必须不阻塞并回源兜底(refill 与 read_block
+    // 的 try_read 都失败,按 miss 处理)。
+    let entry = backend
+        .get_cache_entry(&super::cache_key_digest("guarded"))
+        .expect("entry");
+    let _write = entry.refill_eviction_barrier.write().await;
+    let served = tokio::time::timeout(Duration::from_secs(5), file.read_at(0, 4096))
+        .await
+        .expect("read must not block behind eviction")
+        .expect("read under eviction");
+    assert_eq!(served.as_ref(), payload.as_slice());
+    assert_eq!(src.read_calls(), 2, "read must fall back to the source");
+    drop(_write);
+}
+
+#[tokio::test]
+async fn test_concurrent_reads_survive_open_entry_block_eviction() {
+    const BLOCK: usize = 4096;
+    const READERS: usize = 8;
+    const ITERS: usize = 500;
+
+    let tmp = tempdir().expect("create tempdir");
+    let mut opt = test_options(tmp.path());
+    opt.capacity_bytes = 1024 * 1024;
+    opt.block_size = BLOCK as u64;
+    let backend = FileCacheBackend::with_options(opt).await.expect("backend");
+
+    let payload = Arc::new(uniform_char_random_data(BLOCK, 0xc0de));
+    let src = Arc::new(MockSource::new(payload.to_vec(), Duration::ZERO));
+    let file = backend.open_file("hot", src).await.expect("open");
+    let _ = file.read_at(0, BLOCK).await.expect("fill");
+
+    let entry = backend
+        .get_cache_entry(&super::cache_key_digest("hot"))
+        .expect("entry");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let evictor = {
+        let entry = entry.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                let _ = entry.evict_all_blocks().await;
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+
+    let mut handles = Vec::new();
+    for _ in 0..READERS {
+        let file = file.clone();
+        let payload = payload.clone();
+        let stop = stop.clone();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..ITERS {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let got = file.read_at(0, BLOCK).await.expect("read");
+                assert_eq!(
+                    got.as_ref(),
+                    payload.as_slice(),
+                    "reader observed corrupted data (eviction raced a zero-copy read)"
+                );
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("reader panicked");
+    }
+    stop.store(true, Ordering::Relaxed);
+    evictor.await.expect("evictor panicked");
+}
+
+#[tokio::test]
+async fn test_idle_open_entries_are_block_evicted_under_pressure() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut opt = test_options(tmp.path());
+    opt.capacity_bytes = 6 * 1024;
+    opt.block_size = 4096;
+    opt.open_evict_idle = std::time::Duration::from_secs(60);
+    let backend = FileCacheBackend::with_options(opt).await.expect("backend");
+
+    let payload_a = uniform_char_random_data(4096, 0xaaa1);
+    let payload_b = uniform_char_random_data(4096, 0xbbb2);
+    let src_a = Arc::new(MockSource::new(payload_a.clone(), Duration::ZERO));
+    let src_b = Arc::new(MockSource::new(payload_b.clone(), Duration::ZERO));
+
+    // A、B 各钉住一个块并保持句柄打开(模拟长存活 sandbox)。
+    let file_a = backend
+        .open_file("open-a", src_a.clone())
+        .await
+        .expect("open a");
+    let file_b = backend
+        .open_file("open-b", src_b.clone())
+        .await
+        .expect("open b");
+    let _ = file_a.read_at(0, 4096).await.expect("fill a");
+    let _ = file_b.read_at(0, 4096).await.expect("fill b");
+    assert_eq!(src_a.read_calls(), 1);
+    assert_eq!(src_b.read_calls(), 1);
+
+    // 把 A 的 last_access 老化到阈值之外;B 保持新鲜。
+    let id_a = super::cache_key_digest("open-a");
+    backend
+        .get_cache_entry(&id_a)
+        .expect("entry a")
+        .last_access_nanos
+        .store(0, Ordering::Relaxed);
+
+    // 新模板 C:refill 触发压力驱逐,A 的 idle 块被回收,B(活跃)不受影响。
+    let payload_c = uniform_char_random_data(4096, 0xccc3);
+    let src_c = Arc::new(MockSource::new(payload_c.clone(), Duration::ZERO));
+    let file_c = backend
+        .open_file("open-c", src_c.clone())
+        .await
+        .expect("open c");
+    let got_c = file_c.read_at(0, 4096).await.expect("fill c");
+    assert_eq!(got_c.as_ref(), payload_c.as_slice());
+    assert_eq!(src_c.read_calls(), 1);
+
+    // 缓存满的情况下 C 仍然 populate 了自己的 entry。
+    let c_stats = backend.file_stats("open-c").expect("stats for c");
+    assert_eq!(c_stats.bytes_used, 4096);
+    // B 的块保留;A 的块被回收但 entry 存活。
+    let b_stats = backend.file_stats("open-b").expect("stats for b");
+    assert_eq!(b_stats.bytes_used, 4096);
+    let a_stats = backend.file_stats("open-a").expect("stats for a");
+    assert_eq!(a_stats.bytes_used, 0);
+
+    // A 再次读取时正常 refill,数据正确。
+    let reread = file_a.read_at(0, 4096).await.expect("reread a");
+    assert_eq!(reread.as_ref(), payload_a.as_slice());
+    assert_eq!(src_a.read_calls(), 2);
+}
+
+#[tokio::test]
+async fn test_concurrent_uncached_reads_fetch_source_once() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut opt = test_options(tmp.path());
+    opt.capacity_bytes = 4 * 4096;
+    opt.block_size = 4096;
+    let backend = FileCacheBackend::with_options(opt).await.expect("backend");
+
+    // 用一个保持打开的 filler entry 把缓存池真正钉满(open 且 last_access
+    // 新鲜,二层驱逐不会动它),使 is_full 在整个测试期间保持置位。
+    let filler_payload = uniform_char_random_data(4 * 4096, 0x1eaf);
+    let filler_src = Arc::new(MockSource::new(filler_payload, Duration::ZERO));
+    let filler = backend
+        .open_file("filler", filler_src)
+        .await
+        .expect("open filler");
+    let _ = filler.read_at(0, 4 * 4096).await.expect("fill pool");
+
+    let payload = uniform_char_random_data(4096, 0xfeed);
+    // 50ms 源延迟保证 8 个读者的回源窗口重叠。
+    let src = Arc::new(MockSource::new(payload.clone(), Duration::from_millis(50)));
+    let file = backend.open_file("dedup", src.clone()).await.expect("open");
+
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let file = file.clone();
+        let payload = payload.clone();
+        handles.push(tokio::spawn(async move {
+            let got = file.read_at(0, 4096).await.expect("read");
+            assert_eq!(got.as_ref(), payload.as_slice());
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("reader task");
+    }
+    assert_eq!(
+        src.read_calls(),
+        1,
+        "concurrent readers must share one source fetch"
     );
 }

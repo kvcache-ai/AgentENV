@@ -1575,6 +1575,7 @@ mod tests {
             root_dir,
             remote_blocks_size_gb: 10,
             capacity_bytes: None,
+            open_evict_idle_secs: 600,
         })
     }
 

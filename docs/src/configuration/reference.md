@@ -188,6 +188,7 @@ Overlaybd registryfs_v2 remote block cache settings. The directory is always
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_size_gb` | integer | `100` | Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd `cacheConfig.cacheSizeGB` |
+| `open_evict_idle_secs` | integer | `600` | Idle age in seconds after which a cache entry held open by a running sandbox may have its cached blocks reclaimed under capacity pressure. The entry is kept and refills on demand; `0` disables open-entry eviction. Written to generated overlaybd `cacheConfig.openEvictIdleSecs` and applies to both `remote-blocks` and `memory-blocks` caches |
 
 Resolved image data is cached under:
 

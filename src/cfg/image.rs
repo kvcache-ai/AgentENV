@@ -64,6 +64,13 @@ pub struct ImageCacheConfig {
 pub struct ImageRemoteBlocksCacheConfig {
     #[config(default = 10u32)]
     pub max_size_gb: u32,
+    /// Idle age in seconds after which a cache entry held open by a running
+    /// sandbox may have its cached blocks reclaimed under capacity pressure.
+    /// The entry is kept and refills on demand; 0 disables open-entry
+    /// eviction. Written to generated overlaybd `cacheConfig.openEvictIdleSecs`
+    /// for both the remote-blocks and memory-blocks caches.
+    #[config(default = 600u64)]
+    pub open_evict_idle_secs: u64,
 }
 
 /// Background hard-commit GC scheduling. When enabled it runs the
@@ -94,6 +101,7 @@ pub struct ResolvedImageCacheConfig {
     pub remote_blocks_dir: PathBuf,
     pub remote_blocks_size_gb: u32,
     pub capacity_bytes: Option<u64>,
+    pub open_evict_idle_secs: u64,
 }
 
 /// Resolved background hard-commit GC schedule.
@@ -138,6 +146,7 @@ impl ImageCacheConfig {
             root_dir,
             remote_blocks_size_gb,
             capacity_bytes,
+            open_evict_idle_secs: self.remote_blocks.open_evict_idle_secs,
         }
     }
 
@@ -230,6 +239,17 @@ impl ImageResolverConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layout_carries_open_evict_idle_secs() {
+        let mut config = ImageCacheConfig::default();
+        config.remote_blocks.open_evict_idle_secs = 120;
+        assert_eq!(config.layout().open_evict_idle_secs, 120);
+        assert_eq!(
+            ImageCacheConfig::default().layout().open_evict_idle_secs,
+            600
+        );
+    }
 
     #[test]
     fn validate_rejects_invalid_gc_watermarks() {
