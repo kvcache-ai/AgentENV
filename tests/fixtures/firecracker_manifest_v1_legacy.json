@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "vmState": {},
+  "memory": {
+    "virtualSize": 4096
+  },
+  "rootfs": {
+    "virtualSize": 4096
+  },
+  "attachedDrives": []
+}
