@@ -1,7 +1,7 @@
 name: build-images
 on:
   push:
-    branches: [prometheus-main]
+    branches: [main]
   workflow_dispatch: {}
 
 # The page job pushes gh-pages; default token perms can be read-only.
@@ -45,7 +45,7 @@ jobs:
           push: true
           tags: |
             ${{ env.REGISTRY }}/agentenv-${{ matrix.component }}:${{ steps.tag.outputs.tag }}
-            ${{ env.REGISTRY }}/agentenv-${{ matrix.component }}:prometheus-main
+            ${{ env.REGISTRY }}/agentenv-${{ matrix.component }}:main
   page:
     needs: build
     runs-on: ubuntu-latest

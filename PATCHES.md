@@ -1,13 +1,16 @@
 # Prometheus patch stack
 
-Base: upstream `6e8deea` (the ref deployed in fl2024008/prometheus PR #21749).
-Branch `prometheus-main` carries our patches, rebased (never merged) so
-`git log upstream/main..prometheus-main` is always the exact stack. New
-patches land as PRs against `prometheus-main`.
-Upstream catch-up: rebase `prometheus-main` onto a new upstream ref
-deliberately, then re-run CI and roll pods per the OnDelete runbook.
+Base: upstream `875faee`. The same stack on the previously deployed base
+`6e8deea` stays on branch `prometheus-main` (last build `63a6d1d`).
+Branch `main` carries our patches on top of upstream. The `push` ruleset makes
+it append-only (PRs with one approval, no force-push), so
+`git log --no-merges upstream/main..main` is always the exact stack. New
+patches land as PRs against `main`, merged with "Rebase and merge".
+Upstream catch-up: open a PR that merges a chosen upstream ref into `main`
+("Create a merge commit"), then re-run CI and roll pods per the OnDelete
+runbook.
 
-Builds: every push to `prometheus-main` runs `build-images`, which pushes
+Builds: every push to `main` runs `build-images`, which pushes
 `agentenv-{runtime,gateway,scheduler}:<short-sha>` to OCIR and records the
 build on the `gh-pages` builds page. `.github/scripts/build-od5.sh` builds the
 same images from a local checkout on the od5 buildkit lane. Deployments pin
