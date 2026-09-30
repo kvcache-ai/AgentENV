@@ -34,7 +34,8 @@ permissions:
 
 jobs:
   agentenv-tests:
-    runs-on: ubuntu-latest
+    # Org-managed GitHub runner: Ubuntu x64, 8 vCPU, 32 GB RAM, 300 GB SSD.
+    runs-on: ubuntu-24.04-8core
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/rust-ci-setup
@@ -51,7 +52,8 @@ jobs:
 
   e2e-tests:
     name: e2e-tests (${{ matrix.e2e_name }})
-    runs-on: ubuntu-latest
+    # Org-managed GitHub runner: Ubuntu x64, 8 vCPU, 32 GB RAM, 300 GB SSD.
+    runs-on: ubuntu-24.04-8core
     strategy:
       fail-fast: false
       matrix:
