@@ -1,7 +1,7 @@
 """Append a build record to gh-pages builds.json and regenerate index.html.
 
 The page is the pick-a-tag surface for the agentenv deploy: each row carries
-the exact `image.tag` value to set in values-agentenv-rn-od5.yaml.
+the exact `image.tag` value to set in infra/agentenv/chart/values.yaml.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ PAGE = """<!doctype html>
 </style></head><body>
 <h1>agentenv image builds</h1>
 <p>Deploy a build: set <code>image.tag: &lt;tag&gt;</code> in
-<code>infra/agentenv/chart/values-agentenv-rn-od5.yaml</code> (registry
+<code>infra/agentenv/chart/values.yaml</code> (registry
 <code>{registry}</code>), helm upgrade, then roll node pods per the OnDelete
 runbook. Newest first.</p>
 <table>
