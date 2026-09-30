@@ -1689,6 +1689,12 @@ paths:
           $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
+        "503":
+          description: Runtime admission is temporarily blocked by disk pressure
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /templates/{templateID}/builds/{buildID}/builder:
     description: Build a template from a Dockerfile
@@ -1760,12 +1766,6 @@ paths:
           $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
-        "503":
-          description: Runtime admission is temporarily blocked by disk pressure
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Error"
 
   /v2/sandboxes:
     post:

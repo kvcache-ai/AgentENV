@@ -774,7 +774,7 @@ where
                                                       })).await.unwrap()?;
                                                   response.body(Body::from(body_content))
                                                 },
-                                                apis::sandboxes::SandboxesColdPostResponse::Status503_ServiceUnavailable
+                                                apis::sandboxes::SandboxesColdPostResponse::Status503_RuntimeAdmissionIsTemporarilyBlockedByDiskPressure
                                                     (body)
                                                 => {
                                                   let mut response = response.status(503);

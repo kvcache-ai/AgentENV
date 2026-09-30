@@ -675,7 +675,7 @@ impl Sandboxes<()> for ApiImpl {
         if let Err(err) = self.orchestrator.ensure_disk_admission("create") {
             return Ok(match err {
                 err @ OrchestratorError::AdmissionBlocked { .. } => {
-                    SandboxesColdPostResponse::Status503_ServiceUnavailable(err.into())
+                    SandboxesColdPostResponse::Status503_RuntimeAdmissionIsTemporarilyBlockedByDiskPressure(err.into())
                 }
                 err => SandboxesColdPostResponse::Status500_ServerError(Self::internal_error(&err)),
             });
@@ -690,7 +690,7 @@ impl Sandboxes<()> for ApiImpl {
         {
             Ok(resolved) => resolved,
             Err(err @ ImageError::AdmissionBlocked { .. }) => {
-                return Ok(SandboxesColdPostResponse::Status503_ServiceUnavailable(
+                return Ok(SandboxesColdPostResponse::Status503_RuntimeAdmissionIsTemporarilyBlockedByDiskPressure(
                     Self::error(503, err.to_string()),
                 ));
             }
@@ -727,7 +727,7 @@ impl Sandboxes<()> for ApiImpl {
             Err(err) => {
                 warn!(error = %err.message, "failed to resolve attached drives");
                 if err.code == 503 {
-                    return Ok(SandboxesColdPostResponse::Status503_ServiceUnavailable(err));
+                    return Ok(SandboxesColdPostResponse::Status503_RuntimeAdmissionIsTemporarilyBlockedByDiskPressure(err));
                 }
                 return Ok(Self::client_or_server_response(
                     err,
@@ -849,7 +849,7 @@ impl Sandboxes<()> for ApiImpl {
                 )
             }
             Err(err @ OrchestratorError::AdmissionBlocked { .. }) => Ok(
-                SandboxesColdPostResponse::Status503_ServiceUnavailable(err.into()),
+                SandboxesColdPostResponse::Status503_RuntimeAdmissionIsTemporarilyBlockedByDiskPressure(err.into()),
             ),
             Err(err) => {
                 let _ = finish_volume_reservation(

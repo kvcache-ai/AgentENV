@@ -214,10 +214,23 @@ where
         let persister = FileBackedSandboxPersister::new(
             config.orchestrator.persisted_sandbox_store_path.clone(),
             config.virtualization_mode,
+        )
+        .with_cleanup_journal_reserve_bytes(
+            config
+                .disk_policy
+                .cleanup_journal_reserve_mb
+                .saturating_mul(1024 * 1024),
         );
         let image_refs = local_image_services_from_global_config().runtime_refs;
-        Self::new_inner_with_volumes(store, factory, persister, image_refs, Some(volume_manager))
-            .await
+        Self::new_inner_with_volumes(
+            store,
+            factory,
+            persister,
+            image_refs,
+            Some(volume_manager),
+            LifecycleTimeouts::from(&config.orchestrator),
+        )
+        .await
     }
 }
 
@@ -246,7 +259,7 @@ where
         image_refs: Arc<dyn RuntimeImageRefs>,
         timeouts: LifecycleTimeouts,
     ) -> Result<Arc<Self>> {
-        Self::new_inner_with_volumes(store, factory, persister, image_refs, None).await
+        Self::new_inner_with_volumes(store, factory, persister, image_refs, None, timeouts).await
     }
 
     async fn new_inner_with_volumes(
@@ -255,6 +268,7 @@ where
         persister: P,
         image_refs: Arc<dyn RuntimeImageRefs>,
         volume_manager: Option<Arc<VolumeManager>>,
+        timeouts: LifecycleTimeouts,
     ) -> Result<Arc<Self>> {
         let app_config = ConfigManager::global_config();
         let config = &app_config.orchestrator;
@@ -2571,7 +2585,7 @@ where
             if metadata.state != SandboxState::Running {
                 continue;
             }
-            let _pause_permit = if metadata.timeout_action == SandboxTimeoutAction::Pause {
+            let _pause_permit = if matches!(metadata.timeout_action, SandboxTimeoutAction::Pause) {
                 if let Err(err) = self.ensure_pause_admission(PauseOrigin::AutoEvict) {
                     warn!(sandbox_id = %metadata.id, error = ?err, "auto-pause admission refused");
                     continue;
@@ -3241,10 +3255,11 @@ where
 
         let sandbox_id = resume.sandbox_id;
         let paused_state = Arc::clone(&resume.paused_state);
+        let access_token = resume.envd_access_token.clone();
         let this = Arc::clone(self);
         let mut build = tokio::task::spawn_blocking(move || {
             this.factory
-                .build_from_paused_state(sandbox_id, paused_state.as_ref())
+                .build_from_paused_state(sandbox_id, paused_state.as_ref(), access_token)
         });
 
         let build_result = match tokio::time::timeout(self.timeouts.backend_build, &mut build).await

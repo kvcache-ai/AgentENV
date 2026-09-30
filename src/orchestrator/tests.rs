@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::json;
@@ -3045,6 +3044,7 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
         DisabledSandboxPersister,
         test_runtime_image_refs(),
         Some(volumes.clone()),
+        test_lifecycle_timeouts(),
     )
     .await?;
     let sandbox = orchestrator
@@ -3307,6 +3307,7 @@ async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyh
         DisabledSandboxPersister,
         test_runtime_image_refs(),
         Some(volumes.clone()),
+        test_lifecycle_timeouts(),
     )
     .await?;
     let sandbox = orchestrator
@@ -3955,9 +3956,17 @@ async fn delete_reports_persistence_failure_and_retries_exact_cleanup() -> Resul
         .await
         .expect_err("persistence cleanup failure must fail deletion");
 
+    let OrchestratorError::SandboxOperationFailed {
+        operation: SandboxOperation::Stop,
+        source,
+        ..
+    } = err
+    else {
+        panic!("cleanup failure should be reported by the deletion operation: {err}");
+    };
     assert!(matches!(
-        err,
-        OrchestratorError::SandboxPersistenceFailed(_)
+        source.downcast_ref::<OrchestratorError>(),
+        Some(OrchestratorError::SandboxPersistenceFailed(_))
     ));
     assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
     orchestrator.delete_sandbox(created.id).await?;
@@ -3967,7 +3976,6 @@ async fn delete_reports_persistence_failure_and_retries_exact_cleanup() -> Resul
             RecordingCall::DeleteRecordAndArtifacts,
             RecordingCall::DeleteRecordAndArtifacts,
             RecordingCall::DeleteRecordAndArtifacts,
-            RecordingCall::DeleteIfPersisted,
             RecordingCall::DeleteRecordAndArtifacts,
         ]
     );
@@ -6339,7 +6347,7 @@ async fn sandbox_metrics_history_latest_pause_generation_and_retention() {
     let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
     let id = SandboxId::new();
     add_metrics_runtime(&orchestrator, id, Arc::new(MockBehavior::new())).await;
-    let now = Instant::now();
+    let now = std::time::Instant::now();
     for timestamp in [10, 30, 20] {
         orchestrator.sandbox_metrics.lock().await.insert(
             id,

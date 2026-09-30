@@ -1060,7 +1060,7 @@ mod tests {
             None,
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
-            "",
+            "https://registry.example/v2/base/blobs",
             std::slice::from_ref(&cache_root),
             OverlaybdCompactOutput::Raw,
         )
@@ -1173,7 +1173,7 @@ mod tests {
             None,
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
-            "",
+            "https://registry.example/v2/base/blobs",
             &[],
             OverlaybdCompactOutput::Raw,
         )
@@ -1255,7 +1255,7 @@ mod tests {
             None,
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
-            "",
+            "https://registry.example/v2/base/blobs",
             &[],
             OverlaybdCompactOutput::Raw,
         )

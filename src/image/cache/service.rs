@@ -2391,7 +2391,7 @@ mod tests {
             ("sha256:memory", memory.clone(), 6),
         ] {
             service
-                .record_hard_commit_object(digest, Some(file), Some(size))
+                .record_hard_commit_object(digest, Some(file), Some(size), &[])
                 .await
                 .expect("record hard commit");
         }
@@ -2469,6 +2469,7 @@ mod tests {
                         &digest,
                         Some(commit.clone()),
                         Some(payload.len() as u64),
+                        &[],
                     )
                     .await
                     .expect("record stress commit");
@@ -2545,7 +2546,7 @@ mod tests {
         let service = Arc::new(test_service(&temp));
         let commit = write_commit_file(&service, "sha256:racing", b"racing");
         service
-            .record_hard_commit_object("sha256:racing", Some(commit.clone()), Some(6))
+            .record_hard_commit_object("sha256:racing", Some(commit.clone()), Some(6), &[])
             .await
             .expect("record racing commit");
         let config = temp.path().join("paused/image.json");
@@ -2590,7 +2591,7 @@ mod tests {
         let service = Arc::new(test_service(&temp));
         let commit = write_commit_file(&service, "sha256:operation-race", b"operation");
         service
-            .record_hard_commit_object("sha256:operation-race", Some(commit.clone()), Some(9))
+            .record_hard_commit_object("sha256:operation-race", Some(commit.clone()), Some(9), &[])
             .await
             .expect("record operation commit");
         let reached = Arc::new(Semaphore::new(0));

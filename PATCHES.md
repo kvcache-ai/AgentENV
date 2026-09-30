@@ -13,8 +13,10 @@ runbook.
 Builds: every push to `main` runs `build-images`, which pushes
 `agentenv-{runtime,gateway,scheduler}:<short-sha>` to OCIR and records the
 build on the `gh-pages` builds page. `.github/scripts/build-od5.sh` builds the
-same images from a local checkout on the od5 buildkit lane. Deployments pin
-the tag in fl2024008/prometheus `infra/agentenv/chart/values.yaml`.
+same images from a local checkout on the od5 buildkit lane. The shared production deployment PR in fl2024008/prometheus pins component
+source commits in `infra/agentenv/production/release.json` and consumes those
+published tags; it does not rebuild this repository. Existing manual deployments
+still pin images in their chart values.
 
 | Patch | Why |
 |---|---|
@@ -36,6 +38,14 @@ patch stack. The registry mirror change above was already present.
   binding retention for unready nodes, and larger gateway fleet responses.
 - Missing-layer blob fetches, lifecycle metrics, bounded guest probes, and
   bounded guest telemetry (see [tools-image notes](tools-image/envd-bounded-telemetry.md)).
+
+### Port to the newer upstream base
+
+This stack preserves the upstream guest access tokens, template-builder lifecycle,
+volume cleanup/retry state, and expiry rechecks introduced since `6e8deea`.
+BuildKit content imports use the same conversion semaphore and disk headroom
+checks as registry pulls; cached layers still avoid blob downloads. API and
+scheduler bindings are regenerated from their schemas.
 
 ### Admission and recovery behavior
 

@@ -251,6 +251,7 @@ impl EnvdInstance {
     > {
         Box::pin(async move {
             let probe = async move {
+                self.ensure_live().map_err(|error| error.to_string())?;
                 let request = Request::new(StartRequest {
                     process: Some(ProcessConfig {
                         cmd: "/agentenv/bin/busybox".to_string(),
@@ -486,7 +487,7 @@ mod tests {
             health_probe_timeout_ms: 20,
             ..Default::default()
         };
-        let envd = EnvdInstance::new_with_config(format!("http://{address}"), &config);
+        let envd = EnvdInstance::new_with_config(format!("http://{address}"), None, &config);
         let waiting = tokio::spawn(async move {
             envd.wait_for_ready(Duration::from_secs(3), Duration::from_millis(1))
                 .await
@@ -532,6 +533,11 @@ mod tests {
 
         assert!(stale.process_client().await.is_err());
         assert!(stale.filesystem_client().await.is_err());
+        assert!(stale
+            .probe_boot_ready(Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .contains("no longer active"));
     }
 
     #[tokio::test]

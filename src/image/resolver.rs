@@ -128,6 +128,12 @@ impl ImageResolver {
             ));
         }
         let mut conversion = source.begin_conversion().await?;
+        let _conversion_permit = self
+            .conversion_permits
+            .acquire()
+            .await
+            .expect("image conversion semaphore is never closed");
+        self.ensure_conversion_headroom()?;
         let image = oci_image::convert_content_image(
             content,
             &fetched,

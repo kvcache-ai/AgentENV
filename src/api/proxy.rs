@@ -800,9 +800,9 @@ async fn try_auto_resume(
             debug!(sandbox_id = %sandbox_id, "sandbox auto-resume completed");
             Ok(())
         }
-        Ok(Err(OrchestratorError::AdmissionBlocked { .. })) => Err(proxy_error_response(
-            &ProxyRequestError::AutoResumeAdmissionBlocked(sandbox_id),
-        )),
+        Ok(Err(OrchestratorError::AdmissionBlocked { .. })) => {
+            Err(ProxyRequestError::AutoResumeAdmissionBlocked(sandbox_id))
+        }
         Ok(Err(err)) => {
             warn!(sandbox_id = %sandbox_id, error = %err, "sandbox auto-resume failed");
             Err(ProxyRequestError::AutoResumeFailed(sandbox_id))
