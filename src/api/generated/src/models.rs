@@ -4257,7 +4257,9 @@ impl std::str::FromStr for Node {
             let val = match string_iter.next() {
                 Some(x) => x,
                 None => {
-                    return std::result::Result::Err("Missing value while parsing Node".to_string());
+                    return std::result::Result::Err(
+                        "Missing value while parsing Node".to_string(),
+                    );
                 }
             };
 
