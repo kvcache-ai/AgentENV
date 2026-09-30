@@ -2,8 +2,9 @@ SHELL := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
 .DEFAULT_GOAL := build
 
-TOOLS_VERSION ?= 0.1.1
-ENVD_REF ?= 2026.17
+REPO_ROOT := ..
+TOOLS_VERSION ?= 0.1.1-envd-bounded.1
+ENVD_REF ?= 9c3b7c5dbd181ba819084276b8228f70936e911e
 ENVD_UPSTREAM_REPO ?= https://github.com/e2b-dev/infra.git
 HOST_MACHINE := $(shell uname -m)
 ifeq ($(HOST_MACHINE),x86_64)

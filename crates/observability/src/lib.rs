@@ -30,6 +30,24 @@ const ZFILE_FINE_DURATION_BUCKETS: &[f64] = &[
 
 static PROMETHEUS_HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
+const CREATE_COLD_STAGES: [&str; 3] = [
+    "resolve_rootfs",
+    "resolve_attached_drives",
+    "create_sandbox",
+];
+
+/// Publish explicit zero values before the first cold-create request.
+pub fn initialize_sandbox_stage_metrics() {
+    for stage in CREATE_COLD_STAGES {
+        metrics::gauge!(
+            "agentenv_sandbox_stage_inflight",
+            "operation" => "create_cold",
+            "stage" => stage,
+        )
+        .set(0.0);
+    }
+}
+
 pub fn init_prometheus_recorder() -> anyhow::Result<()> {
     // Startup code can call init more than once in tests; only a true
     // concurrent first initialization is treated as an error.
@@ -88,4 +106,25 @@ pub async fn serve_metrics(
     )
     .with_graceful_shutdown(shutdown)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    use super::{initialize_sandbox_stage_metrics, CREATE_COLD_STAGES};
+
+    #[test]
+    fn initializes_create_cold_stage_metrics_at_zero() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, initialize_sandbox_stage_metrics);
+        let rendered = handle.render();
+
+        for stage in CREATE_COLD_STAGES {
+            assert!(rendered.contains(&format!(
+                "agentenv_sandbox_stage_inflight{{operation=\"create_cold\",stage=\"{stage}\"}} 0"
+            )));
+        }
+    }
 }

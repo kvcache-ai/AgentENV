@@ -4,6 +4,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 use tracing::{info, trace, warn};
 
 use super::cache::{local_image_services_from_app_config, CachedImageConfig, SourceImageStore};
@@ -11,10 +12,12 @@ use super::oci_image::{self, ResolvedImage};
 use super::reference::{image_ref_candidates, registry_host_of};
 use super::{ImageBaseContext, ImageError, ImageResolutionMetadata, ImageResult};
 use crate::cfg::AppConfig;
+use crate::disk_policy::{DiskUsageSource, SampledDiskUsage};
 use crate::image::oci_image::ImageFormat;
 use crate::observability::prometheus::MetricGuard;
 
 const IMAGE_RESOLVE_STAGE_DURATION: &str = "agentenv_image_resolve_stage_duration_seconds";
+const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 
 /// artifactType published by accelerated-container-image (`obdconv`) for
 /// overlaybd-native images.
@@ -63,6 +66,10 @@ pub struct ImageResolver {
     allowed_registries: Option<Vec<String>>,
     try_referrers_overlaybd_prefixes: Vec<String>,
     convert_standard_oci: bool,
+    conversion_permits: Semaphore,
+    conversion_min_free_bytes: u64,
+    disk_hard_watermark_ratio: f64,
+    disk_usage: SampledDiskUsage,
 }
 
 impl ImageResolver {
@@ -83,6 +90,14 @@ impl ImageResolver {
                 .try_referrers_overlaybd_prefixes
                 .clone(),
             convert_standard_oci: config.image.resolver.convert_standard_oci,
+            conversion_permits: Semaphore::new(config.image.resolver.max_concurrent_conversions),
+            conversion_min_free_bytes: config
+                .image
+                .resolver
+                .min_free_disk_gb
+                .saturating_mul(BYTES_PER_GIB),
+            disk_hard_watermark_ratio: config.disk_policy.admission_hard_watermark_ratio,
+            disk_usage: SampledDiskUsage::for_paths(vec![config.image.cache.root_dir.clone()]),
         }
     }
 
@@ -376,6 +391,12 @@ impl ImageResolver {
         .increment(1);
 
         let mut conversion = source.begin_conversion().await?;
+        let _conversion_permit = self
+            .conversion_permits
+            .acquire()
+            .await
+            .expect("image conversion semaphore is never closed");
+        self.ensure_conversion_headroom()?;
 
         let mut metric = MetricGuard::stage(IMAGE_RESOLVE_STAGE_DURATION, "config_fetch");
         let image_config_metadata = oci_image::fetch_oci_image_config_metadata(
@@ -425,6 +446,36 @@ impl ImageResolver {
             image_config_path,
             image_config_metadata,
         ))
+    }
+
+    fn ensure_conversion_headroom(&self) -> ImageResult<()> {
+        let usage = self
+            .disk_usage
+            .collect()
+            .map_err(|error| ImageError::AdmissionBlocked {
+                reason: format!("image conversion refused: {error}"),
+            })?;
+        let filesystem = &usage[0];
+        let available_bytes = filesystem.available_bytes;
+        let used_ratio = filesystem.used_ratio();
+        if used_ratio >= self.disk_hard_watermark_ratio {
+            metrics::counter!("agentenv_image_conversion_rejected_total", "reason" => "disk_hard_limit")
+                .increment(1);
+            return Err(ImageError::AdmissionBlocked {
+                reason: "image conversion refused: total filesystem use is above the admission hard watermark".to_string(),
+            });
+        }
+        if available_bytes < self.conversion_min_free_bytes {
+            metrics::counter!("agentenv_image_conversion_rejected_total", "reason" => "disk_headroom")
+                .increment(1);
+            return Err(ImageError::AdmissionBlocked {
+                reason: format!(
+                    "image conversion refused: image-cache filesystem has {available_bytes} bytes available, below the configured {}-byte reserve",
+                    self.conversion_min_free_bytes
+                ),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -732,6 +783,27 @@ mod tests {
         let resolver = ImageResolver::new(&config);
 
         assert_eq!(resolver.default_image(), "ghcr.io/example/base:latest");
+    }
+
+    #[test]
+    fn resolver_uses_conversion_limits() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = AppConfig {
+            image: ImageConfig {
+                resolver: ImageResolverConfig {
+                    max_concurrent_conversions: 8,
+                    min_free_disk_gb: 123,
+                    ..ImageResolverConfig::default()
+                },
+                ..ImageConfig::default()
+            },
+            ..AppConfig::default()
+        };
+        ImageConfig::normalize(&mut config.image, temp.path(), temp.path());
+        let resolver = ImageResolver::new(&config);
+
+        assert_eq!(resolver.conversion_permits.available_permits(), 8);
+        assert_eq!(resolver.conversion_min_free_bytes, 123 * BYTES_PER_GIB);
     }
 
     #[test]

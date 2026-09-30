@@ -368,6 +368,7 @@ impl ObservabilityReporter {
     ) -> scheduler::HeartbeatRequest {
         scheduler::HeartbeatRequest {
             node_id: snapshot.node_id,
+            runtime_family_id: snapshot.runtime_family_id,
             cluster_id: snapshot.cluster_id.to_string(),
             service_instance_id: snapshot.service_instance_id,
             version: snapshot.version,
@@ -407,6 +408,25 @@ impl ObservabilityReporter {
                 paused_sandbox_count: snapshot.paused_sandbox_count,
                 paused_allocated_cpu: snapshot.metrics.paused_allocated_cpu,
                 paused_allocated_memory_bytes: snapshot.metrics.paused_allocated_memory_bytes,
+                accepting_sandboxes: Some(snapshot.metrics.accepting_sandboxes),
+                admission_reason: match snapshot.metrics.admission_reason {
+                    "ready" => scheduler::AdmissionReason::Ready.into(),
+                    "disk_cleanup" => scheduler::AdmissionReason::DiskCleanup.into(),
+                    "disk_hard_limit" => scheduler::AdmissionReason::DiskHardLimit.into(),
+                    "cleanup_debt" => scheduler::AdmissionReason::CleanupDebt.into(),
+                    _ => scheduler::AdmissionReason::Unspecified.into(),
+                },
+                disk_total_bytes: snapshot.metrics.disk_total_bytes,
+                disk_used_bytes: snapshot.metrics.disk_used_bytes,
+                disk_available_bytes: snapshot.metrics.disk_available_bytes,
+                cleanup_pending: snapshot.metrics.cleanup_pending,
+                cleanup_retries: snapshot.metrics.cleanup_retries,
+                cleanup_failures: snapshot.metrics.cleanup_failures,
+                pruned_generations: snapshot.metrics.pruned_generations,
+                reclaimed_snapshot_bytes: snapshot.metrics.reclaimed_snapshot_bytes,
+                reserved_cleanup_journal_bytes: snapshot.metrics.reserved_cleanup_journal_bytes,
+                reclaimed_log_bytes: snapshot.metrics.reclaimed_log_bytes,
+                disk_admission_rejections: snapshot.metrics.disk_admission_rejections,
             }),
             sandbox_ids: snapshot
                 .sandbox_ids

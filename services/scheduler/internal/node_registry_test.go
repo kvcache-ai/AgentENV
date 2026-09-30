@@ -48,6 +48,53 @@ func TestNodeRegistryHeartbeatRejectsUnknownNode(t *testing.T) {
 	}
 }
 
+func TestHeartbeatRejectsDuplicateLiveRuntimeFamily(t *testing.T) {
+	registry := NewAtomicNodeRegistry([]Node{
+		{ID: "node-a", Endpoint: "http://node-a"},
+		{ID: "node-b", Endpoint: "http://node-b"},
+	}, 30*time.Second)
+	now := time.Unix(100, 0)
+
+	_, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+		NodeId: "node-a", ServiceInstanceId: "svc-a", RuntimeFamilyId: "family-a",
+	}, now)
+	if err != nil {
+		t.Fatalf("first heartbeat: %v", err)
+	}
+	_, _, err = registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+		NodeId: "node-b", ServiceInstanceId: "svc-b", RuntimeFamilyId: "family-a",
+	}, now.Add(time.Second))
+	if !errors.Is(err, ErrRuntimeFamilyConflict) {
+		t.Fatalf("expected ErrRuntimeFamilyConflict, got %v", err)
+	}
+}
+
+func TestHeartbeatReplacesExpiredRuntimeFamilyRegistration(t *testing.T) {
+	registry := NewAtomicNodeRegistry([]Node{
+		{ID: "node-a", Endpoint: "http://node-a"},
+		{ID: "node-b", Endpoint: "http://node-b"},
+	}, time.Second)
+	start := time.Unix(100, 0)
+
+	_, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+		NodeId: "node-a", ServiceInstanceId: "svc-a", RuntimeFamilyId: "family-a",
+	}, start)
+	if err != nil {
+		t.Fatalf("first heartbeat: %v", err)
+	}
+	_, _, err = registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+		NodeId: "node-b", ServiceInstanceId: "svc-b", RuntimeFamilyId: "family-a",
+	}, start.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("replacement heartbeat: %v", err)
+	}
+
+	observed, ok := registry.GetObserved("node-b", "", start.Add(2*time.Second))
+	if !ok || observed.GetRuntimeFamilyId() != "family-a" {
+		t.Fatalf("unexpected replacement registration: %+v", observed)
+	}
+}
+
 func TestObservedNodeBecomesUnhealthyAfterTTL(t *testing.T) {
 	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, time.Second)
 	start := time.Unix(100, 0)
@@ -485,5 +532,29 @@ func TestMultiClusterCpuIntersectionsAreIndependent(t *testing.T) {
 		var c cpuConfig
 		_ = json.Unmarshal([]byte(r), &c)
 		t.Errorf("cluster-y y1: got unexpected second delivery %v", c)
+	}
+}
+
+func TestSchedulingRejectsExpiredHeartbeatAndRecoversOnRefresh(t *testing.T) {
+	node := Node{ID: "node-a", Endpoint: "http://node-a"}
+	registry := NewAtomicNodeRegistry([]Node{node}, defaultObservedReportTTL)
+	request := &schedulerv1.HeartbeatRequest{
+		NodeId:            node.ID,
+		ServiceInstanceId: "svc-a",
+		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+	}
+	if _, _, err := registry.Heartbeat(request, time.Now().Add(-2*defaultObservedReportTTL)); err != nil {
+		t.Fatal(err)
+	}
+	candidates := []RichNode{{Node: node, Snapshot: registry.PeekObserved(node.ID)}}
+	if got := FilterByResourceLimit(candidates, nil); len(got) != 0 {
+		t.Fatalf("expired heartbeat remained eligible: %v", got)
+	}
+	if _, _, err := registry.Heartbeat(request, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	candidates[0].Snapshot = registry.PeekObserved(node.ID)
+	if got := FilterByResourceLimit(candidates, nil); len(got) != 1 {
+		t.Fatalf("fresh heartbeat did not restore eligibility: %v", got)
 	}
 }

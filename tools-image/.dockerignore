@@ -3,3 +3,5 @@
 !init
 !pivot-init
 !Makefile
+!envd/
+!envd/**

@@ -7,8 +7,7 @@
 //!   inspection, layer digests are checked against the OCI→commit indexes. If
 //!   every layer already has a converted `.commit` in the content-addressed
 //!   commit cache, no blobs are downloaded. Missing cache entries trigger a
-//!   background `regctl image copy` into a staging OCI layout; conversion waits
-//!   only for the next needed layer blob to appear, and still applies layers
+//!   `regctl blob get` for only that layer; conversion still applies layers
 //!   strictly in image order.
 //!
 //! * **Overlaybd-native layers** (mediaType advertises the overlaybd/zfile
@@ -37,9 +36,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
 use overlaybd::tools::{ConvertLayerRequest, OverlaybdTools};
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::{Builder, Uuid};
 
@@ -57,7 +54,6 @@ use crate::p2p::P2pArtifactKey;
 const REGCTL_GOMAXPROCS: &str = "4";
 pub(crate) const REGCTL_RETRY_ATTEMPTS: u32 = 5;
 pub(crate) const REGCTL_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
-const OCI_LAYER_BLOB_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_INDEX_RESOLUTION_DEPTH: usize = 4;
 /// Virtual block-device size baked into every converted overlaybd layer. The
 /// VM sees this as the rootfs device capacity; actual storage is only what the
@@ -298,7 +294,7 @@ pub(crate) async fn convert_fetched_oci_image_to_overlaybd(
             info!(
                 image = image_ref,
                 layers = manifest.layers.len(),
-                "source image is standard OCI; starting background image copy because at least one converted layer is missing"
+                "source image is standard OCI; fetching only missing layer blobs"
             );
             let work = sink.create_temp_staging_dir()?;
             let selected_image_ref = fetched.selected_image_ref.as_str();
@@ -308,7 +304,6 @@ pub(crate) async fn convert_fetched_oci_image_to_overlaybd(
                 virtual_size_gib: LAYER_VIRTUAL_SIZE_GIB,
             };
             let lowers = convert_standard_oci_layers_pipeline(
-                conversion.regctl_binary,
                 manifest,
                 selected_image_ref,
                 work.path(),
@@ -382,7 +377,6 @@ impl OverlaybdLayerConverter {
 }
 
 async fn convert_standard_oci_layers_pipeline(
-    regctl_binary: &Path,
     manifest: &OciManifest,
     image_ref: &str,
     work_root: &Path,
@@ -390,9 +384,12 @@ async fn convert_standard_oci_layers_pipeline(
     sink: &mut dyn ImageConversion,
     converter: &OverlaybdLayerConverter,
 ) -> Result<Vec<LocalLayer>> {
-    let layout_dir = work_root.join("oci");
-    let mut producer = RegctlImageCopyProducer::start(regctl_binary, image_ref, layout_dir).await?;
-    let result = convert_standard_oci_layers_pipeline_inner(
+    let mut producer = RegistryLayerSource {
+        regctl_binary: conversion.regctl_binary,
+        image_ref,
+        work: work_root,
+    };
+    convert_standard_oci_layers_pipeline_inner(
         manifest,
         image_ref,
         work_root,
@@ -401,27 +398,7 @@ async fn convert_standard_oci_layers_pipeline(
         converter,
         &mut producer,
     )
-    .await;
-    match result {
-        Ok(lowers) => {
-            if let Err(err) = producer.abort().await {
-                warn!(
-                    error = %err,
-                    "failed to cleanly abort background regctl image copy after successful conversion"
-                );
-            }
-            Ok(lowers)
-        }
-        Err(err) => {
-            if let Err(abort_err) = producer.abort().await {
-                warn!(
-                    error = %abort_err,
-                    "failed to cleanly abort background regctl image copy after conversion failure"
-                );
-            }
-            Err(err)
-        }
-    }
+    .await
 }
 
 async fn convert_standard_oci_layers_pipeline_inner(
@@ -457,7 +434,7 @@ async fn convert_standard_oci_layers_pipeline_inner(
         let blob_path = producer
             .wait_layer_blob(idx, layer)
             .await
-            .with_context(|| format!("wait for copied layer {} ({})", idx, layer.digest))?;
+            .with_context(|| format!("fetch layer {} ({})", idx, layer.digest))?;
         let layer_work = work_root.join(format!("layer-{idx}"));
 
         let layer_commit = converter
@@ -484,19 +461,6 @@ async fn convert_standard_oci_layers_pipeline_inner(
     Ok(lowers)
 }
 
-struct RegctlImageCopyProducer {
-    regctl_binary: PathBuf,
-    image_ref: String,
-    layout_dir: PathBuf,
-    child: Option<tokio::process::Child>,
-    stdout_task: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
-    stderr_task: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
-    exit_status: Option<std::process::ExitStatus>,
-    stderr: Option<String>,
-    attempts_started: u32,
-    backoff: Duration,
-}
-
 #[async_trait]
 trait LayerBlobSource: Send {
     async fn wait_layer_blob(
@@ -504,6 +468,23 @@ trait LayerBlobSource: Send {
         idx: usize,
         layer: &OciLayerDescriptor,
     ) -> ImageResult<PathBuf>;
+}
+
+struct RegistryLayerSource<'a> {
+    regctl_binary: &'a Path,
+    image_ref: &'a str,
+    work: &'a Path,
+}
+
+#[async_trait]
+impl LayerBlobSource for RegistryLayerSource<'_> {
+    async fn wait_layer_blob(
+        &mut self,
+        _idx: usize,
+        layer: &OciLayerDescriptor,
+    ) -> ImageResult<PathBuf> {
+        fetch_oci_layer_blob(self.regctl_binary, self.image_ref, layer, self.work).await
+    }
 }
 
 struct ContentLayerSource<'a> {
@@ -614,242 +595,102 @@ pub(super) async fn convert_content_image(
     Ok(ResolvedImage::Local(layers))
 }
 
-impl RegctlImageCopyProducer {
-    async fn start(
-        regctl_binary: &Path,
-        image_ref: &str,
-        layout_dir: PathBuf,
-    ) -> ImageResult<Self> {
-        ensure_regctl_binary(regctl_binary)?;
-        let mut producer = Self {
-            regctl_binary: regctl_binary.to_path_buf(),
-            image_ref: image_ref.to_string(),
-            layout_dir,
-            child: None,
-            stdout_task: None,
-            stderr_task: None,
-            exit_status: None,
-            stderr: None,
-            attempts_started: 0,
-            backoff: REGCTL_RETRY_BASE_DELAY,
-        };
-        producer.spawn_child()?;
-        Ok(producer)
+async fn fetch_oci_layer_blob(
+    regctl_binary: &Path,
+    image_ref: &str,
+    layer: &OciLayerDescriptor,
+    work_root: &Path,
+) -> ImageResult<PathBuf> {
+    ensure_regctl_binary(regctl_binary)?;
+    let repository = image_ref_repository(image_ref)?;
+    let blob_path = blob_path_for_digest(work_root, &layer.digest)?;
+    let blob_parent = blob_path
+        .parent()
+        .context("OCI blob path has no parent directory")?;
+    tokio::fs::create_dir_all(blob_parent)
+        .await
+        .with_context(|| format!("create OCI blob digest dir {}", blob_parent.display()))?;
+    if tokio::fs::metadata(&blob_path)
+        .await
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == layer.size)
+    {
+        return Ok(blob_path);
     }
 
-    fn spawn_child(&mut self) -> ImageResult<()> {
-        self.abort_pipe_tasks();
-        self.exit_status = None;
-        self.stderr = None;
-        let dest = format!("ocidir://{}:latest", self.layout_dir.display());
-        let mut command = regctl_command(&self.regctl_binary);
+    let mut backoff = REGCTL_RETRY_BASE_DELAY;
+    let mut last_error = String::new();
+    for attempt in 1..=REGCTL_RETRY_ATTEMPTS {
+        let temp = tempfile::NamedTempFile::new_in(blob_parent)
+            .with_context(|| format!("create temporary OCI blob in {}", blob_parent.display()))?;
+        let output_file = temp
+            .reopen()
+            .with_context(|| format!("reopen temporary OCI blob {}", temp.path().display()))?;
+        let mut command = regctl_command(regctl_binary);
         command
-            .args([
-                "image",
-                "copy",
-                "--platform",
-                "local",
-                &self.image_ref,
-                &dest,
-            ])
-            .stdout(std::process::Stdio::piped())
+            .args(["blob", "get", repository.as_str(), &layer.digest])
+            .stdout(std::process::Stdio::from(output_file))
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let mut child = command.spawn().context("spawn regctl image copy")?;
-        let stdout_task = child
-            .stdout
-            .take()
-            .map(|stdout| tokio::spawn(read_pipe_to_end(stdout)));
-        let stderr_task = child
-            .stderr
-            .take()
-            .map(|stderr| tokio::spawn(read_pipe_to_end(stderr)));
-        self.child = Some(child);
-        self.stdout_task = stdout_task;
-        self.stderr_task = stderr_task;
-        self.attempts_started += 1;
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl LayerBlobSource for RegctlImageCopyProducer {
-    async fn wait_layer_blob(
-        &mut self,
-        idx: usize,
-        layer: &OciLayerDescriptor,
-    ) -> ImageResult<PathBuf> {
-        let blob_path = blob_path_for_digest(&self.layout_dir, &layer.digest)?;
-        loop {
-            if layer_blob_is_ready(&blob_path, layer.size).await? {
+        let output = command
+            .spawn()
+            .context("spawn regctl blob get")?
+            .wait_with_output()
+            .await
+            .context("wait for regctl blob get")?;
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if output.status.success() {
+            let actual_size = temp
+                .as_file()
+                .metadata()
+                .with_context(|| format!("stat downloaded OCI blob {}", temp.path().display()))?
+                .len();
+            if actual_size == layer.size {
+                temp.persist(&blob_path).map_err(|err| {
+                    anyhow::Error::new(err.error).context(format!(
+                        "persist OCI blob {} to {}",
+                        err.file.path().display(),
+                        blob_path.display()
+                    ))
+                })?;
                 debug!(
-                    idx,
                     digest = %layer.digest,
+                    size = layer.size,
                     path = %blob_path.display(),
-                    "OCI layer blob is ready in background image-copy layout"
+                    "fetched missing OCI layer blob"
                 );
                 return Ok(blob_path);
             }
-
-            if let Some(status) = self.poll_exit().await? {
-                if !status.success() {
-                    let stderr = self.stderr_text().await;
-                    if regctl_stderr_is_not_found(&stderr) {
-                        return Err(ImageError::NotFound {
-                            reason: format!(
-                                "regctl image copy reported the OCI resource does not exist: {stderr}",
-                            ),
-                        });
-                    }
-                    if self.attempts_started < REGCTL_RETRY_ATTEMPTS {
-                        warn!(
-                            attempt = self.attempts_started,
-                            idx,
-                            digest = %layer.digest,
-                            error = %stderr,
-                            "regctl image copy failed before needed layer was ready; retrying"
-                        );
-                        tokio::time::sleep(self.backoff).await;
-                        self.backoff *= 2;
-                        self.spawn_child()?;
-                        continue;
-                    }
-                    return Err(ImageError::Other(anyhow!(
-                        "regctl image copy failed after {REGCTL_RETRY_ATTEMPTS} attempts with {:?}: {stderr}",
-                        status.code(),
-                    )));
-                }
-                if layer_blob_is_ready(&blob_path, layer.size).await? {
-                    return Ok(blob_path);
-                }
-                return Err(ImageError::Other(anyhow!(
-                    "regctl image copy completed but layer {idx} ({}) is missing or has unexpected size at {}",
-                    layer.digest,
-                    blob_path.display()
-                )));
-            }
-
-            tokio::time::sleep(OCI_LAYER_BLOB_POLL_INTERVAL).await;
-        }
-    }
-}
-
-impl RegctlImageCopyProducer {
-    async fn poll_exit(&mut self) -> Result<Option<std::process::ExitStatus>> {
-        if let Some(status) = self.exit_status {
-            return Ok(Some(status));
-        }
-        let Some(child) = self.child.as_mut() else {
-            return Ok(None);
-        };
-        let Some(status) = child.try_wait().context("poll regctl image copy")? else {
-            return Ok(None);
-        };
-        self.exit_status = Some(status);
-        self.child = None;
-        Ok(Some(status))
-    }
-
-    async fn stderr_text(&mut self) -> String {
-        if let Some(stderr) = &self.stderr {
-            return stderr.clone();
-        }
-        let stderr = match self.stderr_task.take() {
-            Some(task) => match task.await {
-                Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).trim().to_string(),
-                Ok(Err(err)) => format!("failed to read regctl stderr: {err}"),
-                Err(err) => format!("failed to join regctl stderr reader: {err}"),
-            },
-            None => String::new(),
-        };
-        self.stderr = Some(stderr.clone());
-        stderr
-    }
-
-    async fn abort(&mut self) -> Result<()> {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.start_kill();
-            let status = child
-                .wait()
-                .await
-                .context("wait killed regctl image copy")?;
-            self.exit_status = Some(status);
-        }
-        if let Some(task) = self.stdout_task.take() {
-            match task.await {
-                Ok(Ok(_)) => {}
-                Ok(Err(err)) => {
-                    debug!(error = %err, "failed to drain regctl image copy stdout during abort");
-                }
-                Err(err) if err.is_cancelled() => {}
-                Err(err) => return Err(anyhow::Error::new(err).context("join regctl stdout task")),
+            last_error = format!(
+                "downloaded blob has size {actual_size}, expected {}",
+                layer.size
+            );
+        } else {
+            last_error = stderr;
+            if regctl_stderr_is_not_found(&last_error) {
+                return Err(ImageError::NotFound {
+                    reason: format!(
+                        "regctl blob get reported the OCI resource does not exist: {last_error}"
+                    ),
+                });
             }
         }
-        if let Some(task) = self.stderr_task.take() {
-            match task.await {
-                Ok(Ok(bytes)) => {
-                    self.stderr
-                        .get_or_insert_with(|| String::from_utf8_lossy(&bytes).trim().to_string());
-                }
-                Ok(Err(err)) => {
-                    debug!(error = %err, "failed to drain regctl image copy stderr during abort");
-                }
-                Err(err) if err.is_cancelled() => {}
-                Err(err) => return Err(anyhow::Error::new(err).context("join regctl stderr task")),
-            }
+
+        if attempt < REGCTL_RETRY_ATTEMPTS {
+            warn!(
+                attempt,
+                digest = %layer.digest,
+                error = %last_error,
+                "regctl blob get failed; retrying"
+            );
+            tokio::time::sleep(backoff).await;
+            backoff *= 2;
         }
-        Ok(())
     }
 
-    fn abort_pipe_tasks(&mut self) {
-        if let Some(task) = self.stdout_task.take() {
-            if !task.is_finished() {
-                task.abort();
-            }
-        }
-        if let Some(task) = self.stderr_task.take() {
-            if !task.is_finished() {
-                task.abort();
-            }
-        }
-    }
-}
-
-impl Drop for RegctlImageCopyProducer {
-    fn drop(&mut self) {
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.start_kill();
-        }
-        if let Some(task) = &self.stdout_task {
-            if !task.is_finished() {
-                task.abort();
-            }
-        }
-        if let Some(task) = &self.stderr_task {
-            if !task.is_finished() {
-                task.abort();
-            }
-        }
-    }
-}
-
-async fn read_pipe_to_end<R>(mut reader: R) -> std::io::Result<Vec<u8>>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer).await?;
-    Ok(buffer)
-}
-
-async fn layer_blob_is_ready(path: &Path, expected_size: u64) -> Result<bool> {
-    match tokio::fs::metadata(path).await {
-        Ok(metadata) => Ok(metadata.is_file() && metadata.len() == expected_size),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => {
-            Err(anyhow::Error::new(err).context(format!("stat OCI layer blob {}", path.display())))
-        }
-    }
+    Err(ImageError::Other(anyhow!(
+        "regctl blob get {} failed after {REGCTL_RETRY_ATTEMPTS} attempts: {last_error}",
+        layer.digest
+    )))
 }
 
 // ---- manifest fetch ----
@@ -1567,6 +1408,46 @@ mod tests {
     fn blob_path_for_digest_rejects_malformed_digest() {
         let layout = Path::new("/tmp/oci");
         assert!(blob_path_for_digest(layout, "no-colon-here").is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fetch_oci_layer_blob_downloads_only_requested_digest() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let work = tempdir().unwrap();
+        let regctl = work.path().join("regctl");
+        let args_log = work.path().join("args.log");
+        fs::write(
+            &regctl,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf hello\n",
+                args_log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&regctl, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let layer = OciLayerDescriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            digest: "sha256:abc123".into(),
+            size: 5,
+            annotations: BTreeMap::new(),
+        };
+        let blob = fetch_oci_layer_blob(
+            &regctl,
+            "registry.example/team/image@sha256:manifest",
+            &layer,
+            work.path(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(fs::read(blob).unwrap(), b"hello");
+        assert_eq!(
+            fs::read_to_string(args_log).unwrap(),
+            "blob\nget\nregistry.example/team/image\nsha256:abc123\n"
+        );
     }
 
     #[test]

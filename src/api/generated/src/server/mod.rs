@@ -43,6 +43,7 @@ where
 {
     // build our application with a route
     Router::new()
+        .route("/admission", get(admission_get::<I, A, E>))
         .route("/health", get(health_get::<I, A, E>))
         .route("/nodes", get(nodes_get::<I, A, E, C>))
         .route("/nodes/{node_id}", get(nodes_node_id_get::<I, A, E, C>))
@@ -441,6 +442,83 @@ where
 }
 
 #[tracing::instrument(skip_all)]
+fn admission_get_validation() -> std::result::Result<(), ValidationErrors> {
+    Ok(())
+}
+/// AdmissionGet - GET /admission
+#[tracing::instrument(skip_all)]
+async fn admission_get<I, A, E>(
+    method: Method,
+    TypedHeader(host): TypedHeader<Host>,
+    cookies: CookieJar,
+    State(api_impl): State<I>,
+) -> Result<Response, StatusCode>
+where
+    I: AsRef<A> + Send + Sync,
+    A: apis::default::Default<E> + Send + Sync,
+    E: std::fmt::Debug + Send + Sync + 'static,
+{
+    #[allow(clippy::redundant_closure)]
+    let validation = tokio::task::spawn_blocking(move || admission_get_validation())
+        .await
+        .unwrap();
+
+    let Ok(()) = validation else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(validation.unwrap_err().to_string()))
+            .map_err(|_| StatusCode::BAD_REQUEST);
+    };
+
+    let result = api_impl
+        .as_ref()
+        .admission_get(&method, &host, &cookies)
+        .await;
+
+    let mut response = Response::builder();
+
+    let resp = match result {
+        Ok(rsp) => match rsp {
+            apis::default::AdmissionGetResponse::Status204_RuntimeAdmissionIsReady => {
+                let mut response = response.status(204);
+                response.body(Body::empty())
+            }
+            apis::default::AdmissionGetResponse::Status503_RuntimeAdmissionIsBlocked(body) => {
+                let mut response = response.status(503);
+                {
+                    let mut response_headers = response.headers_mut().unwrap();
+                    response_headers
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                }
+
+                let body_content = tokio::task::spawn_blocking(move || {
+                    serde_json::to_vec(&body).map_err(|e| {
+                        error!(error = ?e);
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    })
+                })
+                .await
+                .unwrap()?;
+                response.body(Body::from(body_content))
+            }
+        },
+        Err(why) => {
+            // Application code returned an error. This should not happen, as the implementation should
+            // return a valid response.
+            return api_impl
+                .as_ref()
+                .handle_error(&method, &host, &cookies, why)
+                .await;
+        }
+    };
+
+    resp.map_err(|e| {
+        error!(error = ?e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[tracing::instrument(skip_all)]
 fn health_get_validation() -> std::result::Result<(), ValidationErrors> {
     Ok(())
 }
@@ -682,6 +760,24 @@ where
                                                     (body)
                                                 => {
                                                   let mut response = response.status(500);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesColdPostResponse::Status503_ServiceUnavailable
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(503);
                                                   {
                                                     let mut response_headers = response.headers_mut().unwrap();
                                                     response_headers.insert(
@@ -2768,6 +2864,24 @@ where
                                                     (body)
                                                 => {
                                                   let mut response = response.status(500);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesSandboxIdPausePostResponse::Status503_RuntimeAdmissionIsTemporarilyBlockedByDiskPressure
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(503);
                                                   {
                                                     let mut response_headers = response.headers_mut().unwrap();
                                                     response_headers.insert(

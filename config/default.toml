@@ -206,12 +206,23 @@ metrics_interval_secs = 15
 metrics_retention_secs = 3600
 # Expired-sandbox eviction interval in milliseconds (1000 = 1 second).
 auto_evict_interval_ms = 1000
+# Maximum snapshots written concurrently by one runtime node.
+max_concurrent_pauses = 4
 # Default sandbox lifetime in seconds when a request omits it.
 default_sandbox_timeout_secs = 15
 # Minimum auto-resumed lifetime in seconds (300 = 5 minutes).
 auto_resume_min_sandbox_timeout_secs = 300
 # Durable paused-sandbox metadata restored after a server restart.
 # persisted_sandbox_store_path = "$AENV_HOME/persisted-sandboxes"
+
+[disk_policy]
+enabled = true
+poll_interval_secs = 30
+cleanup_high_watermark_ratio = 0.80
+cleanup_low_watermark_ratio = 0.70
+admission_hard_watermark_ratio = 0.85
+cleanup_journal_reserve_mb = 64
+log_retention_secs = 86400
 
 [snapshot]
 # Node-local cache for snapshot artifacts.

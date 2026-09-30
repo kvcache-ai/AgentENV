@@ -195,6 +195,56 @@ async fn link_or_copy_runtime_layer(source: &Path, destination: &Path) -> Result
         .with_context(|| description)
 }
 
+fn canonical_path(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+async fn adopt_uncontained_local_lowers(
+    lowers: &mut [LayerConfig],
+    output_dir: &Path,
+    image_repo_blob_url: &str,
+    stable_local_roots: &[PathBuf],
+) -> Result<()> {
+    let output_dir = canonical_path(output_dir);
+    let stable_local_roots = stable_local_roots
+        .iter()
+        .map(|root| canonical_path(root))
+        .collect::<Vec<_>>();
+    // These indexes come from a different list than the runtime-owned suffix.
+    let inherited_layers_dir = output_dir.join(INHERITED_LAYERS_DIR).join("adopted");
+
+    for (index, lower) in lowers.iter_mut().enumerate() {
+        let Some(source) = overlaybd::layer_metadata::resolve_local_layer_path(lower) else {
+            ensure!(
+                lower.file.contains("://")
+                    || (!lower.digest.is_empty()
+                        && !lower
+                            .effective_repo_blob_url(image_repo_blob_url)
+                            .is_empty()),
+                "overlaybd lower {index} has no resolvable local layer or remote source"
+            );
+            continue;
+        };
+        let source = canonical_path(&source);
+        if source.starts_with(&output_dir)
+            || stable_local_roots
+                .iter()
+                .any(|root| source.starts_with(root))
+        {
+            continue;
+        }
+        let destination = inherited_layers_dir.join(format!("{index:04}")).join(
+            source
+                .file_name()
+                .unwrap_or_else(|| OsStr::new("runtime-layer.commit")),
+        );
+        link_or_copy_runtime_layer(&source, &destination).await?;
+        lower.file = destination.display().to_string();
+        lower.dir.clear();
+    }
+    Ok(())
+}
+
 async fn prepare_specific_snapshot_layer_path(snapshot_layer_path: &Path) -> Result<()> {
     match tokio::fs::remove_file(&snapshot_layer_path).await {
         Ok(()) => {}
@@ -374,11 +424,13 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         None
     };
 
+    let existing_lowers = std::mem::take(&mut image_config.lowers);
     let rewritten_lowers = rewrite_lowers_with_owned_runtime_suffix(
-        image_config.lowers,
+        existing_lowers,
         output_dir,
         appended_layer,
         MANAGED_BASE_LAYER_FILE,
+        &image_config.repo_blob_url,
         // Sealed rootfs layers always stay raw; compression happens once at
         // publish time under `[snapshot.publish_compression]`.
         OverlaybdCompactOutput::Raw,
@@ -400,25 +452,34 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
     output_dir: &Path,
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
+    image_repo_blob_url: &str,
     compaction_output: OverlaybdCompactOutput,
 ) -> Result<Vec<LayerConfig>> {
+    let stable_local_roots = [ConfigManager::global_config()
+        .image_cache_layout()
+        .commit_store];
     rewrite_lowers_with_runtime_roots(
         existing_lowers,
         output_dir,
         appended_layer,
         compaction_output_name,
         canonicalized_runtime_owned_roots(),
+        image_repo_blob_url,
+        &stable_local_roots,
         compaction_output,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn rewrite_lowers_with_runtime_roots(
     existing_lowers: Vec<LayerConfig>,
     output_dir: &Path,
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
     runtime_owned_roots: &[PathBuf],
+    image_repo_blob_url: &str,
+    stable_local_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
 ) -> Result<Vec<LayerConfig>> {
     let (mut lowers, mut runtime_owned_lowers) =
@@ -452,6 +513,13 @@ async fn rewrite_lowers_with_runtime_roots(
         {
             lowers.push(local_layer_config(&compacted_path));
         }
+        adopt_uncontained_local_lowers(
+            &mut lowers,
+            output_dir,
+            image_repo_blob_url,
+            stable_local_roots,
+        )
+        .await?;
         return Ok(lowers);
     }
 
@@ -472,6 +540,14 @@ async fn rewrite_lowers_with_runtime_roots(
     if let Some(layer) = appended_layer {
         lowers.push(layer);
     }
+
+    adopt_uncontained_local_lowers(
+        &mut lowers,
+        output_dir,
+        image_repo_blob_url,
+        stable_local_roots,
+    )
+    .await?;
 
     Ok(lowers)
 }
@@ -579,18 +655,20 @@ pub(super) async fn build_mem_snapshot_image_config(
 ) -> Result<ImageConfig> {
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
+    let repo_blob_url = inherited_image_config.repo_blob_url.clone();
     let new_layer = local_layer_config(new_layer_path);
     let lowers = rewrite_lowers_with_owned_runtime_suffix(
         inherited_image_config.lowers,
         output_dir,
         Some(new_layer),
         "mem_compacted.commit",
+        &repo_blob_url,
         memory_output,
     )
     .await?;
 
     Ok(ImageConfig {
-        repo_blob_url: inherited_image_config.repo_blob_url,
+        repo_blob_url,
         lowers,
         ..Default::default()
     })
@@ -982,6 +1060,8 @@ mod tests {
             None,
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
+            "",
+            std::slice::from_ref(&cache_root),
             OverlaybdCompactOutput::Raw,
         )
         .await
@@ -1012,6 +1092,52 @@ mod tests {
             assert_eq!(source_metadata.dev(), adopted_metadata.dev());
             assert_eq!(source_metadata.ino(), adopted_metadata.ino());
         }
+    }
+
+    #[tokio::test]
+    async fn snapshot_adopts_unclassified_local_lower_and_keeps_remote_url() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output_dir = temp.path().join("generation/rootfs");
+        let foreign = temp.path().join("foreign/snapshot.commit");
+        let runtime_root = temp.path().join("runtime");
+        let runtime = runtime_root.join("snapshot.commit");
+        std::fs::create_dir_all(foreign.parent().unwrap()).expect("create foreign dir");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime dir");
+        std::fs::write(&foreign, b"foreign lower").expect("write foreign lower");
+        std::fs::write(&runtime, b"runtime lower").expect("write runtime lower");
+        let lowers = vec![
+            local_layer_config(&foreign),
+            LayerConfig {
+                file: "https://registry.example/layer".to_string(),
+                digest: "sha256:remote".to_string(),
+                size: 12,
+                ..Default::default()
+            },
+            local_layer_config(&runtime),
+        ];
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            lowers,
+            &output_dir,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            std::slice::from_ref(&runtime_root),
+            "https://registry.example/v2/repo/blobs",
+            &[],
+            OverlaybdCompactOutput::Raw,
+        )
+        .await
+        .expect("adopt unclassified lower");
+
+        let adopted = PathBuf::from(&rewritten[0].file);
+        let runtime_adopted = PathBuf::from(&rewritten[2].file);
+        assert!(adopted.starts_with(output_dir.join(INHERITED_LAYERS_DIR).join("adopted")));
+        assert!(adopted.exists());
+        assert_eq!(rewritten[1].file, "https://registry.example/layer");
+        assert!(runtime_adopted.starts_with(output_dir.join(INHERITED_LAYERS_DIR)));
+        assert!(!runtime_adopted.starts_with(output_dir.join(INHERITED_LAYERS_DIR).join("adopted")));
+        assert_eq!(std::fs::read(adopted).unwrap(), b"foreign lower");
+        assert_eq!(std::fs::read(runtime_adopted).unwrap(), b"runtime lower");
     }
 
     #[tokio::test]
@@ -1047,6 +1173,8 @@ mod tests {
             None,
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
+            "",
+            &[],
             OverlaybdCompactOutput::Raw,
         )
         .await
@@ -1127,6 +1255,8 @@ mod tests {
             None,
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
+            "",
+            &[],
             OverlaybdCompactOutput::Raw,
         )
         .await

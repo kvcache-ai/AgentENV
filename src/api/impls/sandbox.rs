@@ -11,7 +11,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::cfg::ConfigManager;
-use crate::image::ResolvedBlockImage;
+use crate::image::{ImageError, ResolvedBlockImage};
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
     CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxForkChildSpec, SandboxLaunchSource,
@@ -55,6 +55,7 @@ impl From<OrchestratorError> for models::Error {
             OrchestratorError::ShuttingDown => {
                 Self::new(503, "orchestrator is shutting down".to_string())
             }
+            OrchestratorError::AdmissionBlocked { .. } => Self::new(503, err.to_string()),
             OrchestratorError::SandboxNotFound(id) => sandbox_not_found(id),
             OrchestratorError::InvalidSandboxState { .. } => Self::new(400, err.to_string()),
             OrchestratorError::SandboxOperationFailed {
@@ -671,6 +672,14 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewColdSandbox,
     ) -> Result<SandboxesColdPostResponse, ()> {
+        if let Err(err) = self.orchestrator.ensure_disk_admission("create") {
+            return Ok(match err {
+                err @ OrchestratorError::AdmissionBlocked { .. } => {
+                    SandboxesColdPostResponse::Status503_ServiceUnavailable(err.into())
+                }
+                err => SandboxesColdPostResponse::Status500_ServerError(Self::internal_error(&err)),
+            });
+        }
         let image_resolver = self.image_resolver();
         let timer = SandboxStageTimer::new("create_cold");
         // TODO: Move cold-start image resolution into an async create operation
@@ -680,6 +689,11 @@ impl Sandboxes<()> for ApiImpl {
             .await
         {
             Ok(resolved) => resolved,
+            Err(err @ ImageError::AdmissionBlocked { .. }) => {
+                return Ok(SandboxesColdPostResponse::Status503_ServiceUnavailable(
+                    Self::error(503, err.to_string()),
+                ));
+            }
             Err(err) if err.is_user_error() => {
                 return Ok(SandboxesColdPostResponse::Status400_BadRequest(
                     Self::error(400, err.to_string()),
@@ -712,6 +726,9 @@ impl Sandboxes<()> for ApiImpl {
             Ok(resolved) => resolved,
             Err(err) => {
                 warn!(error = %err.message, "failed to resolve attached drives");
+                if err.code == 503 {
+                    return Ok(SandboxesColdPostResponse::Status503_ServiceUnavailable(err));
+                }
                 return Ok(Self::client_or_server_response(
                     err,
                     SandboxesColdPostResponse::Status400_BadRequest,
@@ -831,6 +848,9 @@ impl Sandboxes<()> for ApiImpl {
                     },
                 )
             }
+            Err(err @ OrchestratorError::AdmissionBlocked { .. }) => Ok(
+                SandboxesColdPostResponse::Status503_ServiceUnavailable(err.into()),
+            ),
             Err(err) => {
                 let _ = finish_volume_reservation(
                     &self.volume_manager,
@@ -1710,6 +1730,11 @@ impl Sandboxes<()> for ApiImpl {
                     409,
                     format!("sandbox cannot be paused from {} state", state),
                 )),
+            ),
+            Err(err @ OrchestratorError::AdmissionBlocked { .. }) => Ok(
+                SandboxesSandboxIdPausePostResponse::Status503_RuntimeAdmissionIsTemporarilyBlockedByDiskPressure(
+                    err.into(),
+                ),
             ),
             Err(err) => Ok(SandboxesSandboxIdPausePostResponse::Status500_ServerError(
                 err.into(),

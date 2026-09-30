@@ -28,6 +28,13 @@ pub struct ImageResolverConfig {
     /// overlaybd-native referrer is selected first.
     #[config(default = true)]
     pub convert_standard_oci: bool,
+    /// Maximum standard-OCI conversions executing concurrently on this node.
+    #[config(default = 4usize)]
+    pub max_concurrent_conversions: usize,
+    /// Refuse a new conversion when the image-cache filesystem has less free
+    /// space than this reserve. Zero disables the reserve check.
+    #[config(default = 0u64)]
+    pub min_free_disk_gb: u64,
     /// Whitelist of registry hosts (e.g. `docker.io`, `ghcr.io`,
     /// `registry.example.com:5000`). `None` (key omitted) imposes no
     /// restriction; an explicit empty list `[]` rejects every registry.
@@ -225,6 +232,13 @@ impl ImageResolverConfig {
             })
             .collect();
     }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.max_concurrent_conversions == 0 {
+            bail!("image.resolver.max_concurrent_conversions must be > 0");
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -258,5 +272,16 @@ mod tests {
                 "expected error containing {expected_error:?}, got: {err}"
             );
         }
+    }
+
+    #[test]
+    fn validate_rejects_zero_conversion_concurrency() {
+        let config = ImageResolverConfig {
+            max_concurrent_conversions: 0,
+            ..Default::default()
+        };
+
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("max_concurrent_conversions"));
     }
 }

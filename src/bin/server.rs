@@ -57,6 +57,7 @@ struct ServerCli {
 async fn main() -> anyhow::Result<()> {
     agentenv::logging::init();
     agentenv_observability::init_prometheus_recorder()?;
+    agentenv_observability::initialize_sandbox_stage_metrics();
 
     let cli = ServerCli::parse();
     let config_manager = if let Some(config_path) = cli.config.as_deref() {

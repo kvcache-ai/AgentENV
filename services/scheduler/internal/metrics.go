@@ -118,6 +118,8 @@ func schedulerStrategyLabel(strategy string) string {
 	switch strings.ToLower(strings.TrimSpace(strategy)) {
 	case "round_robin":
 		return "round_robin"
+	case "weighted_image_affinity":
+		return "weighted_image_affinity"
 	case "random":
 		return "random"
 	default:

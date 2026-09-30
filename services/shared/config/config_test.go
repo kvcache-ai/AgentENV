@@ -62,6 +62,37 @@ func TestLoadSchedulerAllowsQueryOnlyWithRedisWithoutNodes(t *testing.T) {
 	}
 }
 
+func TestLoadSchedulerParsesImageAffinityWeights(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"scheduler": {
+			"strategy": "weighted_image_affinity",
+			"image_affinity_node_weights": {"host-a": 20, "host-b": 80},
+			"nodes": [{"id": "node-a", "endpoint": "http://node-a:8000"}]
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	cfg, err := Load(path, "scheduler")
+	if err != nil {
+		t.Fatalf("load scheduler config failed: %v", err)
+	}
+	if got := cfg.Scheduler.ImageAffinityNodeWeights["host-b"]; got != 80 {
+		t.Fatalf("unexpected host-b weight: %v", got)
+	}
+}
+
+func TestValidateRejectsEmptyImageAffinityWeights(t *testing.T) {
+	cfg := defaultConfig("scheduler")
+	cfg.Scheduler.Strategy = "weighted_image_affinity"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected empty image affinity weights to fail")
+	}
+}
+
 func TestLoadSchedulerRejectsQueryOnlyWithoutRedis(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "config.json")

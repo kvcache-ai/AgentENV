@@ -217,6 +217,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "metrics",
  "metrics-exporter-prometheus",
  "tokio",
 ]

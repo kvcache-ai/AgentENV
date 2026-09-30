@@ -221,6 +221,13 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 			)
 			return nil, status.Error(codes.InvalidArgument, "node is not in scheduler node list")
 		}
+		if errors.Is(err, ErrRuntimeFamilyConflict) {
+			s.logger.Warn("scheduler rejected duplicate live runtime family",
+				zap.String("node_id", nodeID),
+				zap.String("runtime_family_id", strings.TrimSpace(req.GetRuntimeFamilyId())),
+			)
+			return nil, status.Error(codes.AlreadyExists, "runtime family already has a live registration")
+		}
 		return nil, status.Error(codes.Internal, "node registry heartbeat failed")
 	}
 	if err := s.store.ReconcileNode(node, req.GetSandboxIds(), now); err != nil {

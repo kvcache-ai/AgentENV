@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -58,32 +59,34 @@ type NodeResourceLimit struct {
 }
 
 type SchedulerConfig struct {
-	GRPCListenAddr          string                   `json:"grpc_listen_addr"`
-	MetricsListenAddr       string                   `json:"metrics_listen_addr"`
-	Strategy                string                   `json:"strategy"`
-	ReportTTL               time.Duration            `json:"report_ttl"`
-	BindingTTL              time.Duration            `json:"binding_ttl"`
-	RedisAddr               string                   `json:"redis_addr"`
-	ArtifactStoreCapacity   int                      `json:"artifact_store_capacity"`
-	ArtifactLookupNodeLimit int                      `json:"artifact_lookup_node_limit"`
-	Nodes                   []Node                   `json:"nodes"`
-	Discovery               SchedulerDiscoveryConfig `json:"discovery"`
-	NodeResourceLimit       *NodeResourceLimit       `json:"node_resource_limit"`
+	GRPCListenAddr           string                   `json:"grpc_listen_addr"`
+	MetricsListenAddr        string                   `json:"metrics_listen_addr"`
+	Strategy                 string                   `json:"strategy"`
+	ReportTTL                time.Duration            `json:"report_ttl"`
+	BindingTTL               time.Duration            `json:"binding_ttl"`
+	RedisAddr                string                   `json:"redis_addr"`
+	ArtifactStoreCapacity    int                      `json:"artifact_store_capacity"`
+	ArtifactLookupNodeLimit  int                      `json:"artifact_lookup_node_limit"`
+	ImageAffinityNodeWeights map[string]float64       `json:"image_affinity_node_weights"`
+	Nodes                    []Node                   `json:"nodes"`
+	Discovery                SchedulerDiscoveryConfig `json:"discovery"`
+	NodeResourceLimit        *NodeResourceLimit       `json:"node_resource_limit"`
 }
 
 func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	type wire struct {
-		GRPCListenAddr          *string                   `json:"grpc_listen_addr"`
-		MetricsListenAddr       *string                   `json:"metrics_listen_addr"`
-		Strategy                *string                   `json:"strategy"`
-		ReportTTL               json.RawMessage           `json:"report_ttl"`
-		BindingTTL              json.RawMessage           `json:"binding_ttl"`
-		RedisAddr               *string                   `json:"redis_addr"`
-		ArtifactStoreCapacity   *int                      `json:"artifact_store_capacity"`
-		ArtifactLookupNodeLimit *int                      `json:"artifact_lookup_node_limit"`
-		Nodes                   *[]Node                   `json:"nodes"`
-		Discovery               *SchedulerDiscoveryConfig `json:"discovery"`
-		NodeResourceLimit       *NodeResourceLimit        `json:"node_resource_limit"`
+		GRPCListenAddr           *string                   `json:"grpc_listen_addr"`
+		MetricsListenAddr        *string                   `json:"metrics_listen_addr"`
+		Strategy                 *string                   `json:"strategy"`
+		ReportTTL                json.RawMessage           `json:"report_ttl"`
+		BindingTTL               json.RawMessage           `json:"binding_ttl"`
+		RedisAddr                *string                   `json:"redis_addr"`
+		ArtifactStoreCapacity    *int                      `json:"artifact_store_capacity"`
+		ArtifactLookupNodeLimit  *int                      `json:"artifact_lookup_node_limit"`
+		ImageAffinityNodeWeights *map[string]float64       `json:"image_affinity_node_weights"`
+		Nodes                    *[]Node                   `json:"nodes"`
+		Discovery                *SchedulerDiscoveryConfig `json:"discovery"`
+		NodeResourceLimit        *NodeResourceLimit        `json:"node_resource_limit"`
 	}
 
 	parsed := wire{}
@@ -117,6 +120,9 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.ArtifactLookupNodeLimit != nil {
 		s.ArtifactLookupNodeLimit = *parsed.ArtifactLookupNodeLimit
+	}
+	if parsed.ImageAffinityNodeWeights != nil {
+		s.ImageAffinityNodeWeights = *parsed.ImageAffinityNodeWeights
 	}
 
 	if len(bytes.TrimSpace(parsed.ReportTTL)) > 0 {
@@ -445,6 +451,16 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 		if c.Scheduler.ArtifactStoreCapacity <= 0 {
 			return errors.New("scheduler.artifact_store_capacity must be greater than zero")
+		}
+		if strings.EqualFold(strings.TrimSpace(c.Scheduler.Strategy), "weighted_image_affinity") {
+			if len(c.Scheduler.ImageAffinityNodeWeights) == 0 {
+				return errors.New("scheduler.image_affinity_node_weights must not be empty")
+			}
+			for nodeID, weight := range c.Scheduler.ImageAffinityNodeWeights {
+				if strings.TrimSpace(nodeID) == "" || weight <= 0 || math.IsNaN(weight) || math.IsInf(weight, 0) {
+					return errors.New("scheduler.image_affinity_node_weights require non-empty node ids and finite positive weights")
+				}
+			}
 		}
 		switch strings.ToLower(strings.TrimSpace(c.Scheduler.Discovery.Mode)) {
 		case "static":

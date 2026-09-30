@@ -5,7 +5,7 @@ WORKDIR /src
 COPY services/go.mod services/go.sum ./
 RUN go mod download
 COPY services/ .
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/gateway ./gateway/cmd
+RUN go test ./gateway/cmd && CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/gateway ./gateway/cmd
 
 FROM gcr.io/distroless/static-debian12
 COPY --from=build /out/gateway /gateway

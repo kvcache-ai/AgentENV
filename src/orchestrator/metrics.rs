@@ -22,6 +22,19 @@ pub struct OrchestratorMetrics {
     pub paused_sandbox_count: u32,
     pub paused_allocated_cpu: u32,
     pub paused_allocated_memory_bytes: u64,
+    pub disk_total_bytes: u64,
+    pub disk_used_bytes: u64,
+    pub disk_available_bytes: u64,
+    pub cleanup_pending: u64,
+    pub cleanup_retries: u64,
+    pub cleanup_failures: u64,
+    pub pruned_generations: u64,
+    pub reclaimed_snapshot_bytes: u64,
+    pub reserved_cleanup_journal_bytes: u64,
+    pub reclaimed_log_bytes: u64,
+    pub disk_admission_rejections: u64,
+    pub accepting_sandboxes: bool,
+    pub admission_reason: &'static str,
 }
 
 /// Monotonic creation counters maintained by the orchestrator.

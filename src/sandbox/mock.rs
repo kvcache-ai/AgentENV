@@ -39,6 +39,21 @@ impl PausedSandboxState for MockSnapshot {
 }
 
 #[derive(Debug)]
+struct MockSnapshotWithArtifacts {
+    runtime_artifacts: RuntimeArtifactSet,
+}
+
+impl PausedSandboxState for MockSnapshotWithArtifacts {
+    fn encode(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({}))
+    }
+
+    fn runtime_artifacts(&self) -> RuntimeArtifactSet {
+        self.runtime_artifacts.clone()
+    }
+}
+
+#[derive(Debug)]
 pub struct MockCapturedSnapshot;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -77,8 +92,10 @@ pub type MetricsSampler = Arc<
 pub struct MockBehavior {
     actions: Mutex<HashMap<MockOperation, VecDeque<MockAction>>>,
     on_operation: Mutex<HashMap<MockOperation, Arc<dyn Fn() + Send + Sync>>>,
+    on_operation_complete: Mutex<HashMap<MockOperation, Arc<dyn Fn() + Send + Sync>>>,
     runtime_info: Mutex<SandboxRuntimeInfo>,
     metrics_sampler: Mutex<Option<MetricsSampler>>,
+    paused_runtime_artifacts: Mutex<RuntimeArtifactSet>,
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
@@ -105,6 +122,17 @@ impl MockBehavior {
             .insert(operation, hook);
     }
 
+    pub fn set_on_operation_complete(
+        &self,
+        operation: MockOperation,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) {
+        self.on_operation_complete
+            .lock()
+            .expect("on_operation_complete mutex poisoned")
+            .insert(operation, hook);
+    }
+
     pub fn set_runtime_info(&self, runtime_info: SandboxRuntimeInfo) {
         *self
             .runtime_info
@@ -116,6 +144,20 @@ impl MockBehavior {
         self.runtime_info
             .lock()
             .expect("runtime_info mutex poisoned")
+            .clone()
+    }
+
+    pub fn set_paused_runtime_artifacts(&self, artifacts: RuntimeArtifactSet) {
+        *self
+            .paused_runtime_artifacts
+            .lock()
+            .expect("paused_runtime_artifacts mutex poisoned") = artifacts;
+    }
+
+    fn paused_runtime_artifacts(&self) -> RuntimeArtifactSet {
+        self.paused_runtime_artifacts
+            .lock()
+            .expect("paused_runtime_artifacts mutex poisoned")
             .clone()
     }
 
@@ -154,6 +196,18 @@ impl MockBehavior {
             .on_operation
             .lock()
             .expect("on_operation mutex poisoned")
+            .get(&operation)
+            .cloned()
+        {
+            hook();
+        }
+    }
+
+    fn run_operation_complete_hook(&self, operation: MockOperation) {
+        if let Some(hook) = self
+            .on_operation_complete
+            .lock()
+            .expect("on_operation_complete mutex poisoned")
             .get(&operation)
             .cloned()
         {
@@ -211,12 +265,14 @@ impl MockBehavior {
 
     async fn apply_capture_result(&self, operation: MockOperation) -> SandboxCaptureResult<()> {
         self.run_operation_hook(operation);
-        Self::run_async_action(
+        let result = Self::run_async_action(
             self.pop_action(operation),
             |message| SandboxCaptureError::recoverable(anyhow!(message)),
             |message| SandboxCaptureError::terminal(anyhow!(message)),
         )
-        .await
+        .await;
+        self.run_operation_complete_hook(operation);
+        result
     }
 
     async fn apply_async(&self, operation: MockOperation) -> Result<()> {
@@ -316,7 +372,9 @@ impl SandboxBackend for MockSandboxBackend {
             }
             return Err(pause_err);
         }
-        Ok(Arc::new(MockSnapshot))
+        Ok(Arc::new(MockSnapshotWithArtifacts {
+            runtime_artifacts: self.behavior.paused_runtime_artifacts(),
+        }))
     }
 
     async fn resume(&mut self) -> Result<()> {

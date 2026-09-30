@@ -12,6 +12,8 @@ use crate::{models, types::*};
 #[must_use]
 #[allow(clippy::large_enum_variant)]
 pub enum SandboxesColdPostResponse {
+    /// Runtime admission is temporarily blocked by disk pressure
+    Status503_ServiceUnavailable(models::Error),
     /// The sandbox was created successfully
     Status201_TheSandboxWasCreatedSuccessfully {
         body: models::Sandbox,
@@ -224,6 +226,8 @@ pub enum SandboxesSandboxIdPausePostResponse {
     Status401_AuthenticationError(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
+    /// Runtime admission is temporarily blocked by disk pressure
+    Status503_RuntimeAdmissionIsTemporarilyBlockedByDiskPressure(models::Error),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]

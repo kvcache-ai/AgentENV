@@ -307,13 +307,10 @@ func objectExistsInStore(informer cache.SharedIndexInformer, key string) bool {
 }
 
 // nodeFromEndpoint converts an EndpointSlice endpoint into a Node.
-// It uses the Serving condition (not Ready) to decide whether the endpoint
-// is usable, and Terminating to distinguish active from lingering nodes.
+// Non-serving and terminating nodes linger so heartbeats keep existing sandbox
+// bindings alive while new sandbox placement is disabled.
 func nodeFromEndpoint(endpoint discoveryv1.Endpoint, port int32, scheme string) (node Node, lingering bool, ok bool) {
 	serving := endpoint.Conditions.Serving != nil && *endpoint.Conditions.Serving
-	if !serving {
-		return Node{}, false, false
-	}
 
 	if endpoint.TargetRef == nil || endpoint.TargetRef.Name == "" {
 		return Node{}, false, false
@@ -325,12 +322,17 @@ func nodeFromEndpoint(endpoint discoveryv1.Endpoint, port int32, scheme string) 
 	}
 
 	terminating := endpoint.Conditions.Terminating != nil && *endpoint.Conditions.Terminating
+	affinityID := endpoint.TargetRef.Name
+	if endpoint.NodeName != nil && strings.TrimSpace(*endpoint.NodeName) != "" {
+		affinityID = strings.TrimSpace(*endpoint.NodeName)
+	}
 
 	hostPort := net.JoinHostPort(address, strconv.Itoa(int(port)))
 	return Node{
-		ID:       endpoint.TargetRef.Name,
-		Endpoint: fmt.Sprintf("%s://%s", scheme, hostPort),
-	}, terminating, true
+		ID:         endpoint.TargetRef.Name,
+		Endpoint:   fmt.Sprintf("%s://%s", scheme, hostPort),
+		AffinityID: affinityID,
+	}, !serving || terminating, true
 }
 
 func selectRoutableEndpointAddress(addresses []string) (string, bool) {

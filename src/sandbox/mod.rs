@@ -22,6 +22,7 @@ use crate::types::{ImageConfigs, SandboxId};
 
 pub use ::envd::process::Signal;
 pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
+pub(crate) use backend::RuntimeArtifactClosure;
 pub use backend::{
     CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
     SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,

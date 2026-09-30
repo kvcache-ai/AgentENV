@@ -538,6 +538,7 @@ func TestWriteJSONEncodeErrorReturnsInternalServerError(t *testing.T) {
 }
 
 func TestHandleProxyReturnsAggregatedNodesFromScheduler(t *testing.T) {
+	acceptingSandboxes := false
 	server := newTestServer(t, stubSchedulerClient{
 		listObservedFunc: func(_ context.Context, req *schedulerv1.ListObservedNodesRequest, _ ...grpc.CallOption) (*schedulerv1.ListObservedNodesResponse, error) {
 			if req.GetClusterId() != "cluster-1" {
@@ -570,6 +571,11 @@ func TestHandleProxyReturnsAggregatedNodesFromScheduler(t *testing.T) {
 							MemoryTotalBytes:     4096,
 							CreateSuccesses:      9,
 							CreateFails:          2,
+							AcceptingSandboxes:   &acceptingSandboxes,
+							AdmissionReason:      schedulerv1.AdmissionReason_ADMISSION_REASON_DISK_HARD_LIMIT,
+							DiskTotalBytes:       100,
+							DiskUsedBytes:        86,
+							DiskAvailableBytes:   14,
 						},
 					},
 				},
@@ -601,6 +607,16 @@ func TestHandleProxyReturnsAggregatedNodesFromScheduler(t *testing.T) {
 
 	if got := nodes[0]["status"]; got != "ready" {
 		t.Fatalf("unexpected status field: %v", got)
+	}
+	if got := nodes[0]["acceptingSandboxes"]; got != false {
+		t.Fatalf("unexpected admission field: %v", got)
+	}
+	if got := nodes[0]["admissionReason"]; got != "disk_hard_limit" {
+		t.Fatalf("unexpected admission reason: %v", got)
+	}
+	metrics := nodes[0]["metrics"].(map[string]any)
+	if metrics["diskUsedBytes"] != float64(86) {
+		t.Fatalf("unexpected disk usage: %v", metrics["diskUsedBytes"])
 	}
 }
 

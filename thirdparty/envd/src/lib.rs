@@ -21,6 +21,13 @@ macro_rules! impl_envd_client {
                     dst: &str,
                     access_token: Option<&str>,
                 ) -> Result<Self, anyhow::Error> {
+                    Self::connect_now(dst, access_token)
+                }
+
+                pub fn connect_now(
+                    dst: &str,
+                    access_token: Option<&str>,
+                ) -> Result<Self, anyhow::Error> {
                     let chan = crate::transport::new_channel(dst, access_token)?;
                     Ok(Self {
                         inner: GeneratedClient::new(chan),

@@ -1549,6 +1549,20 @@ tags:
   - name: volumes
 
 paths:
+  /admission:
+    get:
+      summary: Check whether the runtime accepts write-heavy sandbox operations
+      tags: [default]
+      responses:
+        "204":
+          description: Runtime admission is ready
+        "503":
+          description: Runtime admission is blocked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /health:
     get:
       summary: Health check
@@ -1746,6 +1760,12 @@ paths:
           $ref: "#/components/responses/409"
         "500":
           $ref: "#/components/responses/500"
+        "503":
+          description: Runtime admission is temporarily blocked by disk pressure
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /v2/sandboxes:
     post:
@@ -2003,6 +2023,12 @@ paths:
           $ref: "#/components/responses/401"
         "500":
           $ref: "#/components/responses/500"
+        "503":
+          description: Runtime admission is temporarily blocked by disk pressure
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /sandboxes/{sandboxID}/resume:
     post:
