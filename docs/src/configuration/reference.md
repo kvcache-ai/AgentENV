@@ -41,7 +41,7 @@ Firecracker VM binary and boot configuration.
 | `version` | string | manifest value | Optional Firecracker release override for auto-download |
 | `url` | string | manifest value | Optional download URL template override with `{version}` and `{arch}` placeholders |
 | `binary_path` | string | derived from manifest/config version | Explicit path to a local `firecracker` binary. Setup skips the Firecracker download and requires this to be a readable, non-empty, executable regular file |
-| `boot_args` | string | `"console=ttyS0 reboot=k panic=1 pci=off init=/init …"` | Kernel command line arguments. The shipped default also includes DAMON memory-reclaim parameters; see `config/default.toml` for the full value. |
+| `boot_args` | string | `"console=ttyS0 reboot=k panic=1 pci=off init=/init …"` | Complete kernel command line. The shipped default also includes DAMON memory-reclaim and free-page-reporting parameters; see `config/default.toml` for the full value. |
 | `allowed_extra_boot_args_prefixes` | array of strings | `[]` | Allowed prefixes for `extraBootArgs` on cold-start sandboxes. If empty, no request-provided extra boot args are appended |
 | `socket_timeout_secs` | integer | `3` | Max seconds to wait for the Firecracker API socket |
 | `socket_poll_ms` | integer | `1` | Poll interval (ms) for checking socket availability |
