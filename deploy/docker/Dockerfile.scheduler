@@ -1,4 +1,4 @@
-FROM golang:1.25-bookworm AS build
+FROM dhi.io/golang:1.25-debian13-dev@sha256:e9446ede55f486a9afef4990c3a96419b080a80ec246dbc56f0beda5da8cf41e AS build
 ARG TARGETOS=linux
 ARG TARGETARCH
 WORKDIR /src
@@ -7,9 +7,9 @@ RUN go mod download
 COPY services/ .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/scheduler ./scheduler/cmd
 
-FROM alpine:3.21 AS grpc-health-probe
+FROM dhi.io/debian-base:trixie-debian13-dev@sha256:4ee34308de2c7a62947a6e6a8873a26bbab6638d164449be8be4b494f908dbcb AS grpc-health-probe
 ARG TARGETARCH
-RUN apk add --no-cache curl \
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
 	&& case "${TARGETARCH}" in \
 		amd64|arm64) ARCH="${TARGETARCH}" ;; \
 		*) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
@@ -17,7 +17,7 @@ RUN apk add --no-cache curl \
 	&& curl -fL "https://github.com/grpc-ecosystem/grpc-health-probe/releases/download/v0.4.46/grpc_health_probe-linux-${ARCH}" -o /grpc_health_probe \
 	&& chmod +x /grpc_health_probe
 
-FROM gcr.io/distroless/static-debian12
+FROM dhi.io/static:20250419-debian13@sha256:98ef7a853608577e8d66dad1d25ada75d745d782f28d84e9ecfb85dfeb1f9c98
 COPY --from=build /out/scheduler /scheduler
 COPY --from=grpc-health-probe /grpc_health_probe /grpc_health_probe
 COPY deploy/docker/config/default.json /config/default.json

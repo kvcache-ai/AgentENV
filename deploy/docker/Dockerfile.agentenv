@@ -2,11 +2,12 @@
 
 ARG AENV_VIRTUALIZATION_MODE=kvm
 
-FROM rust:1-bookworm AS chef
+FROM dhi.io/rust:1-debian13-dev@sha256:06db04e70b0c51305075803eff4a0d59c810773997692a2c1cd83c90385fadd7 AS chef
 
 WORKDIR /build
 ENV CARGO_TARGET_DIR=/build/target
-ENV RUSTUP_TOOLCHAIN=${RUST_VERSION}
+ENV CARGO_HOME=/usr/local/cargo
+ENV PATH=/usr/local/cargo/bin:${PATH}
 ARG APT_MIRROR_BASE
 COPY deploy/docker/apply_apt_mirror.sh /usr/local/bin/apply_apt_mirror.sh
 
@@ -16,6 +17,8 @@ RUN sh /usr/local/bin/apply_apt_mirror.sh "${APT_MIRROR_BASE}" \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         clang \
         libclang-dev \
+        libssl-dev \
+        pkg-config \
         libprotobuf-dev \
         protobuf-compiler \
     && apt-get clean \
@@ -50,7 +53,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && cp /build/target/release/server /out-server \
     && cp /build/target/release/uvm-ublk-daemon /out-uvm-ublk-daemon
 
-FROM ubuntu:24.04 AS runtime-base
+FROM dhi.io/debian-base:trixie-debian13-dev@sha256:4ee34308de2c7a62947a6e6a8873a26bbab6638d164449be8be4b494f908dbcb AS runtime-base
 ARG APT_MIRROR_BASE
 ARG TARGETARCH
 # Optional extra runtime packages, specified as a whitespace- or comma-separated build arg.

@@ -15,6 +15,7 @@ BUILDKIT_ADDR="${BUILDKIT_ADDR:-tcp://buildkit-amd64.shared.svc.od5.prometheus.c
 # The tag names a commit, so the build context must be exactly that commit.
 [ -z "$(git status --porcelain)" ] || { echo "working tree is dirty; commit first" >&2; exit 1; }
 TAG=$(git rev-parse HEAD | cut -c1-7)
+python3 .github/scripts/check_dhi.py
 
 COMPONENTS=("$@")
 [ ${#COMPONENTS[@]} -eq 0 ] && COMPONENTS=(gateway scheduler runtime)

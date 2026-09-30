@@ -1,4 +1,4 @@
-FROM golang:1.25-bookworm AS build
+FROM dhi.io/golang:1.25-debian13-dev@sha256:e9446ede55f486a9afef4990c3a96419b080a80ec246dbc56f0beda5da8cf41e AS build
 ARG TARGETOS=linux
 ARG TARGETARCH
 WORKDIR /src
@@ -7,7 +7,7 @@ RUN go mod download
 COPY services/ .
 RUN go test ./gateway/cmd && CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/gateway ./gateway/cmd
 
-FROM gcr.io/distroless/static-debian12
+FROM dhi.io/static:20250419-debian13@sha256:98ef7a853608577e8d66dad1d25ada75d745d782f28d84e9ecfb85dfeb1f9c98
 COPY --from=build /out/gateway /gateway
 COPY deploy/docker/config/default.json /config/default.json
 ENTRYPOINT ["/gateway"]
