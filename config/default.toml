@@ -24,6 +24,9 @@ home_path = "/var/lib/aenv"
 virtualization_mode = "kvm"
 
 [firecracker]
+# API request limits; snapshot creation has its own budget.
+api_timeout_secs = 120
+snapshot_timeout_secs = 120
 # Use an existing Firecracker executable instead of downloading one. It must
 # be a readable, non-empty, executable regular file.
 # binary_path = "/opt/agentenv/bin/firecracker"
@@ -181,6 +184,9 @@ vcpu_count = 2
 # iops_burst = 500                     # 500 startup IOPS; not replenished
 
 [envd]
+# Individual probes are also bounded by the overall initialization deadline.
+health_probe_timeout_ms = 1000
+boot_ready_probe_timeout_ms = 1000
 # Expected envd version baked into the tools drive.
 version = "0.5.15"
 # Maximum envd initialization wait in seconds (60 = 1 minute).
@@ -204,6 +210,11 @@ max_volume_count = 4
 metrics_interval_secs = 15
 # Guest metrics in-memory retention period in seconds.
 metrics_retention_secs = 3600
+transition_timeout_secs = 60
+# Resume is bounded until Running; subsequent housekeeping has its own budget.
+resume_timeout_secs = 900
+resume_backend_build_timeout_secs = 30
+resume_housekeeping_timeout_secs = 30
 # Expired-sandbox eviction interval in milliseconds (1000 = 1 second).
 auto_evict_interval_ms = 1000
 # Maximum snapshots written concurrently by one runtime node.

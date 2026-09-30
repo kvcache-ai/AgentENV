@@ -68,6 +68,20 @@ backend also cannot resume uses the same recovery path. If no checkpoint exists,
 the stopped sandbox is removed; an unreadable checkpoint is preserved, with
 image GC disabled and no resumable runtime state advertised.
 
+### Operation timeouts
+
+The existing timeout defaults are now configurable in `config/default.toml`:
+Firecracker API requests and snapshot creation each allow 120 seconds; lifecycle
+transitions allow 60 seconds; resume allows 900 seconds, with 30 seconds each for
+backend construction and post-resume housekeeping. Guest health and boot probes
+allow 1,000 milliseconds each, capped by the overall initialization deadline.
+
+Resume's outer deadline ends when the sandbox becomes Running. Housekeeping
+uses its separate budget afterward. All these settings must be positive, and
+the backend construction budget cannot exceed the resume budget. Increasing a
+budget can accommodate slow disks without rebuilding the runtime; it does not
+make timed-out blocking I/O cancellable.
+
 ### Migration and limits
 
 Drain running and paused sandboxes before upgrading from the old paused-record

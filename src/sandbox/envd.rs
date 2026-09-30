@@ -22,8 +22,7 @@ use envd::reqwest::Client;
 
 mod user;
 
-const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
-const BOOT_READY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+use crate::cfg::{ConfigManager, EnvdConfig};
 const BOOT_READY_PROBE: &str = r#"
 pid1="$(cat /proc/1/comm 2>/dev/null)"
 if [ "$pid1" != "systemd" ]; then
@@ -69,6 +68,8 @@ pub(crate) struct EnvdInstance {
     grpc_address: String,
     access_token: Option<EnvdAccessToken>,
     live: Arc<AtomicBool>,
+    health_probe_timeout: Duration,
+    boot_ready_probe_timeout: Duration,
 }
 
 impl EnvdInstance {
@@ -79,6 +80,18 @@ impl EnvdInstance {
     }
 
     pub(crate) fn new(base_path: String, access_token: Option<EnvdAccessToken>) -> Self {
+        Self::new_with_config(
+            base_path,
+            access_token,
+            &ConfigManager::global_config().envd,
+        )
+    }
+
+    fn new_with_config(
+        base_path: String,
+        access_token: Option<EnvdAccessToken>,
+        config: &EnvdConfig,
+    ) -> Self {
         let grpc_address = base_path.clone();
         Self {
             // Share client configuration without retaining bootstrap TCP
@@ -98,6 +111,8 @@ impl EnvdInstance {
             grpc_address,
             access_token,
             live: Arc::new(AtomicBool::new(true)),
+            health_probe_timeout: Duration::from_millis(config.health_probe_timeout_ms),
+            boot_ready_probe_timeout: Duration::from_millis(config.boot_ready_probe_timeout_ms),
         }
     }
 
@@ -164,7 +179,7 @@ impl EnvdInstance {
             }
 
             let remaining = timeout - elapsed;
-            let probe_timeout = std::cmp::min(HEALTH_PROBE_TIMEOUT, remaining);
+            let probe_timeout = std::cmp::min(self.health_probe_timeout, remaining);
             match tokio::time::timeout(probe_timeout, default_api::health_get(&self.config)).await {
                 Ok(Ok(_)) => {
                     debug!(base_path = %self.config.base_path, "envd started successfully");
@@ -205,7 +220,7 @@ impl EnvdInstance {
                 if remaining.is_zero() {
                     return Err("timed out waiting for guest boot services".to_string());
                 }
-                let probe_timeout = std::cmp::min(BOOT_READY_PROBE_TIMEOUT, remaining);
+                let probe_timeout = std::cmp::min(self.boot_ready_probe_timeout, remaining);
                 match self.clone().probe_boot_ready(probe_timeout).await {
                     Ok(0) => {
                         debug!("guest boot services completed");
@@ -461,6 +476,27 @@ mod tests {
                 .unwrap();
             assert_eq!(status.success(), expected, "{active}:{sub}");
         }
+    }
+
+    #[tokio::test]
+    async fn configured_health_probe_timeout_allows_retry_before_overall_deadline() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let config = EnvdConfig {
+            health_probe_timeout_ms: 20,
+            ..Default::default()
+        };
+        let envd = EnvdInstance::new_with_config(format!("http://{address}"), &config);
+        let waiting = tokio::spawn(async move {
+            envd.wait_for_ready(Duration::from_secs(3), Duration::from_millis(1))
+                .await
+        });
+        let (_first, _) = listener.accept().await?;
+        let retry = tokio::time::timeout(Duration::from_millis(500), listener.accept()).await;
+        waiting.abort();
+        retry
+            .expect("configured probe budget should allow a retry before the default one second")?;
+        Ok(())
     }
 
     #[tokio::test]

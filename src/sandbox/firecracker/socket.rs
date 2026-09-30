@@ -12,25 +12,44 @@ use tokio::time::{timeout, Duration};
 
 use super::connector::UnixConnector;
 
-const FIRECRACKER_API_TIMEOUT: Duration = Duration::from_secs(120);
+use crate::cfg::{ConfigManager, FirecrackerConfig};
 
 #[derive(Clone)]
 pub(super) struct UnixSocketClient {
     client: HyperClient<UnixConnector, Full<Bytes>>,
     request_timeout: Duration,
+    snapshot_timeout: Duration,
 }
 
 impl UnixSocketClient {
     pub fn new(socket_path: PathBuf) -> Self {
-        Self::new_with_timeout(socket_path, FIRECRACKER_API_TIMEOUT)
+        Self::new_with_config(socket_path, &ConfigManager::global_config().firecracker)
     }
 
+    fn new_with_config(socket_path: PathBuf, config: &FirecrackerConfig) -> Self {
+        Self::with_timeouts(
+            socket_path,
+            Duration::from_secs(config.api_timeout_secs),
+            Duration::from_secs(config.snapshot_timeout_secs),
+        )
+    }
+
+    #[cfg(test)]
     fn new_with_timeout(socket_path: PathBuf, request_timeout: Duration) -> Self {
+        Self::with_timeouts(socket_path, request_timeout, request_timeout)
+    }
+
+    fn with_timeouts(
+        socket_path: PathBuf,
+        request_timeout: Duration,
+        snapshot_timeout: Duration,
+    ) -> Self {
         let connector = UnixConnector { path: socket_path };
         let client = HyperClient::builder(TokioExecutor::new()).build(connector);
         Self {
             client,
             request_timeout,
+            snapshot_timeout,
         }
     }
 
@@ -62,7 +81,12 @@ impl UnixSocketClient {
             .body(Full::new(Bytes::from(body_bytes)))
             .context("Failed to build request")?;
 
-        let (status, bytes) = timeout(self.request_timeout, async {
+        let deadline = if path == "/snapshot/create" {
+            self.snapshot_timeout
+        } else {
+            self.request_timeout
+        };
+        let (status, bytes) = timeout(deadline, async {
             let res = self.client.request(req).await.context("Request failed")?;
             let status = res.status();
             let bytes = res
@@ -294,6 +318,39 @@ mod tests {
 
         assert!(err.to_string().contains("deserialize response body"));
         server.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn snapshot_creation_uses_its_configured_budget() {
+        for (path, should_succeed) in [("/vm", false), ("/snapshot/create", true)] {
+            let temp = tempdir().unwrap();
+            let socket_path = temp.path().join("firecracker.sock");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(|_req: Request<Incoming>| async move {
+                            tokio::time::sleep(Duration::from_millis(1200)).await;
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"{}"))))
+                        }),
+                    )
+                    .await
+            });
+            let config = FirecrackerConfig {
+                api_timeout_secs: 1,
+                snapshot_timeout_secs: 3,
+                ..Default::default()
+            };
+            let client = UnixSocketClient::new_with_config(socket_path, &config);
+            let result = client
+                .request::<serde_json::Value, serde_json::Value>(Method::PUT, path, None)
+                .await;
+            assert_eq!(result.is_ok(), should_succeed, "{path}: {result:?}");
+            server.abort();
+        }
     }
 
     #[tokio::test]

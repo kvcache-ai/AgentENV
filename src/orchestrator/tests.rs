@@ -38,6 +38,18 @@ use crate::sandbox::{
 use crate::snapshot::RunnableSnapshot;
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 
+const RESUME_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(1);
+const RESUME_BACKEND_BUILD_TIMEOUT: Duration = Duration::from_millis(500);
+
+fn test_lifecycle_timeouts() -> LifecycleTimeouts {
+    LifecycleTimeouts {
+        transition: Duration::from_secs(60),
+        resume: RESUME_TRANSACTION_TIMEOUT,
+        backend_build: RESUME_BACKEND_BUILD_TIMEOUT,
+        housekeeping: Duration::from_millis(100),
+    }
+}
+
 const STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 type TestOrchestrator<
@@ -60,6 +72,7 @@ async fn make_orchestrator() -> Arc<TestOrchestrator> {
         MockBackendFactory::new(),
         DisabledSandboxPersister,
         test_runtime_image_refs(),
+        test_lifecycle_timeouts(),
     )
     .await
     .expect("in-memory orchestrator should not fail to construct")
@@ -71,6 +84,7 @@ async fn make_orchestrator_with_factory(factory: MockBackendFactory) -> Arc<Test
         factory,
         DisabledSandboxPersister,
         test_runtime_image_refs(),
+        test_lifecycle_timeouts(),
     )
     .await
     .expect("in-memory orchestrator should not fail to construct")
@@ -140,6 +154,7 @@ fn make_orchestrator_without_background_with_disk_policy<
         sandbox_metrics: Mutex::new(SandboxMetrics::default()),
         sandbox_event_tx,
         default_sandbox_timeout: Duration::from_secs(15),
+        timeouts: test_lifecycle_timeouts(),
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         shutdown_outcome: tokio::sync::OnceCell::new(),
@@ -4510,13 +4525,19 @@ async fn resume_transaction_timeout_during_start_rolls_back_to_paused_and_allows
             used: AtomicU64::new(0),
         }),
     ));
-    let orchestrator = make_orchestrator_without_background_with_disk_policy(
+    let mut orchestrator = make_orchestrator_without_background_with_disk_policy(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior(behavior.clone()),
         DisabledSandboxPersister,
         disk_policy,
     );
 
+    Arc::get_mut(&mut orchestrator).unwrap().timeouts =
+        LifecycleTimeouts::from(&crate::cfg::OrchestratorConfig {
+            resume_timeout_secs: 1,
+            resume_backend_build_timeout_secs: 1,
+            ..Default::default()
+        });
     let created = orchestrator
         .create_sandbox(create_request(
             Some(60),
@@ -5055,6 +5076,7 @@ async fn resume_rejects_paused_sandbox_from_other_virtualization_mode_without_mu
         MockBackendFactory::new(),
         persister.clone(),
         test_runtime_image_refs(),
+        test_lifecycle_timeouts(),
     )
     .await
     .expect("orchestrator should retain incompatible paused metadata");
@@ -6678,6 +6700,7 @@ async fn terminal_pause_recovers_checkpoint_consistently_across_restart() -> any
         MockBackendFactory::new(),
         persister(),
         test_runtime_image_refs(),
+        test_lifecycle_timeouts(),
     )
     .await?;
     let after_restart = restarted.get_sandbox(&created.id).await?.unwrap();

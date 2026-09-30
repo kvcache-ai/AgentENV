@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock, Semaphore}
 use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, trace, warn};
 
-use crate::cfg::ConfigManager;
+use crate::cfg::{ConfigManager, OrchestratorConfig};
 use crate::disk_policy::{DiskAdmissionReason, DiskPolicyController};
 use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
@@ -59,22 +59,28 @@ enum DeleteProgress {
     Done,
 }
 
-/// Maximum time to wait for a sandbox to leave a transitional state.
-/// Guards against indefinite blocking when a sandbox's in-progress operation
-/// never completes (e.g. the task holding the state panics without rolling back).
-const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
-#[cfg(not(test))]
-const RESUME_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
-#[cfg(test)]
-const RESUME_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(1);
-#[cfg(not(test))]
-const RESUME_BACKEND_BUILD_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const RESUME_BACKEND_BUILD_TIMEOUT: Duration = Duration::from_millis(500);
-#[cfg(not(test))]
-const RESUME_HOUSEKEEPING_TIMEOUT: Duration = Duration::from_secs(30);
-#[cfg(test)]
-const RESUME_HOUSEKEEPING_TIMEOUT: Duration = Duration::from_millis(100);
+#[derive(Clone, Copy)]
+struct LifecycleTimeouts {
+    /// Maximum time to wait for a sandbox to leave a transitional state.
+    /// Guards against indefinite blocking when a sandbox's in-progress operation
+    /// never completes (e.g. the task holding the state panics without rolling back).
+    transition: Duration,
+    resume: Duration,
+    backend_build: Duration,
+    housekeeping: Duration,
+}
+
+impl From<&OrchestratorConfig> for LifecycleTimeouts {
+    fn from(config: &OrchestratorConfig) -> Self {
+        Self {
+            transition: Duration::from_secs(config.transition_timeout_secs),
+            resume: Duration::from_secs(config.resume_timeout_secs),
+            backend_build: Duration::from_secs(config.resume_backend_build_timeout_secs),
+            housekeeping: Duration::from_secs(config.resume_housekeeping_timeout_secs),
+        }
+    }
+}
+
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
 #[cfg(test)]
 const MAX_CONCURRENT_PAUSES: usize = 4;
@@ -150,6 +156,7 @@ pub struct Orchestrator<
     sandbox_metrics: Mutex<SandboxMetrics>,
     sandbox_event_tx: broadcast::Sender<SandboxLifecycleEvent>,
     default_sandbox_timeout: Duration,
+    timeouts: LifecycleTimeouts,
     is_shutting_down: std::sync::atomic::AtomicBool,
     shutdown_tx: watch::Sender<bool>,
     shutdown_outcome: OnceCell<ShutdownOutcome>,
@@ -222,7 +229,14 @@ where
 {
     pub async fn new(store: S, factory: F, persister: P) -> Result<Arc<Self>> {
         let image_refs = local_image_services_from_global_config().runtime_refs;
-        Self::new_inner(store, factory, persister, image_refs).await
+        Self::new_inner(
+            store,
+            factory,
+            persister,
+            image_refs,
+            LifecycleTimeouts::from(&ConfigManager::global_config().orchestrator),
+        )
+        .await
     }
 
     async fn new_inner(
@@ -230,6 +244,7 @@ where
         factory: F,
         persister: P,
         image_refs: Arc<dyn RuntimeImageRefs>,
+        timeouts: LifecycleTimeouts,
     ) -> Result<Arc<Self>> {
         Self::new_inner_with_volumes(store, factory, persister, image_refs, None).await
     }
@@ -297,6 +312,7 @@ where
             sandbox_metrics: Mutex::new(SandboxMetrics::default()),
             sandbox_event_tx,
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
+            timeouts,
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
             shutdown_tx,
             shutdown_outcome: OnceCell::new(),
@@ -2421,7 +2437,7 @@ where
     /// Waits for `sandbox_id` to leave `transitional_state`, then returns the
     /// resulting metadata. Returns `SandboxNotFound` if the sandbox is removed
     /// while waiting, or `InvalidSandboxState` if the sandbox is still in the
-    /// transitional state after the [`WAIT_TRANSITION_TIMEOUT`] elapses.
+    /// transitional state after the configured transition timeout elapses.
     async fn wait_for_transition(
         &self,
         sandbox_id: SandboxId,
@@ -2429,7 +2445,7 @@ where
     ) -> Result<SandboxMetadata> {
         let states = [transitional_state];
         let wait = self.store.wait_while_in_states(&sandbox_id, &states);
-        match tokio::time::timeout(WAIT_TRANSITION_TIMEOUT, wait).await {
+        match tokio::time::timeout(self.timeouts.transition, wait).await {
             Ok(Ok(Some(m))) => Ok(m),
             Ok(Ok(None)) => Err(OrchestratorError::SandboxNotFound(sandbox_id)),
             Ok(Err(e)) => Err(OrchestratorError::from(e)),
@@ -2940,7 +2956,7 @@ where
         let mut progress = LaunchProgress::default();
         let result = if matches!(plan, LaunchPlan::Resume(_)) {
             match tokio::time::timeout(
-                RESUME_TRANSACTION_TIMEOUT,
+                self.timeouts.resume,
                 self.launch_sandbox_transaction(&plan, &mut progress),
             )
             .await
@@ -2953,7 +2969,8 @@ where
                         sandbox_id: plan.sandbox_id(),
                         operation: SandboxOperation::Start,
                         source: anyhow::anyhow!(
-                            "sandbox resume transaction timed out after {RESUME_TRANSACTION_TIMEOUT:?}"
+                            "sandbox resume transaction timed out after {:?}",
+                            self.timeouts.resume
                         ),
                     })
                 }
@@ -2971,7 +2988,7 @@ where
                 self.release_image_refs(RuntimeImageOwner::PausedSandbox(metadata.id))
                     .await;
             };
-            if tokio::time::timeout(RESUME_HOUSEKEEPING_TIMEOUT, finalize)
+            if tokio::time::timeout(self.timeouts.housekeeping, finalize)
                 .await
                 .is_err()
             {
@@ -3230,8 +3247,7 @@ where
                 .build_from_paused_state(sandbox_id, paused_state.as_ref())
         });
 
-        let build_result = match tokio::time::timeout(RESUME_BACKEND_BUILD_TIMEOUT, &mut build)
-            .await
+        let build_result = match tokio::time::timeout(self.timeouts.backend_build, &mut build).await
         {
             Ok(Ok(result)) => result,
             Ok(Err(source)) => {
@@ -3242,7 +3258,7 @@ where
             Err(_) => {
                 warn!(
                     %sandbox_id,
-                    timeout = ?RESUME_BACKEND_BUILD_TIMEOUT,
+                    timeout = ?self.timeouts.backend_build,
                     "sandbox resume backend build timed out"
                 );
                 tokio::spawn(async move {
@@ -3264,7 +3280,8 @@ where
                     sandbox_id,
                     operation: SandboxOperation::Build,
                     source: anyhow::anyhow!(
-                        "sandbox resume backend build timed out after {RESUME_BACKEND_BUILD_TIMEOUT:?}"
+                        "sandbox resume backend build timed out after {:?}",
+                        self.timeouts.backend_build
                     ),
                 });
             }
@@ -3343,7 +3360,7 @@ where
                     warn!(error = %format_args!("{err:#}"), "failed to restore sandbox metadata during launch rollback");
                 }
                 match tokio::time::timeout(
-                    RESUME_HOUSEKEEPING_TIMEOUT,
+                    self.timeouts.housekeeping,
                     self.persister.rollback_resuming(&plan.sandbox_id()),
                 )
                 .await

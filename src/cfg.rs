@@ -164,6 +164,10 @@ pub struct PosixFsBackendConfig {
 
 #[derive(Debug, Clone, Config)]
 pub struct FirecrackerConfig {
+    #[config(default = 120u64)]
+    pub api_timeout_secs: u64,
+    #[config(default = 120u64)]
+    pub snapshot_timeout_secs: u64,
     pub binary_path: Option<PathBuf>,
     pub boot_args: Option<String>,
     pub allowed_extra_boot_args_prefixes: Option<Vec<String>>,
@@ -269,6 +273,10 @@ pub struct SandboxProxyConfig {
 
 #[derive(Debug, Config, Clone)]
 pub struct EnvdConfig {
+    #[config(default = 1000u64)]
+    pub health_probe_timeout_ms: u64,
+    #[config(default = 1000u64)]
+    pub boot_ready_probe_timeout_ms: u64,
     #[config(default = "0.5.15")]
     pub version: String,
     #[config(default = 60u64)]
@@ -665,6 +673,14 @@ pub struct OrchestratorConfig {
     #[config(default = 3600u64)]
     pub metrics_retention_secs: u64,
 
+    #[config(default = 60u64)]
+    pub transition_timeout_secs: u64,
+    #[config(default = 900u64)]
+    pub resume_timeout_secs: u64,
+    #[config(default = 30u64)]
+    pub resume_backend_build_timeout_secs: u64,
+    #[config(default = 30u64)]
+    pub resume_housekeeping_timeout_secs: u64,
     #[config(default = 1000u64)]
     pub auto_evict_interval_ms: u64,
     #[config(default = 4usize, env = "AENV_MAX_CONCURRENT_PAUSES")]
@@ -1042,6 +1058,53 @@ impl AppConfig {
         }
     }
 
+    fn validate_operation_timeouts(&self) -> Result<()> {
+        for (name, value) in [
+            (
+                "firecracker.api_timeout_secs",
+                self.firecracker.api_timeout_secs,
+            ),
+            (
+                "firecracker.snapshot_timeout_secs",
+                self.firecracker.snapshot_timeout_secs,
+            ),
+            (
+                "envd.health_probe_timeout_ms",
+                self.envd.health_probe_timeout_ms,
+            ),
+            (
+                "envd.boot_ready_probe_timeout_ms",
+                self.envd.boot_ready_probe_timeout_ms,
+            ),
+            (
+                "orchestrator.transition_timeout_secs",
+                self.orchestrator.transition_timeout_secs,
+            ),
+            (
+                "orchestrator.resume_timeout_secs",
+                self.orchestrator.resume_timeout_secs,
+            ),
+            (
+                "orchestrator.resume_backend_build_timeout_secs",
+                self.orchestrator.resume_backend_build_timeout_secs,
+            ),
+            (
+                "orchestrator.resume_housekeeping_timeout_secs",
+                self.orchestrator.resume_housekeeping_timeout_secs,
+            ),
+        ] {
+            if value == 0 {
+                bail!("{name} must be > 0");
+            }
+        }
+        if self.orchestrator.resume_backend_build_timeout_secs
+            > self.orchestrator.resume_timeout_secs
+        {
+            bail!("orchestrator.resume_backend_build_timeout_secs must not exceed resume_timeout_secs");
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         let mirrors = &self.ublk.overlaybd.registry_mirrors;
         validate_registry_mirror_hosts(mirrors)?;
@@ -1049,6 +1112,7 @@ impl AppConfig {
         self.image.resolver.validate()?;
         self.image.cache.gc.validate()?;
         self.disk_policy.validate()?;
+        self.validate_operation_timeouts()?;
         if self.orchestrator.max_concurrent_pauses == 0 {
             bail!("orchestrator.max_concurrent_pauses must be > 0");
         }
@@ -1554,6 +1618,27 @@ impl SandboxProxyConfig {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn operation_timeouts_reject_zero_and_inconsistent_resume_budgets() {
+        let mut config = AppConfig::default();
+        config.validate_operation_timeouts().unwrap();
+        config.firecracker.snapshot_timeout_secs = 0;
+        assert!(config
+            .validate_operation_timeouts()
+            .unwrap_err()
+            .to_string()
+            .contains("firecracker.snapshot_timeout_secs must be > 0"));
+        config.firecracker.snapshot_timeout_secs = 120;
+        config.orchestrator.resume_timeout_secs = 10;
+        assert!(config
+            .validate_operation_timeouts()
+            .unwrap_err()
+            .to_string()
+            .contains("must not exceed resume_timeout_secs"));
+        config.orchestrator.resume_backend_build_timeout_secs = 10;
+        config.validate_operation_timeouts().unwrap();
+    }
 
     #[test]
     fn bundled_default_config_loads() -> Result<()> {
