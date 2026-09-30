@@ -213,17 +213,7 @@ pub struct DiskPolicyController {
 
 impl DiskPolicyController {
     pub fn from_config(config: &AppConfig) -> Self {
-        let mut paths = vec![
-            config.home_path.clone(),
-            config.image.cache.root_dir.clone(),
-            config.snapshot.local_cache_path.clone(),
-        ];
-        if let Some(path) = &config.firecracker.work_dir {
-            paths.push(path.clone());
-        }
-        if let Some(posix) = &config.backend.posix_fs {
-            paths.push(posix.snapshot_store.clone());
-        }
+        let paths = Self::monitored_paths(config);
         Self::new(
             config.disk_policy.enabled,
             config.disk_policy.cleanup_high_watermark_ratio,
@@ -231,6 +221,29 @@ impl DiskPolicyController {
             config.disk_policy.admission_hard_watermark_ratio,
             Arc::new(SampledDiskUsage::for_paths(paths)),
         )
+    }
+
+    fn monitored_paths(config: &AppConfig) -> Vec<PathBuf> {
+        let mut paths = vec![
+            config.home_path.clone(),
+            config.image.cache.root_dir.clone(),
+            config.snapshot.local_cache_path.clone(),
+            config.orchestrator.persisted_sandbox_store_path.clone(),
+        ];
+        match &config.firecracker.work_dir {
+            Some(path) => {
+                paths.push(path.clone());
+                paths.push(path.join("managed-snapshots"));
+            }
+            None => {
+                paths.push(std::env::temp_dir());
+                paths.push(std::env::temp_dir().join("aenv/managed-snapshots"));
+            }
+        }
+        if let Some(posix) = &config.backend.posix_fs {
+            paths.push(posix.snapshot_store.clone());
+        }
+        paths
     }
 
     pub fn new(
@@ -462,6 +475,31 @@ mod tests {
         })
         .await?;
         Ok(())
+    }
+
+    #[test]
+    fn monitors_custom_pause_store_and_firecracker_work_directory() {
+        let mut config = AppConfig::default();
+        config.orchestrator.persisted_sandbox_store_path = "/pause-volume/sandboxes".into();
+        config.firecracker.work_dir = Some("/runtime-volume/firecracker".into());
+
+        let paths = DiskPolicyController::monitored_paths(&config);
+        assert!(paths.contains(&PathBuf::from("/pause-volume/sandboxes")));
+        assert!(paths.contains(&PathBuf::from("/runtime-volume/firecracker")));
+        assert!(paths.contains(&PathBuf::from(
+            "/runtime-volume/firecracker/managed-snapshots"
+        )));
+    }
+
+    #[test]
+    fn monitors_temp_runtime_and_managed_snapshot_fallbacks() {
+        let mut config = AppConfig::default();
+        config.firecracker.work_dir = None;
+
+        let paths = DiskPolicyController::monitored_paths(&config);
+        assert!(paths.contains(&config.orchestrator.persisted_sandbox_store_path));
+        assert!(paths.contains(&std::env::temp_dir()));
+        assert!(paths.contains(&std::env::temp_dir().join("aenv/managed-snapshots")));
     }
 
     #[test]
