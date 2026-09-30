@@ -13,6 +13,7 @@
 #   E2E_TEMPLATE_USER_IMAGE - Optional fromImage override for the base template build
 #   SKIP_BUILD            - Set to 1 to skip the build step
 #   SUITE_FILTER          - Run only suites matching this glob (e.g. "02*")
+#   SUITE_EXCLUDE         - Skip suites matching this glob (e.g. "17_buildkit.sh")
 #   E2E_MODE              - Runtime mode: single-node, compose, or k8s
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -142,6 +143,9 @@ failed_names=()
 
 for suite in "${SUITES_DIR}"/${suite_filter}; do
   [[ -f "$suite" ]] || continue
+  if [[ -n "${SUITE_EXCLUDE:-}" && "${suite##*/}" == ${SUITE_EXCLUDE} ]]; then
+    continue
+  fi
   suite_name="$(basename "$suite" .sh)"
   ((total_suites++)) || true
 

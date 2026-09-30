@@ -1,0 +1,80 @@
+name: build-images
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+# The page job pushes gh-pages; default token perms can be read-only.
+permissions:
+  contents: write
+
+env:
+  REGISTRY: us-dallas-1.ocir.io/ax3vcxtxsjva/dev/research
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - component: runtime
+            dockerfile: deploy/docker/Dockerfile.agentenv
+          - component: gateway
+            dockerfile: deploy/docker/Dockerfile.gateway
+          - component: scheduler
+            dockerfile: deploy/docker/Dockerfile.scheduler
+    steps:
+      - uses: actions/checkout@v4
+      # Rust image builds need more disk than the stock runner leaves free.
+      - name: free disk
+        run: sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: us-dallas-1.ocir.io
+          username: ${{ secrets.OCIR_USERNAME }}
+          password: ${{ secrets.OCIR_PASSWORD }}
+      - id: tag
+        run: echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        id: push
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/agentenv-${{ matrix.component }}:${{ steps.tag.outputs.tag }}
+            ${{ env.REGISTRY }}/agentenv-${{ matrix.component }}:main
+  page:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: docker/login-action@v3
+        with:
+          registry: us-dallas-1.ocir.io
+          username: ${{ secrets.OCIR_USERNAME }}
+          password: ${{ secrets.OCIR_PASSWORD }}
+      - name: fetch digests from the registry
+        run: |
+          curl -sL https://github.com/google/go-containerregistry/releases/download/v0.20.6/go-containerregistry_Linux_x86_64.tar.gz | tar xz crane
+          mkdir -p build-meta
+          TAG=$(git rev-parse --short HEAD)
+          for c in runtime gateway scheduler; do
+            ./crane digest "$REGISTRY/agentenv-$c:$TAG" > "build-meta/$c.digest"
+          done
+      - name: update builds page
+        run: |
+          git fetch origin gh-pages || true
+          git worktree add /tmp/pages gh-pages 2>/dev/null || git worktree add --orphan -b gh-pages /tmp/pages
+          python3 .github/scripts/update_builds_page.py \
+            --pages-dir /tmp/pages --meta-dir build-meta \
+            --registry "$REGISTRY" --sha "$(git rev-parse --short HEAD)" \
+            --author "$(git log -1 --format=%an)" --message "$(git log -1 --format=%s)"
+          cd /tmp/pages
+          git add -A
+          git -c user.name=ci -c user.email=ci@prometheus.co commit -m "build $(git -C "$GITHUB_WORKSPACE" rev-parse --short HEAD)" || exit 0
+          git push origin gh-pages

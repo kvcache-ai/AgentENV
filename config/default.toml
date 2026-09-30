@@ -296,6 +296,9 @@ workers = 1
 daemon_metrics_listen_addr = "0.0.0.0:9103"
 
 [ublk.overlaybd]
+# Optional native OCI read mirrors. Keep original image references; origin is fallback.
+# registry_mirrors = { "registry.example.com" = ["https://mirror.example.com"] }
+# Native mirrors currently require p2p.enabled = false.
 # Generated OverlayBD runtime config. The server rewrites it at every startup;
 # configure behavior here rather than editing the generated JSON.
 # global_config_path = "$AENV_HOME/overlaybd/overlaybd-global.json"

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -439,6 +440,7 @@ pub(crate) fn write_generated_overlaybd_global_configs(
         &image_cache,
         p2p_facade_address,
         &rootfs_download,
+        Some(&config.ublk.overlaybd.registry_mirrors),
     )
     .with_context(|| {
         format!(
@@ -455,6 +457,7 @@ pub(crate) fn write_generated_overlaybd_global_configs(
         &memory_cache,
         p2p_facade_address,
         &memory_download,
+        Some(&config.ublk.overlaybd.registry_mirrors),
     )
     .with_context(|| {
         format!(
@@ -481,6 +484,7 @@ pub(crate) fn write_generated_overlaybd_global_configs(
         &convert_cache,
         p2p_facade_address,
         &DownloadConfig::default(),
+        None,
     )
     .with_context(|| format!("write overlaybd global config {}", convert_path.display()))?;
 
@@ -497,6 +501,7 @@ pub(crate) fn write_generated_overlaybd_global_configs(
         &resize_cache,
         p2p_facade_address,
         &DownloadConfig::default(),
+        None,
     )
     .with_context(|| format!("write overlaybd global config {}", resize_path.display()))?;
     Ok(())
@@ -768,6 +773,7 @@ fn write_generated_overlaybd_global_config(
     image_cache: &ResolvedImageCacheConfig,
     p2p_facade_address: Option<&str>,
     download: &DownloadConfig,
+    registry_mirrors: Option<&HashMap<String, Vec<String>>>,
 ) -> Result<()> {
     let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let log_path = config_dir.join("overlaybd.log");
@@ -811,6 +817,10 @@ fn write_generated_overlaybd_global_config(
         "registryFsVersion": "v2",
         "remoteIoWorkers": app_config.ublk.overlaybd.remote_io_workers,
     });
+
+    if let Some(mirrors) = registry_mirrors {
+        config["registryMirrors"] = serde_json::to_value(mirrors)?;
+    }
 
     if app_config.snapshot.repository_backend == SnapshotRepositoryBackendKind::Oss {
         let oss_config = app_config

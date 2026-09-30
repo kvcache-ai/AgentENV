@@ -26,6 +26,9 @@ on:
     paths-ignore: *ignore_docs
 
 env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
   RUST_LOG: ${{ github.event.inputs.log_level || 'info' }}
 
 permissions:
@@ -37,6 +40,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Reclaim runner disk space
+        run: |
+          df -h / "$RUNNER_TEMP"
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL
+          df -h / "$RUNNER_TEMP"
       - uses: ./.github/actions/rust-ci-setup
         with:
           ci_deps_target: ci-deps
@@ -45,19 +53,33 @@ jobs:
           ghcr_username: ${{ github.actor }}
           ghcr_token: ${{ secrets.GITHUB_TOKEN }}
       - name: AgentEnv Integration tests
-        run: sg kvm -c "make test-agent-integration PROFILE=debug"
+        run: |
+          df -h / "$RUNNER_TEMP"
+          sg kvm -c "make test-agent-integration PROFILE=debug"
+      - name: Report remaining disk space
+        if: always()
+        run: df -h / "$RUNNER_TEMP"
       - uses: ./.github/actions/sandbox-artifacts-cleanup
         if: always()
 
   e2e-tests:
-    name: e2e-tests (${{ matrix.e2e_name }})
+    name: e2e-tests (${{ matrix.e2e_name }}, ${{ matrix.suite }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         e2e_name: [single-node, docker-compose]
+        suite: [core, buildkit]
+    env:
+      SUITE_FILTER: ${{ matrix.suite == 'buildkit' && '17_buildkit.sh' || '*.sh' }}
+      SUITE_EXCLUDE: ${{ matrix.suite == 'core' && '17_buildkit.sh' || '' }}
     steps:
       - uses: actions/checkout@v6
+      - name: Reclaim runner disk space
+        run: |
+          df -h / "$RUNNER_TEMP"
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL
+          df -h / "$RUNNER_TEMP"
       - uses: ./.github/actions/rust-ci-setup
         with:
           ci_deps_target: ci-deps
@@ -102,6 +124,9 @@ jobs:
           tags: agentenv-scheduler:latest
           cache-from: type=gha,scope=agentenv-scheduler
           cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=agentenv-scheduler,mode=max' || '' }}
+      - name: Reclaim Docker build cache
+        if: ${{ matrix.e2e_name == 'docker-compose' }}
+        run: docker buildx prune --all --force
       - name: Install Node.js
         uses: actions/setup-node@v6
         with:
@@ -118,6 +143,8 @@ jobs:
         run: |
           make build-aenv
           bash scripts/buildkit/install-buildctl.sh "$RUNNER_TEMP/buildkit"
+      - name: Report disk space before E2E tests
+        run: df -h / "$RUNNER_TEMP"
       - name: Single-node E2E tests
         if: ${{ matrix.e2e_name == 'single-node' }}
         env:
@@ -133,5 +160,8 @@ jobs:
           CONFIG_PATH: ${{ github.workspace }}/scripts/buildkit/test-config.toml
           SKIP_BUILD: "1"
         run: make test-e2e-compose PROFILE=debug
+      - name: Report remaining disk space
+        if: always()
+        run: df -h / "$RUNNER_TEMP"
       - uses: ./.github/actions/sandbox-artifacts-cleanup
         if: always()
