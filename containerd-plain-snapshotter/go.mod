@@ -3,7 +3,7 @@ module github.com/anthropic/containerd-plain-snapshotter
 go 1.25.0
 
 require (
-	github.com/containerd/containerd v1.7.28
+	github.com/containerd/containerd v1.7.36
 	github.com/containerd/containerd/api v1.8.0
 	github.com/google/uuid v1.6.0
 	google.golang.org/grpc v1.83.2
@@ -27,6 +27,7 @@ require (
 	github.com/opencontainers/image-spec v1.1.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
+	github.com/stretchr/testify v1.11.1 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
