@@ -14,7 +14,8 @@ use overlaybd::image_file::ImageFile;
 use overlaybd::image_service::ImageService;
 use overlaybd::RestackSnapshotTerminalFailure;
 use tokio::net::UnixListener;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
+use tokio::task::JoinSet;
 use warm_pool::{PoolConfig, PoolMaintenanceAction, WarmPool};
 
 use storage_util::io_ring::IoRingHandle;
@@ -265,6 +266,9 @@ impl PoolState {
 
 // ── Daemon server ───────────────────────────────────────────────────────────
 
+/// Maximum number of devices torn down at the same time during shutdown.
+const SHUTDOWN_STOP_CONCURRENCY: usize = 16;
+
 pub struct UblkDaemonServer {
     socket_path: PathBuf,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
@@ -471,21 +475,34 @@ impl UblkDaemonServer {
             }
         }
 
+        // Each STOP_DEV/DEL_DEV waits for block-layer RCU grace periods, so
+        // deleting devices one by one makes shutdown time grow linearly with
+        // the device count. Overlap the waits with bounded concurrency.
+        let permits = Arc::new(Semaphore::new(SHUTDOWN_STOP_CONCURRENCY));
+        let mut stops = JoinSet::new();
+
         let dev_ids: Vec<u32> = self.devices.iter().map(|r| *r.key()).collect();
         for dev_id in dev_ids {
             if let Some((_, mut device)) = self.devices.remove(&dev_id) {
-                tracing::info!(dev_id, "stopping device during shutdown");
-                quiesce_managed_device(&mut device).await;
-                // ManagedDevice holds an open fd to the ublk char dev.
-                // Must drop it before delete_dev, or the DEL_DEV ioctl will block.
-                drop(device);
-                if let Err(err) = delete_dev(self.ctrl_ring.clone(), dev_id).await {
-                    tracing::warn!(dev_id, ?err, "failed to stop device during shutdown");
-                }
+                let ctrl_ring = self.ctrl_ring.clone();
+                let permits = Arc::clone(&permits);
+                stops.spawn(async move {
+                    let _permit = permits.acquire_owned().await;
+                    tracing::info!(dev_id, "stopping device during shutdown");
+                    quiesce_managed_device(&mut device).await;
+                    // ManagedDevice holds an open fd to the ublk char dev.
+                    // Must drop it before delete_dev, or the DEL_DEV ioctl will block.
+                    drop(device);
+                    if let Err(err) = delete_dev(ctrl_ring, dev_id).await {
+                        tracing::warn!(dev_id, ?err, "failed to stop device during shutdown");
+                    }
+                });
             }
         }
 
         if let Some(pool) = &self.pool_state {
+            let mut pooled_devs = Vec::new();
+
             let exclusive_ids: Vec<u32> = pool
                 .active_exclusive
                 .iter()
@@ -493,7 +510,7 @@ impl UblkDaemonServer {
                 .collect();
             for dev_id in exclusive_ids {
                 if let Some((_, active)) = pool.active_exclusive.remove(&dev_id) {
-                    stop_overlaybd_device(self.ctrl_ring.clone(), active.dev).await;
+                    pooled_devs.push(active.dev);
                 }
             }
 
@@ -505,13 +522,25 @@ impl UblkDaemonServer {
             for key in shared_keys {
                 if let Some((_, active)) = pool.active_shared.remove(&key) {
                     pool.shared_by_dev_id.remove(&active.dev.dev_id());
-                    stop_overlaybd_device(self.ctrl_ring.clone(), active.dev).await;
+                    pooled_devs.push(active.dev);
                 }
             }
 
-            let idle_devices: Vec<PooledDevice> = pool.idle.drain_all();
-            for pooled in idle_devices {
-                stop_overlaybd_device(self.ctrl_ring.clone(), pooled.dev).await;
+            pooled_devs.extend(pool.idle.drain_all().into_iter().map(|pooled| pooled.dev));
+
+            for dev in pooled_devs {
+                let ctrl_ring = self.ctrl_ring.clone();
+                let permits = Arc::clone(&permits);
+                stops.spawn(async move {
+                    let _permit = permits.acquire_owned().await;
+                    stop_overlaybd_device(ctrl_ring, dev).await;
+                });
+            }
+        }
+
+        while let Some(result) = stops.join_next().await {
+            if let Err(err) = result {
+                tracing::warn!(?err, "device stop task failed during shutdown");
             }
         }
     }
