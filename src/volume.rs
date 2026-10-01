@@ -939,7 +939,7 @@ fn validate_name(name: &str) -> Result<(), VolumeError> {
     }
 }
 
-fn validate_volume_id(id: &str) -> Result<(), VolumeError> {
+pub(crate) fn validate_volume_id(id: &str) -> Result<(), VolumeError> {
     if is_valid_volume_component(id) {
         Ok(())
     } else {

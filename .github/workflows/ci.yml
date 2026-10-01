@@ -64,6 +64,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Reclaim runner disk space
+        run: sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL
       - uses: ./.github/actions/rust-ci-setup
       - name: Configure ublk test host
         run: sudo scripts/tests/setup-ublk-access.sh "$(id -un)" "$(id -gn)"

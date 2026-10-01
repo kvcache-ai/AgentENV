@@ -17,12 +17,13 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::{CleanupMetrics, PersistenceResult, SandboxPersistenceError, SandboxPersister};
-use crate::cfg::ConfigManager;
+use crate::cfg::{AppConfig, ConfigManager};
 use crate::local_store::{LocalKvBatchOp, LocalKvStore, LocalStoreDurability};
 use crate::orchestrator::{store::SandboxMetadata, SandboxState};
 use crate::sandbox::{PausedSandboxState, RuntimeArtifactClosure, SandboxBackendFactory};
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
+use crate::volume::validate_volume_id;
 
 const RECORD_VERSION: u32 = 1;
 const RECORD_DB_DIR: &str = "records.db";
@@ -1110,25 +1111,50 @@ impl FileBackedSandboxPersister {
     fn validate_closure_containment(
         artifact_root: &Path,
         closure: &RuntimeArtifactClosure,
+        metadata: &SandboxMetadata,
+        config: &AppConfig,
     ) -> PersistenceResult<()> {
         let artifact_root = std::fs::canonicalize(artifact_root).map_err(|source| {
             SandboxPersistenceError::io("resolve paused artifact generation", artifact_root, source)
         })?;
-        let commit_store = std::fs::canonicalize(
-            ConfigManager::global_config()
-                .image_cache_layout()
-                .commit_store,
-        )
-        .ok();
+        let commit_store = std::fs::canonicalize(config.image_cache_layout().commit_store).ok();
+        let mut volume_roots = Vec::new();
+        if !metadata.volume_mounts.is_empty() {
+            let volume_store = config.home_path.join("volumes/data");
+            let volume_store = std::fs::canonicalize(&volume_store).map_err(|source| {
+                SandboxPersistenceError::io("resolve managed volume store", &volume_store, source)
+            })?;
+            for volume_id in metadata.volume_mounts.values() {
+                validate_volume_id(volume_id).map_err(|source| {
+                    SandboxPersistenceError::InvalidRecord {
+                        reason: "invalid mounted volume ID".to_string(),
+                        source: Some(source.into()),
+                    }
+                })?;
+                let root = volume_store.join(volume_id);
+                let root = std::fs::canonicalize(&root).map_err(|source| {
+                    SandboxPersistenceError::io("resolve mounted volume directory", &root, source)
+                })?;
+                if !root.starts_with(&volume_store) {
+                    return Err(SandboxPersistenceError::InvalidRecord {
+                        reason: "mounted volume directory escapes the managed volume store"
+                            .to_string(),
+                        source: None,
+                    });
+                }
+                volume_roots.push(root);
+            }
+        }
         for path in closure.paths() {
             let in_generation = path.starts_with(&artifact_root);
             let in_commit_store = commit_store
                 .as_ref()
                 .is_some_and(|commit_store| path.starts_with(commit_store));
-            if !in_generation && !in_commit_store {
+            let in_mounted_volume = volume_roots.iter().any(|root| path.starts_with(root));
+            if !in_generation && !in_commit_store && !in_mounted_volume {
                 return Err(SandboxPersistenceError::InvalidRecord {
                     reason: format!(
-                        "paused runtime artifact {} is outside its generation and the image commit store",
+                        "paused runtime artifact {} is outside its generation, the image commit store, and its mounted volumes",
                         path.display()
                     ),
                     source: None,
@@ -1731,7 +1757,12 @@ impl SandboxPersister for FileBackedSandboxPersister {
                     source: Some(source),
                 })?;
         let artifact_closure = artifact_closure?;
-        Self::validate_closure_containment(artifact_root, &artifact_closure)?;
+        Self::validate_closure_containment(
+            artifact_root,
+            &artifact_closure,
+            metadata,
+            ConfigManager::global_config(),
+        )?;
         let record = PersistedPausedRecord {
             version: RECORD_VERSION,
             lifecycle: PersistedPausedLifecycle::Paused,
@@ -1990,6 +2021,82 @@ mod tests {
         Ok(Arc::new(ArtifactSnapshot {
             configs: configs.into_iter().collect(),
         }))
+    }
+
+    #[test]
+    fn paused_closure_allows_only_mounted_managed_volumes() -> Result<()> {
+        let temp = TempDir::new()?;
+        let config = AppConfig {
+            home_path: temp.path().join("home"),
+            ..AppConfig::default()
+        };
+        let generation = temp.path().join("generation");
+        std::fs::create_dir_all(&generation)?;
+        let volume_id = "vol_0123456789abcdef0123456789abcdef";
+        let volume_root = config.home_path.join("volumes/data").join(volume_id);
+        std::fs::create_dir_all(&volume_root)?;
+        let lower = volume_root.join("snapshot.commit");
+        std::fs::write(&lower, b"volume data")?;
+        let image = volume_root.join("image.json");
+        write_overlaybd_config(&image, &lower)?;
+        let closure = RuntimeArtifactSet::from_overlaybd_image_configs(vec![image.clone()])
+            .resolve_closure()?;
+        let mut metadata = SandboxMetadata::default();
+        assert!(FileBackedSandboxPersister::validate_closure_containment(
+            &generation,
+            &closure,
+            &metadata,
+            &config,
+        )
+        .is_err());
+        metadata
+            .volume_mounts
+            .insert("/data".to_string(), volume_id.to_string());
+        FileBackedSandboxPersister::validate_closure_containment(
+            &generation,
+            &closure,
+            &metadata,
+            &config,
+        )?;
+
+        // A mounted volume cannot smuggle an unrelated lower into the closure.
+        let outside = temp.path().join("unrelated.commit");
+        std::fs::write(&outside, b"other data")?;
+        write_overlaybd_config(&image, &outside)?;
+        let closure = RuntimeArtifactSet::from_overlaybd_image_configs(vec![image.clone()])
+            .resolve_closure()?;
+        assert!(FileBackedSandboxPersister::validate_closure_containment(
+            &generation,
+            &closure,
+            &metadata,
+            &config,
+        )
+        .is_err());
+
+        // Canonical paths also reject a symlink from a volume to an outside file.
+        std::fs::remove_file(&lower)?;
+        std::os::unix::fs::symlink(&outside, &lower)?;
+        write_overlaybd_config(&image, &lower)?;
+        let closure =
+            RuntimeArtifactSet::from_overlaybd_image_configs(vec![image]).resolve_closure()?;
+        assert!(FileBackedSandboxPersister::validate_closure_containment(
+            &generation,
+            &closure,
+            &metadata,
+            &config,
+        )
+        .is_err());
+        metadata
+            .volume_mounts
+            .insert("/data".to_string(), "../escape".to_string());
+        assert!(FileBackedSandboxPersister::validate_closure_containment(
+            &generation,
+            &closure,
+            &metadata,
+            &config,
+        )
+        .is_err());
+        Ok(())
     }
 
     fn test_persister(root: &Path) -> FileBackedSandboxPersister {
