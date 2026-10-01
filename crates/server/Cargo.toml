@@ -1,0 +1,22 @@
+[package]
+name = "agentenv-server"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
+
+[features]
+vendored-openssl = ["agentenv/vendored-openssl"]
+
+[dependencies]
+agentenv = { path = "../.." }
+agentenv-observability = { path = "../observability" }
+anyhow = "1.0.100"
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1.41"

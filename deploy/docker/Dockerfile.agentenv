@@ -24,6 +24,9 @@ RUN sh /usr/local/bin/apply_apt_mirror.sh "${APT_MIRROR_BASE}" \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
+COPY rust-toolchain.toml ./
+RUN test "$(rustc --version | cut -d ' ' -f 2)" = "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo install cargo-chef --locked
@@ -45,11 +48,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo chef cook --release --recipe-path recipe.json
 
 FROM build-deps AS builder
+ARG AENV_BUILD_COMMIT
 
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo build --release -p agentenv --bin server -p uvm-ublk-daemon --bin uvm-ublk-daemon \
+    cargo build --release -p agentenv-server --bin server -p uvm-ublk-daemon --bin uvm-ublk-daemon \
     && cp /build/target/release/server /out-server \
     && cp /build/target/release/uvm-ublk-daemon /out-uvm-ublk-daemon
 

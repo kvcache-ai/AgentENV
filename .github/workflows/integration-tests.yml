@@ -7,7 +7,7 @@ on:
         description: "Log level for the tests"
         required: false
   pull_request:
-    paths-ignore: &ignore_docs
+    paths-ignore:
       - "**.md"
       - "**.rst"
       - "docs/**"
@@ -23,7 +23,22 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - ".github/pull_request_template.md"
   push:
-    paths-ignore: *ignore_docs
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "**.rst"
+      - "docs/**"
+      - "LICENSE"
+      - ".gitignore"
+      - ".github/workflows/ci.yml"
+      - ".github/workflows/benchmark.yml"
+      - ".github/workflows/e2b-benchmark.yml"
+      - ".github/workflows/docs.yml"
+      - ".github/workflows/coverage.yml"
+      - ".github/workflows/services-ci.yml"
+      - ".github/workflows/mutation-tests.yml"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/pull_request_template.md"
 
 env:
   CARGO_INCREMENTAL: "0"
@@ -34,6 +49,10 @@ env:
 permissions:
   contents: read
   packages: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   agentenv-tests:
@@ -62,13 +81,56 @@ jobs:
       - uses: ./.github/actions/sandbox-artifacts-cleanup
         if: always()
 
+  compose-images:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: runtime
+            dockerfile: deploy/docker/Dockerfile.agentenv
+          - component: gateway
+            dockerfile: deploy/docker/Dockerfile.gateway
+          - component: scheduler
+            dockerfile: deploy/docker/Dockerfile.scheduler
+    steps:
+      - uses: actions/checkout@v6
+      - name: Reclaim runner disk space
+        run: sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: dhi.io
+          username: ${{ secrets.DHI_USERNAME }}
+          password: ${{ secrets.DHI_PASSWORD }}
+      - name: Build Compose image once for both suites
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          outputs: type=docker,dest=${{ runner.temp }}/${{ matrix.component }}.tar
+          tags: agentenv-${{ matrix.component }}:latest
+          build-args: AENV_BUILD_COMMIT=${{ github.sha }}
+          cache-from: |
+            type=gha,scope=agentenv-${{ matrix.component }}
+            type=gha,scope=agentenv-${{ matrix.component }}-publish
+          cache-to: type=gha,scope=agentenv-${{ matrix.component }},mode=max
+      - uses: actions/upload-artifact@v7
+        with:
+          name: compose-image-${{ matrix.component }}
+          path: ${{ runner.temp }}/${{ matrix.component }}.tar
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
   e2e-tests:
     name: e2e-tests (${{ matrix.e2e_name }}, ${{ matrix.suite }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        e2e_name: [single-node, docker-compose]
+        e2e_name: [single-node]
         suite: [core, buildkit]
     env:
       SUITE_FILTER: ${{ matrix.suite == 'buildkit' && '17_buildkit.sh' || '*.sh' }}
@@ -84,49 +146,9 @@ jobs:
         with:
           ci_deps_target: ci-deps
       - uses: ./.github/actions/sandbox-ci-setup
-        if: ${{ matrix.e2e_name == 'single-node' }}
         with:
           ghcr_username: ${{ github.actor }}
           ghcr_token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Configure ublk test host
-        if: ${{ matrix.e2e_name != 'single-node' }}
-        run: sudo scripts/tests/setup-ublk-access.sh "$(id -un)" "$(id -gn)"
-      - name: Set up Docker Buildx
-        if: ${{ matrix.e2e_name == 'docker-compose' }}
-        uses: docker/setup-buildx-action@v4
-      - name: Build AgentENV runtime image
-        if: ${{ matrix.e2e_name == 'docker-compose' }}
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: deploy/docker/Dockerfile.agentenv
-          load: true
-          tags: agentenv-runtime:latest
-          cache-from: type=gha,scope=agentenv-runtime
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=agentenv-runtime,mode=max' || '' }}
-      - name: Build gateway image
-        if: ${{ matrix.e2e_name == 'docker-compose' }}
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: deploy/docker/Dockerfile.gateway
-          load: true
-          tags: agentenv-gateway:latest
-          cache-from: type=gha,scope=agentenv-gateway
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=agentenv-gateway,mode=max' || '' }}
-      - name: Build scheduler image
-        if: ${{ matrix.e2e_name == 'docker-compose' }}
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: deploy/docker/Dockerfile.scheduler
-          load: true
-          tags: agentenv-scheduler:latest
-          cache-from: type=gha,scope=agentenv-scheduler
-          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,scope=agentenv-scheduler,mode=max' || '' }}
-      - name: Reclaim Docker build cache
-        if: ${{ matrix.e2e_name == 'docker-compose' }}
-        run: docker buildx prune --all --force
       - name: Install Node.js
         uses: actions/setup-node@v6
         with:
@@ -146,15 +168,73 @@ jobs:
       - name: Report disk space before E2E tests
         run: df -h / "$RUNNER_TEMP"
       - name: Single-node E2E tests
-        if: ${{ matrix.e2e_name == 'single-node' }}
         env:
           BUILDCTL_BIN: ${{ runner.temp }}/buildkit/buildctl
           CONFIG_PATH: ${{ github.workspace }}/scripts/buildkit/test-config.toml
           AENV_HOME_PATH: ${{ runner.temp }}/aenv-e2e/home
           AENV_RUNTIME_PATH: ${{ runner.temp }}/aenv-e2e/run
         run: sg kvm -c "make test-e2e PROFILE=debug"
+      - name: Report remaining disk space
+        if: always()
+        run: df -h / "$RUNNER_TEMP"
+      - uses: ./.github/actions/sandbox-artifacts-cleanup
+        if: always()
+
+  compose-tests:
+    needs: compose-images
+    name: e2e-tests (${{ matrix.e2e_name }}, ${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        e2e_name: [docker-compose]
+        suite: [core, buildkit]
+    env:
+      SUITE_FILTER: ${{ matrix.suite == 'buildkit' && '17_buildkit.sh' || '*.sh' }}
+      SUITE_EXCLUDE: ${{ matrix.suite == 'core' && '17_buildkit.sh' || '' }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Reclaim runner disk space
+        run: |
+          df -h / "$RUNNER_TEMP"
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/CodeQL
+          df -h / "$RUNNER_TEMP"
+      - uses: ./.github/actions/rust-ci-setup
+        with:
+          ci_deps_target: ci-deps
+      - name: Configure ublk test host
+        run: sudo scripts/tests/setup-ublk-access.sh "$(id -un)" "$(id -gn)"
+      - name: Download images built for this run
+        uses: actions/download-artifact@v7
+        with:
+          pattern: compose-image-*
+          path: ${{ runner.temp }}/compose-images
+          merge-multiple: true
+      - name: Load Compose images
+        run: |
+          for image in "$RUNNER_TEMP"/compose-images/*.tar; do
+            docker load --input "$image"
+            rm "$image"
+          done
+      - name: Install Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Install e2b CLI
+        run: npm install -g @e2b/cli
+      - name: Install Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install e2b Python SDK
+        run: python3 -m pip install --upgrade e2b e2b-code-interpreter
+      - name: Prepare BuildKit test client
+        run: |
+          make build-aenv
+          bash scripts/buildkit/install-buildctl.sh "$RUNNER_TEMP/buildkit"
+      - name: Report disk space before E2E tests
+        run: df -h / "$RUNNER_TEMP"
       - name: Docker Compose E2E tests
-        if: ${{ matrix.e2e_name == 'docker-compose' }}
         env:
           BUILDCTL_BIN: ${{ runner.temp }}/buildkit/buildctl
           CONFIG_PATH: ${{ github.workspace }}/scripts/buildkit/test-config.toml

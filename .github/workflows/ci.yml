@@ -9,6 +9,7 @@ on:
       - "**/Cargo.toml"
       - "**/Cargo.lock"
       - "rust-toolchain.toml"
+      - ".github/scripts/restore_rust_source_mtimes.py"
       - "scripts/install.sh"
       - "scripts/run-with-capabilities.sh"
       - "scripts/tests/setup-ublk-access.sh"
@@ -17,12 +18,14 @@ on:
       - ".github/actions/**"
       - ".github/workflows/ci.yml"
   push:
+    branches: [main]
     paths:
       - "**.rs"
       - "Makefile"
       - "**/Cargo.toml"
       - "**/Cargo.lock"
       - "rust-toolchain.toml"
+      - ".github/scripts/restore_rust_source_mtimes.py"
       - "scripts/install.sh"
       - "scripts/run-with-capabilities.sh"
       - "scripts/tests/setup-ublk-access.sh"
@@ -30,6 +33,10 @@ on:
       - "scripts/tests/verify-install-service.sh"
       - ".github/actions/**"
       - ".github/workflows/ci.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   fmt:

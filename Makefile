@@ -78,10 +78,10 @@ release:
 	$(CARGO) build --release
 
 build-server:
-	$(CARGO) build -p agentenv --bin server
+	$(CARGO) build -p agentenv-server --bin server
 
 build-server-release:
-	$(CARGO) build --release -p agentenv --bin server
+	$(CARGO) build --release -p agentenv-server --bin server
 
 build-snapshot-image:
 	$(CARGO) build -p agentenv --bin aenv-snapshot-image
