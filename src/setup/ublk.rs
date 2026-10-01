@@ -24,7 +24,8 @@ fn write_udev_rule(current_group: &str) -> Result<()> {
         "# Managed by agentenv server setup\n\
          KERNEL==\"ublk-control\", MODE=\"0660\", GROUP=\"{current_group}\"\n\
          KERNEL==\"ublkc*\", MODE=\"0660\", GROUP=\"{current_group}\"\n\
-         KERNEL==\"ublkb*\", MODE=\"0660\", GROUP=\"{current_group}\"\n"
+         KERNEL==\"ublkb*\", MODE=\"0660\", GROUP=\"{current_group}\"\n\
+         ACTION==\"add\", SUBSYSTEM==\"block\", KERNEL==\"ublkb*\", ATTR{{queue/scheduler}}=\"none\"\n"
     );
 
     std::fs::write("/etc/udev/rules.d/99-agentenv-ublk.rules", rule_content)

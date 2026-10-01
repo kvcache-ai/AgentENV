@@ -61,6 +61,7 @@ printf '%s\n' \
     "KERNEL==\"ublk-control\", MODE=\"0660\", GROUP=\"${group}\"" \
     "KERNEL==\"ublkc*\", MODE=\"0660\", GROUP=\"${group}\"" \
     "KERNEL==\"ublkb*\", MODE=\"0660\", GROUP=\"${group}\"" \
+    'ACTION=="add", SUBSYSTEM=="block", KERNEL=="ublkb*", ATTR{queue/scheduler}="none"' \
     > /etc/udev/rules.d/99-agentenv-ublk.rules
 udevadm control --reload-rules
 udevadm trigger --subsystem-match=misc --sysname-match=ublk-control

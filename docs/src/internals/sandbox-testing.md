@@ -516,7 +516,7 @@ resumed_sandbox.stop().await?;
    <user> --runtime-group <group>`. The group is the runtime service group: it
    owns AgentENV state and receives ublk device access. Normal server startup
    performs validation only and never invokes `sudo`.
-3. Host setup installs a udev rule for `/dev/ublk-control`, `/dev/ublkc*`, and `/dev/ublkb*`, so the runtime group can access the control and dynamic device nodes.
+3. Host setup installs a udev rule for `/dev/ublk-control`, `/dev/ublkc*`, and `/dev/ublkb*`, so the runtime group can access the control and dynamic device nodes. The same rule sets the I/O scheduler of each `/dev/ublkb*` to `none`.
 4. Update `config/default.toml` paths, or point `AENV_CONFIG_PATH` to a custom config file.
 5. Ensure `/dev/kvm` is accessible by the runtime user and the configured
    virtualization mode matches the host modules.
