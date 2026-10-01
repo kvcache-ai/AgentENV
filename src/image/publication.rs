@@ -396,7 +396,7 @@ case "$1 $2" in
   'artifact list') echo '{"manifests":[]}' ;;
   'manifest get') cat source-manifest ;;
   'blob get') cat source-config ;;
-  'blob head') echo '404 not found' >&2; exit 1 ;;
+  'blob head') echo 'request failed: not found [http 404]' >&2; exit 1 ;;
   'blob copy')
     if test -f fail-upload; then echo '503 unavailable' >&2; exit 1; fi
     cp "${3#ocidir://}/blobs/sha256/${5#sha256:}" "uploaded-${5#sha256:}"
