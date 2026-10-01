@@ -184,7 +184,7 @@ fn try_admit_block_read(running: &AtomicBool, floor: i64) -> Option<BkReadPermit
         return Some(BkReadPermit);
     }
     BK_REMOTE_INFLIGHT
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |background| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |background| {
             (background < floor).then_some(background + 1)
         })
         .ok()
