@@ -51,6 +51,14 @@ pub struct ImageResolverConfig {
     /// `registry.example.com/team/`.
     #[config(default = [])]
     pub try_referrers_overlaybd_prefixes: Vec<String>,
+    /// Internal repository prefixes eligible for best-effort conversion publication.
+    #[config(default = [])]
+    pub publish_overlaybd_prefixes: Vec<String>,
+    /// Maximum queued and active publications on this node.
+    #[config(default = 8usize)]
+    pub publication_capacity: usize,
+    #[config(default = 1usize)]
+    pub publication_concurrency: usize,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -234,6 +242,16 @@ impl ImageResolverConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<()> {
+        if self.publication_concurrency == 0
+            || self.publication_capacity < self.publication_concurrency
+        {
+            bail!("image publication capacity must be >= concurrency > 0");
+        }
+        for prefix in &self.publish_overlaybd_prefixes {
+            if !prefix.ends_with('/') || prefix.starts_with('/') || prefix.contains("://") {
+                bail!("image publication prefixes must be registry[/repository]/ without a scheme");
+            }
+        }
         if self.max_concurrent_conversions == 0 {
             bail!("image.resolver.max_concurrent_conversions must be > 0");
         }
@@ -244,6 +262,24 @@ impl ImageResolverConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_is_opt_in_and_requires_bounded_workers() {
+        let mut config = ImageResolverConfig::default();
+        assert!(config.publish_overlaybd_prefixes.is_empty());
+        assert!(config.validate().is_ok());
+        config.publication_concurrency = 0;
+        assert!(config.validate().is_err());
+        config.publication_concurrency = config.publication_capacity + 1;
+        assert!(config.validate().is_err());
+        config.publication_concurrency = 1;
+        for prefix in ["registry.example", "/", "https://registry.example/"] {
+            config.publish_overlaybd_prefixes = vec![prefix.to_string()];
+            assert!(config.validate().is_err());
+        }
+        config.publish_overlaybd_prefixes = vec!["registry.example/team/".to_string()];
+        assert!(config.validate().is_ok());
+    }
 
     #[test]
     fn validate_rejects_invalid_gc_watermarks() {

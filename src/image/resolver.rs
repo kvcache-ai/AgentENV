@@ -56,6 +56,7 @@ pub struct ResolvedBlockImage {
 
 #[derive(Debug)]
 pub struct ImageResolver {
+    publisher: Option<Arc<super::publication::Publisher>>,
     store: Arc<dyn SourceImageStore>,
     overlaybd_install_root: PathBuf,
     overlaybd_convert_global_config: PathBuf,
@@ -76,6 +77,7 @@ impl ImageResolver {
     pub fn new(config: &AppConfig) -> Self {
         let store = local_image_services_from_app_config(config).source_images;
         Self {
+            publisher: super::publication::Publisher::from_config(config),
             store,
             overlaybd_install_root: config.deps_path.join("overlaybd"),
             overlaybd_convert_global_config: config.resolved_overlaybd_convert_global_config_path(),
@@ -99,6 +101,21 @@ impl ImageResolver {
             disk_hard_watermark_ratio: config.disk_policy.admission_hard_watermark_ratio,
             disk_usage: SampledDiskUsage::for_paths(vec![config.image.cache.root_dir.clone()]),
         }
+    }
+
+    fn resolved_with_publication(
+        &self,
+        standard_oci: bool,
+        source: &str,
+        config_path: PathBuf,
+        metadata: ImageResolutionMetadata,
+    ) -> ResolvedBlockImage {
+        if standard_oci {
+            if let Some(publisher) = &self.publisher {
+                publisher.enqueue(source, config_path.clone());
+            }
+        }
+        resolved_from_cached_config(source, config_path, metadata)
     }
 
     pub fn default_image(&self) -> &str {
@@ -338,6 +355,7 @@ impl ImageResolver {
                 ),
             });
         }
+        let publish = fetched.format() == ImageFormat::StandardOci;
         let manifest_digest = fetched.manifest_digest.clone();
         let repository_scope = fetched.repository_scope.clone();
         let scope = repository_scope.as_deref();
@@ -355,7 +373,8 @@ impl ImageResolver {
                     "registry" => registry_label(&source_image_ref),
                 )
                 .increment(1);
-                return Ok(resolved_from_cached_config(
+                return Ok(self.resolved_with_publication(
+                    publish,
                     &source_image_ref,
                     image_config_path,
                     *metadata,
@@ -380,7 +399,8 @@ impl ImageResolver {
                 .await
                 .map_err(|e| e.context(format!("fetch image metadata for '{source_image_ref}'")))?;
                 source.write_metadata(metadata.clone()).await?;
-                return Ok(resolved_from_cached_config(
+                return Ok(self.resolved_with_publication(
+                    publish,
                     &source_image_ref,
                     image_config_path,
                     metadata,
@@ -447,7 +467,8 @@ impl ImageResolver {
             "image resolved to overlaybd config"
         );
 
-        Ok(resolved_from_cached_config(
+        Ok(self.resolved_with_publication(
+            publish,
             &source_image_ref,
             image_config_path,
             image_config_metadata,
@@ -558,7 +579,7 @@ async fn discover_overlaybd_referrer(
         .with_context(|| format!("parse regctl referrers response for {subject_ref}"))
 }
 
-fn parse_overlaybd_referrer(body: &str) -> Result<Option<(String, &'static str)>> {
+pub(super) fn parse_overlaybd_referrer(body: &str) -> Result<Option<(String, &'static str)>> {
     let index: ReferrersIndex = serde_json::from_str(body).context("parse referrers index JSON")?;
     for &artifact_type in OVERLAYBD_REFERRER_ARTIFACT_TYPES {
         let mut matches = index

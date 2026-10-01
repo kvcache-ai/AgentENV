@@ -88,6 +88,12 @@ convert_standard_oci = true
 # source image.
 try_referrers_overlaybd_prefixes = []
 
+# Publish locally converted linux/amd64 base images as native OCI attachments.
+# Opt in only internal repository prefixes, including the trailing slash.
+publish_overlaybd_prefixes = []
+publication_capacity = 8
+publication_concurrency = 1
+
 [image.cache]
 # Root for converted commits, resolution indexes, configs, and remote blocks.
 # root_dir = "$AENV_HOME/image-cache"
