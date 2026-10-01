@@ -69,11 +69,11 @@ runs:
 
     - name: Set up Rust toolchain
       if: ${{ inputs.components == '' }}
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.98.1
 
     - name: Set up Rust toolchain (with components)
       if: ${{ inputs.components != '' }}
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.98.1
       with:
         components: ${{ inputs.components }}
 

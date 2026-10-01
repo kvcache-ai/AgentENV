@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
 
       - name: Verify tag matches package versions
         env:
@@ -85,7 +85,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
         with:
           targets: ${{ matrix.target }}
 
@@ -140,7 +140,7 @@ jobs:
           sudo mkdir -p /etc/overlaybd
           sudo sh -c 'test -e /etc/overlaybd/overlaybd.json || printf "{}\n" > /etc/overlaybd/overlaybd.json'
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.98.1
 
       - uses: Swatinem/rust-cache@v2
 
