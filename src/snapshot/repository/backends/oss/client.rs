@@ -337,7 +337,7 @@ impl OssClient {
                 let write = operator.write_with(&oss_key, data);
                 let result = match etag.as_deref() {
                     Some(etag) => write.if_match(etag).await,
-                    None => write.if_none_match("*").await,
+                    None => write.if_not_exists(true).await,
                 };
                 match result {
                     Ok(_) => Ok(true),
