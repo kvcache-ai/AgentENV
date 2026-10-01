@@ -16,6 +16,20 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+KERNEL_RELEASE="$(uname -r)"
+case "$KERNEL_RELEASE" in
+    6.18.4|6.18.4[-+]*|6.18.5|6.18.5[-+]*|\
+    6.17.0-1015-azure|6.17.0-1015-azure[-+]*|\
+    6.17.0-1018-azure|6.17.0-1018-azure[-+]*)
+        cat >&2 <<EOF
+warning: Linux kernel ${KERNEL_RELEASE} is known to contain a ublk initialization regression.
+         Creating the first ublk device may hang or panic the host.
+         Upgrade to a fixed vendor kernel (upstream 6.18.6+ for 6.18.y) before running AgentENV.
+         See: https://github.com/kvcache-ai/AgentENV/issues/20
+EOF
+        ;;
+esac
+
 # ---------------------------------------------------------------------------
 # 1. ublk_drv kernel module
 # ---------------------------------------------------------------------------
