@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
 use nix::libc;
 use tempfile::TempDir;
+use tokio::time::Instant;
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
@@ -260,8 +261,8 @@ impl PausedSandboxState for FirecrackerPausedState {
     }
 
     fn runtime_artifacts(&self) -> RuntimeArtifactSet {
-        RuntimeArtifactSet::from_overlaybd_image_configs(rootfs_and_extra_drive_image_config_paths(
-            &self.snapshot_config.common,
+        RuntimeArtifactSet::from_overlaybd_image_configs(paused_image_config_paths(
+            &self.snapshot_config,
         ))
     }
 }
@@ -593,13 +594,11 @@ impl SandboxBackend for FirecrackerSandbox {
     }
 
     fn startup_artifacts(&self) -> RuntimeArtifactSet {
-        let common = match &self.launch {
-            LaunchMode::Fresh(config) => &config.common,
-            LaunchMode::Resume(config) => &config.common,
+        let paths = match &self.launch {
+            LaunchMode::Fresh(config) => rootfs_and_extra_drive_image_config_paths(&config.common),
+            LaunchMode::Resume(config) => paused_image_config_paths(config),
         };
-        RuntimeArtifactSet::from_overlaybd_image_configs(rootfs_and_extra_drive_image_config_paths(
-            common,
-        ))
+        RuntimeArtifactSet::from_overlaybd_image_configs(paths)
     }
 
     async fn update_network_policy(&mut self, policy: Option<SandboxNetworkPolicy>) -> Result<()> {
@@ -892,14 +891,32 @@ impl FirecrackerSandbox {
     /// This should be called after `start_nowait()` if you want to interact with the sandbox.
     #[tracing::instrument(skip(self))]
     pub(crate) async fn wait_for_ready(&self) -> Result<()> {
-        let Some(envd_instance) = self.envd_instance.as_ref() else {
+        let Some(envd_instance) = self.envd_instance.clone() else {
             return Err(anyhow::anyhow!("envd instance not initialized"));
         };
+        let envd_timeout = self.runtime_policy.envd_timeout;
+        let envd_poll_interval = self.runtime_policy.envd_poll_interval;
+        let started = Instant::now();
         envd_instance
-            .wait_for_ready(
-                self.runtime_policy.envd_timeout,
-                self.runtime_policy.envd_poll_interval,
-            )
+            .wait_for_ready(envd_timeout, envd_poll_interval)
+            .await?;
+        let remaining = envd_timeout.saturating_sub(started.elapsed());
+        anyhow::ensure!(
+            !remaining.is_zero(),
+            "timed out waiting for guest boot services"
+        );
+        envd_instance
+            .clone()
+            .wait_for_boot_ready(remaining, envd_poll_interval)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        let remaining = envd_timeout.saturating_sub(started.elapsed());
+        anyhow::ensure!(
+            !remaining.is_zero(),
+            "timed out revalidating envd after guest boot"
+        );
+        envd_instance
+            .wait_for_ready(remaining, envd_poll_interval)
             .await?;
         if let Some(tools) = &self.tools_ublk_device {
             let _ = UblkDeviceManager::global()
@@ -1590,8 +1607,6 @@ impl FirecrackerSandbox {
 /// Overlaybd image config paths a sandbox opens (rootfs + extra drives).
 /// For fresh launches these are source configs; for paused states they are
 /// snapshot artifact configs.
-/// (Memory snapshot layers are remote/repository-backed, never local-only, so
-/// they are not included.)
 fn rootfs_and_extra_drive_image_config_paths(common: &FirecrackerCommonConfig) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(rootfs) = &common.rootfs_image_config {
@@ -1603,6 +1618,13 @@ fn rootfs_and_extra_drive_image_config_paths(common: &FirecrackerCommonConfig) -
             .iter()
             .map(|drive| drive.image_config_path().to_path_buf()),
     );
+    paths
+}
+
+/// Every persisted overlaybd config needed to resume a paused sandbox.
+fn paused_image_config_paths(config: &FirecrackerSnapshotConfig) -> Vec<PathBuf> {
+    let mut paths = rootfs_and_extra_drive_image_config_paths(&config.common);
+    paths.push(config.mem_overlaybd_config.image_config_path.clone());
     paths
 }
 
@@ -2696,6 +2718,9 @@ impl FirecrackerSandbox {
                 .iter()
                 .map(|runtime| runtime.image_config_path.clone()),
         );
+        if let Some(mem_image_config_path) = &self.mem_snapshot_image_config_path {
+            paths.push(mem_image_config_path.clone());
+        }
         paths
     }
 }
@@ -3238,9 +3263,10 @@ mod tests {
 
         assert_eq!(
             state.runtime_artifacts(),
-            RuntimeArtifactSet::from_overlaybd_image_configs(vec![PathBuf::from(
-                "snapshot/rootfs/image.json"
-            )])
+            RuntimeArtifactSet::from_overlaybd_image_configs(vec![
+                PathBuf::from("snapshot/rootfs/image.json"),
+                PathBuf::from("snapshot/mem_image.json"),
+            ])
         );
     }
 

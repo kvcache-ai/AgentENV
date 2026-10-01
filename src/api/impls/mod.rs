@@ -172,6 +172,33 @@ impl apis::ErrorHandler<()> for ApiImpl {}
 
 #[async_trait]
 impl apis::default::Default<()> for ApiImpl {
+    async fn admission_get(
+        &self,
+        _method: &http::Method,
+        _host: &headers::Host,
+        _cookies: &axum_extra::extract::CookieJar,
+    ) -> Result<apis::default::AdmissionGetResponse, ()> {
+        let metrics = match self.orchestrator.metrics_snapshot().await {
+            Ok(metrics) => metrics,
+            Err(error) => {
+                return Ok(
+                    apis::default::AdmissionGetResponse::Status503_RuntimeAdmissionIsBlocked(
+                        Self::internal_error(&error),
+                    ),
+                );
+            }
+        };
+        if metrics.accepting_sandboxes {
+            return Ok(apis::default::AdmissionGetResponse::Status204_RuntimeAdmissionIsReady);
+        }
+        Ok(
+            apis::default::AdmissionGetResponse::Status503_RuntimeAdmissionIsBlocked(Self::error(
+                503,
+                format!("runtime admission blocked: {}", metrics.admission_reason),
+            )),
+        )
+    }
+
     async fn health_get(
         &self,
         _method: &http::Method,

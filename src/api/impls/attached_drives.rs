@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use crate::image::ImageResolver;
+use crate::image::{ImageError, ImageResolver};
 use crate::sandbox::{validate_drive_id, validate_mount_path, validate_sub_path, ExtraDrive};
 use agentenv_http_server::models;
 
@@ -99,7 +99,13 @@ pub(super) async fn resolve_attached_drives(
             .map(|resolved| (resolved.overlaybd_config_path, resolved.raw_config))
             .map_err(|err| {
                 models::Error::new(
-                    if err.is_user_error() { 400 } else { 500 },
+                    if matches!(&err, ImageError::AdmissionBlocked { .. }) {
+                        503
+                    } else if err.is_user_error() {
+                        400
+                    } else {
+                        500
+                    },
                     format!(
                         "resolve attached drive '{}' image '{}': {err:#}",
                         drive.drive_id, drive.image

@@ -116,6 +116,11 @@ General config notes:
 |---|---|
 | `round_robin` (default) | Cycles through eligible nodes in stable order |
 | `random` | Picks a uniformly random eligible node |
+| `weighted_image_affinity` | Uses weighted rendezvous hashing to keep an image on the same host |
+
+Strategy names are case-insensitive and ignore surrounding whitespace. Unknown names fail scheduler startup. `weighted_image_affinity` requires finite positive `scheduler.image_affinity_node_weights`, keyed by static node ID or Kubernetes host name (`spec.nodeName`). Static weight keys must match configured node IDs; duplicate keys after trimming whitespace are rejected. Kubernetes hosts can join later, so their identities are checked during selection.
+
+For image-bearing requests, unweighted hosts are excluded; if none of the eligible hosts matches the configured weights, scheduling returns `Unavailable` instead of silently ignoring the weights. Requests without an image key intentionally use round-robin over all eligible nodes. An explicit reserved runtime still takes precedence and must be eligible.
 
 The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). Current built-in strategies ignore the snapshot, but custom strategy implementations can use it for load-aware decisions.
 

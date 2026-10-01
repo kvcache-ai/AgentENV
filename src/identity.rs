@@ -15,6 +15,7 @@ fn build_commit() -> &'static str {
 #[derive(Clone, Debug)]
 pub struct NodeIdentity {
     pub id: String,
+    pub runtime_family_id: String,
     pub cluster_id: Uuid,
     pub service_instance_id: String,
     pub commit: String,
@@ -35,8 +36,15 @@ impl NodeIdentity {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| hostname.clone());
 
+        let runtime_family_id = config
+            .runtime_family_id
+            .clone()
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| id.clone());
+
         Self {
             id,
+            runtime_family_id,
             cluster_id: parse_uuid_with_fallback("node_identity.cluster_id", &config.cluster_id),
             service_instance_id: config
                 .service_instance_id
@@ -113,5 +121,21 @@ mod tests {
                 std::env::remove_var("AENV_GIT_COMMIT");
             },
         }
+    }
+
+    #[test]
+    fn runtime_family_defaults_to_node_id_and_accepts_override() {
+        let default_identity = NodeIdentity::from_config(&NodeIdentityConfig {
+            node_id: Some("node-a".to_string()),
+            ..NodeIdentityConfig::default()
+        });
+        assert_eq!(default_identity.runtime_family_id, "node-a");
+
+        let configured_identity = NodeIdentity::from_config(&NodeIdentityConfig {
+            node_id: Some("node-b".to_string()),
+            runtime_family_id: Some("family-a".to_string()),
+            ..NodeIdentityConfig::default()
+        });
+        assert_eq!(configured_identity.runtime_family_id, "family-a");
     }
 }

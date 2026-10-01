@@ -22,6 +22,21 @@ func nodeStatusToString(status schedulerv1.NodeStatus) string {
 	}
 }
 
+func admissionReasonToString(reason schedulerv1.AdmissionReason) string {
+	switch reason {
+	case schedulerv1.AdmissionReason_ADMISSION_REASON_READY:
+		return "ready"
+	case schedulerv1.AdmissionReason_ADMISSION_REASON_DISK_CLEANUP:
+		return "disk_cleanup"
+	case schedulerv1.AdmissionReason_ADMISSION_REASON_DISK_HARD_LIMIT:
+		return "disk_hard_limit"
+	case schedulerv1.AdmissionReason_ADMISSION_REASON_CLEANUP_DEBT:
+		return "cleanup_debt"
+	default:
+		return "unspecified"
+	}
+}
+
 type nodeListMachineInfo struct {
 	CPUFamily       string `json:"cpuFamily"`
 	CPUModel        string `json:"cpuModel"`
@@ -38,21 +53,33 @@ type nodeListDiskMetrics struct {
 }
 
 type nodeListMetrics struct {
-	AllocatedCPU               uint32                `json:"allocatedCPU"`
-	AllocatedMemoryBytes       uint64                `json:"allocatedMemoryBytes"`
-	CPUPercent                 uint32                `json:"cpuPercent"`
-	CPUCount                   uint32                `json:"cpuCount"`
-	MemoryUsedBytes            uint64                `json:"memoryUsedBytes"`
-	MemoryTotalBytes           uint64                `json:"memoryTotalBytes"`
-	Disks                      []nodeListDiskMetrics `json:"disks"`
-	PausedAllocatedCPU         uint32                `json:"pausedAllocatedCPU"`
-	PausedAllocatedMemoryBytes uint64                `json:"pausedAllocatedMemoryBytes"`
+	AllocatedCPU                uint32                `json:"allocatedCPU"`
+	AllocatedMemoryBytes        uint64                `json:"allocatedMemoryBytes"`
+	CPUPercent                  uint32                `json:"cpuPercent"`
+	CPUCount                    uint32                `json:"cpuCount"`
+	MemoryUsedBytes             uint64                `json:"memoryUsedBytes"`
+	MemoryTotalBytes            uint64                `json:"memoryTotalBytes"`
+	Disks                       []nodeListDiskMetrics `json:"disks"`
+	PausedAllocatedCPU          uint32                `json:"pausedAllocatedCPU"`
+	PausedAllocatedMemoryBytes  uint64                `json:"pausedAllocatedMemoryBytes"`
+	DiskTotalBytes              uint64                `json:"diskTotalBytes"`
+	DiskUsedBytes               uint64                `json:"diskUsedBytes"`
+	DiskAvailableBytes          uint64                `json:"diskAvailableBytes"`
+	CleanupPending              uint64                `json:"cleanupPending"`
+	CleanupRetries              uint64                `json:"cleanupRetries"`
+	CleanupFailures             uint64                `json:"cleanupFailures"`
+	PrunedGenerations           uint64                `json:"prunedGenerations"`
+	ReclaimedSnapshotBytes      uint64                `json:"reclaimedSnapshotBytes"`
+	ReservedCleanupJournalBytes uint64                `json:"reservedCleanupJournalBytes"`
+	ReclaimedLogBytes           uint64                `json:"reclaimedLogBytes"`
+	DiskAdmissionRejections     uint64                `json:"diskAdmissionRejections"`
 }
 
 type nodeListItem struct {
 	Version              string              `json:"version"`
 	Commit               string              `json:"commit"`
 	ID                   string              `json:"id"`
+	RuntimeFamilyID      string              `json:"runtimeFamilyID"`
 	ServiceInstanceID    string              `json:"serviceInstanceID"`
 	ClusterID            string              `json:"clusterID"`
 	MachineInfo          nodeListMachineInfo `json:"machineInfo"`
@@ -63,6 +90,8 @@ type nodeListItem struct {
 	CreateFails          uint64              `json:"createFails"`
 	SandboxStartingCount uint32              `json:"sandboxStartingCount"`
 	SandboxPausedCount   uint32              `json:"sandboxPausedCount"`
+	AcceptingSandboxes   *bool               `json:"acceptingSandboxes,omitempty"`
+	AdmissionReason      string              `json:"admissionReason,omitempty"`
 }
 
 func isNodeListRequest(r *http.Request) bool {
@@ -125,6 +154,7 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 			Version:           observed.GetVersion(),
 			Commit:            observed.GetCommit(),
 			ID:                observed.GetNodeId(),
+			RuntimeFamilyID:   observed.GetRuntimeFamilyId(),
 			ServiceInstanceID: observed.GetServiceInstanceId(),
 			ClusterID:         observed.GetClusterId(),
 			MachineInfo: nodeListMachineInfo{
@@ -136,20 +166,33 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 			Status:       nodeStatusToString(snapshot.GetStatus()),
 			SandboxCount: snapshot.GetSandboxCount(),
 			Metrics: nodeListMetrics{
-				AllocatedCPU:               snapshot.GetAllocatedCpu(),
-				AllocatedMemoryBytes:       snapshot.GetAllocatedMemoryBytes(),
-				CPUPercent:                 snapshot.GetCpuPercent(),
-				CPUCount:                   snapshot.GetCpuCount(),
-				MemoryUsedBytes:            snapshot.GetMemoryUsedBytes(),
-				MemoryTotalBytes:           snapshot.GetMemoryTotalBytes(),
-				Disks:                      disks,
-				PausedAllocatedCPU:         snapshot.GetPausedAllocatedCpu(),
-				PausedAllocatedMemoryBytes: snapshot.GetPausedAllocatedMemoryBytes(),
+				AllocatedCPU:                snapshot.GetAllocatedCpu(),
+				AllocatedMemoryBytes:        snapshot.GetAllocatedMemoryBytes(),
+				CPUPercent:                  snapshot.GetCpuPercent(),
+				CPUCount:                    snapshot.GetCpuCount(),
+				MemoryUsedBytes:             snapshot.GetMemoryUsedBytes(),
+				MemoryTotalBytes:            snapshot.GetMemoryTotalBytes(),
+				Disks:                       disks,
+				PausedAllocatedCPU:          snapshot.GetPausedAllocatedCpu(),
+				PausedAllocatedMemoryBytes:  snapshot.GetPausedAllocatedMemoryBytes(),
+				DiskTotalBytes:              snapshot.GetDiskTotalBytes(),
+				DiskUsedBytes:               snapshot.GetDiskUsedBytes(),
+				DiskAvailableBytes:          snapshot.GetDiskAvailableBytes(),
+				CleanupPending:              snapshot.GetCleanupPending(),
+				CleanupRetries:              snapshot.GetCleanupRetries(),
+				CleanupFailures:             snapshot.GetCleanupFailures(),
+				PrunedGenerations:           snapshot.GetPrunedGenerations(),
+				ReclaimedSnapshotBytes:      snapshot.GetReclaimedSnapshotBytes(),
+				ReservedCleanupJournalBytes: snapshot.GetReservedCleanupJournalBytes(),
+				ReclaimedLogBytes:           snapshot.GetReclaimedLogBytes(),
+				DiskAdmissionRejections:     snapshot.GetDiskAdmissionRejections(),
 			},
 			CreateSuccesses:      snapshot.GetCreateSuccesses(),
 			CreateFails:          snapshot.GetCreateFails(),
 			SandboxStartingCount: snapshot.GetSandboxStartingCount(),
 			SandboxPausedCount:   snapshot.GetPausedSandboxCount(),
+			AcceptingSandboxes:   snapshot.AcceptingSandboxes,
+			AdmissionReason:      admissionReasonToString(snapshot.GetAdmissionReason()),
 		})
 	}
 

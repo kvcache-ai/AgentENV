@@ -26,7 +26,7 @@
 ARG BUSYBOX_IMAGE=busybox:1.37.0-musl
 ARG DEBIAN_VERSION=bookworm
 ARG GO_VERSION=1.25.9
-ARG TOOLS_VERSION=0.1.1
+ARG TOOLS_VERSION=0.1.1-envd-bounded.1
 
 # ---------------------------------------------------------------------------
 # Stage 1: compile envd from upstream source.
@@ -36,7 +36,7 @@ ARG TOOLS_VERSION=0.1.1
 # ---------------------------------------------------------------------------
 FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-${DEBIAN_VERSION} AS envd-builder
 
-ARG ENVD_REF=2026.17
+ARG ENVD_REF=9c3b7c5dbd181ba819084276b8228f70936e911e
 ARG ENVD_UPSTREAM_REPO=https://github.com/e2b-dev/infra.git
 ARG TARGETARCH
 
@@ -53,6 +53,9 @@ RUN set -eux; \
     git fetch --depth 1 origin "$ENVD_REF"; \
     git checkout --detach FETCH_HEAD
 
+RUN test "$(git -C /src/infra rev-parse HEAD)" = "9c3b7c5dbd181ba819084276b8228f70936e911e"
+COPY envd/internal/logs/exporter/ /src/infra/packages/envd/internal/logs/exporter/
+
 WORKDIR /src/infra/packages/envd
 
 RUN --mount=type=cache,target=/root/.cache/go-build \
@@ -62,9 +65,10 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
       amd64|arm64) ;; \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
-    commit_sha="$(git -C /src/infra rev-parse --short HEAD)"; \
-    CGO_ENABLED=0 GOOS=linux GOARCH="$TARGETARCH" \
-      go build \
+    commit_sha="$(git -C /src/infra rev-parse --short HEAD)-bounded-telemetry.1"; \
+    GOWORK=off GOMAXPROCS=2 go test -p=2 ./internal/logs/exporter; \
+    GOMAXPROCS=2 CGO_ENABLED=0 GOOS=linux GOARCH="$TARGETARCH" \
+      go build -p=2 \
         -ldflags "-X=main.commitSHA=${commit_sha} -s -w" \
         -o /out/envd \
         .; \

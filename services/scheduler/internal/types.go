@@ -3,8 +3,9 @@ package scheduler
 import schedulerv1 "agentenv/services/api/proto"
 
 type Node struct {
-	ID       string `json:"node_id"`
-	Endpoint string `json:"endpoint"`
+	ID         string `json:"node_id"`
+	Endpoint   string `json:"endpoint"`
+	AffinityID string `json:"-"`
 }
 
 // RichNode combines discovery identity with observed runtime state.

@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tracing::info;
 
+use super::gc::ImageCacheGcSummary;
 use super::service::{HoldNamespace, ImageCacheService};
 use crate::cfg::{AppConfig, ConfigManager};
 use crate::image::oci_image::ImageConversion;
@@ -76,6 +77,12 @@ pub(crate) trait RuntimeImageRefs: Send + Sync + std::fmt::Debug {
     async fn reconcile_paused(&self, live_paused: &[SandboxId]) -> Result<()>;
 
     async fn maintain_running(&self, running: Vec<(SandboxId, RuntimeArtifactSet)>) -> Result<()>;
+
+    async fn reclaim_for_disk_pressure(
+        &self,
+        running: Vec<(SandboxId, RuntimeArtifactSet)>,
+        reclaim_bytes: u64,
+    ) -> Result<ImageCacheGcSummary>;
 }
 
 #[derive(Clone)]
@@ -215,6 +222,26 @@ impl RuntimeImageRefs for ImageCacheStore {
             "image cache maintenance pass complete"
         );
         Ok(())
+    }
+
+    async fn reclaim_for_disk_pressure(
+        &self,
+        running: Vec<(SandboxId, RuntimeArtifactSet)>,
+        reclaim_bytes: u64,
+    ) -> Result<ImageCacheGcSummary> {
+        let running = running
+            .into_iter()
+            .filter(|(_, artifacts)| !artifacts.is_empty())
+            .map(|(id, artifacts)| {
+                (
+                    id.to_string(),
+                    artifacts.into_overlaybd_image_config_paths(),
+                )
+            })
+            .collect();
+        self.cache
+            .run_pressure_maintenance(running, reclaim_bytes, self.gc_min_age)
+            .await
     }
 }
 

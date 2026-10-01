@@ -25,6 +25,8 @@ pub enum SandboxesColdPostResponse {
     Status409_Conflict(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
+    /// Runtime admission is temporarily blocked by disk pressure
+    Status503_RuntimeAdmissionIsTemporarilyBlockedByDiskPressure(models::Error),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -224,6 +226,8 @@ pub enum SandboxesSandboxIdPausePostResponse {
     Status401_AuthenticationError(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
+    /// Runtime admission is temporarily blocked by disk pressure
+    Status503_RuntimeAdmissionIsTemporarilyBlockedByDiskPressure(models::Error),
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]

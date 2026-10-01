@@ -21,7 +21,7 @@ type NodeRegistry interface {
 	ListP2pPeers(clusterID string, backend string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
 	FilterP2pPeers(clusterID string, backend string, nodeIDs []string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
 	GetObserved(nodeID string, clusterID string, now time.Time) (*schedulerv1.ObservedNode, bool)
-	// PeekObserved returns the latest heartbeat-reported NodeSnapshot for a node.
+	// PeekObserved returns the latest snapshot with heartbeat expiry and discovery status applied.
 	// Unlike GetObserved, it does not derive status from discovery state or TTL,
 	// and returns only the raw snapshot suitable for scheduling decisions.
 	// Returns nil if the node has never sent a heartbeat.
@@ -32,6 +32,7 @@ type NodeRegistry interface {
 var (
 	ErrServiceInstanceMismatch = errors.New("service instance mismatch")
 	ErrNodeNotInRegistry       = errors.New("node is not in scheduler node list")
+	ErrRuntimeFamilyConflict   = errors.New("runtime family already has a live registration")
 	defaultObservedReportTTL   = 30 * time.Second
 )
 
@@ -102,7 +103,7 @@ func (r *AtomicNodeRegistry) Resolve(nodeID string) (Node, bool) {
 }
 
 // Set replaces the discovered node list. active nodes are serving and not
-// terminating; lingering nodes are serving but terminating (graceful shutdown).
+// terminating; lingering nodes are temporarily non-serving or terminating.
 func (r *AtomicNodeRegistry) Set(active []Node, lingering []Node) {
 	byID := make(map[string]Node, len(active)+len(lingering))
 	for _, node := range active {
@@ -139,6 +140,7 @@ func (r *AtomicNodeRegistry) Set(active []Node, lingering []Node) {
 
 func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, string, error) {
 	nowMs := now.UTC().UnixMilli()
+	runtimeFamilyID := strings.TrimSpace(req.GetRuntimeFamilyId())
 
 	machineInfo := cloneMachineInfo(req.GetMachineInfo())
 
@@ -147,6 +149,16 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 	node, ok := r.nodesByID[req.GetNodeId()]
 	if !ok {
 		return Node{}, "", ErrNodeNotInRegistry
+	}
+	if runtimeFamilyID != "" {
+		for observedNodeID, record := range r.observed {
+			if observedNodeID == req.GetNodeId() || record.node.GetRuntimeFamilyId() != runtimeFamilyID {
+				continue
+			}
+			if nowMs-record.node.GetLastSeenUnixMs() <= record.reportTTL.Milliseconds() {
+				return Node{}, "", ErrRuntimeFamilyConflict
+			}
+		}
 	}
 
 	prevCPU, existed := "", false
@@ -161,6 +173,7 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 	record := observedNodeRecord{
 		node: &schedulerv1.ObservedNode{
 			NodeId:            req.GetNodeId(),
+			RuntimeFamilyId:   runtimeFamilyID,
 			Endpoint:          node.Endpoint,
 			ClusterId:         req.GetClusterId(),
 			ServiceInstanceId: req.GetServiceInstanceId(),
@@ -342,7 +355,7 @@ func (r *AtomicNodeRegistry) PeekObserved(nodeID string) *schedulerv1.NodeSnapsh
 	if snapshot == nil {
 		return nil
 	}
-	return cloneSnapshot(snapshot)
+	return r.deriveObservedNodeViewLocked(record, time.Now().UTC().UnixMilli()).GetSnapshot()
 }
 
 func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID string) error {

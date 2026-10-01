@@ -74,6 +74,7 @@ enum ProxyRequestError {
     SandboxNotFound(SandboxId),
     SandboxUnavailable(SandboxId, SandboxState),
     AutoResumeFailed(SandboxId),
+    AutoResumeAdmissionBlocked(SandboxId),
     AutoResumeTimedOut(SandboxId),
     MissingRuntimeRoute(SandboxId),
     InvalidUpstreamUri,
@@ -799,6 +800,9 @@ async fn try_auto_resume(
             debug!(sandbox_id = %sandbox_id, "sandbox auto-resume completed");
             Ok(())
         }
+        Ok(Err(OrchestratorError::AdmissionBlocked { .. })) => {
+            Err(ProxyRequestError::AutoResumeAdmissionBlocked(sandbox_id))
+        }
         Ok(Err(err)) => {
             warn!(sandbox_id = %sandbox_id, error = %err, "sandbox auto-resume failed");
             Err(ProxyRequestError::AutoResumeFailed(sandbox_id))
@@ -858,6 +862,10 @@ fn proxy_error_response(error: &ProxyRequestError) -> Response<Body> {
             StatusCode::GONE,
             "sandbox is not proxyable in its current state",
         ),
+        ProxyRequestError::AutoResumeAdmissionBlocked(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "sandbox auto-resume temporarily blocked by disk pressure",
+        ),
         ProxyRequestError::AutoResumeFailed(_) => {
             (StatusCode::BAD_GATEWAY, "sandbox auto-resume failed")
         }
@@ -892,6 +900,9 @@ fn proxy_error_response(error: &ProxyRequestError) -> Response<Body> {
         }
         ProxyRequestError::SandboxUnavailable(sandbox_id, state) => {
             debug!(sandbox_id = %sandbox_id, state = ?state, status = %status, message, "proxy request rejected")
+        }
+        ProxyRequestError::AutoResumeAdmissionBlocked(sandbox_id) => {
+            debug!(sandbox_id = %sandbox_id, status = %status, message, "proxy auto-resume admission blocked")
         }
         ProxyRequestError::AutoResumeFailed(sandbox_id) => {
             warn!(sandbox_id = %sandbox_id, status = %status, message, "proxy auto-resume failed")

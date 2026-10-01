@@ -12,7 +12,9 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
 use serde_json::Value;
-use tokio::sync::OnceCell;
+#[cfg(test)]
+use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, OnceCell};
 use tracing::{debug, info, warn};
 
 use super::gc::{
@@ -83,6 +85,10 @@ pub(crate) struct ImageCacheService {
     metadata_store: OnceCell<ImageCacheMetadataStore>,
     source_images: Arc<SourceImageCache>,
     p2p_transport: OnceLock<Arc<dyn P2pTransport>>,
+    /// Serializes installation of runtime holds with the final GC check/delete.
+    liveness_gate: Mutex<()>,
+    #[cfg(test)]
+    gc_before_final_check: StdMutex<Option<(Arc<Semaphore>, Arc<Semaphore>)>>,
 }
 
 impl fmt::Debug for ImageCacheService {
@@ -129,6 +135,9 @@ impl ImageCacheService {
             metadata_store: OnceCell::new(),
             source_images: Arc::new(SourceImageCache::default()),
             p2p_transport: OnceLock::new(),
+            liveness_gate: Mutex::new(()),
+            #[cfg(test)]
+            gc_before_final_check: StdMutex::new(None),
         }
     }
 
@@ -372,6 +381,15 @@ impl ImageCacheService {
         owner: ImageCacheHoldOwner,
         refs: BTreeSet<HardCommitId>,
     ) -> Result<()> {
+        let _liveness = self.liveness_gate.lock().await;
+        self.create_or_replace_hold_locked(owner, refs).await
+    }
+
+    async fn create_or_replace_hold_locked(
+        &self,
+        owner: ImageCacheHoldOwner,
+        refs: BTreeSet<HardCommitId>,
+    ) -> Result<()> {
         self.metadata_store()
             .await?
             .create_or_replace_hold(&owner, &refs)
@@ -468,9 +486,10 @@ impl ImageCacheService {
         })
     }
 
-    /// Hold cache-owned commit-store `file=` commits from these configs; skip
-    /// recoverable `dir=` layers and runtime-owned local files. Callers fail
-    /// closed on commit-store descriptor errors.
+    /// Hold cache-owned commit-store `file=` and `dir=` commits from these
+    /// configs; skip remote and runtime-owned local files. Callers fail closed
+    /// on commit-store descriptor errors.
+    #[cfg(test)]
     async fn acquire_hold_for_config_paths(
         &self,
         owner: ImageCacheHoldOwner,
@@ -482,9 +501,6 @@ impl ImageCacheService {
                 "parse image-cache hold config",
             )
             .await?;
-        if refs.is_empty() {
-            return Ok(());
-        }
         self.create_or_replace_hold(owner, refs).await
     }
 
@@ -499,9 +515,15 @@ impl ImageCacheService {
         owner_id: &str,
         image_config_paths: Vec<PathBuf>,
     ) -> Result<()> {
+        let _liveness = self.liveness_gate.lock().await;
         let owner = ImageCacheHoldOwner::new(namespace.as_str(), owner_id.to_string())?;
-        self.acquire_hold_for_config_paths(owner, image_config_paths)
-            .await
+        let refs = self
+            .commit_store_hard_commits_from_config_paths(
+                image_config_paths,
+                "parse image-cache hold config",
+            )
+            .await?;
+        self.create_or_replace_hold_locked(owner, refs).await
     }
 
     pub(crate) async fn release_protection_best_effort(
@@ -553,6 +575,27 @@ impl ImageCacheService {
         };
         let live_refs = self.live_refs_from_running(running).await?;
         let report = self.run_gc(live_refs, !reconciled).await?;
+        Ok(ImageCacheGcSummary::from_report(&report))
+    }
+
+    pub(crate) async fn run_pressure_maintenance(
+        self: &Arc<Self>,
+        running: Vec<(String, Vec<PathBuf>)>,
+        reclaim_bytes: u64,
+        min_age: Duration,
+    ) -> Result<ImageCacheGcSummary> {
+        self.rebuild_metadata_from_configs().await?;
+        let evictable_before = unix_now_secs().saturating_sub(min_age.as_secs());
+        let current = self
+            .metadata_store()
+            .await?
+            .plan_capacity_eviction(0, u64::MAX, evictable_before)
+            .await?
+            .total_bytes;
+        self.evict_source_configs_over_capacity(0, current.saturating_sub(reclaim_bytes), min_age)
+            .await?;
+        let live_refs = self.live_refs_from_running(running).await?;
+        let report = self.run_gc(live_refs, false).await?;
         Ok(ImageCacheGcSummary::from_report(&report))
     }
 
@@ -736,6 +779,31 @@ impl ImageCacheService {
             .await
     }
 
+    #[cfg(test)]
+    fn pause_gc_before_final_check(&self, reached: Arc<Semaphore>, resume: Arc<Semaphore>) {
+        *self
+            .gc_before_final_check
+            .lock()
+            .expect("GC test hook mutex poisoned") = Some((reached, resume));
+    }
+
+    #[cfg(test)]
+    async fn run_gc_before_final_check_hook(&self) {
+        let hook = self
+            .gc_before_final_check
+            .lock()
+            .expect("GC test hook mutex poisoned")
+            .take();
+        if let Some((reached, resume)) = hook {
+            reached.add_permits(1);
+            resume
+                .acquire()
+                .await
+                .expect("resume semaphore open")
+                .forget();
+        }
+    }
+
     /// Deleting GC is fail-closed: reconcile roots, collect live runtime refs,
     /// then re-check each candidate under an operation hold before deleting.
     /// Fail-closed deleting GC over the candidate hard commits, given the live
@@ -780,6 +848,11 @@ impl ImageCacheService {
             .await?;
 
             let result = async {
+                #[cfg(test)]
+                self.run_gc_before_final_check_hook().await;
+                // A new runtime/paused hold cannot appear between this final
+                // safety check and unlinking the layer.
+                let _liveness = self.liveness_gate.lock().await;
                 let fresh = self
                     .metadata_store()
                     .await?
@@ -2303,6 +2376,250 @@ mod tests {
                 owners: vec![owner]
             })
         );
+    }
+
+    #[tokio::test]
+    async fn paused_hold_keeps_rootfs_extra_and_memory_dir_lowers_through_gc() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        let rootfs = write_commit_file(&service, "sha256:rootfs", b"rootfs");
+        let extra = write_commit_file(&service, "sha256:extra", b"extra");
+        let memory = write_commit_file(&service, "sha256:memory", b"memory");
+        for (digest, file, size) in [
+            ("sha256:rootfs", rootfs.clone(), 6),
+            ("sha256:extra", extra.clone(), 5),
+            ("sha256:memory", memory.clone(), 6),
+        ] {
+            service
+                .record_hard_commit_object(digest, Some(file), Some(size), &[])
+                .await
+                .expect("record hard commit");
+        }
+
+        let configs = temp.path().join("paused-configs");
+        let rootfs_config = configs.join("rootfs/image.json");
+        let extra_config = configs.join("drives/data/image.json");
+        let memory_config = configs.join("mem_image.json");
+        write_image_config(
+            &rootfs_config,
+            "",
+            json!([{"file": rootfs.display().to_string(), "digest": "sha256:rootfs", "size": 6}]),
+        );
+        write_image_config(
+            &extra_config,
+            "",
+            json!([{"file": extra.display().to_string(), "digest": "sha256:extra", "size": 5}]),
+        );
+        write_image_config(
+            &memory_config,
+            "https://registry.example/v2/repo/blobs",
+            json!([{
+                "dir": memory.parent().expect("memory commit dir").display().to_string(),
+                "digest": "sha256:memory",
+                "size": 6
+            }]),
+        );
+
+        service
+            .protect(
+                HoldNamespace::Paused,
+                "sandbox-attempt14",
+                vec![rootfs_config, extra_config, memory_config],
+            )
+            .await
+            .expect("protect full paused closure");
+        let held = service
+            .run_gc(ImageCacheLiveRuntimeRefs::new(), true)
+            .await
+            .expect("run pressure-shaped GC");
+
+        assert_eq!(held.collected, 0);
+        assert!(rootfs.exists());
+        assert!(extra.exists());
+        assert!(memory.exists());
+
+        service
+            .release_protection_best_effort(HoldNamespace::Paused, "sandbox-attempt14")
+            .await;
+        let released = service
+            .run_gc(ImageCacheLiveRuntimeRefs::new(), true)
+            .await
+            .expect("run GC after release");
+        assert_eq!(released.collected, 3);
+    }
+
+    #[tokio::test]
+    async fn repeated_pause_resume_with_pressure_gc_preserves_each_full_closure() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        let mut previous = Vec::new();
+
+        for generation in 0..20 {
+            let mut current = Vec::new();
+            let mut configs = Vec::new();
+            for (kind, payload) in [
+                ("rootfs", b"rootfs".as_slice()),
+                ("extra", b"extra".as_slice()),
+                ("memory", b"memory".as_slice()),
+            ] {
+                let digest = format!("sha256:stress-{generation}-{kind}");
+                let commit = write_commit_file(&service, &digest, payload);
+                service
+                    .record_hard_commit_object(
+                        &digest,
+                        Some(commit.clone()),
+                        Some(payload.len() as u64),
+                        &[],
+                    )
+                    .await
+                    .expect("record stress commit");
+                let config = temp
+                    .path()
+                    .join(format!("generation-{generation}/{kind}/image.json"));
+                let lower = if kind == "memory" {
+                    json!([{
+                        "dir": commit.parent().expect("commit dir").display().to_string(),
+                        "digest": digest,
+                        "size": payload.len()
+                    }])
+                } else {
+                    json!([{
+                        "file": commit.display().to_string(),
+                        "digest": digest,
+                        "size": payload.len()
+                    }])
+                };
+                write_image_config(&config, "https://registry.example/v2/repo/blobs", lower);
+                current.push(commit);
+                configs.push(config);
+            }
+
+            // New layers are transiently pinned before the old durable paused
+            // closure is replaced. GC in this window must preserve both.
+            service
+                .protect(HoldNamespace::Runtime, "stress-sandbox", configs.clone())
+                .await
+                .expect("protect transition closure");
+            service
+                .run_gc(ImageCacheLiveRuntimeRefs::new(), true)
+                .await
+                .expect("GC during repause transition");
+            assert!(current.iter().all(|path| path.exists()));
+            assert!(previous.iter().all(|path: &PathBuf| path.exists()));
+
+            service
+                .protect(HoldNamespace::Paused, "stress-sandbox", configs)
+                .await
+                .expect("promote durable paused closure");
+            service
+                .release_protection_best_effort(HoldNamespace::Runtime, "stress-sandbox")
+                .await;
+            service
+                .run_gc(ImageCacheLiveRuntimeRefs::new(), true)
+                .await
+                .expect("GC between pause and resume");
+            assert!(current.iter().all(|path| path.exists()));
+            assert!(previous.iter().all(|path: &PathBuf| !path.exists()));
+
+            // Resume keeps the last paused recovery closure pinned.
+            service
+                .run_gc(ImageCacheLiveRuntimeRefs::new(), true)
+                .await
+                .expect("GC while resumed");
+            assert!(current.iter().all(|path| path.exists()));
+            previous = current;
+        }
+
+        service
+            .release_protection_best_effort(HoldNamespace::Paused, "stress-sandbox")
+            .await;
+        service
+            .run_gc(ImageCacheLiveRuntimeRefs::new(), true)
+            .await
+            .expect("GC after durable delete");
+        assert!(previous.iter().all(|path: &PathBuf| !path.exists()));
+    }
+
+    #[tokio::test]
+    async fn hold_install_between_gc_checks_prevents_unlink() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        let commit = write_commit_file(&service, "sha256:racing", b"racing");
+        service
+            .record_hard_commit_object("sha256:racing", Some(commit.clone()), Some(6), &[])
+            .await
+            .expect("record racing commit");
+        let config = temp.path().join("paused/image.json");
+        write_image_config(
+            &config,
+            "",
+            json!([{
+                "file": commit.display().to_string(),
+                "digest": "sha256:racing",
+                "size": 6
+            }]),
+        );
+        let reached = Arc::new(Semaphore::new(0));
+        let resume = Arc::new(Semaphore::new(0));
+        service.pause_gc_before_final_check(Arc::clone(&reached), Arc::clone(&resume));
+        let gc_service = Arc::clone(&service);
+        let gc = tokio::spawn(async move {
+            gc_service
+                .run_gc(ImageCacheLiveRuntimeRefs::new(), true)
+                .await
+        });
+        reached
+            .acquire()
+            .await
+            .expect("GC reached final-check hook")
+            .forget();
+
+        service
+            .protect(HoldNamespace::Paused, "racing-sandbox", vec![config])
+            .await
+            .expect("install racing hold");
+        resume.add_permits(1);
+        let report = gc.await.expect("join GC").expect("run GC");
+
+        assert_eq!(report.collected, 0);
+        assert!(commit.exists());
+    }
+
+    #[tokio::test]
+    async fn operation_hold_install_between_gc_checks_prevents_unlink() {
+        let temp = TempDir::new().expect("tempdir");
+        let service = Arc::new(test_service(&temp));
+        let commit = write_commit_file(&service, "sha256:operation-race", b"operation");
+        service
+            .record_hard_commit_object("sha256:operation-race", Some(commit.clone()), Some(9), &[])
+            .await
+            .expect("record operation commit");
+        let reached = Arc::new(Semaphore::new(0));
+        let resume = Arc::new(Semaphore::new(0));
+        service.pause_gc_before_final_check(Arc::clone(&reached), Arc::clone(&resume));
+        let gc_service = Arc::clone(&service);
+        let gc = tokio::spawn(async move {
+            gc_service
+                .run_gc(ImageCacheLiveRuntimeRefs::new(), true)
+                .await
+        });
+        reached
+            .acquire()
+            .await
+            .expect("GC reached final-check hook")
+            .forget();
+
+        let owner =
+            ImageCacheHoldOwner::new("operation", "racing-operation").expect("operation owner");
+        service
+            .create_or_replace_hold(owner, hard_refs(["sha256:operation-race"]))
+            .await
+            .expect("install racing operation hold");
+        resume.add_permits(1);
+        let report = gc.await.expect("join GC").expect("run GC");
+
+        assert_eq!(report.collected, 0);
+        assert!(commit.exists());
     }
 
     #[tokio::test]

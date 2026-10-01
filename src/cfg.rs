@@ -129,6 +129,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub template_build: TemplateBuildConfig,
     #[config(nested)]
+    pub disk_policy: DiskPolicyConfig,
+    #[config(nested)]
     pub memory_snapshot: MemorySnapshotConfig,
     #[config(nested)]
     pub pool: PoolTomlConfig,
@@ -162,6 +164,10 @@ pub struct PosixFsBackendConfig {
 
 #[derive(Debug, Clone, Config)]
 pub struct FirecrackerConfig {
+    #[config(default = 120u64)]
+    pub api_timeout_secs: u64,
+    #[config(default = 120u64)]
+    pub snapshot_timeout_secs: u64,
     pub binary_path: Option<PathBuf>,
     pub boot_args: Option<String>,
     pub allowed_extra_boot_args_prefixes: Option<Vec<String>>,
@@ -267,6 +273,10 @@ pub struct SandboxProxyConfig {
 
 #[derive(Debug, Config, Clone)]
 pub struct EnvdConfig {
+    #[config(default = 1000u64)]
+    pub health_probe_timeout_ms: u64,
+    #[config(default = 1000u64)]
+    pub boot_ready_probe_timeout_ms: u64,
     #[config(default = "0.5.15")]
     pub version: String,
     #[config(default = 60u64)]
@@ -634,6 +644,26 @@ pub struct NodeIdentityConfig {
     pub cluster_id: Option<String>,
     #[config(env = "AENV_SERVICE_INSTANCE_ID")]
     pub service_instance_id: Option<String>,
+    #[config(env = "AENV_RUNTIME_FAMILY_ID", parse_env = parse_trimmed_string)]
+    pub runtime_family_id: Option<String>,
+}
+
+#[derive(Debug, Config, Clone)]
+pub struct DiskPolicyConfig {
+    #[config(default = true)]
+    pub enabled: bool,
+    #[config(default = 30u64)]
+    pub poll_interval_secs: u64,
+    #[config(default = 0.80)]
+    pub cleanup_high_watermark_ratio: f64,
+    #[config(default = 0.70)]
+    pub cleanup_low_watermark_ratio: f64,
+    #[config(default = 0.85)]
+    pub admission_hard_watermark_ratio: f64,
+    #[config(default = 64u64)]
+    pub cleanup_journal_reserve_mb: u64,
+    #[config(default = 86400u64)]
+    pub log_retention_secs: u64,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -643,8 +673,18 @@ pub struct OrchestratorConfig {
     #[config(default = 3600u64)]
     pub metrics_retention_secs: u64,
 
+    #[config(default = 60u64)]
+    pub transition_timeout_secs: u64,
+    #[config(default = 900u64)]
+    pub resume_timeout_secs: u64,
+    #[config(default = 30u64)]
+    pub resume_backend_build_timeout_secs: u64,
+    #[config(default = 30u64)]
+    pub resume_housekeeping_timeout_secs: u64,
     #[config(default = 1000u64)]
     pub auto_evict_interval_ms: u64,
+    #[config(default = 4usize, env = "AENV_MAX_CONCURRENT_PAUSES")]
+    pub max_concurrent_pauses: usize,
     #[config(default = 15u64)]
     pub default_sandbox_timeout_secs: u64,
     #[config(default = 300u64)]
@@ -733,6 +773,7 @@ impl_config_default!(
     ObservabilitySchedulerReportConfig,
     ClusterConfig,
     NodeIdentityConfig,
+    DiskPolicyConfig,
     OrchestratorConfig,
     P2pConfig,
     CustomExtensionConfig,
@@ -1017,11 +1058,64 @@ impl AppConfig {
         }
     }
 
+    fn validate_operation_timeouts(&self) -> Result<()> {
+        for (name, value) in [
+            (
+                "firecracker.api_timeout_secs",
+                self.firecracker.api_timeout_secs,
+            ),
+            (
+                "firecracker.snapshot_timeout_secs",
+                self.firecracker.snapshot_timeout_secs,
+            ),
+            (
+                "envd.health_probe_timeout_ms",
+                self.envd.health_probe_timeout_ms,
+            ),
+            (
+                "envd.boot_ready_probe_timeout_ms",
+                self.envd.boot_ready_probe_timeout_ms,
+            ),
+            (
+                "orchestrator.transition_timeout_secs",
+                self.orchestrator.transition_timeout_secs,
+            ),
+            (
+                "orchestrator.resume_timeout_secs",
+                self.orchestrator.resume_timeout_secs,
+            ),
+            (
+                "orchestrator.resume_backend_build_timeout_secs",
+                self.orchestrator.resume_backend_build_timeout_secs,
+            ),
+            (
+                "orchestrator.resume_housekeeping_timeout_secs",
+                self.orchestrator.resume_housekeeping_timeout_secs,
+            ),
+        ] {
+            if value == 0 {
+                bail!("{name} must be > 0");
+            }
+        }
+        if self.orchestrator.resume_backend_build_timeout_secs
+            > self.orchestrator.resume_timeout_secs
+        {
+            bail!("orchestrator.resume_backend_build_timeout_secs must not exceed resume_timeout_secs");
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<()> {
         let mirrors = &self.ublk.overlaybd.registry_mirrors;
         validate_registry_mirror_hosts(mirrors)?;
         self.validate_pool_config()?;
+        self.image.resolver.validate()?;
         self.image.cache.gc.validate()?;
+        self.disk_policy.validate()?;
+        self.validate_operation_timeouts()?;
+        if self.orchestrator.max_concurrent_pauses == 0 {
+            bail!("orchestrator.max_concurrent_pauses must be > 0");
+        }
         NetworkConfig::validate(&self.network)?;
         if self.ublk.overlaybd.resize_timeout_secs == 0 {
             bail!("invalid ublk.overlaybd config: resize_timeout_secs must be > 0");
@@ -1260,6 +1354,46 @@ impl AppConfig {
     }
 }
 
+impl DiskPolicyConfig {
+    fn validate(&self) -> Result<()> {
+        if self.poll_interval_secs == 0 {
+            bail!("disk_policy.poll_interval_secs must be > 0");
+        }
+        for (name, value) in [
+            (
+                "cleanup_low_watermark_ratio",
+                self.cleanup_low_watermark_ratio,
+            ),
+            (
+                "cleanup_high_watermark_ratio",
+                self.cleanup_high_watermark_ratio,
+            ),
+            (
+                "admission_hard_watermark_ratio",
+                self.admission_hard_watermark_ratio,
+            ),
+        ] {
+            if !value.is_finite() || value <= 0.0 || value >= 1.0 {
+                bail!("disk_policy.{name} must be > 0 and < 1, got {value}");
+            }
+        }
+        if self.cleanup_low_watermark_ratio >= self.cleanup_high_watermark_ratio
+            || self.cleanup_high_watermark_ratio >= self.admission_hard_watermark_ratio
+        {
+            bail!(
+                "disk_policy watermarks must satisfy cleanup_low < cleanup_high < admission_hard"
+            );
+        }
+        if self.cleanup_journal_reserve_mb == 0 {
+            bail!("disk_policy.cleanup_journal_reserve_mb must be > 0");
+        }
+        if self.log_retention_secs == 0 {
+            bail!("disk_policy.log_retention_secs must be > 0");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct ConfigManager {
     config: AppConfig,
@@ -1486,6 +1620,27 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn operation_timeouts_reject_zero_and_inconsistent_resume_budgets() {
+        let mut config = AppConfig::default();
+        config.validate_operation_timeouts().unwrap();
+        config.firecracker.snapshot_timeout_secs = 0;
+        assert!(config
+            .validate_operation_timeouts()
+            .unwrap_err()
+            .to_string()
+            .contains("firecracker.snapshot_timeout_secs must be > 0"));
+        config.firecracker.snapshot_timeout_secs = 120;
+        config.orchestrator.resume_timeout_secs = 10;
+        assert!(config
+            .validate_operation_timeouts()
+            .unwrap_err()
+            .to_string()
+            .contains("must not exceed resume_timeout_secs"));
+        config.orchestrator.resume_backend_build_timeout_secs = 10;
+        config.validate_operation_timeouts().unwrap();
+    }
+
+    #[test]
     fn bundled_default_config_loads() -> Result<()> {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
@@ -1597,6 +1752,18 @@ mod tests {
                 .contains("memory_snapshot.background_download.concurrency must be > 0"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn validate_rejects_zero_pause_concurrency() {
+        let mut config = AppConfig::default();
+        config.orchestrator.max_concurrent_pauses = 0;
+
+        let error = config.validate().expect_err("zero pause concurrency");
+
+        assert!(error
+            .to_string()
+            .contains("orchestrator.max_concurrent_pauses must be > 0"));
     }
 
     #[test]

@@ -1,11 +1,13 @@
 package scheduler
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
 
 	"agentenv/services/shared/config"
+	"go.uber.org/zap"
 
 	schedulerv1 "agentenv/services/api/proto"
 
@@ -40,9 +42,27 @@ func TestNodesFromEndpointSlicesServingEndpointIsActive(t *testing.T) {
 	if got := active[0].Endpoint; got != "http://10.0.0.1:8000" {
 		t.Fatalf("expected endpoint http://10.0.0.1:8000, got %q", got)
 	}
+	if got := active[0].AffinityID; got != "agentenv-node-a" {
+		t.Fatalf("expected pod-name affinity fallback, got %q", got)
+	}
 }
 
-func TestNodesFromEndpointSlicesNotServingIsExcluded(t *testing.T) {
+func TestNodesFromEndpointSlicesUsesStableKubernetesNodeForAffinity(t *testing.T) {
+	endpoint := servingEndpoint("agentenv-node-a", "10.0.0.1")
+	endpoint.NodeName = stringPtr("od5-node-1")
+	active, _ := nodesFromEndpointSlices([]*discoveryv1.EndpointSlice{
+		newEndpointSlice(8000, endpoint),
+	}, defaultDiscoveryCfg)
+
+	if len(active) != 1 {
+		t.Fatalf("expected 1 active node, got %d", len(active))
+	}
+	if got := active[0].AffinityID; got != "od5-node-1" {
+		t.Fatalf("expected stable kubernetes node affinity id, got %q", got)
+	}
+}
+
+func TestNodesFromEndpointSlicesNotServingIsLingering(t *testing.T) {
 	active, lingering := nodesFromEndpointSlices([]*discoveryv1.EndpointSlice{
 		newEndpointSlice(8000, notServingEndpoint("agentenv-node-a", "10.0.0.1")),
 	}, defaultDiscoveryCfg)
@@ -50,8 +70,8 @@ func TestNodesFromEndpointSlicesNotServingIsExcluded(t *testing.T) {
 	if len(active) != 0 {
 		t.Fatalf("expected 0 active nodes, got %d", len(active))
 	}
-	if len(lingering) != 0 {
-		t.Fatalf("expected 0 lingering nodes, got %d", len(lingering))
+	if len(lingering) != 1 || lingering[0].ID != "agentenv-node-a" {
+		t.Fatalf("expected non-serving node to linger, got %v", lingering)
 	}
 }
 
@@ -119,7 +139,7 @@ func TestValidateOptionalPodSelector(t *testing.T) {
 	}
 }
 
-func TestNodesFromEndpointSlicesNotServingTerminatingIsExcluded(t *testing.T) {
+func TestNodesFromEndpointSlicesNotServingTerminatingIsLingering(t *testing.T) {
 	ep := discoveryv1.Endpoint{
 		Addresses: []string{"10.0.0.1"},
 		Conditions: discoveryv1.EndpointConditions{
@@ -132,8 +152,39 @@ func TestNodesFromEndpointSlicesNotServingTerminatingIsExcluded(t *testing.T) {
 		newEndpointSlice(8000, ep),
 	}, defaultDiscoveryCfg)
 
-	if len(active)+len(lingering) != 0 {
-		t.Fatalf("expected no nodes for not-serving+terminating, got active=%d lingering=%d", len(active), len(lingering))
+	if len(active) != 0 || len(lingering) != 1 {
+		t.Fatalf("expected not-serving+terminating node to linger, got active=%d lingering=%d", len(active), len(lingering))
+	}
+}
+
+func TestReadinessTransitionsPreserveSandboxRouting(t *testing.T) {
+	registry := NewAtomicNodeRegistry(nil, defaultObservedReportTTL)
+	service := NewService(zap.NewNop(), registry, &RoundRobinStrategy{}, NewInMemoryBindingStore(defaultObservedReportTTL))
+	endpoint := servingEndpoint("node-a", "10.0.0.1")
+	for _, serving := range []bool{true, false, true} {
+		endpoint.Conditions.Serving = boolPtr(serving)
+		active, lingering := nodesFromEndpointSlices([]*discoveryv1.EndpointSlice{
+			newEndpointSlice(8000, endpoint),
+		}, defaultDiscoveryCfg)
+		registry.Set(active, lingering)
+		_, err := service.Heartbeat(context.Background(), &schedulerv1.HeartbeatRequest{
+			NodeId: "node-a", ServiceInstanceId: "worker-a", SandboxIds: []string{"sandbox-a"},
+			Snapshot: &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+		})
+		if err != nil {
+			t.Fatalf("serving=%v: heartbeat rejected: %v", serving, err)
+		}
+		binding, err := service.LookupNode(context.Background(), &schedulerv1.LookupNodeRequest{SandboxId: "sandbox-a"})
+		if err != nil || binding.GetNode().GetNodeId() != "node-a" {
+			t.Fatalf("serving=%v: sandbox route lost: %v, %v", serving, binding, err)
+		}
+		if admitted := len(registry.Snapshot(false)) > 0; admitted != serving {
+			t.Fatalf("serving=%v: new placement eligibility=%v", serving, admitted)
+		}
+	}
+	registry.Set(nil, nil)
+	if _, ok := registry.Resolve("node-a"); ok {
+		t.Fatal("removed endpoint must leave the registry")
 	}
 }
 
@@ -438,5 +489,9 @@ func int32Ptr(v int32) *int32 {
 }
 
 func boolPtr(v bool) *bool {
+	return &v
+}
+
+func stringPtr(v string) *string {
 	return &v
 }

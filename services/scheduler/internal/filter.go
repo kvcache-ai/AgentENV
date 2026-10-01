@@ -1,19 +1,29 @@
 package scheduler
 
-import "agentenv/services/shared/config"
+import (
+	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/config"
+)
 
 // FilterByResourceLimit removes nodes that exceed any configured resource
 // threshold. Nodes without a heartbeat snapshot are always kept (they have no
 // metrics to evaluate). A nil limit disables all filtering.
 func FilterByResourceLimit(nodes []RichNode, limit *config.NodeResourceLimit) []RichNode {
-	if limit == nil {
-		return nodes
-	}
-
 	result := make([]RichNode, 0, len(nodes))
 	for _, n := range nodes {
 		if n.Snapshot == nil {
 			// No heartbeat yet — cannot evaluate limits; keep the node.
+			result = append(result, n)
+			continue
+		}
+		status := n.Snapshot.GetStatus()
+		if status != schedulerv1.NodeStatus_NODE_STATUS_UNSPECIFIED && status != schedulerv1.NodeStatus_NODE_STATUS_READY {
+			continue
+		}
+		if n.Snapshot.AcceptingSandboxes != nil && !n.Snapshot.GetAcceptingSandboxes() {
+			continue
+		}
+		if limit == nil {
 			result = append(result, n)
 			continue
 		}

@@ -68,3 +68,6 @@ env/
 
 ### Node.js
 node_modules/
+
+# Python CI checks
+__pycache__/

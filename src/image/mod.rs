@@ -22,6 +22,9 @@ pub use resolver::{ImageResolver, ResolvedBlockImage};
 /// a type-erased error.
 #[derive(Debug, Error)]
 pub enum ImageError {
+    /// Temporary disk-pressure rejection (503).
+    #[error("{reason}")]
+    AdmissionBlocked { reason: String },
     /// The image reference is syntactically invalid or disallowed by config (400).
     #[error("{reason}")]
     InvalidReference { reason: String },
@@ -64,6 +67,9 @@ impl ImageError {
                 reason: format!("{context}: {reason}"),
             },
             Self::UnsupportedImage { reason } => Self::UnsupportedImage {
+                reason: format!("{context}: {reason}"),
+            },
+            Self::AdmissionBlocked { reason } => Self::AdmissionBlocked {
                 reason: format!("{context}: {reason}"),
             },
             Self::Other(err) => Self::Other(err.context(context.to_string())),

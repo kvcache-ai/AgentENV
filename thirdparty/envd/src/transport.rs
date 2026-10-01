@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use http::Uri;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tokio::sync::Mutex;
+use tokio::time::{timeout, Duration};
 use tower::Service;
 
 // tonic::body::Body is the type used by generated clients.
@@ -14,8 +15,29 @@ pub(crate) type TonicBoxBody = tonic::body::Body;
 pub(crate) type Channel = tower::util::BoxCloneService<
     http::Request<TonicBoxBody>,
     http::Response<hyper::body::Incoming>,
-    Box<dyn std::error::Error + Send + Sync>, // Use boxed error to support anyhow and others
+    ChannelError,
 >;
+
+#[derive(Debug)]
+pub struct ChannelError(Box<dyn std::error::Error + Send + Sync + 'static>);
+
+impl ChannelError {
+    fn new(error: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self(Box::new(error))
+    }
+}
+
+impl std::fmt::Display for ChannelError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ChannelError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
 
 #[derive(Clone)]
 struct DualClient {
@@ -32,9 +54,21 @@ enum Protocol {
     H2,
 }
 
+const PROTOCOL_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+
+async fn protocol_from_h2_probe<F, T, E>(probe: F, deadline: Duration) -> Protocol
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    match timeout(deadline, probe).await {
+        Ok(Ok(_)) => Protocol::H2,
+        Ok(Err(_)) | Err(_) => Protocol::H1,
+    }
+}
+
 impl Service<http::Request<TonicBoxBody>> for DualClient {
     type Response = http::Response<hyper::body::Incoming>;
-    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Error = ChannelError;
     type Future = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
     >;
@@ -65,19 +99,14 @@ impl Service<http::Request<TonicBoxBody>> for DualClient {
 
                 let probe_req = http::Request::builder()
                     .method(http::Method::OPTIONS)
-                    .uri(Uri::from_parts(parts).map_err(|e| anyhow!("Invalid URI parts: {}", e))?)
+                    .uri(Uri::from_parts(parts).map_err(ChannelError::new)?)
                     .body(TonicBoxBody::default())
-                    .map_err(|e| anyhow!("Failed to build probe request: {}", e))?;
+                    .map_err(ChannelError::new)?;
 
                 // Try H2
-                match h2.request(probe_req).await {
-                    Ok(_) => {
-                        proto = Some(Protocol::H2);
-                    }
-                    Err(_) => {
-                        proto = Some(Protocol::H1);
-                    }
-                }
+                proto = Some(
+                    protocol_from_h2_probe(h2.request(probe_req), PROTOCOL_PROBE_TIMEOUT).await,
+                );
                 *protocol.lock().await = proto;
             }
 
@@ -90,21 +119,19 @@ impl Service<http::Request<TonicBoxBody>> for DualClient {
                 Protocol::H2 => {
                     let mut parts = uri.into_parts();
                     parts.path_and_query = req.uri().path_and_query().cloned();
-                    *req.uri_mut() =
-                        Uri::from_parts(parts).map_err(|e| anyhow!("Invalid URI parts: {}", e))?;
+                    *req.uri_mut() = Uri::from_parts(parts).map_err(ChannelError::new)?;
 
-                    h2.request(req).await.map_err(|e| e.into())
+                    h2.request(req).await.map_err(ChannelError::new)
                 }
                 Protocol::H1 => {
                     let mut parts = uri.into_parts();
                     parts.path_and_query = req.uri().path_and_query().cloned();
-                    *req.uri_mut() =
-                        Uri::from_parts(parts).map_err(|e| anyhow!("Invalid URI parts: {}", e))?;
+                    *req.uri_mut() = Uri::from_parts(parts).map_err(ChannelError::new)?;
 
                     // Coerce version to HTTP/1.1
                     *req.version_mut() = http::Version::HTTP_11;
 
-                    h1.request(req).await.map_err(|e| e.into())
+                    h1.request(req).await.map_err(ChannelError::new)
                 }
             }
         })
@@ -151,4 +178,22 @@ pub fn new_channel(addr: &str, access_token: Option<&str>) -> anyhow::Result<Cha
     };
 
     Ok(tower::util::BoxCloneService::new(service))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn stalled_h2_probe_falls_back_to_h1() {
+        let protocol = protocol_from_h2_probe(
+            future::pending::<Result<(), ()>>(),
+            Duration::from_millis(10),
+        )
+        .await;
+
+        assert!(matches!(protocol, Protocol::H1));
+    }
 }

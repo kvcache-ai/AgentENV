@@ -11,7 +11,7 @@ use crate::virtualization::VirtualizationMode;
 
 pub use metrics::OrchestratorMetrics;
 pub use persistence::{
-    DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
+    CleanupMetrics, DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
     SandboxPersistenceError, SandboxPersister,
 };
 pub use proxy::{ProxyLookupResult, ProxyTarget};
@@ -59,6 +59,12 @@ pub enum OrchestratorError {
 
     #[error("orchestrator is shutting down")]
     ShuttingDown,
+
+    #[error("{operation} is blocked by runtime disk admission: {reason}")]
+    AdmissionBlocked {
+        operation: &'static str,
+        reason: &'static str,
+    },
 
     #[error("sandbox {0} not found")]
     SandboxNotFound(SandboxId),

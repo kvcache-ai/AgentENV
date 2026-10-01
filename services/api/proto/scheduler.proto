@@ -116,6 +116,14 @@ enum NodeStatus {
   NODE_STATUS_LINGERING = 4;
 }
 
+enum AdmissionReason {
+  ADMISSION_REASON_UNSPECIFIED = 0;
+  ADMISSION_REASON_READY = 1;
+  ADMISSION_REASON_DISK_CLEANUP = 2;
+  ADMISSION_REASON_DISK_HARD_LIMIT = 3;
+  ADMISSION_REASON_CLEANUP_DEBT = 4;
+}
+
 message NodeSnapshot {
   NodeStatus status = 1;
   uint32 allocated_cpu = 2;
@@ -139,6 +147,20 @@ message NodeSnapshot {
   uint32 paused_sandbox_count = 14;
   uint32 paused_allocated_cpu = 15;
   uint64 paused_allocated_memory_bytes = 16;
+  // Optional preserves old-runtime behavior during the compatibility window.
+  optional bool accepting_sandboxes = 17;
+  AdmissionReason admission_reason = 18;
+  uint64 disk_total_bytes = 19;
+  uint64 disk_used_bytes = 20;
+  uint64 disk_available_bytes = 21;
+  uint64 cleanup_pending = 22;
+  uint64 cleanup_retries = 23;
+  uint64 cleanup_failures = 24;
+  uint64 pruned_generations = 25;
+  uint64 reclaimed_snapshot_bytes = 26;
+  uint64 reserved_cleanup_journal_bytes = 27;
+  uint64 reclaimed_log_bytes = 28;
+  uint64 disk_admission_rejections = 29;
 }
 
 message P2pEndpoint {
@@ -156,6 +178,8 @@ message ObservedNode {
   MachineInfo machine_info = 7;
   NodeSnapshot snapshot = 8;
   int64 last_seen_unix_ms = 9;
+  // Stable physical runtime identity. Unlike node_id, this survives pod replacement.
+  string runtime_family_id = 10;
 }
 
 message HeartbeatRequest {
@@ -168,6 +192,8 @@ message HeartbeatRequest {
   NodeSnapshot snapshot = 7;
   repeated string sandbox_ids = 8;
   P2pEndpoint p2p_endpoint = 9;
+  // Stable physical runtime identity. Unlike node_id, this survives pod replacement.
+  string runtime_family_id = 10;
 }
 
 message HeartbeatResponse {

@@ -1,7 +1,7 @@
 use axum::{
     body::{Body, Bytes},
     extract::{FromRequest, MatchedPath, Request},
-    http::{header, HeaderValue, Method},
+    http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -12,6 +12,14 @@ use super::{impls::auth, proxy, ApiImpl};
 use crate::observability::prometheus;
 use agentenv_http_server::apis;
 use agentenv_observability::metrics_handler;
+
+async fn livez() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+fn liveness_router() -> Router {
+    Router::new().route("/livez", get(livez))
+}
 
 pub fn new<I, A, E, C>(api_impl: I) -> Router
 where
@@ -35,6 +43,7 @@ where
     // proxy contract.
     agentenv_http_server::server::new::<I, A, E, C>(api_impl.clone())
         .route_layer(middleware::from_fn(optional_connect_body))
+        .merge(liveness_router())
         .merge(proxy::router(api_impl.clone()))
         .merge(super::impls::image_build::router(api_impl.clone()))
         .route("/metrics", get(metrics_handler))
@@ -184,5 +193,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use axum::{body::Body, http::Request};
+    use tokio::runtime::Builder;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    #[test]
+    fn livez_does_not_wait_for_the_blocking_pool() {
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("build test runtime");
+
+        runtime.block_on(async {
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = mpsc::sync_channel(0);
+            let blocker = tokio::task::spawn_blocking(move || {
+                started_tx.send(()).expect("report blocking task start");
+                release_rx.recv().expect("release blocking task");
+            });
+            started_rx.await.expect("blocking task should start");
+
+            let response = tokio::time::timeout(
+                Duration::from_millis(100),
+                liveness_router().oneshot(
+                    Request::builder()
+                        .uri("/livez")
+                        .body(Body::empty())
+                        .expect("build liveness request"),
+                ),
+            )
+            .await;
+
+            release_tx.send(()).expect("release blocking task");
+            blocker.await.expect("blocking task should finish");
+
+            let response = response
+                .expect("liveness must not wait for blocking work")
+                .expect("liveness request should succeed");
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        });
     }
 }

@@ -66,10 +66,15 @@ func main() {
 			registry.Set(nodes, nil)
 		}
 
+		strategy, err := scheduler.NewStrategy(cfg.Scheduler.Strategy, cfg.Scheduler.ImageAffinityNodeWeights)
+		if err != nil {
+			logger.Fatal("create scheduler strategy failed", zap.Error(err))
+		}
+
 		svc := scheduler.NewService(
 			logger,
 			registry,
-			scheduler.NewStrategy(cfg.Scheduler.Strategy),
+			strategy,
 			store,
 			scheduler.WithArtifactStore(scheduler.NewInMemoryArtifactStore(
 				cfg.Scheduler.ArtifactStoreCapacity,

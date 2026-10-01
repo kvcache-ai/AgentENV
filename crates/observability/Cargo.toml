@@ -6,5 +6,6 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 axum = "0.8"
+metrics = "0.24"
 metrics-exporter-prometheus = "0.18.3"
 tokio = { version = "1", features = ["net", "rt", "time"] }

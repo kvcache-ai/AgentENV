@@ -36,6 +36,8 @@ func newSchedulerConn(addr string) (*grpc.ClientConn, error) {
 	return grpc.NewClient(
 		addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		// Fleet status includes cached-image inventories from every runtime.
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(64<<20)),
 	)
 }
 

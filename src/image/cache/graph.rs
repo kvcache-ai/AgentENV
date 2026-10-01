@@ -1064,11 +1064,10 @@ fn load_commit_store_owned_hard_commit_refs(
     let mut refs = Vec::new();
     let mut seen = BTreeSet::new();
 
-    for (idx, lower) in image_config.lowers.into_iter().enumerate() {
-        if lower.file.is_empty() {
+    for (idx, lower) in image_config.lowers.iter().enumerate() {
+        let Some(file) = overlaybd::layer_metadata::resolve_local_layer_path(lower) else {
             continue;
-        }
-        let file = PathBuf::from(lower.file);
+        };
         if !path_is_inside(&file, commit_store) {
             continue;
         }
@@ -1085,7 +1084,7 @@ fn load_commit_store_owned_hard_commit_refs(
             );
         }
 
-        let digest = HardCommitId::new(lower.digest)?;
+        let digest = HardCommitId::new(lower.digest.clone())?;
         if seen.insert(digest.clone()) {
             refs.push(ParsedHardCommitRef {
                 digest,

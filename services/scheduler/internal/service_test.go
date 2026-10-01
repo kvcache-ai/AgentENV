@@ -56,7 +56,7 @@ func TestLookupNodeReturnsRecordedAssignment(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		registry,
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -89,7 +89,7 @@ func TestListNodesReturnsActiveAndLingeringNodes(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		registry,
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -133,7 +133,7 @@ func TestLookupNodeReturnsUnavailableWhenBindingStoreFails(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		failingBindingStore{},
 	)
 
@@ -147,7 +147,7 @@ func TestLookupNodeReturnsNotFoundWhenAssignmentMissing(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -161,7 +161,7 @@ func TestRecordAssignmentReturnsUnavailableWhenBindingStoreFails(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		failingBindingStore{},
 	)
 
@@ -178,7 +178,7 @@ func TestRecordAssignmentRejectsUnknownNode(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -196,7 +196,7 @@ func TestListNodesReflectsRegistryUpdates(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		registry,
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -222,7 +222,7 @@ func TestScheduleReturnsUnavailableWhenRegistryIsEmpty(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		NewAtomicNodeRegistry(nil, defaultObservedReportTTL),
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -242,7 +242,7 @@ func TestScheduleOnlyConsidersReadyNodes(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		registry,
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -266,7 +266,7 @@ func TestGetObservedNodeAfterHeartbeat(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -294,7 +294,7 @@ func TestHeartbeatRebuildsSandboxBindings(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -324,7 +324,7 @@ func TestHeartbeatRemovesBindingsMissingFromRoster(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -366,7 +366,7 @@ func TestUnregisterObservedNodeIsIdempotent(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -393,7 +393,7 @@ func TestUnregisterNodeRemovesBindingsForNode(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -429,7 +429,7 @@ func TestP2pArtifactLookupReturnsReadyIndexedProviders(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		registry,
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -495,7 +495,7 @@ func TestP2pArtifactForgetAndUnregisterRemoveProviders(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		registry,
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -571,7 +571,7 @@ func TestP2pArtifactLookupExcludesExpiredNodes(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		registry,
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -641,7 +641,7 @@ func TestUnregisterObservedNodeRejectsServiceInstanceMismatch(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -660,7 +660,7 @@ func TestHeartbeatRejectsUnknownNode(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -677,7 +677,7 @@ func TestHeartbeatRejectsEmptyNodeID(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -694,7 +694,7 @@ func TestHeartbeatRejectsEmptyServiceInstanceID(t *testing.T) {
 	service := NewService(
 		zap.NewNop(),
 		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
-		NewStrategy("round_robin"),
+		&RoundRobinStrategy{},
 		NewInMemoryBindingStore(defaultObservedReportTTL),
 	)
 
@@ -704,5 +704,16 @@ func TestHeartbeatRejectsEmptyServiceInstanceID(t *testing.T) {
 	})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected invalid argument, got %v", err)
+	}
+}
+
+func TestScheduleReturnsUnavailableForUnmatchedAffinityWeights(t *testing.T) {
+	registry := NewAtomicNodeRegistry([]Node{{ID: "pod-a", AffinityID: "host-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL)
+	service := NewService(zap.NewNop(), registry,
+		NewWeightedImageAffinityStrategy(map[string]float64{"host-b": 1}),
+		NewInMemoryBindingStore(defaultObservedReportTTL))
+	_, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{Hint: coldSandboxHint("repo:latest")})
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected retryable Unavailable for unmatched weights, got %v", err)
 	}
 }

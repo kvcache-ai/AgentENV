@@ -21,6 +21,34 @@ func TestFilterNilLimitKeepsAll(t *testing.T) {
 	}
 }
 
+func TestFilterExcludesAdmissionBlockedNodesAndKeepsLegacyNodes(t *testing.T) {
+	nodes := []RichNode{
+		{
+			Node: Node{ID: "ready"},
+			Snapshot: &schedulerv1.NodeSnapshot{
+				Status:             schedulerv1.NodeStatus_NODE_STATUS_READY,
+				AcceptingSandboxes: boolPtr(true),
+			},
+		},
+		{
+			Node: Node{ID: "blocked"},
+			Snapshot: &schedulerv1.NodeSnapshot{
+				Status:             schedulerv1.NodeStatus_NODE_STATUS_READY,
+				AcceptingSandboxes: boolPtr(false),
+			},
+		},
+		{
+			Node:     Node{ID: "legacy"},
+			Snapshot: &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+		},
+	}
+
+	result := FilterByResourceLimit(nodes, nil)
+	if len(result) != 2 || result[0].ID != "ready" || result[1].ID != "legacy" {
+		t.Fatalf("expected [ready legacy], got %v", result)
+	}
+}
+
 func TestFilterKeepsNodesWithoutSnapshot(t *testing.T) {
 	limit := &config.NodeResourceLimit{MaxSandboxCount: uint32Ptr(5)}
 	nodes := []RichNode{

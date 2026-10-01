@@ -62,6 +62,37 @@ func TestLoadSchedulerAllowsQueryOnlyWithRedisWithoutNodes(t *testing.T) {
 	}
 }
 
+func TestLoadSchedulerParsesImageAffinityWeights(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"scheduler": {
+			"strategy": "weighted_image_affinity",
+			"image_affinity_node_weights": {"host-a": 20, "host-b": 80},
+			"nodes": [{"id": "host-a", "endpoint": "http://node-a:8000"}, {"id": "host-b", "endpoint": "http://node-b:8000"}]
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	cfg, err := Load(path, "scheduler")
+	if err != nil {
+		t.Fatalf("load scheduler config failed: %v", err)
+	}
+	if got := cfg.Scheduler.ImageAffinityNodeWeights["host-b"]; got != 80 {
+		t.Fatalf("unexpected host-b weight: %v", got)
+	}
+}
+
+func TestValidateRejectsEmptyImageAffinityWeights(t *testing.T) {
+	cfg := defaultConfig("scheduler")
+	cfg.Scheduler.Strategy = "weighted_image_affinity"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected empty image affinity weights to fail")
+	}
+}
+
 func TestLoadSchedulerRejectsQueryOnlyWithoutRedis(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "config.json")
@@ -601,5 +632,61 @@ func TestLoadRejectsIncompleteKubernetesSchedulerDiscoveryConfig(t *testing.T) {
 
 	if _, err := Load(path, "scheduler"); err == nil {
 		t.Fatal("expected load to fail for incomplete kubernetes discovery config")
+	}
+}
+
+func TestValidateSchedulerStrategy(t *testing.T) {
+	for _, name := range []string{"round_robin", " RANDOM ", " WEIGHTED_IMAGE_AFFINITY "} {
+		cfg := defaultConfig("scheduler")
+		cfg.Scheduler.Strategy = name
+		cfg.Scheduler.ImageAffinityNodeWeights = map[string]float64{"local-node": 1}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("valid strategy %q: %v", name, err)
+		}
+	}
+	for _, name := range []string{"", "round-robin", "weighted_image_affinty"} {
+		cfg := defaultConfig("scheduler")
+		cfg.Scheduler.Strategy = name
+		if err := cfg.Validate(); err == nil {
+			t.Fatalf("accepted unknown strategy %q", name)
+		}
+	}
+}
+
+func TestValidateImageAffinityWeightIdentities(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		weights map[string]float64
+		valid   bool
+	}{
+		{"known", map[string]float64{"local-node": 1}, true},
+		{"trimmed", map[string]float64{" local-node ": 1}, true},
+		{"unknown", map[string]float64{"wrong-host": 1}, false},
+		{"partially unknown", map[string]float64{"local-node": 1, "wrong-host": 1}, false},
+		{"duplicate", map[string]float64{"local-node": 1, " local-node ": 2}, false},
+		{"empty", map[string]float64{" ": 1}, false},
+		{"zero", map[string]float64{"local-node": 0}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := defaultConfig("scheduler")
+			cfg.Scheduler.Strategy = "weighted_image_affinity"
+			cfg.Scheduler.ImageAffinityNodeWeights = tc.weights
+			if err := cfg.Validate(); (err == nil) != tc.valid {
+				t.Fatalf("valid=%v: %v", tc.valid, err)
+			}
+		})
+	}
+}
+
+func TestValidateKubernetesAffinityAllowsUndiscoveredHosts(t *testing.T) {
+	cfg := defaultConfig("scheduler")
+	cfg.Scheduler.Strategy = "weighted_image_affinity"
+	cfg.Scheduler.ImageAffinityNodeWeights = map[string]float64{"future-host": 1}
+	cfg.Scheduler.Discovery.Mode = "kubernetes"
+	cfg.Scheduler.Discovery.Kubernetes.Namespace = "default"
+	cfg.Scheduler.Discovery.Kubernetes.ServiceName = "agentenv"
+	cfg.Scheduler.Discovery.Kubernetes.Port = 8000
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("dynamic identities should be checked during selection: %v", err)
 	}
 }
