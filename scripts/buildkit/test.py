@@ -336,15 +336,17 @@ class BuildKitTests(unittest.TestCase):
             "workers did not overlap",
         )
         if os.environ.get("E2E_MODE") == "compose":
+            # Metadata requests also advance round-robin placement, so two
+            # concurrent builds may legitimately share a node.
             self.wait_for(
                 lambda: (
                     sum(
-                        counts[0] > self.baseline[node][0]
+                        counts[0] - self.baseline[node][0]
                         for node, counts in self.node_counts().items()
                     )
                     >= 2
                 ),
-                "concurrent builders on different nodes",
+                "two concurrent builder workers",
             )
         for name, build in builds:
             self.finish(build)
