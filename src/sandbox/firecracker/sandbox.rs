@@ -900,6 +900,9 @@ impl FirecrackerSandbox {
         envd_instance
             .wait_for_ready(envd_timeout, envd_poll_interval)
             .await?;
+        // Restored guests retain the source token until /init validates the new
+        // token against MMDS. Authenticate before sending the boot probe command.
+        envd_instance.init(None, None, None).await?;
         let remaining = envd_timeout.saturating_sub(started.elapsed());
         anyhow::ensure!(
             !remaining.is_zero(),
@@ -2857,6 +2860,7 @@ mod tests {
     use crate::sandbox::{SandboxAccessTokenGenerator, SandboxExecutor};
     use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotRecord};
     use std::collections::HashMap;
+    use std::time::Duration;
 
     fn fresh_config() -> FirecrackerSandboxConfig {
         FirecrackerSandboxConfig::new(
@@ -3393,6 +3397,71 @@ mod tests {
             .await
             .expect_err("envd should be missing");
         assert!(err.to_string().contains("envd instance not initialized"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn readiness_rotates_restored_token_before_running_boot_probe() -> Result<()> {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let token = SandboxAccessTokenGenerator::new("readiness-test")?.generate(SandboxId::new());
+        let initialized = Arc::new(AtomicUsize::new(0));
+        let init_count = initialized.clone();
+        let probe_count = initialized.clone();
+        let init_token = token.clone();
+        let probe_token = token.clone();
+        let app = Router::new()
+            .route("/health", get(|| async { StatusCode::NO_CONTENT }))
+            .route(
+                "/init",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let count = init_count.clone();
+                    let token = init_token.clone();
+                    async move {
+                        assert_eq!(body["accessToken"], token.expose());
+                        assert!(body["defaultUser"].is_null());
+                        assert!(body["defaultWorkdir"].is_null());
+                        count.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .route(
+                "/process.Process/Start",
+                post(move |headers: HeaderMap| {
+                    let count = probe_count.clone();
+                    let token = probe_token.clone();
+                    async move {
+                        assert_eq!(headers["x-access-token"], token.expose());
+                        if count.load(Ordering::SeqCst) == 0 {
+                            return (
+                                StatusCode::UNAUTHORIZED,
+                                [("content-type", "application/grpc")],
+                                Vec::new(),
+                            );
+                        }
+                        // A gRPC frame containing StartResponse -> ProcessEvent -> End(exit=0).
+                        (
+                            StatusCode::OK,
+                            [("content-type", "application/grpc")],
+                            vec![0, 0, 0, 0, 4, 10, 2, 26, 0],
+                        )
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
+        sandbox.runtime_policy.envd_timeout = Duration::from_secs(2);
+        sandbox.envd_instance = Some(EnvdInstance::new(format!("http://{address}"), Some(token)));
+        let result = sandbox.wait_for_ready().await;
+        server.abort();
+        result?;
+        assert_eq!(initialized.load(Ordering::SeqCst), 2);
         Ok(())
     }
 

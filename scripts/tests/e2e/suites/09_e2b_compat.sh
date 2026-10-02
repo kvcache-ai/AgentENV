@@ -131,13 +131,13 @@ if python3 -c 'import e2b' >/dev/null 2>&1; then
     if sdk_output=$(timeout "${sdk_timeout}" python3 "$sdk_script" 2>&1); then
       _pass "e2b Python SDK template build, startCmd/readyCmd, sandbox lifecycle, and commands"
     else
-      log "e2b Python SDK output: ${sdk_output:0:1200}"
+      log "e2b Python SDK output: ${sdk_output}"
       _fail "e2b Python SDK compatibility" "exit 0" "non-zero"
     fi
   elif sdk_output=$(python3 "$sdk_script" 2>&1); then
     _pass "e2b Python SDK template build, startCmd/readyCmd, sandbox lifecycle, and commands"
   else
-    log "e2b Python SDK output: ${sdk_output:0:1200}"
+    log "e2b Python SDK output: ${sdk_output}"
     _fail "e2b Python SDK compatibility" "exit 0" "non-zero"
   fi
 else
@@ -161,13 +161,13 @@ if [[ -f "$ts_sdk_script" ]] && command -v npm >/dev/null 2>&1; then
     if sdk_output=$(timeout "${sdk_timeout}" "$tsx_bin" "$ts_sdk_script" 2>&1); then
       _pass "e2b TypeScript SDK template build, volume mount persistence, sandbox lifecycle, and commands"
     else
-      log "e2b TypeScript SDK output: ${sdk_output:0:1200}"
+      log "e2b TypeScript SDK output: ${sdk_output}"
       _fail "e2b TypeScript SDK compatibility" "exit 0" "non-zero"
     fi
   elif sdk_output=$("$tsx_bin" "$ts_sdk_script" 2>&1); then
     _pass "e2b TypeScript SDK template build, volume mount persistence, sandbox lifecycle, and commands"
   else
-    log "e2b TypeScript SDK output: ${sdk_output:0:1200}"
+    log "e2b TypeScript SDK output: ${sdk_output}"
     _fail "e2b TypeScript SDK compatibility" "exit 0" "non-zero"
   fi
   fi

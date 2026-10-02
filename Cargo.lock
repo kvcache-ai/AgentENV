@@ -223,6 +223,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentenv-server"
+version = "0.2.2"
+dependencies = [
+ "agentenv",
+ "agentenv-observability",
+ "anyhow",
+ "axum",
+ "clap",
+ "tikv-jemallocator",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agentenv-test-support"
 version = "0.1.0"
 dependencies = [

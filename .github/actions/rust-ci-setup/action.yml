@@ -67,19 +67,39 @@ runs:
         echo "CARGO_TARGET_DIR=$cargo_target_dir" >> "$GITHUB_ENV"
         echo "PROTOC_LOCAL_CACHE_DIR=$protoc_local_cache_dir" >> "$GITHUB_ENV"
 
-    - name: Set up Rust toolchain
-      if: ${{ inputs.components == '' }}
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Set up Rust toolchain (with components)
-      if: ${{ inputs.components != '' }}
-      uses: dtolnay/rust-toolchain@stable
-      with:
-        components: ${{ inputs.components }}
+    - name: Set up pinned Rust toolchain
+      shell: bash
+      env:
+        COMPONENTS: ${{ inputs.components }}
+      run: |
+        rustup show active-toolchain
+        if [[ -n "$COMPONENTS" ]]; then
+          IFS=',' read -ra components <<< "$COMPONENTS"
+          rustup component add "${components[@]}"
+        fi
+        echo 'CARGO_INCREMENTAL=0' >> "$GITHUB_ENV"
+        echo 'CARGO_PROFILE_DEV_DEBUG=0' >> "$GITHUB_ENV"
+        echo 'CARGO_PROFILE_TEST_DEBUG=0' >> "$GITHUB_ENV"
 
     - name: Restore Rust cache
       if: ${{ runner.environment != 'self-hosted' }}
-      uses: Swatinem/rust-cache@v2
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+          ${{ runner.temp }}/rust-source-state.json
+        key: rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', '.github/actions/rust-ci-setup/action.yml') }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}-${{ github.sha }}
+        restore-keys: |
+          rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', '.github/actions/rust-ci-setup/action.yml') }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}-
+          rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', '.github/actions/rust-ci-setup/action.yml') }}-
+
+    # Fresh checkouts otherwise make Cargo rebuild unchanged workspace sources.
+    - name: Restore unchanged source timestamps
+      if: ${{ runner.environment != 'self-hosted' }}
+      shell: bash
+      run: python3 .github/scripts/restore_rust_source_mtimes.py "$RUNNER_TEMP/rust-source-state.json"
 
     - name: Restore CI deps cache (protoc)
       id: ci-deps-cache

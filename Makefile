@@ -78,10 +78,10 @@ release:
 	$(CARGO) build --release
 
 build-server:
-	$(CARGO) build -p agentenv --bin server
+	$(CARGO) build -p agentenv-server --bin server
 
 build-server-release:
-	$(CARGO) build --release -p agentenv --bin server
+	$(CARGO) build --release -p agentenv-server --bin server
 
 build-snapshot-image:
 	$(CARGO) build -p agentenv --bin aenv-snapshot-image
@@ -118,7 +118,7 @@ coverage:
 test: test-agent test-envd test-ublk
 
 test-unit:
-	$(CARGO) test -p agentenv -p envd -p linux-cap --lib
+	$(CAPABILITY_TEST_ENV) $(CARGO) test -p agentenv -p envd -p linux-cap --lib
 	$(CARGO) test -p aenv --bin aenv
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --lib -- --ignored
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib

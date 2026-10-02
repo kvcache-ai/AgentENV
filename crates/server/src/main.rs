@@ -85,7 +85,8 @@ async fn main() -> anyhow::Result<()> {
     let api_key = ApiKey::resolve(config)?;
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
-    let identity = NodeIdentity::from_config(&config.node_identity);
+    let mut identity = NodeIdentity::from_config(&config.node_identity);
+    identity.commit = env!("AENV_GIT_COMMIT").to_string();
     let p2p_transport = agentenv::p2p::transport_from_config(config, &identity).await?;
     let p2p_local_endpoint = p2p_transport.local_endpoint();
     agentenv::image::initialize_image_cache_p2p_transport(Arc::clone(&p2p_transport));

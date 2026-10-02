@@ -5,13 +5,6 @@ use uuid::Uuid;
 
 use crate::cfg::NodeIdentityConfig;
 
-fn build_commit() -> &'static str {
-    match option_env!("AENV_GIT_COMMIT") {
-        Some(commit) if !commit.is_empty() => commit,
-        _ => "unknown",
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct NodeIdentity {
     pub id: String,
@@ -26,8 +19,8 @@ impl NodeIdentity {
     /// Resolves stable node identity fields used by the node/admin APIs.
     ///
     /// Values come from environment/config overrides when present, otherwise from
-    /// hostname- or process-derived fallbacks. The build commit is injected at
-    /// compile time rather than read from runtime configuration.
+    /// hostname- or process-derived fallbacks. The server sets the build commit
+    /// from its embedded metadata after constructing the identity.
     pub fn from_config(config: &NodeIdentityConfig) -> Self {
         let hostname = read_hostname().unwrap_or_else(|| "unknown".to_string());
         let id = config
@@ -51,7 +44,7 @@ impl NodeIdentity {
                 .clone()
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| Uuid::now_v7().to_string()),
-            commit: build_commit().to_string(),
+            commit: "unknown".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
@@ -98,7 +91,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn observability_commit_uses_build_time_injection() {
+    fn observability_commit_ignores_runtime_environment() {
         let runtime_override = "runtime-override-commit";
         let previous = std::env::var("AENV_GIT_COMMIT").ok();
         unsafe {
@@ -106,12 +99,8 @@ mod tests {
         }
 
         let identity = NodeIdentity::from_config(&NodeIdentityConfig::default());
-        let expected = option_env!("AENV_GIT_COMMIT")
-            .filter(|commit| !commit.is_empty())
-            .unwrap_or("unknown");
-
         assert_ne!(identity.commit, runtime_override);
-        assert_eq!(identity.commit, expected);
+        assert_eq!(identity.commit, "unknown");
 
         match previous {
             Some(value) => unsafe {
