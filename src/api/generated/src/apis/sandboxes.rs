@@ -345,6 +345,20 @@ pub enum V2SandboxesSandboxIdConnectPostResponse {
     Status500_ServerError(models::Error),
 }
 
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
+pub enum V2SandboxesSandboxIdLogsGetResponse {
+    /// Successfully returned the sandbox logs
+    Status200_SuccessfullyReturnedTheSandboxLogs(models::SandboxLogsV2Response),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Not found
+    Status404_NotFound(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
 /// Sandboxes
 #[async_trait]
 #[allow(clippy::ptr_arg)]
@@ -616,4 +630,18 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         path_params: &models::V2SandboxesSandboxIdConnectPostPathParams,
         body: &Option<models::ConnectSandboxV2>,
     ) -> Result<V2SandboxesSandboxIdConnectPostResponse, E>;
+
+    /// Sandbox logs (v2).
+    ///
+    /// V2SandboxesSandboxIdLogsGet - GET /v2/sandboxes/{sandboxID}/logs
+    async fn v2_sandboxes_sandbox_id_logs_get(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        path_params: &models::V2SandboxesSandboxIdLogsGetPathParams,
+        query_params: &models::V2SandboxesSandboxIdLogsGetQueryParams,
+    ) -> Result<V2SandboxesSandboxIdLogsGetResponse, E>;
 }

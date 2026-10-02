@@ -4,6 +4,7 @@ pub(crate) mod custom_extension;
 mod envd;
 mod extra_drive;
 mod firecracker;
+pub(crate) mod logs;
 pub mod manifest;
 mod metrics;
 #[cfg(test)]
@@ -37,6 +38,7 @@ pub use firecracker::{
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
     FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
 };
+pub use logs::SandboxLogEntry;
 pub use manifest::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
 pub use metrics::SandboxMetric;
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};

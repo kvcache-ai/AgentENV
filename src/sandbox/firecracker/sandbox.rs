@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use firecracker_client::models::drive::IoEngine;
 use nix::libc;
 use tempfile::TempDir;
@@ -342,6 +343,23 @@ fn snapshot_config_for_fork(
 
 #[async_trait]
 impl SandboxBackend for FirecrackerSandbox {
+    #[allow(clippy::too_many_arguments)]
+    fn logs_query(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        limit: usize,
+        backward: bool,
+        level: Option<crate::logging::LogLevel>,
+        search: Option<String>,
+    ) -> Option<futures::future::BoxFuture<'static, Result<Vec<crate::sandbox::SandboxLogEntry>>>>
+    {
+        let envd = self.envd_instance.clone()?;
+        Some(Box::pin(async move {
+            envd.logs(start, end, limit, backward, level, search).await
+        }))
+    }
+
     fn metrics_sample(
         &self,
     ) -> Option<futures::future::BoxFuture<'static, Result<crate::sandbox::SandboxMetric>>> {

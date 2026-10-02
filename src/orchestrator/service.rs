@@ -18,7 +18,7 @@ use crate::sandbox::{
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerSandboxFactory,
     FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator,
     SandboxBackend, SandboxBackendFactory, SandboxCaptureError, SandboxForkSpec,
-    SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    SandboxLaunchConfig, SandboxLogEntry, SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
@@ -39,6 +39,8 @@ use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
 #[path = "sandbox_metrics.rs"]
 mod sandbox_metrics;
+use crate::logging::LogLevel;
+use crate::sandbox::logs::log_query_window;
 use sandbox_metrics::SandboxMetrics;
 
 type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
@@ -60,6 +62,8 @@ enum DeleteProgress {
 /// never completes (e.g. the task holding the state panics without rolling back).
 const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
+const MAX_SANDBOX_LOG_LIMIT: usize = 1000;
+const SANDBOX_LOG_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 enum ShutdownOutcome {
@@ -2884,6 +2888,78 @@ where
         }
 
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sandbox_logs(
+        &self,
+        id: SandboxId,
+        cursor: Option<i64>,
+        limit: usize,
+        backward: bool,
+        level: Option<LogLevel>,
+        search: Option<String>,
+    ) -> Result<Vec<SandboxLogEntry>> {
+        let operation = async {
+            let metadata = self
+                .store
+                .get(&id)
+                .await?
+                .ok_or(OrchestratorError::SandboxNotFound(id))?;
+            if metadata.state != SandboxState::Running {
+                return Err(OrchestratorError::InvalidSandboxState {
+                    sandbox_id: id,
+                    state: metadata.state,
+                });
+            }
+            if limit > MAX_SANDBOX_LOG_LIMIT {
+                return Err(OrchestratorError::InternalError(format!(
+                    "sandbox log limit cannot exceed {MAX_SANDBOX_LOG_LIMIT}"
+                )));
+            }
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let (start, end) = log_query_window(cursor, backward);
+            let start = start.max(metadata.created_at.into());
+            let handle = self
+                .sandboxes
+                .read()
+                .await
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| {
+                    OrchestratorError::InternalError(
+                        "sandbox runtime is transitioning; retry log query".into(),
+                    )
+                })?;
+            let future = {
+                let sandbox = handle.lock().await;
+                let current = self
+                    .store
+                    .get(&id)
+                    .await?
+                    .ok_or(OrchestratorError::SandboxNotFound(id))?;
+                if current.state != SandboxState::Running {
+                    return Err(OrchestratorError::InvalidSandboxState {
+                        sandbox_id: id,
+                        state: current.state,
+                    });
+                }
+                sandbox
+                    .logs_query(start, end, limit, backward, level, search)
+                    .ok_or_else(|| {
+                        OrchestratorError::InternalError(
+                            "sandbox backend does not support logs".into(),
+                        )
+                    })?
+            };
+            future.await.map_err(Into::into)
+        };
+
+        tokio::time::timeout(SANDBOX_LOG_QUERY_TIMEOUT, operation)
+            .await
+            .map_err(|_| OrchestratorError::InternalError("sandbox log query timed out".into()))?
     }
 }
 

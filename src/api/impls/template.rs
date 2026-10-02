@@ -18,13 +18,13 @@ use super::template_helpers::{
 };
 use super::ApiImpl;
 use crate::image::ResolvedBlockImage;
+use crate::logging::LogLevel;
 use crate::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
     TemplateBuildErrorReason, TemplateBuildStatus,
 };
 use crate::template::{
-    logs::{BuildLogEntry, BuildLogLevel},
-    TemplateBuildError, TemplateBuildFailure, TemplatePipelineError,
+    logs::BuildLogEntry, TemplateBuildError, TemplateBuildFailure, TemplatePipelineError,
 };
 use crate::types::ImageConfigs;
 
@@ -283,29 +283,13 @@ async fn mark_v2_build_error(
     }
 }
 
-impl From<models::LogLevel> for BuildLogLevel {
-    fn from(level: models::LogLevel) -> Self {
-        match level {
-            models::LogLevel::Debug => Self::Debug,
-            models::LogLevel::Info => Self::Info,
-            models::LogLevel::Warn => Self::Warn,
-            models::LogLevel::Error => Self::Error,
-        }
-    }
-}
-
 impl From<BuildLogEntry> for models::BuildLogEntry {
     fn from(entry: BuildLogEntry) -> Self {
         Self {
             timestamp: entry.timestamp,
             message: entry.message,
             step: entry.step,
-            level: match entry.level {
-                BuildLogLevel::Debug => models::LogLevel::Debug,
-                BuildLogLevel::Info => models::LogLevel::Info,
-                BuildLogLevel::Warn => models::LogLevel::Warn,
-                BuildLogLevel::Error => models::LogLevel::Error,
-            },
+            level: entry.level.into(),
         }
     }
 }
@@ -340,7 +324,7 @@ impl ApiImpl {
         cursor: Option<i64>,
         limit: usize,
         backward: bool,
-        level: Option<BuildLogLevel>,
+        level: Option<LogLevel>,
         source: Option<models::LogsSource>,
     ) -> Result<Vec<models::BuildLogEntry>, models::Error> {
         if limit > 100 {
@@ -406,9 +390,7 @@ impl ApiImpl {
         };
         Ok(entries
             .into_iter()
-            .filter(|entry| {
-                entry.step.as_deref() == Some(step) && entry.level >= BuildLogLevel::Warn
-            })
+            .filter(|entry| entry.step.as_deref() == Some(step) && entry.level >= LogLevel::Warn)
             .take(100)
             .map(Into::into)
             .collect())

@@ -464,6 +464,9 @@ func TestIsSandboxControlPlaneRequest(t *testing.T) {
 	}{
 		{name: "sandbox detail", method: http.MethodGet, path: "/sandboxes/sbx-123", want: true},
 		{name: "sandbox delete", method: http.MethodDelete, path: "/sandboxes/sbx-123", want: true},
+		{name: "v2 sandbox logs", method: http.MethodGet, path: "/v2/sandboxes/sbx-123/logs", want: true},
+		{name: "v2 logs wrong method", method: http.MethodPost, path: "/v2/sandboxes/sbx-123/logs", want: false},
+		{name: "v2 logs missing ID", method: http.MethodGet, path: "/v2/sandboxes//logs", want: false},
 		{name: "v2 sandbox connect", method: http.MethodPost, path: "/v2/sandboxes/sbx-123/connect", want: true},
 		{name: "v2 connect wrong method", method: http.MethodGet, path: "/v2/sandboxes/sbx-123/connect", want: false},
 		{name: "v2 connect missing ID", method: http.MethodPost, path: "/v2/sandboxes//connect", want: false},

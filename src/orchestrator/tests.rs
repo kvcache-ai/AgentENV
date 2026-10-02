@@ -5806,3 +5806,116 @@ async fn sandbox_metrics_failure_is_not_zero_and_paused_guests_are_not_polled() 
     assert_eq!(metadata.state, SandboxState::Paused);
     assert_eq!(metadata.expires_at, expiration);
 }
+
+#[tokio::test]
+async fn sandbox_logs_query_live_guest_and_reject_paused_sandbox() -> Result<()> {
+    use crate::logging::LogLevel;
+    use crate::sandbox::SandboxLogEntry;
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone())).await;
+    let metadata = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let entry = SandboxLogEntry {
+        timestamp: chrono::Utc::now(),
+        level: LogLevel::Warn,
+        message: "guest message".into(),
+        fields: Default::default(),
+    };
+    behavior.set_logs_reader(Arc::new({
+        let entry = entry.clone();
+        move |_, _, _, _, _, _| {
+            let entry = entry.clone();
+            Box::pin(async move { Ok(vec![entry]) })
+        }
+    }));
+    assert_eq!(
+        orchestrator
+            .sandbox_logs(metadata.id, None, 1000, false, None, None)
+            .await?,
+        vec![entry]
+    );
+    let error = orchestrator
+        .sandbox_logs(metadata.id, None, 1001, false, None, None)
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("sandbox log limit cannot exceed 1000"));
+
+    orchestrator.pause_sandbox(metadata.id).await?;
+    behavior.set_logs_reader(Arc::new(|_, _, _, _, _, _| {
+        panic!("paused query must not contact guest")
+    }));
+    let error = orchestrator
+        .sandbox_logs(metadata.id, None, 1000, false, None, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        OrchestratorError::InvalidSandboxState {
+            state: SandboxState::Paused,
+            ..
+        }
+    ));
+    orchestrator.delete_sandbox(metadata.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock() -> Result<()> {
+    use crate::logging::LogLevel;
+    use crate::sandbox::SandboxLogEntry;
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let id = SandboxId::new();
+    let behavior = Arc::new(MockBehavior::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    behavior.set_logs_reader(Arc::new({
+        let entered = entered.clone();
+        let release = release.clone();
+        move |start, _, _, _, _, _| {
+            let entered = entered.clone();
+            let release = release.clone();
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+                let inherited = SandboxLogEntry {
+                    timestamp: chrono::Utc::now() - chrono::Duration::hours(1),
+                    level: LogLevel::Info,
+                    message: "parent sandbox".into(),
+                    fields: Default::default(),
+                };
+                Ok((inherited.timestamp >= start)
+                    .then_some(inherited)
+                    .into_iter()
+                    .collect())
+            })
+        }
+    }));
+    add_metrics_runtime(&orchestrator, id, behavior).await;
+    let task = tokio::spawn({
+        let orchestrator = orchestrator.clone();
+        async move {
+            orchestrator
+                .sandbox_logs(id, None, 1000, true, None, None)
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    assert!(
+        orchestrator.sandboxes.try_write().is_ok(),
+        "network I/O must release the runtime map lock"
+    );
+    let handle = orchestrator.sandboxes.read().await[&id].clone();
+    assert!(
+        handle.try_lock().is_ok(),
+        "network I/O must release the backend lock"
+    );
+    release.notify_one();
+    assert!(task.await.unwrap()?.is_empty());
+    Ok(())
+}

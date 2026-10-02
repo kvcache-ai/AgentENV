@@ -1,6 +1,8 @@
 use std::env;
 use std::sync::Once;
 
+use serde::{Deserialize, Serialize};
+
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -11,6 +13,15 @@ const LOG_FORMAT_ENV: &str = "AENV_LOG_FORMAT";
 const LOG_SPAN_EVENTS_ENV: &str = "AENV_LOG_SPAN_EVENTS";
 
 static INIT_LOGGING: Once = Once::new();
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LogFormat {
