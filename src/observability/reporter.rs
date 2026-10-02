@@ -142,8 +142,12 @@ impl ObservabilityReporter {
                         backoff = cmp::min(backoff.saturating_mul(2), MAX_REPORT_BACKOFF);
                     }
                     Err(err) => {
+                        // `{:#}` walks the context chain. Plain `Display` prints only the
+                        // outermost context, which names the step that failed but never
+                        // why: a failed RPC reads the same whether it was refused, timed
+                        // out, or never reached a connection at all.
                         warn!(
-                            error = %err,
+                            error = %format_args!("{err:#}"),
                             retry_after_secs = backoff.as_secs(),
                             "observability heartbeat failed"
                         );
@@ -173,7 +177,10 @@ impl ObservabilityReporter {
                             &event_scheduler_channel,
                             events,
                         ).await {
-                            warn!(error = %err, "observability sandbox event batch report failed");
+                            warn!(
+                                error = %format_args!("{err:#}"),
+                                "observability sandbox event batch report failed"
+                            );
                         }
                     }
                 }
@@ -232,7 +239,7 @@ impl ObservabilityReporter {
                         node_id = %self.service.node_id(),
                         service_instance_id = %self.service.service_instance_id(),
                         attempt,
-                        error = %err,
+                        error = %format_args!("{err:#}"),
                         "failed to unregister node from scheduler during shutdown"
                     );
                     sleep(Duration::from_millis(200 * attempt)).await;
