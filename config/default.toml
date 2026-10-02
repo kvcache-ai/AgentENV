@@ -64,6 +64,12 @@ socket_poll_ms = 1
 # Port used by envd inside each guest.
 control_plane_port = 49983
 
+[compose]
+# Build compose-image/Dockerfile and configure the published OCI reference.
+# Unset disables POST /sandboxes-compose. Runtime currently supports linux/amd64.
+# base_image = "registry.example.com/agentenv/compose-runtime:1"
+# planner_binary = "/usr/local/bin/aenv-compose-plan"
+
 [image.resolver]
 # Rootfs image used when a template build omits fromImage.
 default_image = "ubuntu:24.04"

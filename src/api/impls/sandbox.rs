@@ -500,7 +500,9 @@ fn duration_from_secs(secs: Option<u32>) -> Option<Duration> {
     secs.map(|s| Duration::from_secs(s as u64))
 }
 
-fn cold_start_resources(body: &models::NewColdSandbox) -> Result<SandboxResources, models::Error> {
+pub(super) fn cold_start_resources(
+    body: &models::NewColdSandbox,
+) -> Result<SandboxResources, models::Error> {
     let config = ConfigManager::global_config();
     let default_cpu = config.machine.vcpu_count;
     let default_mem = config.machine.mem_size_mib;
@@ -662,6 +664,25 @@ fn validate_domain_allowlist(policy: &SandboxNetworkPolicy) -> anyhow::Result<()
 #[async_trait]
 impl Sandboxes<()> for ApiImpl {
     type Claims = super::Claims;
+
+    async fn sandboxes_compose_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        body: &models::NewComposeSandbox,
+    ) -> Result<SandboxesComposePostResponse, ()> {
+        use SandboxesComposePostResponse::*;
+        Ok(match self.create_compose(body).await {
+            Ok(metadata) => Status201_TheSandboxWasCreatedSuccessfully {
+                x_agentenv_sandbox_id: Some(metadata.id.to_string()),
+                body: self.sandbox_model(metadata),
+            },
+            Err(err) if err.code == 400 => Status400_BadRequest(err),
+            Err(err) => Status500_ServerError(err),
+        })
+    }
 
     async fn sandboxes_cold_post(
         &self,

@@ -38,6 +38,7 @@
   - [Sandbox Access-Token Seed](./concepts/authentication/access-token-seed.md)
 - [Sandboxes](./concepts/sandboxes/index.md)
   - [Starting a Sandbox](./concepts/sandboxes/starting.md)
+  - [Compose Sandboxes](./concepts/sandboxes/compose.md)
   - [Working with Sandboxes](./concepts/sandboxes/working.md)
   - [Auto-Eviction](./concepts/sandboxes/auto-eviction.md)
   - [Networking](./concepts/sandboxes/networking.md)

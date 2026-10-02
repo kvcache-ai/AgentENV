@@ -4,6 +4,8 @@ use clap::Args as ClapArgs;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use super::parse_disk_size_mb;
+
 const ENVD_READY_TIMEOUT: Duration = Duration::from_secs(30);
 const ENVD_READY_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const ENVD_READY_PROBE_INTERVAL: Duration = Duration::from_millis(100);
@@ -37,16 +39,6 @@ pub struct Args {
     /// Mount a persistent volume using MOUNT_PATH=VOLUME_ID_OR_NAME (repeatable)
     #[arg(long = "volume", value_name = "MOUNT_PATH=VOLUME", action = clap::ArgAction::Append)]
     volumes: Vec<String>,
-}
-
-fn parse_disk_size_mb(value: &str) -> std::result::Result<u32, String> {
-    let size = value
-        .parse::<u32>()
-        .map_err(|_| "disk size must be a positive integer in MiB".to_string())?;
-    if size == 0 || !size.is_multiple_of(1024) {
-        return Err("disk size must be greater than 0 and divisible by 1024 MiB".to_string());
-    }
-    Ok(size)
 }
 
 pub fn run(args: Args) -> Result<()> {

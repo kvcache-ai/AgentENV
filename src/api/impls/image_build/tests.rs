@@ -89,6 +89,52 @@ async fn cache_volume(api: &ApiImpl, name: &str, mode: VolumeMode, owner: &str) 
 }
 
 #[tokio::test]
+async fn image_only_cleanup_removes_drafts_on_success_failure_and_restart() -> Result<()> {
+    for outcome in ["success", "failure", "restart"] {
+        let (_root, api, existing) = test_api(VolumeLimits::default()).await?;
+        let record =
+            SnapshotRecord::template_waiting(SnapshotId::generate(), None, existing.resources);
+        api.snapshot_manager.create(record.clone()).await?;
+        let id = record.id.to_string();
+        let entry = BuildJournal {
+            cache: cache_volume(&api, "image-only-work", VolumeMode::Exclusive, &id).await?,
+            parent: None,
+            image_only: true,
+        };
+        entry.persist(api.build_journal().await?, &id).await?;
+        if outcome != "restart" {
+            let session = BuildSession::new();
+            session.state.send_replace(SessionState::Finished(
+                (outcome == "failure").then(|| TemplateBuildErrorReason::new("push failed")),
+            ));
+            api.build_sessions
+                .active
+                .lock()
+                .unwrap()
+                .insert(id.clone(), session);
+        }
+        api.recover_image_builds().await?;
+        api.recover_image_builds().await?;
+        assert!(api.snapshot_manager.get(&id).await?.is_none());
+        assert!(api
+            .snapshot_manager
+            .get(existing.id.to_string())
+            .await?
+            .is_some());
+        assert!(api
+            .build_journal()
+            .await?
+            .get(format!("build/{id}"))
+            .await?
+            .is_none());
+        assert!(!api.build_sessions.contains(&id));
+    }
+    let legacy: BuildJournal = serde_json::from_str(r#"{"cache":"old-cache","parent":null}"#)?;
+    assert!(!legacy.image_only);
+    Ok(())
+}
+
+#[tokio::test]
 async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() -> Result<()> {
     for (cancel_retry, succeeded) in [(false, true), (true, true), (false, false), (true, false)] {
         let (root, api, mut record) = test_api(VolumeLimits::default()).await?;
@@ -102,6 +148,7 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
         let entry = BuildJournal {
             cache: cache_volume(&api, "work", VolumeMode::Exclusive, &id).await?,
             parent: Some(cache_volume(&api, "parent", VolumeMode::ReadOnly, &id).await?),
+            image_only: false,
         };
         entry.persist(api.build_journal().await?, &id).await?;
         let session = BuildSession::new();
@@ -223,6 +270,7 @@ async fn buildkit_recovery_isolates_bad_entries_and_skips_active_builds() -> Res
     let entry = BuildJournal {
         cache: "missing-cache".into(),
         parent: None,
+        image_only: false,
     };
     let live_id = SnapshotId::generate().to_string();
     let live = BuildSession::new();
@@ -278,6 +326,7 @@ async fn buildkit_worker_panic_releases_journal_and_scheduler_binding() -> Resul
     let entry = BuildJournal {
         cache: cache_volume(&api, "work", VolumeMode::Exclusive, &id).await?,
         parent: None,
+        image_only: false,
     };
     entry.persist(api.build_journal().await?, &id).await?;
     let session = BuildSession::new();

@@ -1,6 +1,7 @@
 pub mod api;
 pub mod api_key;
 pub mod cfg;
+pub mod compose;
 mod digest;
 pub mod identity;
 pub mod image;

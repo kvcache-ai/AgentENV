@@ -1,6 +1,7 @@
 mod admin;
 mod attached_drives;
 pub(crate) mod auth;
+mod compose;
 pub(crate) mod image_build;
 mod pagination;
 mod sandbox;

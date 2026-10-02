@@ -93,12 +93,14 @@ build-aenv-release:
 	$(CARGO) build --release -p aenv
 
 install-aenv: build-aenv-release
+	CGO_ENABLED=0 go -C services build -trimpath -o "$(abspath $(or $(CARGO_TARGET_DIR),target))/aenv-compose-plan" ./compose/cmd
 	$(AENV_INSTALL_SUDO) install -d "$(AENV_INSTALL_DIR)"
+	$(AENV_INSTALL_SUDO) install -m 0755 "$${CARGO_TARGET_DIR:-$$(pwd)/target}/aenv-compose-plan" "$(AENV_INSTALL_DIR)/aenv-compose-plan"
 	$(AENV_INSTALL_SUDO) install -m 0755 "$${CARGO_TARGET_DIR:-$$(pwd)/target}/release/aenv" "$(AENV_INSTALL_DIR)/aenv"
 	@echo "Installed aenv to $(AENV_INSTALL_DIR)/aenv"
 
 uninstall-aenv:
-	$(AENV_INSTALL_SUDO) rm -f "$(AENV_INSTALL_DIR)/aenv"
+	$(AENV_INSTALL_SUDO) rm -f "$(AENV_INSTALL_DIR)/aenv" "$(AENV_INSTALL_DIR)/aenv-compose-plan"
 	@echo "Removed $(AENV_INSTALL_DIR)/aenv"
 
 fmt:
@@ -118,6 +120,7 @@ coverage:
 test: test-agent test-envd test-ublk
 
 test-unit:
+	$(CARGO) test -p aenv-compose-runtime --features runtime
 	$(CARGO) test -p agentenv -p envd -p linux-cap --lib
 	$(CARGO) test -p aenv --bin aenv
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --lib -- --ignored

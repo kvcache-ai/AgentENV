@@ -30,6 +30,23 @@ pub enum SandboxesColdPostResponse {
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+pub enum SandboxesComposePostResponse {
+    /// The sandbox was created successfully
+    Status201_TheSandboxWasCreatedSuccessfully {
+        body: models::Sandbox,
+        x_agentenv_sandbox_id: Option<String>,
+    },
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum SandboxesGetResponse {
     /// Successfully returned all running sandboxes
     Status200_SuccessfullyReturnedAllRunningSandboxes(Vec<models::ListedSandbox>),
@@ -363,6 +380,17 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         claims: &Self::Claims,
         body: &models::NewColdSandbox,
     ) -> Result<SandboxesColdPostResponse, E>;
+
+    /// SandboxesComposePost - POST /sandboxes-compose
+    async fn sandboxes_compose_post(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        body: &models::NewComposeSandbox,
+    ) -> Result<SandboxesComposePostResponse, E>;
 
     /// List running sandboxes.
     ///

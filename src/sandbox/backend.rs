@@ -22,6 +22,14 @@ use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::RunnableSnapshot;
 use crate::types::SandboxId;
 
+pub(crate) fn check_startup_deadline(deadline: Option<tokio::time::Instant>) -> Result<()> {
+    anyhow::ensure!(
+        deadline.is_none_or(|deadline| tokio::time::Instant::now() < deadline),
+        "Compose startup deadline exceeded"
+    );
+    Ok(())
+}
+
 /// A concrete sandbox backend's paused state.
 ///
 /// The Orchestrator treats this value as completely opaque: it stores it in
@@ -204,11 +212,28 @@ pub trait SandboxBackend: Send + 'static {
     /// Start the sandbox without waiting for the sandbox to become ready.
     async fn start_nowait(&mut self) -> Result<()>;
 
+    /// Finish resource acquisitions before observing the deadline. Callers must
+    /// await this operation and then stop the backend on failure, never drop it
+    /// inside a timeout while resources are still owned by an in-flight future.
+    async fn start_nowait_with_deadline(&mut self, deadline: tokio::time::Instant) -> Result<()> {
+        check_startup_deadline(Some(deadline))?;
+        self.start_nowait().await?;
+        check_startup_deadline(Some(deadline))
+    }
+
     /// Block until the sandbox signals readiness.
     ///
     /// Should be called after [`start_nowait`][Self::start_nowait] before any
     /// workload is submitted.
     async fn wait_for_ready(&self) -> Result<()>;
+
+    /// Initialize a fresh Compose workload before publishing Running.
+    async fn initialize_compose(
+        &mut self,
+        _bootstrap: &crate::compose::ComposeBootstrap,
+    ) -> Result<()> {
+        anyhow::bail!("this backend does not support Compose sandboxes")
+    }
 
     /// Pause the sandbox and capture its state for later resume.
     ///

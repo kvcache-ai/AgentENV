@@ -200,13 +200,16 @@ sudo mkdir -p "$INSTALL_DIR"
 echo "Downloading aenv CLI and buildctl ..."
 download_release_asset "aenv-linux-${ARCH_TAG}.tar.gz" "$tmp_cli"
 mkdir -p "$tmp_dir/cli"
-tar -xzf "$tmp_cli" -C "$tmp_dir/cli" aenv aenv-buildctl manifest.json
+tar -xzf "$tmp_cli" -C "$tmp_dir/cli" aenv aenv-buildctl aenv-compose-plan manifest.json
 test -s "$tmp_dir/cli/aenv"
 test -s "$tmp_dir/cli/aenv-buildctl"
+test -s "$tmp_dir/cli/aenv-compose-plan"
 stage_dir="$(sudo mktemp -d "${INSTALL_DIR}/.aenv-install.XXXXXX")"
 sudo install -m 0755 "$tmp_dir/cli/aenv-buildctl" "$stage_dir/buildctl"
+sudo install -m 0755 "$tmp_dir/cli/aenv-compose-plan" "$stage_dir/planner"
 sudo install -m 0755 "$tmp_dir/cli/aenv" "$stage_dir/aenv"
 sudo mv "$stage_dir/buildctl" "${INSTALL_DIR}/aenv-buildctl"
+sudo mv "$stage_dir/planner" "${INSTALL_DIR}/aenv-compose-plan"
 sudo mv "$stage_dir/aenv" "${INSTALL_DIR}/aenv"
 
 # ---------------------------------------------------------------------------
@@ -224,6 +227,9 @@ tar -xzf "$tmp_tarball" -C "$tmp_dir"
 
 sudo mkdir -p "$(dirname "$UBLK_DAEMON_PATH")"
 sudo install -m 0755 "$tmp_dir/server" "${INSTALL_DIR}/server"
+if [[ -f "$tmp_dir/aenv-compose-plan" ]]; then
+    sudo install -m 0755 "$tmp_dir/aenv-compose-plan" "${INSTALL_DIR}/aenv-compose-plan"
+fi
 sudo install -m 0755 "$tmp_dir/ublk/uvm-ublk-daemon" "$UBLK_DAEMON_PATH"
 
 if [[ -d "$tmp_dir/deps" ]]; then

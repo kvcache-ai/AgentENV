@@ -15,6 +15,8 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_API_KEY` | generated under `$AENV_HOME/secrets/api-key` | Optional API-key override. Runtime nodes also check `/run/secrets/api-key` before creating a managed key. Use one shared value or secret in multi-node deployments. |
 | `API_ADDR` | `0.0.0.0:8000` | Address and port the API server listens on |
 | `AENV_CONFIG_PATH` | `config/default.toml` | Path to the TOML configuration file |
+| `AENV_COMPOSE_BASE_IMAGE` | unset | OCI reference built from `compose-image/Dockerfile`; enables Compose sandbox creation. |
+| `AENV_COMPOSE_PLANNER_BINARY` | `aenv-compose-plan` | Compose planner executable on PATH or an absolute path. |
 | `AENV_LOG_FORMAT` | `compact` | Server log output format: `compact`, `pretty`, or `json` |
 | `AENV_LOG_SPAN_EVENTS` | `off` | Tracing span lifecycle events to emit: `off`, `new`, `enter`, `exit`, `close`, `active`, or `full` |
 | `AENV_NODE_ID` | hostname-derived | Override the runtime node identifier used in observability/admin snapshots |

@@ -41,6 +41,25 @@ pub(crate) async fn bind_local() -> Result<(tempfile::TempDir, BuildkitListener,
 }
 
 impl Client {
+    /// The export is confirmed by buildctl. Poll the build-affine status route
+    /// until server cleanup removes the draft. A generic template DELETE can
+    /// route to another node and must not race the active builder's cleanup.
+    pub(crate) async fn finish_image_export(&self, template_id: &str) -> Result<bool> {
+        let response = self
+            .async_agent
+            .get(self.url(&format!(
+                "/templates/{template_id}/builds/{template_id}/status"
+            )))
+            .header("X-API-Key", &self.api_key)
+            .send()
+            .await?;
+        match response.status().as_u16() {
+            404 => Ok(true),
+            200 => Ok(false),
+            status => Err(super::format_status_error(status, &response.text().await?)),
+        }
+    }
+
     pub(crate) async fn build_request(
         &self,
         method: reqwest::Method,
@@ -159,6 +178,41 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncReadExt;
     use tokio::net::{TcpListener, UnixStream};
+
+    #[tokio::test]
+    async fn image_export_cleanup_uses_the_build_affine_read_route() -> Result<()> {
+        use tokio::io::AsyncBufReadExt;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let client = Client::new(&format!("http://{}", listener.local_addr()?), "test-key")?;
+        let server = tokio::spawn(async move {
+            for status in [200, 404, 500] {
+                let (stream, _) = listener.accept().await?;
+                let mut stream = tokio::io::BufReader::new(stream);
+                let mut headers = String::new();
+                loop {
+                    let mut line = String::new();
+                    anyhow::ensure!(stream.read_line(&mut line).await? != 0, "unexpected EOF");
+                    if line == "\r\n" {
+                        break;
+                    }
+                    headers.push_str(&line);
+                }
+                assert!(headers
+                    .starts_with("GET /templates/build-id/builds/build-id/status HTTP/1.1\r\n"));
+                assert!(headers
+                    .to_ascii_lowercase()
+                    .contains("x-api-key: test-key\r\n"));
+                stream.get_mut().write_all(format!("HTTP/1.1 {status} Response\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes()).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        assert!(!client.finish_image_export("build-id").await?);
+        assert!(client.finish_image_export("build-id").await?);
+        assert!(client.finish_image_export("build-id").await.is_err());
+        server.await??;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn local_read_shutdown_does_not_fail_bridge() -> Result<()> {

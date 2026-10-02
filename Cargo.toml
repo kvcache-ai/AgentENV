@@ -9,6 +9,7 @@ members = [
     ".",
     "adev",
     "crates/aenv",
+    "crates/compose-runtime",
     "crates/benchmarks",
     "crates/e2e-tests",
     "crates/linux-cap",
@@ -41,6 +42,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dependencies]
+aenv-compose-runtime = { path = "crates/compose-runtime" }
 firecracker_client = { version = "1.15.1", path = "thirdparty/firecracker-client" }
 envd = { version = "0.1.0", path = "thirdparty/envd" }
 custom_extension_client = { version = "0.1.0", path = "src/custom_extension_api/generated" }

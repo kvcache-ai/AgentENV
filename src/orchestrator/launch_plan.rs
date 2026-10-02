@@ -14,6 +14,7 @@ pub(super) struct CreateLaunchPlan {
     pub launch_config: SandboxLaunchConfig,
     pub metadata: SandboxMetadata,
     pub timeout: NewTimeout,
+    pub compose: Option<crate::compose::ComposeBootstrap>,
 }
 
 pub(super) enum CreateLaunchSource {
@@ -39,6 +40,23 @@ pub(super) enum LaunchPlan {
 }
 
 impl LaunchPlan {
+    pub(super) fn with_compose(
+        mut self,
+        compose: Option<crate::compose::ComposeBootstrap>,
+    ) -> Self {
+        if let Self::Create(plan) = &mut self {
+            plan.compose = compose;
+        }
+        self
+    }
+
+    pub(super) fn compose(&self) -> Option<&crate::compose::ComposeBootstrap> {
+        match self {
+            Self::Create(plan) => plan.compose.as_ref(),
+            Self::Resume(_) => None,
+        }
+    }
+
     pub(super) fn for_create_from_snapshot(
         sandbox_id: SandboxId,
         snapshot: Box<RunnableSnapshot>,
@@ -49,6 +67,7 @@ impl LaunchPlan {
         Self::Create(Box::new(CreateLaunchPlan {
             sandbox_id,
             source: CreateLaunchSource::Snapshot { snapshot },
+            compose: None,
             launch_config,
             metadata,
             timeout,
@@ -67,6 +86,7 @@ impl LaunchPlan {
             source: CreateLaunchSource::Fresh {
                 build_spec: Box::new(build_spec),
             },
+            compose: None,
             launch_config,
             metadata,
             timeout,

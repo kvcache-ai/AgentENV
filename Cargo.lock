@@ -72,6 +72,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "aenv-compose-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "aes"
 version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -100,6 +112,7 @@ dependencies = [
 name = "agentenv"
 version = "0.2.3"
 dependencies = [
+ "aenv-compose-runtime",
  "agentenv-observability",
  "agentenv_http_server",
  "anyhow",

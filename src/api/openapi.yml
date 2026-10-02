@@ -768,6 +768,46 @@ components:
           type: string
           description: Additional kernel command-line arguments appended to the Firecracker boot args for this cold-start sandbox. Arguments are whitespace-separated and may contain only 0-9, a-z, A-Z, underscore, hyphen, dot, slash, plus, or equals sign, so base64 values are allowed. The server also applies the firecracker.allowed_extra_boot_args_prefixes allowlist; non-matching or invalid arguments are silently ignored.
 
+    NewComposeSandbox:
+      type: object
+      required: [compose]
+      properties:
+        compose:
+          type: string
+          minLength: 1
+          maxLength: 1048576
+          description: Image-only Compose YAML or JSON. One writable rootfs per selected service; no host files, builds, replicas, or privileged services.
+        composeEnv:
+          $ref: "#/components/schemas/EnvVars"
+        profiles:
+          type: array
+          items:
+            type: string
+        startupTimeout:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 300
+          default: 300
+          description: Total startup budget in seconds, including image resolution and health checks. Cleanup may extend response time.
+        timeout:
+          type: integer
+          format: int32
+          minimum: 0
+          default: 300
+          description: Sandbox lifetime in seconds, starting after Compose is ready.
+        autoPause:
+          type: boolean
+          default: true
+        cpuCount:
+          $ref: "#/components/schemas/CPUCount"
+        memoryMB:
+          $ref: "#/components/schemas/MemoryMB"
+        diskSizeMB:
+          $ref: "#/components/schemas/DiskSizeMB"
+        metadata:
+          $ref: "#/components/schemas/SandboxMetadata"
+
     ConnectSandbox:
       type: object
       required:
@@ -1085,6 +1125,9 @@ components:
     TemplateBuilderRequest:
       type: object
       properties:
+        imageOnly:
+          type: boolean
+          description: Build and export OCI images without creating a runnable template. The client must add a registry image exporter. The temporary template record is removed after builder cleanup. Defaults to false.
         startCmd:
           type: string
           description: Override the final image ENTRYPOINT/CMD for template startup. Omit to use the image command; an empty string disables startup.
@@ -1105,6 +1148,9 @@ components:
         imageName:
           type: string
           description: Required BuildKit image exporter name for this build. The server observes its successful completion and automatically imports and publishes the template.
+        imageOnly:
+          type: boolean
+          description: Whether this builder skips template publication. Clients requesting imageOnly must verify this is true before building.
 
     TemplateBuildStartV2:
       type: object
@@ -1673,6 +1719,44 @@ paths:
           $ref: "#/components/responses/400"
         "409":
           $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandboxes-compose:
+    post:
+      description: >
+        Create one sandbox running a Compose project. Returns only after all selected
+        services are running or healthy according to Compose --wait. Requires a
+        configured compose base image and planner. Use an HTTP timeout over 300 seconds.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewComposeSandbox"
+      responses:
+        "201":
+          description: The sandbox was created successfully
+          headers:
+            x-agentenv-sandbox-id:
+              description: Identifier of the created sandbox for proxy routing.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
         "500":
           $ref: "#/components/responses/500"
 

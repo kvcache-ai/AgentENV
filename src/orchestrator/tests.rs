@@ -1203,6 +1203,154 @@ fn write_local_commit_image_config(path: &Path, file: &Path, digest: &str, size:
     .expect("write image config");
 }
 
+fn compose_create_request() -> CreateSandboxRequest {
+    let mut request = create_request(Some(60), &[]);
+    request.source = SandboxLaunchSource::Image {
+        image_ref: "compose-runtime:test".to_string(),
+        overlaybd_config_path: PathBuf::from("/tmp/compose-runtime.json"),
+        context: Default::default(),
+        resources: None,
+        extra_drives: Vec::new(),
+        extra_boot_args: None,
+        image_configs: Box::new(ImageConfigs::new()),
+    };
+    request
+}
+
+fn compose_bootstrap(budget: Duration) -> crate::compose::ComposeBootstrap {
+    crate::compose::ComposeBootstrap {
+        plan: crate::compose::ComposePlan {
+            compose: json!({}),
+            services: Vec::new(),
+        },
+        deadline: tokio::time::Instant::now() + budget,
+    }
+}
+
+#[tokio::test]
+async fn compose_failure_and_deadline_roll_back_runtime_and_metadata() -> Result<()> {
+    setup();
+    for (operation, action) in [
+        (
+            MockOperation::InitializeCompose,
+            MockAction::Fail {
+                message: "unhealthy Compose service".into(),
+            },
+        ),
+        (
+            MockOperation::InitializeCompose,
+            MockAction::SucceedAfter(Duration::from_secs(60)),
+        ),
+        (
+            MockOperation::StartNowait,
+            MockAction::SucceedAfter(Duration::from_millis(200)),
+        ),
+    ] {
+        let behavior = Arc::new(MockBehavior::new());
+        behavior.push_action(operation, action);
+        let orchestrator =
+            make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone()))
+                .await;
+        let result = orchestrator
+            .create_compose_sandbox(
+                compose_create_request(),
+                compose_bootstrap(Duration::from_millis(100)),
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(orchestrator.list_sandboxes().await?.is_empty());
+        assert!(orchestrator.sandboxes.read().await.is_empty());
+        assert_eq!(behavior.stop_calls(), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn compose_deadline_does_not_drop_startup_before_it_can_finish() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::StartNowait,
+        MockAction::FailAfter {
+            delay: Duration::from_millis(200),
+            message: "startup finished its resource acquisition".into(),
+        },
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone())).await;
+    let error = orchestrator
+        .create_compose_sandbox(
+            compose_create_request(),
+            compose_bootstrap(Duration::from_millis(100)),
+        )
+        .await
+        .unwrap_err();
+    // A timeout around start_nowait would drop the operation before it returns
+    // this error, bypassing resource ownership transfer and local rollback.
+    assert!(
+        format!("{error:#}").contains("startup finished its resource acquisition"),
+        "{error:#}"
+    );
+    assert_eq!(behavior.stop_calls(), 1);
+    assert!(orchestrator.list_sandboxes().await?.is_empty());
+    assert!(orchestrator.sandboxes.read().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn compose_readiness_gates_publication_and_is_not_repeated_on_resume() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::InitializeCompose,
+        MockAction::SucceedAfter(Duration::from_millis(100)),
+    );
+    behavior.push_action(
+        MockOperation::InitializeCompose,
+        MockAction::Fail {
+            message: "must not run on resume".into(),
+        },
+    );
+    let started = Arc::new(tokio::sync::Notify::new());
+    let notify = started.clone();
+    behavior.set_on_operation(
+        MockOperation::InitializeCompose,
+        Arc::new(move || notify.notify_one()),
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let creator = orchestrator.clone();
+    let create = tokio::spawn(async move {
+        creator
+            .create_compose_sandbox(
+                compose_create_request(),
+                compose_bootstrap(Duration::from_secs(5)),
+            )
+            .await
+    });
+    started.notified().await;
+    let id = *orchestrator
+        .sandboxes
+        .read()
+        .await
+        .keys()
+        .next()
+        .expect("creating runtime exists");
+    assert_eq!(
+        orchestrator.store.get(&id).await?.unwrap().state,
+        SandboxState::Creating
+    );
+    let created = create.await.expect("Compose create task panicked")?;
+    assert_eq!(created.state, SandboxState::Running);
+    assert_proxy_ready(&orchestrator, &id).await?;
+    orchestrator.pause_sandbox(id).await?;
+    orchestrator
+        .resume_sandbox(id, NewTimeout::UseExisting)
+        .await?;
+    assert_proxy_ready(&orchestrator, &id).await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
     setup();

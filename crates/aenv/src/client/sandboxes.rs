@@ -60,6 +60,24 @@ pub struct Sandbox {
 }
 
 #[derive(Debug, Serialize)]
+pub struct NewComposeSandbox<'a> {
+    pub compose: &'a str,
+    #[serde(skip_serializing_if = "HashMap::is_empty", rename = "composeEnv")]
+    pub compose_env: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub profiles: Vec<String>,
+    pub timeout: u32,
+    #[serde(rename = "startupTimeout")]
+    pub startup_timeout: u32,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "cpuCount")]
+    pub cpu_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "memoryMB")]
+    pub memory_mb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "diskSizeMB")]
+    pub disk_size_mb: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct RefreshSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration: Option<u32>,
@@ -141,6 +159,18 @@ impl Client {
         Ok(resp.into_json()?)
     }
 
+    pub fn create_compose_sandbox(&self, body: &NewComposeSandbox<'_>) -> Result<Sandbox> {
+        // Compose startup can take 300 seconds, beyond the client's default
+        // 120-second timeout. Allow additional time for server-side cleanup.
+        let timeout = Duration::from_secs(u64::from(body.startup_timeout) + 60);
+        let resp = handle_status(
+            self.post("/sandboxes-compose")
+                .timeout(timeout)
+                .send_json(body),
+        )?;
+        Ok(resp.into_json()?)
+    }
+
     pub fn delete_sandbox(&self, id: &str) -> Result<()> {
         handle_status(self.delete(&format!("/sandboxes/{}", id)).call())?;
         Ok(())
@@ -203,7 +233,85 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::{NewColdSandbox, NewSandbox, RefreshSandbox};
+    use super::{Client, NewColdSandbox, NewComposeSandbox, NewSandbox, RefreshSandbox};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::time::Duration;
+
+    #[test]
+    fn compose_request_uses_auth_contract_and_overrides_default_timeout() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = Client::new_with_timeouts(
+            &format!("http://{address}"),
+            "test-key",
+            Duration::from_secs(5),
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut reader = BufReader::new(&mut conn);
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                if line == "\r\n" {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::trim)
+                        .map(str::to_owned)
+                })
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            let response = r#"{"sandboxID":"compose-sandbox","envdAccessToken":"guest-token"}"#;
+            write!(conn, "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).unwrap();
+            (headers, body)
+        });
+        let request = NewComposeSandbox {
+            compose: "services: {app: {image: '${IMAGE}'}}",
+            compose_env: [("IMAGE".to_owned(), "busybox:1.37".to_owned())].into(),
+            profiles: vec!["worker".to_owned()],
+            timeout: 600,
+            startup_timeout: 300,
+            cpu_count: Some(2),
+            memory_mb: Some(2048),
+            disk_size_mb: Some(8192),
+        };
+        let sandbox = client.create_compose_sandbox(&request).unwrap();
+        let (headers, body) = server.join().unwrap();
+        assert!(headers.starts_with("POST /sandboxes-compose HTTP/1.1\r\n"));
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("x-api-key: test-key\r\n"));
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "compose": request.compose,
+                "composeEnv": {"IMAGE": "busybox:1.37"},
+                "profiles": ["worker"],
+                "timeout": 600,
+                "startupTimeout": 300,
+                "cpuCount": 2,
+                "memoryMB": 2048,
+                "diskSizeMB": 8192,
+            })
+        );
+        assert_eq!(sandbox.sandbox_id, "compose-sandbox");
+        assert_eq!(sandbox.envd_access_token.as_deref(), Some("guest-token"));
+    }
 
     #[test]
     fn new_sandbox_serializes_template_start() {

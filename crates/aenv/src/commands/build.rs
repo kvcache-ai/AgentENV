@@ -16,35 +16,41 @@ use crate::client::{
 };
 use crate::progress::BuildProgress;
 
+mod compose;
+
 #[derive(Clone, ClapArgs)]
 #[command(after_help = "\
 Examples:
   aenv build --name my-ubuntu .
   aenv build --name my-python ./my-python
   aenv build --name my-app -f ./my-app/Dockerfile.custom ./my-app
+  aenv build --compose compose.yaml --image-repository registry.example.com/team/images
 ")]
 pub struct Args {
     /// Local build context directory
-    context: PathBuf,
+    #[arg(required_unless_present = "compose", conflicts_with = "compose")]
+    context: Option<PathBuf>,
     /// Dockerfile path (defaults to CONTEXT/Dockerfile)
-    #[arg(short = 'f', long = "file")]
+    #[arg(short = 'f', long = "file", conflicts_with = "compose")]
     dockerfile: Option<PathBuf>,
     /// Template name
-    #[arg(long)]
-    name: String,
+    #[arg(long, required_unless_present = "compose", conflicts_with = "compose")]
+    name: Option<String>,
+    #[command(flatten)]
+    compose: compose::Args,
     #[command(flatten)]
     resources: super::CpuMemoryArgs,
     /// Override image ENTRYPOINT/CMD; an empty value disables startup
-    #[arg(long)]
+    #[arg(long, conflicts_with = "compose")]
     start_cmd: Option<String>,
     /// Override the image HEALTHCHECK with a command that must succeed before capture
-    #[arg(long)]
+    #[arg(long, conflicts_with = "compose")]
     ready_cmd: Option<String>,
     /// Build argument, KEY=VALUE; repeatable
-    #[arg(long = "build-arg")]
+    #[arg(long = "build-arg", conflicts_with = "compose")]
     build_args: Vec<String>,
     /// BuildKit secret, for example id=token,src=./token; repeatable
-    #[arg(long)]
+    #[arg(long, conflicts_with = "compose")]
     secret: Vec<String>,
     /// Rebuild without cached instructions or their cache mounts
     #[arg(long)]
@@ -64,9 +70,10 @@ pub struct Args {
 #[cfg(target_os = "linux")]
 pub(super) fn codex_template(context: PathBuf, name: String) -> Result<()> {
     run(Args {
-        context,
+        context: Some(context),
         dockerfile: None,
-        name,
+        name: Some(name),
+        compose: compose::Args::default(),
         resources: super::CpuMemoryArgs {
             cpu_count: Some(2),
             memory_mb: Some(1024),
@@ -90,7 +97,6 @@ pub fn run(mut args: Args) -> Result<()> {
     if args.buildctl.is_none() {
         args.buildctl = Some(std::env::current_exe()?.with_file_name("aenv-buildctl"));
     }
-    let context = BuildContext::prepare(&args)?;
     let buildctl = args
         .buildctl
         .as_ref()
@@ -110,14 +116,30 @@ pub fn run(mut args: Args) -> Result<()> {
         "CPU and memory must be greater than zero"
     );
     let client = Client::from_env()?;
-    super::tokio_rt()?.block_on(run_async(client, args, context))
+    if args.compose.compose.is_some() {
+        return compose::run(client, args);
+    }
+    let context = BuildContext::prepare(&args)?;
+    super::tokio_rt()?.block_on(run_async(&client, &args, context, None))
 }
 
-async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<()> {
+struct ImageExport {
+    image: String,
+    target: Option<String>,
+    insecure: bool,
+}
+
+async fn run_async(
+    client: &Client,
+    args: &Args,
+    context: BuildContext,
+    export: Option<&ImageExport>,
+) -> Result<()> {
     let request = json!({
         "timeout": args.timeout,
         "startCmd": args.start_cmd,
         "readyCmd": args.ready_cmd,
+        "imageOnly": export.is_some(),
     });
     let mut session = None;
     let progress = BuildProgress::new(args.progress == "auto")?;
@@ -128,7 +150,7 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
                     Method::POST,
                     "/v3/templates",
                     Some(serde_json::to_value(CreateTemplateV3 {
-                        name: args.name.clone(),
+                        name: args.name.clone().context("missing build name")?,
                         tags: vec![],
                         cpu_count: args.resources.cpu_count,
                         memory_mb: args.resources.memory_mb,
@@ -136,10 +158,14 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
                 )
                 .await?,
         )?;
-        println!(
-            "Created template {} (build {})",
-            allocated.template_id, allocated.build_id
-        );
+        if export.is_some() {
+            eprintln!("Allocated image build {}", allocated.build_id);
+        } else {
+            println!(
+                "Created template {} (build {})",
+                allocated.template_id, allocated.build_id
+            );
+        }
         let allocated = session.insert(allocated);
         progress.stage(0, "Preparing template builder");
         let builder: Builder = serde_json::from_slice(
@@ -147,13 +173,18 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
                 .build_request(Method::PUT, &builder_path(allocated), Some(request))
                 .await?,
         )?;
+        ensure!(
+            export.is_none() || builder.image_only,
+            "server does not support image-only builds; upgrade the AgentENV server"
+        );
         build(
-            &client,
+            client,
             allocated,
-            &args,
+            args,
             &context,
             &progress,
             &builder.image_name,
+            export,
         )
         .await
     };
@@ -176,19 +207,35 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
             .await
             .context("cleanup request timed out")
             .and_then(|result| result);
-            if let Err(cleanup) = cleanup {
-                eprintln!(
-                    "Build cleanup: {cleanup:#}. Check build {} with `aenv template watch`.",
-                    session.build_id
+            // Cancellation can race with the server already removing the draft.
+            let removed = export.is_some()
+                && matches!(
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        client.finish_image_export(&session.template_id)
+                    )
+                    .await,
+                    Ok(Ok(true))
                 );
+            if !removed {
+                if let Err(cleanup) = cleanup {
+                    eprintln!(
+                        "Build cleanup: {cleanup:#}. Check build {} with `aenv template watch`.",
+                        session.build_id
+                    );
+                }
             }
         }
         return Err(error);
     }
-    println!(
-        "Template {} is ready.",
-        session.context("missing build session")?.template_id
-    );
+    if let Some(export) = export {
+        eprintln!("Image {} is ready.", export.image);
+    } else {
+        println!(
+            "Template {} is ready.",
+            session.context("missing build session")?.template_id
+        );
+    }
     Ok(())
 }
 
@@ -196,6 +243,8 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
 struct Builder {
     #[serde(rename = "imageName")]
     image_name: String,
+    #[serde(default, rename = "imageOnly")]
+    image_only: bool,
 }
 
 fn builder_path(session: &TemplateV3Response) -> String {
@@ -255,6 +304,7 @@ async fn build(
     context: &BuildContext,
     progress: &BuildProgress,
     image_name: &str,
+    export: Option<&ImageExport>,
 ) -> Result<()> {
     let path = builder_path(session);
     wait_for_status(client, session, "building").await?;
@@ -290,6 +340,21 @@ async fn build(
             .arg(format!("type=image,name={image_name},oci-mediatypes=true"))
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        if let Some(export) = export {
+            command.arg("--output").arg(format!(
+                "type=image,name={},push=true,oci-mediatypes=true{}",
+                export.image,
+                if export.insecure {
+                    ",registry.insecure=true"
+                } else {
+                    ""
+                }
+            ));
+            command.args(["--opt", "platform=linux/amd64"]);
+            if let Some(target) = &export.target {
+                command.arg("--opt").arg(format!("target={target}"));
+            }
+        }
         for arg in &args.build_args {
             command.arg("--opt").arg(format!("build-arg:{arg}"));
         }
@@ -317,8 +382,16 @@ async fn build(
         result = command => result?,
         result = client.buildkit_tunnel(&path, listener) => { result?; bail!("BuildKit tunnel closed"); }
     }
-    progress.stage(2, "Converting image and publishing template");
-    wait_for_status(client, session, "ready").await
+    if export.is_some() {
+        progress.stage(2, "Releasing image builder and publishing build cache");
+        while !client.finish_image_export(&session.template_id).await? {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        Ok(())
+    } else {
+        progress.stage(2, "Converting image and publishing template");
+        wait_for_status(client, session, "ready").await
+    }
 }
 
 struct BuildContext {
@@ -331,6 +404,8 @@ impl BuildContext {
     fn prepare(args: &Args) -> Result<Self> {
         let context = args
             .context
+            .as_ref()
+            .context("missing build context")?
             .canonicalize()
             .context("locate build context")?;
         ensure!(
@@ -396,7 +471,7 @@ mod tests {
         .args;
         assert_eq!(args.resources.cpu_count, Some(2));
         assert_eq!(args.build_args, ["VALUE=a b"]);
-        assert_eq!(args.context, PathBuf::from("."));
+        assert_eq!(args.context, Some(PathBuf::from(".")));
         assert_eq!(
             args.dockerfile,
             Some("deploy/docker/Dockerfile.agentenv".into())
@@ -465,7 +540,7 @@ mod tests {
         assert_eq!(prepared.context, context.canonicalize()?);
         assert_eq!(prepared.dockerfile_dir, dockerfiles.canonicalize()?);
         assert_eq!(prepared.filename, "Custom.Dockerfile");
-        args.context = custom;
+        args.context = Some(custom);
         assert!(BuildContext::prepare(&args)
             .err()
             .unwrap()

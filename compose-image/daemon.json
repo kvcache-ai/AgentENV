@@ -1,0 +1,9 @@
+{
+  "features": {"containerd-snapshotter": true},
+  "storage-driver": "plain",
+  "containerd": "/run/containerd/containerd.sock",
+  "exec-opts": ["native.cgroupdriver=cgroupfs"],
+  "log-driver": "json-file",
+  "log-opts": {"max-size": "10m", "max-file": "2"},
+  "default-address-pools": [{"base": "172.28.0.0/16", "size": 24}]
+}

@@ -94,6 +94,9 @@ impl ApiImpl {
         self.release_builder(id, &entry.cache).await?;
         self.cleanup_build_cache(id, &entry).await?;
         persisted?;
+        if entry.image_only && self.snapshot_manager.get(id).await?.is_some() {
+            self.snapshot_manager.delete(id).await?;
+        }
         self.orchestrator
             .unregister_template_build(sandbox_id)
             .await;

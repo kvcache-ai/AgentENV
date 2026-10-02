@@ -150,10 +150,11 @@ echo "Downloading aenv and buildctl (${OS}/${ARCH_TAG}) ..."
 curl_get "${api_headers[@]}" "$RELEASE_API" -o "$RELEASE_METADATA"
 download_release_asset "$ASSET" "$TMP"
 mkdir -p "$BUNDLE_DIR"
-tar -xzf "$TMP" -C "$BUNDLE_DIR" aenv aenv-buildctl manifest.json
+tar -xzf "$TMP" -C "$BUNDLE_DIR" aenv aenv-buildctl aenv-compose-plan manifest.json
 test -s "$BUNDLE_DIR/aenv"
 test -s "$BUNDLE_DIR/aenv-buildctl"
-chmod 0755 "$BUNDLE_DIR/aenv" "$BUNDLE_DIR/aenv-buildctl"
+test -s "$BUNDLE_DIR/aenv-compose-plan"
+chmod 0755 "$BUNDLE_DIR/aenv" "$BUNDLE_DIR/aenv-buildctl" "$BUNDLE_DIR/aenv-compose-plan"
 
 if [[ -w "$INSTALL_DIR" ]] || mkdir -p "$INSTALL_DIR"; then
     true
@@ -165,13 +166,16 @@ install_command=()
 stage_dir="$("${install_command[@]}" mktemp -d "${INSTALL_DIR}/.aenv-install.XXXXXX")"
 trap 'rm -rf "$TMP_DIR"; "${install_command[@]}" rm -rf "$stage_dir"' EXIT
 "${install_command[@]}" install -m 0755 "$BUNDLE_DIR/aenv-buildctl" "$stage_dir/buildctl"
+"${install_command[@]}" install -m 0755 "$BUNDLE_DIR/aenv-compose-plan" "$stage_dir/planner"
 "${install_command[@]}" install -m 0755 "$BUNDLE_DIR/aenv" "$stage_dir/aenv"
-# Keep both renames on the destination filesystem.
+# Keep the renames on the destination filesystem, publishing the CLI last.
 "${install_command[@]}" mv "$stage_dir/buildctl" "${INSTALL_DIR}/aenv-buildctl"
+"${install_command[@]}" mv "$stage_dir/planner" "${INSTALL_DIR}/aenv-compose-plan"
 "${install_command[@]}" mv "$stage_dir/aenv" "$DEST"
 
 echo "Installed: ${DEST}"
 echo "Installed: ${INSTALL_DIR}/aenv-buildctl"
+echo "Installed: ${INSTALL_DIR}/aenv-compose-plan"
 
 if ! command -v aenv &>/dev/null; then
     echo ""

@@ -17,6 +17,16 @@ use crate::virtualization::VirtualizationMode;
 
 const ENV_CONFIG_PATH: &str = "AENV_CONFIG_PATH";
 
+/// Optional runtime for image-only Compose sandboxes.
+#[derive(Debug, Clone, Config)]
+pub struct ComposeConfig {
+    /// Dedicated image built from compose-image/Dockerfile. Unset disables the API.
+    #[config(env = "AENV_COMPOSE_BASE_IMAGE")]
+    pub base_image: Option<String>,
+    #[config(default = "aenv-compose-plan", env = "AENV_COMPOSE_PLANNER_BINARY")]
+    pub planner_binary: String,
+}
+
 #[cfg(test)]
 const TEST_ACCESS_TOKEN_HASH_SEED: &str = "agentenv-unit-test-access-token-seed";
 
@@ -111,6 +121,8 @@ pub struct AppConfig {
     pub envd: EnvdConfig,
     #[config(nested)]
     pub sandbox: SandboxConfig,
+    #[config(nested)]
+    pub compose: ComposeConfig,
     #[config(nested)]
     pub volume: VolumeConfig,
     #[config(nested)]

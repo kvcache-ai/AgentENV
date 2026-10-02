@@ -49,6 +49,15 @@ Firecracker VM binary and boot configuration.
 | `serial_dir` | string | `"$AENV_HOME/logs/serial"` | Directory for persistent Firecracker logs when enabled (per-sandbox subdirectories). Setting this path alone does not enable logging |
 | `log_level` | string | unset (disabled) | Optional Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`, case-insensitive). A non-empty value enables `firecracker.log` and stdout/stderr capture in each sandbox's log directory. Empty/unset discards stdout/stderr and creates no log files or per-sandbox log directories. Explicit Rust stdout/stderr destinations still enable the requested stream |
 
+## `[compose]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `base_image` | string | unset | Dedicated Compose runtime OCI image. Unset disables `POST /sandboxes-compose`. |
+| `planner_binary` | string | `aenv-compose-plan` | Host-side Compose planner on PATH or an absolute path. |
+
+See [Compose Sandboxes](../concepts/sandboxes/compose.md) for installation and supported features.
+
 ## `[kernel]`
 
 Linux kernel image for microVMs.

@@ -2,6 +2,7 @@ pub mod auth;
 pub mod build;
 pub mod codex;
 pub mod completion;
+pub mod compose;
 pub mod connect;
 pub mod delete;
 pub mod download;
@@ -22,6 +23,16 @@ use anyhow::Result;
 use clap::Args as ClapArgs;
 
 pub const DEFAULT_TIMEOUT_SECS: u32 = 300;
+
+pub fn parse_disk_size_mb(value: &str) -> std::result::Result<u32, String> {
+    let size = value
+        .parse::<u32>()
+        .map_err(|_| "disk size must be a positive integer in MiB".to_string())?;
+    if size == 0 || !size.is_multiple_of(1024) {
+        return Err("disk size must be greater than 0 and divisible by 1024 MiB".to_string());
+    }
+    Ok(size)
+}
 
 #[derive(Clone, Copy, Debug, Default, ClapArgs)]
 pub struct CpuMemoryArgs {

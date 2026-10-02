@@ -96,7 +96,18 @@ jobs:
           OPENSSL_STATIC: ${{ runner.os == 'Linux' && '1' || '' }}
         run: cargo build --release --locked -p aenv ${{ matrix.features }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
-      - name: Package CLI and BuildKit client
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: services/go.mod
+          cache-dependency-path: services/go.sum
+
+      - name: Build Compose planner
+        working-directory: services
+        run: |
+          PLATFORM=${{ matrix.buildkit_platform }}
+          CGO_ENABLED=0 GOOS=${PLATFORM%-*} GOARCH=${PLATFORM#*-} go build -trimpath -o ../target/aenv-compose-plan ./compose/cmd
+
+      - name: Package CLI and build helpers
         env:
           RELEASE_VERSION: ${{ github.ref_name }}
         run: |
@@ -106,7 +117,8 @@ jobs:
             "$BIN" \
             "dist/${{ matrix.asset_name }}.tar.gz" \
             "${RELEASE_VERSION#v}" \
-            "${{ matrix.buildkit_platform }}"
+            "${{ matrix.buildkit_platform }}" \
+            target/aenv-compose-plan
 
       - uses: actions/upload-artifact@v7
         with:
@@ -144,6 +156,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: services/go.mod
+          cache-dependency-path: services/go.sum
+
+      - name: Build Compose planner
+        working-directory: services
+        run: CGO_ENABLED=0 go build -trimpath -o ../target/aenv-compose-plan ./compose/cmd
+
       - name: Build server binaries
         env:
           OPENSSL_STATIC: "1"
@@ -161,6 +182,7 @@ jobs:
             BUNDLE="dist/bundle-$MODE"
             mkdir -p "$BUNDLE/ublk"
             cp target/release/server "$BUNDLE/server"
+            cp target/aenv-compose-plan "$BUNDLE/aenv-compose-plan"
             strip "$BUNDLE/server"
             cp target/release/uvm-ublk-daemon "$BUNDLE/ublk/uvm-ublk-daemon"
             strip "$BUNDLE/ublk/uvm-ublk-daemon"

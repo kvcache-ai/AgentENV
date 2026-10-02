@@ -25,6 +25,39 @@ CLI obtains and manages the access token automatically.
 
 CPU, memory, and disk overrides are supported only for cold starts.
 
+## `aenv compose up`
+
+Create one sandbox running an image-only Compose project. The command waits for
+the services to become running or healthy, prints only the sandbox ID to stdout,
+and exits without attaching a shell. Each invocation creates a new sandbox.
+
+```bash
+aenv compose up -f compose.yaml --cpu 2 --memory 2048 --timeout 600
+aenv compose up -f compose.yaml --env TAG=stable --profile worker
+cat compose.yaml | aenv compose up -f -
+```
+
+| Flag | Description |
+|------|-------------|
+| `-f, --file <PATH>` | Compose YAML or JSON file (default: `compose.yaml`); `-` reads stdin. Maximum 1 MiB. |
+| `--env <KEY=VALUE>` | Explicit interpolation variable; repeatable, with the last value winning. Empty values are allowed. |
+| `--profile <NAME>` | Enable an optional Compose profile; repeatable. |
+| `--timeout <secs>` | Sandbox TTL after readiness (default: 300). |
+| `--startup-timeout <secs>` | Total startup budget, including image resolution and health checks (1–300; default: 300). |
+| `--cpu <count>` | CPU cores. Alias: `--cpu-count`. |
+| `--memory <MiB>` | Memory in MiB. Aliases: `--memory-mb`, `--mem`. |
+| `--disk-size-mb <MiB>` | Root filesystem size, at least 1024 and divisible by 1024 MiB. Alias: `--disk-mb`. |
+
+Only `--env` values are used for interpolation; local environment variables and
+`.env` files are not loaded. Resource defaults come from the server. The HTTP
+request allows an additional 60 seconds beyond the startup budget for cleanup.
+Startup failures produce a non-zero exit status and the API error on stderr.
+
+The command uses the existing `POST /sandboxes-compose` endpoint and requires a
+[Compose-enabled server](../../concepts/sandboxes/compose.md). Existing restrictions
+on builds, host files, and other Compose features still apply. Manage the returned
+sandbox with `aenv exec`, `connect`, `pause`, `resume`, `snapshot`, and `delete`.
+
 ## `aenv pause <sandbox-id>`
 
 Pause a running sandbox. The sandbox state is preserved and can be resumed later.

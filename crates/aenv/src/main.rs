@@ -30,6 +30,8 @@ enum Cmd {
     Build(Box<commands::build::Args>),
     /// Start a sandbox and attach an interactive shell
     Start(commands::start::Args),
+    /// Run a Compose project in a sandbox
+    Compose(commands::compose::Args),
     /// Run a command in a sandbox
     Exec(commands::exec::Args),
     /// Upload a file to a sandbox
@@ -83,6 +85,7 @@ fn main() -> Result<()> {
         Cmd::Pull(a) => commands::pull::run(a),
         Cmd::Build(a) => commands::build::run(*a),
         Cmd::Start(a) => commands::start::run(a),
+        Cmd::Compose(a) => commands::compose::run(a),
         Cmd::Exec(a) => commands::exec::run(a),
         Cmd::Upload(a) => commands::upload::run(a),
         Cmd::Download(a) => commands::download::run(a),

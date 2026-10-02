@@ -85,6 +85,8 @@ impl BuildSessions {
 struct BuildJournal {
     cache: String,
     parent: Option<String>,
+    #[serde(default)]
+    image_only: bool,
 }
 
 impl BuildJournal {
@@ -271,6 +273,7 @@ impl ApiImpl {
         let entry = BuildJournal {
             cache: format!("aenv-buildkit-work-{id}"),
             parent: None,
+            image_only: body.image_only.unwrap_or(false),
         };
         if let Err(err) = entry.persist(journal, &id.to_string()).await {
             let _ = self
@@ -288,12 +291,13 @@ impl ApiImpl {
             )
             .await;
         let api = self.clone();
+        let image_only = entry.image_only;
         tokio::spawn(async move {
             api.run_image_build(record, body, session, entry).await;
         });
-        Ok(models::TemplateBuilder::new(build_image_name(
-            &id.to_string(),
-        )))
+        let mut builder = models::TemplateBuilder::new(build_image_name(&id.to_string()));
+        builder.image_only = Some(image_only);
+        Ok(builder)
     }
 
     fn session(&self, template_id: &str, build_id: &str) -> Result<BuildSession, models::Error> {
@@ -370,6 +374,20 @@ impl ApiImpl {
             let (address, digest) = self
                 .wait_for_image_build(&record, &body, &session, &entry, deadline, &logger)
                 .await?;
+            if entry.image_only {
+                // The successful Solve includes all exporters, including the client's
+                // registry push. Never boot the resulting service image here: its
+                // entrypoint or healthcheck may depend on other Compose services.
+                let _connections =
+                    tokio::time::timeout(Duration::from_secs(10), session.connections.write())
+                        .await;
+                if self.release_builder(&id, &entry.cache).await? {
+                    if let Err(error) = self.publish_build_cache(&id, &entry.cache).await {
+                        warn!(build_id = %id, error = %format_args!("{error:#}"), "cache publication failed; keeping the previous cache seed");
+                    }
+                }
+                return Ok(());
+            }
             let content = BuildkitContent::connect(address).await?;
             let resolved = tokio::time::timeout(
                 Duration::from_secs(3600),
@@ -456,6 +474,12 @@ impl ApiImpl {
                 Some(TemplateBuildErrorReason::new(format!("{error:#}")))
             }
         };
+        if reason.is_some() {
+            // Failed exporters still have a final Solve error to deliver. Give
+            // buildctl a bounded chance to print it before closing its tunnel.
+            let _connections =
+                tokio::time::timeout(Duration::from_secs(10), session.connections.write()).await;
+        }
         session.state.send_replace(SessionState::Finished(reason));
         if let Err(error) = self.retry_image_build_cleanup(&id).await {
             warn!(build_id = %id, error = %format_args!("{error:#}"), "build finalization failed; cleanup will be retried");

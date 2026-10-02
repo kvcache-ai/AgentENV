@@ -31,9 +31,9 @@ use crate::sandbox::manifest::SandboxSnapshotManifest;
 use crate::cfg::ConfigManager;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
-    SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec,
-    SandboxRuntimeInfo,
+    check_startup_deadline, CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet,
+    SandboxBackend, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult,
+    SandboxForkSpec, SandboxRuntimeInfo,
 };
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{
@@ -358,8 +358,53 @@ impl SandboxBackend for FirecrackerSandbox {
         FirecrackerSandbox::start_nowait(self).await
     }
 
+    async fn start_nowait_with_deadline(&mut self, deadline: tokio::time::Instant) -> Result<()> {
+        self.start_with_deadline(Some(deadline)).await
+    }
+
     async fn wait_for_ready(&self) -> Result<()> {
         FirecrackerSandbox::wait_for_ready(self).await
+    }
+
+    async fn initialize_compose(
+        &mut self,
+        bootstrap: &crate::compose::ComposeBootstrap,
+    ) -> Result<()> {
+        let envd = self.envd_instance.clone().context("envd is not running")?;
+        let remaining = bootstrap
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        let input = crate::compose::encode_plan(&bootstrap.plan)?;
+        let deadline = bootstrap.deadline;
+        // Like guest filesystem sync, envd's streaming client needs a local
+        // future behind this Send lifecycle interface.
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                tokio::time::timeout_at(deadline, async move {
+                    let executor = Executor::new(envd).with_root_user();
+                    let seconds = remaining.as_secs_f64().to_string();
+                    let mut process = executor
+                        .start_process(
+                            "/usr/local/bin/aenv-compose-start",
+                            &[&seconds],
+                            &crate::sandbox::ProcessOpts::default().with_cwd("/"),
+                        )
+                        .await?;
+                    process.send_stdin(&input).await?;
+                    let output = process.wait().await?;
+                    anyhow::ensure!(
+                        output.exit_code == 0,
+                        "Compose startup failed: {}",
+                        output.stderr
+                    );
+                    Ok(())
+                })
+                .await
+                .context("Compose startup deadline exceeded")?
+            })
+        })
+        .await
+        .context("Compose initialization task failed")?
     }
 
     /// Pauses the VM and returns the paused state wrapped as a [`PausedSandboxState`].
@@ -857,11 +902,17 @@ impl FirecrackerSandbox {
     /// This only waits for the Firecracker API socket to be available and
     /// returns immediately after VM start command is issued.
     pub(crate) async fn start_nowait(&mut self) -> Result<()> {
+        self.start_with_deadline(None).await
+    }
+
+    async fn start_with_deadline(&mut self, deadline: Option<tokio::time::Instant>) -> Result<()> {
+        check_startup_deadline(deadline)?;
         self.prepare_tools_drive().await?;
+        check_startup_deadline(deadline)?;
         self.launch.validate()?;
         trace!("launch config validated");
         match &self.launch {
-            LaunchMode::Fresh(config) => self.start_fresh(config.clone()).await,
+            LaunchMode::Fresh(config) => self.start_fresh(config.clone(), deadline).await,
             LaunchMode::Resume(config) => self.start_resume(config.clone()).await,
         }
     }
@@ -1760,7 +1811,12 @@ impl FirecrackerSandbox {
     }
 
     #[tracing::instrument(skip(self, config))]
-    async fn start_fresh(&mut self, config: FirecrackerSandboxConfig) -> Result<()> {
+    async fn start_fresh(
+        &mut self,
+        config: FirecrackerSandboxConfig,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<()> {
+        check_startup_deadline(deadline)?;
         let work_dir = self.work_dir.path();
         debug!(work_dir = %work_dir.display(), "starting fresh sandbox");
 
@@ -1815,6 +1871,7 @@ impl FirecrackerSandbox {
             actual_virtual_size: runtime_device.actual_virtual_size,
         });
         self.current_rootfs_virtual_size = Some(runtime_device.actual_virtual_size);
+        check_startup_deadline(deadline)?;
 
         // ── Boot args: init=/init (tools drive has init baked in) ──
         let mut boot_args = config.boot_args.clone();
@@ -1845,12 +1902,14 @@ impl FirecrackerSandbox {
                     self.work_dir.path(),
                     runtime_upper_mode,
                     ExtraDrivePrepareMode::Fresh { allow_shrink },
+                    deadline,
                 )
                 .await
                 .context("prepare extra drives")?
                 .into_parts()
             };
         self.extra_drive_runtimes = extra_drive_runtimes;
+        check_startup_deadline(deadline)?;
 
         // ── Boot args: extra drive mount points (agentenv_drives=vdc:...) ──
         if let Some(drives_arg) = build_drives_boot_arg(&config.common.extra_drives) {
@@ -1884,6 +1943,7 @@ impl FirecrackerSandbox {
         });
 
         // ── Custom extension hook: start-fresh (may contribute extra boot args) ──
+        check_startup_deadline(deadline)?;
         if let Some(client) = CustomExtensionClient::global() {
             let mut guard = CustomExtensionHookGuard::new(client, self.id);
             let extra_boot_args = guard
@@ -1902,6 +1962,7 @@ impl FirecrackerSandbox {
             }
         }
 
+        check_startup_deadline(deadline)?;
         boot_args =
             add_damon_monitor_region(boot_args, config.mem_size_mib, std::env::consts::ARCH);
 
@@ -1918,6 +1979,9 @@ impl FirecrackerSandbox {
             )
             .await?;
 
+        // spawn_with_netns may acquire the child on another thread. Wait until
+        // it has installed the process handle before observing cancellation.
+        check_startup_deadline(deadline)?;
         let envd_base_url = format!(
             "http://{}:{}",
             interaction_ip, config.common.control_plane_port
@@ -1928,15 +1992,26 @@ impl FirecrackerSandbox {
         ));
 
         // ── Configure microVM: tools drive as rootfs + user image + extras ──
-        self.fc_instance
-            .wait_for_ready(
-                self.runtime_policy.socket_timeout,
-                self.runtime_policy.socket_poll_interval,
-            )
-            .await?;
-        self.configure_microvm(&config, boot_args.as_deref(), &extra_drive_attachments)
-            .await?;
-        self.fc_instance.start().await?;
+        let boot = async {
+            self.fc_instance
+                .wait_for_ready(
+                    self.runtime_policy.socket_timeout,
+                    self.runtime_policy.socket_poll_interval,
+                )
+                .await?;
+            self.configure_microvm(&config, boot_args.as_deref(), &extra_drive_attachments)
+                .await?;
+            self.fc_instance.start().await
+        };
+        // All host resources now belong to self, so stop() can reclaim them
+        // even if a Firecracker API request is cancelled.
+        if let Some(deadline) = deadline {
+            tokio::time::timeout_at(deadline, boot)
+                .await
+                .context("Compose startup deadline exceeded")??;
+        } else {
+            boot.await?;
+        }
         debug!("fresh sandbox started");
         Ok(())
     }
@@ -2590,6 +2665,7 @@ impl FirecrackerSandbox {
             self.work_dir.path(),
             runtime_upper_mode,
             ExtraDrivePrepareMode::Resume,
+            None,
         )
         .await?;
         let (attachments, extra_drive_runtimes) = prepared_extra_drives.into_parts();

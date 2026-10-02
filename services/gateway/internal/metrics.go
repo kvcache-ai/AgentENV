@@ -208,7 +208,7 @@ func gatewayRouteLabel(path string) string {
 	}
 
 	switch trimmed {
-	case "/sandboxes", "/sandboxes-cold", "/v2/sandboxes", "/nodes":
+	case "/sandboxes", "/sandboxes-cold", "/sandboxes-compose", "/v2/sandboxes", "/nodes":
 		return trimmed
 	}
 

@@ -424,7 +424,22 @@ where
         let sandbox_id = SandboxId::new();
         let this = Arc::clone(self);
         self.run_cancellation_safe("create", sandbox_id, async move {
-            this.create_sandbox_inner(sandbox_id, request, false).await
+            this.create_sandbox_inner(sandbox_id, request, false, None)
+                .await
+        })
+        .await
+    }
+
+    pub(crate) async fn create_compose_sandbox(
+        self: &Arc<Self>,
+        request: CreateSandboxRequest,
+        bootstrap: crate::compose::ComposeBootstrap,
+    ) -> Result<SandboxMetadata> {
+        let sandbox_id = SandboxId::new();
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("create_compose", sandbox_id, async move {
+            this.create_sandbox_inner(sandbox_id, request, false, Some(bootstrap))
+                .await
         })
         .await
     }
@@ -436,14 +451,15 @@ where
     ) -> Result<SandboxMetadata> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("create_builder", build_id, async move {
-            this.create_sandbox_inner(build_id, request, true).await
+            this.create_sandbox_inner(build_id, request, true, None)
+                .await
         })
         .await
     }
 
     #[tracing::instrument(
         name = "create_sandbox",
-        skip(self, request),
+        skip(self, request, compose),
         fields(sandbox_id = %sandbox_id)
     )]
     async fn create_sandbox_inner(
@@ -451,6 +467,7 @@ where
         sandbox_id: SandboxId,
         request: CreateSandboxRequest,
         template_builder: bool,
+        compose: Option<crate::compose::ComposeBootstrap>,
     ) -> Result<SandboxMetadata> {
         if let Err(err) = self.ensure_accepting_lifecycle_operations() {
             self.counters.record_create_fail(1);
@@ -597,13 +614,16 @@ where
                     ..Default::default()
                 };
 
-                self.launch_sandbox(LaunchPlan::for_create_fresh(
-                    sandbox_id,
-                    build_spec,
-                    launch_config,
-                    transitional_metadata,
-                    NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
-                ))
+                self.launch_sandbox(
+                    LaunchPlan::for_create_fresh(
+                        sandbox_id,
+                        build_spec,
+                        launch_config,
+                        transitional_metadata,
+                        NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    )
+                    .with_compose(compose),
+                )
                 .await
             }
         };
@@ -2426,7 +2446,12 @@ where
                 .await;
             return Err(err);
         }
-        if let Err(source) = sandbox.start_nowait().await {
+        let start_result = if let Some(bootstrap) = plan.compose() {
+            sandbox.start_nowait_with_deadline(bootstrap.deadline).await
+        } else {
+            sandbox.start_nowait().await
+        };
+        if let Err(source) = start_result {
             warn!(error = %format_args!("{source:#}"), "failed to start sandbox");
             if let Err(stop_err) = sandbox.stop().await {
                 warn!(error = %format_args!("{stop_err:#}"), "failed to stop sandbox after start failure");
@@ -2490,8 +2515,17 @@ where
 
         // Wait for the sandbox to be ready
         let wait_result = {
-            let sandbox = handle.lock().await;
-            sandbox.wait_for_ready().await
+            let mut sandbox = handle.lock().await;
+            if let Some(bootstrap) = plan.compose() {
+                tokio::time::timeout_at(bootstrap.deadline, async {
+                    sandbox.wait_for_ready().await?;
+                    sandbox.initialize_compose(bootstrap).await
+                })
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Compose startup deadline exceeded")))
+            } else {
+                sandbox.wait_for_ready().await
+            }
         };
         if let Err(source) = wait_result {
             warn!(error = %format_args!("{source:#}"), "sandbox failed to become ready");

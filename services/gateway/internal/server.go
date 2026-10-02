@@ -169,7 +169,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	websocket := isWebSocketRequest(r)
 	streaming := isStreamingRequest(r)
 	longLived := streaming || websocket
-	routingCtx, cancelRouting := context.WithTimeout(r.Context(), s.requestTimeout)
+	routingCtx, cancelRouting := context.WithTimeout(r.Context(), requestTimeoutFor(r, s.requestTimeout))
 	defer cancelRouting()
 
 	hostRoute, hostRouteErr := parseHostRoute(r.Host, s.sandboxProxyDomains)
@@ -536,6 +536,14 @@ func readBodyWithLimit(src io.Reader, limit int64) ([]byte, bool, error) {
 	return body, false, nil
 }
 
+// Compose allows a 300-second startup budget, plus time for failure cleanup.
+func requestTimeoutFor(r *http.Request, configured time.Duration) time.Duration {
+	if r.Method == http.MethodPost && strings.TrimRight(r.URL.Path, "/") == "/sandboxes-compose" && configured < 330*time.Second {
+		return 330 * time.Second
+	}
+	return configured
+}
+
 func recordAssignmentTimeout(requestTimeout time.Duration) time.Duration {
 	if requestTimeout <= 0 {
 		return maxRecordAssignmentTimeout
@@ -562,7 +570,7 @@ func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox
 	}
 	path := strings.TrimRight(r.URL.Path, "/")
 	if !hasSandbox {
-		return path == "/sandboxes" || path == "/v2/sandboxes" || path == "/sandboxes-cold"
+		return path == "/sandboxes" || path == "/v2/sandboxes" || path == "/sandboxes-cold" || path == "/sandboxes-compose"
 	}
 	if routeSource != routeSourcePath {
 		return false
