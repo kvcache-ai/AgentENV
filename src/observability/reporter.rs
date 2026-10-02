@@ -19,6 +19,13 @@ use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
 
 const MAX_REPORT_BACKOFF: Duration = Duration::from_secs(60);
 const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// Bounds the TCP connect of a reconnect, which `GRPC_CALL_TIMEOUT` does not:
+/// the `grpc-timeout` deadline it sets is started by the channel when the call
+/// reaches it, and a call only reaches it once a connection is up. A SYN that
+/// is never answered is therefore left to the kernel's own retry limit, over
+/// two minutes at the default `tcp_syn_retries`, and a node refreshes every one
+/// of its sandbox bindings through this channel.
+const GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Returned by [`ObservabilityReporter::send_heartbeat`] when the scheduler
 /// rejects the heartbeat because this node's ID is not in its configured node
@@ -246,7 +253,8 @@ impl ObservabilityReporter {
     fn build_scheduler_channel(scheduler_endpoint: &str) -> Result<Channel> {
         let raw_endpoint = scheduler_endpoint.to_string();
         let endpoint = Endpoint::from_shared(raw_endpoint.clone())
-            .with_context(|| format!("invalid scheduler endpoint: {raw_endpoint}"))?;
+            .with_context(|| format!("invalid scheduler endpoint: {raw_endpoint}"))?
+            .connect_timeout(GRPC_CONNECT_TIMEOUT);
         Ok(endpoint.connect_lazy())
     }
 
