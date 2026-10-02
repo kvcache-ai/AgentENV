@@ -103,6 +103,11 @@ jobs:
           registry: dhi.io
           username: ${{ secrets.DHI_USERNAME }}
           password: ${{ secrets.DHI_PASSWORD }}
+      - uses: docker/login-action@v4
+        with:
+          registry: us-dallas-1.ocir.io
+          username: ${{ secrets.OCIR_USERNAME }}
+          password: ${{ secrets.OCIR_PASSWORD }}
       - name: Build Compose image once for both suites
         uses: docker/build-push-action@v7
         with:
@@ -113,9 +118,10 @@ jobs:
           tags: agentenv-${{ matrix.component }}:latest
           build-args: AENV_BUILD_COMMIT=${{ github.sha }}
           cache-from: |
+            type=registry,ref=us-dallas-1.ocir.io/ax3vcxtxsjva/dev/research/agentenv-${{ matrix.component }}:cache-ci-${{ github.event.pull_request.number || 'main' }}
+            type=registry,ref=us-dallas-1.ocir.io/ax3vcxtxsjva/dev/research/agentenv-${{ matrix.component }}:cache-main
             type=gha,scope=agentenv-${{ matrix.component }}
-            type=gha,scope=agentenv-${{ matrix.component }}-publish
-          cache-to: type=gha,scope=agentenv-${{ matrix.component }},mode=max
+          cache-to: type=registry,ref=us-dallas-1.ocir.io/ax3vcxtxsjva/dev/research/agentenv-${{ matrix.component }}:cache-ci-${{ github.event.pull_request.number || 'main' }},mode=max,image-manifest=true,oci-mediatypes=true
       - uses: actions/upload-artifact@v7
         with:
           name: compose-image-${{ matrix.component }}

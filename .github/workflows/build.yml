@@ -68,9 +68,9 @@ jobs:
           platforms: linux/amd64
           build-args: AENV_BUILD_COMMIT=${{ github.sha }}
           cache-from: |
-            type=gha,scope=agentenv-${{ matrix.component }}-publish
-            type=gha,scope=agentenv-${{ matrix.component }}
-          cache-to: type=gha,scope=agentenv-${{ matrix.component }}-publish,mode=max
+            type=registry,ref=${{ env.REGISTRY }}/agentenv-${{ matrix.component }}:cache-main
+            type=registry,ref=${{ env.REGISTRY }}/agentenv-${{ matrix.component }}:cache-ci-main
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/agentenv-${{ matrix.component }}:cache-main,mode=max,image-manifest=true,oci-mediatypes=true
           push: true
           tags: |
             ${{ env.REGISTRY }}/agentenv-${{ matrix.component }}:${{ steps.tag.outputs.tag }}
