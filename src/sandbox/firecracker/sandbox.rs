@@ -902,9 +902,7 @@ impl FirecrackerSandbox {
             .await?;
         // Restored guests retain the source token until /init validates the new
         // token against MMDS. Authenticate before sending the boot probe command.
-        envd_instance
-            .init(None, Some("/".to_owned()), Some("root".to_owned()))
-            .await?;
+        envd_instance.init(None, None, None).await?;
         let remaining = envd_timeout.saturating_sub(started.elapsed());
         anyhow::ensure!(
             !remaining.is_zero(),
@@ -3424,6 +3422,8 @@ mod tests {
                     let token = init_token.clone();
                     async move {
                         assert_eq!(body["accessToken"], token.expose());
+                        assert!(body["defaultUser"].is_null());
+                        assert!(body["defaultWorkdir"].is_null());
                         count.fetch_add(1, Ordering::SeqCst);
                         StatusCode::NO_CONTENT
                     }

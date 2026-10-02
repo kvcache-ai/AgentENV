@@ -80,6 +80,17 @@ jobs:
         run: df -h / "$RUNNER_TEMP"
       - uses: ./.github/actions/sandbox-artifacts-cleanup
         if: always()
+      # A failed VM assertion should not discard a successful Rust compilation.
+      - name: Preserve Rust cache after integration failure
+        if: failure() && runner.environment != 'self-hosted'
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ${{ runner.temp }}/rust-source-state.json
+          key: rust-v1-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('rust-toolchain.toml', '.cargo/config.toml', '.github/actions/rust-ci-setup/action.yml') }}-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}-${{ github.sha }}
 
   compose-images:
     runs-on: ubuntu-latest
