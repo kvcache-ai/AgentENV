@@ -1,10 +1,10 @@
 use agentenv::image::ImageResolver;
 use agentenv::sandbox::{
-    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotConfig, OverlaybdConfig,
-    SandboxExecutor, UblkDeviceManager,
+    CapturedSandboxSnapshot, FirecrackerSandbox, FirecrackerSandboxConfig,
+    FirecrackerSnapshotConfig, OverlaybdConfig, SandboxBackend, SandboxExecutor, UblkDeviceManager,
 };
 use anyhow::{Context, Result};
-use criterion::Criterion;
+use criterion::{Criterion, SamplingMode, Throughput};
 use overlaybd::config::UpperMode;
 use std::path::PathBuf;
 use std::sync::{
@@ -12,8 +12,8 @@ use std::sync::{
     Arc, Barrier,
 };
 use std::thread;
-use std::time::Duration;
-use tokio::runtime::Runtime;
+use std::time::{Duration, Instant};
+use tokio::runtime::{Handle, Runtime};
 use tokio::sync::OnceCell;
 
 static DEFAULT_ROOTFS_IMAGE_CONFIG: OnceCell<PathBuf> = OnceCell::const_new();
@@ -25,6 +25,8 @@ const DEFAULT_SAMPLE_COUNT: usize = 10;
 const DEFAULT_CLEANUP_SETTLE_TIME: Duration = Duration::from_millis(25);
 const FULL_CLEANUP_SETTLE_TIME: Duration = Duration::from_millis(500);
 const CONCURRENCY: usize = 50;
+const BENCH_CONCURRENCY_ENV: &str = "AENV_BENCH_CONCURRENCY";
+const FULL_THROUGHPUT_MEASUREMENT_TIME: Duration = Duration::from_secs(30);
 const HEAVY_DATA_SIZE_MIB: u32 = 1024;
 const HEAVY_MEM_SIZE_MIB: u32 = HEAVY_DATA_SIZE_MIB + 512;
 const BENCH_UPPER_MODE_ENV: &str = "AENV_BENCH_UPPER_MODE";
@@ -45,6 +47,23 @@ fn bench_upper_mode() -> UpperMode {
 
 fn full_bench_mode() -> bool {
     std::env::var_os("AENV_BENCH_FULL").is_some()
+}
+
+fn throughput_concurrency() -> Result<usize> {
+    match std::env::var(BENCH_CONCURRENCY_ENV) {
+        Ok(value) => {
+            let concurrency = value.parse::<usize>().with_context(|| {
+                format!("{BENCH_CONCURRENCY_ENV} must be a positive integer, got {value:?}")
+            })?;
+            anyhow::ensure!(
+                concurrency > 0,
+                "{BENCH_CONCURRENCY_ENV} must be greater than zero"
+            );
+            Ok(concurrency)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(CONCURRENCY),
+        Err(err) => Err(err).context(format!("read {BENCH_CONCURRENCY_ENV}")),
+    }
 }
 
 fn cleanup_settle_time() -> Duration {
@@ -68,6 +87,9 @@ fn filtered_benchmark_names() -> Result<Option<Vec<String>>> {
         println!("snapshot_resume_cold");
         println!("snapshot_resume");
         println!("concurrent_resume");
+        println!("concurrent_resume_throughput");
+        println!("concurrent_snapshot_capture_throughput");
+        println!("concurrent_pause_throughput");
         return Ok(None);
     }
 
@@ -106,6 +128,37 @@ fn print_samples(name: &str, samples: &[Duration]) {
     }
 }
 
+fn print_throughput_samples(name: &str, samples: &[Duration], concurrency: usize) -> Result<()> {
+    anyhow::ensure!(!samples.is_empty(), "{name} produced no samples");
+    let total: Duration = samples.iter().copied().sum();
+    anyhow::ensure!(!total.is_zero(), "{name} measured zero elapsed time");
+    let operations = concurrency
+        .checked_mul(samples.len())
+        .context("throughput operation count overflowed")?;
+    let throughput = operations as f64 / total.as_secs_f64();
+    let mean = total / samples.len() as u32;
+    let min = samples.iter().copied().min().unwrap_or_default();
+    let max = samples.iter().copied().max().unwrap_or_default();
+
+    println!(
+        "{name:<40} throughput {throughput:>10.2} ops/s  mean batch {:>10}  min {:>10}  max {:>10}  samples {}  concurrency {concurrency}",
+        format_duration(mean),
+        format_duration(min),
+        format_duration(max),
+        samples.len()
+    );
+
+    if std::env::var_os("AENV_BENCH_PRINT_SAMPLES").is_some() {
+        let samples = samples
+            .iter()
+            .map(|duration| format_duration(*duration))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{name:<40} batch samples [{samples}]");
+    }
+    Ok(())
+}
+
 fn run_default_benchmark<F>(name: &str, filters: &[String], mut run: F) -> bool
 where
     F: FnMut() -> Result<Vec<Duration>>,
@@ -119,6 +172,23 @@ where
         Err(err) => eprintln!("Skipping {name}: {err:#}"),
     }
     true
+}
+
+fn run_default_throughput_benchmark<F>(
+    name: &str,
+    filters: &[String],
+    concurrency: usize,
+    mut run: F,
+) -> Result<bool>
+where
+    F: FnMut() -> Result<Vec<Duration>>,
+{
+    if !should_run(name, filters) {
+        return Ok(false);
+    }
+    let samples = run().with_context(|| format!("run {name}"))?;
+    print_throughput_samples(name, &samples, concurrency)?;
+    Ok(true)
 }
 
 async fn setup_sandbox() -> Result<FirecrackerSandbox> {
@@ -610,6 +680,218 @@ fn default_concurrent_resume(rt: &Runtime) -> Result<Vec<Duration>> {
     benchmark_result
 }
 
+// Each worker owns a separate sandbox. The timer starts when the whole batch is
+// released and stops after every operation has completed; setup and cleanup are
+// deliberately outside this interval.
+fn measure_concurrent_batch<F, T>(work: Vec<F>) -> (Duration, Vec<thread::Result<T>>)
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let start_barrier = Arc::new(Barrier::new(work.len() + 1));
+    let handles: Vec<_> = work
+        .into_iter()
+        .map(|run| {
+            let start_barrier = Arc::clone(&start_barrier);
+            thread::spawn(move || {
+                start_barrier.wait();
+                run()
+            })
+        })
+        .collect();
+
+    let start = Instant::now();
+    start_barrier.wait();
+    let results = handles.into_iter().map(|handle| handle.join()).collect();
+    (start.elapsed(), results)
+}
+
+fn stop_batch(rt: &Runtime, sandboxes: Vec<FirecrackerSandbox>) -> Result<()> {
+    if sandboxes.is_empty() {
+        return Ok(());
+    }
+    let mut first_error = None;
+    for mut sandbox in sandboxes {
+        if let Err(error) = rt.block_on(sandbox.stop()) {
+            first_error.get_or_insert(error);
+        }
+    }
+    rt.block_on(async { tokio::time::sleep(cleanup_settle_time()).await });
+    if let Some(error) = first_error {
+        return Err(error).context("stop benchmark sandboxes");
+    }
+    Ok(())
+}
+
+fn prepare_running_batch(rt: &Runtime, concurrency: usize) -> Result<Vec<FirecrackerSandbox>> {
+    let mut sandboxes = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        match rt.block_on(setup_sandbox()) {
+            Ok(sandbox) => sandboxes.push(sandbox),
+            Err(error) => {
+                stop_batch(rt, sandboxes)?;
+                return Err(error).context("prepare running sandbox batch");
+            }
+        }
+    }
+    Ok(sandboxes)
+}
+
+fn capture_running_sandbox(
+    handle: &Handle,
+    sandbox: &mut FirecrackerSandbox,
+) -> Result<CapturedSandboxSnapshot> {
+    Ok(handle.block_on(SandboxBackend::snapshot(sandbox))?)
+}
+
+fn pause_running_sandbox(
+    handle: &Handle,
+    sandbox: &mut FirecrackerSandbox,
+) -> Result<FirecrackerSnapshotConfig> {
+    handle.block_on(sandbox.pause())
+}
+
+fn run_running_batch<T, F>(rt: &Runtime, concurrency: usize, operation: F) -> Result<Duration>
+where
+    T: Send + 'static,
+    F: Fn(&Handle, &mut FirecrackerSandbox) -> Result<T> + Copy + Send + 'static,
+{
+    let sandboxes = prepare_running_batch(rt, concurrency)?;
+    let work = sandboxes
+        .into_iter()
+        .map(|mut sandbox| {
+            let handle = rt.handle().clone();
+            move || {
+                let result = operation(&handle, &mut sandbox);
+                (sandbox, result)
+            }
+        })
+        .collect();
+    let (elapsed, results) = measure_concurrent_batch(work);
+
+    let mut sandboxes = Vec::with_capacity(concurrency);
+    let mut artifacts = Vec::with_capacity(concurrency);
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok((sandbox, Ok(artifact))) => {
+                sandboxes.push(sandbox);
+                artifacts.push(artifact);
+            }
+            Ok((sandbox, Err(error))) => {
+                sandboxes.push(sandbox);
+                first_error.get_or_insert(error);
+            }
+            Err(_) => {
+                first_error.get_or_insert_with(|| anyhow::anyhow!("benchmark worker panicked"));
+            }
+        }
+    }
+    let cleanup = stop_batch(rt, sandboxes);
+    drop(artifacts);
+    cleanup?;
+    if let Some(error) = first_error {
+        return Err(error).context("running sandbox batch failed");
+    }
+    Ok(elapsed)
+}
+
+fn run_resume_batch(
+    rt: &Runtime,
+    snapshot: &FirecrackerSnapshotConfig,
+    concurrency: usize,
+) -> Result<Duration> {
+    let work = (0..concurrency)
+        .map(|_| {
+            let snapshot = snapshot.clone();
+            let handle = rt.handle().clone();
+            move || handle.block_on(FirecrackerSandbox::resume_from_snapshot_config(&snapshot))
+        })
+        .collect();
+    let (elapsed, results) = measure_concurrent_batch(work);
+
+    let mut sandboxes = Vec::with_capacity(concurrency);
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok(Ok(sandbox)) => sandboxes.push(sandbox),
+            Ok(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Err(_) => {
+                first_error.get_or_insert_with(|| anyhow::anyhow!("resume worker panicked"));
+            }
+        }
+    }
+    stop_batch(rt, sandboxes)?;
+    if let Some(error) = first_error {
+        return Err(error).context("concurrent resume batch failed");
+    }
+    Ok(elapsed)
+}
+
+fn default_throughput_samples(
+    mut run_batch: impl FnMut() -> Result<Duration>,
+) -> Result<Vec<Duration>> {
+    run_batch().context("warm up throughput benchmark")?;
+    (0..DEFAULT_SAMPLE_COUNT).map(|_| run_batch()).collect()
+}
+
+fn default_resume_throughput(rt: &Runtime, concurrency: usize) -> Result<Vec<Duration>> {
+    let snapshot = rt.block_on(prepare_snapshot())?;
+    let mut warm_sandbox =
+        rt.block_on(FirecrackerSandbox::resume_from_snapshot_config(&snapshot))?;
+    let samples = default_throughput_samples(|| run_resume_batch(rt, &snapshot, concurrency));
+    rt.block_on(warm_sandbox.stop())?;
+    samples
+}
+
+fn bench_snapshot_throughput(c: &mut Criterion) {
+    let concurrency = throughput_concurrency().expect("valid throughput concurrency");
+    let rt = Runtime::new().expect("create Tokio runtime for throughput benchmarks");
+    let mut group = c.benchmark_group("snapshot_throughput");
+    group.throughput(Throughput::Elements(concurrency as u64));
+    group.sample_size(FULL_SAMPLE_SIZE);
+    group.sampling_mode(SamplingMode::Flat);
+    group.measurement_time(FULL_THROUGHPUT_MEASUREMENT_TIME);
+
+    let snapshot = rt
+        .block_on(prepare_snapshot())
+        .expect("prepare resume snapshot");
+    let mut warm_sandbox = rt
+        .block_on(FirecrackerSandbox::resume_from_snapshot_config(&snapshot))
+        .expect("warm resume snapshot");
+    group.bench_function("concurrent_resume_throughput", |b| {
+        b.iter_custom(|iters| {
+            (0..iters)
+                .map(|_| run_resume_batch(&rt, &snapshot, concurrency).expect("resume batch"))
+                .sum()
+        });
+    });
+    rt.block_on(warm_sandbox.stop()).expect("stop warm sandbox");
+
+    group.bench_function("concurrent_snapshot_capture_throughput", |b| {
+        b.iter_custom(|iters| {
+            (0..iters)
+                .map(|_| {
+                    run_running_batch(&rt, concurrency, capture_running_sandbox)
+                        .expect("snapshot capture batch")
+                })
+                .sum()
+        });
+    });
+    group.bench_function("concurrent_pause_throughput", |b| {
+        b.iter_custom(|iters| {
+            (0..iters)
+                .map(|_| {
+                    run_running_batch(&rt, concurrency, pause_running_sandbox).expect("pause batch")
+                })
+                .sum()
+        });
+    });
+    group.finish();
+}
+
 fn run_default_snapshot_benchmarks() -> Result<()> {
     let Some(filters) = filtered_benchmark_names()? else {
         return Ok(());
@@ -635,6 +917,33 @@ fn run_default_snapshot_benchmarks() -> Result<()> {
     ran |= run_default_benchmark("concurrent_resume", &filters, || {
         default_concurrent_resume(&rt)
     });
+    let concurrency = throughput_concurrency()?;
+    ran |= run_default_throughput_benchmark(
+        "concurrent_resume_throughput",
+        &filters,
+        concurrency,
+        || default_resume_throughput(&rt, concurrency),
+    )?;
+    ran |= run_default_throughput_benchmark(
+        "concurrent_snapshot_capture_throughput",
+        &filters,
+        concurrency,
+        || {
+            default_throughput_samples(|| {
+                run_running_batch(&rt, concurrency, capture_running_sandbox)
+            })
+        },
+    )?;
+    ran |= run_default_throughput_benchmark(
+        "concurrent_pause_throughput",
+        &filters,
+        concurrency,
+        || {
+            default_throughput_samples(|| {
+                run_running_batch(&rt, concurrency, pause_running_sandbox)
+            })
+        },
+    )?;
 
     if !ran {
         eprintln!(
@@ -654,6 +963,7 @@ fn run_full_snapshot_benchmarks() {
     bench_snapshot_resume_cold(&mut criterion);
     bench_snapshot_resume(&mut criterion);
     bench_snapshot_concurrent_resume(&mut criterion);
+    bench_snapshot_throughput(&mut criterion);
     criterion.final_summary();
 }
 
