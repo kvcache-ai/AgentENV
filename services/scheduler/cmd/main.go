@@ -54,10 +54,18 @@ func main() {
 		schedulerv1.RegisterSchedulerServer(g, svc)
 		logger.Info("scheduler query-only service enabled", zap.String("redis_addr", cfg.Scheduler.RedisAddr))
 	} else {
-		registry := scheduler.NewAtomicNodeRegistry(nil, cfg.Scheduler.ReportTTL)
-		switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode)) {
+		discoveryMode := strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode))
+		var registry *scheduler.AtomicNodeRegistry
+		if discoveryMode == "heartbeat" {
+			registry = scheduler.NewHeartbeatNodeRegistry(cfg.Scheduler.ReportTTL)
+		} else {
+			registry = scheduler.NewAtomicNodeRegistry(nil, cfg.Scheduler.ReportTTL)
+		}
+		switch discoveryMode {
 		case "kubernetes":
 			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry)
+		case "heartbeat":
+			logger.Info("scheduler heartbeat discovery enabled")
 		default:
 			nodes := make([]scheduler.Node, 0, len(cfg.Scheduler.Nodes))
 			for _, n := range cfg.Scheduler.Nodes {
@@ -66,16 +74,34 @@ func main() {
 			registry.Set(nodes, nil)
 		}
 
-		svc := scheduler.NewService(
-			logger,
-			registry,
-			scheduler.NewStrategy(cfg.Scheduler.Strategy),
-			store,
+		options := []scheduler.ServiceOption{
 			scheduler.WithArtifactStore(scheduler.NewInMemoryArtifactStore(
 				cfg.Scheduler.ArtifactStoreCapacity,
 				cfg.Scheduler.ArtifactLookupNodeLimit,
 			)),
 			scheduler.WithNodeResourceLimit(cfg.Scheduler.NodeResourceLimit),
+			scheduler.WithHeartbeatRegistrationToken(cfg.Scheduler.HeartbeatRegistrationToken),
+		}
+		if cfg.Scheduler.Fleet.Enabled {
+			fleetPlanner, planErr := scheduler.NewFleetPlanner(registry, scheduler.FleetPolicy{
+				MinNodes: cfg.Scheduler.Fleet.MinNodes, MaxNodes: cfg.Scheduler.Fleet.MaxNodes,
+				WarmNodes:            cfg.Scheduler.Fleet.WarmNodes,
+				MaxSandboxesPerNode:  cfg.Scheduler.Fleet.MaxSandboxesPerNode,
+				MaxMemoryUsedPercent: cfg.Scheduler.Fleet.MaxMemoryUsedPercent,
+				EmptyGrace:           cfg.Scheduler.Fleet.EmptyGrace, DrainGrace: cfg.Scheduler.Fleet.DrainGrace,
+				DemandTTL: cfg.Scheduler.Fleet.DemandTTL,
+			})
+			if planErr != nil {
+				logger.Fatal("create scheduler fleet planner failed", zap.Error(planErr))
+			}
+			options = append(options, scheduler.WithFleetPlanner(fleetPlanner))
+		}
+		svc := scheduler.NewService(
+			logger,
+			registry,
+			scheduler.NewStrategy(cfg.Scheduler.Strategy),
+			store,
+			options...,
 		)
 		go svc.RunObservedNodesMetrics(sigCtx, 15*time.Second)
 		schedulerv1.RegisterSchedulerServer(g, svc)

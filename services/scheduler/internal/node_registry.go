@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"errors"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -27,11 +28,14 @@ type NodeRegistry interface {
 	// Returns nil if the node has never sent a heartbeat.
 	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
+	SetCordoned(nodeID string, serviceInstanceID string, cordoned bool) error
+	HeartbeatDiscovery() bool
 }
 
 var (
 	ErrServiceInstanceMismatch = errors.New("service instance mismatch")
 	ErrNodeNotInRegistry       = errors.New("node is not in scheduler node list")
+	ErrInvalidNodeEndpoint     = errors.New("invalid node endpoint")
 	defaultObservedReportTTL   = 30 * time.Second
 )
 
@@ -42,13 +46,15 @@ type observedNodeRecord struct {
 }
 
 type AtomicNodeRegistry struct {
-	mu               sync.RWMutex
-	nodesByID        map[string]Node
-	lingeringIDs     map[string]bool
-	observedTTL      time.Duration
-	observed         map[string]observedNodeRecord
-	cpuIntersection  map[string]string
-	intersectionSent map[string]bool
+	mu                 sync.RWMutex
+	nodesByID          map[string]Node
+	lingeringIDs       map[string]bool
+	observedTTL        time.Duration
+	observed           map[string]observedNodeRecord
+	cpuIntersection    map[string]string
+	intersectionSent   map[string]bool
+	heartbeatDiscovery bool
+	now                func() time.Time
 }
 
 func NewAtomicNodeRegistry(nodes []Node, observedTTL time.Duration) *AtomicNodeRegistry {
@@ -64,9 +70,20 @@ func NewAtomicNodeRegistry(nodes []Node, observedTTL time.Duration) *AtomicNodeR
 		observed:         make(map[string]observedNodeRecord),
 		cpuIntersection:  make(map[string]string),
 		intersectionSent: make(map[string]bool),
+		now:              time.Now,
 	}
 	registry.Set(nodes, nil)
 	return registry
+}
+
+func NewHeartbeatNodeRegistry(observedTTL time.Duration) *AtomicNodeRegistry {
+	registry := NewAtomicNodeRegistry(nil, observedTTL)
+	registry.heartbeatDiscovery = true
+	return registry
+}
+
+func (r *AtomicNodeRegistry) HeartbeatDiscovery() bool {
+	return r.heartbeatDiscovery
 }
 
 // Snapshot returns discovered nodes filtered by their derived status.
@@ -77,6 +94,12 @@ func (r *AtomicNodeRegistry) Snapshot(allowLingering bool) []Node {
 	for _, node := range r.nodesByID {
 		if r.lingeringIDs[node.ID] && !allowLingering {
 			continue
+		}
+		if r.heartbeatDiscovery {
+			record, ok := r.observed[node.ID]
+			if !ok || !recordReady(record, r.now()) {
+				continue
+			}
 		}
 		result = append(result, node)
 	}
@@ -146,13 +169,31 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 	defer r.mu.Unlock()
 	node, ok := r.nodesByID[req.GetNodeId()]
 	if !ok {
-		return Node{}, "", ErrNodeNotInRegistry
+		if !r.heartbeatDiscovery {
+			return Node{}, "", ErrNodeNotInRegistry
+		}
+		endpoint := strings.TrimSpace(req.GetEndpoint())
+		if !validNodeEndpoint(endpoint) {
+			return Node{}, "", ErrInvalidNodeEndpoint
+		}
+		node = Node{ID: req.GetNodeId(), Endpoint: endpoint}
+		r.nodesByID[node.ID] = node
+	} else if r.heartbeatDiscovery {
+		endpoint := strings.TrimSpace(req.GetEndpoint())
+		if !validNodeEndpoint(endpoint) {
+			return Node{}, "", ErrInvalidNodeEndpoint
+		}
+		node.Endpoint = endpoint
+		r.nodesByID[node.ID] = node
 	}
 
 	prevCPU, existed := "", false
 	if prev, ok := r.observed[req.GetNodeId()]; ok {
 		existed = true
 		prevCPU = prev.node.GetMachineInfo().GetCpuConfigJson()
+		if prev.node.GetServiceInstanceId() != req.GetServiceInstanceId() {
+			delete(r.lingeringIDs, req.GetNodeId())
+		}
 		if machineInfo != nil && machineInfo.CpuConfigJson == "" {
 			machineInfo.CpuConfigJson = prevCPU
 		}
@@ -359,8 +400,53 @@ func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID
 
 	clusterID := record.node.GetClusterId()
 	delete(r.observed, nodeID)
+	if r.heartbeatDiscovery {
+		delete(r.nodesByID, nodeID)
+		delete(r.lingeringIDs, nodeID)
+	}
 	r.invalidateIntersectionLocked(clusterID)
 	return nil
+}
+
+func (r *AtomicNodeRegistry) SetCordoned(nodeID string, serviceInstanceID string, cordoned bool) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	record, ok := r.observed[nodeID]
+	if !ok {
+		return ErrNodeNotInRegistry
+	}
+	if record.node.GetServiceInstanceId() != serviceInstanceID {
+		return ErrServiceInstanceMismatch
+	}
+	if cordoned {
+		r.lingeringIDs[nodeID] = true
+	} else {
+		delete(r.lingeringIDs, nodeID)
+	}
+	return nil
+}
+
+func validNodeEndpoint(raw string) bool {
+	parsed, err := url.Parse(raw)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return false
+	}
+	return parsed.User == nil && parsed.Fragment == "" && parsed.RawQuery == "" && (parsed.Path == "" || parsed.Path == "/")
+}
+
+func recordReady(record observedNodeRecord, now time.Time) bool {
+	if record.node == nil || record.node.GetSnapshot() == nil {
+		return false
+	}
+	ttl := record.reportTTL
+	if ttl <= 0 {
+		ttl = defaultObservedReportTTL
+	}
+	lastSeen := time.UnixMilli(record.node.GetLastSeenUnixMs())
+	if record.node.GetLastSeenUnixMs() <= 0 || now.Sub(lastSeen) > ttl {
+		return false
+	}
+	return record.node.GetSnapshot().GetStatus() == schedulerv1.NodeStatus_NODE_STATUS_READY
 }
 
 // deriveObservedNodeViewLocked builds the external ObservedNode view for a

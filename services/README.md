@@ -11,7 +11,7 @@ Go implementation of a distributed Gateway and pluggable Scheduler for AgentENV.
 - Gateway routes sandbox requests by existing sandbox-to-node binding.
 - Scheduler exposes gRPC API and supports pluggable strategy providers.
 - Built-in strategies in v1: round_robin and random.
-- Scheduler supports both static node configuration and Kubernetes EndpointSlice discovery.
+- Scheduler supports static configuration, Kubernetes EndpointSlice discovery, and authenticated heartbeat discovery.
 - Scheduler sandbox binding store can be in-memory or Redis-backed.
 - Scheduler can run as a primary read/write service or as query-only replicas that serve only `LookupNode` from Redis.
 - Scheduler observes node health and sandbox roster from heartbeats, and drops expired sandbox-to-node bindings on heartbeat, node unregistration, or lookup.
@@ -92,6 +92,7 @@ Scheduler discovery modes:
 
 - `static` (default): use `scheduler.nodes` from config.
 - `kubernetes`: watch EndpointSlices for a headless Service and build the node list from serving Pod endpoints. Terminating endpoints, or Pods matching `no_schedule_pod_selector`, are kept as lingering/no-schedule nodes; Pods matching `ignore_pod_selector` are excluded.
+- `heartbeat`: register nodes from authenticated heartbeats. Each runtime must set `AENV_OBSERVABILITY_NODE_ENDPOINT` and `AENV_OBSERVABILITY_REGISTRATION_TOKEN`; the Scheduler must receive the same token in `SCHEDULER_HEARTBEAT_REGISTRATION_TOKEN`. Nodes stop receiving new work after `scheduler.report_ttl` without a heartbeat.
 
 General config notes:
 
@@ -107,6 +108,21 @@ General config notes:
 - `SCHEDULER_REDIS_ADDR=<addr>` overrides `scheduler.redis_addr` from the environment.
 - `SCHEDULER_ARTIFACT_STORE_CAPACITY=<count>` overrides `scheduler.artifact_store_capacity` from the environment.
 - `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT=<count>` overrides `scheduler.artifact_lookup_node_limit` from the environment.
+- `SCHEDULER_HEARTBEAT_REGISTRATION_TOKEN=<secret>` authenticates node registration when discovery mode is `heartbeat`.
+
+### Fleet planning
+
+When `scheduler.fleet.enabled` is true, AgentENV computes desired capacity from heartbeat sandbox and memory reservations. It adds `warm_nodes` of headroom and reacts to recent scheduling failures. The planner returns exact node ID and service-generation references for cordon and deletion; it never deletes infrastructure itself.
+
+An external infrastructure executor should call these protected Gateway endpoints and apply at most one plan action per reconcile:
+
+- `POST /fleet/plan` with `{"fleetNodeIds":["node-a"]}`
+- `POST /fleet/nodes/{id}/cordon` with `{"serviceInstanceId":"..."}`
+- `POST /fleet/nodes/{id}/uncordon` with `{"serviceInstanceId":"..."}`
+
+Scale-in is two phase. A node must stay empty for `empty_grace`, then stay cordoned and empty for `drain_grace`, before the plan names that exact node generation for deletion. Starting, running, and paused sandboxes all block deletion.
+
+Fleet settings are `min_nodes`, `max_nodes`, `warm_nodes`, `max_sandboxes_per_node`, `max_memory_used_percent`, `empty_grace`, `drain_grace`, and `demand_ttl`. Duration values use Go duration strings such as `"15m"`.
 
 ### Scheduling strategy
 
@@ -308,3 +324,6 @@ Methods:
 - ReportSandboxEvent
 - GetNode
 - UnregisterNode
+- GetFleetPlan
+- CordonNode
+- UncordonNode
