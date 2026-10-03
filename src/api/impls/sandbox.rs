@@ -889,6 +889,58 @@ impl Sandboxes<()> for ApiImpl {
         }
     }
 
+    async fn v2_sandboxes_sandbox_id_logs_get(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        path: &models::V2SandboxesSandboxIdLogsGetPathParams,
+        query: &models::V2SandboxesSandboxIdLogsGetQueryParams,
+    ) -> Result<V2SandboxesSandboxIdLogsGetResponse, ()> {
+        use V2SandboxesSandboxIdLogsGetResponse::*;
+        let Ok(id) = SandboxId::parse_str(&path.sandbox_id) else {
+            return Ok(Status404_NotFound(sandbox_not_found(&path.sandbox_id)));
+        };
+        let level = query.level.map(Into::into);
+        match self
+            .orchestrator
+            .sandbox_logs(
+                id,
+                query.cursor.map(|value| value as i64),
+                query.limit.unwrap_or(1000) as usize,
+                query.direction != Some(models::LogsDirection::LogsDirectionForward),
+                level,
+                query.search.clone(),
+            )
+            .await
+        {
+            Ok(entries) => Ok(Status200_SuccessfullyReturnedTheSandboxLogs(
+                models::SandboxLogsV2Response {
+                    logs: entries
+                        .into_iter()
+                        .map(|entry| models::SandboxLogEntry {
+                            timestamp: entry.timestamp,
+                            level: entry.level.into(),
+                            message: entry.message,
+                            fields: entry.fields.into_iter().collect(),
+                        })
+                        .collect(),
+                },
+            )),
+            Err(OrchestratorError::SandboxNotFound(_)) => {
+                Ok(Status404_NotFound(sandbox_not_found(&path.sandbox_id)))
+            }
+            Err(error) => {
+                warn!(sandbox_id = %id, %error, "sandbox log query failed");
+                Ok(Status500_ServerError(ApiImpl::error(
+                    500,
+                    "Failed to fetch sandbox logs",
+                )))
+            }
+        }
+    }
+
     async fn sandboxes_sandbox_id_metrics_get(
         &self,
         _method: &Method,

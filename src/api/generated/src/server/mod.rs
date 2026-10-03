@@ -137,6 +137,10 @@ where
             "/v2/sandboxes/{sandbox_id}/connect",
             post(v2_sandboxes_sandbox_id_connect_post::<I, A, E, C>),
         )
+        .route(
+            "/v2/sandboxes/{sandbox_id}/logs",
+            get(v2_sandboxes_sandbox_id_logs_get::<I, A, E, C>),
+        )
         .route("/v2/templates", get(v2_templates_get::<I, A, E, C>))
         .route(
             "/v2/templates/{template_id}/builds/{build_id}",
@@ -4081,6 +4085,172 @@ where
                                                   response.body(Body::from(body_content))
                                                 },
                                                 apis::sandboxes::V2SandboxesSandboxIdConnectPostResponse::Status500_ServerError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(500);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                            },
+                                            Err(why) => {
+                                                    // Application code returned an error. This should not happen, as the implementation should
+                                                    // return a valid response.
+                                                    return api_impl.as_ref().handle_error(&method, &host, &cookies, why).await;
+                                            },
+                                        };
+
+    resp.map_err(|e| {
+        error!(error = ?e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+#[tracing::instrument(skip_all)]
+fn v2_sandboxes_sandbox_id_logs_get_validation(
+    path_params: models::V2SandboxesSandboxIdLogsGetPathParams,
+    query_params: models::V2SandboxesSandboxIdLogsGetQueryParams,
+) -> std::result::Result<
+    (
+        models::V2SandboxesSandboxIdLogsGetPathParams,
+        models::V2SandboxesSandboxIdLogsGetQueryParams,
+    ),
+    ValidationErrors,
+> {
+    path_params.validate()?;
+    query_params.validate()?;
+
+    Ok((path_params, query_params))
+}
+/// V2SandboxesSandboxIdLogsGet - GET /v2/sandboxes/{sandboxID}/logs
+#[tracing::instrument(skip_all)]
+async fn v2_sandboxes_sandbox_id_logs_get<I, A, E, C>(
+    method: Method,
+    TypedHeader(host): TypedHeader<Host>,
+    cookies: CookieJar,
+    headers: HeaderMap,
+    Path(path_params): Path<models::V2SandboxesSandboxIdLogsGetPathParams>,
+    QueryExtra(query_params): QueryExtra<models::V2SandboxesSandboxIdLogsGetQueryParams>,
+    State(api_impl): State<I>,
+) -> Result<Response, StatusCode>
+where
+    I: AsRef<A> + Send + Sync,
+    A: apis::sandboxes::Sandboxes<E, Claims = C>
+        + apis::ApiKeyAuthHeader<Claims = C>
+        + apis::ApiAuthBasic<Claims = C>
+        + Send
+        + Sync,
+    E: std::fmt::Debug + Send + Sync + 'static,
+{
+    // Authentication
+    let claims_in_header = api_impl
+        .as_ref()
+        .extract_claims_from_header(&headers, "X-Team-ID")
+        .await;
+    let claims_in_auth_header = api_impl
+        .as_ref()
+        .extract_claims_from_auth_header(apis::BasicAuthKind::Bearer, &headers, "authorization")
+        .await;
+    let claims = None.or(claims_in_header).or(claims_in_auth_header);
+    let Some(claims) = claims else {
+        return response_with_status_code_only(StatusCode::UNAUTHORIZED);
+    };
+
+    #[allow(clippy::redundant_closure)]
+    let validation = tokio::task::spawn_blocking(move || {
+        v2_sandboxes_sandbox_id_logs_get_validation(path_params, query_params)
+    })
+    .await
+    .unwrap();
+
+    let Ok((path_params, query_params)) = validation else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(validation.unwrap_err().to_string()))
+            .map_err(|_| StatusCode::BAD_REQUEST);
+    };
+
+    let result = api_impl
+        .as_ref()
+        .v2_sandboxes_sandbox_id_logs_get(
+            &method,
+            &host,
+            &cookies,
+            &claims,
+            &path_params,
+            &query_params,
+        )
+        .await;
+
+    let mut response = Response::builder();
+
+    let resp = match result {
+                                            Ok(rsp) => match rsp {
+                                                apis::sandboxes::V2SandboxesSandboxIdLogsGetResponse::Status200_SuccessfullyReturnedTheSandboxLogs
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(200);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::V2SandboxesSandboxIdLogsGetResponse::Status401_AuthenticationError
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(401);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::V2SandboxesSandboxIdLogsGetResponse::Status404_NotFound
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(404);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::V2SandboxesSandboxIdLogsGetResponse::Status500_ServerError
                                                     (body)
                                                 => {
                                                   let mut response = response.status(500);

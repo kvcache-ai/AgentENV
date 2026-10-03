@@ -15,6 +15,7 @@ use tracing::{
 };
 use tracing_subscriber::{layer::Context as LayerContext, registry::LookupSpan, Layer};
 
+use crate::logging::LogLevel;
 use crate::snapshot::{repository::SnapshotRepository, SnapshotId};
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -27,19 +28,10 @@ fn active_build_logs() -> &'static Mutex<HashMap<String, Weak<Mutex<Buffer>>>> {
     ACTIVE_BUILD_LOGS.get_or_init(Default::default)
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
-#[serde(rename_all = "lowercase")]
-pub enum BuildLogLevel {
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct BuildLogEntry {
     pub timestamp: DateTime<Utc>,
-    pub level: BuildLogLevel,
+    pub level: LogLevel,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step: Option<String>,
@@ -57,7 +49,7 @@ struct Buffer {
 pub struct BuildLogger(Option<Arc<Mutex<Buffer>>>);
 
 impl BuildLogger {
-    pub fn log(&self, level: BuildLogLevel, step: Option<&str>, message: impl Into<String>) {
+    pub fn log(&self, level: LogLevel, step: Option<&str>, message: impl Into<String>) {
         let Some(buffer) = &self.0 else { return };
         let mut buffer = buffer.lock().unwrap();
         if buffer.truncated || buffer.sealed {
@@ -76,7 +68,7 @@ impl BuildLogger {
         let mut step = step.map(str::to_owned);
         if buffer.entries.len() >= MAX_ENTRIES || buffer.bytes + message.len() > MAX_BYTES {
             message = "Build log limit reached; subsequent output is omitted".into();
-            level = BuildLogLevel::Warn;
+            level = LogLevel::Warn;
             step = None;
             buffer.truncated = true;
         }
@@ -98,9 +90,9 @@ impl BuildLogger {
         for line in String::from_utf8_lossy(bytes).lines() {
             self.log(
                 if stderr {
-                    BuildLogLevel::Warn
+                    LogLevel::Warn
                 } else {
-                    BuildLogLevel::Info
+                    LogLevel::Info
                 },
                 step,
                 line,
@@ -198,10 +190,10 @@ where
             message.push_str(&visitor.fields.join(" "));
         }
         let level = match *event.metadata().level() {
-            tracing::Level::DEBUG | tracing::Level::TRACE => BuildLogLevel::Debug,
-            tracing::Level::INFO => BuildLogLevel::Info,
-            tracing::Level::WARN => BuildLogLevel::Warn,
-            tracing::Level::ERROR => BuildLogLevel::Error,
+            tracing::Level::DEBUG | tracing::Level::TRACE => LogLevel::Debug,
+            tracing::Level::INFO => LogLevel::Info,
+            tracing::Level::WARN => LogLevel::Warn,
+            tracing::Level::ERROR => LogLevel::Error,
         };
         BuildLogger(Some(buffer)).log(level, None, message);
     }
@@ -394,10 +386,10 @@ mod tests {
         assert_eq!(
             entries.iter().map(|entry| entry.level).collect::<Vec<_>>(),
             vec![
-                BuildLogLevel::Debug,
-                BuildLogLevel::Info,
-                BuildLogLevel::Warn,
-                BuildLogLevel::Error,
+                LogLevel::Debug,
+                LogLevel::Info,
+                LogLevel::Warn,
+                LogLevel::Error,
             ]
         );
         assert!(entries[0].message.contains("debug event"));
@@ -436,14 +428,14 @@ mod tests {
         for n in 0..600 {
             session
                 .logger
-                .log(BuildLogLevel::Info, None, format!("line {n}"));
+                .log(LogLevel::Info, None, format!("line {n}"));
         }
         assert!(logs.temporary(&id).is_some());
         let logger = session.logger.clone();
         session.finish().await?;
         assert!(logs.temporary(&id).is_none());
         logger.log(
-            BuildLogLevel::Info,
+            LogLevel::Info,
             None,
             "late write must not change the closed stream",
         );
@@ -479,9 +471,7 @@ mod tests {
         let id = SnapshotId::generate();
         let logs = BuildLogs::default();
         let session = logs.start(id.clone(), repository.clone());
-        session
-            .logger
-            .log(BuildLogLevel::Info, None, "interrupted task");
+        session.logger.log(LogLevel::Info, None, "interrupted task");
         drop(session);
         tokio::time::timeout(Duration::from_secs(5), async {
             while logs.temporary(&id).is_some() {
@@ -498,10 +488,10 @@ mod tests {
         let buffer = Arc::new(Mutex::new(Buffer::default()));
         let logger = BuildLogger(Some(buffer.clone()));
         for _ in 0..MAX_ENTRIES + 2 {
-            logger.log(BuildLogLevel::Info, None, "");
+            logger.log(LogLevel::Info, None, "");
         }
         let buffer = buffer.lock().unwrap();
         assert_eq!(buffer.entries.len(), MAX_ENTRIES + 1);
-        assert_eq!(buffer.entries.last().unwrap().level, BuildLogLevel::Warn);
+        assert_eq!(buffer.entries.last().unwrap().level, LogLevel::Warn);
     }
 }

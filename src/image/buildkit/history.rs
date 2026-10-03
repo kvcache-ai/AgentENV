@@ -1,6 +1,7 @@
 use std::{net::SocketAddr, time::Duration};
 
-use crate::template::logs::{BuildLogLevel, BuildLogger};
+use crate::logging::LogLevel;
+use crate::template::logs::BuildLogger;
 use anyhow::{bail, Context, Result};
 use tonic::transport::{Channel, Endpoint};
 
@@ -65,7 +66,7 @@ impl BuildkitHistory {
                         match collectors.join_next().await {
                             Some(Ok(Ok(()))) => {}
                             other => logger.log(
-                                BuildLogLevel::Warn,
+                                LogLevel::Warn,
                                 None,
                                 format!("BuildKit log collection did not finish: {other:?}"),
                             ),
@@ -110,27 +111,27 @@ struct VertexProgress {
 fn vertex_updates(
     vertex: &proto::Vertex,
     progress: &mut VertexProgress,
-) -> Vec<(BuildLogLevel, String)> {
+) -> Vec<(LogLevel, String)> {
     let mut updates = Vec::new();
     if vertex.started.is_some() && !progress.started && !progress.finished {
         progress.started = true;
-        updates.push((BuildLogLevel::Info, "started".to_owned()));
+        updates.push((LogLevel::Info, "started".to_owned()));
     }
     if !vertex.error.is_empty() {
         if progress.error.as_deref() != Some(&vertex.error) {
             progress.error = Some(vertex.error.clone());
-            updates.push((BuildLogLevel::Error, vertex.error.clone()));
+            updates.push((LogLevel::Error, vertex.error.clone()));
         }
         progress.finished = true;
     } else if vertex.cached {
         if !progress.cached {
             progress.cached = true;
-            updates.push((BuildLogLevel::Info, "cached".to_owned()));
+            updates.push((LogLevel::Info, "cached".to_owned()));
         }
         progress.finished = true;
     } else if vertex.completed.is_some() && !progress.finished {
         progress.finished = true;
-        updates.push((BuildLogLevel::Info, "completed".to_owned()));
+        updates.push((LogLevel::Info, "completed".to_owned()));
     }
     updates
 }
@@ -193,7 +194,7 @@ async fn collect_status(
                 if attempt == 0 {
                     for warning in status.warnings {
                         logger.log(
-                            BuildLogLevel::Warn,
+                            LogLevel::Warn,
                             None,
                             String::from_utf8_lossy(&warning.short),
                         );
@@ -271,8 +272,8 @@ mod tests {
         assert_eq!(
             vertex_updates(&completed, &mut progress),
             vec![
-                (BuildLogLevel::Info, "started".to_owned()),
-                (BuildLogLevel::Info, "completed".to_owned()),
+                (LogLevel::Info, "started".to_owned()),
+                (LogLevel::Info, "completed".to_owned()),
             ]
         );
         let replayed_start = proto::Vertex {
@@ -481,8 +482,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["output", "output", "last"]
         );
-        assert_eq!(entries[0].level, BuildLogLevel::Warn);
-        assert_eq!(entries[2].level, BuildLogLevel::Info);
+        assert_eq!(entries[0].level, LogLevel::Warn);
+        assert_eq!(entries[2].level, LogLevel::Info);
         assert_eq!(status_calls.load(Ordering::SeqCst), 2);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         Ok(())

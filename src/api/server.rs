@@ -35,6 +35,7 @@ where
     // proxy contract.
     agentenv_http_server::server::new::<I, A, E, C>(api_impl.clone())
         .route_layer(middleware::from_fn(optional_connect_body))
+        .route_layer(middleware::from_fn(sandbox_logs_cursor))
         .merge(proxy::router(api_impl.clone()))
         .merge(super::impls::image_build::router(api_impl.clone()))
         .route("/metrics", get(metrics_handler))
@@ -47,6 +48,31 @@ where
             auth::require_auth::<I>,
         ))
         .layer(middleware::from_fn(prometheus::http_metrics_middleware))
+}
+
+async fn sandbox_logs_cursor(request: Request, next: Next) -> Response {
+    if request.method() == Method::GET
+        && request
+            .extensions()
+            .get::<MatchedPath>()
+            .is_some_and(|path| path.as_str() == "/v2/sandboxes/{sandbox_id}/logs")
+    {
+        for (key, value) in
+            url::form_urlencoded::parse(request.uri().query().unwrap_or("").as_bytes())
+        {
+            if key == "cursor" && value.parse::<i64>().map_or(true, |value| value < 0) {
+                return (
+                    http::StatusCode::BAD_REQUEST,
+                    axum::Json(agentenv_http_server::models::Error {
+                        code: 400,
+                        message: "cursor must be a non-negative int64".into(),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+    next.run(request).await
 }
 
 // The generated Json<Option<ConnectSandboxV2>> extractor accepts JSON null,

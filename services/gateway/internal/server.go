@@ -642,6 +642,9 @@ func sandboxIDFromPath(path string) (string, bool) {
 
 func isSandboxControlPlaneRequest(r *http.Request) bool {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) == 4 && parts[0] == "v2" && parts[1] == "sandboxes" && strings.TrimSpace(parts[2]) != "" && parts[3] == "logs" {
+		return r.Method == http.MethodGet
+	}
 	if len(parts) == 4 && parts[0] == "v2" && parts[1] == "sandboxes" && strings.TrimSpace(parts[2]) != "" && parts[3] == "connect" {
 		return r.Method == http.MethodPost
 	}

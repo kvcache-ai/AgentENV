@@ -686,7 +686,8 @@ async fn saturated_builder_api_leaves_template_waiting_without_allocating() -> R
 
 mod build_logs {
     use super::*;
-    use crate::template::logs::{BuildLogLevel, BuildLogs};
+    use crate::logging::LogLevel;
+    use crate::template::logs::BuildLogs;
     use axum::body::{to_bytes, Body};
     use http::{Request, StatusCode};
     use serde_json::{json, Value};
@@ -725,9 +726,9 @@ mod build_logs {
         for n in 0..230 {
             session.logger.log(
                 if n % 2 == 0 {
-                    BuildLogLevel::Info
+                    LogLevel::Info
                 } else {
-                    BuildLogLevel::Warn
+                    LogLevel::Warn
                 },
                 Some("2"),
                 format!("line {n}"),
@@ -784,9 +785,7 @@ mod build_logs {
 
         // A final new entry guarantees finish performs a final flush even if a
         // periodic flush raced with the persistent replacement above.
-        session
-            .logger
-            .log(BuildLogLevel::Info, Some("2"), "line 230");
+        session.logger.log(LogLevel::Info, Some("2"), "line 230");
         session.finish().await?;
         assert_eq!(
             get(&app, &format!("{path}/logs?source=temporary"), true)
@@ -901,13 +900,11 @@ mod build_logs {
             .start(id.clone(), api.snapshot_manager.repository());
         session
             .logger
-            .log(BuildLogLevel::Info, Some("2"), "step started");
+            .log(LogLevel::Info, Some("2"), "step started");
+        session.logger.log(LogLevel::Error, Some("1"), "other step");
         session
             .logger
-            .log(BuildLogLevel::Error, Some("1"), "other step");
-        session
-            .logger
-            .log(BuildLogLevel::Warn, Some("2"), "failed output");
+            .log(LogLevel::Warn, Some("2"), "failed output");
         api.snapshot_manager
             .mark_build_error(
                 id,

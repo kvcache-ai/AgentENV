@@ -1973,6 +1973,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sandbox_logs_http_contract_validates_auth_and_query() {
+        let api = build_api().await;
+        let app = server::new(api.clone());
+        let id = SandboxId::new();
+        let path = format!("/v2/sandboxes/{id}/logs");
+        let auth = [(API_KEY_HEADER, TEST_API_KEY)];
+        assert_eq!(get_status(&app, &path, &[]).await, StatusCode::UNAUTHORIZED);
+        for suffix in [
+            "?limit=-1",
+            "?limit=1001",
+            "?cursor=-1",
+            "?cursor=9223372036854775808",
+            "?direction=sideways",
+            "?level=fatal",
+            &format!("?search={}", "x".repeat(257)),
+        ] {
+            assert_eq!(
+                get_status(&app, &format!("{path}{suffix}"), &auth).await,
+                StatusCode::BAD_REQUEST,
+                "{suffix}"
+            );
+        }
+        for suffix in [
+            "",
+            "?limit=0",
+            "?limit=1000",
+            "?cursor=9223372036854775807",
+            "?direction=forward&level=warn&search=Hello",
+        ] {
+            assert_eq!(
+                get_status(&app, &format!("{path}{suffix}"), &auth).await,
+                StatusCode::NOT_FOUND,
+                "{suffix}"
+            );
+        }
+        api.orchestrator()
+            .set_proxy_target_for_test(
+                id,
+                ProxyTarget::new(Ipv4Addr::LOCALHOST),
+                crate::orchestrator::SandboxState::Paused,
+            )
+            .await;
+        for suffix in ["", "?limit=0"] {
+            assert_eq!(
+                get_status(&app, &format!("{path}{suffix}"), &auth).await,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "paused sandboxes cannot serve guest logs"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn sandbox_metrics_http_contract_auth_csv_and_time_validation() {
         let app = server::new(build_api().await);
         let a = SandboxId::new();

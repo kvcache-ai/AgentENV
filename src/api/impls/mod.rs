@@ -28,6 +28,28 @@ use agentenv_http_server::{apis, models};
 #[derive(Clone, Debug)]
 pub struct Claims;
 
+impl From<models::LogLevel> for crate::logging::LogLevel {
+    fn from(level: models::LogLevel) -> Self {
+        match level {
+            models::LogLevel::Debug => Self::Debug,
+            models::LogLevel::Info => Self::Info,
+            models::LogLevel::Warn => Self::Warn,
+            models::LogLevel::Error => Self::Error,
+        }
+    }
+}
+
+impl From<crate::logging::LogLevel> for models::LogLevel {
+    fn from(level: crate::logging::LogLevel) -> Self {
+        match level {
+            crate::logging::LogLevel::Debug => Self::Debug,
+            crate::logging::LogLevel::Info => Self::Info,
+            crate::logging::LogLevel::Warn => Self::Warn,
+            crate::logging::LogLevel::Error => Self::Error,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ApiImpl {
     orchestrator: Arc<Orchestrator>,

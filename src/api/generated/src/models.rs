@@ -245,6 +245,40 @@ pub struct V2SandboxesSandboxIdConnectPostPathParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct V2SandboxesSandboxIdLogsGetPathParams {
+    pub sandbox_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct V2SandboxesSandboxIdLogsGetQueryParams {
+    /// Starting timestamp of the logs that should be returned in milliseconds
+    #[serde(rename = "cursor")]
+    #[validate(range(min = 0u64))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u64>,
+    /// Maximum number of logs that should be returned
+    #[serde(rename = "limit")]
+    #[validate(range(min = 0u32, max = 1000u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    /// Direction of the logs that should be returned
+    #[serde(rename = "direction")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub direction: Option<models::LogsDirection>,
+    /// Minimum log level to return. Logs below this level are excluded
+    #[serde(rename = "level")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub level: Option<models::LogLevel>,
+    /// Case-sensitive substring match on log message content
+    #[serde(rename = "search")]
+    #[validate(length(max = 256))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SnapshotsGetQueryParams {
     #[serde(rename = "sandboxID")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -6663,6 +6697,331 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxLifec
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into SandboxLifecycle - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxLogEntry {
+    /// Timestamp of the log entry
+    #[serde(rename = "timestamp")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+
+    /// Log message content
+    #[serde(rename = "message")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub message: String,
+
+    #[serde(rename = "level")]
+    #[validate(nested)]
+    pub level: models::LogLevel,
+
+    #[serde(rename = "fields")]
+    #[validate(custom(function = "check_xss_map_string"))]
+    pub fields: std::collections::HashMap<String, String>,
+}
+
+impl SandboxLogEntry {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        timestamp: chrono::DateTime<chrono::Utc>,
+        message: String,
+        level: models::LogLevel,
+        fields: std::collections::HashMap<String, String>,
+    ) -> SandboxLogEntry {
+        SandboxLogEntry {
+            timestamp,
+            message,
+            level,
+            fields,
+        }
+    }
+}
+
+/// Converts the SandboxLogEntry value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxLogEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping timestamp in query parameter serialization
+            Some("message".to_string()),
+            Some(self.message.to_string()),
+            // Skipping level in query parameter serialization
+
+            // Skipping fields in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxLogEntry value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxLogEntry {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub timestamp: Vec<chrono::DateTime<chrono::Utc>>,
+            pub message: Vec<String>,
+            pub level: Vec<models::LogLevel>,
+            pub fields: Vec<std::collections::HashMap<String, String>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxLogEntry".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "timestamp" => intermediate_rep.timestamp.push(
+                        <chrono::DateTime<chrono::Utc> as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "message" => intermediate_rep.message.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "level" => intermediate_rep.level.push(
+                        <models::LogLevel as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    "fields" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in SandboxLogEntry"
+                                .to_string(),
+                        );
+                    }
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing SandboxLogEntry".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxLogEntry {
+            timestamp: intermediate_rep
+                .timestamp
+                .into_iter()
+                .next()
+                .ok_or_else(|| "timestamp missing in SandboxLogEntry".to_string())?,
+            message: intermediate_rep
+                .message
+                .into_iter()
+                .next()
+                .ok_or_else(|| "message missing in SandboxLogEntry".to_string())?,
+            level: intermediate_rep
+                .level
+                .into_iter()
+                .next()
+                .ok_or_else(|| "level missing in SandboxLogEntry".to_string())?,
+            fields: intermediate_rep
+                .fields
+                .into_iter()
+                .next()
+                .ok_or_else(|| "fields missing in SandboxLogEntry".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxLogEntry> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxLogEntry>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxLogEntry>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxLogEntry - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxLogEntry> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxLogEntry as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxLogEntry - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct SandboxLogsV2Response {
+    /// Sandbox logs structured
+    #[serde(rename = "logs")]
+    #[validate(nested)]
+    pub logs: Vec<models::SandboxLogEntry>,
+}
+
+impl SandboxLogsV2Response {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(logs: Vec<models::SandboxLogEntry>) -> SandboxLogsV2Response {
+        SandboxLogsV2Response { logs }
+    }
+}
+
+/// Converts the SandboxLogsV2Response value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for SandboxLogsV2Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping logs in query parameter serialization
+
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a SandboxLogsV2Response value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for SandboxLogsV2Response {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub logs: Vec<Vec<models::SandboxLogEntry>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing SandboxLogsV2Response".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    "logs" => return std::result::Result::Err("Parsing a container in this style is not supported in SandboxLogsV2Response".to_string()),
+                    _ => return std::result::Result::Err("Unexpected key while parsing SandboxLogsV2Response".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(SandboxLogsV2Response {
+            logs: intermediate_rep
+                .logs
+                .into_iter()
+                .next()
+                .ok_or_else(|| "logs missing in SandboxLogsV2Response".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<SandboxLogsV2Response> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<SandboxLogsV2Response>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<SandboxLogsV2Response>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for SandboxLogsV2Response - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<SandboxLogsV2Response> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <SandboxLogsV2Response as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into SandboxLogsV2Response - {err}"#
                     )),
                 }
             }
