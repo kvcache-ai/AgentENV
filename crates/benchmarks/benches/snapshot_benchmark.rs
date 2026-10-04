@@ -61,7 +61,11 @@ fn throughput_concurrency() -> Result<usize> {
             );
             Ok(concurrency)
         }
-        Err(std::env::VarError::NotPresent) => Ok(CONCURRENCY),
+        Err(std::env::VarError::NotPresent) => thread::available_parallelism()
+            .context("determine available CPU parallelism for throughput benchmark")?
+            .get()
+            .checked_mul(2)
+            .context("default throughput concurrency overflowed"),
         Err(err) => Err(err).context(format!("read {BENCH_CONCURRENCY_ENV}")),
     }
 }
