@@ -122,10 +122,14 @@ The queue is in memory and best effort: restarts, full queues, missing cached
 layers, and failed uploads can skip publication. A later local-cache hit can
 try again. Duplicate work for the same repository and digest is suppressed while
 queued or running. Each node remembers up to 4096 completed publications: successes
-are skipped and failures wait five minutes before another resolve can retry.
+are skipped and transient failures wait five minutes before another resolve can retry.
+Explicit authorization failures stop upload retries and wait 24 hours before retrying.
 History is lost on restart or when older entries are evicted. Publisher settings
 are shared per normalized cache root and require a process restart to change.
 Attachments record the converter ID in `co.prometheus.overlaybd.converter`.
+Only a native attachment with that same ID suppresses publication; unlabelled,
+older-converter and ACR attachments do not. Consumer discovery remains unchanged;
+this does not force reconversion of images already served from a usable attachment.
 Standard-OCI config-cache entries are separated by converter ID; legacy unscoped
 entries are rebuilt on first use. Tools images are not published by this path.
 Each write gets at most three attempts; registry commands time out

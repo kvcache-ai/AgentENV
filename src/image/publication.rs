@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use super::cache::{stable_path_identity, ImageCacheService};
 use super::local_layer::LocalLayer;
 use super::oci_image::{regctl_command, regctl_stderr_is_not_found};
-use super::resolver::parse_overlaybd_referrer;
+use super::resolver::parse_overlaybd_referrer_for_converter;
 use crate::cfg::AppConfig;
 use crate::digest::{sha256_digest, FileDigest};
 
@@ -30,6 +30,7 @@ const ARTIFACT_TYPE: &str = "application/vnd.containerd.overlaybd.native.v1+json
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1800);
 const ATTEMPTS: usize = 3;
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
+const ACCESS_DENIED_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
 const HISTORY_LIMIT: usize = 4096;
 
 #[derive(Debug, Clone, Copy)]
@@ -37,13 +38,14 @@ enum PublicationState {
     InFlight,
     Done(Instant),
     Failed(Instant),
+    AccessDenied(Instant),
 }
 
 impl PublicationState {
     fn completed_at(self) -> Option<Instant> {
         match self {
             Self::InFlight => None,
-            Self::Done(at) | Self::Failed(at) => Some(at),
+            Self::Done(at) | Self::Failed(at) | Self::AccessDenied(at) => Some(at),
         }
     }
 }
@@ -52,6 +54,7 @@ struct PublicationJob {
     publisher: Arc<Publisher>,
     source: String,
     succeeded: bool,
+    access_denied: bool,
 }
 
 impl Drop for PublicationJob {
@@ -77,6 +80,8 @@ impl Drop for PublicationJob {
             self.source.clone(),
             if self.succeeded {
                 PublicationState::Done(now)
+            } else if self.access_denied {
+                PublicationState::AccessDenied(now)
             } else {
                 PublicationState::Failed(now)
             },
@@ -146,6 +151,9 @@ impl Publisher {
         match states.get(source) {
             Some(PublicationState::InFlight | PublicationState::Done(_)) => return,
             Some(PublicationState::Failed(at)) if at.elapsed() < FAILURE_COOLDOWN => return,
+            Some(PublicationState::AccessDenied(at)) if at.elapsed() < ACCESS_DENIED_COOLDOWN => {
+                return
+            }
             _ => {}
         }
         let Ok(slot) = self.capacity.clone().try_acquire_owned() else {
@@ -159,6 +167,7 @@ impl Publisher {
             publisher: Arc::clone(self),
             source: source.to_string(),
             succeeded: false,
+            access_denied: false,
         };
         let publisher = Arc::clone(self);
         let source = source.to_string();
@@ -173,6 +182,10 @@ impl Publisher {
             let started = Instant::now();
             let result = publisher.publish(&source, &config_path).await;
             job.succeeded = result.is_ok();
+            job.access_denied = result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.is::<RegistryAccessDenied>());
             drop(job);
             metrics::histogram!("agentenv_image_publication_duration_seconds")
                 .record(started.elapsed().as_secs_f64());
@@ -190,7 +203,12 @@ impl Publisher {
     async fn publish(&self, source: &str, config_path: &Path) -> Result<()> {
         let referrers =
             checked_output(self.command(&["artifact", "list", "--format", "body", source])).await?;
-        if parse_overlaybd_referrer(std::str::from_utf8(&referrers.stdout)?)?.is_some() {
+        if parse_overlaybd_referrer_for_converter(
+            std::str::from_utf8(&referrers.stdout)?,
+            Some(&self.converter_id),
+        )?
+        .is_some()
+        {
             return Ok(());
         }
         let (repository, subject_digest) = source
@@ -330,6 +348,7 @@ impl Publisher {
                         .increment(blob.size);
                     return Ok(());
                 }
+                Err(error) if error.is::<RegistryAccessDenied>() => return Err(error),
                 Err(error) => failure = Some(error),
             }
             if attempt + 1 < ATTEMPTS {
@@ -360,6 +379,7 @@ impl Publisher {
             command.stdin(Stdio::from(std::fs::File::open(path)?));
             match checked_output(command).await {
                 Ok(_) => return Ok(()),
+                Err(error) if error.is::<RegistryAccessDenied>() => return Err(error),
                 Err(error) => failure = Some(error),
             }
             if attempt + 1 < ATTEMPTS {
@@ -377,13 +397,28 @@ async fn bounded_output(mut command: Command) -> Result<Output> {
         .context("run registry command")
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("registry access denied: {0}")]
+struct RegistryAccessDenied(String);
+
 async fn checked_output(command: Command) -> Result<Output> {
     let output = bounded_output(command).await?;
-    ensure!(
-        output.status.success(),
-        "registry command failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lower = stderr.to_ascii_lowercase();
+    if !output.status.success()
+        && [
+            "[http 401]",
+            "[http 403]",
+            "unauthorized",
+            "forbidden",
+            "denied",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return Err(RegistryAccessDenied(stderr.into_owned()).into());
+    }
+    ensure!(output.status.success(), "registry command failed: {stderr}");
     Ok(output)
 }
 
@@ -491,13 +526,14 @@ set -eu
 cd "$(dirname "$0")"
 printf '%s\n' "$*" >> calls
 case "$1 $2" in
-  'artifact list') echo '{"manifests":[]}' ;;
+  'artifact list') if test -f referrers; then cat referrers; else echo '{"manifests":[]}'; fi ;;
   'manifest get') cat source-manifest ;;
   'blob get') cat source-config ;;
   'blob head')
     if test -f fail-head; then echo '503 head unavailable' >&2; exit 1; fi
     echo 'request failed: not found [http 404]' >&2; exit 1 ;;
   'blob copy')
+    if test -f deny-upload; then echo 'request failed: forbidden [http 403]' >&2; exit 1; fi
     if test -f fail-upload; then echo '503 unavailable' >&2; exit 1; fi
     cp "${3#ocidir://}/blobs/sha256/${5#sha256:}" "uploaded-${5#sha256:}"
     ;;
@@ -536,6 +572,91 @@ esac
             local_config,
             config,
         ))
+    }
+
+    #[tokio::test]
+    async fn only_matching_native_converter_skips_publication() -> Result<()> {
+        for (artifact, converter, skip) in [
+            (ARTIFACT_TYPE, Some("test-converter-v1"), true),
+            (ARTIFACT_TYPE, Some("older-converter"), false),
+            (ARTIFACT_TYPE, None, false),
+            (
+                "application/vnd.azure.artifact.streaming.v1",
+                Some("test-converter-v1"),
+                false,
+            ),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let (publisher, source, local, _) = fixture(temp.path(), false).await?;
+            let mut descriptor = json!({"digest": "sha256:existing", "artifactType": artifact});
+            if let Some(converter) = converter {
+                descriptor["annotations"] = json!({"co.prometheus.overlaybd.converter": converter});
+            }
+            tokio::fs::write(
+                temp.path().join("referrers"),
+                serde_json::to_vec(&json!({"manifests": [descriptor]}))?,
+            )
+            .await?;
+            publisher.publish(&source, &local).await?;
+            assert_eq!(temp.path().join("published").exists(), !skip);
+            if skip {
+                let calls = tokio::fs::read_to_string(temp.path().join("calls")).await?;
+                assert_eq!(calls.lines().count(), 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn denied_upload_stops_retries_and_uses_long_cooldown() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (publisher, source, local, _) = fixture(temp.path(), false).await?;
+        tokio::fs::write(temp.path().join("deny-upload"), b"").await?;
+        let publisher = Arc::new(publisher);
+        publisher.enqueue(&source, local.clone(), "test-converter-v1");
+        timeout(Duration::from_secs(30), async {
+            while publisher.capacity.available_permits() != 2 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert!(matches!(
+            publisher.states.lock().unwrap()[&source],
+            PublicationState::AccessDenied(_)
+        ));
+        let calls = tokio::fs::read_to_string(temp.path().join("calls")).await?;
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.starts_with("blob copy"))
+                .count(),
+            1
+        );
+        assert!(!temp.path().join("published").exists());
+        publisher.states.lock().unwrap().insert(
+            source.clone(),
+            PublicationState::AccessDenied(Instant::now() - FAILURE_COOLDOWN),
+        );
+        publisher.enqueue(&source, local.clone(), "test-converter-v1");
+        assert_eq!(publisher.capacity.available_permits(), 2);
+        assert_eq!(
+            tokio::fs::read_to_string(temp.path().join("calls")).await?,
+            calls
+        );
+        publisher.states.lock().unwrap().insert(
+            source.clone(),
+            PublicationState::AccessDenied(Instant::now() - ACCESS_DENIED_COOLDOWN),
+        );
+        tokio::fs::remove_file(temp.path().join("deny-upload")).await?;
+        publisher.enqueue(&source, local, "test-converter-v1");
+        timeout(Duration::from_secs(30), async {
+            while publisher.capacity.available_permits() != 2 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert!(temp.path().join("published").exists());
+        Ok(())
     }
 
     #[tokio::test]
@@ -746,6 +867,7 @@ esac
             publisher: publisher.clone(),
             source: source.clone(),
             succeeded: false,
+            access_denied: false,
         });
         let states = publisher.states.lock().unwrap();
         assert_eq!(states.len(), HISTORY_LIMIT + 1);

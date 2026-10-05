@@ -604,12 +604,29 @@ async fn discover_overlaybd_referrer(
 }
 
 pub(super) fn parse_overlaybd_referrer(body: &str) -> Result<Option<(String, &'static str)>> {
+    parse_overlaybd_referrer_for_converter(body, None)
+}
+
+pub(super) fn parse_overlaybd_referrer_for_converter(
+    body: &str,
+    converter_id: Option<&str>,
+) -> Result<Option<(String, &'static str)>> {
     let index: ReferrersIndex = serde_json::from_str(body).context("parse referrers index JSON")?;
     for &artifact_type in OVERLAYBD_REFERRER_ARTIFACT_TYPES {
         let mut matches = index
             .manifests
             .iter()
-            .filter(|descriptor| descriptor.artifact_type.as_deref() == Some(artifact_type));
+            .filter(|descriptor| descriptor.artifact_type.as_deref() == Some(artifact_type))
+            .filter(|descriptor| {
+                converter_id.is_none_or(|id| {
+                    artifact_type == OVERLAYBD_NATIVE_ARTIFACT_TYPE
+                        && descriptor
+                            .annotations
+                            .get("co.prometheus.overlaybd.converter")
+                            .and_then(Value::as_str)
+                            == Some(id)
+                })
+            });
         let Some(selected) = matches.next() else {
             continue;
         };
@@ -638,6 +655,8 @@ struct ReferrerDescriptor {
     digest: String,
     #[serde(rename = "artifactType", default)]
     artifact_type: Option<String>,
+    #[serde(default)]
+    annotations: serde_json::Map<String, Value>,
 }
 
 fn detect_arch() -> Result<String> {
