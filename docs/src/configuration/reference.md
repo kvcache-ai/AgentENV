@@ -107,6 +107,42 @@ User-visible rootfs images are selected at the template API layer.
 | `search_registries` | array of strings | `["docker.io", "ghcr.io"]` | Registries tried when resolving short image references |
 | `allowed_registries` | array of strings | unset (no restriction) | Whitelist of registry hosts (e.g. `docker.io`, `registry.example.com:5000`). **Omitting the key** imposes no restriction; an **explicit empty list `[]`** denies every registry. When set to a non-empty list, only references whose registry host is in the list resolve; any other host is rejected as a client (4xx, `ImageReferenceError`) error. See *How the three registry settings interact* below. |
 | `try_referrers_overlaybd_prefixes` | array of strings | `[]` | Image reference prefixes for which AgentENV tries OCI Referrers API via `regctl` for an overlaybd-native artifact before converting a standard OCI image locally. Prefixes are matched with simple `starts_with`; include the trailing slash yourself, for example `registry.example.com/` or `registry.example.com/team/`. Requires `regctl` on `PATH`; lookup failures fall back to the source image. |
+| `publish_overlaybd_prefixes` | array of strings | `[]` | Internal repository prefixes eligible for background publication of locally converted linux/amd64 base images. Each prefix must end in `/`. Requires registry write credentials available to `regctl`. |
+| `publication_capacity` | integer | `8` | Maximum active plus queued publications per node. When full, new requests skip publication. |
+| `publication_concurrency` | integer | `1` | Maximum concurrent publication jobs per node; must be positive and no greater than capacity. |
+
+Publication is optional and does not delay sandbox startup. A worker protects the
+cached base layers from eviction, compresses each into independently readable
+32 KiB Zstd blocks, then uploads the layers and image config before publishing
+an OCI native-image attachment to the original platform manifest digest. The
+original image and tags remain unchanged. Sandbox writable layers are excluded.
+Enable `try_referrers_overlaybd_prefixes` for consumers to discover these attachments.
+
+The queue is in memory and best effort: restarts, full queues, missing cached
+layers, and failed uploads can skip publication. A later local-cache hit can
+try again. Duplicate work for the same repository and digest is suppressed while
+queued or running. Each node remembers up to 4096 completed publications: successes
+are skipped and transient failures wait five minutes before another resolve can retry.
+Explicit HTTP 403 responses stop upload retries and wait 24 hours before retrying.
+HTTP 401 responses and local permission errors retain the normal retry policy.
+History is lost on restart or when older entries are evicted. Publisher settings
+are shared per normalized cache root and require a process restart to change.
+Attachments record the converter ID in `co.prometheus.overlaybd.converter`.
+Only a native attachment with that same ID suppresses publication; unlabelled,
+older-converter and ACR attachments do not. Consumer discovery remains unchanged;
+this does not force reconversion of images already served from a usable attachment.
+Standard-OCI config-cache entries are separated by converter ID; legacy unscoped
+entries remain usable without conversion or its disk-headroom check, but are not
+published because their converter provenance is unknown. Tools images are not published by this path.
+Each write gets at most three attempts; registry commands time out
+after 30 minutes. Upload failures are logged and do not fail the sandbox.
+Temporary compressed data uses the image-cache volume, one layer per worker,
+and respects `min_free_disk_gb` before compression; this check is not a disk
+reservation. Normal completion and errors remove temporary files, while a hard
+process kill may leave a temporary directory under `image.cache.root_dir/publication`.
+Counters `agentenv_image_publication_total` (queued/done/failed/queue_full),
+`agentenv_image_publication_bytes_total`, and the histogram
+`agentenv_image_publication_duration_seconds` expose background activity.
 
 ### How the three registry settings interact
 

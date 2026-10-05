@@ -12,6 +12,7 @@ use super::oci_image::{self, ResolvedImage};
 use super::reference::{image_ref_candidates, registry_host_of};
 use super::{ImageBaseContext, ImageError, ImageResolutionMetadata, ImageResult};
 use crate::cfg::AppConfig;
+use crate::digest::sha256_hex;
 use crate::disk_policy::{DiskUsageSource, SampledDiskUsage};
 use crate::image::oci_image::ImageFormat;
 use crate::observability::prometheus::MetricGuard;
@@ -56,6 +57,7 @@ pub struct ResolvedBlockImage {
 
 #[derive(Debug)]
 pub struct ImageResolver {
+    publisher: Option<Arc<super::publication::Publisher>>,
     store: Arc<dyn SourceImageStore>,
     overlaybd_install_root: PathBuf,
     overlaybd_convert_global_config: PathBuf,
@@ -76,6 +78,7 @@ impl ImageResolver {
     pub fn new(config: &AppConfig) -> Self {
         let store = local_image_services_from_app_config(config).source_images;
         Self {
+            publisher: super::publication::Publisher::from_config(config),
             store,
             overlaybd_install_root: config.deps_path.join("overlaybd"),
             overlaybd_convert_global_config: config.resolved_overlaybd_convert_global_config_path(),
@@ -101,8 +104,41 @@ impl ImageResolver {
         }
     }
 
+    fn resolved_with_publication(
+        &self,
+        standard_oci: bool,
+        source: &str,
+        config_path: PathBuf,
+        metadata: ImageResolutionMetadata,
+    ) -> ResolvedBlockImage {
+        if standard_oci {
+            if let Some(publisher) = &self.publisher {
+                publisher.enqueue(
+                    source,
+                    config_path.clone(),
+                    &self.overlaybd_oci_converter_id,
+                );
+            }
+        }
+        resolved_from_cached_config(source, config_path, metadata)
+    }
+
     pub fn default_image(&self) -> &str {
         &self.default_image
+    }
+
+    fn source_cache_scope(
+        &self,
+        format: ImageFormat,
+        repository_scope: Option<&str>,
+    ) -> Option<String> {
+        match format {
+            ImageFormat::StandardOci => Some(format!(
+                "oci-converter-{}",
+                sha256_hex(self.overlaybd_oci_converter_id.as_bytes())
+            )),
+            ImageFormat::OverlaybdNative => repository_scope.map(str::to_owned),
+        }
     }
 
     pub(crate) async fn resolve_buildkit(
@@ -116,10 +152,23 @@ impl ImageResolver {
         );
         let (fetched, metadata) =
             oci_image::fetch_content_manifest(content, digest, &detect_arch()?).await?;
-        let source = self.store.open(&fetched.manifest_digest, None).await?;
+        let scope = self.source_cache_scope(fetched.format(), fetched.repository_scope.as_deref());
+        let source = self
+            .store
+            .open(&fetched.manifest_digest, scope.as_deref())
+            .await?;
+        let mut cached = source.cached_config().await?;
+        if matches!(cached, CachedImageConfig::Missing) {
+            cached = self
+                .store
+                .open(&fetched.manifest_digest, None)
+                .await?
+                .cached_config()
+                .await?;
+        }
         if let CachedImageConfig::Found {
             image_config_path, ..
-        } = source.cached_config().await?
+        } = cached
         {
             return Ok(resolved_from_cached_config(
                 &fetched.manifest_digest,
@@ -164,6 +213,7 @@ impl ImageResolver {
         mut self,
         image_ref: &str,
     ) -> ImageResult<Option<ResolvedBlockImage>> {
+        self.publisher = None;
         // System dependencies use their configured release source, independently
         // of the admission policy and conversion settings for user images.
         let arch = detect_arch()?;
@@ -338,12 +388,29 @@ impl ImageResolver {
                 ),
             });
         }
+        let mut publish = fetched.format() == ImageFormat::StandardOci;
         let manifest_digest = fetched.manifest_digest.clone();
-        let repository_scope = fetched.repository_scope.clone();
+        // A cached conversion must have the same provenance as a fresh conversion.
+        let repository_scope =
+            self.source_cache_scope(fetched.format(), fetched.repository_scope.as_deref());
         let scope = repository_scope.as_deref();
-        let source = self.store.open(&manifest_digest, scope).await?;
+        let mut source = self.store.open(&manifest_digest, scope).await?;
+        let mut cached = source.cached_config().await?;
+        if publish && matches!(cached, CachedImageConfig::Missing) {
+            let legacy = self
+                .store
+                .open(&manifest_digest, fetched.repository_scope.as_deref())
+                .await?;
+            let legacy_cached = legacy.cached_config().await?;
+            if matches!(legacy_cached, CachedImageConfig::Found { .. }) {
+                // Legacy configs remain usable, but their converter provenance is unknown.
+                source = legacy;
+                cached = legacy_cached;
+                publish = false;
+            }
+        }
 
-        match source.cached_config().await? {
+        match cached {
             CachedImageConfig::Found {
                 image_config_path,
                 metadata: Some(metadata),
@@ -355,7 +422,8 @@ impl ImageResolver {
                     "registry" => registry_label(&source_image_ref),
                 )
                 .increment(1);
-                return Ok(resolved_from_cached_config(
+                return Ok(self.resolved_with_publication(
+                    publish,
                     &source_image_ref,
                     image_config_path,
                     *metadata,
@@ -380,7 +448,8 @@ impl ImageResolver {
                 .await
                 .map_err(|e| e.context(format!("fetch image metadata for '{source_image_ref}'")))?;
                 source.write_metadata(metadata.clone()).await?;
-                return Ok(resolved_from_cached_config(
+                return Ok(self.resolved_with_publication(
+                    publish,
                     &source_image_ref,
                     image_config_path,
                     metadata,
@@ -447,7 +516,8 @@ impl ImageResolver {
             "image resolved to overlaybd config"
         );
 
-        Ok(resolved_from_cached_config(
+        Ok(self.resolved_with_publication(
+            publish,
             &source_image_ref,
             image_config_path,
             image_config_metadata,
@@ -558,13 +628,30 @@ async fn discover_overlaybd_referrer(
         .with_context(|| format!("parse regctl referrers response for {subject_ref}"))
 }
 
-fn parse_overlaybd_referrer(body: &str) -> Result<Option<(String, &'static str)>> {
+pub(super) fn parse_overlaybd_referrer(body: &str) -> Result<Option<(String, &'static str)>> {
+    parse_overlaybd_referrer_for_converter(body, None)
+}
+
+pub(super) fn parse_overlaybd_referrer_for_converter(
+    body: &str,
+    converter_id: Option<&str>,
+) -> Result<Option<(String, &'static str)>> {
     let index: ReferrersIndex = serde_json::from_str(body).context("parse referrers index JSON")?;
     for &artifact_type in OVERLAYBD_REFERRER_ARTIFACT_TYPES {
         let mut matches = index
             .manifests
             .iter()
-            .filter(|descriptor| descriptor.artifact_type.as_deref() == Some(artifact_type));
+            .filter(|descriptor| descriptor.artifact_type.as_deref() == Some(artifact_type))
+            .filter(|descriptor| {
+                converter_id.is_none_or(|id| {
+                    artifact_type == OVERLAYBD_NATIVE_ARTIFACT_TYPE
+                        && descriptor
+                            .annotations
+                            .get("co.prometheus.overlaybd.converter")
+                            .and_then(Value::as_str)
+                            == Some(id)
+                })
+            });
         let Some(selected) = matches.next() else {
             continue;
         };
@@ -593,6 +680,8 @@ struct ReferrerDescriptor {
     digest: String,
     #[serde(rename = "artifactType", default)]
     artifact_type: Option<String>,
+    #[serde(default)]
+    annotations: serde_json::Map<String, Value>,
 }
 
 fn detect_arch() -> Result<String> {
@@ -654,6 +743,94 @@ mod tests {
     use super::*;
     use crate::cfg::{ImageConfig, ImageResolverConfig};
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn legacy_cache_resolves_without_conversion_headroom() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut resolver = test_resolver_with_search(&temp, vec![]);
+        let manifest = json!({
+            "schemaVersion": 2,
+            "config": {"digest": "sha256:config"},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar", "digest": "sha256:layer", "size": 5}]
+        }).to_string();
+        resolver.regctl_binary = fake_regctl(temp.path(), &manifest, "", 0);
+        resolver.conversion_min_free_bytes = u64::MAX;
+        let layer = temp.path().join("layer");
+        tokio::fs::write(&layer, b"layer").await?;
+        let digest = crate::digest::sha256_digest(manifest.as_bytes());
+        let legacy = resolver.store.open(&digest, None).await?;
+        let path = legacy
+            .publish_config(
+                &json!({"lowers": [{"file": layer, "digest": "sha256:layer", "size": 5}]}),
+                ImageResolutionMetadata {
+                    base_context: ImageBaseContext::default(),
+                    raw_config: None,
+                },
+                legacy.begin_conversion().await?,
+            )
+            .await?;
+        assert!(matches!(
+            resolver.ensure_conversion_headroom(),
+            Err(ImageError::AdmissionBlocked { .. })
+        ));
+        let resolved = resolver.resolve("registry.example/image:latest").await?;
+        assert_eq!(resolved.overlaybd_config_path, path);
+        let scoped = resolver.source_cache_scope(ImageFormat::StandardOci, None);
+        assert!(matches!(
+            resolver
+                .store
+                .open(&digest, scoped.as_deref())
+                .await?
+                .cached_config()
+                .await?,
+            CachedImageConfig::Missing
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn converted_config_cache_isolated_by_converter() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut resolver = test_resolver_with_search(&temp, vec![]);
+        let digest = "sha256:manifest";
+        let layer = temp.path().join("layer");
+        tokio::fs::write(&layer, b"layer").await?;
+        let config = json!({"lowers": [{"file": layer, "digest": "sha256:layer", "size": 5}]});
+        let metadata = ImageResolutionMetadata {
+            base_context: ImageBaseContext::default(),
+            raw_config: None,
+        };
+        // Legacy unscoped configs and a previous converter must not satisfy a new one.
+        let legacy = resolver.store.open(digest, None).await?;
+        legacy
+            .publish_config(&config, metadata.clone(), legacy.begin_conversion().await?)
+            .await?;
+        let first_scope = resolver.source_cache_scope(ImageFormat::StandardOci, None);
+        let first = resolver.store.open(digest, first_scope.as_deref()).await?;
+        assert!(matches!(
+            first.cached_config().await?,
+            CachedImageConfig::Missing
+        ));
+        first
+            .publish_config(&config, metadata, first.begin_conversion().await?)
+            .await?;
+        assert!(matches!(
+            first.cached_config().await?,
+            CachedImageConfig::Found { .. }
+        ));
+        resolver.overlaybd_oci_converter_id.push_str("-new-version");
+        let next_scope = resolver.source_cache_scope(ImageFormat::StandardOci, None);
+        let next = resolver.store.open(digest, next_scope.as_deref()).await?;
+        assert!(matches!(
+            next.cached_config().await?,
+            CachedImageConfig::Missing
+        ));
+        assert_eq!(
+            resolver.source_cache_scope(ImageFormat::OverlaybdNative, Some("registry/repo")),
+            Some("registry/repo".into())
+        );
+        Ok(())
+    }
 
     fn test_resolver_with_search(temp: &TempDir, search_registries: Vec<&str>) -> ImageResolver {
         let mut config = AppConfig {

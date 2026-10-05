@@ -441,6 +441,54 @@ impl ImageCacheService {
         Ok(released.len())
     }
 
+    pub(crate) async fn hold_publication_layers(
+        self: &Arc<Self>,
+        config_path: &Path,
+    ) -> Result<(ImageCacheOperationHold, Vec<LocalLayer>)> {
+        let _liveness = self.liveness_gate.lock().await;
+        let config: Value = serde_json::from_slice(&tokio::fs::read(config_path).await?)?;
+        let mut layers = Vec::new();
+        for lower in config["lowers"]
+            .as_array()
+            .context("missing local layers")?
+        {
+            let path = PathBuf::from(lower["file"].as_str().context("non-local layer")?);
+            anyhow::ensure!(
+                path_is_inside(&path, &self.commit_store),
+                "layer is outside commit cache"
+            );
+            let digest = lower["digest"]
+                .as_str()
+                .context("missing layer digest")?
+                .to_string();
+            let size = lower["size"].as_u64().context("missing layer size")?;
+            anyhow::ensure!(
+                tokio::fs::metadata(&path).await?.len() == size,
+                "layer size changed"
+            );
+            layers.push(LocalLayer { path, digest, size });
+        }
+        anyhow::ensure!(!layers.is_empty(), "no layers to publish");
+        let owner = Self::next_operation_hold_owner("registry-publication")?;
+        let digests = layers
+            .iter()
+            .map(|layer| HardCommitId::new(layer.digest.clone()))
+            .collect::<Result<BTreeSet<_>>>()?;
+        self.create_or_replace_hold_locked(owner.clone(), digests.clone())
+            .await?;
+        Ok((
+            ImageCacheOperationHold {
+                image_cache: Arc::clone(self),
+                owner,
+                digests,
+                attempted_p2p_lookups: BTreeSet::new(),
+                materialized: true,
+                released: false,
+            },
+            layers,
+        ))
+    }
+
     fn next_operation_hold_owner(operation: &str) -> Result<ImageCacheHoldOwner> {
         static NEXT_OPERATION_HOLD_ID: AtomicU64 = AtomicU64::new(1);
         let operation = non_empty("image cache operation", operation.to_string())?;
@@ -1767,6 +1815,42 @@ mod tests {
             parent_commit_digest: None,
             expected_layer_uuid: expected_uuid,
         }
+    }
+
+    #[tokio::test]
+    async fn publication_hold_protects_layers_until_release() -> Result<()> {
+        let temp = TempDir::new()?;
+        let service = Arc::new(test_service(&temp));
+        service.ensure_layout().await?;
+        let bytes = b"cached immutable bytes";
+        let digest = crate::digest::sha256_digest(bytes);
+        let layer = write_commit_file(&service, &digest, bytes);
+        let config = temp.path().join("image.json");
+        write_image_config(
+            &config,
+            "",
+            json!([{"file": layer, "digest": digest, "size": bytes.len()}]),
+        );
+        let (hold, layers) = service.hold_publication_layers(&config).await?;
+        assert_eq!(layers.len(), 1);
+        let id = HardCommitId::new(digest)?;
+        assert_eq!(
+            service
+                .metadata_store()
+                .await?
+                .hard_commit_hold_referrers(&id)
+                .await?
+                .len(),
+            1
+        );
+        hold.release_best_effort("test").await;
+        assert!(service
+            .metadata_store()
+            .await?
+            .hard_commit_hold_referrers(&id)
+            .await?
+            .is_empty());
+        Ok(())
     }
 
     #[tokio::test]

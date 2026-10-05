@@ -4,6 +4,7 @@ pub(crate) mod commit_index;
 pub(crate) mod local_layer;
 mod metadata;
 pub(crate) mod oci_image;
+mod publication;
 mod reference;
 mod resolver;
 

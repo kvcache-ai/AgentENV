@@ -871,7 +871,7 @@ pub(super) fn load_cache_owned_image_config_facts(
     })
 }
 
-pub(super) fn stable_path_identity(path: &Path) -> PathBuf {
+pub(crate) fn stable_path_identity(path: &Path) -> PathBuf {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
