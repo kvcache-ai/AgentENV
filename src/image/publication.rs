@@ -404,18 +404,7 @@ struct RegistryAccessDenied(String);
 async fn checked_output(command: Command) -> Result<Output> {
     let output = bounded_output(command).await?;
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let lower = stderr.to_ascii_lowercase();
-    if !output.status.success()
-        && [
-            "[http 401]",
-            "[http 403]",
-            "unauthorized",
-            "forbidden",
-            "denied",
-        ]
-        .iter()
-        .any(|marker| lower.contains(marker))
-    {
+    if !output.status.success() && stderr.contains("[http 403]") {
         return Err(RegistryAccessDenied(stderr.into_owned()).into());
     }
     ensure!(output.status.success(), "registry command failed: {stderr}");
@@ -572,6 +561,22 @@ esac
             local_config,
             config,
         ))
+    }
+
+    #[tokio::test]
+    async fn only_explicit_http_forbidden_gets_long_cooldown() -> Result<()> {
+        for (message, denied) in [
+            ("request failed: forbidden [http 403]", true),
+            ("token refresh: unauthorized [http 401]", false),
+            ("open cached layer: permission denied", false),
+            ("token refresh temporarily forbidden", false),
+        ] {
+            let mut command = Command::new("sh");
+            command.args(["-c", "printf '%s' \"$1\" >&2; exit 1", "test", message]);
+            let error = checked_output(command).await.unwrap_err();
+            assert_eq!(error.is::<RegistryAccessDenied>(), denied, "{message}");
+        }
+        Ok(())
     }
 
     #[tokio::test]
