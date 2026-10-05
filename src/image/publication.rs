@@ -125,7 +125,15 @@ impl Publisher {
         ))
     }
 
-    pub(super) fn enqueue(self: &Arc<Self>, source: &str, config_path: PathBuf) {
+    pub(super) fn enqueue(
+        self: &Arc<Self>,
+        source: &str,
+        config_path: PathBuf,
+        converter_id: &str,
+    ) {
+        if converter_id != self.converter_id {
+            return;
+        }
         if !self
             .prefixes
             .iter()
@@ -197,7 +205,7 @@ impl Publisher {
         );
         let source_manifest: Value = serde_json::from_slice(&source_output.stdout)?;
         let subject = json!({
-            "mediaType": source_manifest["mediaType"].as_str().context("source manifest media type")?,
+            "mediaType": source_manifest["mediaType"].as_str().unwrap_or(MANIFEST_TYPE),
             "digest": subject_digest, "size": source_output.stdout.len(),
         });
         let config_digest = source_manifest["config"]["digest"]
@@ -531,6 +539,47 @@ esac
     }
 
     #[tokio::test]
+    async fn publishes_source_manifest_without_media_type() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (publisher, _, local, _) = fixture(temp.path(), false).await?;
+        let path = temp.path().join("source-manifest");
+        let mut source: Value = serde_json::from_slice(&tokio::fs::read(&path).await?)?;
+        source.as_object_mut().unwrap().remove("mediaType");
+        let bytes = serde_json::to_vec(&source)?;
+        tokio::fs::write(path, &bytes).await?;
+        publisher
+            .publish(
+                &format!("registry.example/image@{}", sha256_digest(&bytes)),
+                &local,
+            )
+            .await?;
+        let manifest: Value =
+            serde_json::from_slice(&tokio::fs::read(temp.path().join("published")).await?)?;
+        assert_eq!(manifest["subject"]["mediaType"], MANIFEST_TYPE);
+        assert_eq!(manifest["subject"]["digest"], sha256_digest(&bytes));
+        assert_eq!(manifest["subject"]["size"], bytes.len());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mismatched_converter_never_queues_publication() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (publisher, source, local, _) = fixture(temp.path(), false).await?;
+        let publisher = Arc::new(publisher);
+        for converter in [
+            "tools-oci-rootfs-v1:overlaybd-v1.0.18-aenv.1",
+            "another-user-converter",
+        ] {
+            publisher.enqueue(&source, local.clone(), converter);
+        }
+        assert_eq!(publisher.capacity.available_permits(), 2);
+        assert!(publisher.states.lock().unwrap().is_empty());
+        tokio::task::yield_now().await;
+        assert!(!temp.path().join("calls").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn publishes_attachment_last_and_preserves_source_metadata() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let (publisher, source, local, config) = fixture(temp.path(), false).await?;
@@ -585,14 +634,26 @@ esac
         let (publisher, source, local, _) = fixture(temp.path(), false).await?;
         let publisher = Arc::new(publisher);
         let active = publisher.active.acquire().await?;
-        publisher.enqueue("another.example/image@sha256:unused", local.clone());
+        publisher.enqueue(
+            "another.example/image@sha256:unused",
+            local.clone(),
+            "test-converter-v1",
+        );
         assert_eq!(publisher.capacity.available_permits(), 2);
         for _ in 0..3 {
-            publisher.enqueue(&source, local.clone());
+            publisher.enqueue(&source, local.clone(), "test-converter-v1");
         }
         assert_eq!(publisher.capacity.available_permits(), 1);
-        publisher.enqueue(&source.replace("/image@", "/second@"), local.clone());
-        publisher.enqueue(&source.replace("/image@", "/third@"), local.clone());
+        publisher.enqueue(
+            &source.replace("/image@", "/second@"),
+            local.clone(),
+            "test-converter-v1",
+        );
+        publisher.enqueue(
+            &source.replace("/image@", "/third@"),
+            local.clone(),
+            "test-converter-v1",
+        );
         assert_eq!(publisher.capacity.available_permits(), 0);
         assert_eq!(publisher.states.lock().unwrap().len(), 2);
         tokio::task::yield_now().await;
@@ -605,7 +666,7 @@ esac
         })
         .await?;
         assert!(temp.path().join("published").exists());
-        publisher.enqueue(&source, local);
+        publisher.enqueue(&source, local, "test-converter-v1");
         assert_eq!(publisher.capacity.available_permits(), 2);
         Ok(())
     }
@@ -637,14 +698,14 @@ esac
         let temp = tempfile::tempdir()?;
         let (publisher, source, local, _) = fixture(temp.path(), true).await?;
         let publisher = Arc::new(publisher);
-        publisher.enqueue(&source, local.clone());
+        publisher.enqueue(&source, local.clone(), "test-converter-v1");
         timeout(Duration::from_secs(30), async {
             while publisher.capacity.available_permits() != 2 {
                 sleep(Duration::from_millis(10)).await;
             }
         })
         .await?;
-        publisher.enqueue(&source, local.clone());
+        publisher.enqueue(&source, local.clone(), "test-converter-v1");
         assert_eq!(publisher.capacity.available_permits(), 2);
         assert!(matches!(
             publisher.states.lock().unwrap()[&source],
@@ -655,7 +716,7 @@ esac
             PublicationState::Failed(Instant::now() - FAILURE_COOLDOWN),
         );
         tokio::fs::remove_file(temp.path().join("fail-upload")).await?;
-        publisher.enqueue(&source, local);
+        publisher.enqueue(&source, local, "test-converter-v1");
         assert_eq!(publisher.capacity.available_permits(), 1);
         timeout(Duration::from_secs(30), async {
             while publisher.capacity.available_permits() != 2 {

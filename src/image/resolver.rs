@@ -12,6 +12,7 @@ use super::oci_image::{self, ResolvedImage};
 use super::reference::{image_ref_candidates, registry_host_of};
 use super::{ImageBaseContext, ImageError, ImageResolutionMetadata, ImageResult};
 use crate::cfg::AppConfig;
+use crate::digest::sha256_hex;
 use crate::disk_policy::{DiskUsageSource, SampledDiskUsage};
 use crate::image::oci_image::ImageFormat;
 use crate::observability::prometheus::MetricGuard;
@@ -112,7 +113,11 @@ impl ImageResolver {
     ) -> ResolvedBlockImage {
         if standard_oci {
             if let Some(publisher) = &self.publisher {
-                publisher.enqueue(source, config_path.clone());
+                publisher.enqueue(
+                    source,
+                    config_path.clone(),
+                    &self.overlaybd_oci_converter_id,
+                );
             }
         }
         resolved_from_cached_config(source, config_path, metadata)
@@ -120,6 +125,20 @@ impl ImageResolver {
 
     pub fn default_image(&self) -> &str {
         &self.default_image
+    }
+
+    fn source_cache_scope(
+        &self,
+        format: ImageFormat,
+        repository_scope: Option<&str>,
+    ) -> Option<String> {
+        match format {
+            ImageFormat::StandardOci => Some(format!(
+                "oci-converter-{}",
+                sha256_hex(self.overlaybd_oci_converter_id.as_bytes())
+            )),
+            ImageFormat::OverlaybdNative => repository_scope.map(str::to_owned),
+        }
     }
 
     pub(crate) async fn resolve_buildkit(
@@ -133,7 +152,11 @@ impl ImageResolver {
         );
         let (fetched, metadata) =
             oci_image::fetch_content_manifest(content, digest, &detect_arch()?).await?;
-        let source = self.store.open(&fetched.manifest_digest, None).await?;
+        let scope = self.source_cache_scope(fetched.format(), fetched.repository_scope.as_deref());
+        let source = self
+            .store
+            .open(&fetched.manifest_digest, scope.as_deref())
+            .await?;
         if let CachedImageConfig::Found {
             image_config_path, ..
         } = source.cached_config().await?
@@ -181,11 +204,11 @@ impl ImageResolver {
         mut self,
         image_ref: &str,
     ) -> ImageResult<Option<ResolvedBlockImage>> {
+        self.publisher = None;
         // System dependencies use their configured release source, independently
         // of the admission policy and conversion settings for user images.
         let arch = detect_arch()?;
-        let mut fetched =
-            oci_image::fetch_oci_manifest(&self.regctl_binary, image_ref, &arch).await?;
+        let fetched = oci_image::fetch_oci_manifest(&self.regctl_binary, image_ref, &arch).await?;
         if fetched.format() != ImageFormat::OverlaybdNative {
             let metadata = oci_image::fetch_oci_image_config_metadata(
                 &self.regctl_binary,
@@ -219,7 +242,6 @@ impl ImageResolver {
             self.overlaybd_oci_converter_id = "tools-oci-rootfs-v1:overlaybd-v1.0.18-aenv.1".into();
             self.convert_standard_oci = true;
             self.try_referrers_overlaybd_prefixes.clear();
-            fetched.repository_scope = Some("tools-oci-rootfs-v1".into());
         }
         self.resolve_fetched_manifest(image_ref, &arch, fetched)
             .await
@@ -357,7 +379,9 @@ impl ImageResolver {
         }
         let publish = fetched.format() == ImageFormat::StandardOci;
         let manifest_digest = fetched.manifest_digest.clone();
-        let repository_scope = fetched.repository_scope.clone();
+        // A cached conversion must have the same provenance as a fresh conversion.
+        let repository_scope =
+            self.source_cache_scope(fetched.format(), fetched.repository_scope.as_deref());
         let scope = repository_scope.as_deref();
         let source = self.store.open(&manifest_digest, scope).await?;
 
@@ -675,6 +699,50 @@ mod tests {
     use super::*;
     use crate::cfg::{ImageConfig, ImageResolverConfig};
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn converted_config_cache_isolated_by_converter() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut resolver = test_resolver_with_search(&temp, vec![]);
+        let digest = "sha256:manifest";
+        let layer = temp.path().join("layer");
+        tokio::fs::write(&layer, b"layer").await?;
+        let config = json!({"lowers": [{"file": layer, "digest": "sha256:layer", "size": 5}]});
+        let metadata = ImageResolutionMetadata {
+            base_context: ImageBaseContext::default(),
+            raw_config: None,
+        };
+        // Legacy unscoped configs and a previous converter must not satisfy a new one.
+        let legacy = resolver.store.open(digest, None).await?;
+        legacy
+            .publish_config(&config, metadata.clone(), legacy.begin_conversion().await?)
+            .await?;
+        let first_scope = resolver.source_cache_scope(ImageFormat::StandardOci, None);
+        let first = resolver.store.open(digest, first_scope.as_deref()).await?;
+        assert!(matches!(
+            first.cached_config().await?,
+            CachedImageConfig::Missing
+        ));
+        first
+            .publish_config(&config, metadata, first.begin_conversion().await?)
+            .await?;
+        assert!(matches!(
+            first.cached_config().await?,
+            CachedImageConfig::Found { .. }
+        ));
+        resolver.overlaybd_oci_converter_id.push_str("-new-version");
+        let next_scope = resolver.source_cache_scope(ImageFormat::StandardOci, None);
+        let next = resolver.store.open(digest, next_scope.as_deref()).await?;
+        assert!(matches!(
+            next.cached_config().await?,
+            CachedImageConfig::Missing
+        ));
+        assert_eq!(
+            resolver.source_cache_scope(ImageFormat::OverlaybdNative, Some("registry/repo")),
+            Some("registry/repo".into())
+        );
+        Ok(())
+    }
 
     fn test_resolver_with_search(temp: &TempDir, search_registries: Vec<&str>) -> ImageResolver {
         let mut config = AppConfig {
