@@ -55,6 +55,44 @@ pub struct SandboxForkChildSpec {
     pub replace_drive_ids: Vec<(String, String)>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SandboxMemoryResizeState {
+    Converged,
+    Resizing,
+    RolledBack,
+    Partial,
+}
+
+impl Display for SandboxMemoryResizeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Converged => "converged",
+            Self::Resizing => "resizing",
+            Self::RolledBack => "rolled_back",
+            Self::Partial => "partial",
+        };
+        f.write_str(value)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxMemoryHotplugStatus {
+    pub previous_requested_size_mib: u32,
+    pub target_size_mib: u32,
+    pub requested_size_mib: u32,
+    pub plugged_size_mib: u32,
+    pub total_size_mib: u32,
+    pub slot_size_mib: u32,
+    pub block_size_mib: u32,
+    pub boot_memory_mib: u32,
+    pub effective_memory_mib: u32,
+    pub accounted_memory_mib: u32,
+    pub elapsed_ms: u64,
+    pub state: SandboxMemoryResizeState,
+    pub rollback_target_size_mib: Option<u32>,
+    pub reason: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxLifecycleEventType {
     Create,
@@ -76,6 +114,7 @@ pub enum SandboxState {
     Creating,
     Resuming,
     Running,
+    Resizing,
     Snapshotting,
     Forking,
     Pausing,
@@ -89,6 +128,7 @@ impl Display for SandboxState {
             SandboxState::Creating => "creating",
             SandboxState::Resuming => "resuming",
             SandboxState::Running => "running",
+            SandboxState::Resizing => "resizing",
             SandboxState::Snapshotting => "snapshotting",
             SandboxState::Forking => "forking",
             SandboxState::Pausing => "pausing",
