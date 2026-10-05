@@ -16,14 +16,16 @@ use clap::Parser;
 use tokio::sync::oneshot;
 use tracing::{info, warn};
 
+#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 // jemalloc tuning: purge dirty/muzzy pages after 1s instead of the default
 // 10s, and do the purging on a background thread (the `background_threads`
-// cargo feature is already enabled). Burst allocations (RocksDB opens, image
+// dependency feature is enabled). Burst allocations (RocksDB opens, image
 // resolution, template builds) otherwise linger as retained RSS long after
 // the burst is over.
+#[cfg(feature = "jemalloc")]
 #[used]
 #[allow(non_upper_case_globals)]
 #[export_name = "malloc_conf"]

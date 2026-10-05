@@ -75,13 +75,13 @@ build:
 	$(CARGO) build
 
 release:
-	$(CARGO) build --release
+	$(CARGO) build --release --features jemalloc
 
 build-server:
 	$(CARGO) build -p agentenv --bin server
 
 build-server-release:
-	$(CARGO) build --release -p agentenv --bin server
+	$(CARGO) build --release -p agentenv --bin server --features jemalloc
 
 build-snapshot-image:
 	$(CARGO) build -p agentenv --bin aenv-snapshot-image
@@ -225,7 +225,7 @@ start-server:
 
 start-server-release:
 	$(MAKE) install-ublk PROFILE=release
-	$(CAPABILITY_RUNNER) $(CARGO) run --release --bin server
+	$(CAPABILITY_RUNNER) $(CARGO) run --release --bin server --features jemalloc
 
 deploy-up:
 	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" $(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) up --build -d
