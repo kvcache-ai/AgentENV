@@ -7,6 +7,7 @@ mod store;
 #[cfg(test)]
 mod mock;
 
+pub(crate) use graph::stable_path_identity;
 pub(crate) use service::ImageCacheService;
 
 pub(crate) use store::{

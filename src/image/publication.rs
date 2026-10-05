@@ -16,7 +16,7 @@ use tokio::sync::Semaphore;
 use tokio::time::{sleep, timeout};
 use tracing::{info, warn};
 
-use super::cache::ImageCacheService;
+use super::cache::{stable_path_identity, ImageCacheService};
 use super::local_layer::LocalLayer;
 use super::oci_image::{regctl_command, regctl_stderr_is_not_found};
 use super::resolver::parse_overlaybd_referrer;
@@ -29,6 +29,60 @@ const LAYER_TYPE: &str = "application/vnd.containerd.overlaybd.image.layer.v1.zf
 const ARTIFACT_TYPE: &str = "application/vnd.containerd.overlaybd.native.v1+json";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1800);
 const ATTEMPTS: usize = 3;
+const FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
+const HISTORY_LIMIT: usize = 4096;
+
+#[derive(Debug, Clone, Copy)]
+enum PublicationState {
+    InFlight,
+    Done(Instant),
+    Failed(Instant),
+}
+
+impl PublicationState {
+    fn completed_at(self) -> Option<Instant> {
+        match self {
+            Self::InFlight => None,
+            Self::Done(at) | Self::Failed(at) => Some(at),
+        }
+    }
+}
+
+struct PublicationJob {
+    publisher: Arc<Publisher>,
+    source: String,
+    succeeded: bool,
+}
+
+impl Drop for PublicationJob {
+    fn drop(&mut self) {
+        let mut states = self.publisher.states.lock().unwrap();
+        // Bound completed history without evicting queued or running work.
+        if states
+            .values()
+            .filter(|state| state.completed_at().is_some())
+            .count()
+            >= HISTORY_LIMIT
+        {
+            let oldest = states
+                .iter()
+                .filter_map(|(key, state)| state.completed_at().map(|at| (key.clone(), at)))
+                .min_by_key(|(_, at)| *at)
+                .unwrap()
+                .0;
+            states.remove(&oldest);
+        }
+        let now = Instant::now();
+        states.insert(
+            self.source.clone(),
+            if self.succeeded {
+                PublicationState::Done(now)
+            } else {
+                PublicationState::Failed(now)
+            },
+        );
+    }
+}
 
 #[derive(Debug)]
 pub(super) struct Publisher {
@@ -39,6 +93,8 @@ pub(super) struct Publisher {
     reserve_bytes: u64,
     capacity: Arc<Semaphore>,
     active: Semaphore,
+    states: Mutex<BTreeMap<String, PublicationState>>,
+    converter_id: String,
 }
 
 impl Publisher {
@@ -52,7 +108,7 @@ impl Publisher {
         let mut shared = SHARED.get_or_init(Mutex::default).lock().unwrap();
         Some(Arc::clone(
             shared
-                .entry(config.image.cache.root_dir.clone())
+                .entry(stable_path_identity(&config.image.cache.root_dir))
                 .or_insert_with(|| {
                     Arc::new(Self {
                         cache: ImageCacheService::shared_from_app_config(config),
@@ -62,6 +118,8 @@ impl Publisher {
                         reserve_bytes: resolver.min_free_disk_gb.saturating_mul(1024 * 1024 * 1024),
                         capacity: Arc::new(Semaphore::new(resolver.publication_capacity)),
                         active: Semaphore::new(resolver.publication_concurrency),
+                        states: Mutex::default(),
+                        converter_id: config.resolved_overlaybd_oci_converter_id(),
                     })
                 }),
         ))
@@ -75,10 +133,24 @@ impl Publisher {
         {
             return;
         }
+        // Include the repository: referrers and write permissions are repository-scoped.
+        let mut states = self.states.lock().unwrap();
+        match states.get(source) {
+            Some(PublicationState::InFlight | PublicationState::Done(_)) => return,
+            Some(PublicationState::Failed(at)) if at.elapsed() < FAILURE_COOLDOWN => return,
+            _ => {}
+        }
         let Ok(slot) = self.capacity.clone().try_acquire_owned() else {
             metrics::counter!("agentenv_image_publication_total", "result" => "queue_full")
                 .increment(1);
             return;
+        };
+        states.insert(source.to_string(), PublicationState::InFlight);
+        drop(states);
+        let mut job = PublicationJob {
+            publisher: Arc::clone(self),
+            source: source.to_string(),
+            succeeded: false,
         };
         let publisher = Arc::clone(self);
         let source = source.to_string();
@@ -92,6 +164,8 @@ impl Publisher {
                 .expect("publisher remains open");
             let started = Instant::now();
             let result = publisher.publish(&source, &config_path).await;
+            job.succeeded = result.is_ok();
+            drop(job);
             metrics::histogram!("agentenv_image_publication_duration_seconds")
                 .record(started.elapsed().as_secs_f64());
             let outcome = if result.is_ok() { "done" } else { "failed" };
@@ -182,7 +256,7 @@ impl Publisher {
         .await?;
         self.put_blob(repository, work.path(), &config_descriptor)
             .await?;
-        let manifest = attachment(subject, &config_descriptor, descriptors);
+        let manifest = attachment(subject, &config_descriptor, descriptors, &self.converter_id);
         let bytes = serde_json::to_vec(&manifest)?;
         let manifest_ref = format!("{repository}@{}", sha256_digest(&bytes));
         let path = work.path().join("manifest.json");
@@ -231,7 +305,12 @@ impl Publisher {
         let source = format!("ocidir://{}", layout.display());
         let mut failure = None;
         for attempt in 0..ATTEMPTS {
-            if self.blob_exists(repository, &blob.sha256).await? {
+            // A failed HEAD is inconclusive; let the idempotent copy use its retry budget.
+            if self
+                .blob_exists(repository, &blob.sha256)
+                .await
+                .unwrap_or(false)
+            {
                 return Ok(());
             }
             // OCI-directory copy supplies the payload length and supports chunked retries.
@@ -250,7 +329,11 @@ impl Publisher {
             }
         }
         // A timed-out client can still have committed its last request.
-        if self.blob_exists(repository, &blob.sha256).await? {
+        if self
+            .blob_exists(repository, &blob.sha256)
+            .await
+            .unwrap_or(false)
+        {
             return Ok(());
         }
         Err(failure.expect("an upload was attempted"))
@@ -319,13 +402,19 @@ async fn compress_layer(source: &Path, destination: &Path) -> Result<()> {
     .context("background compression worker")?
 }
 
-fn attachment(subject: Value, config: &FileDigest, layers: Vec<Value>) -> Value {
+fn attachment(
+    subject: Value,
+    config: &FileDigest,
+    layers: Vec<Value>,
+    converter_id: &str,
+) -> Value {
     json!({
         "schemaVersion": 2, "mediaType": MANIFEST_TYPE,
         "artifactType": ARTIFACT_TYPE, "subject": subject,
         "config": {"mediaType": CONFIG_TYPE, "digest": config.sha256, "size": config.size},
         "layers": layers,
-        "annotations": {"co.prometheus.overlaybd.producer": "agentenv-writeback-zstd32-v1"},
+        "annotations": {"co.prometheus.overlaybd.producer": "agentenv-writeback-zstd32-v1",
+            "co.prometheus.overlaybd.converter": converter_id},
     })
 }
 
@@ -337,6 +426,7 @@ mod tests {
 
     use super::*;
     use crate::cfg::ResolvedImageCacheConfig;
+    use crate::image::oci_image::{classify_manifest, ImageFormat};
 
     #[tokio::test]
     async fn compression_preserves_bytes_for_partial_reads() -> Result<()> {
@@ -396,7 +486,9 @@ case "$1 $2" in
   'artifact list') echo '{"manifests":[]}' ;;
   'manifest get') cat source-manifest ;;
   'blob get') cat source-config ;;
-  'blob head') echo 'request failed: not found [http 404]' >&2; exit 1 ;;
+  'blob head')
+    if test -f fail-head; then echo '503 head unavailable' >&2; exit 1; fi
+    echo 'request failed: not found [http 404]' >&2; exit 1 ;;
   'blob copy')
     if test -f fail-upload; then echo '503 unavailable' >&2; exit 1; fi
     cp "${3#ocidir://}/blobs/sha256/${5#sha256:}" "uploaded-${5#sha256:}"
@@ -427,6 +519,8 @@ esac
             reserve_bytes: 0,
             capacity: Arc::new(Semaphore::new(2)),
             active: Semaphore::new(1),
+            states: Mutex::default(),
+            converter_id: "test-converter-v1".into(),
         };
         Ok((
             publisher,
@@ -448,6 +542,15 @@ esac
             source.rsplit_once('@').unwrap().1
         );
         assert_eq!(manifest["artifactType"], ARTIFACT_TYPE);
+        assert_eq!(
+            manifest["annotations"]["co.prometheus.overlaybd.converter"],
+            "test-converter-v1"
+        );
+        let consumer_manifest = serde_json::from_value(manifest.clone())?;
+        assert_eq!(
+            classify_manifest(&consumer_manifest)?,
+            ImageFormat::OverlaybdNative
+        );
         let digest = manifest["config"]["digest"].as_str().unwrap();
         let uploaded: Value = serde_json::from_slice(
             &tokio::fs::read(temp.path().join(format!(
@@ -487,7 +590,11 @@ esac
         for _ in 0..3 {
             publisher.enqueue(&source, local.clone());
         }
+        assert_eq!(publisher.capacity.available_permits(), 1);
+        publisher.enqueue(&source.replace("/image@", "/second@"), local.clone());
+        publisher.enqueue(&source.replace("/image@", "/third@"), local.clone());
         assert_eq!(publisher.capacity.available_permits(), 0);
+        assert_eq!(publisher.states.lock().unwrap().len(), 2);
         tokio::task::yield_now().await;
         assert!(!temp.path().join("calls").exists());
         drop(active);
@@ -498,6 +605,94 @@ esac
         })
         .await?;
         assert!(temp.path().join("published").exists());
+        publisher.enqueue(&source, local);
+        assert_eq!(publisher.capacity.available_permits(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn head_errors_do_not_prevent_upload_or_hide_upload_failure() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (publisher, source, local, _) = fixture(temp.path(), false).await?;
+        tokio::fs::write(temp.path().join("fail-head"), b"").await?;
+        publisher.publish(&source, &local).await?;
+        assert!(temp.path().join("published").exists());
+        tokio::fs::write(temp.path().join("fail-upload"), b"").await?;
+        tokio::fs::write(temp.path().join("calls"), b"").await?;
+        let error = publisher.publish(&source, &local).await.unwrap_err();
+        assert!(format!("{error:#}").contains("503 unavailable"));
+        let calls = tokio::fs::read_to_string(temp.path().join("calls")).await?;
+        assert_eq!(
+            calls
+                .lines()
+                .filter(|line| line.starts_with("blob copy"))
+                .count(),
+            ATTEMPTS
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failure_cooldown_allows_later_retry() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (publisher, source, local, _) = fixture(temp.path(), true).await?;
+        let publisher = Arc::new(publisher);
+        publisher.enqueue(&source, local.clone());
+        timeout(Duration::from_secs(30), async {
+            while publisher.capacity.available_permits() != 2 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        publisher.enqueue(&source, local.clone());
+        assert_eq!(publisher.capacity.available_permits(), 2);
+        assert!(matches!(
+            publisher.states.lock().unwrap()[&source],
+            PublicationState::Failed(_)
+        ));
+        publisher.states.lock().unwrap().insert(
+            source.clone(),
+            PublicationState::Failed(Instant::now() - FAILURE_COOLDOWN),
+        );
+        tokio::fs::remove_file(temp.path().join("fail-upload")).await?;
+        publisher.enqueue(&source, local);
+        assert_eq!(publisher.capacity.available_permits(), 1);
+        timeout(Duration::from_secs(30), async {
+            while publisher.capacity.available_permits() != 2 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert!(temp.path().join("published").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn completion_history_is_bounded_and_abandoned_jobs_can_retry() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (publisher, source, _, _) = fixture(temp.path(), false).await?;
+        let publisher = Arc::new(publisher);
+        let now = Instant::now();
+        {
+            let mut states = publisher.states.lock().unwrap();
+            for i in 0..HISTORY_LIMIT {
+                states.insert(format!("done-{i}"), PublicationState::Done(now));
+            }
+            states.insert(source.clone(), PublicationState::InFlight);
+            states.insert("other-running".into(), PublicationState::InFlight);
+        }
+        drop(PublicationJob {
+            publisher: publisher.clone(),
+            source: source.clone(),
+            succeeded: false,
+        });
+        let states = publisher.states.lock().unwrap();
+        assert_eq!(states.len(), HISTORY_LIMIT + 1);
+        assert!(matches!(states[&source], PublicationState::Failed(_)));
+        assert!(matches!(
+            states["other-running"],
+            PublicationState::InFlight
+        ));
         Ok(())
     }
 

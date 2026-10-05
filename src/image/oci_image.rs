@@ -944,7 +944,7 @@ struct OciPlatform {
 }
 
 #[derive(Debug, Deserialize)]
-struct OciManifest {
+pub(super) struct OciManifest {
     /// OCI 1.1 `artifactType`; accelerated-container-image uses it to mark
     /// overlaybd images (`...overlaybd.native.v1+json` / `...overlaybd.turbo.v1+json`).
     #[serde(rename = "artifactType", default)]
@@ -1048,7 +1048,7 @@ impl std::fmt::Display for ImageFormat {
     }
 }
 
-fn classify_manifest(manifest: &OciManifest) -> ImageResult<ImageFormat> {
+pub(super) fn classify_manifest(manifest: &OciManifest) -> ImageResult<ImageFormat> {
     if manifest.layers.is_empty() {
         return Err(ImageError::Other(anyhow!("OCI manifest has no layers")));
     }
