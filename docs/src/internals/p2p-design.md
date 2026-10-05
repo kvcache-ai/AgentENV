@@ -112,7 +112,7 @@ GC is gated to avoid periodic full-store scans when there is no known deletion w
 
 The scheduler is a directory for node endpoints and artifact-to-node hints only.
 
-1. AgentENV starts the configured P2P transport in `src/bin/server.rs`.
+1. AgentENV starts the configured P2P transport in `crates/server/src/main.rs`.
 2. If the transport exposes `local_endpoint()`, `ObservabilityReporter` includes it in heartbeat requests.
 3. Scheduler stores the endpoint with the observed-node record.
 4. `SchedulerPeerDiscovery` periodically calls `ListP2pPeers(cluster_id, backend, exclude_node_id)`.

@@ -5,10 +5,12 @@ edition = "2021"
 license = "MIT"
 
 [workspace]
+default-members = [".", "crates/server"]
 members = [
     ".",
     "adev",
     "crates/aenv",
+    "crates/server",
     "crates/benchmarks",
     "crates/e2e-tests",
     "crates/linux-cap",

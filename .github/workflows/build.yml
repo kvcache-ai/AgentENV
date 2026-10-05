@@ -8,10 +8,16 @@ on:
       - deploy/docker/**
       - .github/scripts/**
       - .github/workflows/build.yml
+      - crates/server/build.rs
+      - rust-toolchain.toml
 
 # The page job pushes gh-pages; default token perms can be read-only.
 permissions:
   contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: us-dallas-1.ocir.io/ax3vcxtxsjva/dev/research
@@ -60,6 +66,11 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/amd64
+          build-args: AENV_BUILD_COMMIT=${{ github.sha }}
+          cache-from: |
+            type=registry,ref=${{ env.REGISTRY }}/agentenv-${{ matrix.component }}:cache-main
+            type=registry,ref=${{ env.REGISTRY }}/agentenv-${{ matrix.component }}:cache-ci-main
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/agentenv-${{ matrix.component }}:cache-main,mode=max,image-manifest=true,oci-mediatypes=true
           push: true
           tags: |
             ${{ env.REGISTRY }}/agentenv-${{ matrix.component }}:${{ steps.tag.outputs.tag }}

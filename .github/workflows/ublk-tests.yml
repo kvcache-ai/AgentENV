@@ -17,9 +17,11 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - ".github/scripts/restore_rust_source_mtimes.py"
       - ".github/actions/rust-ci-setup/**"
       - ".github/workflows/ublk-tests.yml"
   push:
+    branches: [main]
     paths:
       - "storage/**"
       - "crates/linux-cap/**"
@@ -30,11 +32,16 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - ".github/scripts/restore_rust_source_mtimes.py"
       - ".github/actions/rust-ci-setup/**"
       - ".github/workflows/ublk-tests.yml"
 
 env:
   RUST_LOG: ${{ github.event.inputs.log_level || 'info' }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   ublk-tests:

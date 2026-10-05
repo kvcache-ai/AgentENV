@@ -66,6 +66,8 @@ services:
     restart: unless-stopped
 
   gateway:
+    # Runtime nodes create the shared API key as root with mode 0600.
+    user: "0:0"
     build:
       context: ..
       dockerfile: deploy/docker/Dockerfile.gateway

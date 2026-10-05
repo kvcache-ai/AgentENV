@@ -1,5 +1,4 @@
 [toolchain]
-# Keep this version aligned with the CI setup action and release workflow.
 channel = "1.98.1"
 components = ["clippy", "rustfmt"]
 profile = "minimal"
