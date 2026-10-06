@@ -61,9 +61,9 @@ type Server struct {
 	apiKey             []byte
 	requestTimeout     time.Duration
 	maxRespSize        int64
-	// debugMode, when true, enables debug-only behaviors such as exposing
-	// the backend node id on proxied responses via the x-agentenv-node-id
-	// header. Off by default; toggled via GatewayConfig.DebugMode.
+	// debugMode exposes the backend node ID on all proxied responses. Successful
+	// authenticated sandbox control-plane responses expose it independently.
+	// Off by default; toggled via GatewayConfig.DebugMode.
 	debugMode           bool
 	sandboxProxyDomains []string
 }
@@ -299,6 +299,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		node,
 		proxyRequestOptions{
 			recordAssignment: shouldRecordAssignment(r, routeSource, hasSandbox),
+			exposeNodeID:     shouldExposeNodeID(r, routeSource, hasSandbox),
 			hostRoute:        hostRoute,
 			flushImmediately: longLived,
 		},
@@ -325,6 +326,7 @@ func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
 
 type proxyRequestOptions struct {
 	recordAssignment bool
+	exposeNodeID     bool
 	hostRoute        *hostRoute
 	flushImmediately bool
 }
@@ -359,11 +361,10 @@ func (s *Server) proxyRequest(
 		},
 		FlushInterval: flushInterval(options.flushImmediately),
 		ModifyResponse: func(resp *http.Response) error {
-			// In debug mode, expose the upstream node id on the response so
-			// operators can tell which backend node served a given request.
-			// This is purely for debugging/observability and is not consumed
-			// by the client.
-			if s.debugMode {
+			// Never forward an upstream-supplied node identity. The gateway's
+			// scheduler result is the authoritative source for this header.
+			resp.Header.Del(headerNodeID)
+			if s.debugMode || (options.exposeNodeID && resp.StatusCode >= 200 && resp.StatusCode < 300) {
 				if nodeID := node.GetNodeId(); nodeID != "" {
 					resp.Header.Set(headerNodeID, nodeID)
 				}
@@ -570,6 +571,17 @@ func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox
 
 	// Fork is routed by the source sandbox but creates child sandbox assignments.
 	return isForkPath(path)
+}
+
+func shouldExposeNodeID(r *http.Request, routeSource routeSource, hasSandbox bool) bool {
+	if hasSandbox {
+		return routeSource == routeSourcePath && isSandboxControlPlaneRequest(r)
+	}
+	if routeSource != routeSourceSchedule || r.Method != http.MethodPost {
+		return false
+	}
+	path := strings.TrimRight(r.URL.Path, "/")
+	return path == "/sandboxes" || path == "/v2/sandboxes" || path == "/sandboxes-cold"
 }
 
 func isForkPath(path string) bool {

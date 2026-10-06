@@ -736,6 +736,7 @@ func TestSandboxControlPlaneRequestWithE2BHeadersUsesPathRoute(t *testing.T) {
 					sandboxID: r.Header.Get(headerE2BSandboxID),
 				}
 				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set(headerNodeID, "spoofed-upstream-node")
 				w.WriteHeader(http.StatusCreated)
 				_, _ = w.Write([]byte(`{"sandboxID":"sbx-path"}`))
 			}))
@@ -774,6 +775,9 @@ func TestSandboxControlPlaneRequestWithE2BHeadersUsesPathRoute(t *testing.T) {
 
 			if resp.StatusCode != http.StatusCreated {
 				t.Fatalf("connect status = %d, want %d", resp.StatusCode, http.StatusCreated)
+			}
+			if got := resp.Header.Get(headerNodeID); got != "node-1" {
+				t.Fatalf("response %s = %q, want %q", headerNodeID, got, "node-1")
 			}
 
 			upstreamReq := <-requests
@@ -820,6 +824,36 @@ func TestShouldRecordAssignment(t *testing.T) {
 			got := shouldRecordAssignment(req, tc.route, tc.hasSandbox)
 			if got != tc.want {
 				t.Fatalf("expected %v, got %v", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestShouldExposeNodeID(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		route      routeSource
+		hasSandbox bool
+		want       bool
+	}{
+		{name: "create sandbox", method: http.MethodPost, path: "/sandboxes", route: routeSourceSchedule, want: true},
+		{name: "create v2 sandbox", method: http.MethodPost, path: "/v2/sandboxes", route: routeSourceSchedule, want: true},
+		{name: "create cold sandbox", method: http.MethodPost, path: "/sandboxes-cold", route: routeSourceSchedule, want: true},
+		{name: "sandbox detail", method: http.MethodGet, path: "/sandboxes/sbx-1", route: routeSourcePath, hasSandbox: true, want: true},
+		{name: "sandbox connect", method: http.MethodPost, path: "/v2/sandboxes/sbx-1/connect", route: routeSourcePath, hasSandbox: true, want: true},
+		{name: "data plane headers", method: http.MethodGet, path: "/files", route: routeSourceHeader, hasSandbox: true, want: false},
+		{name: "data plane host", method: http.MethodGet, path: "/sandboxes/sbx-1", route: routeSourceHost, hasSandbox: true, want: false},
+		{name: "sandbox list", method: http.MethodGet, path: "/sandboxes", route: routeSourceSchedule, want: false},
+		{name: "template allocation", method: http.MethodPost, path: "/v2/templates/t/builds/b", route: routeSourceSchedule, want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			if got := shouldExposeNodeID(req, tc.route, tc.hasSandbox); got != tc.want {
+				t.Fatalf("shouldExposeNodeID(%s %s, %s, %v) = %v, want %v", tc.method, tc.path, tc.route, tc.hasSandbox, got, tc.want)
 			}
 		})
 	}
@@ -1913,6 +1947,7 @@ func TestHealthAndMetricsEndpointsWithSandboxHeadersProxyToSandbox(t *testing.T)
 			targetPort:   r.Header.Get(headerTargetPort),
 			forwardedURI: r.Header.Get("X-Forwarded-URI"),
 		}
+		w.Header().Set(headerNodeID, "spoofed-upstream-node")
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer upstream.Close()
@@ -1951,6 +1986,9 @@ func TestHealthAndMetricsEndpointsWithSandboxHeadersProxyToSandbox(t *testing.T)
 
 			if resp.StatusCode != http.StatusNoContent {
 				t.Fatalf("proxy status = %d, want %d", resp.StatusCode, http.StatusNoContent)
+			}
+			if got := resp.Header.Get(headerNodeID); got != "" {
+				t.Fatalf("data-plane response exposed upstream %s = %q", headerNodeID, got)
 			}
 
 			upstreamReq := <-requests
@@ -2214,6 +2252,7 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 		}
 
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set(headerNodeID, "spoofed-upstream-node")
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"sandboxID":"sbx-created"}`))
 	}))
@@ -2235,7 +2274,7 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 			recorded <- req
 			return &schedulerv1.RecordAssignmentResponse{}, nil
 		},
-	}, time.Second, 1024, withDebugMode(true))
+	}, time.Second, 1024)
 
 	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
 	defer gatewayServer.Close()
