@@ -10,9 +10,11 @@ use std::io::ErrorKind;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use storage_util::io_ring::AsyncIoRing;
 
 use super::startup_pack_recorder::StartupPackRecorder;
+use crate::metrics::{IoOp, SlowIoTracker, UblkIoMetrics};
 use crate::{IOBuffer, UVMUblkTarget, UblkDescOperation};
 
 const DEFAULT_PHYSICAL_BS_SHIFT: u8 = 12;
@@ -48,6 +50,8 @@ pub struct OverlaybdTargetConfig {
 pub struct OverlaybdTarget {
     state: ArcSwap<TargetState>,
     recorder: ArcSwapOption<StartupPackRecorder>,
+    metrics: UblkIoMetrics,
+    slow_io_tracker: Arc<SlowIoTracker>,
 }
 
 impl fmt::Debug for OverlaybdTarget {
@@ -120,10 +124,16 @@ impl OverlaybdTarget {
             discard_supported,
         };
 
-        Ok(Self {
+        let target = Self {
             state: ArcSwap::new(Arc::new(state)),
             recorder: ArcSwapOption::new(None),
-        })
+            metrics: UblkIoMetrics::new(Self::DEV_NAME),
+            slow_io_tracker: Arc::new(SlowIoTracker::new(Self::DEV_NAME)),
+        };
+        // Self-register with the process-wide slow-I/O scanner (spawned
+        // once at daemon startup); dead trackers are pruned automatically.
+        crate::metrics::register_slow_io_tracker(&target.slow_io_tracker);
+        Ok(target)
     }
 
     /// Attach (or detach with `None`) a startup-pack first-touch recorder.
@@ -361,13 +371,26 @@ impl UVMUblkTarget for OverlaybdTarget {
         _extra: Option<&mut IOBuffer>,
         io_ring: &AsyncIoRing,
     ) -> i32 {
+        let start = Instant::now();
         let state = self.state.load_full();
         let (op, offset, len) = match self.request_meta(&state, io_desc) {
             Ok(meta) => meta,
             Err(err) => {
+                self.metrics
+                    .record_completion(IoOp::Other, Some(err), 0, start.elapsed());
                 tracing::error!(qid, tag, ?io_desc, "invalid overlaybd ublk request");
                 return err;
             }
+        };
+        let io_op = IoOp::from(op);
+        // Read/write requests are tracked from start (not completion) so
+        // stuck I/Os stay visible in the in-flight gauge even if they never
+        // complete; the guard also removes the entry if this future is
+        // dropped during device teardown.
+        let _slow_guard = if io_op.is_data_op() {
+            Some(self.slow_io_tracker.track(qid, tag, io_op, start))
+        } else {
+            None
         };
 
         tracing::debug!(qid, tag, ?op, offset, len, "handle overlaybd ublk request");
@@ -391,9 +414,15 @@ impl UVMUblkTarget for OverlaybdTarget {
         };
 
         match result {
-            Ok(ret) => ret,
+            Ok(ret) => {
+                self.metrics
+                    .record_completion(io_op, None, ret as u64, start.elapsed());
+                ret
+            }
             Err(err) => {
                 let errno = anyhow_to_ublk_errno(&err);
+                self.metrics
+                    .record_completion(io_op, Some(errno), 0, start.elapsed());
                 tracing::error!(
                     qid,
                     tag,
