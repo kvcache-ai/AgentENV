@@ -16,10 +16,10 @@ use crate::protocol::{
 use overlaybd::{config::UpperMode, RestackSnapshotTerminalFailure};
 
 /// Default timeout for daemon RPC calls.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Timeout for snapshot operations (may be slow for large images).
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(360);
+const SNAPSHOT_TIMEOUT: Duration = Duration::from_hours(6);
 
 /// Timeout for waiting for the daemon to signal readiness.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
