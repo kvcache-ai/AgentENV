@@ -87,7 +87,7 @@ The build accepts these Make variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TOOLS_VERSION` | `0.1.1` | Immutable SemVer release of the complete tools drive |
+| `TOOLS_VERSION` | `0.1.2` | Immutable SemVer release of the complete tools drive |
 | `ENVD_REF` | `2026.17` | Tag, branch, or fetchable commit to build from the envd upstream repository |
 | `ENVD_UPSTREAM_REPO` | `https://github.com/e2b-dev/infra.git` | Repository containing `packages/envd` |
 | `ARCH` | host architecture, normalized to `amd64` or `arm64` | Target architecture |
@@ -98,11 +98,11 @@ The build accepts these Make variables:
 Examples:
 
 ```bash
-make TOOLS_VERSION=0.1.1 ENVD_REF=2026.17 ARCH=amd64
+make TOOLS_VERSION=0.1.2 ENVD_REF=2026.17 ARCH=amd64
 
 make \
   ENVD_UPSTREAM_REPO=https://github.com/e2b-dev/infra.git \
-  TOOLS_VERSION=0.1.1 \
+  TOOLS_VERSION=0.1.2 \
   ENVD_REF=2026.17 \
   ARCH=amd64
 ```
@@ -117,9 +117,9 @@ tags to prevent concurrent or external publishers from replacing a release.
 
 ```bash
 make publish \
-  TOOLS_VERSION=0.1.1 \
+  TOOLS_VERSION=0.1.2 \
   ENVD_REF=2026.17 \
-  IMAGE=ghcr.io/kvcache-ai/agentenv-tools:0.1.1
+  IMAGE=ghcr.io/kvcache-ai/agentenv-tools:0.1.2
 
 make publish \
   TOOLS_VERSION=0.1.1-custom.1 \
@@ -131,7 +131,7 @@ The **Publish Tools Image** workflow also publishes a selected version. Its
 `tools_version` default only prefills the publication form; it does not select
 the runtime's default tools version.
 
-After publishing and validating a release (for example `0.1.1`), update
+After publishing and validating a release (for example `0.1.2`), update
 `[tools].version` in `config/deps_manifest.toml` to that version, then build and
 roll out AgentENV through the existing deployment process. The manifest is
 embedded in the binary; `server --setup-only` prepares the default tools release
