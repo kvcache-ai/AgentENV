@@ -599,6 +599,19 @@ Environment variable override:
 - `AENV_UBLK_DAEMON_BINARY_PATH`
 - `AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR`
 
+The daemon's `/metrics` endpoint includes OverlayBD device I/O metrics,
+aggregated across devices with `target="overlaybd"` (no device ID label):
+
+- `agentenv_ublk_io_requests_total{target,op,errno}`: completed requests; `errno="none"` on success, otherwise the positive errno number. `op` is `read`, `write`, or `other` (including flush, discard, and invalid requests).
+- `agentenv_ublk_io_bytes_total{target,op}`: successfully completed read/write bytes.
+- `agentenv_ublk_io_duration_seconds{target,op}`: read/write completion latency, including errors; the largest finite bucket is 30 seconds.
+- `agentenv_ublk_io_in_flight{target,op,slow_io}`: pending reads/writes, sampled every 5 seconds; `slow_io="true"` means pending for at least 30 seconds.
+
+The in-flight gauge includes requests still waiting on remote storage. Requests
+cancelled during device teardown leave the gauge on the next scan and do not
+count as completed requests. Series reset to zero after the last device is
+released. These metrics use the existing daemon metrics listener setting above.
+
 ## `[ublk.overlaybd]`
 
 OverlayBD configuration for ublk. Legacy `enabled` and `device_type` keys are ignored.

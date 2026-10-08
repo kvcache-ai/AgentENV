@@ -279,6 +279,10 @@ fn main() -> Result<()> {
             .await
             .context("start ublk daemon metrics server")?;
 
+        // Spawn the process-wide slow-I/O scanner on this (the daemon's
+        // main) runtime, which outlives the per-queue worker runtimes.
+        uvm_ublk::spawn_slow_io_scanner();
+
         // Create a shared ImageService from the global config.
         let image_service = ImageService::from_config_path_with_p2p_publish_url(
             &cli.global_config,

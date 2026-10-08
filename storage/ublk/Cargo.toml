@@ -21,6 +21,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1", features = ["v5"] }
 arc-swap = "1.7"
+metrics = "0.24"
+dashmap = "6.1.0"
 
 tracing = "0.1.41"
 tracing-log = "0.2.0"
@@ -30,5 +32,6 @@ tracing-bunyan-formatter = "0.3.10"
 [dev-dependencies]
 tempfile = "3"
 axum = "0.8.6"
+metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
 sha2 = { version = "0.10.9", features = ["asm"] }
 storage-util = { path = "../util", features = ["io-uring"] }
