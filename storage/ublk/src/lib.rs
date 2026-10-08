@@ -13,6 +13,7 @@ mod ctrl;
 mod dev;
 pub mod impls;
 mod io_buffer;
+mod metrics;
 mod queue;
 pub mod ublk_caps;
 
@@ -25,6 +26,7 @@ pub use impls::startup_pack_recorder::{
 };
 pub use impls::{OverlaybdTarget, OverlaybdTargetConfig};
 pub use io_buffer::{AutoRegBuffer, IOBuffer, IOBufferView, UserBuffer};
+pub use metrics::spawn_slow_io_scanner;
 use queue::UBLK_QUEUE_URING;
 pub use queue::{UVMUblkQueue, UblkDescOperation};
 use storage_util::io_ring::IoRingHandle;
