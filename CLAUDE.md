@@ -188,7 +188,7 @@ Reuse shared helpers: `src/local_store.rs` (`LocalKvStore`, explicit
 - **Lifecycle:** Recoverable capture/fork errors restore `Running`; terminal
   errors require teardown. Graceful shutdown persists sandboxes as `Paused`. Node-local state uses one directory per sandbox; startup recovery requires the previous runtime to have stopped.
   Keep the captured `Arc<Snapshot>` alive until repository publication completes.
-- **Storage:** Commit logical layer references, not node-local paths. Cache GC
+- **Storage:** State-changing ublk RPCs wait for confirmation without a fatal wall-clock timeout; slow operations are logged. Interrupted control connections and unconfirmed teardown remain instance-fatal. Commit logical layer references, not node-local paths. Cache GC
   must not delete durable artifacts or live writable uppers. Use
   `UblkDeviceManager`; preserve shared-memory device reference counts and COW.
 - **Capture:** Preserve sealing/restacking and attached-drive state. Template-build
