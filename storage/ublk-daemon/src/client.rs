@@ -16,11 +16,10 @@ use crate::protocol::{
 };
 use overlaybd::{config::UpperMode, RestackSnapshotTerminalFailure};
 
-/// Default timeout for daemon RPC calls.
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for best-effort daemon RPC calls.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Timeout for snapshot operations (may be slow for large images).
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(360);
+const SLOW_REQUEST_WARNING_AFTER: Duration = Duration::from_secs(300);
 
 /// Timeout for waiting for the daemon to signal readiness.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -119,7 +118,6 @@ pub struct UblkDaemonSpawnConfig<'a> {
     pub metrics_listen_addr: &'a str,
     pub pool_config: Option<&'a PoolConfig>,
     pub p2p_publish_url: Option<&'a str>,
-    pub runtime_device_timeout: Duration,
     /// Replace the daemon and recover its devices when it exits unexpectedly.
     pub recovery_enabled: bool,
 }
@@ -188,7 +186,6 @@ struct UblkDaemonClientInner {
     shutting_down: AtomicBool,
     /// Populated with the exit status description when the daemon dies.
     death_reason: Mutex<Option<String>>,
-    runtime_device_timeout: Duration,
     /// How to start a replacement daemon; `None` for test clients.
     command: Option<DaemonCommand>,
     recovery_enabled: bool,
@@ -243,7 +240,6 @@ impl UblkDaemonClient {
                 daemon_exited: tokio::sync::watch::channel(false).0,
                 shutting_down: AtomicBool::new(false),
                 death_reason: Mutex::new(None),
-                runtime_device_timeout: config.runtime_device_timeout,
                 command: Some(command),
                 recovery_enabled: config.recovery_enabled,
                 restarting: AtomicBool::new(false),
@@ -471,7 +467,7 @@ impl UblkDaemonClient {
         let mut exited = inner.daemon_exited.subscribe();
         match tokio::time::timeout(
             DETACH_TIMEOUT,
-            inner.call_inner(DaemonRequest::Detach, &mut false, false),
+            inner.call_inner(&DaemonRequest::Detach, &mut false, false),
         )
         .await
         {
@@ -541,7 +537,7 @@ impl UblkDaemonClient {
             global_config: global_config.to_path_buf(),
             read_only_upper,
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::DeviceCreated {
                 dev_id,
                 device_path,
@@ -558,7 +554,7 @@ impl UblkDaemonClient {
         let request = DaemonRequest::NotifySandboxReady {
             device_key: device_key.to_string(),
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Ok => Ok(()),
             response => bail!("unexpected ublk response: {response:?}"),
         }
@@ -583,7 +579,7 @@ impl UblkDaemonClient {
             quiet_ms,
             max_window_ms,
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Ok => Ok(()),
             DaemonResponse::InvalidRequest { message } => {
                 bail!("daemon: start pack recording rejected: {message}")
@@ -598,7 +594,7 @@ impl UblkDaemonClient {
     /// Poll the state of the pack recording running on `dev_id`.
     pub async fn pack_recording_status(&self, dev_id: u32) -> Result<PackRecordingState> {
         let request = DaemonRequest::PackRecordingStatus { dev_id };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::PackRecording { state } => Ok(state),
             DaemonResponse::InvalidRequest { message } => {
                 bail!("daemon: pack recording status rejected: {message}")
@@ -614,7 +610,7 @@ impl UblkDaemonClient {
     /// recorder, stop the window task, and remove any partial pack output.
     pub async fn abort_pack_recording(&self, dev_id: u32) -> Result<()> {
         let request = DaemonRequest::AbortPackRecording { dev_id };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Ok => Ok(()),
             DaemonResponse::Error { message } => {
                 bail!("daemon: abort pack recording failed: {message}")
@@ -646,7 +642,7 @@ impl UblkDaemonClient {
             mem_virtual_size,
             timeout_secs,
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Ok => Ok(()),
             DaemonResponse::Error { message } => {
                 bail!("daemon: prefetch startup pack failed: {message}")
@@ -685,10 +681,7 @@ impl UblkDaemonClient {
             allow_shrink: request.allow_shrink,
             source_state_strategy,
         };
-        match self
-            .call(request, self.inner.runtime_device_timeout)
-            .await?
-        {
+        match self.call(request).await? {
             DaemonResponse::OverlaybdRuntimeDeviceCreated {
                 dev_id,
                 device_path,
@@ -707,7 +700,7 @@ impl UblkDaemonClient {
     /// Delete a ublk device.
     pub async fn delete(&self, dev_id: u32) -> Result<()> {
         let request = DaemonRequest::Delete { dev_id };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Deleted => Ok(()),
             response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
@@ -725,7 +718,7 @@ impl UblkDaemonClient {
             output_layer_path: output_layer_path.to_path_buf(),
             compact_from,
         };
-        let response = self.call(request, SNAPSHOT_TIMEOUT).await?;
+        let response = self.call(request).await?;
         match response {
             DaemonResponse::RestackSnapshotCreated {
                 descriptor,
@@ -745,7 +738,7 @@ impl UblkDaemonClient {
     /// Flush a live image after its owning VM has stopped issuing I/O.
     pub async fn flush_for_checkpoint(&self, dev_id: u32) -> Result<()> {
         let request = DaemonRequest::FlushForCheckpoint { dev_id };
-        match self.call(request, SNAPSHOT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Ok => Ok(()),
             response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
@@ -765,7 +758,7 @@ impl UblkDaemonClient {
             let response = tokio::time::timeout(
                 Duration::from_secs(5),
                 self.inner
-                    .call_inner(DaemonRequest::Shutdown, &mut false, false),
+                    .call_inner(&DaemonRequest::Shutdown, &mut false, false),
             )
             .await;
             // The daemon may close its socket before replying; process exit is decisive.
@@ -794,7 +787,7 @@ impl UblkDaemonClient {
     /// Returns a bitmask of feature flags (e.g., `UBLK_F_UPDATE_SIZE`).
     pub async fn get_features(&self) -> Result<u64> {
         let request = DaemonRequest::GetFeatures;
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Features { flags } => Ok(flags),
             response => bail!("unexpected ublk response: {response:?}"),
         }
@@ -835,7 +828,7 @@ impl UblkDaemonClient {
             access_mode,
             read_only_upper,
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::DeviceAcquired {
                 dev_id,
                 device_path,
@@ -848,7 +841,7 @@ impl UblkDaemonClient {
     /// Release an overlaybd device back to the pool.
     pub async fn release_overlaybd(&self, dev_id: u32) -> Result<()> {
         let request = DaemonRequest::ReleaseOverlaybd { dev_id };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Released => Ok(()),
             response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
@@ -862,14 +855,14 @@ impl UblkDaemonClient {
             dev_id,
             new_sectors,
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::SizeUpdated => Ok(()),
             response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
 
     /// Fail stop when a live daemon may still own backing files after an uncertain request.
-    async fn call(&self, request: DaemonRequest, timeout: Duration) -> Result<DaemonResponse> {
+    async fn call(&self, request: DaemonRequest) -> Result<DaemonResponse> {
         let inner = &self.inner;
         let best_effort = matches!(
             request,
@@ -903,13 +896,25 @@ impl UblkDaemonClient {
 
         let update = RegistryUpdate::for_request(&request);
         let mut request_started = false;
-        let result = tokio::time::timeout(
-            timeout,
-            inner.call_inner(request, &mut request_started, !best_effort),
-        )
-        .await
-        .with_context(|| format!("ublk control request timed out after {timeout:?}"))
-        .and_then(|result| result);
+        let result = {
+            let exchange = inner.call_inner(&request, &mut request_started, !best_effort);
+            if best_effort {
+                tokio::time::timeout(DEFAULT_TIMEOUT, exchange)
+                    .await
+                    .context("ublk daemon request timed out")?
+            } else {
+                // A slow request can still be changing live backing files.
+                let started = std::time::Instant::now();
+                let mut exchange = std::pin::pin!(exchange);
+                match tokio::time::timeout(SLOW_REQUEST_WARNING_AFTER, &mut exchange).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        tracing::warn!(?request, elapsed = ?started.elapsed(), "ublk daemon request still pending");
+                        exchange.await
+                    }
+                }
+            }
+        };
         let response = match result {
             Ok(response) => response,
             Err(error) if best_effort || (creating && !request_started) => return Err(error),
@@ -965,12 +970,12 @@ impl UblkDaemonClient {
 impl UblkDaemonClientInner {
     async fn call_inner(
         &self,
-        request: DaemonRequest,
+        request: &DaemonRequest,
         request_started: &mut bool,
         protect: bool,
     ) -> Result<DaemonResponse> {
         // Encoding cannot have changed daemon state, so invalid input remains an error.
-        let payload = serde_json::to_vec(&request).context("encode daemon request")?;
+        let payload = serde_json::to_vec(request).context("encode daemon request")?;
         let mut stream = UnixStream::connect(&self.socket_path)
             .await
             .with_context(|| {
@@ -1066,7 +1071,7 @@ impl UblkDaemonClientInner {
         let count = devices.len();
         let response = tokio::time::timeout(
             RECOVER_TIMEOUT,
-            self.call_inner(DaemonRequest::Recover { devices }, &mut false, false),
+            self.call_inner(&DaemonRequest::Recover { devices }, &mut false, false),
         )
         .await;
         let failed = match response {
@@ -1281,7 +1286,6 @@ impl UblkDaemonClient {
                 } else {
                     None
                 }),
-                runtime_device_timeout: Duration::from_secs(360),
                 command: None,
                 recovery_enabled: false,
                 restarting: AtomicBool::new(false),
@@ -1697,10 +1701,6 @@ mod tests {
         let (health, served) = tokio::join!(client.get_features(), server);
         assert_eq!(health?, 0);
         served?;
-        assert!(client
-            .call(DaemonRequest::GetFeatures, Duration::from_millis(10))
-            .await
-            .is_err());
         Ok(())
     }
 
@@ -1784,14 +1784,11 @@ mod tests {
                         }
                         _ => {
                             client
-                                .call(
-                                    DaemonRequest::CreateOverlaybd {
-                                        image_config: "image".into(),
-                                        global_config: "global".into(),
-                                        read_only_upper: false,
-                                    },
-                                    Duration::from_millis(100),
-                                )
+                                .call(DaemonRequest::CreateOverlaybd {
+                                    image_config: "image".into(),
+                                    global_config: "global".into(),
+                                    read_only_upper: false,
+                                })
                                 .await?;
                         }
                     }
@@ -1816,9 +1813,6 @@ mod tests {
                         .await?
                     }
                     "response" => send_message(&mut stream, &DaemonResponse::Deleted).await?,
-                    "timeout" => {
-                        tokio::time::sleep(Duration::from_secs(4)).await;
-                    }
                     _ => unreachable!(),
                 }
                 request.await??;
@@ -1828,7 +1822,6 @@ mod tests {
         }
         for case in [
             "disconnect",
-            "timeout",
             "cancel",
             "response",
             "release",
