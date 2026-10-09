@@ -39,6 +39,19 @@ impl PosixFsSnapshotArtifactLayout {
         root.join("volumes")
     }
 
+    pub(super) fn webhooks_dir(root: &Path) -> PathBuf {
+        root.join("webhooks")
+    }
+
+    pub(super) fn webhook_record_path(root: &Path, id: &uuid::Uuid) -> PathBuf {
+        Self::webhooks_dir(root).join(format!("{id}.json"))
+    }
+
+    /// Not a `.json` file, so webhook listing skips it.
+    pub(super) fn webhook_generation_path(root: &Path) -> PathBuf {
+        Self::webhooks_dir(root).join("generation")
+    }
+
     pub(super) fn volume_aliases_dir(root: &Path) -> PathBuf {
         Self::volumes_dir(root).join("aliases")
     }

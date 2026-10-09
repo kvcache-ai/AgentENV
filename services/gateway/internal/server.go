@@ -190,6 +190,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			s.handleSandboxMetricsList(w, r, routingCtx)
 			return
 		}
+		if kind, ok := webhookAggregateRequest(r); ok {
+			setGatewayRouteSource(w, routeSourceGateway)
+			s.handleWebhookAggregate(w, r, routingCtx, kind)
+			return
+		}
 		if isClusterListRequest(r) {
 			setGatewayRouteSource(w, routeSourceGateway)
 			s.handleClusterList(w, r, routingCtx)

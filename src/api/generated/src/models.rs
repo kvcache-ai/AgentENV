@@ -463,6 +463,82 @@ pub struct VolumesVolumeIdGetPathParams {
     pub volume_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct EventsWebhooksWebhookIdDeletePathParams {
+    pub webhook_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct EventsWebhooksWebhookIdDeliveriesGetPathParams {
+    pub webhook_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct EventsWebhooksWebhookIdDeliveriesGetQueryParams {
+    /// Opaque cursor from the previous response's nextCursor field.
+    #[serde(rename = "cursor")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(rename = "limit")]
+    #[validate(range(min = 1u32, max = 100u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(rename = "orderAsc")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub order_asc: Option<bool>,
+    /// Include deliveries at or after this timestamp.
+    #[serde(rename = "start")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<chrono::DateTime<chrono::Utc>>,
+    /// Include deliveries before this timestamp.
+    #[serde(rename = "end")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<chrono::DateTime<chrono::Utc>>,
+    /// Filter deliveries by delivery status
+    /// Note: inline enums are not fully supported by openapi-generator
+    #[serde(rename = "deliveryStatus")]
+    #[serde(default)]
+    pub delivery_status: Vec<String>,
+    /// Filter deliveries by event type
+    #[serde(rename = "eventType")]
+    #[serde(default)]
+    pub event_type: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct EventsWebhooksWebhookIdGetPathParams {
+    pub webhook_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct EventsWebhooksWebhookIdPatchPathParams {
+    pub webhook_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct EventsWebhooksWebhookIdStatsGetPathParams {
+    pub webhook_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct EventsWebhooksWebhookIdStatsGetQueryParams {
+    /// Inclusive stats range start. Defaults to 24 hours ago.
+    #[serde(rename = "start")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<chrono::DateTime<chrono::Utc>>,
+    /// Exclusive stats range end. Defaults to now.
+    #[serde(rename = "end")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Block drive to attach when starting a sandbox. Attached drives are sandbox launch inputs; if the sandbox is later snapshotted, the current drive state is captured into the resulting snapshot.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
@@ -11536,6 +11612,2261 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<Volume> {
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into Volume - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Configuration for updating existing webhooks
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct WebhookConfiguration {
+    #[serde(rename = "enabled")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// Webhook user friendly name
+    #[serde(rename = "name")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    #[serde(rename = "url")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+
+    #[serde(rename = "events")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events: Option<Vec<String>>,
+
+    /// Secret used to sign the webhook payloads
+    #[serde(rename = "signatureSecret")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature_secret: Option<String>,
+}
+
+impl WebhookConfiguration {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new() -> WebhookConfiguration {
+        WebhookConfiguration {
+            enabled: None,
+            name: None,
+            url: None,
+            events: None,
+            signature_secret: None,
+        }
+    }
+}
+
+/// Converts the WebhookConfiguration value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for WebhookConfiguration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            self.enabled
+                .as_ref()
+                .map(|enabled| ["enabled".to_string(), enabled.to_string()].join(",")),
+            self.name
+                .as_ref()
+                .map(|name| ["name".to_string(), name.to_string()].join(",")),
+            self.url
+                .as_ref()
+                .map(|url| ["url".to_string(), url.to_string()].join(",")),
+            self.events.as_ref().map(|events| {
+                [
+                    "events".to_string(),
+                    events
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ]
+                .join(",")
+            }),
+            self.signature_secret.as_ref().map(|signature_secret| {
+                ["signatureSecret".to_string(), signature_secret.to_string()].join(",")
+            }),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a WebhookConfiguration value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for WebhookConfiguration {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub enabled: Vec<bool>,
+            pub name: Vec<String>,
+            pub url: Vec<String>,
+            pub events: Vec<Vec<String>>,
+            pub signature_secret: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing WebhookConfiguration".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "enabled" => intermediate_rep.enabled.push(<bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "name" => intermediate_rep.name.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "url" => intermediate_rep.url.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    "events" => return std::result::Result::Err("Parsing a container in this style is not supported in WebhookConfiguration".to_string()),
+                    #[allow(clippy::redundant_clone)]
+                    "signatureSecret" => intermediate_rep.signature_secret.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    _ => return std::result::Result::Err("Unexpected key while parsing WebhookConfiguration".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(WebhookConfiguration {
+            enabled: intermediate_rep.enabled.into_iter().next(),
+            name: intermediate_rep.name.into_iter().next(),
+            url: intermediate_rep.url.into_iter().next(),
+            events: intermediate_rep.events.into_iter().next(),
+            signature_secret: intermediate_rep.signature_secret.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<WebhookConfiguration> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<WebhookConfiguration>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<WebhookConfiguration>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for WebhookConfiguration - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<WebhookConfiguration> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <WebhookConfiguration as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into WebhookConfiguration - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Configuration for registering new webhooks
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct WebhookCreate {
+    #[serde(rename = "name")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub name: String,
+
+    #[serde(rename = "url")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub url: String,
+
+    #[serde(rename = "events")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    pub events: Vec<String>,
+
+    #[serde(rename = "enabled")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// Secret used to sign the webhook payloads
+    #[serde(rename = "signatureSecret")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub signature_secret: String,
+}
+
+impl WebhookCreate {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        name: String,
+        url: String,
+        events: Vec<String>,
+        signature_secret: String,
+    ) -> WebhookCreate {
+        WebhookCreate {
+            name,
+            url,
+            events,
+            enabled: Some(true),
+            signature_secret,
+        }
+    }
+}
+
+/// Converts the WebhookCreate value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for WebhookCreate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("name".to_string()),
+            Some(self.name.to_string()),
+            Some("url".to_string()),
+            Some(self.url.to_string()),
+            Some("events".to_string()),
+            Some(
+                self.events
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            self.enabled
+                .as_ref()
+                .map(|enabled| ["enabled".to_string(), enabled.to_string()].join(",")),
+            Some("signatureSecret".to_string()),
+            Some(self.signature_secret.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a WebhookCreate value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for WebhookCreate {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub name: Vec<String>,
+            pub url: Vec<String>,
+            pub events: Vec<Vec<String>>,
+            pub enabled: Vec<bool>,
+            pub signature_secret: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing WebhookCreate".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "name" => intermediate_rep.name.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "url" => intermediate_rep.url.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    "events" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in WebhookCreate"
+                                .to_string(),
+                        );
+                    }
+                    #[allow(clippy::redundant_clone)]
+                    "enabled" => intermediate_rep.enabled.push(
+                        <bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "signatureSecret" => intermediate_rep.signature_secret.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing WebhookCreate".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(WebhookCreate {
+            name: intermediate_rep
+                .name
+                .into_iter()
+                .next()
+                .ok_or_else(|| "name missing in WebhookCreate".to_string())?,
+            url: intermediate_rep
+                .url
+                .into_iter()
+                .next()
+                .ok_or_else(|| "url missing in WebhookCreate".to_string())?,
+            events: intermediate_rep
+                .events
+                .into_iter()
+                .next()
+                .ok_or_else(|| "events missing in WebhookCreate".to_string())?,
+            enabled: intermediate_rep.enabled.into_iter().next(),
+            signature_secret: intermediate_rep
+                .signature_secret
+                .into_iter()
+                .next()
+                .ok_or_else(|| "signatureSecret missing in WebhookCreate".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<WebhookCreate> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<WebhookCreate>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<WebhookCreate>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for WebhookCreate - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<WebhookCreate> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <WebhookCreate as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into WebhookCreate - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Webhook creation response
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct WebhookCreation {
+    /// Webhook unique identifier
+    #[serde(rename = "id")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub id: String,
+
+    /// Webhook user friendly name
+    #[serde(rename = "name")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub name: String,
+
+    /// Time when the template was created
+    #[serde(rename = "createdAt")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
+
+    /// Unique identifier for the team
+    #[serde(rename = "teamId")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub team_id: String,
+
+    #[serde(rename = "url")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub url: String,
+
+    #[serde(rename = "enabled")]
+    pub enabled: bool,
+
+    #[serde(rename = "events")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    pub events: Vec<String>,
+}
+
+impl WebhookCreation {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        id: String,
+        name: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+        team_id: String,
+        url: String,
+        enabled: bool,
+        events: Vec<String>,
+    ) -> WebhookCreation {
+        WebhookCreation {
+            id,
+            name,
+            created_at,
+            team_id,
+            url,
+            enabled,
+            events,
+        }
+    }
+}
+
+/// Converts the WebhookCreation value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for WebhookCreation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("id".to_string()),
+            Some(self.id.to_string()),
+            Some("name".to_string()),
+            Some(self.name.to_string()),
+            // Skipping createdAt in query parameter serialization
+            Some("teamId".to_string()),
+            Some(self.team_id.to_string()),
+            Some("url".to_string()),
+            Some(self.url.to_string()),
+            Some("enabled".to_string()),
+            Some(self.enabled.to_string()),
+            Some("events".to_string()),
+            Some(
+                self.events
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a WebhookCreation value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for WebhookCreation {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub id: Vec<String>,
+            pub name: Vec<String>,
+            pub created_at: Vec<chrono::DateTime<chrono::Utc>>,
+            pub team_id: Vec<String>,
+            pub url: Vec<String>,
+            pub enabled: Vec<bool>,
+            pub events: Vec<Vec<String>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing WebhookCreation".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "id" => intermediate_rep.id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "name" => intermediate_rep.name.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "createdAt" => intermediate_rep.created_at.push(
+                        <chrono::DateTime<chrono::Utc> as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "teamId" => intermediate_rep.team_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "url" => intermediate_rep.url.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "enabled" => intermediate_rep.enabled.push(
+                        <bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    "events" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in WebhookCreation"
+                                .to_string(),
+                        );
+                    }
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing WebhookCreation".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(WebhookCreation {
+            id: intermediate_rep
+                .id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "id missing in WebhookCreation".to_string())?,
+            name: intermediate_rep
+                .name
+                .into_iter()
+                .next()
+                .ok_or_else(|| "name missing in WebhookCreation".to_string())?,
+            created_at: intermediate_rep
+                .created_at
+                .into_iter()
+                .next()
+                .ok_or_else(|| "createdAt missing in WebhookCreation".to_string())?,
+            team_id: intermediate_rep
+                .team_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "teamId missing in WebhookCreation".to_string())?,
+            url: intermediate_rep
+                .url
+                .into_iter()
+                .next()
+                .ok_or_else(|| "url missing in WebhookCreation".to_string())?,
+            enabled: intermediate_rep
+                .enabled
+                .into_iter()
+                .next()
+                .ok_or_else(|| "enabled missing in WebhookCreation".to_string())?,
+            events: intermediate_rep
+                .events
+                .into_iter()
+                .next()
+                .ok_or_else(|| "events missing in WebhookCreation".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<WebhookCreation> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<WebhookCreation>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<WebhookCreation>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for WebhookCreation - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<WebhookCreation> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <WebhookCreation as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into WebhookCreation - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Paginated webhook delivery attempts grouped by event
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct WebhookDeliveriesListPayload {
+    #[serde(rename = "data")]
+    #[validate(nested)]
+    pub data: Vec<models::WebhookDeliveryGroup>,
+
+    /// Cursor to pass to the next list request, or null when there is no next page.
+    #[serde(rename = "nextCursor")]
+    pub next_cursor: Nullable<String>,
+}
+
+impl WebhookDeliveriesListPayload {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        data: Vec<models::WebhookDeliveryGroup>,
+        next_cursor: Nullable<String>,
+    ) -> WebhookDeliveriesListPayload {
+        WebhookDeliveriesListPayload { data, next_cursor }
+    }
+}
+
+/// Converts the WebhookDeliveriesListPayload value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for WebhookDeliveriesListPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping data in query parameter serialization
+            Some("nextCursor".to_string()),
+            Some(
+                self.next_cursor
+                    .as_ref()
+                    .map_or("null".to_string(), |x| x.to_string()),
+            ),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a WebhookDeliveriesListPayload value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for WebhookDeliveriesListPayload {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub data: Vec<Vec<models::WebhookDeliveryGroup>>,
+            pub next_cursor: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing WebhookDeliveriesListPayload".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    "data" => return std::result::Result::Err("Parsing a container in this style is not supported in WebhookDeliveriesListPayload".to_string()),
+                    "nextCursor" => return std::result::Result::Err("Parsing a nullable type in this style is not supported in WebhookDeliveriesListPayload".to_string()),
+                    _ => return std::result::Result::Err("Unexpected key while parsing WebhookDeliveriesListPayload".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(WebhookDeliveriesListPayload {
+            data: intermediate_rep
+                .data
+                .into_iter()
+                .next()
+                .ok_or_else(|| "data missing in WebhookDeliveriesListPayload".to_string())?,
+            next_cursor: std::result::Result::Err(
+                "Nullable types not supported in WebhookDeliveriesListPayload".to_string(),
+            )?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<WebhookDeliveriesListPayload> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<WebhookDeliveriesListPayload>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<WebhookDeliveriesListPayload>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for WebhookDeliveriesListPayload - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<WebhookDeliveriesListPayload> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <WebhookDeliveriesListPayload as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into WebhookDeliveriesListPayload - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Webhook delivery attempt
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct WebhookDelivery {
+    /// Delivery attempt identifier
+    #[serde(rename = "id")]
+    pub id: uuid::Uuid,
+
+    /// Team identifier
+    #[serde(rename = "teamId")]
+    pub team_id: uuid::Uuid,
+
+    /// Webhook configuration identifier
+    #[serde(rename = "webhookId")]
+    pub webhook_id: uuid::Uuid,
+
+    /// Sandbox event identifier
+    #[serde(rename = "eventId")]
+    pub event_id: uuid::Uuid,
+
+    /// Sandbox identifier
+    #[serde(rename = "sandboxId")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub sandbox_id: String,
+
+    /// Sandbox event type
+    #[serde(rename = "eventType")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub event_type: String,
+
+    /// Delivery attempt status
+    /// Note: inline enums are not fully supported by openapi-generator
+    #[serde(rename = "status")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub status: String,
+
+    /// Delivery request duration in milliseconds
+    #[serde(rename = "durationMs")]
+    pub duration_ms: i32,
+
+    /// Serialized webhook request body
+    #[serde(rename = "requestBody")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub request_body: String,
+
+    /// JSON-encoded request headers with sensitive values redacted
+    #[serde(rename = "requestHeaders")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub request_headers: String,
+
+    /// URL attempted for this delivery
+    #[serde(rename = "requestUrl")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub request_url: String,
+
+    /// Truncated response body, if a response was received
+    #[serde(rename = "responseBody")]
+    #[serde(deserialize_with = "deserialize_optional_nullable")]
+    #[serde(default = "default_optional_nullable")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_body: Option<Nullable<String>>,
+
+    /// JSON-encoded response headers, if a response was received
+    #[serde(rename = "responseHeaders")]
+    #[serde(deserialize_with = "deserialize_optional_nullable")]
+    #[serde(default = "default_optional_nullable")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_headers: Option<Nullable<String>>,
+
+    /// HTTP response status code, if a response was received
+    #[serde(rename = "responseHttpStatusCode")]
+    #[serde(deserialize_with = "deserialize_optional_nullable")]
+    #[serde(default = "default_optional_nullable")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_http_status_code: Option<Nullable<i32>>,
+
+    /// Machine-readable non-HTTP or HTTP failure class
+    /// Note: inline enums are not fully supported by openapi-generator
+    #[serde(rename = "errorClass")]
+    pub error_class: Nullable<String>,
+
+    /// Error message for failures without a useful response body
+    #[serde(rename = "errorMessage")]
+    #[serde(deserialize_with = "deserialize_optional_nullable")]
+    #[serde(default = "default_optional_nullable")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<Nullable<String>>,
+
+    /// Time when the delivery attempt started
+    #[serde(rename = "timestamp")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+impl WebhookDelivery {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        id: uuid::Uuid,
+        team_id: uuid::Uuid,
+        webhook_id: uuid::Uuid,
+        event_id: uuid::Uuid,
+        sandbox_id: String,
+        event_type: String,
+        status: String,
+        duration_ms: i32,
+        request_body: String,
+        request_headers: String,
+        request_url: String,
+        error_class: Nullable<String>,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) -> WebhookDelivery {
+        WebhookDelivery {
+            id,
+            team_id,
+            webhook_id,
+            event_id,
+            sandbox_id,
+            event_type,
+            status,
+            duration_ms,
+            request_body,
+            request_headers,
+            request_url,
+            response_body: None,
+            response_headers: None,
+            response_http_status_code: None,
+            error_class,
+            error_message: None,
+            timestamp,
+        }
+    }
+}
+
+/// Converts the WebhookDelivery value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for WebhookDelivery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping id in query parameter serialization
+
+            // Skipping teamId in query parameter serialization
+
+            // Skipping webhookId in query parameter serialization
+
+            // Skipping eventId in query parameter serialization
+            Some("sandboxId".to_string()),
+            Some(self.sandbox_id.to_string()),
+            Some("eventType".to_string()),
+            Some(self.event_type.to_string()),
+            Some("status".to_string()),
+            Some(self.status.to_string()),
+            Some("durationMs".to_string()),
+            Some(self.duration_ms.to_string()),
+            Some("requestBody".to_string()),
+            Some(self.request_body.to_string()),
+            Some("requestHeaders".to_string()),
+            Some(self.request_headers.to_string()),
+            Some("requestUrl".to_string()),
+            Some(self.request_url.to_string()),
+            self.response_body.as_ref().map(|response_body| {
+                [
+                    "responseBody".to_string(),
+                    response_body
+                        .as_ref()
+                        .map_or("null".to_string(), |x| x.to_string()),
+                ]
+                .join(",")
+            }),
+            self.response_headers.as_ref().map(|response_headers| {
+                [
+                    "responseHeaders".to_string(),
+                    response_headers
+                        .as_ref()
+                        .map_or("null".to_string(), |x| x.to_string()),
+                ]
+                .join(",")
+            }),
+            self.response_http_status_code
+                .as_ref()
+                .map(|response_http_status_code| {
+                    [
+                        "responseHttpStatusCode".to_string(),
+                        response_http_status_code
+                            .as_ref()
+                            .map_or("null".to_string(), |x| x.to_string()),
+                    ]
+                    .join(",")
+                }),
+            Some("errorClass".to_string()),
+            Some(
+                self.error_class
+                    .as_ref()
+                    .map_or("null".to_string(), |x| x.to_string()),
+            ),
+            self.error_message.as_ref().map(|error_message| {
+                [
+                    "errorMessage".to_string(),
+                    error_message
+                        .as_ref()
+                        .map_or("null".to_string(), |x| x.to_string()),
+                ]
+                .join(",")
+            }),
+            // Skipping timestamp in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a WebhookDelivery value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for WebhookDelivery {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub id: Vec<uuid::Uuid>,
+            pub team_id: Vec<uuid::Uuid>,
+            pub webhook_id: Vec<uuid::Uuid>,
+            pub event_id: Vec<uuid::Uuid>,
+            pub sandbox_id: Vec<String>,
+            pub event_type: Vec<String>,
+            pub status: Vec<String>,
+            pub duration_ms: Vec<i32>,
+            pub request_body: Vec<String>,
+            pub request_headers: Vec<String>,
+            pub request_url: Vec<String>,
+            pub response_body: Vec<String>,
+            pub response_headers: Vec<String>,
+            pub response_http_status_code: Vec<i32>,
+            pub error_class: Vec<String>,
+            pub error_message: Vec<String>,
+            pub timestamp: Vec<chrono::DateTime<chrono::Utc>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing WebhookDelivery".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "id" => intermediate_rep.id.push(
+                        <uuid::Uuid as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "teamId" => intermediate_rep.team_id.push(
+                        <uuid::Uuid as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "webhookId" => intermediate_rep.webhook_id.push(
+                        <uuid::Uuid as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "eventId" => intermediate_rep.event_id.push(
+                        <uuid::Uuid as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "sandboxId" => intermediate_rep.sandbox_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "eventType" => intermediate_rep.event_type.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "status" => intermediate_rep.status.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "durationMs" => intermediate_rep.duration_ms.push(
+                        <i32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "requestBody" => intermediate_rep.request_body.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "requestHeaders" => intermediate_rep.request_headers.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "requestUrl" => intermediate_rep.request_url.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    "responseBody" => return std::result::Result::Err(
+                        "Parsing a nullable type in this style is not supported in WebhookDelivery"
+                            .to_string(),
+                    ),
+                    "responseHeaders" => return std::result::Result::Err(
+                        "Parsing a nullable type in this style is not supported in WebhookDelivery"
+                            .to_string(),
+                    ),
+                    "responseHttpStatusCode" => return std::result::Result::Err(
+                        "Parsing a nullable type in this style is not supported in WebhookDelivery"
+                            .to_string(),
+                    ),
+                    "errorClass" => return std::result::Result::Err(
+                        "Parsing a nullable type in this style is not supported in WebhookDelivery"
+                            .to_string(),
+                    ),
+                    "errorMessage" => return std::result::Result::Err(
+                        "Parsing a nullable type in this style is not supported in WebhookDelivery"
+                            .to_string(),
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "timestamp" => intermediate_rep.timestamp.push(
+                        <chrono::DateTime<chrono::Utc> as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing WebhookDelivery".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(WebhookDelivery {
+            id: intermediate_rep
+                .id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "id missing in WebhookDelivery".to_string())?,
+            team_id: intermediate_rep
+                .team_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "teamId missing in WebhookDelivery".to_string())?,
+            webhook_id: intermediate_rep
+                .webhook_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "webhookId missing in WebhookDelivery".to_string())?,
+            event_id: intermediate_rep
+                .event_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "eventId missing in WebhookDelivery".to_string())?,
+            sandbox_id: intermediate_rep
+                .sandbox_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "sandboxId missing in WebhookDelivery".to_string())?,
+            event_type: intermediate_rep
+                .event_type
+                .into_iter()
+                .next()
+                .ok_or_else(|| "eventType missing in WebhookDelivery".to_string())?,
+            status: intermediate_rep
+                .status
+                .into_iter()
+                .next()
+                .ok_or_else(|| "status missing in WebhookDelivery".to_string())?,
+            duration_ms: intermediate_rep
+                .duration_ms
+                .into_iter()
+                .next()
+                .ok_or_else(|| "durationMs missing in WebhookDelivery".to_string())?,
+            request_body: intermediate_rep
+                .request_body
+                .into_iter()
+                .next()
+                .ok_or_else(|| "requestBody missing in WebhookDelivery".to_string())?,
+            request_headers: intermediate_rep
+                .request_headers
+                .into_iter()
+                .next()
+                .ok_or_else(|| "requestHeaders missing in WebhookDelivery".to_string())?,
+            request_url: intermediate_rep
+                .request_url
+                .into_iter()
+                .next()
+                .ok_or_else(|| "requestUrl missing in WebhookDelivery".to_string())?,
+            response_body: std::result::Result::Err(
+                "Nullable types not supported in WebhookDelivery".to_string(),
+            )?,
+            response_headers: std::result::Result::Err(
+                "Nullable types not supported in WebhookDelivery".to_string(),
+            )?,
+            response_http_status_code: std::result::Result::Err(
+                "Nullable types not supported in WebhookDelivery".to_string(),
+            )?,
+            error_class: std::result::Result::Err(
+                "Nullable types not supported in WebhookDelivery".to_string(),
+            )?,
+            error_message: std::result::Result::Err(
+                "Nullable types not supported in WebhookDelivery".to_string(),
+            )?,
+            timestamp: intermediate_rep
+                .timestamp
+                .into_iter()
+                .next()
+                .ok_or_else(|| "timestamp missing in WebhookDelivery".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<WebhookDelivery> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<WebhookDelivery>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<WebhookDelivery>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for WebhookDelivery - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<WebhookDelivery> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <WebhookDelivery as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into WebhookDelivery - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Webhook delivery duration statistics in milliseconds
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct WebhookDeliveryDurationStats {
+    #[serde(rename = "minimum")]
+    pub minimum: f64,
+
+    #[serde(rename = "average")]
+    pub average: f64,
+
+    #[serde(rename = "maximum")]
+    pub maximum: f64,
+}
+
+impl WebhookDeliveryDurationStats {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(minimum: f64, average: f64, maximum: f64) -> WebhookDeliveryDurationStats {
+        WebhookDeliveryDurationStats {
+            minimum,
+            average,
+            maximum,
+        }
+    }
+}
+
+/// Converts the WebhookDeliveryDurationStats value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for WebhookDeliveryDurationStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("minimum".to_string()),
+            Some(self.minimum.to_string()),
+            Some("average".to_string()),
+            Some(self.average.to_string()),
+            Some("maximum".to_string()),
+            Some(self.maximum.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a WebhookDeliveryDurationStats value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for WebhookDeliveryDurationStats {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub minimum: Vec<f64>,
+            pub average: Vec<f64>,
+            pub maximum: Vec<f64>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing WebhookDeliveryDurationStats".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "minimum" => intermediate_rep.minimum.push(
+                        <f64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "average" => intermediate_rep.average.push(
+                        <f64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "maximum" => intermediate_rep.maximum.push(
+                        <f64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing WebhookDeliveryDurationStats".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(WebhookDeliveryDurationStats {
+            minimum: intermediate_rep
+                .minimum
+                .into_iter()
+                .next()
+                .ok_or_else(|| "minimum missing in WebhookDeliveryDurationStats".to_string())?,
+            average: intermediate_rep
+                .average
+                .into_iter()
+                .next()
+                .ok_or_else(|| "average missing in WebhookDeliveryDurationStats".to_string())?,
+            maximum: intermediate_rep
+                .maximum
+                .into_iter()
+                .next()
+                .ok_or_else(|| "maximum missing in WebhookDeliveryDurationStats".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<WebhookDeliveryDurationStats> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<WebhookDeliveryDurationStats>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<WebhookDeliveryDurationStats>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for WebhookDeliveryDurationStats - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<WebhookDeliveryDurationStats> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <WebhookDeliveryDurationStats as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into WebhookDeliveryDurationStats - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Webhook delivery attempts grouped by sandbox event
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct WebhookDeliveryGroup {
+    #[serde(rename = "eventId")]
+    pub event_id: uuid::Uuid,
+
+    #[serde(rename = "eventType")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub event_type: String,
+
+    #[serde(rename = "sandboxId")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub sandbox_id: String,
+
+    #[serde(rename = "attempts")]
+    #[validate(nested)]
+    pub attempts: Vec<models::WebhookDelivery>,
+}
+
+impl WebhookDeliveryGroup {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        event_id: uuid::Uuid,
+        event_type: String,
+        sandbox_id: String,
+        attempts: Vec<models::WebhookDelivery>,
+    ) -> WebhookDeliveryGroup {
+        WebhookDeliveryGroup {
+            event_id,
+            event_type,
+            sandbox_id,
+            attempts,
+        }
+    }
+}
+
+/// Converts the WebhookDeliveryGroup value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for WebhookDeliveryGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping eventId in query parameter serialization
+            Some("eventType".to_string()),
+            Some(self.event_type.to_string()),
+            Some("sandboxId".to_string()),
+            Some(self.sandbox_id.to_string()),
+            // Skipping attempts in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a WebhookDeliveryGroup value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for WebhookDeliveryGroup {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub event_id: Vec<uuid::Uuid>,
+            pub event_type: Vec<String>,
+            pub sandbox_id: Vec<String>,
+            pub attempts: Vec<Vec<models::WebhookDelivery>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing WebhookDeliveryGroup".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "eventId" => intermediate_rep.event_id.push(<uuid::Uuid as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "eventType" => intermediate_rep.event_type.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "sandboxId" => intermediate_rep.sandbox_id.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    "attempts" => return std::result::Result::Err("Parsing a container in this style is not supported in WebhookDeliveryGroup".to_string()),
+                    _ => return std::result::Result::Err("Unexpected key while parsing WebhookDeliveryGroup".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(WebhookDeliveryGroup {
+            event_id: intermediate_rep
+                .event_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "eventId missing in WebhookDeliveryGroup".to_string())?,
+            event_type: intermediate_rep
+                .event_type
+                .into_iter()
+                .next()
+                .ok_or_else(|| "eventType missing in WebhookDeliveryGroup".to_string())?,
+            sandbox_id: intermediate_rep
+                .sandbox_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "sandboxId missing in WebhookDeliveryGroup".to_string())?,
+            attempts: intermediate_rep
+                .attempts
+                .into_iter()
+                .next()
+                .ok_or_else(|| "attempts missing in WebhookDeliveryGroup".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<WebhookDeliveryGroup> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<WebhookDeliveryGroup>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<WebhookDeliveryGroup>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for WebhookDeliveryGroup - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<WebhookDeliveryGroup> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <WebhookDeliveryGroup as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into WebhookDeliveryGroup - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Webhook delivery aggregate stats
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct WebhookDeliveryStats {
+    #[serde(rename = "buckets")]
+    #[validate(nested)]
+    pub buckets: Vec<models::WebhookDeliveryStatsBucket>,
+
+    #[serde(rename = "total")]
+    pub total: i64,
+
+    #[serde(rename = "failed")]
+    pub failed: i64,
+
+    #[serde(rename = "durationMs")]
+    #[validate(nested)]
+    pub duration_ms: models::WebhookDeliveryDurationStats,
+}
+
+impl WebhookDeliveryStats {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        buckets: Vec<models::WebhookDeliveryStatsBucket>,
+        total: i64,
+        failed: i64,
+        duration_ms: models::WebhookDeliveryDurationStats,
+    ) -> WebhookDeliveryStats {
+        WebhookDeliveryStats {
+            buckets,
+            total,
+            failed,
+            duration_ms,
+        }
+    }
+}
+
+/// Converts the WebhookDeliveryStats value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for WebhookDeliveryStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping buckets in query parameter serialization
+            Some("total".to_string()),
+            Some(self.total.to_string()),
+            Some("failed".to_string()),
+            Some(self.failed.to_string()),
+            // Skipping durationMs in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a WebhookDeliveryStats value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for WebhookDeliveryStats {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub buckets: Vec<Vec<models::WebhookDeliveryStatsBucket>>,
+            pub total: Vec<i64>,
+            pub failed: Vec<i64>,
+            pub duration_ms: Vec<models::WebhookDeliveryDurationStats>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing WebhookDeliveryStats".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    "buckets" => return std::result::Result::Err("Parsing a container in this style is not supported in WebhookDeliveryStats".to_string()),
+                    #[allow(clippy::redundant_clone)]
+                    "total" => intermediate_rep.total.push(<i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "failed" => intermediate_rep.failed.push(<i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "durationMs" => intermediate_rep.duration_ms.push(<models::WebhookDeliveryDurationStats as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    _ => return std::result::Result::Err("Unexpected key while parsing WebhookDeliveryStats".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(WebhookDeliveryStats {
+            buckets: intermediate_rep
+                .buckets
+                .into_iter()
+                .next()
+                .ok_or_else(|| "buckets missing in WebhookDeliveryStats".to_string())?,
+            total: intermediate_rep
+                .total
+                .into_iter()
+                .next()
+                .ok_or_else(|| "total missing in WebhookDeliveryStats".to_string())?,
+            failed: intermediate_rep
+                .failed
+                .into_iter()
+                .next()
+                .ok_or_else(|| "failed missing in WebhookDeliveryStats".to_string())?,
+            duration_ms: intermediate_rep
+                .duration_ms
+                .into_iter()
+                .next()
+                .ok_or_else(|| "durationMs missing in WebhookDeliveryStats".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<WebhookDeliveryStats> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<WebhookDeliveryStats>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<WebhookDeliveryStats>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for WebhookDeliveryStats - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<WebhookDeliveryStats> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <WebhookDeliveryStats as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into WebhookDeliveryStats - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Webhook delivery stats for a time bucket
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct WebhookDeliveryStatsBucket {
+    #[serde(rename = "timestamp")]
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+
+    #[serde(rename = "total")]
+    pub total: i64,
+
+    #[serde(rename = "failed")]
+    pub failed: i64,
+
+    #[serde(rename = "durationMs")]
+    #[validate(nested)]
+    pub duration_ms: models::WebhookDeliveryDurationStats,
+}
+
+impl WebhookDeliveryStatsBucket {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        timestamp: chrono::DateTime<chrono::Utc>,
+        total: i64,
+        failed: i64,
+        duration_ms: models::WebhookDeliveryDurationStats,
+    ) -> WebhookDeliveryStatsBucket {
+        WebhookDeliveryStatsBucket {
+            timestamp,
+            total,
+            failed,
+            duration_ms,
+        }
+    }
+}
+
+/// Converts the WebhookDeliveryStatsBucket value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for WebhookDeliveryStatsBucket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            // Skipping timestamp in query parameter serialization
+            Some("total".to_string()),
+            Some(self.total.to_string()),
+            Some("failed".to_string()),
+            Some(self.failed.to_string()),
+            // Skipping durationMs in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a WebhookDeliveryStatsBucket value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for WebhookDeliveryStatsBucket {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub timestamp: Vec<chrono::DateTime<chrono::Utc>>,
+            pub total: Vec<i64>,
+            pub failed: Vec<i64>,
+            pub duration_ms: Vec<models::WebhookDeliveryDurationStats>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing WebhookDeliveryStatsBucket".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "timestamp" => intermediate_rep.timestamp.push(
+                        <chrono::DateTime<chrono::Utc> as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "total" => intermediate_rep.total.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "failed" => intermediate_rep.failed.push(
+                        <i64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "durationMs" => intermediate_rep.duration_ms.push(
+                        <models::WebhookDeliveryDurationStats as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing WebhookDeliveryStatsBucket".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(WebhookDeliveryStatsBucket {
+            timestamp: intermediate_rep
+                .timestamp
+                .into_iter()
+                .next()
+                .ok_or_else(|| "timestamp missing in WebhookDeliveryStatsBucket".to_string())?,
+            total: intermediate_rep
+                .total
+                .into_iter()
+                .next()
+                .ok_or_else(|| "total missing in WebhookDeliveryStatsBucket".to_string())?,
+            failed: intermediate_rep
+                .failed
+                .into_iter()
+                .next()
+                .ok_or_else(|| "failed missing in WebhookDeliveryStatsBucket".to_string())?,
+            duration_ms: intermediate_rep
+                .duration_ms
+                .into_iter()
+                .next()
+                .ok_or_else(|| "durationMs missing in WebhookDeliveryStatsBucket".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<WebhookDeliveryStatsBucket> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<WebhookDeliveryStatsBucket>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<WebhookDeliveryStatsBucket>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for WebhookDeliveryStatsBucket - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<WebhookDeliveryStatsBucket> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <WebhookDeliveryStatsBucket as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into WebhookDeliveryStatsBucket - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Webhook detail response
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct WebhookDetail {
+    /// Webhook unique identifier
+    #[serde(rename = "id")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub id: String,
+
+    /// Unique identifier for the team
+    #[serde(rename = "teamId")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub team_id: String,
+
+    /// Webhook user friendly name
+    #[serde(rename = "name")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub name: String,
+
+    /// Time when the template was created
+    #[serde(rename = "createdAt")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
+
+    #[serde(rename = "url")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub url: String,
+
+    #[serde(rename = "enabled")]
+    pub enabled: bool,
+
+    #[serde(rename = "events")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    pub events: Vec<String>,
+}
+
+impl WebhookDetail {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        id: String,
+        team_id: String,
+        name: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+        url: String,
+        enabled: bool,
+        events: Vec<String>,
+    ) -> WebhookDetail {
+        WebhookDetail {
+            id,
+            team_id,
+            name,
+            created_at,
+            url,
+            enabled,
+            events,
+        }
+    }
+}
+
+/// Converts the WebhookDetail value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for WebhookDetail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("id".to_string()),
+            Some(self.id.to_string()),
+            Some("teamId".to_string()),
+            Some(self.team_id.to_string()),
+            Some("name".to_string()),
+            Some(self.name.to_string()),
+            // Skipping createdAt in query parameter serialization
+            Some("url".to_string()),
+            Some(self.url.to_string()),
+            Some("enabled".to_string()),
+            Some(self.enabled.to_string()),
+            Some("events".to_string()),
+            Some(
+                self.events
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a WebhookDetail value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for WebhookDetail {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub id: Vec<String>,
+            pub team_id: Vec<String>,
+            pub name: Vec<String>,
+            pub created_at: Vec<chrono::DateTime<chrono::Utc>>,
+            pub url: Vec<String>,
+            pub enabled: Vec<bool>,
+            pub events: Vec<Vec<String>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing WebhookDetail".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "id" => intermediate_rep.id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "teamId" => intermediate_rep.team_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "name" => intermediate_rep.name.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "createdAt" => intermediate_rep.created_at.push(
+                        <chrono::DateTime<chrono::Utc> as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "url" => intermediate_rep.url.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "enabled" => intermediate_rep.enabled.push(
+                        <bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    "events" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in WebhookDetail"
+                                .to_string(),
+                        );
+                    }
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing WebhookDetail".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(WebhookDetail {
+            id: intermediate_rep
+                .id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "id missing in WebhookDetail".to_string())?,
+            team_id: intermediate_rep
+                .team_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "teamId missing in WebhookDetail".to_string())?,
+            name: intermediate_rep
+                .name
+                .into_iter()
+                .next()
+                .ok_or_else(|| "name missing in WebhookDetail".to_string())?,
+            created_at: intermediate_rep
+                .created_at
+                .into_iter()
+                .next()
+                .ok_or_else(|| "createdAt missing in WebhookDetail".to_string())?,
+            url: intermediate_rep
+                .url
+                .into_iter()
+                .next()
+                .ok_or_else(|| "url missing in WebhookDetail".to_string())?,
+            enabled: intermediate_rep
+                .enabled
+                .into_iter()
+                .next()
+                .ok_or_else(|| "enabled missing in WebhookDetail".to_string())?,
+            events: intermediate_rep
+                .events
+                .into_iter()
+                .next()
+                .ok_or_else(|| "events missing in WebhookDetail".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<WebhookDetail> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<WebhookDetail>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<WebhookDetail>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for WebhookDetail - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<WebhookDetail> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <WebhookDetail as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into WebhookDetail - {err}"#
                     )),
                 }
             }

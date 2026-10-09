@@ -8,6 +8,8 @@ Go implementation of a distributed Gateway and pluggable Scheduler for AgentENV.
 - Gateway aggregates `GET /sandboxes` and `GET /v2/sandboxes` across all scheduler nodes.
 - Gateway aggregates `GET /nodes` across all observed nodes in the scheduler.
 - Gateway resolves `GET /nodes/{id}` via scheduler and proxies to the target node.
+- Gateway aggregates webhook `GET /events/webhooks/{id}/deliveries` and `/stats`
+  across all nodes, because each node records only its own delivery attempts.
 - Gateway routes sandbox requests by existing sandbox-to-node binding.
 - Scheduler exposes gRPC API and supports pluggable strategy providers.
 - Built-in strategies in v1: round_robin and random.

@@ -5919,3 +5919,56 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
     assert!(task.await.unwrap()?.is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn lifecycle_events_carry_metadata_and_fork_source() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let mut events = orchestrator.subscribe_sandbox_events();
+    let created = orchestrator
+        .create_sandbox(create_request(Some(90), &[("case_id", "events")]))
+        .await?;
+    let create = events.recv().await.unwrap();
+    assert_eq!(create.event_type, SandboxLifecycleEventType::Create);
+    assert_eq!(create.sandbox_id, created.id);
+    assert_eq!(create.template_id, created.snapshot_id);
+    assert_eq!(
+        create
+            .user_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("case_id"))
+            .map(String::as_str),
+        Some("events")
+    );
+
+    // Timeout changes are not lifecycle events.
+    orchestrator
+        .keep_alive_for(created.id, Some(Duration::from_secs(600)), false)
+        .await?;
+    assert!(events.try_recv().is_err());
+
+    let children = orchestrator
+        .fork_sandbox(created.id, 2, NewTimeout::UseExisting)
+        .await?
+        .into_iter()
+        .collect::<StdResult<Vec<_>, _>>()?;
+    for child in &children {
+        let fork = events.recv().await.unwrap();
+        assert_eq!(fork.event_type, SandboxLifecycleEventType::Fork);
+        assert_eq!(fork.sandbox_id, child.id);
+        assert_eq!(fork.source_sandbox_id, Some(created.id));
+        assert_eq!(fork.user_metadata, created.user_metadata);
+    }
+    for child in &children {
+        orchestrator.delete_sandbox(child.id).await?;
+        events.recv().await.unwrap();
+    }
+
+    orchestrator.delete_sandbox(created.id).await?;
+    assert_eq!(
+        events.recv().await.unwrap().event_type,
+        SandboxLifecycleEventType::Delete
+    );
+    assert!(events.try_recv().is_err());
+    Ok(())
+}

@@ -64,11 +64,16 @@ pub enum SandboxLifecycleEventType {
     Fork,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SandboxLifecycleEvent {
     pub event_type: SandboxLifecycleEventType,
     pub sandbox_id: SandboxId,
     pub resources: SandboxResources,
+    pub template_id: String,
+    pub template_builder: bool,
+    pub user_metadata: Option<HashMap<String, String>>,
+    pub timestamp: std::time::SystemTime,
+    pub source_sandbox_id: Option<SandboxId>,
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -34,6 +34,19 @@ impl<'a> OssSnapshotArtifactLayout<'a> {
         format!("volumes/aliases/{alias}.json")
     }
 
+    pub(super) fn webhook_record_key(id: &uuid::Uuid) -> String {
+        format!("webhooks/{id}.json")
+    }
+
+    pub(super) fn webhooks_prefix() -> &'static str {
+        "webhooks/"
+    }
+
+    /// Not a `.json` key, so webhook listing skips it.
+    pub(super) fn webhook_generation_key() -> &'static str {
+        "webhooks/generation"
+    }
+
     pub(crate) fn managed_layer_key(digest: &str) -> String {
         format!("managed-layers/{digest}")
     }

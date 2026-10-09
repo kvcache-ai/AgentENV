@@ -109,6 +109,11 @@ async fn main() -> anyhow::Result<()> {
         .p2p_enabled
         .then(|| Arc::clone(&p2p_transport));
     let snapshot_manager = Arc::new(SnapshotManager::new(snapshot_p2p_transport)?);
+    let webhooks = agentenv::webhook::WebhookService::open(
+        snapshot_manager.repository(),
+        config.home_path.join("webhooks/deliveries"),
+    )
+    .await?;
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     let template_builder = Arc::new(TemplateBuilder::with_cpu_config(Arc::clone(
         &cluster_cpu_arc,
@@ -160,16 +165,20 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    let api_impl = Arc::new(ApiImpl::new(
-        Arc::clone(&orchestrator),
-        snapshot_manager,
-        template_builder,
-        image_resolver,
-        volume_manager,
-        observability,
-        config.sandbox_proxy.domains.clone(),
-        api_key,
-    ));
+    let api_impl = Arc::new(
+        ApiImpl::new(
+            Arc::clone(&orchestrator),
+            snapshot_manager,
+            template_builder,
+            image_resolver,
+            volume_manager,
+            observability,
+            config.sandbox_proxy.domains.clone(),
+            api_key,
+        )
+        .with_webhooks(Arc::clone(&webhooks)),
+    );
+    let webhook_dispatcher = webhooks.start(orchestrator.subscribe_sandbox_events());
     if let Err(error) = api_impl.recover_image_builds().await {
         warn!(error = %format_args!("{error:#}"), "build recovery unavailable; will retry after startup");
     }
@@ -208,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
             if let Err(err) = shutdown_orchestrator.shutdown().await {
                 warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
             }
+            webhook_dispatcher.abort();
             if let Some(pool) = FirecrackerPool::global() {
                 info!(target: "agentenv", "shutting down firecracker pool");
                 if let Err(err) = pool.shutdown().await {

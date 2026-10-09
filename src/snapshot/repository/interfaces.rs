@@ -334,6 +334,41 @@ pub trait SnapshotRepository: Send + Sync {
     ) -> RepositoryResult<()> {
         unsupported("volume reservations")
     }
+
+    /// Lists every registered event webhook, in no particular order.
+    async fn list_webhooks(&self) -> RepositoryResult<Vec<crate::webhook::WebhookRecord>> {
+        unsupported("event webhooks")
+    }
+
+    /// Reads one event webhook registration.
+    async fn get_webhook(
+        &self,
+        _id: &uuid::Uuid,
+    ) -> RepositoryResult<Option<crate::webhook::WebhookRecord>> {
+        unsupported("event webhooks")
+    }
+
+    /// Creates or replaces one event webhook registration.
+    async fn put_webhook(&self, _record: crate::webhook::WebhookRecord) -> RepositoryResult<()> {
+        unsupported("event webhooks")
+    }
+
+    /// Removes one event webhook registration. Missing records are considered success.
+    async fn delete_webhook(&self, _id: &uuid::Uuid) -> RepositoryResult<()> {
+        unsupported("event webhooks")
+    }
+
+    /// Reads the webhook registry generation, a value replaced after every
+    /// registration change so nodes can cheaply detect that their cached
+    /// registrations are stale. `None` until the first change.
+    async fn get_webhook_generation(&self) -> RepositoryResult<Option<String>> {
+        unsupported("event webhooks")
+    }
+
+    /// Replaces the webhook registry generation.
+    async fn put_webhook_generation(&self, _generation: &str) -> RepositoryResult<()> {
+        unsupported("event webhooks")
+    }
 }
 
 #[async_trait]

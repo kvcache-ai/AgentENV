@@ -452,6 +452,46 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         .await
     }
 
+    async fn list_webhooks(&self) -> RepositoryResult<Vec<crate::webhook::WebhookRecord>> {
+        self.run_catalog("list webhooks", |store| store.list_webhooks())
+            .await
+    }
+
+    async fn get_webhook(
+        &self,
+        id: &uuid::Uuid,
+    ) -> RepositoryResult<Option<crate::webhook::WebhookRecord>> {
+        let id = *id;
+        self.run_catalog("get webhook", move |store| store.get_webhook(&id))
+            .await
+    }
+
+    async fn put_webhook(&self, record: crate::webhook::WebhookRecord) -> RepositoryResult<()> {
+        self.run_catalog("put webhook", move |store| store.put_webhook(&record))
+            .await
+    }
+
+    async fn delete_webhook(&self, id: &uuid::Uuid) -> RepositoryResult<()> {
+        let id = *id;
+        self.run_catalog("delete webhook", move |store| store.delete_webhook(&id))
+            .await
+    }
+
+    async fn get_webhook_generation(&self) -> RepositoryResult<Option<String>> {
+        self.run_catalog("get webhook generation", |store| {
+            store.get_webhook_generation()
+        })
+        .await
+    }
+
+    async fn put_webhook_generation(&self, generation: &str) -> RepositoryResult<()> {
+        let generation = generation.to_owned();
+        self.run_catalog("put webhook generation", move |store| {
+            store.put_webhook_generation(&generation)
+        })
+        .await
+    }
+
     async fn create_volume(&self, record: VolumeRecord) -> RepositoryResult<()> {
         self.run_catalog("create volume", move |store| store.create_volume(&record))
             .await

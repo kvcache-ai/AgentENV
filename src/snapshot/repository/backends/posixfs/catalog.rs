@@ -17,6 +17,7 @@ use crate::snapshot::{
     SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };
 use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord};
+use crate::webhook::WebhookRecord;
 const FILE_LOCK_TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
 
 pub struct PosixFsCatalogStore {
@@ -490,6 +491,65 @@ impl PosixFsCatalogStore {
         durable_record.reserved_by_sandbox_id = existing.reserved_by_sandbox_id;
         durable_record.read_only_mounts = existing.read_only_mounts;
         self.write_json(&path, &durable_record)
+    }
+
+    pub(crate) fn list_webhooks(&self) -> RepositoryResult<Vec<WebhookRecord>> {
+        let directory = PosixFsSnapshotArtifactLayout::webhooks_dir(&self.root);
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(RepositoryError::backend(
+                    format!("read webhook directory '{}'", directory.display()),
+                    error,
+                ))
+            }
+        };
+        let mut records = Vec::new();
+        for entry in entries {
+            let path = entry
+                .map_err(|error| RepositoryError::backend("read webhook directory entry", error))?
+                .path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                records.push(self.read_json::<WebhookRecord>(&path)?);
+            }
+        }
+        Ok(records)
+    }
+
+    pub(crate) fn get_webhook(&self, id: &uuid::Uuid) -> RepositoryResult<Option<WebhookRecord>> {
+        let path = PosixFsSnapshotArtifactLayout::webhook_record_path(&self.root, id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        self.read_json(&path).map(Some)
+    }
+
+    pub(crate) fn put_webhook(&self, record: &WebhookRecord) -> RepositoryResult<()> {
+        let path = PosixFsSnapshotArtifactLayout::webhook_record_path(&self.root, &record.id);
+        self.write_json(&path, record)
+    }
+
+    pub(crate) fn get_webhook_generation(&self) -> RepositoryResult<Option<String>> {
+        let path = PosixFsSnapshotArtifactLayout::webhook_generation_path(&self.root);
+        if !path.exists() {
+            return Ok(None);
+        }
+        self.read_json(&path).map(Some)
+    }
+
+    pub(crate) fn put_webhook_generation(&self, generation: &str) -> RepositoryResult<()> {
+        let path = PosixFsSnapshotArtifactLayout::webhook_generation_path(&self.root);
+        self.write_json(&path, &generation)
+    }
+
+    pub(crate) fn delete_webhook(&self, id: &uuid::Uuid) -> RepositoryResult<()> {
+        self.remove_file_if_exists(&PosixFsSnapshotArtifactLayout::webhook_record_path(
+            &self.root, id,
+        ))
     }
 
     pub(crate) fn get_build_cache_state(

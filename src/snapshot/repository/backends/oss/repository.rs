@@ -665,6 +665,90 @@ impl SnapshotRepository for OssSnapshotRepository {
         self.write_record(&record).await
     }
 
+    async fn list_webhooks(&self) -> RepositoryResult<Vec<crate::webhook::WebhookRecord>> {
+        let keys = self
+            .client
+            .list_keys_recursive(OssSnapshotArtifactLayout::webhooks_prefix())
+            .await
+            .map_err(|error| RepositoryError::backend("list webhook records", error))?;
+        let mut records = Vec::with_capacity(keys.len());
+        for key in keys.iter().filter(|key| key.ends_with(".json")) {
+            match self.client.get_bytes(key).await {
+                Ok(bytes) => records.push(serde_json::from_slice(&bytes).map_err(|error| {
+                    RepositoryError::backend(format!("parse webhook record '{key}'"), error)
+                })?),
+                Err(error) if OssClient::is_not_found_error(&error) => {}
+                Err(error) => {
+                    return Err(RepositoryError::backend(
+                        format!("read webhook record '{key}'"),
+                        error,
+                    ))
+                }
+            }
+        }
+        Ok(records)
+    }
+
+    async fn get_webhook(
+        &self,
+        id: &uuid::Uuid,
+    ) -> RepositoryResult<Option<crate::webhook::WebhookRecord>> {
+        let key = OssSnapshotArtifactLayout::webhook_record_key(id);
+        match self.client.get_bytes(&key).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+                RepositoryError::backend(format!("parse webhook record '{key}'"), error)
+            }),
+            Err(error) if OssClient::is_not_found_error(&error) => Ok(None),
+            Err(error) => Err(RepositoryError::backend(
+                format!("read webhook record '{key}'"),
+                error,
+            )),
+        }
+    }
+
+    async fn put_webhook(&self, record: crate::webhook::WebhookRecord) -> RepositoryResult<()> {
+        let key = OssSnapshotArtifactLayout::webhook_record_key(&record.id);
+        let bytes = serde_json::to_vec_pretty(&record)
+            .map_err(|error| RepositoryError::backend("serialize webhook record", error))?;
+        self.client
+            .put_bytes(&key, bytes, OssUploadArtifact::CatalogRecord)
+            .await
+            .map_err(|error| {
+                RepositoryError::backend(format!("write webhook record '{key}'"), error)
+            })
+    }
+
+    async fn delete_webhook(&self, id: &uuid::Uuid) -> RepositoryResult<()> {
+        let key = OssSnapshotArtifactLayout::webhook_record_key(id);
+        self.client.delete(&key).await.map_err(|error| {
+            RepositoryError::backend(format!("delete webhook record '{key}'"), error)
+        })
+    }
+
+    async fn get_webhook_generation(&self) -> RepositoryResult<Option<String>> {
+        let key = OssSnapshotArtifactLayout::webhook_generation_key();
+        match self.client.get_bytes(key).await {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|error| RepositoryError::backend("parse webhook generation", error)),
+            Err(error) if OssClient::is_not_found_error(&error) => Ok(None),
+            Err(error) => Err(RepositoryError::backend("read webhook generation", error)),
+        }
+    }
+
+    async fn put_webhook_generation(&self, generation: &str) -> RepositoryResult<()> {
+        let bytes = serde_json::to_vec(generation)
+            .map_err(|error| RepositoryError::backend("serialize webhook generation", error))?;
+        self.client
+            .put_bytes(
+                OssSnapshotArtifactLayout::webhook_generation_key(),
+                bytes,
+                OssUploadArtifact::CatalogRecord,
+            )
+            .await
+            .map_err(|error| RepositoryError::backend("write webhook generation", error))
+    }
+
     async fn get_volume(&self, reference: &str) -> RepositoryResult<Option<VolumeRecord>> {
         validate_volume_component(reference, "reference")?;
         if let Some(record) = self.read_volume_record(reference).await? {

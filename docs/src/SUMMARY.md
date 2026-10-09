@@ -42,6 +42,7 @@
   - [Auto-Eviction](./concepts/sandboxes/auto-eviction.md)
   - [Networking](./concepts/sandboxes/networking.md)
   - [Proxy](./concepts/sandboxes/proxy.md)
+  - [Lifecycle Event Webhooks](./concepts/sandboxes/webhooks.md)
 - [Templates](./concepts/templates/index.md)
   - [Create Your Template](./concepts/templates/creating.md)
   - [Manage Templates](./concepts/templates/managing.md)

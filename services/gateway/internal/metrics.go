@@ -231,6 +231,17 @@ func gatewayRouteLabel(path string) string {
 		if len(parts) == 2 {
 			return "/nodes/{node_id}"
 		}
+	case "events":
+		if len(parts) >= 2 && parts[1] == "webhooks" {
+			switch {
+			case len(parts) == 2:
+				return "/events/webhooks"
+			case len(parts) == 3:
+				return "/events/webhooks/{webhook_id}"
+			case len(parts) == 4 && (parts[3] == "deliveries" || parts[3] == "stats"):
+				return "/events/webhooks/{webhook_id}/" + parts[3]
+			}
+		}
 	case "proxy":
 		return "/proxy/*"
 	}
