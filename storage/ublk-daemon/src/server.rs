@@ -1354,9 +1354,7 @@ async fn quiesce_ublk_device<T: UVMUblkTarget>(dev: &mut UVMUblkDev<T>) {
         fatal_exit(&format!("stop ublk device {dev_id}: {err:#}"));
     }
 
-    if let Err(err) = tokio::time::timeout(Duration::from_secs(5), dev.wait_for_bg_tasks()).await {
-        fatal_exit(&format!("ublk {dev_id} queue workers did not stop: {err}"));
-    }
+    dev.wait_for_bg_tasks().await;
 }
 
 async fn cleanup_failed_ublk_start<T: UVMUblkTarget>(
@@ -1386,11 +1384,7 @@ async fn cleanup_failed_ublk_start<T: UVMUblkTarget>(
         }
     }
 
-    if let Err(err) = tokio::time::timeout(Duration::from_secs(5), dev.wait_for_bg_tasks()).await {
-        fatal_exit(&format!(
-            "ublk {dev_id} startup rollback could not stop its workers: {err}"
-        ));
-    }
+    dev.wait_for_bg_tasks().await;
 
     drop(dev);
 
@@ -2133,6 +2127,7 @@ fn clear_page_cache(device_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -2343,7 +2338,7 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires root and the Linux ublk driver"]
-    async fn rejected_pool_acquire_removes_the_device_before_returning() -> Result<()> {
+    async fn rejected_pool_acquire_waits_for_workers_before_removing_device() -> Result<()> {
         let dir = TempDir::new()?;
         let pool = PoolState::new(
             test_pool_config(),
@@ -2355,6 +2350,8 @@ mod tests {
         let (ctrl_ring, _worker) = storage_util::io_ring::spawn_io_ring_worker(0);
         let dev = create_new_device(ctrl_ring.clone(), &config, &image).await?;
         let dev_id = dev.dev_id();
+        let (finished, pending) = tokio::sync::oneshot::channel();
+        dev.inner.queue_threads.lock().unwrap().push(pending);
         assert!(
             return_or_stop_idle_device(&pool, ctrl_ring.clone(), dev, Arc::clone(&image)).await
         );
@@ -2366,9 +2363,20 @@ mod tests {
         )
         .await?;
         invalid.block_size = 3;
-        let result =
-            prepare_overlaybd_device(&pool, &ctrl_ring, &config, &Arc::new(invalid), "exclusive")
-                .await;
+        let invalid = Arc::new(invalid);
+        let slow_worker = async {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            let mut ctrl = UVMUblkCtrlBuilder::new()
+                .dev_id(dev_id)
+                .build(ctrl_ring.clone())?;
+            let retained = ctrl.get_dev_info().await.is_ok();
+            let _ = finished.send(Ok(()));
+            Ok::<_, anyhow::Error>(retained)
+        };
+        let (result, retained_while_stopping) = tokio::join!(
+            prepare_overlaybd_device(&pool, &ctrl_ring, &config, &invalid, "exclusive"),
+            slow_worker
+        );
         let rejected = result.is_err();
         drop(result);
         let mut ctrl = UVMUblkCtrlBuilder::new()
@@ -2381,6 +2389,10 @@ mod tests {
             delete_dev(ctrl_ring.clone(), dev_id).await?;
         }
         assert!(rejected);
+        assert!(
+            retained_while_stopping?,
+            "device removed before workers stopped"
+        );
         assert!(!retained, "rejected acquire left an unmanaged ublk device");
         assert_eq!(pool.idle.len(), 0);
 

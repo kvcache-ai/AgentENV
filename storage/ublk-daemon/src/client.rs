@@ -15,11 +15,10 @@ use crate::protocol::{
 };
 use overlaybd::{config::UpperMode, RestackSnapshotTerminalFailure};
 
-/// Default timeout for daemon RPC calls.
+/// Timeout for best-effort daemon RPC calls.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Timeout for snapshot operations (may be slow for large images).
-const SNAPSHOT_TIMEOUT: Duration = Duration::from_hours(6);
+const SLOW_REQUEST_WARNING_AFTER: Duration = Duration::from_secs(300);
 
 /// Timeout for waiting for the daemon to signal readiness.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -102,7 +101,6 @@ pub struct UblkDaemonSpawnConfig<'a> {
     pub metrics_listen_addr: &'a str,
     pub pool_config: Option<&'a PoolConfig>,
     pub p2p_publish_url: Option<&'a str>,
-    pub runtime_device_timeout: Duration,
 }
 
 struct UblkDaemonClientInner {
@@ -111,7 +109,6 @@ struct UblkDaemonClientInner {
     /// Set to `true` when `shutdown()` is called, so the watchdog accepts a successful
     /// exit after all device owners have released their resources.
     shutting_down: AtomicBool,
-    runtime_device_timeout: Duration,
 }
 
 impl UblkDaemonClient {
@@ -203,7 +200,6 @@ impl UblkDaemonClient {
                 socket_path: config.socket_path,
                 exited: tokio::sync::watch::channel(false).0,
                 shutting_down: AtomicBool::new(false),
-                runtime_device_timeout: config.runtime_device_timeout,
             }),
         });
 
@@ -330,7 +326,7 @@ impl UblkDaemonClient {
             global_config: global_config.to_path_buf(),
             read_only_upper,
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::DeviceCreated {
                 dev_id,
                 device_path,
@@ -347,7 +343,7 @@ impl UblkDaemonClient {
         let request = DaemonRequest::NotifySandboxReady {
             device_key: device_key.to_string(),
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Ok => Ok(()),
             response => bail!("unexpected ublk response: {response:?}"),
         }
@@ -372,7 +368,7 @@ impl UblkDaemonClient {
             quiet_ms,
             max_window_ms,
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Ok => Ok(()),
             DaemonResponse::InvalidRequest { message } => {
                 bail!("daemon: start pack recording rejected: {message}")
@@ -387,7 +383,7 @@ impl UblkDaemonClient {
     /// Poll the state of the pack recording running on `dev_id`.
     pub async fn pack_recording_status(&self, dev_id: u32) -> Result<PackRecordingState> {
         let request = DaemonRequest::PackRecordingStatus { dev_id };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::PackRecording { state } => Ok(state),
             DaemonResponse::InvalidRequest { message } => {
                 bail!("daemon: pack recording status rejected: {message}")
@@ -403,7 +399,7 @@ impl UblkDaemonClient {
     /// recorder, stop the window task, and remove any partial pack output.
     pub async fn abort_pack_recording(&self, dev_id: u32) -> Result<()> {
         let request = DaemonRequest::AbortPackRecording { dev_id };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Ok => Ok(()),
             DaemonResponse::Error { message } => {
                 bail!("daemon: abort pack recording failed: {message}")
@@ -435,7 +431,7 @@ impl UblkDaemonClient {
             mem_virtual_size,
             timeout_secs,
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Ok => Ok(()),
             DaemonResponse::Error { message } => {
                 bail!("daemon: prefetch startup pack failed: {message}")
@@ -474,10 +470,7 @@ impl UblkDaemonClient {
             allow_shrink: request.allow_shrink,
             source_state_strategy,
         };
-        match self
-            .call(request, self.inner.runtime_device_timeout)
-            .await?
-        {
+        match self.call(request).await? {
             DaemonResponse::OverlaybdRuntimeDeviceCreated {
                 dev_id,
                 device_path,
@@ -496,7 +489,7 @@ impl UblkDaemonClient {
     /// Delete a ublk device.
     pub async fn delete(&self, dev_id: u32) -> Result<()> {
         let request = DaemonRequest::Delete { dev_id };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Deleted => Ok(()),
             response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
@@ -514,7 +507,7 @@ impl UblkDaemonClient {
             output_layer_path: output_layer_path.to_path_buf(),
             compact_from,
         };
-        let response = self.call(request, SNAPSHOT_TIMEOUT).await?;
+        let response = self.call(request).await?;
         match response {
             DaemonResponse::RestackSnapshotCreated {
                 descriptor,
@@ -534,7 +527,7 @@ impl UblkDaemonClient {
     /// Flush a live image after its owning VM has stopped issuing I/O.
     pub async fn flush_for_checkpoint(&self, dev_id: u32) -> Result<()> {
         let request = DaemonRequest::FlushForCheckpoint { dev_id };
-        match self.call(request, SNAPSHOT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Ok => Ok(()),
             response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
@@ -546,10 +539,7 @@ impl UblkDaemonClient {
         self.inner.shutting_down.store(true, Ordering::Release);
         let stopped = tokio::time::timeout(Duration::from_secs(10), async {
             // The daemon may close its socket before replying; process exit is decisive.
-            match self
-                .call(DaemonRequest::Shutdown, Duration::from_secs(5))
-                .await
-            {
+            match self.call(DaemonRequest::Shutdown).await {
                 Ok(DaemonResponse::Ok) | Err(_) => {}
                 Ok(response) => fatal_exit(&format!("unexpected ublk response: {response:?}")),
             }
@@ -571,7 +561,7 @@ impl UblkDaemonClient {
     /// Returns a bitmask of feature flags (e.g., `UBLK_F_UPDATE_SIZE`).
     pub async fn get_features(&self) -> Result<u64> {
         let request = DaemonRequest::GetFeatures;
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Features { flags } => Ok(flags),
             response => bail!("unexpected ublk response: {response:?}"),
         }
@@ -612,7 +602,7 @@ impl UblkDaemonClient {
             access_mode,
             read_only_upper,
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::DeviceAcquired {
                 dev_id,
                 device_path,
@@ -625,7 +615,7 @@ impl UblkDaemonClient {
     /// Release an overlaybd device back to the pool.
     pub async fn release_overlaybd(&self, dev_id: u32) -> Result<()> {
         let request = DaemonRequest::ReleaseOverlaybd { dev_id };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::Released => Ok(()),
             response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
@@ -639,14 +629,14 @@ impl UblkDaemonClient {
             dev_id,
             new_sectors,
         };
-        match self.call(request, DEFAULT_TIMEOUT).await? {
+        match self.call(request).await? {
             DaemonResponse::SizeUpdated => Ok(()),
             response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
 
     /// Fail stop on uncertain device changes; callers handle confirmed failures.
-    async fn call(&self, request: DaemonRequest, timeout: Duration) -> Result<DaemonResponse> {
+    async fn call(&self, request: DaemonRequest) -> Result<DaemonResponse> {
         let shutdown = matches!(request, DaemonRequest::Shutdown);
         let best_effort = matches!(
             request,
@@ -700,14 +690,32 @@ impl UblkDaemonClient {
                 response
             }
         };
-        let result = tokio::time::timeout(timeout, exchange).await;
+        let result = if shutdown || best_effort {
+            let timeout = if shutdown {
+                Duration::from_secs(5)
+            } else {
+                DEFAULT_TIMEOUT
+            };
+            tokio::time::timeout(timeout, exchange)
+                .await
+                .context("ublk daemon request timed out")?
+        } else {
+            // Abandoning this wait cannot cancel daemon changes to backing files.
+            let started = Instant::now();
+            let mut exchange = std::pin::pin!(exchange);
+            match tokio::time::timeout(SLOW_REQUEST_WARNING_AFTER, &mut exchange).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(?request, elapsed = ?started.elapsed(), "ublk daemon request still pending");
+                    exchange.await
+                }
+            }
+        };
         let can_return = shutdown || best_effort || (creating && !request_started);
         let response = match result {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) if can_return => return Err(error),
-            Err(error) if can_return => return Err(error.into()),
-            Ok(Err(error)) => fatal_exit(&format!("ublk control connection failed: {error:#}")),
-            Err(_) => fatal_exit(&format!("ublk control request timed out after {timeout:?}")),
+            Ok(response) => response,
+            Err(error) if can_return => return Err(error),
+            Err(error) => fatal_exit(&format!("ublk control connection failed: {error:#}")),
         };
         match response {
             DaemonResponse::TerminalError { message }
@@ -755,7 +763,6 @@ impl UblkDaemonClient {
                 socket_path,
                 exited: tokio::sync::watch::channel(false).0,
                 shutting_down: AtomicBool::new(false),
-                runtime_device_timeout: Duration::from_secs(360),
             }),
         })
     }
@@ -871,10 +878,6 @@ mod tests {
         let (health, served) = tokio::join!(client.get_features(), server);
         assert_eq!(health?, 0);
         served?;
-        assert!(client
-            .call(DaemonRequest::GetFeatures, Duration::from_millis(10))
-            .await
-            .is_err());
         Ok(())
     }
 
@@ -957,14 +960,11 @@ mod tests {
                         }
                         _ => {
                             client
-                                .call(
-                                    DaemonRequest::CreateOverlaybd {
-                                        image_config: "image".into(),
-                                        global_config: "global".into(),
-                                        read_only_upper: false,
-                                    },
-                                    Duration::from_millis(100),
-                                )
+                                .call(DaemonRequest::CreateOverlaybd {
+                                    image_config: "image".into(),
+                                    global_config: "global".into(),
+                                    read_only_upper: false,
+                                })
                                 .await?;
                         }
                     }
@@ -989,9 +989,6 @@ mod tests {
                         .await?
                     }
                     "response" => send_message(&mut stream, &DaemonResponse::Deleted).await?,
-                    "timeout" => {
-                        tokio::time::sleep(Duration::from_secs(4)).await;
-                    }
                     _ => unreachable!(),
                 }
                 request.await??;
@@ -1001,7 +998,6 @@ mod tests {
         }
         for case in [
             "disconnect",
-            "timeout",
             "cancel",
             "response",
             "release",

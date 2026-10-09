@@ -2,7 +2,6 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
@@ -21,8 +20,6 @@ use crate::sandbox::SandboxCaptureError;
 use crate::snapshot::Snapshot;
 
 const UBLK_OPERATION_DURATION: &str = "agentenv_ublk_operation_duration_seconds";
-const RUNTIME_DEVICE_TIMEOUT: Duration = Duration::from_secs(360);
-const RESIZE_RPC_TIMEOUT_MARGIN: Duration = Duration::from_secs(120);
 
 /// Window and guard parameters for one startup pack recording, derived from
 /// `[snapshot.memory_startup_pack]` by the recording orchestration.
@@ -59,8 +56,6 @@ pub struct UblkDaemonConfig {
     pub pool_config: Option<uvm_ublk_daemon::PoolConfig>,
     /// Local HTTP endpoint used by the daemon to notify P2P layer publication.
     pub p2p_publish_url: Option<String>,
-    /// Client-side timeout for runtime-device RPCs.
-    pub runtime_device_timeout: Duration,
 }
 
 impl UblkDaemonConfig {
@@ -81,8 +76,6 @@ impl UblkDaemonConfig {
             })?;
 
         let pool_config = config.block_pool_config();
-        let runtime_device_timeout =
-            runtime_device_timeout(config.ublk.overlaybd.resize_timeout_secs);
 
         Ok(Self {
             daemon_binary,
@@ -96,16 +89,8 @@ impl UblkDaemonConfig {
             metrics_listen_addr: ublk.daemon_metrics_listen_addr.clone(),
             pool_config,
             p2p_publish_url: None,
-            runtime_device_timeout,
         })
     }
-}
-
-fn runtime_device_timeout(resize_timeout_secs: u64) -> Duration {
-    let resize_timeout = Duration::from_secs(resize_timeout_secs)
-        .checked_add(RESIZE_RPC_TIMEOUT_MARGIN)
-        .unwrap_or(Duration::MAX);
-    RUNTIME_DEVICE_TIMEOUT.max(resize_timeout)
 }
 
 /// Global ublk device manager.
@@ -169,7 +154,6 @@ impl UblkDeviceManager {
                             metrics_listen_addr: &cfg.metrics_listen_addr,
                             pool_config: cfg.pool_config.as_ref(),
                             p2p_publish_url: cfg.p2p_publish_url.as_deref(),
-                            runtime_device_timeout: cfg.runtime_device_timeout,
                         })
                         .await?;
                         (Some(client), pool_enabled)

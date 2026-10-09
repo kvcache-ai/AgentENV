@@ -2275,19 +2275,36 @@ where
             };
             // Use the same operation lock as explicit deletion before claiming Killing.
             let deletion = self.deletion_progress(metadata.id).await;
-            let mut progress = deletion.lock().await;
+            let mut progress = deletion.lock_owned().await;
             let result = match self
                 .claim_expired_running_sandbox(metadata.id, eviction_cutoff, claimed_state)
                 .await
             {
-                Ok(true) => match metadata.timeout_action {
-                    SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
-                    SandboxTimeoutAction::Delete => {
-                        self.delete_sandbox_impl(metadata.id, SandboxState::Running, &mut progress)
-                            .await
+                Ok(true) => {
+                    let this = Arc::clone(self);
+                    let sandbox_id = metadata.id;
+                    let action = metadata.timeout_action;
+                    let eviction = self.run_cancellation_safe("auto_evict", sandbox_id, async move {
+                        let result = match action {
+                            SandboxTimeoutAction::Pause => this.pause_sandbox_impl(sandbox_id).await,
+                            SandboxTimeoutAction::Delete => {
+                                this.delete_sandbox_impl(sandbox_id, SandboxState::Running, &mut progress).await
+                            }
+                        };
+                        if let Err(err) = &result {
+                            warn!(%sandbox_id, ?action, error = ?err, "failed to auto-evict expired sandbox");
+                        }
+                        Ok(result.is_ok())
+                    });
+                    // Only the scanner stops waiting; the claimed operation retains its resources.
+                    match tokio::time::timeout(WAIT_TRANSITION_TIMEOUT, eviction).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            warn!(%sandbox_id, ?action, "auto-eviction still running; continuing scan");
+                            Ok(false)
+                        }
                     }
                 }
-                .map(|_| true),
                 Ok(false) => Ok(false),
                 Err(err) => Err(err),
             };
