@@ -526,7 +526,6 @@ impl Env {
             metrics_listen_addr: "",
             pool_config: pool,
             p2p_publish_url: None,
-            runtime_device_timeout: Duration::from_secs(60),
             recovery_enabled: true,
         })
         .await

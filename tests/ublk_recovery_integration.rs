@@ -10,8 +10,12 @@ mod common;
 use std::time::{Duration, Instant};
 
 use agentenv::cfg::ConfigManager;
-use agentenv::sandbox::{FirecrackerSandbox, SandboxExecutor, SandboxLaunchConfig};
+use agentenv::sandbox::{
+    FirecrackerPausedState, FirecrackerSandbox, SandboxBackend, SandboxExecutor,
+    SandboxLaunchConfig,
+};
 use agentenv::snapshot::RunnableSnapshot;
+use agentenv::types::SandboxId;
 use anyhow::{bail, ensure, Context, Result};
 use futures::future::try_join_all;
 use tempfile::tempdir;
@@ -168,7 +172,8 @@ async fn wait_all_progress(sandboxes: &[FirecrackerSandbox]) -> Result<()> {
 }
 
 async fn launch(runnable: &RunnableSnapshot) -> Result<FirecrackerSandbox> {
-    let mut sandbox = FirecrackerSandbox::from_snapshot(runnable, &SandboxLaunchConfig::default())?;
+    let mut sandbox =
+        FirecrackerSandbox::from_snapshot(runnable, &SandboxLaunchConfig::default(), None)?;
     bounded("sandbox start", sandbox.start()).await?;
     start_workload(&sandbox).await?;
     Ok(sandbox)
@@ -300,13 +305,24 @@ async fn sandboxes_survive_random_ublk_daemon_crashes() -> Result<()> {
                 let index = rng.below(sandboxes.len() as u64) as usize;
                 let mut sandbox = sandboxes.swap_remove(index);
                 let before = progress(&sandbox).await?;
-                let snapshot = bounded("sandbox pause", sandbox.pause()).await?;
+                let paused = bounded("sandbox pause", sandbox.pause()).await?;
                 bounded("sandbox stop", sandbox.stop()).await?;
-                let resumed = bounded(
-                    "sandbox resume",
-                    FirecrackerSandbox::resume_from_snapshot_config(&snapshot),
-                )
-                .await?;
+                drop(sandbox);
+                let paused = paused
+                    .downcast_ref::<FirecrackerPausedState>()
+                    .context("expected a Firecracker paused state")?;
+                let storage_root = paused
+                    .snapshot_config()
+                    .vm_state_path
+                    .parent()
+                    .context("paused VM state has no storage directory")?;
+                let mut resumed = FirecrackerSandbox::from_paused_state(
+                    paused,
+                    SandboxId::new(),
+                    None,
+                    storage_root,
+                )?;
+                bounded("sandbox resume", resumed.start()).await?;
                 ensure!(
                     progress(&resumed).await? >= before,
                     "resumed sandbox lost writes"
