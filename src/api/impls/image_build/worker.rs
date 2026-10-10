@@ -272,15 +272,17 @@ cat /run/aenv-buildkit/log >&2
 exit 1
 "#;
 
+// A zombie may be reaped between checks; a missing status file means stopped.
 const STOP_BUILDKIT: &str = r#"
 set -eu
+running() { grep -s '^State:' "/proc/$1/status" | grep -qv 'Z'; }
 if test -f /run/aenv-buildkit/pid; then
   pid=$(cat /run/aenv-buildkit/pid)
   kill -TERM "$pid" 2>/dev/null || true
   for attempt in $(seq 1 300); do
-    if ! kill -0 "$pid" 2>/dev/null || grep -q 'State:.*Z' "/proc/$pid/status"; then break; fi
+    running "$pid" || break
     sleep 0.1
   done
-  if kill -0 "$pid" 2>/dev/null && ! grep -q 'State:.*Z' "/proc/$pid/status"; then exit 1; fi
+  if running "$pid"; then exit 1; fi
 fi
 "#;
