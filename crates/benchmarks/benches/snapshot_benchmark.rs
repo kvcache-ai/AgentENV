@@ -26,8 +26,8 @@ const DEFAULT_SAMPLE_COUNT: usize = 10;
 const DEFAULT_CLEANUP_SETTLE_TIME: Duration = Duration::from_millis(25);
 const FULL_CLEANUP_SETTLE_TIME: Duration = Duration::from_millis(500);
 const CONCURRENCY: usize = 50;
-// Keep the automatic batch no larger than the existing concurrent-resume benchmark.
-const MAX_AUTO_THROUGHPUT_CONCURRENCY: usize = CONCURRENCY;
+// Keep throughput batches no larger than the existing concurrent-resume benchmark.
+const MAX_THROUGHPUT_CONCURRENCY: usize = CONCURRENCY;
 const BENCH_CONCURRENCY_ENV: &str = "AENV_BENCH_CONCURRENCY";
 const FULL_THROUGHPUT_MEASUREMENT_TIME: Duration = Duration::from_secs(30);
 const HEAVY_DATA_SIZE_MIB: u32 = 1024;
@@ -62,13 +62,17 @@ fn throughput_concurrency() -> Result<usize> {
                 concurrency > 0,
                 "{BENCH_CONCURRENCY_ENV} must be greater than zero"
             );
+            anyhow::ensure!(
+                concurrency <= MAX_THROUGHPUT_CONCURRENCY,
+                "{BENCH_CONCURRENCY_ENV} must be at most {MAX_THROUGHPUT_CONCURRENCY}"
+            );
             Ok(concurrency)
         }
         Err(std::env::VarError::NotPresent) => thread::available_parallelism()
             .context("determine available CPU parallelism for throughput benchmark")?
             .get()
             .checked_mul(2)
-            .map(|concurrency| concurrency.min(MAX_AUTO_THROUGHPUT_CONCURRENCY))
+            .map(|concurrency| concurrency.min(MAX_THROUGHPUT_CONCURRENCY))
             .context("default throughput concurrency overflowed"),
         Err(err) => Err(err).context(format!("read {BENCH_CONCURRENCY_ENV}")),
     }
@@ -231,7 +235,14 @@ async fn setup_sandbox_inner(mem_size_mib: u32) -> Result<FirecrackerSandbox> {
     config.common.runtime_policy.socket_timeout = Duration::from_secs(30);
 
     let mut sandbox = FirecrackerSandbox::new(config)?;
-    sandbox.start().await?;
+    if let Err(error) = sandbox.start().await {
+        if let Err(cleanup_error) = sandbox.stop().await {
+            return Err(error).context(format!(
+                "start benchmark sandbox; cleanup also failed: {cleanup_error:#}"
+            ));
+        }
+        return Err(error).context("start benchmark sandbox");
+    }
     Ok(sandbox)
 }
 
@@ -837,7 +848,7 @@ fn run_resume_batch(
         .map(|_| {
             let snapshot = snapshot.clone();
             let handle = rt.handle().clone();
-            move || handle.block_on(FirecrackerSandbox::resume_from_snapshot_config(&snapshot))
+            move || start_resume_sandbox(&handle, &snapshot)
         })
         .collect();
     let (elapsed, results) = measure_concurrent_batch(work);
@@ -846,7 +857,15 @@ fn run_resume_batch(
     let mut first_error = None;
     for result in results {
         match result {
-            Ok(Ok(sandbox)) => sandboxes.push(sandbox),
+            Ok(Ok((sandbox, Ok(Ok(()))))) => sandboxes.push(sandbox),
+            Ok(Ok((sandbox, Ok(Err(error))))) => {
+                sandboxes.push(sandbox);
+                first_error.get_or_insert(error);
+            }
+            Ok(Ok((sandbox, Err(_)))) => {
+                sandboxes.push(sandbox);
+                first_error.get_or_insert_with(|| anyhow::anyhow!("resume worker panicked"));
+            }
             Ok(Err(error)) => {
                 first_error.get_or_insert(error);
             }
@@ -868,6 +887,40 @@ fn run_resume_batch(
     Ok(elapsed)
 }
 
+fn start_resume_sandbox(
+    handle: &Handle,
+    snapshot: &FirecrackerSnapshotConfig,
+) -> Result<(FirecrackerSandbox, thread::Result<Result<()>>)> {
+    // Keep ownership outside the start call so failures and panics can be cleaned up.
+    let mut sandbox = FirecrackerSandbox::from_snapshot_config(snapshot)?;
+    let start = catch_unwind(AssertUnwindSafe(|| handle.block_on(sandbox.start())));
+    Ok((sandbox, start))
+}
+
+fn resume_warm_sandbox(
+    rt: &Runtime,
+    snapshot: &FirecrackerSnapshotConfig,
+) -> Result<FirecrackerSandbox> {
+    let (sandbox, start) = start_resume_sandbox(rt.handle(), snapshot)?;
+    match start {
+        Ok(Ok(())) => Ok(sandbox),
+        Ok(Err(error)) => {
+            if let Err(cleanup_error) = stop_batch(rt, vec![sandbox]) {
+                return Err(error).context(format!(
+                    "warm resume failed; cleanup also failed: {cleanup_error:#}"
+                ));
+            }
+            Err(error).context("warm resume sandbox")
+        }
+        Err(panic) => {
+            if let Err(cleanup_error) = stop_batch(rt, vec![sandbox]) {
+                eprintln!("Warm resume panic cleanup failed: {cleanup_error:#}");
+            }
+            resume_unwind(panic)
+        }
+    }
+}
+
 fn default_throughput_samples(
     mut run_batch: impl FnMut() -> Result<Duration>,
 ) -> Result<Vec<Duration>> {
@@ -877,8 +930,7 @@ fn default_throughput_samples(
 
 fn default_resume_throughput(rt: &Runtime, concurrency: usize) -> Result<Vec<Duration>> {
     let snapshot = rt.block_on(prepare_snapshot())?;
-    let mut warm_sandbox =
-        rt.block_on(FirecrackerSandbox::resume_from_snapshot_config(&snapshot))?;
+    let mut warm_sandbox = resume_warm_sandbox(rt, &snapshot)?;
     let samples = default_throughput_samples(|| run_resume_batch(rt, &snapshot, concurrency));
     rt.block_on(warm_sandbox.stop())?;
     samples
@@ -896,9 +948,7 @@ fn bench_snapshot_throughput(c: &mut Criterion) {
     let snapshot = rt
         .block_on(prepare_snapshot())
         .expect("prepare resume snapshot");
-    let mut warm_sandbox = rt
-        .block_on(FirecrackerSandbox::resume_from_snapshot_config(&snapshot))
-        .expect("warm resume snapshot");
+    let mut warm_sandbox = resume_warm_sandbox(&rt, &snapshot).expect("warm resume snapshot");
     let resume_result = catch_unwind(AssertUnwindSafe(|| {
         group.bench_function("concurrent_resume_throughput", |b| {
             b.iter_custom(|iters| {
