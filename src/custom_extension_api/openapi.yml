@@ -112,6 +112,53 @@ paths:
         "200":
           description: Hook accepted.
 
+  /sandbox-hook/event:
+    post:
+      operationId: sandboxEvent
+      summary: Receives a sandbox lifecycle event for the event webhook.
+      description: >-
+        Called after a sandbox lifecycle change completes, when the event
+        webhook is enabled and subscribed to that event type (configured
+        through the public `PATCH /events/webhooks/{webhookID}` API). The body
+        is an E2B v2 SandboxEvent. Delivery is best-effort and asynchronous: it
+        never blocks or fails the sandbox operation, failures are only logged,
+        and each event is sent once without retry. Signature headers are sent
+        only when a signature secret is configured.
+      parameters:
+        - name: e2b-webhook-id
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Identifier of the event webhook.
+        - name: e2b-delivery-id
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Unique identifier of this delivery.
+        - name: e2b-signature-version
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Signature scheme version. Always `v1`.
+        - name: e2b-signature
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Unpadded base64 of sha256(signatureSecret + raw request body).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SandboxEventHookRequest"
+      responses:
+        "200":
+          description: Event accepted.
+
 components:
   schemas:
     CustomExtensionParams:
@@ -216,3 +263,74 @@ components:
             delivered by that instance's start-fresh / start-resume hook.
             May arrive after a newer start for the same sandboxId; ignore it
             when it does not match the latest started instance.
+
+    SandboxEventHookRequest:
+      type: object
+      description: E2B v2 SandboxEvent describing one sandbox lifecycle change.
+      required:
+        - id
+        - version
+        - type
+        - timestamp
+        - event_category
+        - event_label
+        - event_data
+        - sandbox_id
+        - sandbox_execution_id
+        - sandbox_template_id
+        - sandbox_build_id
+        - sandbox_team_id
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Event identifier.
+        version:
+          type: string
+          description: Event structure version. Always `v2`.
+        type:
+          type: string
+          description: >-
+            One of sandbox.lifecycle.created, sandbox.lifecycle.killed,
+            sandbox.lifecycle.paused, sandbox.lifecycle.resumed, or
+            sandbox.lifecycle.forked (an AgentENV extension).
+        timestamp:
+          type: string
+          format: date-time
+        event_category:
+          type: string
+          description: Always `lifecycle`.
+        event_label:
+          type: string
+          description: One of create, kill, pause, resume, or fork.
+        event_data:
+          $ref: "#/components/schemas/SandboxEventData"
+        sandbox_id:
+          type: string
+        sandbox_execution_id:
+          type: string
+          description: Always empty.
+        sandbox_template_id:
+          type: string
+          description: Snapshot or template the sandbox was launched from.
+        sandbox_build_id:
+          type: string
+          description: Always empty.
+        sandbox_team_id:
+          type: string
+          format: uuid
+          description: Always the nil UUID; AgentENV is single-tenant.
+
+    SandboxEventData:
+      type: object
+      required:
+        - sandbox_metadata
+      properties:
+        sandbox_metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: User metadata of the sandbox.
+        source_sandbox_id:
+          type: string
+          description: Forked events only. Sandbox the child was forked from.

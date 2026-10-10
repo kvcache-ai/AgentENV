@@ -1,8 +1,8 @@
 # Lifecycle Hooks
 
 To support the complete sandbox lifecycle, your extension should implement the
-following four APIs. AgentENV sends a JSON request to
-`POST {url}/sandbox-hook/<hook>` when the corresponding event occurs. Any connection error, timeout, or non-2xx response fails the corresponding sandbox operation (except `stop`, which is best-effort).
+following APIs. AgentENV sends a JSON request to
+`POST {url}/sandbox-hook/<hook>` when the corresponding event occurs. Any connection error, timeout, or non-2xx response fails the corresponding sandbox operation (except `stop` and `event`, which are best-effort).
 
 | Hook | When | Request | Response |
 |------|------|---------|----------|
@@ -10,6 +10,7 @@ following four APIs. AgentENV sends a JSON request to
 | `start-resume` | Before a sandbox resumes from a snapshot (template launch, resume after pause, fork child) | same as above | none |
 | `patch-params` | When a user PATCHes the sandbox's params | `sandboxId`, `patch` (verbatim user body) | updated **full** `customExtensionParams` |
 | `stop` | When the sandbox runtime is torn down, before the network slot is released | `sandboxId`, `sandboxInstanceId` | none |
+| `event` | After a sandbox lifecycle change, when the webhook is enabled (optional, see [Webhook](./connect-and-use.md#webhook)) | E2B v2 `SandboxEvent` body, signature headers when a secret is set | none |
 
 Notes:
 
@@ -23,6 +24,10 @@ Notes:
 ## Minimal Extension Example
 
 ```python
+import base64
+import hashlib
+import hmac
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
@@ -32,6 +37,9 @@ app = FastAPI()
 # is the identity of a running instance; a stop for a superseded instance
 # (e.g. arriving after a newer start) is ignored.
 latest_instance: dict[str, str] = {}
+
+# Must match the webhook's signatureSecret; empty if signing is off.
+SIGNATURE_SECRET = "replace-with-a-random-secret"
 
 @app.post("/sandbox-hook/start-fresh")
 async def start_fresh(req: Request):
@@ -59,7 +67,18 @@ async def stop(req: Request):
         latest_instance.pop(body["sandboxId"], None)
         # tear down resources for this instance
     return {}
+
+@app.post("/sandbox-hook/event")
+async def event(req: Request):
+    raw = await req.body()
+    if SIGNATURE_SECRET:
+        digest = hashlib.sha256(SIGNATURE_SECRET.encode() + raw).digest()
+        expected = base64.b64encode(digest).decode().rstrip("=")
+        if not hmac.compare_digest(expected, req.headers.get("e2b-signature", "")):
+            return JSONResponse({"error": "bad signature"}, status_code=401)
+    body = await req.json()
+    return {}
 ```
 
 Any non-2xx response or timeout fails the corresponding sandbox operation,
-except for `stop`, which is always tolerated.
+except for `stop` and `event`, which are always tolerated.

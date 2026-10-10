@@ -1973,12 +1973,14 @@ dependencies = [
 name = "custom_extension_client"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "reqwest 0.13.3",
  "serde",
  "serde_json",
  "serde_repr",
  "serde_with",
  "url",
+ "uuid",
 ]
 
 [[package]]

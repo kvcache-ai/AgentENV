@@ -13,6 +13,13 @@ use crate::{apis::ResponseContent, models};
 use reqwest;
 use serde::{de::Error as _, Deserialize, Serialize};
 
+/// struct for typed errors of method [`sandbox_event`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SandboxEventError {
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`sandbox_patch_params`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -39,6 +46,62 @@ pub enum SandboxStartResumeError {
 #[serde(untagged)]
 pub enum SandboxStopError {
     UnknownValue(serde_json::Value),
+}
+
+/// Called after a sandbox lifecycle change completes, when the event webhook is enabled and subscribed to that event type (configured through the public `PATCH /events/webhooks/{webhookID}` API). The body is an E2B v2 SandboxEvent. Delivery is best-effort and asynchronous: it never blocks or fails the sandbox operation, failures are only logged, and each event is sent once without retry. Signature headers are sent only when a signature secret is configured.
+pub async fn sandbox_event(
+    configuration: &configuration::Configuration,
+    sandbox_event_hook_request: models::SandboxEventHookRequest,
+    e2b_webhook_id: Option<&str>,
+    e2b_delivery_id: Option<&str>,
+    e2b_signature_version: Option<&str>,
+    e2b_signature: Option<&str>,
+) -> Result<(), Error<SandboxEventError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_body_sandbox_event_hook_request = sandbox_event_hook_request;
+    let p_header_e2b_webhook_id = e2b_webhook_id;
+    let p_header_e2b_delivery_id = e2b_delivery_id;
+    let p_header_e2b_signature_version = e2b_signature_version;
+    let p_header_e2b_signature = e2b_signature;
+
+    let uri_str = format!("{}/sandbox-hook/event", configuration.base_path);
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(param_value) = p_header_e2b_webhook_id {
+        req_builder = req_builder.header("e2b-webhook-id", param_value.to_string());
+    }
+    if let Some(param_value) = p_header_e2b_delivery_id {
+        req_builder = req_builder.header("e2b-delivery-id", param_value.to_string());
+    }
+    if let Some(param_value) = p_header_e2b_signature_version {
+        req_builder = req_builder.header("e2b-signature-version", param_value.to_string());
+    }
+    if let Some(param_value) = p_header_e2b_signature {
+        req_builder = req_builder.header("e2b-signature", param_value.to_string());
+    }
+    req_builder = req_builder.json(&p_body_sandbox_event_hook_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req).await?;
+
+    let status = resp.status();
+
+    if !status.is_client_error() && !status.is_server_error() {
+        Ok(())
+    } else {
+        let content = resp.text().await?;
+        let entity: Option<SandboxEventError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
 }
 
 /// Called when a user PATCHes the sandbox's custom extension params. The patch document is passed through verbatim; its semantics are defined entirely by the extension. The hook must return the updated full params, which the runtime stores as the new current value. A failure response rejects the patch: the sandbox keeps its previous params and the API call fails. The runtime does not serialize concurrent patches to the same sandbox; if patch semantics are not commutative, the extension must handle concurrency itself.

@@ -17,6 +17,7 @@ use crate::snapshot::{
     SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };
 use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord};
+use crate::webhook::ExtensionWebhookConfig;
 const FILE_LOCK_TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
 
 pub struct PosixFsCatalogStore {
@@ -490,6 +491,24 @@ impl PosixFsCatalogStore {
         durable_record.reserved_by_sandbox_id = existing.reserved_by_sandbox_id;
         durable_record.read_only_mounts = existing.read_only_mounts;
         self.write_json(&path, &durable_record)
+    }
+
+    pub(crate) fn get_extension_webhook(&self) -> RepositoryResult<Option<ExtensionWebhookConfig>> {
+        let path = PosixFsSnapshotArtifactLayout::extension_webhook_path(&self.root);
+        if !path.exists() {
+            return Ok(None);
+        }
+        self.read_json(&path).map(Some)
+    }
+
+    pub(crate) fn put_extension_webhook(
+        &self,
+        config: &ExtensionWebhookConfig,
+    ) -> RepositoryResult<()> {
+        self.write_json(
+            &PosixFsSnapshotArtifactLayout::extension_webhook_path(&self.root),
+            config,
+        )
     }
 
     pub(crate) fn get_build_cache_state(

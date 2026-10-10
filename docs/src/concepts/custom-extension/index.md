@@ -13,5 +13,5 @@ AgentENV acts as the client. The interface is defined in
 
 Where to Go Next:
 
-- [Lifecycle Hooks](./lifecycle-hooks.md) — implement the four lifecycle endpoints.
+- [Lifecycle Hooks](./lifecycle-hooks.md) — implement the lifecycle and event endpoints.
 - [Use the Extension](./connect-and-use.md) — configure AgentENV and manage extension-specific Sandbox parameters.

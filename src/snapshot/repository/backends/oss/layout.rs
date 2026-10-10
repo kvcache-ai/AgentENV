@@ -34,6 +34,10 @@ impl<'a> OssSnapshotArtifactLayout<'a> {
         format!("volumes/aliases/{alias}.json")
     }
 
+    pub(super) fn extension_webhook_key() -> &'static str {
+        "webhooks/extension.json"
+    }
+
     pub(crate) fn managed_layer_key(digest: &str) -> String {
         format!("managed-layers/{digest}")
     }
