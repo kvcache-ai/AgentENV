@@ -115,6 +115,8 @@ jobs:
       - name: Install e2b Python SDK
         run: python3 -m pip install --upgrade e2b e2b-code-interpreter
       - name: Prepare BuildKit test client
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           make build-aenv
           bash scripts/buildkit/install-buildctl.sh "$RUNNER_TEMP/buildkit"
