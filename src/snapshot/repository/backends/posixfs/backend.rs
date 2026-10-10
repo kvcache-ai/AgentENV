@@ -452,6 +452,25 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         .await
     }
 
+    async fn get_extension_webhook(
+        &self,
+    ) -> RepositoryResult<Option<crate::webhook::ExtensionWebhookConfig>> {
+        self.run_catalog("get extension webhook", |store| {
+            store.get_extension_webhook()
+        })
+        .await
+    }
+
+    async fn put_extension_webhook(
+        &self,
+        config: crate::webhook::ExtensionWebhookConfig,
+    ) -> RepositoryResult<()> {
+        self.run_catalog("put extension webhook", move |store| {
+            store.put_extension_webhook(&config)
+        })
+        .await
+    }
+
     async fn create_volume(&self, record: VolumeRecord) -> RepositoryResult<()> {
         self.run_catalog("create volume", move |store| store.create_volume(&record))
             .await

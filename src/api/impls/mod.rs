@@ -8,6 +8,7 @@ mod snapshots;
 mod template;
 mod template_helpers;
 mod volumes;
+mod webhooks;
 
 use std::sync::Arc;
 
@@ -23,6 +24,7 @@ use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
 use crate::volume::VolumeManager;
+use crate::webhook::WebhookService;
 use agentenv_http_server::{apis, models};
 
 #[derive(Clone, Debug)]
@@ -63,6 +65,7 @@ pub struct ApiImpl {
     api_key: ApiKey,
     build_sessions: Arc<image_build::BuildSessions>,
     build_logs: crate::template::logs::BuildLogs,
+    webhooks: Arc<WebhookService>,
 }
 
 impl ApiImpl {
@@ -77,6 +80,7 @@ impl ApiImpl {
         sandbox_proxy_domains: Vec<String>,
         api_key: ApiKey,
     ) -> Self {
+        let webhooks = WebhookService::new(snapshot_manager.repository());
         Self {
             orchestrator,
             snapshot_manager,
@@ -89,7 +93,12 @@ impl ApiImpl {
             api_key,
             build_sessions: Arc::new(image_build::BuildSessions::default()),
             build_logs: Default::default(),
+            webhooks,
         }
+    }
+
+    pub fn webhooks(&self) -> Arc<WebhookService> {
+        Arc::clone(&self.webhooks)
     }
 
     pub(crate) fn orchestrator(&self) -> Arc<Orchestrator> {

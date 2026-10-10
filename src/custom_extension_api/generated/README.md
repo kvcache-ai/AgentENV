@@ -27,6 +27,7 @@ All URIs are relative to *http://localhost*
 
 Class | Method | HTTP request | Description
 ------------ | ------------- | ------------- | -------------
+*DefaultApi* | [**sandbox_event**](docs/DefaultApi.md#sandbox_event) | **POST** /sandbox-hook/event | Receives a sandbox lifecycle event for the event webhook.
 *DefaultApi* | [**sandbox_patch_params**](docs/DefaultApi.md#sandbox_patch_params) | **POST** /sandbox-hook/patch-params | Applies an extension-defined patch to a sandbox's custom extension params.
 *DefaultApi* | [**sandbox_start_fresh**](docs/DefaultApi.md#sandbox_start_fresh) | **POST** /sandbox-hook/start-fresh | Invoked before a fresh sandbox boots, after its network slot is allocated.
 *DefaultApi* | [**sandbox_start_resume**](docs/DefaultApi.md#sandbox_start_resume) | **POST** /sandbox-hook/start-resume | Invoked before a sandbox resumes from a snapshot, after its network slot is ready.
@@ -37,6 +38,8 @@ Class | Method | HTTP request | Description
 
  - [PatchCustomExtensionParamsHookRequest](docs/PatchCustomExtensionParamsHookRequest.md)
  - [PatchCustomExtensionParamsHookResponse](docs/PatchCustomExtensionParamsHookResponse.md)
+ - [SandboxEventData](docs/SandboxEventData.md)
+ - [SandboxEventHookRequest](docs/SandboxEventHookRequest.md)
  - [StartFreshHookRequest](docs/StartFreshHookRequest.md)
  - [StartFreshHookResponse](docs/StartFreshHookResponse.md)
  - [StartResumeHookRequest](docs/StartResumeHookRequest.md)

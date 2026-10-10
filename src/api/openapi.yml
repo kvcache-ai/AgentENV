@@ -105,6 +105,13 @@ components:
       required: true
       schema:
         type: string
+    webhookID:
+      name: webhookID
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
 
   headers:
     XNextToken:
@@ -1573,12 +1580,69 @@ components:
       required:
         - name
 
+    WebhookDetail:
+      description: Webhook detail response
+      required:
+        - id
+        - teamId
+        - name
+        - createdAt
+        - url
+        - enabled
+        - events
+      properties:
+        id:
+          type: string
+          description: Webhook unique identifier
+        teamId:
+          type: string
+          description: Unique identifier for the team
+        name:
+          type: string
+          description: Webhook user friendly name
+        createdAt:
+          type: string
+          format: date-time
+          description: Time when the template was created
+        url:
+          type: string
+          format: uri
+        enabled:
+          type: boolean
+        events:
+          type: array
+          items:
+            type: string
+
+    WebhookConfiguration:
+      description: Configuration for updating existing webhooks
+      properties:
+        enabled:
+          type: boolean
+        name:
+          type: string
+          description: Webhook user friendly name
+        url:
+          type: string
+          format: uri
+          description: >-
+            Not updatable: the webhook URL is the custom extension's URL. A
+            request that sets it is rejected with 400.
+        events:
+          type: array
+          items:
+            type: string
+        signatureSecret:
+          type: string
+          description: Secret used to sign the webhook payloads
+
 tags:
   - name: admin
   - name: templates
   - name: sandboxes
   - name: snapshots
   - name: volumes
+  - name: webhooks
 
 paths:
   /health:
@@ -3053,5 +3117,93 @@ paths:
           $ref: "#/components/responses/404"
         "409":
           $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /events/webhooks:
+    get:
+      description: >-
+        List registered webhooks. AgentENV has at most one webhook, backed by the
+        custom extension; the list is empty when no extension is configured.
+      tags: [webhooks]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      responses:
+        "200":
+          description: List of registered webhooks.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/WebhookDetail"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /events/webhooks/{webhookID}:
+    get:
+      description: Get a registered webhook.
+      tags: [webhooks]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/webhookID"
+      responses:
+        "200":
+          description: Successfully returned the webhook configuration.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookDetail"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+
+    patch:
+      description: >-
+        Update the webhook configuration. `url` cannot be changed.
+      tags: [webhooks]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      parameters:
+        - $ref: "#/components/parameters/webhookID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WebhookConfiguration"
+      responses:
+        "200":
+          description: Successfully updated webhook.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookDetail"
+        "400":
+          $ref: "#/components/responses/400"
+        "404":
+          $ref: "#/components/responses/404"
+        "401":
+          $ref: "#/components/responses/401"
         "500":
           $ref: "#/components/responses/500"

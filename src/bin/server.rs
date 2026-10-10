@@ -170,6 +170,9 @@ async fn main() -> anyhow::Result<()> {
         config.sandbox_proxy.domains.clone(),
         api_key,
     ));
+    let webhook_dispatcher = api_impl
+        .webhooks()
+        .start(orchestrator.subscribe_sandbox_events());
     if let Err(error) = api_impl.recover_image_builds().await {
         warn!(error = %format_args!("{error:#}"), "build recovery unavailable; will retry after startup");
     }
@@ -207,6 +210,11 @@ async fn main() -> anyhow::Result<()> {
             info!(target: "agentenv", "stopping sandboxes before process exit");
             if let Err(err) = shutdown_orchestrator.shutdown().await {
                 warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
+            }
+            // Event forwarding is best-effort: events from the shutdown
+            // pauses above and in-flight deliveries end with the process.
+            if let Some(dispatcher) = webhook_dispatcher {
+                dispatcher.abort();
             }
             if let Some(pool) = FirecrackerPool::global() {
                 info!(target: "agentenv", "shutting down firecracker pool");

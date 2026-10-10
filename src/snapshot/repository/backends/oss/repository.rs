@@ -665,6 +665,35 @@ impl SnapshotRepository for OssSnapshotRepository {
         self.write_record(&record).await
     }
 
+    async fn get_extension_webhook(
+        &self,
+    ) -> RepositoryResult<Option<crate::webhook::ExtensionWebhookConfig>> {
+        let key = OssSnapshotArtifactLayout::extension_webhook_key();
+        match self.client.get_bytes(key).await {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map(Some)
+                .map_err(|error| RepositoryError::backend("parse extension webhook", error)),
+            Err(error) if OssClient::is_not_found_error(&error) => Ok(None),
+            Err(error) => Err(RepositoryError::backend("read extension webhook", error)),
+        }
+    }
+
+    async fn put_extension_webhook(
+        &self,
+        config: crate::webhook::ExtensionWebhookConfig,
+    ) -> RepositoryResult<()> {
+        let bytes = serde_json::to_vec_pretty(&config)
+            .map_err(|error| RepositoryError::backend("serialize extension webhook", error))?;
+        self.client
+            .put_bytes(
+                OssSnapshotArtifactLayout::extension_webhook_key(),
+                bytes,
+                OssUploadArtifact::CatalogRecord,
+            )
+            .await
+            .map_err(|error| RepositoryError::backend("write extension webhook", error))
+    }
+
     async fn get_volume(&self, reference: &str) -> RepositoryResult<Option<VolumeRecord>> {
         validate_volume_component(reference, "reference")?;
         if let Some(record) = self.read_volume_record(reference).await? {

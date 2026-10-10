@@ -39,6 +39,10 @@ impl PosixFsSnapshotArtifactLayout {
         root.join("volumes")
     }
 
+    pub(super) fn extension_webhook_path(root: &Path) -> PathBuf {
+        root.join("webhooks").join("extension.json")
+    }
+
     pub(super) fn volume_aliases_dir(root: &Path) -> PathBuf {
         Self::volumes_dir(root).join("aliases")
     }

@@ -334,6 +334,22 @@ pub trait SnapshotRepository: Send + Sync {
     ) -> RepositoryResult<()> {
         unsupported("volume reservations")
     }
+
+    /// Reads the event webhook configuration shared by every node. `None`
+    /// until it is first updated.
+    async fn get_extension_webhook(
+        &self,
+    ) -> RepositoryResult<Option<crate::webhook::ExtensionWebhookConfig>> {
+        unsupported("event webhooks")
+    }
+
+    /// Replaces the event webhook configuration.
+    async fn put_extension_webhook(
+        &self,
+        _config: crate::webhook::ExtensionWebhookConfig,
+    ) -> RepositoryResult<()> {
+        unsupported("event webhooks")
+    }
 }
 
 #[async_trait]
