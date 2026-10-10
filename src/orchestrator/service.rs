@@ -616,11 +616,7 @@ where
         match result {
             Ok(metadata) => {
                 self.counters.record_create_success(1);
-                self.publish_sandbox_event(
-                    SandboxLifecycleEventType::Create,
-                    metadata.id,
-                    metadata.resources,
-                );
+                self.publish_sandbox_event(SandboxLifecycleEventType::Create, &metadata, None);
                 Ok(metadata)
             }
             Err(err) => {
@@ -839,8 +835,8 @@ where
             self.upsert_proxy_route(metadata.id, proxy_target).await;
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Fork,
-                metadata.id,
-                metadata.resources,
+                &metadata,
+                Some(source_sandbox_id),
             );
             successes += 1;
             outcomes.push(Ok(metadata));
@@ -1339,11 +1335,7 @@ where
     async fn remove_deleted_sandbox(&self, sandbox_id: SandboxId) -> Result<()> {
         let metadata = self.store.remove(&sandbox_id).await?;
         if let Some(metadata) = metadata {
-            self.publish_sandbox_event(
-                SandboxLifecycleEventType::Delete,
-                metadata.id,
-                metadata.resources,
-            );
+            self.publish_sandbox_event(SandboxLifecycleEventType::Delete, &metadata, None);
         }
         if let Err(err) = self
             .persister
@@ -1609,7 +1601,6 @@ where
                 "failed to persist paused sandbox state: {err:#}"
             )));
         }
-        let resources = persisted_metadata.resources;
         self.store.update(persisted_metadata.clone()).await?;
 
         // Stop the sandbox to free up resources.
@@ -1620,7 +1611,7 @@ where
         if let Err(err) = stop_result {
             warn!(error = ?err, "failed to stop sandbox after pausing");
         }
-        self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
+        self.publish_sandbox_event(SandboxLifecycleEventType::Pause, &persisted_metadata, None);
         info!("sandbox paused");
 
         Ok(())
@@ -1758,11 +1749,7 @@ where
         if let Ok(metadata) = resumed.as_ref() {
             self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                 .await;
-            self.publish_sandbox_event(
-                SandboxLifecycleEventType::Resume,
-                metadata.id,
-                metadata.resources,
-            );
+            self.publish_sandbox_event(SandboxLifecycleEventType::Resume, metadata, None);
         }
         resumed
     }
@@ -2130,13 +2117,18 @@ where
     fn publish_sandbox_event(
         &self,
         event_type: SandboxLifecycleEventType,
-        sandbox_id: SandboxId,
-        resources: SandboxResources,
+        metadata: &SandboxMetadata,
+        source_sandbox_id: Option<SandboxId>,
     ) {
         let event = SandboxLifecycleEvent {
             event_type,
-            sandbox_id,
-            resources,
+            sandbox_id: metadata.id,
+            resources: metadata.resources,
+            template_id: metadata.snapshot_id.clone(),
+            template_builder: metadata.template_builder,
+            user_metadata: metadata.user_metadata.clone(),
+            timestamp: SystemTime::now(),
+            source_sandbox_id,
         };
         let _ = self.sandbox_event_tx.send(event);
     }

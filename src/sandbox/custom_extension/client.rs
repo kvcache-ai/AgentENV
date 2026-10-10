@@ -111,6 +111,46 @@ impl CustomExtensionClient {
         })
     }
 
+    /// URL of the event hook, reported as the event webhook's URL.
+    pub(crate) fn event_hook_url(&self) -> String {
+        format!("{}/sandbox-hook/event", self.configuration.base_path)
+    }
+
+    /// Invoke the event hook with an E2B v2 `SandboxEvent` body.
+    ///
+    /// The body is sent byte-for-byte as given, because `signature` covers
+    /// those exact bytes; re-serializing through the generated model would
+    /// break verification. Signature headers are sent only with a signature.
+    pub(crate) async fn hook_event(
+        &self,
+        webhook_id: Uuid,
+        body: Vec<u8>,
+        signature: Option<String>,
+    ) -> Result<()> {
+        let mut request = self
+            .configuration
+            .client
+            .post(self.event_hook_url())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("e2b-webhook-id", webhook_id.to_string())
+            .header("e2b-delivery-id", Uuid::now_v7().to_string())
+            .body(body);
+        if let Some(signature) = signature {
+            request = request
+                .header("e2b-signature-version", "v1")
+                .header("e2b-signature", signature);
+        }
+        let response = request
+            .send()
+            .await
+            .context("custom extension event hook request failed")?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!("custom extension event hook returned {status}");
+        }
+        Ok(())
+    }
+
     /// Invoke the start-fresh hook: a fresh sandbox is about to boot.
     ///
     /// Returns extra kernel boot args to append, if any.

@@ -10,6 +10,8 @@ pub enum DocumentKey {
     BuildLog(SnapshotId),
     /// The shared Dockerfile build-cache seed and its pending retirements.
     BuildCacheState,
+    /// Shared settings for the extension-backed event webhook.
+    ExtensionWebhook,
     /// One volume record, keyed by volume ID.
     VolumeRecord(String),
     /// The volume ID that currently owns a volume name.
@@ -25,6 +27,7 @@ impl DocumentKey {
         match self {
             Self::BuildLog(id) => format!("snapshots/build-logs/{id}.json"),
             Self::BuildCacheState => "template-build/cache-head.json".to_owned(),
+            Self::ExtensionWebhook => "webhooks/extension.json".to_owned(),
             Self::VolumeRecord(id) => format!("{VOLUME_RECORDS_PREFIX}{id}.json"),
             Self::VolumeAlias(name) => format!("volumes/aliases/{name}.json"),
             Self::SnapshotRecord(id) => format!("{SNAPSHOT_RECORDS_PREFIX}{id}.json"),
@@ -52,7 +55,7 @@ impl DocumentKey {
             Self::VolumeAlias(name) => format!("volumes/aliases/{name}.lock"),
             Self::SnapshotRecord(id) => format!("{SNAPSHOT_RECORDS_PREFIX}{id}.lock"),
             Self::SnapshotAlias(alias) => format!("catalog/aliases/{alias}.lock"),
-            Self::BuildLog(_) => format!("{}.lock", self.path()),
+            Self::BuildLog(_) | Self::ExtensionWebhook => format!("{}.lock", self.path()),
         }
     }
 }

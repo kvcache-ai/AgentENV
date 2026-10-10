@@ -4,6 +4,7 @@ pub mod sandboxes;
 pub mod snapshots;
 pub mod templates;
 pub mod volumes;
+pub mod webhooks;
 
 /// API Key Authentication - Header.
 #[async_trait::async_trait]
