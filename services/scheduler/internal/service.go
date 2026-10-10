@@ -15,6 +15,10 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// The Service sees leadership state only through the narrow leadershipView
+// seam (defined in leadership.go); LeadershipManager is the only production
+// implementation, and the internal snapshot object is never handed out.
+
 type Service struct {
 	schedulerv1.UnimplementedSchedulerServer
 	logger        *zap.Logger
@@ -23,6 +27,9 @@ type Service struct {
 	store         BindingStore
 	artifacts     ArtifactStore
 	resourceLimit *config.NodeResourceLimit
+	leadership    leadershipView
+	// for test cases, inject for time-related function checking on `inRecoveryWindow`
+	now func() time.Time
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -38,6 +45,7 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 		strategy:  strategy,
 		store:     store,
 		artifacts: NewInMemoryArtifactStore(defaultArtifactStoreCapacity, 0),
+		now:       time.Now,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -58,6 +66,22 @@ func WithNodeResourceLimit(limit *config.NodeResourceLimit) ServiceOption {
 func WithArtifactStore(store ArtifactStore) ServiceOption {
 	return func(s *Service) {
 		s.artifacts = store
+	}
+}
+
+// WithLeadership attaches the read-only leadership view so scheduling and
+// lookup can apply recovery-window rules right after a leadership
+// transition (#259).
+func WithLeadership(leadership leadershipView) ServiceOption {
+	return func(s *Service) {
+		s.leadership = leadership
+	}
+}
+
+// WithClock overrides the time source (tests only).
+func WithClock(now func() time.Time) ServiceOption {
+	return func(s *Service) {
+		s.now = now
 	}
 }
 
@@ -93,6 +117,8 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		})
 	}
 
+	rich = s.filterFreshObservations(rich)
+
 	eligible := FilterByResourceLimit(rich, s.resourceLimit)
 
 	node, selectErr := s.strategy.Select(eligible, req.GetHint())
@@ -122,6 +148,50 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	return &schedulerv1.ScheduleResponse{Node: node.Node.ToProto()}, nil
 }
 
+// filterFreshObservations applies the fresh-observations-only rule (#259):
+// a node that was known at leadership acquisition is a scheduling candidate
+// only once it has reported at or after the acquisition — a timer alone
+// must not readmit a node whose reporter is still backing off (#341
+// review). Nodes that joined after the acquisition are not in the
+// recovery-pending set and keep the steady-state fail-open behaviour; with
+// leader election disabled everything passes.
+func (s *Service) filterFreshObservations(rich []RichNode) []RichNode {
+	if s.leadership == nil {
+		return rich
+	}
+	since, ok := s.leadership.LeaderSince()
+	if !ok {
+		return rich
+	}
+	// Compare at millisecond precision: LastReportAt is reconstructed from a
+	// millisecond timestamp while the acquisition time has nanoseconds, so a
+	// report in the same millisecond as the acquisition must count as fresh
+	// (#341 review).
+	sinceMs := since.UnixMilli()
+	fresh := make([]RichNode, 0, len(rich))
+	for _, n := range rich {
+		at, reported := s.nodes.LastReportAt(n.Node.ID)
+		if reported && at.UnixMilli() >= sinceMs {
+			fresh = append(fresh, n)
+			continue
+		}
+		var lastReport *time.Time
+		if reported {
+			lastReport = &at
+		}
+		if !s.leadership.RecoveryPending(n.Node.ID, lastReport) {
+			fresh = append(fresh, n)
+		}
+	}
+	return fresh
+}
+
+// inRecoveryWindow reports whether the recovery window following leadership
+// acquisition is open right now. Without leader election it is always closed.
+func (s *Service) inRecoveryWindow() bool {
+	return s.leadership != nil && s.leadership.InRecoveryWindow(s.now())
+}
+
 // summarizeScheduleHint renders a compact, log-friendly description of a
 // scheduling hint.
 func summarizeScheduleHint(hint *schedulerv1.ScheduleRequestHint) string {
@@ -149,7 +219,13 @@ func (s *Service) ListNodes(_ context.Context, _ *schedulerv1.ListNodesRequest) 
 }
 
 func (s *Service) LookupNode(_ context.Context, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
-	return lookupNode(s.logger, s.store, req)
+	resp, err := lookupNode(s.logger, s.store, req)
+	if err != nil && status.Code(err) == codes.NotFound && s.inRecoveryWindow() {
+		// Recovery window open: a missing binding means "not yet rebuilt",
+		// not "does not exist" (#259).
+		return nil, status.Error(codes.Unavailable, "sandbox assignment not rebuilt yet")
+	}
+	return resp, err
 }
 
 func lookupNode(logger *zap.Logger, store BindingStore, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
@@ -212,23 +288,76 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 		return nil, status.Error(codes.InvalidArgument, "node_id and service_instance_id are required")
 	}
 
-	now := time.Now()
+	return s.ingestNodeReport(nodeReportFromProto(req), s.now())
+}
+
+// ingestNodeError maps registry ingest failures to gRPC statuses.
+func ingestNodeError(logger *zap.Logger, nodeID string, err error) error {
+	if errors.Is(err, ErrNodeNotInRegistry) {
+		logger.Warn("scheduler rejected observed registration for unknown node",
+			zap.String("node_id", nodeID),
+		)
+		return status.Error(codes.InvalidArgument, "node is not in scheduler node list")
+	}
+	return status.Error(codes.Internal, "node registry heartbeat failed")
+}
+
+// nodeReportFromProto adapts a Heartbeat RPC request to the neutral ingest
+// currency. Identity validation already happened in Heartbeat.
+func nodeReportFromProto(req *schedulerv1.HeartbeatRequest) *nodeReport {
+	// A heartbeat roster is always authoritative, including when empty:
+	// proto3 decodes absent and empty repeated fields identically, so force
+	// a non-nil slice to keep heartbeats reconciling (see nodeReport).
+	sandboxIDs := req.GetSandboxIds()
+	if sandboxIDs == nil {
+		sandboxIDs = []string{}
+	}
+	return &nodeReport{
+		nodeID:            req.GetNodeId(),
+		clusterID:         req.GetClusterId(),
+		serviceInstanceID: req.GetServiceInstanceId(),
+		version:           req.GetVersion(),
+		commit:            req.GetCommit(),
+		machineInfo:       req.GetMachineInfo(),
+		snapshot:          req.GetSnapshot(),
+		sandboxIDs:        sandboxIDs,
+		p2pEndpoint:       req.GetP2PEndpoint(),
+	}
+}
+
+// ingestNodeReport is the shared ingest path for heartbeat RPCs and pulled
+// node snapshots (sync-node-snapshots on leadership acquisition, #259):
+// update registry observations, then reconcile sandbox bindings.
+func (s *Service) ingestNodeReport(report *nodeReport, now time.Time) (*schedulerv1.HeartbeatResponse, error) {
+	req := report.toHeartbeatRequest()
+	if !report.fetchedAt.IsZero() {
+		// Pulled report: skip when the node already reported something
+		// newer (#341 review). The residual check-then-act window is
+		// microseconds and self-heals on the next heartbeat.
+		if at, ok := s.nodes.LastReportAt(report.nodeID); ok && at.After(report.fetchedAt) {
+			return &schedulerv1.HeartbeatResponse{}, nil
+		}
+		// The admin API does not serve the P2P endpoint; carry over the
+		// previously known one so a pull does not erase it (#341 review).
+		if req.P2PEndpoint == nil {
+			req.P2PEndpoint = s.nodes.P2PEndpointFor(report.nodeID)
+		}
+	}
 	node, cpuConfigJSON, err := s.nodes.Heartbeat(req, now)
 	if err != nil {
-		if errors.Is(err, ErrNodeNotInRegistry) {
-			s.logger.Warn("scheduler rejected observed registration for unknown node",
-				zap.String("node_id", nodeID),
-			)
-			return nil, status.Error(codes.InvalidArgument, "node is not in scheduler node list")
-		}
-		return nil, status.Error(codes.Internal, "node registry heartbeat failed")
+		return nil, ingestNodeError(s.logger, report.nodeID, err)
 	}
-	if err := s.store.ReconcileNode(node, req.GetSandboxIds(), now); err != nil {
-		s.logger.Warn("scheduler heartbeat binding reconcile failed",
-			zap.String("node_id", nodeID),
-			zap.Error(err),
-		)
-		return nil, status.Error(codes.Unavailable, "binding store unavailable")
+	// Reconcile only from an authoritative roster (heartbeat). A snapshot
+	// pull leaves sandboxIDs nil — bindings are refreshed by heartbeats and
+	// guarded meanwhile by the binding TTL floor (#341 review).
+	if report.sandboxIDs != nil {
+		if err := s.store.ReconcileNode(node, report.sandboxIDs, now); err != nil {
+			s.logger.Warn("scheduler heartbeat binding reconcile failed",
+				zap.String("node_id", report.nodeID),
+				zap.Error(err),
+			)
+			return nil, status.Error(codes.Unavailable, "binding store unavailable")
+		}
 	}
 	return &schedulerv1.HeartbeatResponse{CpuConfigJson: cpuConfigJSON}, nil
 }
@@ -336,8 +465,12 @@ func (s *Service) GetNode(_ context.Context, req *schedulerv1.GetNodeRequest) (*
 		return nil, status.Error(codes.InvalidArgument, "node_id is required")
 	}
 
-	node, ok := s.nodes.GetObserved(nodeID, req.GetClusterId(), time.Now())
+	node, ok := s.nodes.GetObserved(nodeID, req.GetClusterId(), s.now())
 	if !ok {
+		if s.inRecoveryWindow() {
+			// Same recovery-window rule as LookupNode (#259).
+			return nil, status.Error(codes.Unavailable, "observed node not rebuilt yet")
+		}
 		return nil, status.Error(codes.NotFound, "observed node not found")
 	}
 

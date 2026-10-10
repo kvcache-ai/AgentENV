@@ -25,6 +25,7 @@ import (
 const kubernetesDiscoveryCacheSyncTimeout = 30 * time.Second
 
 type KubernetesDiscovery struct {
+	ready                 []chan<- struct{}
 	logger                *zap.Logger
 	config                config.SchedulerDiscoveryKubernetesConfig
 	registry              *AtomicNodeRegistry
@@ -33,10 +34,15 @@ type KubernetesDiscovery struct {
 	noSchedulePodInformer cache.SharedIndexInformer
 }
 
+// NewKubernetesDiscovery builds discovery. When ready is non-nil, it is
+// closed once the initial informer cache sync completes (the first time the
+// registry actually reflects the cluster); leader election waits on it so an
+// early acquisition cannot capture an empty registry (#341 review).
 func NewKubernetesDiscovery(
 	logger *zap.Logger,
 	cfg config.SchedulerDiscoveryKubernetesConfig,
 	registry *AtomicNodeRegistry,
+	ready ...chan<- struct{},
 ) (*KubernetesDiscovery, error) {
 	if logger == nil {
 		logger = zap.NewNop()
@@ -81,6 +87,7 @@ func NewKubernetesDiscovery(
 	}
 
 	discovery := &KubernetesDiscovery{
+		ready:                 ready,
 		logger:                logger,
 		config:                cfg,
 		registry:              registry,
@@ -157,7 +164,11 @@ func (d *KubernetesDiscovery) Run(ctx context.Context) error {
 		if err := syncCtx.Err(); err != nil {
 			return fmt.Errorf("kubernetes discovery cache sync timed out after %s", kubernetesDiscoveryCacheSyncTimeout)
 		}
-		return fmt.Errorf("kubernetes discovery cache sync failed")
+	}
+	// Signal first sync right after it completes — deferring this to Run's
+	// return would never fire during normal operation (#341 e2e finding).
+	if len(d.ready) > 0 {
+		close(d.ready[0])
 	}
 
 	d.syncFromStore()

@@ -1,0 +1,49 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# HA scheduler topology (#259): 3 leader-elected scheduler replicas behind
+# one Service. Only the leader is ready (readiness probes the leader-specific
+# health service), so Service endpoints contain only the leader; standbys
+# stay liveness-healthy and serve reads from the shared Redis bindings.
+#
+# Point scheduler.redis_addr at your Redis to enable standby reads and
+# failover-preserved routing; without it the scheduler runs the documented
+# degraded mode (reads retry to the leader; pre-failover routing is lost).
+
+resources:
+  - ../../base
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: scheduler-k8s-config
+    behavior: replace
+    files:
+      - config/scheduler.json
+
+patches:
+  - target:
+      kind: Deployment
+      name: agentenv-scheduler
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 3
+      - op: replace
+        path: /spec/template/spec/containers/0/readinessProbe/exec/command
+        value:
+          - /grpc_health_probe
+          - -addr=127.0.0.1:9090
+          - -service=scheduler.v1.Scheduler/leader
+      # sync-node-snapshots pulls authenticate against node admin APIs with
+      # the cluster-wide admin key; mount it from the shared agentenv-auth
+      # Secret, never from a ConfigMap.
+      - op: add
+        path: /spec/template/spec/containers/0/env
+        value:
+          - name: SCHEDULER_NODE_ADMIN_API_KEY
+            valueFrom:
+              secretKeyRef:
+                name: agentenv-auth
+                key: AENV_API_KEY

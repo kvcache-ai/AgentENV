@@ -139,6 +139,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(&orchestrator),
                 config.resolved_cpu_template_helper(),
                 cluster_cpu_arc,
+                p2p_local_endpoint.clone(),
             )
             .await,
         ))

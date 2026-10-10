@@ -57,18 +57,42 @@ type NodeResourceLimit struct {
 	MaxAllocatedMemoryBytesIncludingPaused *uint64 `json:"max_allocated_memory_bytes_including_paused"`
 }
 
+// SchedulerLeaderElectionConfig configures Kubernetes Lease-based leader
+// election for the scheduler (#259). Disabled by default; when disabled the
+// scheduler behaves exactly as a single-writer process (today's behaviour).
+// A Redis binding store is recommended but not required: without it, failover
+// loses routing for pre-failover sandboxes (degraded mode).
+type SchedulerLeaderElectionConfig struct {
+	Enabled        bool          `json:"enabled"`
+	LeaseName      string        `json:"lease_name"`
+	LeaseNamespace string        `json:"lease_namespace"`
+	LeaseDuration  time.Duration `json:"lease_duration"`
+	RenewDeadline  time.Duration `json:"renew_deadline"`
+	RetryPeriod    time.Duration `json:"retry_period"`
+	// SnapshotPullConcurrency bounds how many nodes the post-acquisition
+	// sync-node-snapshots pull fans out to at once. Zero means the default.
+	SnapshotPullConcurrency int `json:"snapshot_pull_concurrency"`
+}
+
 type SchedulerConfig struct {
-	GRPCListenAddr          string                   `json:"grpc_listen_addr"`
-	MetricsListenAddr       string                   `json:"metrics_listen_addr"`
-	Strategy                string                   `json:"strategy"`
-	ReportTTL               time.Duration            `json:"report_ttl"`
-	BindingTTL              time.Duration            `json:"binding_ttl"`
-	RedisAddr               string                   `json:"redis_addr"`
-	ArtifactStoreCapacity   int                      `json:"artifact_store_capacity"`
-	ArtifactLookupNodeLimit int                      `json:"artifact_lookup_node_limit"`
-	Nodes                   []Node                   `json:"nodes"`
-	Discovery               SchedulerDiscoveryConfig `json:"discovery"`
-	NodeResourceLimit       *NodeResourceLimit       `json:"node_resource_limit"`
+	GRPCListenAddr    string        `json:"grpc_listen_addr"`
+	MetricsListenAddr string        `json:"metrics_listen_addr"`
+	Strategy          string        `json:"strategy"`
+	ReportTTL         time.Duration `json:"report_ttl"`
+	BindingTTL        time.Duration `json:"binding_ttl"`
+	RedisAddr         string        `json:"redis_addr"`
+	// NodeAdminAPIKey authenticates the scheduler against each node's admin
+	// API (x-api-key header) for sync-node-snapshots pulls (#259). It is a
+	// credential: prefer the SCHEDULER_NODE_ADMIN_API_KEY env (mounted from
+	// the agentenv-auth Secret) over this JSON field. Optional; without it,
+	// pulls fail auth and nodes stay unobserved until heartbeats.
+	NodeAdminAPIKey         string                        `json:"node_admin_api_key"`
+	ArtifactStoreCapacity   int                           `json:"artifact_store_capacity"`
+	ArtifactLookupNodeLimit int                           `json:"artifact_lookup_node_limit"`
+	Nodes                   []Node                        `json:"nodes"`
+	Discovery               SchedulerDiscoveryConfig      `json:"discovery"`
+	NodeResourceLimit       *NodeResourceLimit            `json:"node_resource_limit"`
+	LeaderElection          SchedulerLeaderElectionConfig `json:"leader_election"`
 }
 
 func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
@@ -79,11 +103,13 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		ReportTTL               json.RawMessage           `json:"report_ttl"`
 		BindingTTL              json.RawMessage           `json:"binding_ttl"`
 		RedisAddr               *string                   `json:"redis_addr"`
+		NodeAdminAPIKey         *string                   `json:"node_admin_api_key"`
 		ArtifactStoreCapacity   *int                      `json:"artifact_store_capacity"`
 		ArtifactLookupNodeLimit *int                      `json:"artifact_lookup_node_limit"`
 		Nodes                   *[]Node                   `json:"nodes"`
 		Discovery               *SchedulerDiscoveryConfig `json:"discovery"`
 		NodeResourceLimit       *NodeResourceLimit        `json:"node_resource_limit"`
+		LeaderElection          *leaderElectionWire       `json:"leader_election"`
 	}
 
 	parsed := wire{}
@@ -112,6 +138,9 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	if parsed.RedisAddr != nil {
 		s.RedisAddr = *parsed.RedisAddr
 	}
+	if parsed.NodeAdminAPIKey != nil {
+		s.NodeAdminAPIKey = *parsed.NodeAdminAPIKey
+	}
 	if parsed.ArtifactStoreCapacity != nil {
 		s.ArtifactStoreCapacity = *parsed.ArtifactStoreCapacity
 	}
@@ -134,7 +163,62 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		s.BindingTTL = d
 	}
 
+	if parsed.LeaderElection != nil {
+		le := parsed.LeaderElection
+		if le.Enabled != nil {
+			s.LeaderElection.Enabled = *le.Enabled
+		}
+		if le.LeaseName != nil {
+			s.LeaderElection.LeaseName = *le.LeaseName
+		}
+		if le.LeaseNamespace != nil {
+			s.LeaderElection.LeaseNamespace = *le.LeaseNamespace
+		}
+		if le.SnapshotPullConcurrency != nil {
+			if *le.SnapshotPullConcurrency <= 0 {
+				return fmt.Errorf("scheduler.leader_election.snapshot_pull_concurrency must be greater than zero, got %d", *le.SnapshotPullConcurrency)
+			}
+			s.LeaderElection.SnapshotPullConcurrency = *le.SnapshotPullConcurrency
+		}
+		durationFields := []struct {
+			raw   json.RawMessage
+			field string
+			dst   *time.Duration
+		}{
+			{le.LeaseDuration, "scheduler.leader_election.lease_duration", &s.LeaderElection.LeaseDuration},
+			{le.RenewDeadline, "scheduler.leader_election.renew_deadline", &s.LeaderElection.RenewDeadline},
+			{le.RetryPeriod, "scheduler.leader_election.retry_period", &s.LeaderElection.RetryPeriod},
+		}
+		for _, f := range durationFields {
+			if len(bytes.TrimSpace(f.raw)) == 0 {
+				continue
+			}
+			d, err := parseSchedulerDuration(f.raw, f.field)
+			if err != nil {
+				return err
+			}
+			// Defaults apply to omitted fields only; an explicitly provided
+			// non-positive duration is invalid, not a request for the default.
+			if d <= 0 {
+				return fmt.Errorf("%s must be greater than zero, got %q", f.field, d.String())
+			}
+			*f.dst = d
+		}
+	}
+
 	return nil
+}
+
+// leaderElectionWire is the JSON wire form of SchedulerLeaderElectionConfig;
+// durations arrive as strings and are parsed via parseSchedulerDuration.
+type leaderElectionWire struct {
+	Enabled                 *bool           `json:"enabled"`
+	LeaseName               *string         `json:"lease_name"`
+	LeaseNamespace          *string         `json:"lease_namespace"`
+	LeaseDuration           json.RawMessage `json:"lease_duration"`
+	RenewDeadline           json.RawMessage `json:"renew_deadline"`
+	RetryPeriod             json.RawMessage `json:"retry_period"`
+	SnapshotPullConcurrency *int            `json:"snapshot_pull_concurrency"`
 }
 
 func parseSchedulerDuration(raw json.RawMessage, field string) (time.Duration, error) {
@@ -320,6 +404,9 @@ func overrideWithEnv(cfg *Config) error {
 	set("SCHEDULER_METRICS_LISTEN_ADDR", &cfg.Scheduler.MetricsListenAddr)
 	set("SCHEDULER_STRATEGY", &cfg.Scheduler.Strategy)
 	set("SCHEDULER_REDIS_ADDR", &cfg.Scheduler.RedisAddr)
+	// The node admin API key is a credential: pass it via env/Secret (same
+	// agentenv-auth secret the nodes use), never via config files.
+	set("SCHEDULER_NODE_ADMIN_API_KEY", &cfg.Scheduler.NodeAdminAPIKey)
 	set("GATEWAY_HTTP_LISTEN_ADDR", &cfg.Gateway.HTTPListenAddr)
 	set("GATEWAY_METRICS_LISTEN_ADDR", &cfg.Gateway.MetricsListenAddr)
 	set("GATEWAY_SCHEDULER_ADDR", &cfg.Gateway.SchedulerAddr)
@@ -403,6 +490,27 @@ func (c *Config) applyDefaults() {
 	if strings.TrimSpace(c.Gateway.MetricsListenAddr) == "" {
 		c.Gateway.MetricsListenAddr = ":9102"
 	}
+	if c.Scheduler.LeaderElection.Enabled {
+		le := &c.Scheduler.LeaderElection
+		if strings.TrimSpace(le.LeaseName) == "" {
+			le.LeaseName = "agentenv-scheduler"
+		}
+		if strings.TrimSpace(le.LeaseNamespace) == "" {
+			le.LeaseNamespace = "agentenv-system"
+		}
+		if le.LeaseDuration <= 0 {
+			le.LeaseDuration = 15 * time.Second
+		}
+		if le.RenewDeadline <= 0 {
+			le.RenewDeadline = 10 * time.Second
+		}
+		if le.RetryPeriod <= 0 {
+			le.RetryPeriod = 2 * time.Second
+		}
+		if le.SnapshotPullConcurrency <= 0 {
+			le.SnapshotPullConcurrency = 4
+		}
+	}
 }
 
 func (c Config) Validate() error {
@@ -436,6 +544,9 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 		if c.Scheduler.BindingTTL <= 0 {
 			return errors.New("scheduler.binding_ttl must be greater than zero")
+		}
+		if c.Scheduler.LeaderElection.Enabled && schedulerQueryOnly {
+			return errors.New("scheduler.leader_election is mutually exclusive with --query-only")
 		}
 		if schedulerQueryOnly {
 			if strings.TrimSpace(c.Scheduler.RedisAddr) == "" {
@@ -472,6 +583,22 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 			}
 		default:
 			return errors.New("scheduler.discovery.mode must be one of static, kubernetes")
+		}
+		if c.Scheduler.LeaderElection.Enabled {
+			le := c.Scheduler.LeaderElection
+			if strings.TrimSpace(le.LeaseName) == "" {
+				return errors.New("scheduler.leader_election.lease_name is required")
+			}
+			if strings.TrimSpace(le.LeaseNamespace) == "" {
+				return errors.New("scheduler.leader_election.lease_namespace is required")
+			}
+			// client-go leaderelection timing constraints.
+			if le.LeaseDuration <= le.RenewDeadline {
+				return errors.New("scheduler.leader_election requires lease_duration > renew_deadline")
+			}
+			if le.RenewDeadline <= 2*le.RetryPeriod {
+				return errors.New("scheduler.leader_election requires renew_deadline > 2 * retry_period")
+			}
 		}
 	}
 	if c.Service == "gateway" {

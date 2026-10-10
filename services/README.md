@@ -108,6 +108,17 @@ General config notes:
 - `SCHEDULER_ARTIFACT_STORE_CAPACITY=<count>` overrides `scheduler.artifact_store_capacity` from the environment.
 - `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT=<count>` overrides `scheduler.artifact_lookup_node_limit` from the environment.
 
+### Leader election (HA)
+
+`scheduler.leader_election` enables Kubernetes Lease-based leader election (#259). Off by default; with it off, the scheduler behaves exactly as a single-writer process.
+
+- With it on, N replicas compete for a `coordination.k8s.io/Lease`. Exactly one leader schedules and processes heartbeats; standbys stay liveness-healthy, reject writes with `Unavailable`, and serve `LookupNode`/`GetNode` from the shared Redis bindings (reads are rejected too when no `redis_addr` is set, and clients retry onto the leader).
+- Readiness probes should target the leader-specific health service `scheduler.v1.Scheduler/leader` (`grpc_health_probe -service=scheduler.v1.Scheduler/leader`) so Service endpoints contain only the leader. Liveness keeps probing the overall health status.
+- Traffic rules: node heartbeats → scheduler Service (leader only); gateway writes (`Schedule`, `RecordAssignment`) → same Service; gateway reads (`LookupNode`) → same Service, answered by standbys when Redis is configured.
+- On failover, the new leader pulls each node's admin `/nodes` snapshot (sync-node-snapshots) instead of waiting for the next heartbeat; pulls authenticate with the `x-api-key` from `SCHEDULER_NODE_ADMIN_API_KEY` — pass it via env/Secret (the HA overlay mounts the shared `agentenv-auth` Secret), not via config files.
+- `redis_addr` is optional but recommended: without it, failover loses routing for pre-failover sandboxes (documented degraded mode). Under election the binding TTL is floored to `lease_duration + 90s` so bindings outlive the failover budget.
+- Mutually exclusive with `--query-only`. Ready-made manifests: `deploy/k8s/overlays/ha` (see its README for upgrade ordering).
+
 ### Scheduling strategy
 
 `scheduler.strategy` selects the algorithm used to pick a node from the eligible candidate list. Built-in strategies:

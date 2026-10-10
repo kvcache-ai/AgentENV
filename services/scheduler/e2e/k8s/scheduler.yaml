@@ -1,0 +1,130 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: agentenv-scheduler
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agentenv-scheduler
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agentenv-scheduler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: agentenv-scheduler
+subjects:
+  - kind: ServiceAccount
+    name: agentenv-scheduler
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scheduler-config
+data:
+  scheduler.json: |
+    {
+      "log_level": "info",
+      "log_format": "json",
+      "scheduler": {
+        "grpc_listen_addr": ":9090",
+        "metrics_listen_addr": ":9091",
+        "strategy": "round_robin",
+        "report_ttl": "10s",
+        "binding_ttl": "60s",
+        "discovery": {
+          "mode": "kubernetes",
+          "kubernetes": {
+            "namespace": "default",
+            "service_name": "agentenv-nodes",
+            "port": 8000,
+            "scheme": "http"
+          }
+        },
+        "leader_election": {
+          "enabled": true,
+          "lease_name": "agentenv-scheduler",
+          "lease_namespace": "default",
+          "lease_duration": "6s",
+          "renew_deadline": "4s",
+          "retry_period": "1s"
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentenv-scheduler
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: agentenv-scheduler
+  template:
+    metadata:
+      labels:
+        app: agentenv-scheduler
+    spec:
+      serviceAccountName: agentenv-scheduler
+      # Lets debug containers signal the scheduler process (T2 freezes the
+      # leader with SIGSTOP via an ephemeral busybox container).
+      shareProcessNamespace: true
+      containers:
+        - name: scheduler
+          image: agentenv-scheduler:e2e
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/config/scheduler.json"]
+          env:
+            - name: SCHEDULER_REDIS_ADDR
+              value: redis:6379
+            - name: SCHEDULER_NODE_ADMIN_API_KEY
+              value: e2e-admin-key
+          ports:
+            - name: grpc
+              containerPort: 9090
+          readinessProbe:
+            exec:
+              command:
+                - /grpc_health_probe
+                - -addr=127.0.0.1:9090
+                - -service=scheduler.v1.Scheduler/leader
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          livenessProbe:
+            exec:
+              command:
+                - /grpc_health_probe
+                - -addr=127.0.0.1:9090
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /config/scheduler.json
+              subPath: scheduler.json
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: scheduler-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentenv-scheduler
+spec:
+  selector:
+    app: agentenv-scheduler
+  ports:
+    - port: 9090
+      targetPort: 9090

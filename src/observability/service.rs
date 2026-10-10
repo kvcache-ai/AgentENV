@@ -28,6 +28,7 @@ pub struct ObservabilityService {
     host_metrics: HostMetricsCollector,
     pending_cpu_config: Arc<Mutex<Option<String>>>,
     cluster_cpu_config: Arc<RwLock<Option<String>>>,
+    p2p_endpoint: Option<crate::p2p::P2pEndpoint>,
 }
 
 impl ObservabilityService {
@@ -36,6 +37,7 @@ impl ObservabilityService {
         orchestrator: Arc<Orchestrator>,
         cpu_template_helper: Option<PathBuf>,
         cluster_cpu_arc: Arc<RwLock<Option<String>>>,
+        p2p_endpoint: Option<crate::p2p::P2pEndpoint>,
     ) -> Self {
         let machine_info = detect_machine_info();
         let host_metrics = HostMetricsCollector::new();
@@ -51,6 +53,7 @@ impl ObservabilityService {
             host_metrics,
             pending_cpu_config: Arc::new(Mutex::new(cpu_config_json)),
             cluster_cpu_config: cluster_cpu_arc,
+            p2p_endpoint,
         }
     }
 
@@ -95,6 +98,7 @@ impl ObservabilityService {
             create_fails: runtime.create_fails,
             sandbox_starting_count: runtime.starting_sandbox_count,
             paused_sandbox_count: runtime.paused_sandbox_count,
+            p2p_endpoint: self.p2p_endpoint.clone(),
         })
     }
 

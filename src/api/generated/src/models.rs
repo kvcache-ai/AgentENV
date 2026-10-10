@@ -2610,6 +2610,12 @@ pub struct MachineInfo {
     #[serde(rename = "cpuArchitecture")]
     #[validate(custom(function = "check_xss_string"))]
     pub cpu_architecture: String,
+
+    /// Cluster-level CPU configuration assigned by the scheduler; empty until the node reports one
+    #[serde(rename = "cpuConfigJSON")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_config_json: Option<String>,
 }
 
 impl MachineInfo {
@@ -2625,6 +2631,7 @@ impl MachineInfo {
             cpu_model,
             cpu_model_name,
             cpu_architecture,
+            cpu_config_json: None,
         }
     }
 }
@@ -2643,6 +2650,9 @@ impl std::fmt::Display for MachineInfo {
             Some(self.cpu_model_name.to_string()),
             Some("cpuArchitecture".to_string()),
             Some(self.cpu_architecture.to_string()),
+            self.cpu_config_json.as_ref().map(|cpu_config_json| {
+                ["cpuConfigJSON".to_string(), cpu_config_json.to_string()].join(",")
+            }),
         ];
 
         write!(
@@ -2668,6 +2678,7 @@ impl std::str::FromStr for MachineInfo {
             pub cpu_model: Vec<String>,
             pub cpu_model_name: Vec<String>,
             pub cpu_architecture: Vec<String>,
+            pub cpu_config_json: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -2705,6 +2716,10 @@ impl std::str::FromStr for MachineInfo {
                     "cpuArchitecture" => intermediate_rep.cpu_architecture.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "cpuConfigJSON" => intermediate_rep.cpu_config_json.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing MachineInfo".to_string(),
@@ -2739,6 +2754,7 @@ impl std::str::FromStr for MachineInfo {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "cpuArchitecture missing in MachineInfo".to_string())?,
+            cpu_config_json: intermediate_rep.cpu_config_json.into_iter().next(),
         })
     }
 }
@@ -4151,6 +4167,17 @@ pub struct Node {
     #[validate(nested)]
     pub machine_info: models::MachineInfo,
 
+    /// IDs of all tracked sandboxes on the node, including paused sandboxes and template builds
+    #[serde(rename = "sandboxIDs")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_ids: Option<Vec<String>>,
+
+    #[serde(rename = "p2pEndpoint")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub p2p_endpoint: Option<models::P2pEndpoint>,
+
     #[serde(rename = "status")]
     #[validate(nested)]
     pub status: models::NodeStatus,
@@ -4204,6 +4231,8 @@ impl Node {
             service_instance_id,
             cluster_id,
             machine_info,
+            sandbox_ids: None,
+            p2p_endpoint: None,
             status,
             sandbox_count,
             metrics,
@@ -4232,6 +4261,18 @@ impl std::fmt::Display for Node {
             Some("clusterID".to_string()),
             Some(self.cluster_id.to_string()),
             // Skipping machineInfo in query parameter serialization
+            self.sandbox_ids.as_ref().map(|sandbox_ids| {
+                [
+                    "sandboxIDs".to_string(),
+                    sandbox_ids
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ]
+                .join(",")
+            }),
+            // Skipping p2pEndpoint in query parameter serialization
 
             // Skipping status in query parameter serialization
             Some("sandboxCount".to_string()),
@@ -4272,6 +4313,8 @@ impl std::str::FromStr for Node {
             pub service_instance_id: Vec<String>,
             pub cluster_id: Vec<String>,
             pub machine_info: Vec<models::MachineInfo>,
+            pub sandbox_ids: Vec<Vec<String>>,
+            pub p2p_endpoint: Vec<models::P2pEndpoint>,
             pub status: Vec<models::NodeStatus>,
             pub sandbox_count: Vec<u32>,
             pub metrics: Vec<models::NodeMetrics>,
@@ -4291,9 +4334,7 @@ impl std::str::FromStr for Node {
             let val = match string_iter.next() {
                 Some(x) => x,
                 None => {
-                    return std::result::Result::Err(
-                        "Missing value while parsing Node".to_string(),
-                    );
+                    return std::result::Result::Err("Missing value while parsing Node".to_string());
                 }
             };
 
@@ -4323,6 +4364,17 @@ impl std::str::FromStr for Node {
                     #[allow(clippy::redundant_clone)]
                     "machineInfo" => intermediate_rep.machine_info.push(
                         <models::MachineInfo as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    "sandboxIDs" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in Node"
+                                .to_string(),
+                        );
+                    }
+                    #[allow(clippy::redundant_clone)]
+                    "p2pEndpoint" => intermediate_rep.p2p_endpoint.push(
+                        <models::P2pEndpoint as std::str::FromStr>::from_str(val)
                             .map_err(|x| x.to_string())?,
                     ),
                     #[allow(clippy::redundant_clone)]
@@ -4399,6 +4451,8 @@ impl std::str::FromStr for Node {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "machineInfo missing in Node".to_string())?,
+            sandbox_ids: intermediate_rep.sandbox_ids.into_iter().next(),
+            p2p_endpoint: intermediate_rep.p2p_endpoint.into_iter().next(),
             status: intermediate_rep
                 .status
                 .into_iter()
@@ -5201,6 +5255,159 @@ impl std::str::FromStr for OrderDirection {
             "asc" => std::result::Result::Ok(OrderDirection::Asc),
             "desc" => std::result::Result::Ok(OrderDirection::Desc),
             _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct P2pEndpoint {
+    /// Transport backend that understands the address (e.g. iroh)
+    #[serde(rename = "backend")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub backend: String,
+
+    /// Backend-specific serialized endpoint address
+    #[serde(rename = "address")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub address: String,
+}
+
+impl P2pEndpoint {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(backend: String, address: String) -> P2pEndpoint {
+        P2pEndpoint { backend, address }
+    }
+}
+
+/// Converts the P2pEndpoint value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for P2pEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("backend".to_string()),
+            Some(self.backend.to_string()),
+            Some("address".to_string()),
+            Some(self.address.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a P2pEndpoint value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for P2pEndpoint {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub backend: Vec<String>,
+            pub address: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing P2pEndpoint".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "backend" => intermediate_rep.backend.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "address" => intermediate_rep.address.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing P2pEndpoint".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(P2pEndpoint {
+            backend: intermediate_rep
+                .backend
+                .into_iter()
+                .next()
+                .ok_or_else(|| "backend missing in P2pEndpoint".to_string())?,
+            address: intermediate_rep
+                .address
+                .into_iter()
+                .next()
+                .ok_or_else(|| "address missing in P2pEndpoint".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<P2pEndpoint> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<P2pEndpoint>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<P2pEndpoint>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for P2pEndpoint - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<P2pEndpoint> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <P2pEndpoint as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into P2pEndpoint - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
         }
     }
 }

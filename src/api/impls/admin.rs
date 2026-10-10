@@ -10,12 +10,14 @@ use super::ApiImpl;
 
 impl From<MachineInfo> for models::MachineInfo {
     fn from(machine_info: MachineInfo) -> Self {
-        models::MachineInfo::new(
+        let mut out = models::MachineInfo::new(
             machine_info.cpu_family,
             machine_info.cpu_model,
             machine_info.cpu_model_name,
             machine_info.cpu_architecture,
-        )
+        );
+        out.cpu_config_json = machine_info.cpu_config_json;
+        out
     }
 }
 
@@ -53,7 +55,7 @@ impl From<NodeMetricsSnapshot> for models::NodeMetrics {
 
 impl From<NodeSnapshot> for models::Node {
     fn from(node: NodeSnapshot) -> Self {
-        models::Node::new(
+        let mut out = models::Node::new(
             node.version,
             node.commit,
             node.node_id,
@@ -67,7 +69,12 @@ impl From<NodeSnapshot> for models::Node {
             node.create_fails,
             node.sandbox_starting_count,
             node.paused_sandbox_count,
-        )
+        );
+        out.sandbox_ids = Some(node.sandbox_ids.iter().map(|id| id.to_string()).collect());
+        out.p2p_endpoint = node
+            .p2p_endpoint
+            .map(|ep| models::P2pEndpoint::new(ep.backend, ep.address));
+        out
     }
 }
 
