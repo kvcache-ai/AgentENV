@@ -145,7 +145,10 @@ impl FirecrackerInstance {
         Ok(())
     }
 
-    /// Waits for the Firecracker API socket to become available.
+    /// Waits for the Firecracker API socket to accept connections.
+    ///
+    /// The socket path appears at `bind()`, before Firecracker calls
+    /// `listen()`; connecting in that window fails with `ECONNREFUSED`.
     pub async fn wait_for_ready(
         &mut self,
         timeout: Duration,
@@ -158,14 +161,17 @@ impl FirecrackerInstance {
             "waiting for firecracker api socket"
         );
         let start = Instant::now();
-        while !self.socket_path.exists() {
+        while tokio::net::UnixStream::connect(&self.socket_path)
+            .await
+            .is_err()
+        {
             if let Some(process) = self.process.as_mut() {
                 if let Some(status) = process
                     .try_wait()
                     .context("check firecracker process status")?
                 {
                     bail!(
-                        "firecracker exited before its API socket appeared at {} (status: {status}); stderr: {}",
+                        "firecracker exited before its API socket accepted connections at {} (status: {status}); stderr: {}",
                         self.socket_path.display(),
                         self.stderr_summary()
                     );
@@ -173,7 +179,7 @@ impl FirecrackerInstance {
             }
             if start.elapsed() > timeout {
                 bail!(
-                    "firecracker api socket did not appear at {} within {} ms; stderr: {}",
+                    "firecracker api socket did not accept connections at {} within {} ms; stderr: {}",
                     self.socket_path.display(),
                     timeout.as_millis(),
                     self.stderr_summary()
@@ -635,23 +641,39 @@ mod tests {
             .await
             .expect_err("missing socket should time out");
 
-        assert!(err.to_string().contains("did not appear"));
+        assert!(err.to_string().contains("did not accept connections"));
     }
 
     #[tokio::test]
-    async fn wait_for_ready_succeeds_when_socket_file_appears() -> Result<()> {
+    async fn wait_for_ready_waits_for_listening_socket() -> Result<()> {
+        let temp = tempdir()?;
+        let mut instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        // A path that exists but refuses connections is not ready.
+        fs::write(&instance.socket_path, b"not a socket")?;
+
+        let err = instance
+            .wait_for_ready(Duration::from_millis(30), Duration::from_millis(10))
+            .await
+            .expect_err("non-listening socket path should time out");
+        assert!(err.to_string().contains("did not accept connections"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wait_for_ready_succeeds_when_socket_listens() -> Result<()> {
         let temp = tempdir()?;
         let mut instance = FirecrackerInstance::new(temp.path().to_path_buf());
         let socket_path = instance.socket_path.clone();
 
-        tokio::spawn(async move {
+        let listener = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            fs::write(&socket_path, b"socket").expect("create socket marker");
+            tokio::net::UnixListener::bind(&socket_path).expect("bind socket")
         });
 
         instance
-            .wait_for_ready(Duration::from_millis(100), Duration::from_millis(10))
+            .wait_for_ready(Duration::from_millis(1000), Duration::from_millis(10))
             .await?;
+        drop(listener.await?);
         Ok(())
     }
 

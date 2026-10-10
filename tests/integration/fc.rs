@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{
-    BaseSandboxNetworkPolicy, FirecrackerSandbox, FirecrackerSnapshotConfig, SandboxBackend,
-    SandboxExecutor, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+    BaseSandboxNetworkPolicy, FirecrackerSandbox, FirecrackerSnapshotConfig, ProcessOutput,
+    SandboxBackend, SandboxExecutor, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
 };
 use anyhow::{bail, Context, Result};
 use overlaybd::backend::local::LocalFile;
@@ -623,13 +623,40 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
     Ok(())
 }
 
+/// Runs a connectivity probe, retrying expected successes so transient public
+/// DNS or upstream failures do not fail policy assertions. Expected failures
+/// run once: a retry cannot turn a correctly blocked connection into a pass.
+async fn run_connectivity_probe(
+    sandbox: &mut FirecrackerSandbox,
+    cmd: &str,
+    args: &[&str],
+    should_succeed: bool,
+) -> Result<ProcessOutput> {
+    const ATTEMPTS: usize = 3;
+    let mut attempt = 1;
+    loop {
+        let output = sandbox.run_command(cmd, args).await?;
+        if output.exit_code == 0 || !should_succeed || attempt == ATTEMPTS {
+            return Ok(output);
+        }
+        tracing::warn!(
+            attempt,
+            exit_code = output.exit_code,
+            stderr = %output.stderr,
+            "connectivity probe failed; retrying"
+        );
+        attempt += 1;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 async fn assert_tcp_connect(
     sandbox: &mut FirecrackerSandbox,
     destination: &str,
     should_succeed: bool,
 ) -> Result<()> {
     let cmd = format!("timeout 5 bash -lc ': </dev/tcp/{destination}'");
-    let output = sandbox.run_command("bash", &["-lc", &cmd]).await?;
+    let output = run_connectivity_probe(sandbox, "bash", &["-lc", &cmd], should_succeed).await?;
     assert_eq!(
         output.exit_code == 0,
         should_succeed,
@@ -646,25 +673,26 @@ async fn assert_curl(
     url: &str,
     should_succeed: bool,
 ) -> Result<()> {
-    let output = sandbox
-        .run_command(
-            "curl",
-            &[
-                "--noproxy",
-                "*",
-                "-4",
-                "-sS",
-                "--connect-timeout",
-                "5",
-                "--max-time",
-                "10",
-                "-o",
-                "/dev/null",
-                "--",
-                url,
-            ],
-        )
-        .await?;
+    let output = run_connectivity_probe(
+        sandbox,
+        "curl",
+        &[
+            "--noproxy",
+            "*",
+            "-4",
+            "-sS",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "10",
+            "-o",
+            "/dev/null",
+            "--",
+            url,
+        ],
+        should_succeed,
+    )
+    .await?;
     assert_eq!(
         output.exit_code == 0,
         should_succeed,
