@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-41174ef2.js";
+            window.path_to_searchindex_js = "../searchindex-46080746.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-d7504e7d.js"></script>
@@ -399,6 +399,7 @@ eviction.</p>
 </thead>
 <tbody>
 <tr><td><code>max_size_gb</code></td><td>integer</td><td><code>100</code></td><td>Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd <code>cacheConfig.cacheSizeGB</code></td></tr>
+<tr><td><code>open_evict_idle_secs</code></td><td>integer</td><td><code>600</code></td><td>Idle age in seconds after which a cache entry held open by a running sandbox may have its cached blocks reclaimed under capacity pressure. The entry is kept and refills on demand; <code>0</code> disables open-entry eviction. Written to generated overlaybd <code>cacheConfig.openEvictIdleSecs</code> and applies to both <code>remote-blocks</code> and <code>memory-blocks</code> caches</td></tr>
 </tbody>
 </table>
 </div>
