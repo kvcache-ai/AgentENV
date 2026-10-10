@@ -32,3 +32,9 @@ jobs:
           llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
           llm_model: ${{ secrets.OCR_LLM_MODEL }}
           llm_use_anthropic: ${{ vars.OCR_LLM_USE_ANTHROPIC || 'false' }}
+          # The action's default extra_body disables thinking, which
+          # OpenAI-compatible endpoints translate to reasoning_effort "none";
+          # models such as gpt-6.1-sol reject it. Request an explicit effort
+          # instead (OpenAI-compatible protocols only).
+          llm_extra_body: '{}'
+          llm_reasoning_effort: medium
