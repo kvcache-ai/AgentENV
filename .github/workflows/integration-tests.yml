@@ -115,9 +115,11 @@ jobs:
       - name: Install e2b Python SDK
         run: python3 -m pip install --upgrade e2b e2b-code-interpreter
       - name: Prepare BuildKit test client
-        run: |
-          make build-aenv
-          bash scripts/buildkit/install-buildctl.sh "$RUNNER_TEMP/buildkit"
+        run: make build-aenv
+      - name: Install BuildKit test client
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: bash scripts/buildkit/install-buildctl.sh "$RUNNER_TEMP/buildkit"
       - name: Single-node E2E tests
         if: ${{ matrix.e2e_name == 'single-node' }}
         env:

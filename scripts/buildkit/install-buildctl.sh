@@ -22,7 +22,11 @@ asset="buildkit-${version}.${platform}.tar.gz"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-curl -fsSL --retry 5 "https://api.github.com/repos/moby/buildkit/releases/tags/$version" -o "$work/release.json"
+# Unauthenticated API calls share a 60/hour per-IP limit on CI runners. Pass
+# the token on stdin so it stays out of the process list.
+printf '%s\n' "${GITHUB_TOKEN:+Authorization: Bearer $GITHUB_TOKEN}" |
+    curl -fsSL --retry 5 -H @- \
+        "https://api.github.com/repos/moby/buildkit/releases/tags/$version" -o "$work/release.json"
 asset_json=$(jq -cer --arg asset "$asset" \
     '[.assets[] | select(.name == $asset)] |
      if length == 1 then .[0] else error("BuildKit asset not found or not unique") end' "$work/release.json")
