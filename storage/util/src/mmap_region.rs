@@ -4,7 +4,7 @@
 //! descriptors, and [`MMapRegionSlice`] for zero-copy sub-slices that keep
 //! the underlying mapping alive via reference counting.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, ensure, Context, Result};
 use nix::sys::mman::{MapFlags, ProtFlags};
 use std::os::fd::AsFd;
 use std::sync::Arc;
@@ -25,11 +25,13 @@ pub struct MMapRegion {
 struct MMapRegionInner {
     addr: std::ptr::NonNull<u8>,
     length: usize,
+    on_unmap: Option<Box<dyn FnOnce() + Send + Sync + 'static>>,
 }
 
 // Safety: the mmap'd region is process-wide memory accessible from any thread.
 // Synchronisation of concurrent writes is the caller's responsibility (e.g. the
 // acquire/finish refill pattern guarantees at most one writer per block).
+// The callback is Send + Sync and runs only during exclusive destruction.
 unsafe impl Send for MMapRegionInner {}
 unsafe impl Sync for MMapRegionInner {}
 
@@ -76,8 +78,24 @@ impl MMapRegion {
             inner: Arc::new(MMapRegionInner {
                 addr: addr.cast::<u8>(),
                 length: len,
+                on_unmap: None,
             }),
         })
+    }
+
+    /// Register a callback to run once, after the last reference is dropped
+    /// and the mapping is successfully unmapped. The callback runs on the
+    /// thread that drops the last reference; it must not block or panic.
+    ///
+    /// # Errors
+    /// Returns an error if the mapping is shared by another region or slice,
+    /// or if a callback is already registered. An existing callback is kept.
+    pub fn on_unmap(&mut self, callback: impl FnOnce() + Send + Sync + 'static) -> Result<()> {
+        let inner = Arc::get_mut(&mut self.inner)
+            .context("cannot register on_unmap while the mapping is shared")?;
+        ensure!(inner.on_unmap.is_none(), "on_unmap is already registered");
+        inner.on_unmap = Some(Box::new(callback));
+        Ok(())
     }
 
     /// Return the total length of the mapped region in bytes.
@@ -149,6 +167,10 @@ impl Drop for MMapRegionInner {
     fn drop(&mut self) {
         if let Err(err) = unsafe { nix::sys::mman::munmap(self.addr.cast(), self.length) } {
             tracing::error!(?err, "munmap failed when dropping MMapRegionInner");
+            return;
+        }
+        if let Some(callback) = self.on_unmap.take() {
+            callback();
         }
     }
 }
@@ -157,6 +179,7 @@ impl Drop for MMapRegionInner {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn test_mmap_basic_read_write() {
@@ -185,6 +208,94 @@ mod tests {
 
         let slice = region.subslice(0, 5).unwrap();
         assert_eq!(slice.as_ref(), b"HELLO");
+    }
+
+    #[test]
+    fn test_on_unmap_runs_once_after_last_reference() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(4096).unwrap();
+        let mut region = MMapRegion::from_fd(&file, 0, 4096).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        let owned = String::from("consumed by FnOnce");
+        region
+            .on_unmap(move || {
+                drop(owned);
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        let clone = region.clone();
+        let slice = region.subslice(0, 1).unwrap();
+        drop(region);
+        drop(clone);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // A slice can keep the mapping alive and release it on another thread.
+        std::thread::spawn(move || drop(slice)).join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_on_unmap_requires_exclusive_ownership() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(4096).unwrap();
+        let mut region = MMapRegion::from_fd(&file, 0, 4096).unwrap();
+        let clone = region.clone();
+        assert!(region.on_unmap(|| panic!("rejected callback ran")).is_err());
+        drop(clone);
+        let slice = region.subslice(0, 1).unwrap();
+        assert!(region.on_unmap(|| panic!("rejected callback ran")).is_err());
+        drop(slice);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        region
+            .on_unmap(move || {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        drop(region);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_on_unmap_rejects_replacement() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(4096).unwrap();
+        let mut region = MMapRegion::from_fd(&file, 0, 4096).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        region
+            .on_unmap(move || {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        assert!(region
+            .on_unmap(|| panic!("replacement callback ran"))
+            .is_err());
+        drop(region);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_on_unmap_does_not_run_when_munmap_fails() {
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(4096).unwrap();
+        let mut region = MMapRegion::from_fd(&file, 0, 4096).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = calls.clone();
+        region
+            .on_unmap(move || {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+            })
+            .unwrap();
+        let addr = region.inner.addr;
+        let len = region.len();
+        // Force EINVAL in Drop without unmapping the region prematurely.
+        Arc::get_mut(&mut region.inner).unwrap().length = 0;
+        drop(region);
+        // SAFETY: the failed zero-length munmap left this original mapping live.
+        unsafe { nix::sys::mman::munmap(addr.cast(), len) }.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

@@ -33,6 +33,7 @@ const DEFAULT_CACHE_DIR: &str = "/opt/overlaybd/registry_cache";
 const PAGE_SIZE: u64 = 4096;
 const DEFAULT_BLOCK_SIZE: u64 = 256 * 1024;
 const DEFAULT_CAPACITY_BYTES: u64 = 4 * GIB;
+const DEFAULT_MMAP_CAPACITY_BYTES: u64 = 32 * 1024 * GIB;
 const DEFAULT_DISK_AVAIL_BYTES: u64 = 128 * 1024 * 1024;
 const DATA_FILE_NAME: &str = "data";
 const META_FILE_NAME: &str = "meta.bin";
