@@ -6,6 +6,7 @@ use agentenv::sandbox::{
 use anyhow::{Context, Result};
 use criterion::{Criterion, SamplingMode, Throughput};
 use overlaybd::config::UpperMode;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -25,6 +26,8 @@ const DEFAULT_SAMPLE_COUNT: usize = 10;
 const DEFAULT_CLEANUP_SETTLE_TIME: Duration = Duration::from_millis(25);
 const FULL_CLEANUP_SETTLE_TIME: Duration = Duration::from_millis(500);
 const CONCURRENCY: usize = 50;
+// Keep the automatic batch no larger than the existing concurrent-resume benchmark.
+const MAX_AUTO_THROUGHPUT_CONCURRENCY: usize = CONCURRENCY;
 const BENCH_CONCURRENCY_ENV: &str = "AENV_BENCH_CONCURRENCY";
 const FULL_THROUGHPUT_MEASUREMENT_TIME: Duration = Duration::from_secs(30);
 const HEAVY_DATA_SIZE_MIB: u32 = 1024;
@@ -65,6 +68,7 @@ fn throughput_concurrency() -> Result<usize> {
             .context("determine available CPU parallelism for throughput benchmark")?
             .get()
             .checked_mul(2)
+            .map(|concurrency| concurrency.min(MAX_AUTO_THROUGHPUT_CONCURRENCY))
             .context("default throughput concurrency overflowed"),
         Err(err) => Err(err).context(format!("read {BENCH_CONCURRENCY_ENV}")),
     }
@@ -715,9 +719,20 @@ fn stop_batch(rt: &Runtime, sandboxes: Vec<FirecrackerSandbox>) -> Result<()> {
         return Ok(());
     }
     let mut first_error = None;
+    let mut failed = Vec::new();
     for mut sandbox in sandboxes {
         if let Err(error) = rt.block_on(sandbox.stop()) {
             first_error.get_or_insert(error);
+            failed.push(sandbox);
+        }
+    }
+    // A failed stop retains its device handles; retry before dropping the sandbox.
+    if !failed.is_empty() {
+        rt.block_on(async { tokio::time::sleep(cleanup_settle_time()).await });
+        for mut sandbox in failed {
+            if let Err(error) = rt.block_on(sandbox.stop()) {
+                eprintln!("Retrying benchmark sandbox cleanup failed: {error:#}");
+            }
         }
     }
     rt.block_on(async { tokio::time::sleep(cleanup_settle_time()).await });
@@ -733,7 +748,11 @@ fn prepare_running_batch(rt: &Runtime, concurrency: usize) -> Result<Vec<Firecra
         match rt.block_on(setup_sandbox()) {
             Ok(sandbox) => sandboxes.push(sandbox),
             Err(error) => {
-                stop_batch(rt, sandboxes)?;
+                if let Err(cleanup_error) = stop_batch(rt, sandboxes) {
+                    return Err(error).context(format!(
+                        "prepare running sandbox batch; cleanup also failed: {cleanup_error:#}"
+                    ));
+                }
                 return Err(error).context("prepare running sandbox batch");
             }
         }
@@ -766,7 +785,7 @@ where
         .map(|mut sandbox| {
             let handle = rt.handle().clone();
             move || {
-                let result = operation(&handle, &mut sandbox);
+                let result = catch_unwind(AssertUnwindSafe(|| operation(&handle, &mut sandbox)));
                 (sandbox, result)
             }
         })
@@ -778,13 +797,17 @@ where
     let mut first_error = None;
     for result in results {
         match result {
-            Ok((sandbox, Ok(artifact))) => {
+            Ok((sandbox, Ok(Ok(artifact)))) => {
                 sandboxes.push(sandbox);
                 artifacts.push(artifact);
             }
-            Ok((sandbox, Err(error))) => {
+            Ok((sandbox, Ok(Err(error)))) => {
                 sandboxes.push(sandbox);
                 first_error.get_or_insert(error);
+            }
+            Ok((sandbox, Err(_))) => {
+                sandboxes.push(sandbox);
+                first_error.get_or_insert_with(|| anyhow::anyhow!("benchmark worker panicked"));
             }
             Err(_) => {
                 first_error.get_or_insert_with(|| anyhow::anyhow!("benchmark worker panicked"));
@@ -793,10 +816,15 @@ where
     }
     let cleanup = stop_batch(rt, sandboxes);
     drop(artifacts);
-    cleanup?;
     if let Some(error) = first_error {
+        if let Err(cleanup_error) = cleanup {
+            return Err(error).context(format!(
+                "running sandbox batch failed; cleanup also failed: {cleanup_error:#}"
+            ));
+        }
         return Err(error).context("running sandbox batch failed");
     }
+    cleanup?;
     Ok(elapsed)
 }
 
@@ -827,10 +855,16 @@ fn run_resume_batch(
             }
         }
     }
-    stop_batch(rt, sandboxes)?;
+    let cleanup = stop_batch(rt, sandboxes);
     if let Some(error) = first_error {
+        if let Err(cleanup_error) = cleanup {
+            return Err(error).context(format!(
+                "concurrent resume batch failed; cleanup also failed: {cleanup_error:#}"
+            ));
+        }
         return Err(error).context("concurrent resume batch failed");
     }
+    cleanup?;
     Ok(elapsed)
 }
 
@@ -865,14 +899,19 @@ fn bench_snapshot_throughput(c: &mut Criterion) {
     let mut warm_sandbox = rt
         .block_on(FirecrackerSandbox::resume_from_snapshot_config(&snapshot))
         .expect("warm resume snapshot");
-    group.bench_function("concurrent_resume_throughput", |b| {
-        b.iter_custom(|iters| {
-            (0..iters)
-                .map(|_| run_resume_batch(&rt, &snapshot, concurrency).expect("resume batch"))
-                .sum()
+    let resume_result = catch_unwind(AssertUnwindSafe(|| {
+        group.bench_function("concurrent_resume_throughput", |b| {
+            b.iter_custom(|iters| {
+                (0..iters)
+                    .map(|_| run_resume_batch(&rt, &snapshot, concurrency).expect("resume batch"))
+                    .sum()
+            });
         });
-    });
+    }));
     rt.block_on(warm_sandbox.stop()).expect("stop warm sandbox");
+    if let Err(panic) = resume_result {
+        resume_unwind(panic);
+    }
 
     group.bench_function("concurrent_snapshot_capture_throughput", |b| {
         b.iter_custom(|iters| {
@@ -921,33 +960,43 @@ fn run_default_snapshot_benchmarks() -> Result<()> {
     ran |= run_default_benchmark("concurrent_resume", &filters, || {
         default_concurrent_resume(&rt)
     });
-    let concurrency = throughput_concurrency()?;
-    ran |= run_default_throughput_benchmark(
+    let throughput_names = [
         "concurrent_resume_throughput",
-        &filters,
-        concurrency,
-        || default_resume_throughput(&rt, concurrency),
-    )?;
-    ran |= run_default_throughput_benchmark(
         "concurrent_snapshot_capture_throughput",
-        &filters,
-        concurrency,
-        || {
-            default_throughput_samples(|| {
-                run_running_batch(&rt, concurrency, capture_running_sandbox)
-            })
-        },
-    )?;
-    ran |= run_default_throughput_benchmark(
         "concurrent_pause_throughput",
-        &filters,
-        concurrency,
-        || {
-            default_throughput_samples(|| {
-                run_running_batch(&rt, concurrency, pause_running_sandbox)
-            })
-        },
-    )?;
+    ];
+    if throughput_names
+        .iter()
+        .any(|name| should_run(name, &filters))
+    {
+        let concurrency = throughput_concurrency()?;
+        ran |= run_default_throughput_benchmark(
+            "concurrent_resume_throughput",
+            &filters,
+            concurrency,
+            || default_resume_throughput(&rt, concurrency),
+        )?;
+        ran |= run_default_throughput_benchmark(
+            "concurrent_snapshot_capture_throughput",
+            &filters,
+            concurrency,
+            || {
+                default_throughput_samples(|| {
+                    run_running_batch(&rt, concurrency, capture_running_sandbox)
+                })
+            },
+        )?;
+        ran |= run_default_throughput_benchmark(
+            "concurrent_pause_throughput",
+            &filters,
+            concurrency,
+            || {
+                default_throughput_samples(|| {
+                    run_running_batch(&rt, concurrency, pause_running_sandbox)
+                })
+            },
+        )?;
+    }
 
     if !ran {
         eprintln!(
