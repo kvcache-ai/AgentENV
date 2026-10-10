@@ -2,10 +2,14 @@ use std::collections::HashMap;
 
 use anyhow::{bail, ensure, Context, Result};
 use envd::http_client::apis::files_api;
-use shell_util::shell_quote;
 
 use super::EnvdInstance;
 use crate::sandbox::{Executor, ProcessOpts};
+
+const BUSYBOX: &str = "/agentenv/bin/busybox";
+/// Locked passwd append. It ships with the server rather than the tools drive
+/// so it also applies to sandboxes on older, immutable tools releases.
+const ADD_PASSWD_ENTRY: &str = include_str!("add_passwd_entry.sh");
 
 pub(super) fn needs_resolution(user: &str) -> bool {
     user.contains(':') || is_numeric(user)
@@ -30,12 +34,19 @@ impl EnvdInstance {
         if let Some(entry) = resolved.passwd_entry {
             // envd requires a name even when Docker permits a UID without an
             // account. Add an identity without changing existing accounts.
-            let script = format!("printf '\\n%s\\n' {} >> /etc/passwd", shell_quote(&entry));
             let output = Executor::new(self.clone())
                 .with_root_user()
                 .run_command_with_opts(
-                    "/agentenv/bin/busybox",
-                    &["sh", "-c", &script],
+                    BUSYBOX,
+                    &[
+                        "sh",
+                        "-c",
+                        ADD_PASSWD_ENTRY,
+                        "sh",
+                        BUSYBOX,
+                        "/etc/passwd",
+                        &entry,
+                    ],
                     &ProcessOpts::default()
                         .with_cwd("/")
                         .with_timeout(std::time::Duration::from_secs(10)),
@@ -199,6 +210,130 @@ fn resolve_user(user: &str, passwd: &[u8], groups: &[u8]) -> Result<ResolvedUser
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::process::{Command, Output};
+    use std::time::{Duration, Instant};
+
+    /// Runs the guest script on the host; `env` stands in for BusyBox applets.
+    fn add_passwd_entry(passwd: &Path, entry: &str) -> Output {
+        Command::new("sh")
+            .args(["-c", ADD_PASSWD_ENTRY, "sh", "env"])
+            .arg(passwd)
+            .arg(entry)
+            .output()
+            .expect("run add_passwd_entry.sh")
+    }
+
+    fn assert_added(output: &Output) {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn passwd_append_is_idempotent_and_releases_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwd = dir.path().join("passwd");
+        // A missing trailing newline must not merge records.
+        std::fs::write(&passwd, "root:x:0:0::/root:/bin/sh").unwrap();
+        let entry = "aenv-1-2:x:1:2::/:/bin/sh";
+
+        assert_added(&add_passwd_entry(&passwd, entry));
+        assert_added(&add_passwd_entry(&passwd, entry));
+
+        let contents = std::fs::read_to_string(&passwd).unwrap();
+        assert_eq!(contents.lines().filter(|line| *line == entry).count(), 1);
+        assert!(contents
+            .lines()
+            .any(|line| line == "root:x:0:0::/root:/bin/sh"));
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["passwd"], "lock or temporary files left behind");
+    }
+
+    #[test]
+    fn passwd_append_reclaims_a_lock_whose_owner_exited() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwd = dir.path().join("passwd");
+        std::fs::write(&passwd, "root:x:0:0::/root:/bin/sh\n").unwrap();
+        let mut exited = Command::new("true").spawn().unwrap();
+        exited.wait().unwrap();
+        std::fs::write(dir.path().join("passwd.lock"), exited.id().to_string()).unwrap();
+
+        assert_added(&add_passwd_entry(&passwd, "aenv-1-0:x:1:0::/:/bin/sh"));
+        assert!(!dir.path().join("passwd.lock").exists());
+    }
+
+    #[test]
+    fn passwd_append_waits_for_a_live_lock_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwd = dir.path().join("passwd");
+        let lock = dir.path().join("passwd.lock");
+        std::fs::write(&passwd, "root:x:0:0::/root:/bin/sh\n").unwrap();
+        let mut owner = Command::new("sleep").arg("30").spawn().unwrap();
+        std::fs::write(&lock, owner.id().to_string()).unwrap();
+        let release = {
+            let lock = lock.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                std::fs::remove_file(lock).unwrap();
+            })
+        };
+
+        let start = Instant::now();
+        let output = add_passwd_entry(&passwd, "aenv-1-0:x:1:0::/:/bin/sh");
+        release.join().unwrap();
+        owner.kill().unwrap();
+        owner.wait().unwrap();
+
+        assert_added(&output);
+        assert!(start.elapsed() >= Duration::from_millis(300));
+        assert!(std::fs::read_to_string(&passwd)
+            .unwrap()
+            .contains("aenv-1-0:x:1:0::/:/bin/sh"));
+    }
+
+    #[test]
+    fn passwd_append_survives_a_locked_concurrent_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let passwd = dir.path().join("passwd");
+        std::fs::write(&passwd, "root:x:0:0::/root:/bin/sh\n").unwrap();
+        // Rewrite like shadow's usermod: lock, copy, pause, rename, unlock.
+        let mut rewriter = Command::new("sh")
+            .args([
+                "-c",
+                r#"p=$1; i=0
+                while [ "$i" -lt 100 ]; do
+                    echo $$ > "$p.rw"
+                    if ln "$p.rw" "$p.lock" 2>/dev/null; then
+                        cp "$p" "$p.new"; sleep 0.005; mv "$p.new" "$p"
+                        rm -f "$p.lock"; i=$((i + 1))
+                    fi
+                    rm -f "$p.rw"
+                done"#,
+                "sh",
+            ])
+            .arg(&passwd)
+            .spawn()
+            .unwrap();
+
+        let entries: Vec<_> = (1..=20)
+            .map(|uid| format!("aenv-{uid}-0:x:{uid}:0::/:/bin/sh"))
+            .collect();
+        for entry in &entries {
+            assert_added(&add_passwd_entry(&passwd, entry));
+        }
+        assert!(rewriter.wait().unwrap().success());
+
+        let contents = std::fs::read_to_string(&passwd).unwrap();
+        for entry in &entries {
+            assert!(contents.lines().any(|line| line == entry), "lost {entry}");
+        }
+    }
 
     const PASSWD: &str =
         "root:x:0:0:root:/root:/bin/sh\nnonroot:x:65532:65532::/home/nonroot:/sbin/nologin\n";
