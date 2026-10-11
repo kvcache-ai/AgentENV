@@ -285,19 +285,48 @@ pub trait SnapshotRepository: Send + Sync {
     async fn publish_volume_backing(
         &self,
         _volume_id: &str,
-        _image_config_path: &Path,
+        image_config_path: &Path,
     ) -> RepositoryResult<Vec<crate::snapshot::OverlaybdLayerRef>> {
-        unsupported("volume backing publication")
+        self.publish_image_layers(image_config_path).await
     }
 
     /// Materializes a node-local runtime image config from shared logical layers.
     async fn materialize_volume_backing(
         &self,
         _volume_id: &str,
+        layers: &[crate::snapshot::OverlaybdLayerRef],
+        destination: &Path,
+    ) -> RepositoryResult<PathBuf> {
+        self.materialize_image_layers(layers, destination).await
+    }
+
+    /// Import immutable disk layers into repository-owned storage.
+    async fn publish_image_layers(
+        &self,
+        _image_config_path: &Path,
+    ) -> RepositoryResult<Vec<crate::snapshot::OverlaybdLayerRef>> {
+        unsupported("image layer publication")
+    }
+
+    async fn materialize_image_layers(
+        &self,
         _layers: &[crate::snapshot::OverlaybdLayerRef],
         _destination: &Path,
     ) -> RepositoryResult<PathBuf> {
-        unsupported("volume backing materialization")
+        unsupported("image layer materialization")
+    }
+
+    /// Publish only after all referenced layers are durable. The digest binds
+    /// the complete description; repeated publication is idempotent.
+    async fn put_image(&self, _image: &crate::image::PublishedImage) -> RepositoryResult<String> {
+        unsupported("image catalog")
+    }
+
+    async fn get_image(
+        &self,
+        _digest: &str,
+    ) -> RepositoryResult<Option<crate::image::PublishedImage>> {
+        unsupported("image catalog")
     }
 
     /// Removes one durable volume record. Missing records are considered success.

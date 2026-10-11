@@ -1023,7 +1023,7 @@ fn verify_blob_digest(expected_digest: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn parse_oci_image_config(raw: &str) -> Result<ImageResolutionMetadata> {
+pub(super) fn parse_oci_image_config(raw: &str) -> Result<ImageResolutionMetadata> {
     let document: OciImageConfigDocument =
         serde_json::from_str(raw).context("parse OCI image config JSON")?;
     let config = document.config.unwrap_or_default();
@@ -1447,7 +1447,7 @@ fn image_ref_repository(image_ref: &str) -> Result<String> {
 
 // ---- helpers ----
 
-fn host_arch_to_oci(host_arch: &str) -> Result<&'static str> {
+pub(super) fn host_arch_to_oci(host_arch: &str) -> Result<&'static str> {
     match host_arch {
         "x86_64" | "amd64" => Ok("amd64"),
         "aarch64" | "arm64" => Ok("arm64"),

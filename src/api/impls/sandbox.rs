@@ -500,7 +500,9 @@ fn duration_from_secs(secs: Option<u32>) -> Option<Duration> {
     secs.map(|s| Duration::from_secs(s as u64))
 }
 
-fn cold_start_resources(body: &models::NewColdSandbox) -> Result<SandboxResources, models::Error> {
+pub(super) fn cold_start_resources(
+    body: &models::NewColdSandbox,
+) -> Result<SandboxResources, models::Error> {
     let config = ConfigManager::global_config();
     let default_cpu = config.machine.vcpu_count;
     let default_mem = config.machine.mem_size_mib;
@@ -662,6 +664,58 @@ fn validate_domain_allowlist(policy: &SandboxNetworkPolicy) -> anyhow::Result<()
 #[async_trait]
 impl Sandboxes<()> for ApiImpl {
     type Claims = super::Claims;
+
+    async fn sandboxes_compose_plan_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        body: &models::ComposeBuildRequest,
+    ) -> Result<SandboxesComposePlanPostResponse, ()> {
+        use SandboxesComposePlanPostResponse::*;
+        let request = serde_json::json!({
+            "mode": "build", "compose": body.compose,
+            "composeEnv": body.compose_env.clone().unwrap_or_default(),
+            "profiles": body.profiles.clone().unwrap_or_default(),
+            "harbor": body.harbor.unwrap_or(false),
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            compose::prepare(
+                &ConfigManager::global_config().compose.planner_binary,
+                request,
+            ),
+        )
+        .await;
+        Ok(match result {
+            Ok(Ok(plan)) => Status200_ComposeBuildPlan(plan),
+            Ok(Err(err)) if err.is::<compose::InvalidCompose>() => {
+                Status400_BadRequest(Self::error(400, err.to_string()))
+            }
+            Ok(Err(err)) => Status500_ServerError(Self::internal_error(err.as_ref())),
+            Err(_) => Status500_ServerError(Self::error(500, "Compose planning deadline exceeded")),
+        })
+    }
+
+    async fn sandboxes_compose_post(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
+        body: &models::NewComposeSandbox,
+    ) -> Result<SandboxesComposePostResponse, ()> {
+        use SandboxesComposePostResponse::*;
+        Ok(match self.create_compose(body).await {
+            Ok(metadata) => Status201_TheSandboxWasCreatedSuccessfully {
+                x_agentenv_sandbox_id: Some(metadata.id.to_string()),
+                body: self.sandbox_model(metadata),
+            },
+            Err(err) if err.code == 400 => Status400_BadRequest(err),
+            Err(err) => Status500_ServerError(err),
+        })
+    }
 
     async fn sandboxes_cold_post(
         &self,
@@ -2452,5 +2506,353 @@ mod metrics_contract_tests {
         assert!(valid_metrics_interval(Some(0), Some(i64::MAX as u64)));
         assert!(!valid_metrics_interval(Some(u64::MAX), None));
         assert!(!valid_metrics_interval(Some(2), Some(1)));
+    }
+}
+
+// Compose planning stays at the API boundary; lifecycle owns only its startup frame.
+mod compose {
+    use std::collections::HashMap;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    use agentenv_http_server::models;
+    use anyhow::{Context, Result};
+    use serde::{Deserialize, Serialize};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use tokio::time::{timeout_at, Instant};
+
+    use super::{cold_start_resources, ApiImpl};
+    use crate::cfg::ConfigManager;
+    use crate::observability::prometheus::SandboxStageTimer;
+    use crate::orchestrator::{
+        CreateSandboxRequest, SandboxLaunchSource, SandboxMetadata, SandboxTimeoutAction,
+    };
+    use crate::sandbox::ExtraDrive;
+    use crate::types::ImageConfigs;
+
+    /// Maximum complete startup frame, including image configurations and newline.
+    pub const MAX_PLAN_BYTES: usize = 4 * 1024 * 1024;
+
+    #[derive(Debug, Deserialize, Serialize)]
+    pub struct ComposeService {
+        pub name: String,
+        pub image: String,
+        #[serde(rename = "localImage")]
+        pub local_image: String,
+        #[serde(rename = "driveID")]
+        pub drive_id: String,
+        #[serde(rename = "mountPath")]
+        pub mount_path: String,
+        #[serde(default)]
+        pub config: serde_json::Value,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    pub struct ComposePlan {
+        pub compose: serde_json::Value,
+        pub services: Vec<ComposeService>,
+    }
+
+    const MAX_PLANNER_STDERR_BYTES: usize = 64 * 1024;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("{0}")]
+    pub(crate) struct InvalidCompose(pub String);
+
+    /// Bound the complete frame before handing it to the lifecycle owner.
+    pub(crate) fn encode_plan(plan: &ComposePlan) -> Result<Vec<u8>> {
+        struct Frame(Vec<u8>);
+        impl std::io::Write for Frame {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > (MAX_PLAN_BYTES - 1).saturating_sub(self.0.len()) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "Compose startup plan exceeds 4 MiB",
+                    ));
+                }
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut frame = Frame(Vec::new());
+        serde_json::to_writer(&mut frame, plan)
+            .map_err(|error| InvalidCompose(error.to_string()))?;
+        frame.0.push(b'\n');
+        Ok(frame.0)
+    }
+
+    async fn read_limited(
+        reader: impl AsyncRead + Unpin,
+        limit: usize,
+        stream: &str,
+    ) -> Result<Vec<u8>> {
+        let mut output = Vec::new();
+        reader
+            .take((limit + 1) as u64)
+            .read_to_end(&mut output)
+            .await?;
+        if output.len() > limit {
+            return Err(
+                InvalidCompose(format!("Compose planner {stream} exceeds {limit} bytes")).into(),
+            );
+        }
+        Ok(output)
+    }
+
+    pub(super) async fn prepare<T: serde::de::DeserializeOwned>(
+        binary: &str,
+        request: serde_json::Value,
+    ) -> Result<T> {
+        let mut child = tokio::process::Command::new(binary)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .context("start Compose planner (install aenv-compose-plan)")?;
+        let mut stdin = child.stdin.take().context("planner stdin unavailable")?;
+        let stdout = child.stdout.take().context("planner stdout unavailable")?;
+        let stderr = child.stderr.take().context("planner stderr unavailable")?;
+        let input = serde_json::to_vec(&request)?;
+        // Drain output concurrently with writing input to avoid pipe backpressure.
+        let write = async move {
+            stdin.write_all(&input).await?;
+            stdin.shutdown().await?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let result = tokio::try_join!(
+            write,
+            read_limited(stdout, MAX_PLAN_BYTES, "stdout"),
+            read_limited(stderr, MAX_PLANNER_STDERR_BYTES, "stderr"),
+            async { child.wait().await.context("wait for Compose planner") },
+        );
+        let ((), stdout, stderr, status) = match result {
+            Ok(output) => output,
+            Err(error) => {
+                // kill() also reaps the child; dropping the read futures alone does
+                // not stop a planner that is still expanding or writing its plan.
+                let _ = child.kill().await;
+                return Err(error);
+            }
+        };
+        if !status.success() {
+            let message = String::from_utf8_lossy(&stderr).trim().to_owned();
+            if status.code() == Some(2) {
+                return Err(InvalidCompose(message).into());
+            }
+            anyhow::bail!("Compose planner failed: {message}");
+        }
+        serde_json::from_slice(&stdout).context("invalid Compose planner output")
+    }
+
+    impl ApiImpl {
+        pub(super) async fn create_compose(
+            &self,
+            body: &models::NewComposeSandbox,
+        ) -> Result<SandboxMetadata, models::Error> {
+            if !cfg!(target_arch = "x86_64")
+                || ConfigManager::global_config().virtualization_mode
+                    != crate::virtualization::VirtualizationMode::Kvm
+            {
+                return Err(Self::error(
+                    500,
+                    "Compose currently requires Linux x86-64 with KVM",
+                ));
+            }
+            let config = &ConfigManager::global_config().compose;
+            let base_image = config
+                .base_image
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    Self::error(500, "Compose is not configured: set compose.base_image")
+                })?;
+            let startup_timeout = body.startup_timeout.unwrap_or(300);
+            let mut cold = models::NewColdSandbox::new(base_image.to_owned());
+            cold.cpu_count = body.cpu_count;
+            cold.memory_mb = body.memory_mb;
+            cold.disk_size_mb = body.disk_size_mb;
+            let resources = cold_start_resources(&cold)?;
+            let deadline = Instant::now() + Duration::from_secs(startup_timeout as u64);
+            let timer = SandboxStageTimer::new("create_compose");
+            let plan_request = serde_json::json!({
+                "compose": body.compose,
+                "composeEnv": body.compose_env.clone().unwrap_or_default(),
+                "profiles": body.profiles.clone().unwrap_or_default(),
+            });
+            let prepared = timeout_at(deadline, async {
+                let mut plan = timer
+                    .time(
+                        "plan",
+                        prepare::<ComposePlan>(&config.planner_binary, plan_request),
+                    )
+                    .await
+                    .map_err(|err| {
+                        Self::error(
+                            if err.is::<InvalidCompose>() { 400 } else { 500 },
+                            err.to_string(),
+                        )
+                    })?;
+                let resolver = self.image_resolver();
+                let root = timer
+                    .time("resolve_rootfs", resolver.resolve(base_image))
+                    .await
+                    .map_err(|err| {
+                        Self::error(500, format!("resolve Compose base image: {err:#}"))
+                    })?;
+                let mut resolved = HashMap::new();
+                let mut extra_drives = Vec::with_capacity(plan.services.len());
+                let mut image_configs = ImageConfigs::new();
+                if let Some(raw) = &root.raw_config {
+                    image_configs.add(None::<String>, "/", raw.clone());
+                }
+                for service in &mut plan.services {
+                    // Share immutable resolution, but allocate a separate writable upper
+                    // and placeholder image for every service, even for identical sources.
+                    if !resolved.contains_key(&service.image) {
+                        let image = timer
+                            .time("resolve_service_image", resolver.resolve(&service.image))
+                            .await
+                            .map_err(|err| {
+                                Self::error(
+                                    if err.is_user_error() { 400 } else { 500 },
+                                    format!("resolve service {}: {err:#}", service.name),
+                                )
+                            })?;
+                        resolved.insert(service.image.clone(), image);
+                    }
+                    let image = &resolved[&service.image];
+                    service.config = image.raw_config.clone().ok_or_else(|| {
+                        Self::error(
+                            500,
+                            format!("service {} image config is missing", service.name),
+                        )
+                    })?;
+                    image_configs.add(
+                        Some(service.drive_id.clone()),
+                        service.mount_path.clone(),
+                        service.config.clone(),
+                    );
+                    extra_drives.push(
+                        ExtraDrive::try_new_overlaybd_with_mount_path(
+                            service.drive_id.clone(),
+                            image.overlaybd_config_path.clone(),
+                            false,
+                            service.mount_path.clone(),
+                            None::<std::path::PathBuf>,
+                        )
+                        .map_err(|err| Self::error(500, err.to_string()))?,
+                    );
+                }
+                // Image configs are added after planning and count toward the same
+                // guest frame limit. Reject before allocating any VM resources.
+                let input = encode_plan(&plan).map_err(|err| Self::error(400, err.to_string()))?;
+                let request = CreateSandboxRequest {
+                    source: SandboxLaunchSource::Image {
+                        image_ref: root.image_ref,
+                        overlaybd_config_path: root.overlaybd_config_path,
+                        context: Box::new(root.base_context.into()),
+                        resources: Some(resources),
+                        extra_drives,
+                        extra_boot_args: None,
+                        image_configs: Box::new(image_configs),
+                    },
+                    extra_drives: Vec::new(),
+                    extra_drives_in_snapshot: false,
+                    timeout: Some(Duration::from_secs(body.timeout.unwrap_or(300) as u64)),
+                    timeout_action: if body.auto_pause == Some(false) {
+                        SandboxTimeoutAction::Delete
+                    } else {
+                        SandboxTimeoutAction::Pause
+                    },
+                    auto_resume: false,
+                    user_metadata: body.metadata.clone(),
+                    env_vars: None,
+                    network_policy: Default::default(),
+                    secure: true,
+                    custom_extension_params: None,
+                    volume_mounts: HashMap::new(),
+                };
+                Ok::<_, models::Error>((request, input))
+            })
+            .await
+            .map_err(|_| {
+                Self::error(
+                    500,
+                    "Compose startup deadline exceeded while preparing images",
+                )
+            })??;
+            // Lifecycle owns cancellation and rollback from this point onward.
+            timer
+                .time(
+                    "create_sandbox",
+                    self.orchestrator
+                        .create_compose_sandbox(prepared.0, prepared.1, deadline),
+                )
+                .await
+                .map_err(|err| Self::internal_error(&err))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use serde_json::json;
+
+        #[test]
+        fn final_frame_limit_includes_image_configs_and_newline() {
+            let mut plan = ComposePlan {
+                compose: json!({"services": {"app": {"image": "local"}}}),
+                services: vec![ComposeService {
+                    name: "app".into(),
+                    image: "busybox".into(),
+                    local_image: "local".into(),
+                    drive_id: "compose_0".into(),
+                    mount_path: "/mnt/compose_0".into(),
+                    config: json!({"Env": [""]}),
+                }],
+            };
+            let empty_size = encode_plan(&plan).unwrap().len();
+            plan.services[0].config["Env"][0] = json!("x".repeat(MAX_PLAN_BYTES - empty_size));
+            let frame = encode_plan(&plan).unwrap();
+            assert_eq!(frame.len(), MAX_PLAN_BYTES);
+            assert_eq!(frame.last(), Some(&b'\n'));
+            plan.services[0].config["Env"][0] = json!("x".repeat(MAX_PLAN_BYTES - empty_size + 1));
+            assert!(encode_plan(&plan).unwrap_err().is::<InvalidCompose>());
+        }
+
+        #[tokio::test]
+        async fn planner_output_limits_kill_a_writer_that_never_exits() {
+            use std::os::unix::fs::PermissionsExt;
+
+            for stream in ["stdout", "stderr"] {
+                let directory = tempfile::tempdir().unwrap();
+                let script = directory.path().join("planner");
+                let redirect = if stream == "stderr" { " >&2" } else { "" };
+                std::fs::write(
+                    &script,
+                    format!(
+                        "#!/bin/sh\ncat >/dev/null\nwhile :; do printf '%s' '{}'{redirect}; done\n",
+                        "x".repeat(1024)
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+                let error = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    prepare::<ComposePlan>(script.to_str().unwrap(), json!({})),
+                )
+                .await
+                .expect("oversized output must not wait for process exit")
+                .unwrap_err();
+                assert!(error.is::<InvalidCompose>(), "{error:#}");
+                assert!(error.to_string().contains(stream), "{error:#}");
+            }
+        }
     }
 }

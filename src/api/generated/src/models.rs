@@ -94,6 +94,36 @@ pub struct NodesNodeIdGetQueryParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImagesBuildsBuildIdDeletePathParams {
+    pub build_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImagesBuildsBuildIdGetPathParams {
+    pub build_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImagesBuildsBuildIdLogsGetPathParams {
+    pub build_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImagesBuildsBuildIdLogsGetQueryParams {
+    #[serde(rename = "offset")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+    #[serde(rename = "limit")]
+    #[validate(range(min = 0u32, max = 100u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxesGetQueryParams {
     /// Metadata query used to filter the sandboxes (e.g. \"user=abc&app=prod\"). Each key and values must be URL encoded.
     #[serde(rename = "metadata")]
@@ -1179,6 +1209,195 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<BuildStatusR
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ComposeBuildRequest {
+    /// Compose YAML or JSON to validate and normalize for image builds. Files are read only by the client.
+    #[serde(rename = "compose")]
+    #[validate(length(min = 1, max = 1048576), custom(function = "check_xss_string"))]
+    pub compose: String,
+
+    #[serde(rename = "composeEnv")]
+    #[validate(custom(function = "check_xss_map_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_env: Option<std::collections::HashMap<String, String>>,
+
+    #[serde(rename = "profiles")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profiles: Option<Vec<String>>,
+
+    /// Apply Harbor task defaults before validation.
+    #[serde(rename = "harbor")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harbor: Option<bool>,
+}
+
+impl ComposeBuildRequest {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(compose: String) -> ComposeBuildRequest {
+        ComposeBuildRequest {
+            compose,
+            compose_env: None,
+            profiles: None,
+            harbor: Some(false),
+        }
+    }
+}
+
+/// Converts the ComposeBuildRequest value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ComposeBuildRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("compose".to_string()),
+            Some(self.compose.to_string()),
+            // Skipping composeEnv in query parameter serialization
+            self.profiles.as_ref().map(|profiles| {
+                [
+                    "profiles".to_string(),
+                    profiles
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ]
+                .join(",")
+            }),
+            self.harbor
+                .as_ref()
+                .map(|harbor| ["harbor".to_string(), harbor.to_string()].join(",")),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ComposeBuildRequest value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ComposeBuildRequest {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub compose: Vec<String>,
+            pub compose_env: Vec<std::collections::HashMap<String, String>>,
+            pub profiles: Vec<Vec<String>>,
+            pub harbor: Vec<bool>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ComposeBuildRequest".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "compose" => intermediate_rep.compose.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    "composeEnv" => return std::result::Result::Err(
+                        "Parsing a container in this style is not supported in ComposeBuildRequest"
+                            .to_string(),
+                    ),
+                    "profiles" => return std::result::Result::Err(
+                        "Parsing a container in this style is not supported in ComposeBuildRequest"
+                            .to_string(),
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "harbor" => intermediate_rep.harbor.push(
+                        <bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ComposeBuildRequest".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ComposeBuildRequest {
+            compose: intermediate_rep
+                .compose
+                .into_iter()
+                .next()
+                .ok_or_else(|| "compose missing in ComposeBuildRequest".to_string())?,
+            compose_env: intermediate_rep.compose_env.into_iter().next(),
+            profiles: intermediate_rep.profiles.into_iter().next(),
+            harbor: intermediate_rep.harbor.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ComposeBuildRequest> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ComposeBuildRequest>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ComposeBuildRequest>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ComposeBuildRequest - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ComposeBuildRequest> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ComposeBuildRequest as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ComposeBuildRequest - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct ConnectSandbox {
     /// Timeout in seconds from the current time after which the sandbox should expire
     #[serde(rename = "timeout")]
@@ -2094,6 +2313,537 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<Error> {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImageBuildInfo {
+    #[serde(rename = "buildID")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub build_id: String,
+
+    #[serde(rename = "status")]
+    #[validate(nested)]
+    pub status: models::ImageBuildStatus,
+
+    /// SHA256 of the canonical OverlayBD image description in the shared repository, binding ordered layers and OCI runtime configuration. Available only when ready; usable as a sandbox image reference.
+    #[serde(rename = "imageDigest")]
+    #[validate(
+            regex(path = *RE_IMAGEBUILDINFO_IMAGE_DIGEST),
+          custom(function = "check_xss_string"),
+    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
+
+    #[serde(rename = "reason")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<models::BuildStatusReason>,
+}
+
+lazy_static::lazy_static! {
+    static ref RE_IMAGEBUILDINFO_IMAGE_DIGEST: regex::Regex = regex::Regex::new("^sha256:[0-9a-f]{64}$").unwrap();
+}
+
+impl ImageBuildInfo {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(build_id: String, status: models::ImageBuildStatus) -> ImageBuildInfo {
+        ImageBuildInfo {
+            build_id,
+            status,
+            image_digest: None,
+            reason: None,
+        }
+    }
+}
+
+/// Converts the ImageBuildInfo value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ImageBuildInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("buildID".to_string()),
+            Some(self.build_id.to_string()),
+            // Skipping status in query parameter serialization
+            self.image_digest.as_ref().map(|image_digest| {
+                ["imageDigest".to_string(), image_digest.to_string()].join(",")
+            }),
+            // Skipping reason in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ImageBuildInfo value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ImageBuildInfo {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub build_id: Vec<String>,
+            pub status: Vec<models::ImageBuildStatus>,
+            pub image_digest: Vec<String>,
+            pub reason: Vec<models::BuildStatusReason>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ImageBuildInfo".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "buildID" => intermediate_rep.build_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "status" => intermediate_rep.status.push(
+                        <models::ImageBuildStatus as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "imageDigest" => intermediate_rep.image_digest.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "reason" => intermediate_rep.reason.push(
+                        <models::BuildStatusReason as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ImageBuildInfo".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ImageBuildInfo {
+            build_id: intermediate_rep
+                .build_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "buildID missing in ImageBuildInfo".to_string())?,
+            status: intermediate_rep
+                .status
+                .into_iter()
+                .next()
+                .ok_or_else(|| "status missing in ImageBuildInfo".to_string())?,
+            image_digest: intermediate_rep.image_digest.into_iter().next(),
+            reason: intermediate_rep.reason.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ImageBuildInfo> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ImageBuildInfo>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ImageBuildInfo>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ImageBuildInfo - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ImageBuildInfo> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ImageBuildInfo as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ImageBuildInfo - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImageBuildRequest {
+    /// Builder preparation and solve deadline in seconds; defaults to 3600.
+    #[serde(rename = "timeout")]
+    #[validate(range(min = 1u32, max = 86400u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+}
+
+impl ImageBuildRequest {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new() -> ImageBuildRequest {
+        ImageBuildRequest { timeout: None }
+    }
+}
+
+/// Converts the ImageBuildRequest value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ImageBuildRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            self.timeout
+                .as_ref()
+                .map(|timeout| ["timeout".to_string(), timeout.to_string()].join(",")),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ImageBuildRequest value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ImageBuildRequest {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub timeout: Vec<u32>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ImageBuildRequest".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "timeout" => intermediate_rep.timeout.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ImageBuildRequest".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ImageBuildRequest {
+            timeout: intermediate_rep.timeout.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ImageBuildRequest> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ImageBuildRequest>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ImageBuildRequest>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ImageBuildRequest - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ImageBuildRequest> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ImageBuildRequest as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ImageBuildRequest - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+/// Enumeration of values.
+/// Since this enum's variants do not hold data, we can easily define them as `#[repr(C)]`
+/// which helps with FFI.
+#[allow(non_camel_case_types, clippy::large_enum_variant)]
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[cfg_attr(feature = "conversion", derive(frunk_enum_derive::LabelledGenericEnum))]
+pub enum ImageBuildStatus {
+    #[serde(rename = "waiting")]
+    Waiting,
+    #[serde(rename = "building")]
+    Building,
+    #[serde(rename = "ready")]
+    Ready,
+    #[serde(rename = "error")]
+    Error,
+}
+
+impl validator::Validate for ImageBuildStatus {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        std::result::Result::Ok(())
+    }
+}
+
+impl std::fmt::Display for ImageBuildStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            ImageBuildStatus::Waiting => write!(f, "waiting"),
+            ImageBuildStatus::Building => write!(f, "building"),
+            ImageBuildStatus::Ready => write!(f, "ready"),
+            ImageBuildStatus::Error => write!(f, "error"),
+        }
+    }
+}
+
+impl std::str::FromStr for ImageBuildStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "waiting" => std::result::Result::Ok(ImageBuildStatus::Waiting),
+            "building" => std::result::Result::Ok(ImageBuildStatus::Building),
+            "ready" => std::result::Result::Ok(ImageBuildStatus::Ready),
+            "error" => std::result::Result::Ok(ImageBuildStatus::Error),
+            _ => std::result::Result::Err(format!(r#"Value not valid: {s}"#)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImageBuilder {
+    #[serde(rename = "buildID")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub build_id: String,
+
+    /// Required BuildKit image exporter name. The server publishes an OverlayBD image after the solve completes.
+    #[serde(rename = "imageName")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub image_name: String,
+}
+
+impl ImageBuilder {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(build_id: String, image_name: String) -> ImageBuilder {
+        ImageBuilder {
+            build_id,
+            image_name,
+        }
+    }
+}
+
+/// Converts the ImageBuilder value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ImageBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("buildID".to_string()),
+            Some(self.build_id.to_string()),
+            Some("imageName".to_string()),
+            Some(self.image_name.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ImageBuilder value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ImageBuilder {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub build_id: Vec<String>,
+            pub image_name: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ImageBuilder".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "buildID" => intermediate_rep.build_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "imageName" => intermediate_rep.image_name.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ImageBuilder".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ImageBuilder {
+            build_id: intermediate_rep
+                .build_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "buildID missing in ImageBuilder".to_string())?,
+            image_name: intermediate_rep
+                .image_name
+                .into_iter()
+                .next()
+                .ok_or_else(|| "imageName missing in ImageBuilder".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ImageBuilder> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ImageBuilder>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ImageBuilder>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ImageBuilder - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ImageBuilder> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ImageBuilder as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ImageBuilder - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct ListedSandbox {
     /// Identifier of the template from which is the sandbox created
     #[serde(rename = "templateID")]
@@ -2905,7 +3655,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<MemoryMb> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct NewColdSandbox {
-    /// Explicit external OCI image reference to use as the sandbox rootfs. Cold starts may pull and convert OCI layers on a cache miss and can take tens of seconds.
+    /// External OCI image reference or published OverlayBD description digest (sha256:...) to use as the sandbox rootfs. Published images are resolved from the configured shared repository. Cold starts may pull and convert OCI layers on a cache miss and can take tens of seconds.
     #[serde(rename = "image")]
     #[validate(custom(function = "check_xss_string"))]
     pub image: String,
@@ -3272,6 +4022,287 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<NewColdSandb
                     }
                     std::result::Result::Err(err) => std::result::Result::Err(format!(
                         r#"Unable to convert header value '{value}' into NewColdSandbox - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct NewComposeSandbox {
+    /// Image-only Compose YAML or JSON. One writable rootfs per selected service; no host files, builds, replicas, or privileged services.
+    #[serde(rename = "compose")]
+    #[validate(length(min = 1, max = 1048576), custom(function = "check_xss_string"))]
+    pub compose: String,
+
+    #[serde(rename = "composeEnv")]
+    #[validate(custom(function = "check_xss_map_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_env: Option<std::collections::HashMap<String, String>>,
+
+    #[serde(rename = "profiles")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profiles: Option<Vec<String>>,
+
+    /// Total startup budget in seconds, including image resolution and health checks. Cleanup may extend response time.
+    #[serde(rename = "startupTimeout")]
+    #[validate(range(min = 1u32, max = 300u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_timeout: Option<u32>,
+
+    /// Sandbox lifetime in seconds, starting after Compose is ready.
+    #[serde(rename = "timeout")]
+    #[validate(range(min = 0u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u32>,
+
+    #[serde(rename = "autoPause")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_pause: Option<bool>,
+
+    /// CPU cores for the sandbox
+    #[serde(rename = "cpuCount")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_count: Option<u32>,
+
+    /// Memory for the sandbox in MiB
+    #[serde(rename = "memoryMB")]
+    #[validate(range(min = 128u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u32>,
+
+    /// Disk size for the sandbox in MiB
+    #[serde(rename = "diskSizeMB")]
+    #[validate(range(min = 0u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_size_mb: Option<u32>,
+
+    #[serde(rename = "metadata")]
+    #[validate(custom(function = "check_xss_map_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<std::collections::HashMap<String, String>>,
+}
+
+impl NewComposeSandbox {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(compose: String) -> NewComposeSandbox {
+        NewComposeSandbox {
+            compose,
+            compose_env: None,
+            profiles: None,
+            startup_timeout: Some(300),
+            timeout: Some(300),
+            auto_pause: Some(true),
+            cpu_count: None,
+            memory_mb: None,
+            disk_size_mb: None,
+            metadata: None,
+        }
+    }
+}
+
+/// Converts the NewComposeSandbox value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for NewComposeSandbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("compose".to_string()),
+            Some(self.compose.to_string()),
+            // Skipping composeEnv in query parameter serialization
+            self.profiles.as_ref().map(|profiles| {
+                [
+                    "profiles".to_string(),
+                    profiles
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ]
+                .join(",")
+            }),
+            self.startup_timeout.as_ref().map(|startup_timeout| {
+                ["startupTimeout".to_string(), startup_timeout.to_string()].join(",")
+            }),
+            self.timeout
+                .as_ref()
+                .map(|timeout| ["timeout".to_string(), timeout.to_string()].join(",")),
+            self.auto_pause
+                .as_ref()
+                .map(|auto_pause| ["autoPause".to_string(), auto_pause.to_string()].join(",")),
+            self.cpu_count
+                .as_ref()
+                .map(|cpu_count| ["cpuCount".to_string(), cpu_count.to_string()].join(",")),
+            self.memory_mb
+                .as_ref()
+                .map(|memory_mb| ["memoryMB".to_string(), memory_mb.to_string()].join(",")),
+            self.disk_size_mb
+                .as_ref()
+                .map(|disk_size_mb| ["diskSizeMB".to_string(), disk_size_mb.to_string()].join(",")),
+            // Skipping metadata in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a NewComposeSandbox value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for NewComposeSandbox {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub compose: Vec<String>,
+            pub compose_env: Vec<std::collections::HashMap<String, String>>,
+            pub profiles: Vec<Vec<String>>,
+            pub startup_timeout: Vec<u32>,
+            pub timeout: Vec<u32>,
+            pub auto_pause: Vec<bool>,
+            pub cpu_count: Vec<u32>,
+            pub memory_mb: Vec<u32>,
+            pub disk_size_mb: Vec<u32>,
+            pub metadata: Vec<std::collections::HashMap<String, String>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing NewComposeSandbox".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "compose" => intermediate_rep.compose.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    "composeEnv" => return std::result::Result::Err(
+                        "Parsing a container in this style is not supported in NewComposeSandbox"
+                            .to_string(),
+                    ),
+                    "profiles" => return std::result::Result::Err(
+                        "Parsing a container in this style is not supported in NewComposeSandbox"
+                            .to_string(),
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "startupTimeout" => intermediate_rep.startup_timeout.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "timeout" => intermediate_rep.timeout.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "autoPause" => intermediate_rep.auto_pause.push(
+                        <bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "cpuCount" => intermediate_rep.cpu_count.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "memoryMB" => intermediate_rep.memory_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "diskSizeMB" => intermediate_rep.disk_size_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    "metadata" => return std::result::Result::Err(
+                        "Parsing a container in this style is not supported in NewComposeSandbox"
+                            .to_string(),
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing NewComposeSandbox".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(NewComposeSandbox {
+            compose: intermediate_rep
+                .compose
+                .into_iter()
+                .next()
+                .ok_or_else(|| "compose missing in NewComposeSandbox".to_string())?,
+            compose_env: intermediate_rep.compose_env.into_iter().next(),
+            profiles: intermediate_rep.profiles.into_iter().next(),
+            startup_timeout: intermediate_rep.startup_timeout.into_iter().next(),
+            timeout: intermediate_rep.timeout.into_iter().next(),
+            auto_pause: intermediate_rep.auto_pause.into_iter().next(),
+            cpu_count: intermediate_rep.cpu_count.into_iter().next(),
+            memory_mb: intermediate_rep.memory_mb.into_iter().next(),
+            disk_size_mb: intermediate_rep.disk_size_mb.into_iter().next(),
+            metadata: intermediate_rep.metadata.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<NewComposeSandbox> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<NewComposeSandbox>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<NewComposeSandbox>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for NewComposeSandbox - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<NewComposeSandbox> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <NewComposeSandbox as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into NewComposeSandbox - {err}"#
                     )),
                 }
             }

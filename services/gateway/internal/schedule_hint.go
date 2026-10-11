@@ -2,48 +2,71 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/compose"
 )
 
-// buildScheduleHint inspects the incoming request and produces a structured
-// scheduling hint. Requests that do not map to a known hint type return a nil
-// hint. For cold-sandbox creation the request body is parsed to extract
-// structured fields and then restored so the full body remains available for
-// the upstream request.
-// It only returns error when it's a fatal error and the request cannot be proceeded.
+// Inspect bounded sandbox requests for resource and image locality hints.
+// Published images are recoverable from the shared repository on every node.
 func buildScheduleHint(r *http.Request) (*schedulerv1.ScheduleRequestHint, error) {
 	if r.Method != http.MethodPost {
 		return nil, nil
 	}
 	switch strings.TrimRight(r.URL.Path, "/") {
+	case "/sandboxes-compose":
+		body, err := captureRequestBodyLimit(r, compose.MaxRequestBytes)
+		if err != nil {
+			return nil, err
+		}
+		if len(body) == 0 {
+			return nil, fmt.Errorf("Compose request is empty or too large")
+		}
+		var request struct {
+			Compose    string            `json:"compose"`
+			ComposeEnv map[string]string `json:"composeEnv"`
+			Profiles   []string          `json:"profiles"`
+		}
+		if err := json.Unmarshal(body, &request); err != nil {
+			return nil, err
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+		defer cancel()
+		plan, err := compose.Prepare(ctx, compose.Request{Compose: request.Compose, Environment: request.ComposeEnv, Profiles: request.Profiles})
+		if err != nil {
+			return nil, err
+		}
+		cold := parseNewColdSandboxHint(body)
+		for _, service := range plan.Services {
+			cold.Images = append(cold.Images, service.Image)
+		}
+		return &schedulerv1.ScheduleRequestHint{
+			Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{NewColdSandbox: cold},
+		}, nil
 	case "/sandboxes-cold":
 		body, err := captureRequestBody(r)
 		if err != nil {
 			return nil, err
 		}
+		cold := parseNewColdSandboxHint(body)
 		return &schedulerv1.ScheduleRequestHint{
-			Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{
-				NewColdSandbox: parseNewColdSandboxHint(body),
-			},
+			Kind: &schedulerv1.ScheduleRequestHint_NewColdSandbox{NewColdSandbox: cold},
 		}, nil
 	case "/sandboxes", "/v2/sandboxes":
 		body, err := captureRequestBody(r)
 		if err != nil {
 			return nil, err
 		}
-		return &schedulerv1.ScheduleRequestHint{
-			Kind: &schedulerv1.ScheduleRequestHint_NewSandbox{
-				NewSandbox: parseNewSandboxHint(body),
-			},
-		}, nil
-	default:
-		return nil, nil
+		return &schedulerv1.ScheduleRequestHint{Kind: &schedulerv1.ScheduleRequestHint_NewSandbox{NewSandbox: parseNewSandboxHint(body)}}, nil
 	}
+	return nil, nil
 }
 
 // maxHintBodyBytes bounds how much of a request body the gateway buffers in
@@ -61,15 +84,19 @@ const maxHintBodyBytes = 64 * 1024
 // full buffering) and a nil body is returned so the caller skips hint
 // extraction.
 func captureRequestBody(r *http.Request) ([]byte, error) {
+	return captureRequestBodyLimit(r, maxHintBodyBytes)
+}
+
+func captureRequestBodyLimit(r *http.Request, limit int64) ([]byte, error) {
 	if r.Body == nil || r.Body == http.NoBody {
 		return nil, nil
 	}
 	orig := r.Body
-	buf, err := io.ReadAll(io.LimitReader(orig, maxHintBodyBytes+1))
+	buf, err := io.ReadAll(io.LimitReader(orig, limit+1))
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(buf)) > maxHintBodyBytes {
+	if int64(len(buf)) > limit {
 		// Too large to inspect: restore the full stream without buffering the
 		// remainder and skip hint extraction.
 		r.Body = &prefixedBody{Reader: io.MultiReader(bytes.NewReader(buf), orig), closer: orig}

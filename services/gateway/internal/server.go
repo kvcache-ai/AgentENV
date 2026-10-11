@@ -169,7 +169,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	websocket := isWebSocketRequest(r)
 	streaming := isStreamingRequest(r)
 	longLived := streaming || websocket
-	routingCtx, cancelRouting := context.WithTimeout(r.Context(), s.requestTimeout)
+	routingCtx, cancelRouting := context.WithTimeout(r.Context(), requestTimeoutFor(r, s.requestTimeout))
 	defer cancelRouting()
 
 	hostRoute, hostRouteErr := parseHostRoute(r.Host, s.sandboxProxyDomains)
@@ -216,8 +216,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	} else if isSandboxControlPlaneRequest(r) {
 		sandboxID, hasSandbox = sandboxIDFromPath(r.URL.Path)
 		routeSource = routeSourcePath
-	} else if isTemplateBuilderAllocation(r) {
+	} else if isTemplateBuilderAllocation(r) || isImageBuilderAllocation(r) {
 		routeSource = routeSourceSchedule
+	} else if buildID, ok := imageBuildIDFromPath(r.URL.Path); ok {
+		sandboxID, hasSandbox = buildID, true
+		routeSource = routeSourcePath
 	} else if buildID, ok := templateBuildIDFromPath(r.URL.Path); ok {
 		sandboxID, hasSandbox = buildID, true
 		buildReadRequest = r.Method == http.MethodGet && (strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/status") || strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/logs"))
@@ -236,7 +239,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		resp, err := s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
 		recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
 		if buildReadRequest && status.Code(err) == codes.NotFound {
-			// Completed and legacy builds use the shared template repository.
+			// Published templates use the shared repository.
 			hasSandbox = false
 			routeSource = routeSourceSchedule
 			setGatewayRouteSource(w, routeSource)
@@ -250,13 +253,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if !hasSandbox {
 		hint, err := buildScheduleHint(r)
 		if err != nil {
-			// this only happens it cannot read request body, so the request cannot continue
-			s.logger.Warn("Fatal error when building schedule hint",
+			s.logger.Warn("Invalid scheduling request",
 				zap.String("method", r.Method),
 				zap.String("path", r.URL.Path),
 				zap.Error(err),
 			)
-			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			s.writeJSON(w, http.StatusBadRequest, map[string]any{"code": http.StatusBadRequest, "message": err.Error()})
 			return
 		}
 		rpcStart := time.Now()
@@ -441,6 +443,16 @@ func (e *proxyResponseError) Error() string {
 func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestPath string) error {
 	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
 	defer cancelRecord()
+	if strings.TrimRight(requestPath, "/") == "/images/builds" {
+		buildID := strings.TrimSpace(resp.Header.Get("x-agentenv-build-id"))
+		if buildID == "" {
+			return &proxyResponseError{statusCode: http.StatusBadGateway, message: "upstream image build response is missing its build ID"}
+		}
+		if err := s.recordAssignment(recordCtx, buildID, node, "image_build"); err != nil {
+			return &proxyResponseError{statusCode: http.StatusServiceUnavailable, message: "failed to route allocated image build", cause: err}
+		}
+		return nil
+	}
 	if buildID, ok := v2TemplateBuildIDFromPath(requestPath); ok {
 		if err := s.recordAssignment(recordCtx, buildID, node, "template_build"); err != nil {
 			return &proxyResponseError{statusCode: http.StatusServiceUnavailable, message: "failed to route allocated build", cause: err}
@@ -536,6 +548,19 @@ func readBodyWithLimit(src io.Reader, limit int64) ([]byte, bool, error) {
 	return body, false, nil
 }
 
+// Leave room for the node's Compose deadline and response/cleanup overhead.
+func requestTimeoutFor(r *http.Request, configured time.Duration) time.Duration {
+	if r.Method == http.MethodPost {
+		switch strings.TrimRight(r.URL.Path, "/") {
+		case "/sandboxes-compose":
+			return max(configured, 330*time.Second)
+		case "/sandboxes-compose/plan":
+			return max(configured, 60*time.Second)
+		}
+	}
+	return configured
+}
+
 func recordAssignmentTimeout(requestTimeout time.Duration) time.Duration {
 	if requestTimeout <= 0 {
 		return maxRecordAssignmentTimeout
@@ -554,7 +579,7 @@ func flushInterval(flushImmediately bool) time.Duration {
 }
 
 func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox bool) bool {
-	if isTemplateBuilderAllocation(r) {
+	if isTemplateBuilderAllocation(r) || isImageBuilderAllocation(r) {
 		return true
 	}
 	if r.Method != http.MethodPost {
@@ -562,7 +587,7 @@ func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox
 	}
 	path := strings.TrimRight(r.URL.Path, "/")
 	if !hasSandbox {
-		return path == "/sandboxes" || path == "/v2/sandboxes" || path == "/sandboxes-cold"
+		return path == "/sandboxes" || path == "/v2/sandboxes" || path == "/sandboxes-cold" || path == "/sandboxes-compose"
 	}
 	if routeSource != routeSourcePath {
 		return false
@@ -671,6 +696,21 @@ func isSandboxControlPlaneRequest(r *http.Request) bool {
 	default:
 		return false
 	}
+}
+
+func isImageBuilderAllocation(r *http.Request) bool {
+	return r.Method == http.MethodPost && strings.TrimRight(r.URL.Path, "/") == "/images/builds"
+}
+
+func imageBuildIDFromPath(path string) (string, bool) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if (len(parts) != 3 && len(parts) != 4) || parts[0] != "images" || parts[1] != "builds" || parts[2] == "" {
+		return "", false
+	}
+	if len(parts) == 4 && parts[3] != "builder" && parts[3] != "logs" {
+		return "", false
+	}
+	return parts[2], true
 }
 
 func isTemplateBuilderAllocation(r *http.Request) bool {
@@ -978,8 +1018,11 @@ func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
 	}
 
 	_, templateBuildRequest := templateBuildIDFromPath(r.URL.Path)
+	_, imageBuildRequest := imageBuildIDFromPath(r.URL.Path)
 	return !isSandboxControlPlaneRequest(r) &&
 		!templateBuildRequest &&
+		!imageBuildRequest &&
+		!isImageBuilderAllocation(r) &&
 		!isTemplateBuilderAllocation(r) &&
 		hasCompleteProxyRouteHeaders(r.Header)
 }

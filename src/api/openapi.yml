@@ -747,7 +747,9 @@ components:
         image:
           type: string
           description: >
-            Explicit external OCI image reference to use as the sandbox rootfs.
+            External OCI image reference or published OverlayBD description
+            digest (sha256:...) to use as the sandbox rootfs. Published images
+            are resolved from the configured shared repository.
             Cold starts may pull and convert OCI layers on a cache miss and can
             take tens of seconds.
         timeout:
@@ -799,6 +801,66 @@ components:
         extraBootArgs:
           type: string
           description: Additional kernel command-line arguments appended to the Firecracker boot args for this cold-start sandbox. Arguments are whitespace-separated and may contain only 0-9, a-z, A-Z, underscore, hyphen, dot, slash, plus, or equals sign, so base64 values are allowed. The server also applies the firecracker.allowed_extra_boot_args_prefixes allowlist; non-matching or invalid arguments are silently ignored.
+
+    ComposeBuildRequest:
+      type: object
+      required: [compose]
+      properties:
+        compose:
+          type: string
+          minLength: 1
+          maxLength: 1048576
+          description: Compose YAML or JSON to validate and normalize for image builds. Files are read only by the client.
+        composeEnv:
+          $ref: "#/components/schemas/EnvVars"
+        profiles:
+          type: array
+          items:
+            type: string
+        harbor:
+          type: boolean
+          default: false
+          description: Apply Harbor task defaults before validation.
+
+    NewComposeSandbox:
+      type: object
+      required: [compose]
+      properties:
+        compose:
+          type: string
+          minLength: 1
+          maxLength: 1048576
+          description: Image-only Compose YAML or JSON. One writable rootfs per selected service; no host files, builds, replicas, or privileged services.
+        composeEnv:
+          $ref: "#/components/schemas/EnvVars"
+        profiles:
+          type: array
+          items:
+            type: string
+        startupTimeout:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 300
+          default: 300
+          description: Total startup budget in seconds, including image resolution and health checks. Cleanup may extend response time.
+        timeout:
+          type: integer
+          format: int32
+          minimum: 0
+          default: 300
+          description: Sandbox lifetime in seconds, starting after Compose is ready.
+        autoPause:
+          type: boolean
+          default: true
+        cpuCount:
+          $ref: "#/components/schemas/CPUCount"
+        memoryMB:
+          $ref: "#/components/schemas/MemoryMB"
+        diskSizeMB:
+          $ref: "#/components/schemas/DiskSizeMB"
+        metadata:
+          $ref: "#/components/schemas/SandboxMetadata"
 
     ConnectSandbox:
       type: object
@@ -1113,6 +1175,43 @@ components:
           $ref: "#/components/schemas/CPUCount"
         memoryMB:
           $ref: "#/components/schemas/MemoryMB"
+
+    ImageBuildRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        timeout:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 86400
+          description: Builder preparation and solve deadline in seconds; defaults to 3600.
+    ImageBuilder:
+      type: object
+      required: [buildID, imageName]
+      properties:
+        buildID:
+          type: string
+        imageName:
+          type: string
+          description: Required BuildKit image exporter name. The server publishes an OverlayBD image after the solve completes.
+    ImageBuildStatus:
+      type: string
+      enum: [waiting, building, ready, error]
+    ImageBuildInfo:
+      type: object
+      required: [buildID, status]
+      properties:
+        buildID:
+          type: string
+        status:
+          $ref: '#/components/schemas/ImageBuildStatus'
+        imageDigest:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: SHA256 of the canonical OverlayBD image description in the shared repository, binding ordered layers and OCI runtime configuration. Available only when ready; usable as a sandbox image reference.
+        reason:
+          $ref: '#/components/schemas/BuildStatusReason'
 
     TemplateBuilderRequest:
       type: object
@@ -1581,6 +1680,122 @@ tags:
   - name: volumes
 
 paths:
+  /images/builds:
+    post:
+      summary: Prepare an image build
+      description: Allocate an independent BuildKit worker. Connect buildctl through the WebSocket at /images/builds/{buildID}/builder using the returned imageName. Completion publishes the OverlayBD layers and description to the configured shared repository. No template is created.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImageBuildRequest'
+      responses:
+        '202':
+          description: Builder preparation accepted
+          headers:
+            x-agentenv-build-id:
+              description: Build identifier used by the gateway for routing.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageBuilder'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '429':
+          description: Concurrent build limit reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/500'
+  /images/builds/{buildID}:
+    parameters:
+      - $ref: '#/components/parameters/buildID'
+    get:
+      summary: Get image build status
+      description: Results survive worker cleanup and node restart until explicit deletion. Ready means all image objects are durable in the repository.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Image build status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageBuildInfo'
+        '401':
+          $ref: '#/components/responses/401'
+        '404':
+          $ref: '#/components/responses/404'
+        '500':
+          $ref: '#/components/responses/500'
+    delete:
+      summary: Release an image build
+      description: Cancel the worker and delete the build result and logs. Published images and shared layers are retained. Publication already in progress finishes before the build can be deleted.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '204':
+          description: Builder released
+        '401':
+          $ref: '#/components/responses/401'
+        '404':
+          $ref: '#/components/responses/404'
+        '409':
+          $ref: '#/components/responses/409'
+        '500':
+          $ref: '#/components/responses/500'
+  /images/builds/{buildID}/logs:
+    get:
+      summary: Get image build logs
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/buildID'
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            format: uint32
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            format: uint32
+            minimum: 0
+            maximum: 100
+            default: 100
+      responses:
+        '200':
+          description: Image build logs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BuildLogEntry'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '404':
+          $ref: '#/components/responses/404'
+        '500':
+          $ref: '#/components/responses/500'
+
   /health:
     get:
       summary: Health check
@@ -1664,6 +1879,78 @@ paths:
           $ref: "#/components/responses/400"
         "409":
           $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandboxes-compose/plan:
+    post:
+      description: >
+        Validate a Compose build and return normalized compose and per-service build settings.
+        Reads no client files and allocates no builders or sandboxes. Planning has a 30-second deadline.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ComposeBuildRequest"
+      responses:
+        "200":
+          description: Compose build plan
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+                description: Contains compose (normalized project) and services (name, context, dockerfile, args, target, noCache).
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /sandboxes-compose:
+    post:
+      description: >
+        Create one sandbox running a Compose project. Returns only after all selected
+        services are running or healthy according to Compose --wait. Requires a
+        configured compose base image and planner. Use an HTTP timeout over 300 seconds.
+      tags: [sandboxes]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewComposeSandbox"
+      responses:
+        "201":
+          description: The sandbox was created successfully
+          headers:
+            x-agentenv-sandbox-id:
+              description: Identifier of the created sandbox for proxy routing.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sandbox"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
         "500":
           $ref: "#/components/responses/500"
 

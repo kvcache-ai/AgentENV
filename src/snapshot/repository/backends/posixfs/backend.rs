@@ -464,9 +464,8 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
             .await
     }
 
-    async fn publish_volume_backing(
+    async fn publish_image_layers(
         &self,
-        _volume_id: &str,
         image_config_path: &std::path::Path,
     ) -> RepositoryResult<Vec<crate::snapshot::OverlaybdLayerRef>> {
         let repository = self.clone();
@@ -479,9 +478,8 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         .await
     }
 
-    async fn materialize_volume_backing(
+    async fn materialize_image_layers(
         &self,
-        _volume_id: &str,
         layers: &[crate::snapshot::OverlaybdLayerRef],
         destination: &std::path::Path,
     ) -> RepositoryResult<std::path::PathBuf> {
@@ -507,6 +505,21 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
             store.delete_volume(&volume_id)
         })
         .await
+    }
+
+    async fn put_image(&self, image: &crate::image::PublishedImage) -> RepositoryResult<String> {
+        let image = image.clone();
+        self.run_catalog("publish image", move |store| store.put_image(&image))
+            .await
+    }
+
+    async fn get_image(
+        &self,
+        digest: &str,
+    ) -> RepositoryResult<Option<crate::image::PublishedImage>> {
+        let digest = digest.to_owned();
+        self.run_catalog("read image", move |store| store.get_image(&digest))
+            .await
     }
 
     async fn reserve_volume(
