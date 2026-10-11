@@ -1664,6 +1664,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_build_control_endpoints_require_api_auth_and_validate_input() {
+        let app = server::new(build_api().await);
+        for path in [
+            "/images/builds/missing",
+            "/images/builds/missing/logs",
+            "/images/builds/missing/builder",
+        ] {
+            assert_eq!(get_status(&app, path, &[]).await, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                get_status(&app, path, &[(TRAFFIC_ACCESS_TOKEN_HEADER, "invalid")]).await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        for (key, timeout, expected) in [
+            (None, 60, StatusCode::UNAUTHORIZED),
+            (Some("incorrect"), 60, StatusCode::UNAUTHORIZED),
+            (Some(TEST_API_KEY), 0, StatusCode::BAD_REQUEST),
+            (Some(TEST_API_KEY), 86401, StatusCode::BAD_REQUEST),
+        ] {
+            let mut request = http::Request::builder()
+                .method("POST")
+                .uri("/images/builds")
+                .header("host", "localhost")
+                .header("content-type", "application/json");
+            if let Some(key) = key {
+                request = request.header(API_KEY_HEADER, key);
+            }
+            let response = app
+                .clone()
+                .oneshot(
+                    request
+                        .body(Body::from(json!({"timeout": timeout}).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
     async fn buildkit_workers_are_hidden_with_encoded_control_path_ids() {
         let api = build_api().await;
         let id = SandboxId::new();

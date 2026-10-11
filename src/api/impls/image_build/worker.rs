@@ -15,7 +15,7 @@ use crate::{
     sandbox::{Executor, ProcessOpts, SandboxNetworkPolicy},
     snapshot::{
         repository::backends::build_builder_snapshot_backend, CommandContext, RepositoryError,
-        RunnableSnapshot, SnapshotManager, SnapshotRecord,
+        RunnableSnapshot, SnapshotId, SnapshotManager,
     },
     template::TemplateBuildSpec,
     types::{ImageConfigs, SandboxId},
@@ -28,7 +28,7 @@ impl ApiImpl {
     /// Apply one solve deadline and cancellation boundary across all startup phases.
     pub(super) async fn wait_for_image_build(
         &self,
-        record: &SnapshotRecord,
+        build_id: &SnapshotId,
         body: &models::TemplateBuilderRequest,
         session: &BuildSession,
         entry: &BuildJournal,
@@ -38,7 +38,7 @@ impl ApiImpl {
         let mut cancellation = session.state.subscribe();
         let solve = async {
             let snapshot = self.builder_template().await?;
-            let id = record.id.to_string();
+            let id = build_id.to_string();
             // Finish attaching the cache even if the caller cancels. Cleanup waits
             // on the same lock before deleting the worker or releasing its volumes.
             let cleanup = session.cleanup.clone().lock_owned().await;
@@ -54,7 +54,7 @@ impl ApiImpl {
             let history = BuildkitHistory::connect(address).await?;
             ensure!(session.ready(address), "build cancelled");
             let digest = history
-                .wait_for_image(&record.id.to_string(), logger)
+                .wait_for_image(&build_id.to_string(), logger)
                 .await?;
             session
                 .publish()

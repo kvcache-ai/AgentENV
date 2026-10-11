@@ -18,6 +18,7 @@ where
     I: AsRef<A> + AsRef<ApiImpl> + Clone + Send + Sync + 'static,
     A: apis::admin::Admin<E, Claims = C>
         + apis::default::Default<E>
+        + apis::images::Images<E, Claims = C>
         + apis::sandboxes::Sandboxes<E, Claims = C>
         + apis::snapshots::Snapshots<E, Claims = C>
         + apis::templates::Templates<E, Claims = C>

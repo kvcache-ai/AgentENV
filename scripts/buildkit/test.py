@@ -72,6 +72,28 @@ class BuildKitTests(unittest.TestCase):
                 data = json.loads(data)
             return response.status, data
 
+    def test_native_image_build(self):
+        context = self.work / "native-image"
+        context.mkdir()
+        (context / "Dockerfile").write_text(
+            f"FROM busybox:1.37\nRUN echo {self.prefix} >/marker\n"
+            'ENV IMAGE_KIND=native\nCMD ["sleep", "infinity"]\n')
+        result = subprocess.run(
+            [AENV, "build", "--image", str(context), "--buildctl", BUILDCTL,
+             "--progress", "plain"], capture_output=True, text=True, timeout=900)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        digest = result.stdout.strip()
+        self.assertRegex(digest, r"^sha256:[0-9a-f]{64}$")
+        build_ids = re.findall(r"Allocated image build ([0-9a-f-]+)", result.stderr)
+        self.assertEqual(len(build_ids), 1, result.stderr)
+        self.assertEqual(self.api("GET", f"/images/builds/{build_ids[0]}")[0], 404)
+        status, created = self.api("POST", "/sandboxes-cold", {"image": digest, "timeout": 900})
+        self.assertEqual(status, 201, created)
+        sandbox = created["sandboxID"]
+        self.sandboxes.add(sandbox)
+        self.assertEqual(self.cli("exec", sandbox, "cat", "/marker"), self.prefix)
+
+
     def node_counts(self):
         status, nodes = self.api("GET", "/nodes")
         self.assertEqual(status, 200, nodes)

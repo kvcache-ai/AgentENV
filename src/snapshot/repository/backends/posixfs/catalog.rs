@@ -39,6 +39,38 @@ impl PosixFsCatalogStore {
         Self { root }
     }
 
+    pub(crate) fn put_image(
+        &self,
+        image: &crate::image::PublishedImage,
+    ) -> RepositoryResult<String> {
+        let (digest, bytes) = image
+            .encode()
+            .map_err(|error| RepositoryError::backend("encode image", error))?;
+        let key = crate::image::PublishedImage::key(&digest)
+            .map_err(|error| RepositoryError::backend("image catalog key", error))?;
+        self.write_bytes(&self.root.join(key), &bytes)?;
+        Ok(digest)
+    }
+
+    pub(crate) fn get_image(
+        &self,
+        digest: &str,
+    ) -> RepositoryResult<Option<crate::image::PublishedImage>> {
+        let key = crate::image::PublishedImage::key(digest).map_err(|error| {
+            RepositoryError::InvalidRequest {
+                reason: error.to_string(),
+            }
+        })?;
+        let bytes = match fs::read(self.root.join(key)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(RepositoryError::backend("read image description", error)),
+        };
+        crate::image::PublishedImage::decode(digest, &bytes)
+            .map(Some)
+            .map_err(|error| RepositoryError::backend("verify image description", error))
+    }
+
     pub(crate) fn write_build_logs(
         &self,
         id: &SnapshotId,
@@ -863,14 +895,18 @@ impl PosixFsCatalogStore {
     where
         T: Serialize,
     {
+        let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+            RepositoryError::backend(format!("serialize json '{}'", path.display()), error)
+        })?;
+        self.write_bytes(path, &bytes)
+    }
+
+    fn write_bytes(&self, path: &Path, bytes: &[u8]) -> RepositoryResult<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 RepositoryError::backend(format!("create '{}'", parent.display()), error)
             })?;
         }
-        let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
-            RepositoryError::backend(format!("serialize json '{}'", path.display()), error)
-        })?;
         let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
             message: format!("resolve parent for '{}'", path.display()),
             source: None,
@@ -878,7 +914,7 @@ impl PosixFsCatalogStore {
         let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
             RepositoryError::backend(format!("create temp file in '{}'", parent.display()), error)
         })?;
-        temp.write_all(&bytes).map_err(|error| {
+        temp.write_all(bytes).map_err(|error| {
             RepositoryError::backend(
                 format!("write temp json '{}'", temp.path().display()),
                 error,

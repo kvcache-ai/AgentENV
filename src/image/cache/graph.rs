@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::warn;
 
+use crate::image::commit_index;
 use crate::local_store::{LocalKvBatchOp, LocalKvStore, LocalStoreDurability};
 use crate::p2p::P2pArtifactKey;
 
@@ -243,9 +244,10 @@ impl ImageCacheMetadataStore {
     pub(crate) async fn record_config_refs_from_config_path(
         &self,
         config_path: &Path,
+        commit_store: &Path,
     ) -> Result<()> {
         let config_id = ImageCacheConfigId::from_config_path(config_path)?;
-        let hard_refs = load_cache_owned_hard_commit_refs(config_path)?;
+        let hard_refs = load_commit_store_owned_hard_commit_refs(config_path, commit_store)?;
         let new_refs = hard_refs
             .iter()
             .map(|reference| reference.digest.clone())
@@ -282,7 +284,7 @@ impl ImageCacheMetadataStore {
     }
 
     /// Cache-owned `file=` lowers inside the commit store; remote-recoverable
-    /// `dir=` layers and runtime-owned local files are intentionally excluded.
+    /// `dir=` layers and repository/runtime-owned local files are excluded.
     pub(crate) fn commit_store_hard_commit_digests_from_config_path(
         config_path: &Path,
         commit_store: &Path,
@@ -475,18 +477,62 @@ impl ImageCacheMetadataStore {
             .with_context(|| format!("remove image cache refs for config {config_id}"))
     }
 
-    pub(crate) async fn rebuild_from_configs(&self, configs_dir: &Path) -> Result<()> {
-        let parsed = parse_configs_dir(configs_dir).await.with_context(|| {
-            format!(
-                "rebuild image cache metadata from {}",
-                configs_dir.display()
-            )
-        })?;
+    pub(crate) async fn rebuild_from_configs(
+        &self,
+        configs_dir: &Path,
+        commit_store: &Path,
+    ) -> Result<()> {
+        let parsed = parse_configs_dir(configs_dir, commit_store)
+            .await
+            .with_context(|| {
+                format!(
+                    "rebuild image cache metadata from {}",
+                    configs_dir.display()
+                )
+            })?;
         let _guard = self.object_update_lock.lock().await;
         let existing = self.config_ref_map().await?;
         let existing_last_used = self.config_last_used_map().await?;
         let now = unix_now_secs();
         let mut ops = Vec::new();
+
+        // Older configs could overwrite a local commit's record with a
+        // repository path for the same digest. Recover its canonical cache
+        // location even when the original source config has been evicted.
+        // Repository-only records are metadata mistakes, not files to delete.
+        for record in self.list_hard_commit_objects().await? {
+            let Some(file) = &record.file else {
+                continue;
+            };
+            if path_is_inside(file, commit_store) {
+                continue;
+            }
+            let local = commit_index::commit_file(commit_store, record.digest.as_str());
+            let size = match tokio::fs::symlink_metadata(&local).await {
+                Ok(_) => record.size,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if record.p2p_keys.is_empty() {
+                        ops.push(LocalKvBatchOp::delete(hard_commit_object_key(
+                            &record.digest,
+                        )));
+                        continue;
+                    }
+                    // Preserve P2P ownership if the local file is also missing,
+                    // but do not charge repository bytes to the cache budget.
+                    None
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("stat image cache commit {}", local.display()));
+                }
+            };
+            ops.push(hard_commit_object_put_op(
+                &record.digest,
+                Some(local),
+                size,
+                record.p2p_keys,
+            )?);
+        }
 
         for stale_config in existing.keys().filter(|id| !parsed.contains_key(*id)) {
             ops.extend(config_ref_removal_ops(
@@ -993,6 +1039,7 @@ fn hold_hard_reference_record(
 
 async fn parse_configs_dir(
     configs_dir: &Path,
+    commit_store: &Path,
 ) -> Result<BTreeMap<ImageCacheConfigId, Vec<ParsedHardCommitRef>>> {
     let mut paths = Vec::new();
     let mut entries = match tokio::fs::read_dir(configs_dir).await {
@@ -1028,31 +1075,10 @@ async fn parse_configs_dir(
     let mut parsed = BTreeMap::new();
     for path in paths {
         let config_id = ImageCacheConfigId::from_config_path(&path)?;
-        let refs = load_cache_owned_hard_commit_refs(&path)?;
+        let refs = load_commit_store_owned_hard_commit_refs(&path, commit_store)?;
         parsed.insert(config_id, refs);
     }
     Ok(parsed)
-}
-
-fn load_cache_owned_hard_commit_refs(image_config_path: &Path) -> Result<Vec<ParsedHardCommitRef>> {
-    let facts = load_cache_owned_image_config_facts(image_config_path)?;
-    let mut refs = Vec::new();
-    let mut seen = BTreeSet::new();
-
-    // In cache-owned image configs, `file=` lowers are hard commits.
-    // `dir=`+repoBlobUrl lowers are remote-recoverable and are never strongly
-    // pinned, so they are not tracked as hard commits here.
-    for lower in facts.local_file_lowers {
-        let digest = HardCommitId::new(lower.digest)?;
-        if seen.insert(digest.clone()) {
-            refs.push(ParsedHardCommitRef {
-                digest,
-                file: lower.file,
-                size: lower.size,
-            });
-        }
-    }
-    Ok(refs)
 }
 
 fn load_commit_store_owned_hard_commit_refs(
@@ -1317,8 +1343,9 @@ mod tests {
         lowers: serde_json::Value,
     ) {
         write_config(path, lowers, "");
+        let commit_store = path.parent().expect("config parent").join("../commits");
         store
-            .record_config_refs_from_config_path(path)
+            .record_config_refs_from_config_path(path, &commit_store)
             .await
             .expect("record config refs");
     }
@@ -1415,7 +1442,7 @@ mod tests {
         );
 
         store
-            .rebuild_from_configs(&configs)
+            .rebuild_from_configs(&configs, &temp.path().join("commits"))
             .await
             .expect("rebuild metadata");
 
@@ -1438,6 +1465,134 @@ mod tests {
             referrers.remove(&hard("sha256:hard")).unwrap_or_default(),
             vec![config]
         );
+    }
+
+    #[tokio::test]
+    async fn config_refs_filter_ownership_before_deduplicating_digests() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store = test_store(&temp).await;
+        let commits = temp.path().join("custom-commits");
+        let configs = temp.path().join("configs");
+        let config = configs.join("mixed-image.json");
+        let local = commits.join("shared.commit");
+        std::fs::create_dir_all(&commits)?;
+        let lowers = json!([
+            {"file": "../repository/shared", "digest": "sha256:shared", "size": 7},
+            {"file": "../custom-commits/../repository/other", "digest": "sha256:other", "size": 9},
+            {"file": local, "digest": "sha256:shared", "size": 7}
+        ]);
+        #[cfg(unix)]
+        let lowers = {
+            let mut lowers = lowers;
+            let repository = temp.path().join("repository");
+            std::fs::create_dir_all(&repository)?;
+            std::os::unix::fs::symlink(&repository, commits.join("outside"))?;
+            lowers.as_array_mut().unwrap().push(json!({
+                "file": "../custom-commits/outside/other",
+                "digest": "sha256:symlink", "size": 9
+            }));
+            lowers
+        };
+        write_config(&config, lowers, "");
+        for _ in 0..2 {
+            store
+                .record_config_refs_from_config_path(&config, &commits)
+                .await?;
+            let records = store.list_hard_commit_objects().await?;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].file.as_ref(), Some(&local));
+            store.rebuild_from_configs(&configs, &commits).await?;
+            let records = store.list_hard_commit_objects().await?;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].file.as_ref(), Some(&local));
+            assert_eq!(
+                store
+                    .plan_capacity_eviction(0, 0, u64::MAX)
+                    .await?
+                    .total_bytes,
+                7
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_removes_legacy_repository_refs_and_capacity() -> Result<()> {
+        let temp = TempDir::new()?;
+        let store = test_store(&temp).await;
+        let commits = temp.path().join("commits");
+        let configs = temp.path().join("configs");
+        let config = configs.join("published-image.json");
+        let config_id = ImageCacheConfigId::from_config_path(&config)?;
+        let digest = hard("sha256:repository");
+        let file = temp.path().join("repository/layer");
+        write_config(
+            &config,
+            json!([{"file": file, "digest": digest.as_str(), "size": 7}]),
+            "",
+        );
+        // Seed the persisted state written by the old unfiltered parser.
+        store
+            .record_hard_commit_object(digest.clone(), Some(file), Some(7), BTreeSet::new())
+            .await?;
+        let mut ops =
+            config_ref_replacement_ops(&config_id, &BTreeSet::new(), &BTreeSet::from([digest]))?;
+        ops.push(config_last_used_put_op(&config_id, 1)?);
+        store.store.write_batch(ops).await?;
+
+        for _ in 0..2 {
+            store.rebuild_from_configs(&configs, &commits).await?;
+            assert!(store.list_hard_commit_objects().await?.is_empty());
+            assert!(store.hard_commit_config_referrer_map().await?.is_empty());
+            assert_eq!(store.config_last_used(&config_id).await?, None);
+            assert_eq!(
+                store
+                    .plan_capacity_eviction(0, 0, u64::MAX)
+                    .await?
+                    .total_bytes,
+                0
+            );
+        }
+        assert!(config.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_preserves_p2p_keys_for_missing_local_copy_without_charging_repository(
+    ) -> Result<()> {
+        let temp = TempDir::new()?;
+        let store = test_store(&temp).await;
+        let commits = temp.path().join("commits");
+        let digest = hard("sha256:missing");
+        let keys = BTreeSet::from(["oci-layer/v1/missing".to_string()]);
+        store
+            .record_hard_commit_object(
+                digest.clone(),
+                Some(temp.path().join("repository/layer")),
+                Some(7),
+                keys.clone(),
+            )
+            .await?;
+        for _ in 0..2 {
+            store
+                .rebuild_from_configs(&temp.path().join("configs"), &commits)
+                .await?;
+            let record = store.get_hard_commit_object(&digest).await?.unwrap();
+            assert_eq!(
+                record.file,
+                Some(commit_index::commit_file(&commits, digest.as_str()))
+            );
+            assert_eq!(record.size, None);
+            assert_eq!(record.p2p_keys, keys);
+            assert_eq!(
+                store
+                    .plan_capacity_eviction(0, 0, u64::MAX)
+                    .await?
+                    .total_bytes,
+                0
+            );
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -1468,7 +1623,7 @@ mod tests {
         );
 
         let err = store
-            .rebuild_from_configs(&configs)
+            .rebuild_from_configs(&configs, &temp.path().join("commits"))
             .await
             .expect_err("malformed config should fail rebuild");
 
@@ -1476,7 +1631,7 @@ mod tests {
             // The "no digest" cause is a source in the error chain; the outer
             // `to_string()` only carries the "rebuild ..." context, so match the
             // full alternate-formatted chain.
-            format!("{err:#}").contains("local file but no digest"),
+            format!("{err:#}").contains("commit-store file but no digest"),
             "unexpected error: {err:#}"
         );
         let mut referrers = store
@@ -1498,7 +1653,7 @@ mod tests {
         // Both reference the shared base; a also has an exclusive layer.
         record_config(
             &store,
-            &temp.path().join(a.as_str()),
+            &temp.path().join("configs").join(a.as_str()),
             json!([
                 {
                     "file": "../commits/sha256-shared/overlaybd.commit",
@@ -1515,7 +1670,7 @@ mod tests {
         .await;
         record_config(
             &store,
-            &temp.path().join(b.as_str()),
+            &temp.path().join("configs").join(b.as_str()),
             json!([{
                 "file": "../commits/sha256-shared/overlaybd.commit",
                 "digest": "sha256:shared",

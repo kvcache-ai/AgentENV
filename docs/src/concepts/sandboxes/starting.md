@@ -92,3 +92,44 @@ default. Shrinking below the source image size requires
 applies only when creating a fresh writable root filesystem, not to read-only
 images, images with an existing upper layer, or snapshot resume. Sandbox
 responses report the effective size as `diskSizeMB`.
+
+## Build reusable images
+
+To build a standalone image, run `aenv build --image ./app`. The command prints
+the published `sha256:...` reference on stdout; build progress goes to stderr.
+Use that reference in a sandbox `image` field. Dockerfile, build
+arguments, secrets, cache, progress, and timeout flags work as for template
+builds. Template naming, startup overrides, and sandbox resource flags do not
+apply to image builds; worker resources come from the server configuration.
+
+Images are referenced by the SHA256 of its canonical OverlayBD
+image description (`sha256:...`), rather than its original OCI manifest digest.
+The description binds the ordered layer digests, platform, and OCI runtime
+configuration, including entrypoint, command, environment, and healthcheck.
+Descriptions live at `catalog/images/{digest}.json`; layer data uses the same
+content-addressed managed-layer storage as snapshots. Node-local paths are
+materialized on resolution and are not part of the image identity.
+
+Builders and runtime nodes must use the same repository. Every compatible node
+with repository access can resolve an image independently of the build node's
+cache. Local cache eviction does not remove published images. With a POSIX
+backend, cross-node use requires a shared filesystem. Publication completes
+before status becomes `ready`; failed publication does not expose a usable build
+result. Uploaded immutable objects may remain for reuse after a failed build.
+
+Image builds have an independent API:
+
+- `POST /images/builds` accepts `{ "timeout": 3600 }` and returns `buildID` and
+  the required BuildKit `imageName`.
+- `GET /images/builds/{buildID}/builder` upgrades to the BuildKit WebSocket tunnel.
+- `GET /images/builds/{buildID}` reports `waiting`, `building`, `ready`, or `error`;
+  successful results include the published description's `imageDigest`.
+- `GET /images/builds/{buildID}/logs` accepts bounded `offset` and `limit` queries.
+- `DELETE /images/builds/{buildID}` releases the worker, result, and diagnostics.
+  Published images and their shared layers are retained.
+
+Build status and logs survive worker cleanup and server restart until explicit
+deletion. The node's build journal retains results and heartbeat routing without
+occupying a build slot. Image builds do not create template records. The existing
+template builder API continues to publish runnable VM snapshots. Upgrade the
+server, gateway, and CLI together to use the image API.
