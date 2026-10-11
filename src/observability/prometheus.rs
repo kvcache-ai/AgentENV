@@ -262,6 +262,8 @@ pub fn http_route_label(path: &str) -> &'static str {
     match path {
         "/sandboxes" => "/sandboxes",
         "/sandboxes-cold" => "/sandboxes-cold",
+        "/sandboxes-compose" => "/sandboxes-compose",
+        "/sandboxes-compose/plan" => "/sandboxes-compose/plan",
         "/v2/sandboxes" => "/v2/sandboxes",
         "/snapshots" => "/snapshots",
         "/templates" => "/templates",

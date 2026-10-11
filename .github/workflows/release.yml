@@ -144,6 +144,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: services/go.mod
+          cache-dependency-path: services/go.sum
+
+      - name: Build Compose planner
+        working-directory: services
+        run: CGO_ENABLED=0 go build -trimpath -o ../target/aenv-compose-plan ./compose/cmd
+
       - name: Build server binaries
         env:
           OPENSSL_STATIC: "1"
@@ -161,6 +170,7 @@ jobs:
             BUNDLE="dist/bundle-$MODE"
             mkdir -p "$BUNDLE/ublk"
             cp target/release/server "$BUNDLE/server"
+            cp target/aenv-compose-plan "$BUNDLE/aenv-compose-plan"
             strip "$BUNDLE/server"
             cp target/release/uvm-ublk-daemon "$BUNDLE/ublk/uvm-ublk-daemon"
             strip "$BUNDLE/ublk/uvm-ublk-daemon"

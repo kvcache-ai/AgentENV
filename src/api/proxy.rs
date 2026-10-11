@@ -142,6 +142,7 @@ where
 {
     Router::new()
         .route(PROXY_ROUTE, any(proxy_via_prefix::<I>))
+        .route("/proxy/", any(proxy_via_prefix::<I>))
         .route("/proxy/{*proxy_path}", any(proxy_via_prefix::<I>))
         .fallback(proxy_via_fallback::<I>)
         .with_state(api_impl)
@@ -2521,25 +2522,28 @@ mod tests {
         let sandbox_id = SandboxId::new();
         let app = proxy_app_for_sandbox(&sandbox_id).await;
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/proxy?foo=bar")
-                    .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
-                    .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        for path in ["/proxy?foo=bar", "/proxy/?foo=bar"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(path)
+                        .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
+                        .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.status(), StatusCode::OK);
 
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let payload: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["path"], "/");
-        assert_eq!(payload["query"], "foo=bar");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let payload: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(payload["path"], "/");
+            assert_eq!(payload["query"], "foo=bar");
+        }
     }
 
     #[tokio::test]

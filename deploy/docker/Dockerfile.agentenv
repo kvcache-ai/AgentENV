@@ -2,6 +2,12 @@
 
 ARG AENV_VIRTUALIZATION_MODE=kvm
 
+FROM golang:1.25.0-bookworm AS compose-planner
+WORKDIR /src
+COPY services/go.mod services/go.sum ./
+COPY services/compose ./compose
+RUN CGO_ENABLED=0 go build -trimpath -o /aenv-compose-plan ./compose/cmd
+
 FROM rust:1-bookworm AS chef
 
 WORKDIR /build
@@ -116,6 +122,7 @@ COPY --from=builder --chmod=0755 /out-uvm-ublk-daemon /usr/local/bin/uvm-ublk-da
 COPY --from=builder --chmod=0755 /out-server /server
 
 COPY config/default.toml /workspace/config/default.toml
+COPY --from=compose-planner --chmod=0755 /aenv-compose-plan /usr/local/bin/aenv-compose-plan
 ENV AENV_CONFIG_PATH=/workspace/config/default.toml
 ENV AENV_HOME_PATH=/workspace/env
 ENV AENV_VIRTUALIZATION_MODE=${AENV_VIRTUALIZATION_MODE}

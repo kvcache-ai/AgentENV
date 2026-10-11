@@ -169,7 +169,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	websocket := isWebSocketRequest(r)
 	streaming := isStreamingRequest(r)
 	longLived := streaming || websocket
-	routingCtx, cancelRouting := context.WithTimeout(r.Context(), s.requestTimeout)
+	routingCtx, cancelRouting := context.WithTimeout(r.Context(), requestTimeoutFor(r, s.requestTimeout))
 	defer cancelRouting()
 
 	hostRoute, hostRouteErr := parseHostRoute(r.Host, s.sandboxProxyDomains)
@@ -250,13 +250,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	if !hasSandbox {
 		hint, err := buildScheduleHint(r)
 		if err != nil {
-			// this only happens it cannot read request body, so the request cannot continue
-			s.logger.Warn("Fatal error when building schedule hint",
+			s.logger.Warn("Invalid scheduling request",
 				zap.String("method", r.Method),
 				zap.String("path", r.URL.Path),
 				zap.Error(err),
 			)
-			http.Error(w, "failed to read request body", http.StatusBadRequest)
+			s.writeJSON(w, http.StatusBadRequest, map[string]any{"code": http.StatusBadRequest, "message": err.Error()})
 			return
 		}
 		rpcStart := time.Now()
@@ -536,6 +535,17 @@ func readBodyWithLimit(src io.Reader, limit int64) ([]byte, bool, error) {
 	return body, false, nil
 }
 
+// Leave room for the node's Compose deadline and response/cleanup overhead.
+func requestTimeoutFor(r *http.Request, configured time.Duration) time.Duration {
+	if r.Method == http.MethodPost {
+		switch strings.TrimRight(r.URL.Path, "/") {
+		case "/sandboxes-compose":
+			return max(configured, 330*time.Second)
+		}
+	}
+	return configured
+}
+
 func recordAssignmentTimeout(requestTimeout time.Duration) time.Duration {
 	if requestTimeout <= 0 {
 		return maxRecordAssignmentTimeout
@@ -562,7 +572,7 @@ func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox
 	}
 	path := strings.TrimRight(r.URL.Path, "/")
 	if !hasSandbox {
-		return path == "/sandboxes" || path == "/v2/sandboxes" || path == "/sandboxes-cold"
+		return path == "/sandboxes" || path == "/v2/sandboxes" || path == "/sandboxes-cold" || path == "/sandboxes-compose"
 	}
 	if routeSource != routeSourcePath {
 		return false

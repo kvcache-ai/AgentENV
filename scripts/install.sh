@@ -224,6 +224,9 @@ tar -xzf "$tmp_tarball" -C "$tmp_dir"
 
 sudo mkdir -p "$(dirname "$UBLK_DAEMON_PATH")"
 sudo install -m 0755 "$tmp_dir/server" "${INSTALL_DIR}/server"
+if [[ -f "$tmp_dir/aenv-compose-plan" ]]; then
+    sudo install -m 0755 "$tmp_dir/aenv-compose-plan" "${INSTALL_DIR}/aenv-compose-plan"
+fi
 sudo install -m 0755 "$tmp_dir/ublk/uvm-ublk-daemon" "$UBLK_DAEMON_PATH"
 
 if [[ -d "$tmp_dir/deps" ]]; then
