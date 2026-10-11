@@ -26,7 +26,7 @@ enum Cmd {
     /// Build a template from a base image.
     /// Waits for the build to complete by default; exits non-zero on failure. Use -d to return immediately.
     Pull(commands::pull::Args),
-    /// Build a template from a local Dockerfile
+    /// Build a template or image from a local Dockerfile
     Build(Box<commands::build::Args>),
     /// Start a sandbox and attach an interactive shell
     Start(commands::start::Args),

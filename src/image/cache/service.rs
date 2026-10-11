@@ -218,7 +218,7 @@ impl ImageCacheService {
     ) -> Result<()> {
         self.metadata_store()
             .await?
-            .record_config_refs_from_config_path(image_config_path)
+            .record_config_refs_from_config_path(image_config_path, &self.commit_store)
             .await?;
         Ok(())
     }
@@ -244,7 +244,7 @@ impl ImageCacheService {
     async fn rebuild_metadata_from_configs(&self) -> Result<()> {
         self.metadata_store()
             .await?
-            .rebuild_from_configs(&self.config_dir)
+            .rebuild_from_configs(&self.config_dir, &self.commit_store)
             .await
     }
 
@@ -2063,6 +2063,178 @@ mod tests {
                 .unwrap_or_default(),
             vec![ImageCacheConfigId::from_config_path(&published_path).expect("config id")]
         );
+    }
+
+    #[tokio::test]
+    async fn published_posix_image_does_not_own_or_charge_local_commits() -> Result<()> {
+        use crate::cfg::ImageConfig;
+        use crate::image::{ImageResolver, ResolvedBlockImage};
+        use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+
+        let temp = TempDir::new()?;
+        let node = temp.path().join("node");
+        let mut config = AppConfig::default();
+        ImageConfig::normalize(&mut config.image, &node, &node);
+        let service = ImageCacheService::shared_from_app_config(&config);
+        let resolver = ImageResolver::new(&config);
+        let repository = PosixFsBackend::new(PosixFsBackendConfig {
+            root: temp.path().join("repository"),
+            cache_root: Some(temp.path().join("repository-cache")),
+            runtime_cache_root: None,
+        })?;
+        resolver.set_repository(repository.repository());
+        let (_, _, manifest) =
+            crate::snapshot::mock::write_mock_built_artifacts(&temp.path().join("build"))?;
+        let digest = resolver
+            .publish_image(&ResolvedBlockImage {
+                image_ref: crate::digest::sha256_digest(b"source manifest"),
+                overlaybd_config_path: manifest.rootfs.image_config_path,
+                base_context: ImageBaseContext::default(),
+                raw_config: Some(json!({"Cmd": ["/bin/true"]})),
+            })
+            .await?;
+
+        // Check the initial publish, cache hits, and reconciliation separately.
+        let metadata = service.metadata_store().await?;
+        for _ in 0..2 {
+            let resolved = resolver.resolve(&digest).await?;
+            assert!(resolved
+                .overlaybd_config_path
+                .starts_with(&service.config_dir));
+            assert!(metadata.list_hard_commit_objects().await?.is_empty());
+            service.rebuild_metadata_from_configs().await?;
+            assert!(metadata.list_hard_commit_objects().await?.is_empty());
+            assert_eq!(
+                metadata
+                    .plan_capacity_eviction(0, 0, u64::MAX)
+                    .await?
+                    .total_bytes,
+                0
+            );
+        }
+
+        // A converted source can have a separate local copy of the same layer.
+        let resolved = resolver.resolve(&digest).await?;
+        let published = overlaybd::config::load_image_config(&resolved.overlaybd_config_path)?;
+        let layer = &published.lowers[0];
+        let repository_file = PathBuf::from(&layer.file);
+        let payload = std::fs::read(&repository_file)?;
+        let local = write_commit_file(&service, &layer.digest, &payload);
+        let source_config = service.config_dir.join("converted-image.json");
+        write_image_config(
+            &source_config,
+            "",
+            json!([{"file": local, "digest": layer.digest, "size": layer.size}]),
+        );
+        service
+            .record_source_config_refs_from_config_path(&source_config)
+            .await?;
+        for _ in 0..2 {
+            resolver.resolve(&digest).await?;
+            let records = metadata.list_hard_commit_objects().await?;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].file.as_ref(), Some(&local));
+            service.rebuild_metadata_from_configs().await?;
+            let records = metadata.list_hard_commit_objects().await?;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].file.as_ref(), Some(&local));
+            assert_eq!(
+                metadata
+                    .plan_capacity_eviction(0, 0, u64::MAX)
+                    .await?
+                    .total_bytes,
+                layer.size
+            );
+        }
+
+        // Evicting the source must collect only its local copy, even while the
+        // published config continues to refer to the same digest in POSIX.
+        let report = service
+            .run_maintenance(Vec::new(), Some((0, 0)), Duration::ZERO)
+            .await?;
+        assert_eq!(report.collected, 1);
+        assert_eq!(report.freed_bytes, layer.size);
+        assert!(!source_config.exists());
+        assert!(!local.exists());
+        assert_eq!(std::fs::read(&repository_file)?, payload);
+        assert!(resolved.overlaybd_config_path.exists());
+        resolver.resolve(&digest).await?;
+        assert!(metadata.list_hard_commit_objects().await?.is_empty());
+        assert_eq!(
+            metadata
+                .plan_capacity_eviction(0, 0, u64::MAX)
+                .await?
+                .total_bytes,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_repairs_repository_records_after_source_config_eviction() -> Result<()> {
+        let temp = TempDir::new()?;
+        let service = Arc::new(test_service(&temp));
+        let p2p = Arc::new(MockTransport::default());
+        service.initialize_p2p_transport(p2p.clone());
+        let local = write_commit_file(&service, "sha256:shared", b"shared");
+        let repository = temp.path().join("repository");
+        std::fs::create_dir_all(&repository)?;
+        let repository_shared = repository.join("shared");
+        let repository_only = repository.join("only");
+        std::fs::write(&repository_shared, b"shared")?;
+        std::fs::write(&repository_only, b"only")?;
+        let key = "oci-layer/v1/shared".to_string();
+        // Simulate the old writer overwriting the local record's path, with
+        // the converted source config already evicted before this rebuild.
+        service
+            .record_hard_commit_object(
+                "sha256:shared",
+                Some(repository_shared.clone()),
+                Some(6),
+                std::slice::from_ref(&key),
+            )
+            .await?;
+        service
+            .record_hard_commit_object("sha256:only", Some(repository_only.clone()), Some(4), &[])
+            .await?;
+        let published_config = service.config_dir.join("published-image.json");
+        write_image_config(
+            &published_config,
+            "",
+            json!([
+                {"file": repository_shared, "digest": "sha256:shared", "size": 6},
+                {"file": repository_only, "digest": "sha256:only", "size": 4}
+            ]),
+        );
+
+        let metadata = service.metadata_store().await?;
+        for _ in 0..2 {
+            service.rebuild_metadata_from_configs().await?;
+            let records = metadata.list_hard_commit_objects().await?;
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].file.as_ref(), Some(&local));
+            assert_eq!(records[0].p2p_keys, BTreeSet::from([key.clone()]));
+            assert!(metadata.hard_commit_config_referrer_map().await?.is_empty());
+            assert_eq!(
+                metadata
+                    .plan_capacity_eviction(0, 0, u64::MAX)
+                    .await?
+                    .total_bytes,
+                6
+            );
+        }
+        let report = service
+            .run_gc(ImageCacheLiveRuntimeRefs::new(), true)
+            .await?;
+        assert_eq!(report.collected, 1);
+        assert_eq!(report.freed_bytes, 6);
+        assert_eq!(*p2p.unpublished_keys.read().await, vec![key]);
+        assert!(!local.exists());
+        assert!(metadata.list_hard_commit_objects().await?.is_empty());
+        assert_eq!(std::fs::read(repository_shared)?, b"shared");
+        assert_eq!(std::fs::read(repository_only)?, b"only");
+        assert!(published_config.exists());
+        Ok(())
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use super::{ApiImpl, BuildJournal, BuildSession, SessionState};
+use super::{ApiImpl, BuildJournal, BuildSession, ImageBuildResult, SessionState};
 use crate::{snapshot::TemplateBuildErrorReason, snapshot::TemplateBuildStatus, types::SandboxId};
 use anyhow::{Context, Result};
 use std::{sync::Arc, time::Duration};
@@ -16,6 +16,22 @@ impl ApiImpl {
             .await;
             if let Err(error) = result {
                 warn!(key = %String::from_utf8_lossy(&key), error = %format_args!("{error:#}"), "build recovery failed; journal retained for retry");
+            }
+        }
+        // Results retain routing after workers exit. Recovery and deletion
+        // serialize so a concurrent scan cannot resurrect a deleted route.
+        {
+            let _routes = self.build_sessions.result_routes.lock().await;
+            for (key, _) in journal.scan_prefix(b"image/".to_vec()).await? {
+                let id = std::str::from_utf8(&key[6..])
+                    .context("invalid image result key")
+                    .and_then(|id| SandboxId::parse_str(id).map_err(Into::into));
+                match id {
+                    Ok(id) => self.orchestrator.register_template_build(id).await,
+                    Err(error) => {
+                        warn!(key = %String::from_utf8_lossy(&key), %error, "invalid image result routing identity")
+                    }
+                }
             }
         }
         self.collect_retired_build_caches().await?;
@@ -76,14 +92,14 @@ impl ApiImpl {
         };
         let entry: BuildJournal = serde_json::from_slice(&value)?;
         let persisted: Result<()> = async {
-            if let Some(reason) = reason {
+            if let Some(reason) = reason.as_ref().filter(|_| !entry.image_only) {
                 if let Some(record) = self.snapshot_manager.get(id).await? {
                     if matches!(
                         super::super::template::template_build_status(&record),
                         TemplateBuildStatus::Waiting | TemplateBuildStatus::Building
                     ) {
                         self.snapshot_manager
-                            .mark_build_error(&record.id, reason)
+                            .mark_build_error(&record.id, reason.clone())
                             .await?;
                     }
                 }
@@ -94,9 +110,32 @@ impl ApiImpl {
         self.release_builder(id, &entry.cache).await?;
         self.cleanup_build_cache(id, &entry).await?;
         persisted?;
-        self.orchestrator
-            .unregister_template_build(sandbox_id)
-            .await;
+        if entry.image_only {
+            let _routes = self.build_sessions.result_routes.lock().await;
+            let result_key = format!("image/{id}");
+            if !self.image_build_info(id).await?.is_some_and(|info| {
+                matches!(
+                    info.status,
+                    agentenv_http_server::models::ImageBuildStatus::Ready
+                        | agentenv_http_server::models::ImageBuildStatus::Error
+                )
+            }) {
+                let reason = reason.unwrap_or_else(|| {
+                    TemplateBuildErrorReason::new("image publication did not complete")
+                });
+                journal
+                    .put(
+                        result_key,
+                        serde_json::to_vec(&ImageBuildResult::Error { reason })?,
+                    )
+                    .await?;
+            }
+        }
+        if journal.get(format!("image/{id}")).await?.is_none() {
+            self.orchestrator
+                .unregister_template_build(sandbox_id)
+                .await;
+        }
         journal.delete(key).await?;
         self.build_sessions.active.lock().unwrap().remove(id);
         Ok(())

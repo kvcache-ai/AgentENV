@@ -28,7 +28,28 @@ pub(crate) fn router<I: AsRef<ApiImpl> + Clone + Send + Sync + 'static>(state: I
             "/templates/{template_id}/builds/{build_id}/builder",
             get(connect::<I>),
         )
+        .route("/images/builds/{build_id}/builder", get(connect_image::<I>))
         .with_state(state)
+}
+
+async fn connect_image<I: AsRef<ApiImpl>>(
+    State(state): State<I>,
+    Path(build_id): Path<String>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    match state.as_ref().image_build_info(&build_id).await {
+        Ok(Some(_)) => connect_session(state.as_ref(), &build_id, &build_id, ws).await,
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiImpl::error(404, "image build not found")),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiImpl::internal_error(error.as_ref())),
+        )
+            .into_response(),
+    }
 }
 
 async fn connect<I: AsRef<ApiImpl>>(
@@ -36,8 +57,29 @@ async fn connect<I: AsRef<ApiImpl>>(
     Path((template_id, build_id)): Path<(String, String)>,
     ws: WebSocketUpgrade,
 ) -> Response {
+    match state.as_ref().snapshot_manager.get(&template_id).await {
+        Ok(Some(_)) => connect_session(state.as_ref(), &template_id, &build_id, ws).await,
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiImpl::error(404, "template build not found")),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiImpl::snapshot_manager_error(&error)),
+        )
+            .into_response(),
+    }
+}
+
+async fn connect_session(
+    api: &ApiImpl,
+    template_id: &str,
+    build_id: &str,
+    ws: WebSocketUpgrade,
+) -> Response {
     let result = async {
-        let session = state.as_ref().session(&template_id, &build_id)?;
+        let session = api.session(template_id, build_id)?;
         let SessionState::Ready(address) = *session.state.borrow() else {
             return Err(ApiImpl::error(409, "builder is not ready"));
         };
@@ -52,6 +94,7 @@ async fn connect<I: AsRef<ApiImpl>>(
         Ok((stream, session.state.subscribe(), connection))
     }
     .await;
+    let build_id = build_id.to_owned();
     match result {
         Ok((stream, state, connection)) => ws
             .max_message_size(1024 * 1024)

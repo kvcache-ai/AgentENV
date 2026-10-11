@@ -858,18 +858,16 @@ impl SnapshotRepository for OssSnapshotRepository {
         .await
     }
 
-    async fn publish_volume_backing(
+    async fn publish_image_layers(
         &self,
-        _volume_id: &str,
         image_config_path: &std::path::Path,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
         self.derive_and_upload_volume_layers(image_config_path)
             .await
     }
 
-    async fn materialize_volume_backing(
+    async fn materialize_image_layers(
         &self,
-        _volume_id: &str,
         layers: &[OverlaybdLayerRef],
         destination: &std::path::Path,
     ) -> RepositoryResult<std::path::PathBuf> {
@@ -882,6 +880,83 @@ impl SnapshotRepository for OssSnapshotRepository {
             ..LayerConfig::default()
         })
         .await
+    }
+
+    async fn put_image(&self, image: &crate::image::PublishedImage) -> RepositoryResult<String> {
+        let (digest, bytes) = image
+            .encode()
+            .map_err(|error| RepositoryError::backend("encode image", error))?;
+        let key = crate::image::PublishedImage::key(&digest)
+            .map_err(|error| RepositoryError::backend("image catalog key", error))?;
+        self.client
+            .put_bytes(&key, bytes, OssUploadArtifact::CatalogRecord)
+            .await
+            .map_err(|error| RepositoryError::backend("publish image description", error))?;
+        Ok(digest)
+    }
+
+    async fn list_image_digests(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> RepositoryResult<Vec<String>> {
+        let after = after
+            .map(crate::image::PublishedImage::key)
+            .transpose()
+            .map_err(|error| RepositoryError::InvalidRequest {
+                reason: error.to_string(),
+            })?;
+        self.client
+            .list_keys_page("catalog/images/", after.as_deref(), limit)
+            .await
+            .map_err(|error| RepositoryError::backend("list images", error))?
+            .into_iter()
+            .map(|key| {
+                let digest = key
+                    .strip_prefix("catalog/images/")
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .ok_or_else(|| RepositoryError::InvalidRequest {
+                        reason: "invalid image catalog key".into(),
+                    })?;
+                crate::image::buildkit::validate_digest(digest).map_err(|error| {
+                    RepositoryError::InvalidRequest {
+                        reason: error.to_string(),
+                    }
+                })?;
+                Ok(digest.to_owned())
+            })
+            .collect()
+    }
+
+    async fn delete_image(&self, digest: &str) -> RepositoryResult<()> {
+        let key = crate::image::PublishedImage::key(digest).map_err(|error| {
+            RepositoryError::InvalidRequest {
+                reason: error.to_string(),
+            }
+        })?;
+        self.client
+            .delete(&key)
+            .await
+            .map_err(|error| RepositoryError::backend("delete image", error))
+    }
+
+    async fn get_image(
+        &self,
+        digest: &str,
+    ) -> RepositoryResult<Option<crate::image::PublishedImage>> {
+        let key = crate::image::PublishedImage::key(digest).map_err(|error| {
+            RepositoryError::InvalidRequest {
+                reason: error.to_string(),
+            }
+        })?;
+        let bytes = match self.client.get_bytes(&key).await {
+            Ok(bytes) => bytes,
+            Err(error) if OssClient::is_not_found_error(&error) => return Ok(None),
+            Err(error) => return Err(RepositoryError::backend("read image description", error)),
+        };
+        crate::image::PublishedImage::decode(digest, &bytes)
+            .map(Some)
+            .map_err(|error| RepositoryError::backend("verify image description", error))
     }
 
     async fn delete_volume(&self, volume_id: &str) -> RepositoryResult<()> {
@@ -2165,6 +2240,196 @@ mod tests {
     use object_store_operator::CredentialSource;
     use overlaybd::config::ImageConfig;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn published_images_round_trip_through_object_storage_without_source_files(
+    ) -> anyhow::Result<()> {
+        use crate::image::PublishedImage;
+        use axum::{
+            body::{Body, Bytes},
+            extract::{Path as Key, Query, State},
+            http::{Method, Response, StatusCode},
+            routing::any,
+            Router,
+        };
+        type Objects = Arc<tokio::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>;
+        async fn object(
+            State(objects): State<Objects>,
+            Key(key): Key<String>,
+            Query(query): Query<std::collections::HashMap<String, String>>,
+            method: Method,
+            body: Bytes,
+        ) -> Response<Body> {
+            let mut objects = objects.lock().await;
+            if method == Method::GET && query.contains_key("list-type") {
+                let prefix = query.get("prefix").map(String::as_str).unwrap_or("");
+                let after = query
+                    .get("continuation-token")
+                    .or_else(|| query.get("start-after"))
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let limit = query
+                    .get("max-keys")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(1000);
+                let mut keys: Vec<_> = objects
+                    .keys()
+                    .filter_map(|key| key.strip_prefix("bucket/"))
+                    .filter(|key| key.starts_with(prefix) && *key > after)
+                    .collect();
+                keys.sort();
+                let truncated = keys.len() > limit;
+                keys.truncate(limit);
+                let mut xml = format!("<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>bucket</Name><IsTruncated>{truncated}</IsTruncated>");
+                for key in &keys {
+                    xml.push_str(&format!(
+                        "<Contents><Key>{key}</Key><Size>{}</Size><LastModified>2026-01-01T00:00:00Z</LastModified></Contents>",
+                        objects[&format!("bucket/{key}")].len()
+                    ));
+                }
+                if truncated {
+                    xml.push_str(&format!(
+                        "<NextContinuationToken>{}</NextContinuationToken>",
+                        keys.last().unwrap()
+                    ));
+                }
+                xml.push_str("</ListBucketResult>");
+                return Response::new(Body::from(xml));
+            }
+            if method == Method::PUT {
+                objects.insert(key, body.to_vec());
+                return Response::new(Body::empty());
+            }
+            if method == Method::DELETE {
+                objects.remove(&key);
+                return Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(Body::empty())
+                    .unwrap();
+            }
+            match objects.get(&key) {
+                Some(bytes) => Response::builder()
+                    .header("content-length", bytes.len())
+                    .body(if method == Method::HEAD {
+                        Body::empty()
+                    } else {
+                        Body::from(bytes.clone())
+                    })
+                    .unwrap(),
+                None => Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::from("<Error><Code>NoSuchKey</Code></Error>"))
+                    .unwrap(),
+            }
+        }
+        let objects = Objects::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let router = Router::new()
+            .route("/{*key}", any(object))
+            .with_state(objects.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let result = async {
+            let repository = || -> anyhow::Result<OssSnapshotRepository> {
+                Ok(OssSnapshotRepository::new(
+                    Arc::new(OssClient::new(
+                        "bucket".into(),
+                        endpoint.clone(),
+                        "region".into(),
+                        "prefix".into(),
+                        CredentialSource::Static(object_store_operator::ResolvedCredential {
+                            access_key_id: "test-key".into(),
+                            secret_access_key: "test-secret".into(),
+                            security_token: None,
+                            expires_at: None,
+                        }),
+                        None,
+                    )?),
+                    SnapshotImageStoragePolicy::ObjectStorage,
+                    &SnapshotPublishCompressionConfig {
+                        enabled: false,
+                        ..Default::default()
+                    },
+                ))
+            };
+            let publisher = repository()?;
+            let source = tempfile::tempdir()?;
+            let (_, _, manifest) =
+                crate::snapshot::mock::write_mock_built_artifacts(source.path())?;
+            let layers = publisher
+                .publish_image_layers(&manifest.rootfs.image_config_path)
+                .await?;
+            let image = PublishedImage::new("amd64".into(), layers, json!({"Cmd": ["serve"]}));
+            let digest = publisher.put_image(&image).await?;
+            assert_eq!(publisher.put_image(&image).await?, digest);
+            let (one, two) = tokio::join!(publisher.put_image(&image), publisher.put_image(&image));
+            assert_eq!(one?, two?);
+            drop(source);
+            let reader = repository()?;
+            let fetched = reader.get_image(&digest).await?.unwrap();
+            assert_eq!(fetched.encode()?, image.encode()?);
+            let key = format!("bucket/prefix/{}", PublishedImage::key(&digest)?);
+            let bytes = objects.lock().await.get(&key).unwrap().clone();
+            assert_eq!(crate::digest::sha256_digest(&bytes), digest);
+            assert!(!String::from_utf8(bytes)?.contains("/tmp/"));
+            for layer in &fetched.layers {
+                let OverlaybdLayerRef::Managed(layer) = layer else {
+                    panic!("image must own its layers")
+                };
+                let key = format!("bucket/prefix/managed-layers/{}", layer.digest);
+                let bytes = objects.lock().await.get(&key).unwrap().clone();
+                assert_eq!(crate::digest::sha256_digest(&bytes), layer.digest);
+                assert_eq!(bytes.len() as u64, layer.size);
+            }
+            let destination = tempfile::tempdir()?;
+            let path = reader
+                .materialize_image_layers(&fetched.layers, &destination.path().join("image.json"))
+                .await?;
+            let config: ImageConfig = serde_json::from_slice(&tokio::fs::read(path).await?)?;
+            assert!(config.lowers.iter().all(|layer| layer.file.is_empty()
+                && layer.repo_blob_url == "s3://bucket/prefix/managed-layers"));
+            assert!(reader
+                .get_image(&crate::digest::sha256_digest(b"missing"))
+                .await?
+                .is_none());
+            let other = PublishedImage::new(
+                "amd64".into(),
+                image.layers.clone(),
+                json!({"Cmd": ["other"]}),
+            );
+            let other_digest = publisher.put_image(&other).await?;
+            let mut expected = vec![digest.clone(), other_digest.clone()];
+            expected.sort();
+            assert_eq!(reader.list_image_digests(None, 10).await?, expected);
+            assert_eq!(reader.list_image_digests(None, 1).await?, expected[..1]);
+            assert_eq!(
+                reader.list_image_digests(Some(&expected[0]), 1).await?,
+                expected[1..]
+            );
+            for _ in 0..2 {
+                reader.delete_image(&other_digest).await?;
+            }
+            assert!(reader.get_image(&other_digest).await?.is_none());
+            assert_eq!(
+                reader.list_image_digests(None, 10).await?,
+                vec![digest.clone()]
+            );
+            for layer in &config.lowers {
+                assert!(objects
+                    .lock()
+                    .await
+                    .contains_key(&format!("bucket/prefix/managed-layers/{}", layer.digest)));
+            }
+            objects.lock().await.insert(key, b"tampered".to_vec());
+            assert!(reader.get_image(&digest).await.is_err());
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        server.abort();
+        result
+    }
 
     fn write_test_image(path: &Path, value: serde_json::Value) {
         std::fs::write(

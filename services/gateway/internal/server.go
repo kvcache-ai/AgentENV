@@ -216,8 +216,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	} else if isSandboxControlPlaneRequest(r) {
 		sandboxID, hasSandbox = sandboxIDFromPath(r.URL.Path)
 		routeSource = routeSourcePath
-	} else if isTemplateBuilderAllocation(r) {
+	} else if isTemplateBuilderAllocation(r) || isImageBuilderAllocation(r) || isImageCatalogRequest(r) {
 		routeSource = routeSourceSchedule
+	} else if buildID, ok := imageBuildIDFromPath(r.URL.Path); ok {
+		sandboxID, hasSandbox = buildID, true
+		routeSource = routeSourcePath
 	} else if buildID, ok := templateBuildIDFromPath(r.URL.Path); ok {
 		sandboxID, hasSandbox = buildID, true
 		buildReadRequest = r.Method == http.MethodGet && (strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/status") || strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/logs"))
@@ -236,7 +239,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		resp, err := s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
 		recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
 		if buildReadRequest && status.Code(err) == codes.NotFound {
-			// Completed and legacy builds use the shared template repository.
+			// Published templates use the shared repository.
 			hasSandbox = false
 			routeSource = routeSourceSchedule
 			setGatewayRouteSource(w, routeSource)
@@ -441,6 +444,16 @@ func (e *proxyResponseError) Error() string {
 func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestPath string) error {
 	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
 	defer cancelRecord()
+	if strings.TrimRight(requestPath, "/") == "/images/builds" {
+		buildID := strings.TrimSpace(resp.Header.Get("x-agentenv-build-id"))
+		if buildID == "" {
+			return &proxyResponseError{statusCode: http.StatusBadGateway, message: "upstream image build response is missing its build ID"}
+		}
+		if err := s.recordAssignment(recordCtx, buildID, node, "image_build"); err != nil {
+			return &proxyResponseError{statusCode: http.StatusServiceUnavailable, message: "failed to route allocated image build", cause: err}
+		}
+		return nil
+	}
 	if buildID, ok := v2TemplateBuildIDFromPath(requestPath); ok {
 		if err := s.recordAssignment(recordCtx, buildID, node, "template_build"); err != nil {
 			return &proxyResponseError{statusCode: http.StatusServiceUnavailable, message: "failed to route allocated build", cause: err}
@@ -554,7 +567,7 @@ func flushInterval(flushImmediately bool) time.Duration {
 }
 
 func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox bool) bool {
-	if isTemplateBuilderAllocation(r) {
+	if isTemplateBuilderAllocation(r) || isImageBuilderAllocation(r) {
 		return true
 	}
 	if r.Method != http.MethodPost {
@@ -671,6 +684,31 @@ func isSandboxControlPlaneRequest(r *http.Request) bool {
 	default:
 		return false
 	}
+}
+
+func isImageBuilderAllocation(r *http.Request) bool {
+	return r.Method == http.MethodPost && strings.TrimRight(r.URL.Path, "/") == "/images/builds"
+}
+
+// Image records live in the shared repository and have no worker binding.
+func isImageCatalogRequest(r *http.Request) bool {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if parts[0] != "images" {
+		return false
+	}
+	return len(parts) == 1 && r.Method == http.MethodGet ||
+		len(parts) == 2 && parts[1] != "builds" && (r.Method == http.MethodGet || r.Method == http.MethodDelete)
+}
+
+func imageBuildIDFromPath(path string) (string, bool) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if (len(parts) != 3 && len(parts) != 4) || parts[0] != "images" || parts[1] != "builds" || parts[2] == "" {
+		return "", false
+	}
+	if len(parts) == 4 && parts[3] != "builder" && parts[3] != "logs" {
+		return "", false
+	}
+	return parts[2], true
 }
 
 func isTemplateBuilderAllocation(r *http.Request) bool {
@@ -978,8 +1016,12 @@ func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
 	}
 
 	_, templateBuildRequest := templateBuildIDFromPath(r.URL.Path)
+	_, imageBuildRequest := imageBuildIDFromPath(r.URL.Path)
 	return !isSandboxControlPlaneRequest(r) &&
 		!templateBuildRequest &&
+		!imageBuildRequest &&
+		!isImageBuilderAllocation(r) &&
+		!isImageCatalogRequest(r) &&
 		!isTemplateBuilderAllocation(r) &&
 		hasCompleteProxyRouteHeaders(r.Header)
 }

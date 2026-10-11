@@ -72,6 +72,58 @@ class BuildKitTests(unittest.TestCase):
                 data = json.loads(data)
             return response.status, data
 
+    def test_native_image_build_and_catalog_lifecycle(self):
+        context = self.work / "native-image"
+        context.mkdir()
+        (context / "Dockerfile").write_text(
+            f"FROM busybox:1.37\nRUN echo {self.prefix} >/marker\n"
+            'ENV IMAGE_KIND=native\nCMD ["sleep", "infinity"]\n')
+        result = subprocess.run(
+            [AENV, "build", "--image", str(context), "--buildctl", BUILDCTL,
+             "--progress", "plain"], capture_output=True, text=True, timeout=900)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        digest = result.stdout.strip()
+        self.assertRegex(digest, r"^sha256:[0-9a-f]{64}$")
+        self.addCleanup(self.api, "DELETE", f"/images/{digest}")
+
+        def request(method, path, body=None, expected=200):
+            status, data = self.api(method, path, body)
+            self.assertEqual(status, expected, data)
+            return data
+
+        detail = request("GET", f"/images/{digest}")
+        self.assertEqual(detail["imageDigest"], digest)
+        encoded = json.dumps(detail["description"], sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        self.assertEqual("sha256:" + hashlib.sha256(encoded).hexdigest(), digest)
+        build_ids = re.findall(r"Allocated image build ([0-9a-f-]+)", result.stderr)
+        self.assertEqual(len(build_ids), 1, result.stderr)
+        self.assertEqual(self.api("GET", f"/images/builds/{build_ids[0]}")[0], 404)
+        status, created = self.api("POST", "/sandboxes-cold", {"image": digest, "timeout": 900})
+        self.assertEqual(status, 201, created)
+        sandbox = created["sandboxID"]
+        self.sandboxes.add(sandbox)
+        self.assertEqual(self.cli("exec", sandbox, "cat", "/marker"), self.prefix)
+        self.cli("exec", sandbox, "sh", "-c", "echo private >/marker")
+        snapshot = request("POST", f"/sandboxes/{sandbox}/snapshots", {}, expected=201)["snapshotID"]
+        self.addCleanup(self.api, "DELETE", f"/templates/{snapshot}")
+        request("DELETE", f"/images/{digest}", expected=204)
+        request("GET", f"/images/{digest}", expected=404)
+        missing = request("POST", "/sandboxes-cold", {"image": digest, "timeout": 60}, expected=400)
+        self.assertIn(digest, missing["message"])
+        self.assertEqual(self.cli("exec", sandbox, "cat", "/marker"), "private")
+        request("POST", f"/sandboxes/{sandbox}/pause", expected=204)
+        request("POST", f"/sandboxes/{sandbox}/connect", {"timeout": 900}, expected=201)
+        self.assertEqual(self.cli("exec", sandbox, "cat", "/marker"), "private")
+        fork = request("POST", f"/sandboxes/{sandbox}/fork", {"count": 1, "timeout": 900}, expected=201)[0]["sandbox"]
+        self.sandboxes.add(fork["sandboxID"])
+        self.addCleanup(self.api, "DELETE", f"/templates/{fork['templateID']}")
+        self.cli("exec", fork["sandboxID"], "sh", "-c", "echo child >/marker")
+        self.assertEqual(self.cli("exec", sandbox, "cat", "/marker"), "private")
+        restored = request("POST", "/sandboxes", {"templateID": snapshot, "timeout": 900}, expected=201)["sandboxID"]
+        self.sandboxes.add(restored)
+        self.assertEqual(self.cli("exec", restored, "cat", "/marker"), "private")
+
+
     def node_counts(self):
         status, nodes = self.api("GET", "/nodes")
         self.assertEqual(status, 200, nodes)

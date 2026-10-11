@@ -747,7 +747,9 @@ components:
         image:
           type: string
           description: >
-            Explicit external OCI image reference to use as the sandbox rootfs.
+            External OCI image reference or published OverlayBD description
+            digest (sha256:...) to use as the sandbox rootfs. Published images
+            are resolved from the configured shared repository.
             Cold starts may pull and convert OCI layers on a cache miss and can
             take tens of seconds.
         timeout:
@@ -1113,6 +1115,79 @@ components:
           $ref: "#/components/schemas/CPUCount"
         memoryMB:
           $ref: "#/components/schemas/MemoryMB"
+
+    ImageSummary:
+      type: object
+      required: [imageDigest, os, architecture, layerCount]
+      properties:
+        imageDigest:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+        os:
+          type: string
+        architecture:
+          type: string
+        layerCount:
+          type: integer
+          format: uint32
+    ImagePage:
+      type: object
+      required: [images]
+      properties:
+        images:
+          type: array
+          items:
+            $ref: '#/components/schemas/ImageSummary'
+        nextToken:
+          type: string
+          description: Digest cursor for the next page; omitted at the end. Concurrent publication and deletion may change subsequent pages.
+    ImageDetails:
+      type: object
+      required: [imageDigest, description]
+      properties:
+        imageDigest:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+        description:
+          type: object
+          description: Immutable OverlayBD description containing schemaVersion, os, architecture, ordered layers, and OCI runtime config. Its canonical JSON SHA256 is imageDigest.
+
+    ImageBuildRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        timeout:
+          type: integer
+          format: uint32
+          minimum: 1
+          maximum: 86400
+          description: Builder preparation and solve deadline in seconds; defaults to 3600.
+    ImageBuilder:
+      type: object
+      required: [buildID, imageName]
+      properties:
+        buildID:
+          type: string
+        imageName:
+          type: string
+          description: Required BuildKit image exporter name. The server publishes an OverlayBD image after the solve completes.
+    ImageBuildStatus:
+      type: string
+      enum: [waiting, building, ready, error]
+    ImageBuildInfo:
+      type: object
+      required: [buildID, status]
+      properties:
+        buildID:
+          type: string
+        status:
+          $ref: '#/components/schemas/ImageBuildStatus'
+        imageDigest:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: SHA256 of the canonical OverlayBD image description in the shared repository, binding ordered layers and OCI runtime configuration. Available only when ready; usable as a sandbox image reference.
+        reason:
+          $ref: '#/components/schemas/BuildStatusReason'
 
     TemplateBuilderRequest:
       type: object
@@ -1579,8 +1654,200 @@ tags:
   - name: sandboxes
   - name: snapshots
   - name: volumes
+  - name: images
 
 paths:
+  /images:
+    get:
+      summary: List published images
+      description: Lists images in the configured shared repository, ordered by digest. A cursor continues after the last scanned digest, even if that image has since been deleted.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            format: uint32
+            minimum: 1
+            maximum: 100
+            default: 100
+        - name: nextToken
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Published image page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImagePage'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '500':
+          $ref: '#/components/responses/500'
+  /images/{imageDigest}:
+    parameters:
+      - name: imageDigest
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      summary: Inspect a published image
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Published image details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageDetails'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '404':
+          $ref: '#/components/responses/404'
+        '500':
+          $ref: '#/components/responses/500'
+    delete:
+      summary: Delete a published image
+      description: Idempotently removes the image description. New resolutions fail until the image is published again. Existing workloads and snapshots retain their layers. Shared layer data is retained; deletion does not reclaim repository storage immediately.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '204':
+          description: Image deleted
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '500':
+          $ref: '#/components/responses/500'
+  /images/builds:
+    post:
+      summary: Prepare an image build
+      description: Allocate an independent BuildKit worker. Connect buildctl through the WebSocket at /images/builds/{buildID}/builder using the returned imageName. Completion publishes the OverlayBD layers and description to the configured shared repository. No template is created.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImageBuildRequest'
+      responses:
+        '202':
+          description: Builder preparation accepted
+          headers:
+            x-agentenv-build-id:
+              description: Build identifier used by the gateway for routing.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageBuilder'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '429':
+          description: Concurrent build limit reached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/500'
+  /images/builds/{buildID}:
+    parameters:
+      - $ref: '#/components/parameters/buildID'
+    get:
+      summary: Get image build status
+      description: Results survive worker cleanup and node restart until explicit deletion. Ready means all image objects are durable in the repository.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Image build status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImageBuildInfo'
+        '401':
+          $ref: '#/components/responses/401'
+        '404':
+          $ref: '#/components/responses/404'
+        '500':
+          $ref: '#/components/responses/500'
+    delete:
+      summary: Release an image build
+      description: Cancel the worker and delete the build result and logs. Published images and shared layers are retained. Publication already in progress finishes before the build can be deleted.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '204':
+          description: Builder released
+        '401':
+          $ref: '#/components/responses/401'
+        '404':
+          $ref: '#/components/responses/404'
+        '409':
+          $ref: '#/components/responses/409'
+        '500':
+          $ref: '#/components/responses/500'
+  /images/builds/{buildID}/logs:
+    get:
+      summary: Get image build logs
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/buildID'
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            format: uint32
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            format: uint32
+            minimum: 0
+            maximum: 100
+            default: 100
+      responses:
+        '200':
+          description: Image build logs
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/BuildLogEntry'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '404':
+          $ref: '#/components/responses/404'
+        '500':
+          $ref: '#/components/responses/500'
+
   /health:
     get:
       summary: Health check

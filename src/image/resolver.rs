@@ -51,8 +51,8 @@ pub struct ResolvedBlockImage {
     pub raw_config: Option<serde_json::Value>,
 }
 
-#[derive(Debug)]
 pub struct ImageResolver {
+    repository: std::sync::OnceLock<Arc<dyn crate::snapshot::repository::SnapshotRepository>>,
     store: Arc<dyn SourceImageStore>,
     overlaybd_install_root: PathBuf,
     overlaybd_convert_global_config: PathBuf,
@@ -65,10 +65,17 @@ pub struct ImageResolver {
     convert_standard_oci: bool,
 }
 
+impl std::fmt::Debug for ImageResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageResolver").finish_non_exhaustive()
+    }
+}
+
 impl ImageResolver {
     pub fn new(config: &AppConfig) -> Self {
         let store = local_image_services_from_app_config(config).source_images;
         Self {
+            repository: Default::default(),
             store,
             overlaybd_install_root: config.deps_path.join("overlaybd"),
             overlaybd_convert_global_config: config.resolved_overlaybd_convert_global_config_path(),
@@ -106,6 +113,9 @@ impl ImageResolver {
             image_config_path, ..
         } = source.cached_config().await?
         {
+            // Older cache entries may lack resolution metadata. Persist the
+            // freshly fetched config before reporting a digest-only import ready.
+            source.write_metadata(metadata.clone()).await?;
             return Ok(resolved_from_cached_config(
                 &fetched.manifest_digest,
                 image_config_path,
@@ -188,7 +198,97 @@ impl ImageResolver {
             .map(Some)
     }
 
+    pub(crate) fn set_repository(
+        &self,
+        repository: Arc<dyn crate::snapshot::repository::SnapshotRepository>,
+    ) {
+        self.repository.get_or_init(|| repository);
+    }
+
+    pub(crate) async fn publish_image(&self, image: &ResolvedBlockImage) -> Result<String> {
+        let repository = self
+            .repository
+            .get()
+            .context("image repository is not configured")?;
+        // Capacity eviction takes this same source-image lock. Keep the local
+        // converted layers rooted until the repository has committed them.
+        let source = self.store.open(&image.image_ref, None).await?;
+        let _source_lock = source.begin_conversion().await?;
+        let config = image
+            .raw_config
+            .clone()
+            .context("built image configuration is missing")?;
+        let layers = repository
+            .publish_image_layers(&image.overlaybd_config_path)
+            .await?;
+        let description = super::PublishedImage::new(
+            oci_image::host_arch_to_oci(&detect_arch()?)?.into(),
+            layers,
+            config,
+        );
+        Ok(repository.put_image(&description).await?)
+    }
+
+    async fn resolve_published(&self, digest: &str) -> ImageResult<ResolvedBlockImage> {
+        super::buildkit::validate_digest(digest).map_err(|error| ImageError::InvalidReference {
+            reason: error.to_string(),
+        })?;
+        let repository = self
+            .repository
+            .get()
+            .context("image repository is not configured")?;
+        let image = repository
+            .get_image(digest)
+            .await
+            .map_err(anyhow::Error::from)?
+            .ok_or_else(|| ImageError::NotFound {
+                reason: format!("published OverlayBD image '{digest}' was not found"),
+            })?;
+        if image.architecture != oci_image::host_arch_to_oci(&detect_arch()?)? {
+            return Err(ImageError::UnsupportedImage {
+                reason: format!("image requires {}", image.architecture),
+            });
+        }
+        let metadata = oci_image::parse_oci_image_config(
+            &serde_json::to_string(&json!({"config": image.config}))
+                .map_err(anyhow::Error::from)?,
+        )?;
+        let source = self
+            .store
+            .open(digest, Some("published-overlaybd-v1"))
+            .await?;
+        if let CachedImageConfig::Found {
+            image_config_path, ..
+        } = source.cached_config().await?
+        {
+            return Ok(resolved_from_cached_config(
+                digest,
+                image_config_path,
+                metadata,
+            ));
+        }
+        let conversion = source.begin_conversion().await?;
+        let work = tempfile::tempdir().context("materialize published image")?;
+        let path = repository
+            .materialize_image_layers(&image.layers, &work.path().join("image.json"))
+            .await
+            .map_err(anyhow::Error::from)?;
+        let config: Value =
+            serde_json::from_slice(&tokio::fs::read(path).await.map_err(anyhow::Error::from)?)
+                .map_err(anyhow::Error::from)?;
+        let path = source
+            .publish_config(&config, metadata.clone(), conversion)
+            .await?;
+        Ok(resolved_from_cached_config(digest, path, metadata))
+    }
+
     pub async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage> {
+        // Bare digests identify repository-owned OverlayBD descriptions, not
+        // OCI manifests or node-local conversion cache entries.
+        let trimmed = image_ref.trim();
+        if trimmed.starts_with("sha256:") {
+            return self.resolve_published(trimmed).await;
+        }
         let candidates = image_ref_candidates(
             image_ref,
             &self.search_registries,
@@ -596,6 +696,7 @@ fn overlaybd_image_config_json(resolved: &ResolvedImage) -> Value {
 mod tests {
     use super::*;
     use crate::cfg::{ImageConfig, ImageResolverConfig};
+    use crate::image::cache::ImageCacheService;
     use tempfile::TempDir;
 
     fn test_resolver_with_search(temp: &TempDir, search_registries: Vec<&str>) -> ImageResolver {
@@ -1210,5 +1311,84 @@ mod tests {
             Some(expected_layer_dir.as_str())
         );
         assert!(config["lowers"][0].get("cacheFile").is_none());
+    }
+
+    fn local_resolver(temp: &TempDir) -> (ImageResolver, Arc<ImageCacheService>) {
+        let mut config = AppConfig::default();
+        ImageConfig::normalize(&mut config.image, temp.path(), temp.path());
+        let cache = ImageCacheService::shared_from_app_config(&config);
+        (ImageResolver::new(&config), cache)
+    }
+
+    #[tokio::test]
+    async fn published_image_survives_source_removal_and_resolves_on_another_node() -> Result<()> {
+        use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+        let shared = TempDir::new()?;
+        let source = TempDir::new()?;
+        let node_a = TempDir::new()?;
+        let node_b = TempDir::new()?;
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: shared.path().join("repository"),
+            cache_root: Some(shared.path().join("cache")),
+            runtime_cache_root: None,
+        })?;
+        let (publisher, _) = local_resolver(&node_a);
+        publisher.set_repository(backend.repository());
+        let (_, _, manifest) = crate::snapshot::mock::write_mock_built_artifacts(source.path())?;
+        let raw = json!({"Env": ["A=B"], "Entrypoint": ["/app"], "Cmd": ["serve"], "Healthcheck": {"Test": ["CMD", "true"]}});
+        let built = ResolvedBlockImage {
+            image_ref: crate::digest::sha256_digest(b"original OCI manifest"),
+            overlaybd_config_path: manifest.rootfs.image_config_path,
+            base_context: ImageBaseContext::default(),
+            raw_config: Some(raw.clone()),
+        };
+        let digest = publisher.publish_image(&built).await?;
+        assert_ne!(digest, built.image_ref);
+        assert_eq!(publisher.publish_image(&built).await?, digest);
+        let mut changed = built.clone();
+        changed.raw_config = Some(json!({"Cmd": ["different"]}));
+        assert_ne!(publisher.publish_image(&changed).await?, digest);
+        drop(source);
+        drop(node_a);
+        let (reader, _) = local_resolver(&node_b);
+        reader.set_repository(backend.repository());
+        let resolved = reader.resolve(&digest).await?;
+        assert_eq!(resolved.image_ref, digest);
+        assert_eq!(resolved.raw_config, Some(raw));
+        assert_eq!(
+            resolved.base_context.env_vars.get("A").map(String::as_str),
+            Some("B")
+        );
+        let config: Value =
+            serde_json::from_slice(&tokio::fs::read(&resolved.overlaybd_config_path).await?)?;
+        assert!(config["lowers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|layer| { std::path::Path::new(layer["file"].as_str().unwrap()).is_file() }));
+        tokio::fs::remove_file(&resolved.overlaybd_config_path).await?;
+        assert!(reader
+            .resolve(&digest)
+            .await?
+            .overlaybd_config_path
+            .is_file());
+        let unknown = crate::digest::sha256_digest(b"unknown");
+        assert!(matches!(
+            reader.resolve(&unknown).await,
+            Err(ImageError::NotFound { .. })
+        ));
+        assert!(matches!(
+            reader.resolve("sha256:invalid").await,
+            Err(ImageError::InvalidReference { .. })
+        ));
+        let key = super::super::PublishedImage::key(&digest)?;
+        let path = shared.path().join("repository").join(key);
+        let mut description: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        description["config"]["Cmd"] = json!(["tampered"]);
+        std::fs::write(path, serde_json::to_vec(&description)?)?;
+        assert!(
+            format!("{:#}", reader.resolve(&digest).await.unwrap_err()).contains("digest mismatch")
+        );
+        Ok(())
     }
 }
