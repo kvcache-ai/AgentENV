@@ -3,7 +3,6 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
-use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::digest::{self, FileDigest};
 use crate::repository::{BlobBody, BlobKey, RepositoryError, RepositoryResult};
 use crate::snapshot::SnapshotId;
@@ -18,28 +17,24 @@ impl PosixFsArtifactStore {
         Self { root }
     }
 
-    pub(crate) fn managed_layer_path(&self, digest: &str) -> PathBuf {
-        PosixFsSnapshotArtifactLayout::managed_layer_path(&self.root, digest)
-    }
-
-    fn committed_layout(&self, snapshot_id: &SnapshotId) -> PosixFsSnapshotArtifactLayout {
-        PosixFsSnapshotArtifactLayout::new(&self.root, snapshot_id)
+    fn snapshot_dir(&self, snapshot_id: &SnapshotId) -> PathBuf {
+        self.root.join(BlobKey::posix_snapshot_dir(snapshot_id))
     }
 
     pub(crate) fn put_blob(&self, key: &BlobKey, body: BlobBody<'_>) -> RepositoryResult<()> {
         match (key, body) {
             (BlobKey::Layer { digest, .. }, BlobBody::File(source)) => {
-                self.put_layer(digest, source)
+                self.put_layer(digest, self.blob_path(key), source)
             }
             (BlobKey::Layer { digest, .. }, BlobBody::Bytes(bytes)) => {
                 let mut staged = self.staging_file()?;
                 std::io::Write::write_all(&mut staged, &bytes).map_err(|error| {
                     RepositoryError::backend(format!("write '{}'", staged.path().display()), error)
                 })?;
-                self.put_layer(digest, staged.path())
+                self.put_layer(digest, self.blob_path(key), staged.path())
             }
-            (BlobKey::Snapshot(id, file), BlobBody::File(source)) => {
-                self.put_snapshot_file(id, file.name(), source)
+            (BlobKey::Snapshot(..), BlobBody::File(source)) => {
+                self.copy_local_artifact(self.blob_path(key), source)
             }
             (BlobKey::Snapshot(id, file), BlobBody::Bytes(bytes)) => {
                 self.put_snapshot_bytes(id, file.name(), &bytes)
@@ -50,7 +45,7 @@ impl PosixFsArtifactStore {
     /// A temporary file on the repository's filesystem, so storing it as a
     /// layer links it in without copying.
     pub(crate) fn staging_file(&self) -> RepositoryResult<NamedTempFile> {
-        let staging_dir = PosixFsSnapshotArtifactLayout::staging_dir(&self.root);
+        let staging_dir = self.root.join(BlobKey::POSIX_STAGING_DIR);
         fs::create_dir_all(&staging_dir).map_err(|error| {
             RepositoryError::backend(
                 format!("create staging dir '{}'", staging_dir.display()),
@@ -67,20 +62,7 @@ impl PosixFsArtifactStore {
 
     /// Where `key` is stored.
     pub(crate) fn blob_path(&self, key: &BlobKey) -> PathBuf {
-        match key {
-            BlobKey::Layer { digest, .. } => self.managed_layer_path(digest),
-            BlobKey::Snapshot(id, file) => self.committed_layout(id).path(file.name()),
-        }
-    }
-
-    /// Stores one snapshot file from `source`, hard-linking it when possible.
-    fn put_snapshot_file(
-        &self,
-        snapshot_id: &SnapshotId,
-        name: &str,
-        source: &Path,
-    ) -> RepositoryResult<()> {
-        self.copy_local_artifact(self.committed_layout(snapshot_id).path(name), source)
+        self.root.join(key.posix_path())
     }
 
     /// Stores one snapshot file, creating the snapshot's directory.
@@ -90,7 +72,7 @@ impl PosixFsArtifactStore {
         name: &str,
         bytes: &[u8],
     ) -> RepositoryResult<()> {
-        let snapshot_dir = self.committed_layout(snapshot_id).snapshot_dir();
+        let snapshot_dir = self.snapshot_dir(snapshot_id);
         fs::create_dir_all(&snapshot_dir).map_err(|error| {
             RepositoryError::backend(
                 format!("create snapshot dir '{}'", snapshot_dir.display()),
@@ -102,7 +84,7 @@ impl PosixFsArtifactStore {
 
     /// Removes one snapshot's directory. Shared managed layers stay.
     pub(crate) fn delete_snapshot_files(&self, snapshot_id: &SnapshotId) -> RepositoryResult<()> {
-        let snapshot_dir = self.committed_layout(snapshot_id).snapshot_dir();
+        let snapshot_dir = self.snapshot_dir(snapshot_id);
         match fs::remove_dir_all(&snapshot_dir) {
             Ok(()) => snapshot_dir.parent().map_or(Ok(()), sync_dir),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -120,9 +102,8 @@ impl PosixFsArtifactStore {
         name: &str,
         bytes: &[u8],
     ) -> RepositoryResult<()> {
-        let layout = self.committed_layout(snapshot_id);
-        let snapshot_dir = layout.snapshot_dir();
-        let path = layout.path(name);
+        let snapshot_dir = self.snapshot_dir(snapshot_id);
+        let path = snapshot_dir.join(name);
         let mut temp = NamedTempFile::new_in(&snapshot_dir).map_err(|error| {
             RepositoryError::backend(
                 format!("create temp file in '{}'", snapshot_dir.display()),
@@ -187,8 +168,7 @@ impl PosixFsArtifactStore {
 
     /// Stores a content-addressed layer unless one is already there,
     /// hard-linking it when possible.
-    fn put_layer(&self, digest: &str, source: &Path) -> RepositoryResult<()> {
-        let destination = PosixFsSnapshotArtifactLayout::managed_layer_path(&self.root, digest);
+    fn put_layer(&self, digest: &str, destination: PathBuf, source: &Path) -> RepositoryResult<()> {
         if destination.exists() {
             let size = fs::metadata(source)
                 .map_err(|error| {
@@ -433,9 +413,9 @@ mod tests {
 
     use super::super::backend::PosixFsRepository;
     use super::super::catalog::PosixFsCatalogStore;
-    use super::super::layout::{managed_layer_file_name, PosixFsSnapshotArtifactLayout};
     use super::PosixFsArtifactStore;
     use crate::digest::FileDigest;
+    use crate::repository::{BlobKey, LayerRole};
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::store::store_snapshot;
     use crate::snapshot::{
@@ -454,6 +434,17 @@ mod tests {
             id: id.clone(),
             ..SnapshotPublishMetadata::mock()
         }
+    }
+
+    /// Where a POSIX repository stores a layer, relative to its root.
+    fn layer_file(digest: &str) -> PathBuf {
+        PathBuf::from(
+            BlobKey::Layer {
+                digest: digest.to_owned(),
+                role: LayerRole::Rootfs,
+            }
+            .posix_path(),
+        )
     }
 
     fn assert_same_inode(left: &std::path::Path, right: &std::path::Path) {
@@ -524,10 +515,7 @@ mod tests {
                 assert_eq!(layers.len(), 1);
                 match &layers[0] {
                     crate::snapshot::OverlaybdLayerRef::Managed(layer) => {
-                        PathBuf::from("managed-layers")
-                            .join(managed_layer_file_name(&layer.digest))
-                            .display()
-                            .to_string()
+                        layer_file(&layer.digest).display().to_string()
                     }
                     crate::snapshot::OverlaybdLayerRef::External(_) => {
                         panic!("expected managed rootfs layer")
@@ -554,8 +542,7 @@ mod tests {
         assert_eq!(built.rootfs_layers.len(), 1);
         match &built.rootfs_layers[0] {
             crate::snapshot::OverlaybdLayerRef::Managed(layer) => {
-                let path =
-                    PathBuf::from("managed-layers").join(managed_layer_file_name(&layer.digest));
+                let path = layer_file(&layer.digest);
                 assert!(path.display().to_string().contains("managed-layers"));
                 assert!(tempdir.path().join(path).exists());
             }
@@ -579,20 +566,19 @@ mod tests {
             .await
             .expect("collect built artifacts");
 
-        let committed_layout = PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id);
+        let snapshot_dir = tempdir
+            .path()
+            .join(BlobKey::posix_snapshot_dir(&snapshot_id));
         assert_same_inode(
             &manifest.vm_state.path,
-            &committed_layout.path(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
+            &snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
         );
 
         match &built.rootfs_layers[0] {
             crate::snapshot::OverlaybdLayerRef::Managed(layer) => {
                 assert_same_inode(
                     &rootfs_lower,
-                    &tempdir
-                        .path()
-                        .join("managed-layers")
-                        .join(managed_layer_file_name(&layer.digest)),
+                    &tempdir.path().join(layer_file(&layer.digest)),
                 );
             }
             crate::snapshot::OverlaybdLayerRef::External(_) => {
@@ -603,8 +589,7 @@ mod tests {
             &memory_lower,
             &tempdir
                 .path()
-                .join("managed-layers")
-                .join(managed_layer_file_name(&built.memory_layers[0].digest)),
+                .join(layer_file(&built.memory_layers[0].digest)),
         );
     }
 
@@ -642,8 +627,7 @@ mod tests {
             crate::snapshot::OverlaybdLayerRef::Managed(layer) => {
                 assert_eq!(layer.digest, declared_digest);
                 assert_eq!(layer.size, 10);
-                let path =
-                    PathBuf::from("managed-layers").join(managed_layer_file_name(&layer.digest));
+                let path = layer_file(&layer.digest);
                 assert!(tempdir.path().join(path).exists());
             }
             crate::snapshot::OverlaybdLayerRef::External(_) => {
@@ -665,9 +649,11 @@ mod tests {
             .expect("collect built artifacts");
 
         assert_eq!(built.memory_layers.len(), 1);
-        let committed_layout = PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id);
+        let snapshot_dir = tempdir
+            .path()
+            .join(BlobKey::posix_snapshot_dir(&snapshot_id));
         let persisted_manifest: serde_json::Value = serde_json::from_slice(
-            &fs::read(committed_layout.path(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest))
+            &fs::read(snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest))
                 .expect("read committed firecracker manifest"),
         )
         .expect("parse committed firecracker manifest");
@@ -679,8 +665,8 @@ mod tests {
             .get("imageConfigPath")
             .is_none());
         assert!(
-            !committed_layout
-                .path(SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config)
+            !snapshot_dir
+                .join(SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config)
                 .exists(),
             "committed snapshot dir should not persist mem_image.json"
         );
@@ -726,10 +712,7 @@ mod tests {
         assert!(staged.path().starts_with(&staging_dir));
         assert_same_inode(
             staged.path(),
-            &tempdir
-                .path()
-                .join("managed-layers")
-                .join(managed_layer_file_name(&layer.digest)),
+            &tempdir.path().join(layer_file(&layer.digest)),
         );
         drop(built);
         assert_eq!(fs::read_dir(&staging_dir).expect("staging dir").count(), 0);
@@ -805,10 +788,7 @@ mod tests {
         // ZFile wraps the raw LSMT header, so no layer UUID is exposed.
         assert!(managed.uuid.is_none());
 
-        let managed_path = tempdir
-            .path()
-            .join("managed-layers")
-            .join(managed_layer_file_name(&managed.digest));
+        let managed_path = tempdir.path().join(layer_file(&managed.digest));
         assert_eq!(
             fs::read(&managed_path).expect("read managed layer"),
             fs::read(&zfile_lower).expect("read source zfile lower"),

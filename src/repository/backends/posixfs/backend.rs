@@ -742,8 +742,12 @@ mod tests {
         let cache =
             LocalArtifactCache::new(tempdir.path().join("cache"), None).expect("local cache");
         let resolver = test_resolver(tempdir.path(), tempdir.path().join("runtime-cache"), cache);
-        let layer_path = tempdir.path().join("managed-layers").join(
-            super::super::layout::managed_layer_file_name("sharedfs:test"),
+        let layer_path = tempdir.path().join(
+            crate::repository::BlobKey::Layer {
+                digest: "sharedfs:test".to_owned(),
+                role: crate::repository::LayerRole::Rootfs,
+            }
+            .posix_path(),
         );
         std::fs::create_dir_all(layer_path.parent().expect("managed-layers dir"))
             .expect("managed-layers dir");

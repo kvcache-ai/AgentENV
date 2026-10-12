@@ -1,4 +1,7 @@
-use crate::snapshot::{SnapshotAlias, SnapshotId};
+use super::LayerRole;
+use crate::snapshot::{
+    SnapshotAlias, SnapshotId, MEMORY_STARTUP_PACK_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
+};
 
 /// A small shared document that every backend stores at the same path relative
 /// to its repository root. This is the only place that names those paths;
@@ -92,6 +95,78 @@ impl DocumentCollection {
     }
 }
 
+/// One blob a repository stores. Like [`DocumentKey`], this is the only place
+/// that names blob paths; changing one strands the blobs already stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlobKey {
+    /// A content-addressed layer, stored once for every snapshot and volume
+    /// that uses it.
+    Layer { digest: String, role: LayerRole },
+    /// One file of one snapshot, removed with the snapshot.
+    Snapshot(SnapshotId, SnapshotFile),
+}
+
+/// The files a snapshot stores besides its layers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotFile {
+    VmState,
+    FirecrackerManifest,
+    StartupManifest,
+}
+
+impl SnapshotFile {
+    /// The file's name among the snapshot's files.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::VmState => SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
+            Self::FirecrackerManifest => SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
+            Self::StartupManifest => MEMORY_STARTUP_PACK_ARTIFACT,
+        }
+    }
+}
+
+impl BlobKey {
+    /// The directory or object prefix that holds every managed layer.
+    pub(crate) const LAYERS_DIR: &'static str = "managed-layers";
+
+    /// Where a POSIX repository prepares blobs before storing them, so they
+    /// are on the repository's filesystem.
+    pub(crate) const POSIX_STAGING_DIR: &'static str = "staging";
+
+    /// The object key in an object-store repository.
+    pub(crate) fn path(&self) -> String {
+        match self {
+            Self::Layer { digest, .. } => format!("{}/{digest}", Self::LAYERS_DIR),
+            Self::Snapshot(id, file) => format!("{}/{}", Self::snapshot_dir(id), file.name()),
+        }
+    }
+
+    /// The path in a POSIX repository, which predates the shared layout.
+    pub(crate) fn posix_path(&self) -> String {
+        match self {
+            Self::Layer { digest, .. } => format!(
+                "{}/{}.overlaybd.commit",
+                Self::LAYERS_DIR,
+                digest.replace([':', '/'], "_")
+            ),
+            Self::Snapshot(id, file) => {
+                format!("{}/{}", Self::posix_snapshot_dir(id), file.name())
+            }
+        }
+    }
+
+    /// The object prefix that holds every blob of one snapshot.
+    pub(crate) fn snapshot_dir(id: &SnapshotId) -> String {
+        format!("artifacts/{id}")
+    }
+
+    /// The directory that holds every file of one snapshot in a POSIX
+    /// repository.
+    pub(crate) fn posix_snapshot_dir(id: &SnapshotId) -> String {
+        format!("snapshots/{id}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +222,38 @@ mod tests {
         assert!(record.path().starts_with(records.prefix()));
         assert_eq!(records.id_from_file_name("vol_test.json"), Some("vol_test"));
         assert_eq!(records.id_from_file_name("vol_test.lock"), None);
+    }
+
+    #[test]
+    fn blob_paths_match_existing_repositories() {
+        let layer = BlobKey::Layer {
+            digest: "sha256:abc".to_owned(),
+            role: LayerRole::Rootfs,
+        };
+        assert_eq!(layer.path(), "managed-layers/sha256:abc");
+        assert_eq!(
+            layer.posix_path(),
+            "managed-layers/sha256_abc.overlaybd.commit"
+        );
+        let id = SnapshotId::generate();
+        let vm_state = BlobKey::Snapshot(id.clone(), SnapshotFile::VmState);
+        assert_eq!(vm_state.path(), format!("artifacts/{id}/vm_state.bin"));
+        assert_eq!(
+            vm_state.posix_path(),
+            format!("snapshots/{id}/vm_state.bin")
+        );
+        let manifest = BlobKey::Snapshot(id.clone(), SnapshotFile::FirecrackerManifest);
+        assert_eq!(
+            manifest.path(),
+            format!("artifacts/{id}/firecracker-manifest.json")
+        );
+        let startup = BlobKey::Snapshot(id.clone(), SnapshotFile::StartupManifest);
+        assert_eq!(
+            startup.posix_path(),
+            format!("snapshots/{id}/memory-startup.pack")
+        );
+        assert!(vm_state
+            .path()
+            .starts_with(&format!("{}/", BlobKey::snapshot_dir(&id))));
     }
 }

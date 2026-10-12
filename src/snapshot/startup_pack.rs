@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-/// File name of the per-snapshot startup memory pack stored under
-/// `artifacts/{snapshot_id}/` in the snapshot repository.
+/// File name of the per-snapshot startup memory pack, stored as
+/// `BlobKey::Snapshot(id, SnapshotFile::StartupManifest)`.
 pub const MEMORY_STARTUP_PACK_ARTIFACT: &str = "memory-startup.pack";
 
 /// File name of the local first-touch trace the recorder emits next to the

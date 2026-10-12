@@ -163,23 +163,8 @@ impl OssClient {
         }
     }
 
-    pub(crate) fn managed_layers_repo_blob_url(&self) -> String {
-        // overlaybd expects an S3-compatible repo blob URL here, including for
-        // Alibaba OSS, so the scheme remains `s3://` rather than `oss://`.
-        if self.prefix.is_empty() {
-            format!("s3://{}/managed-layers", self.operator_config.bucket)
-        } else {
-            format!(
-                "s3://{}/{}/managed-layers",
-                self.operator_config.bucket, self.prefix
-            )
-        }
-    }
-
-    /// s3:// URL of a snapshot's startup memory pack artifact, in the same
-    /// URL form as managed layers (credentials resolve from the global OSS
-    /// config on the consuming side).
-    /// The `s3://` URL overlaybd reads an object from.
+    /// The `s3://` URL overlaybd reads an object or prefix from. overlaybd
+    /// expects S3-compatible URLs, including for Alibaba OSS.
     pub(crate) fn object_url(&self, key: &str) -> String {
         format!(
             "s3://{}/{}",

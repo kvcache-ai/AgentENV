@@ -1,7 +1,6 @@
 mod client;
 mod config;
 mod documents;
-mod layout;
 mod lease;
 mod repository;
 
@@ -19,7 +18,6 @@ use crate::snapshot::resolver::RepositoryRuntimeResolver;
 
 pub(crate) use self::client::OssClient;
 pub(crate) use self::config::NormalizedOssConfig;
-pub(crate) use self::layout::OssSnapshotArtifactLayout;
 pub(crate) use self::repository::OssRepository;
 
 /// OSS-backed snapshot backend.

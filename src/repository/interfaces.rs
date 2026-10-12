@@ -5,11 +5,10 @@ use async_trait::async_trait;
 use tempfile::NamedTempFile;
 
 use super::errors::{RepositoryError, RepositoryResult};
-use super::{DocumentCollection, DocumentKey};
+use super::{BlobKey, DocumentCollection, DocumentKey};
 use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::snapshot::{
     RunnableSnapshot, SnapshotId, SnapshotRecord, SnapshotSourceKind, TemplateBuildStatus,
-    MEMORY_STARTUP_PACK_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 /// A committed snapshot and the local upload files kept alive for post-commit
@@ -49,35 +48,6 @@ pub enum LayerRole {
     Rootfs,
     AttachedDrive,
     Memory,
-}
-
-/// One file a repository stores.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum BlobKey {
-    /// A content-addressed layer, stored once for every snapshot and volume
-    /// that uses it.
-    Layer { digest: String, role: LayerRole },
-    /// One file of one snapshot, removed with the snapshot.
-    Snapshot(SnapshotId, SnapshotFile),
-}
-
-/// The files a snapshot stores besides its layers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SnapshotFile {
-    VmState,
-    FirecrackerManifest,
-    StartupManifest,
-}
-
-impl SnapshotFile {
-    /// The file's name among the snapshot's files.
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::VmState => SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
-            Self::FirecrackerManifest => SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
-            Self::StartupManifest => MEMORY_STARTUP_PACK_ARTIFACT,
-        }
-    }
 }
 
 /// The contents [`Repository::put_blob`] stores.

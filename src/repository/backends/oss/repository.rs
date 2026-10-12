@@ -5,7 +5,6 @@ use async_trait::async_trait;
 
 use super::client::{OssClient, OssUploadArtifact};
 use super::documents;
-use super::layout::OssSnapshotArtifactLayout;
 use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::repository::interfaces::{LayerRole, PublishPolicy, Repository};
 use crate::repository::{
@@ -16,17 +15,8 @@ use crate::snapshot::SnapshotId;
 
 /// Manages the committed‐state layer of the OSS snapshot repository.
 ///
-/// Object layout under the configured prefix:
-///
-/// ```text
-/// catalog/records/{id}.json                → SnapshotRecord
-/// catalog/aliases/{alias}.json             → "snapshot-id"
-/// volumes/records/{volume-id}.json         → VolumeRecord
-/// volumes/aliases/{volume-name}.json       → "volume-id"
-/// artifacts/{id}/firecracker-manifest.json → SandboxSnapshotManifest (paths omitted)
-/// artifacts/{id}/vm_state.bin
-/// managed-layers/{digest}
-/// ```
+/// Objects sit under the configured prefix at the paths
+/// [`DocumentKey::path`] and [`BlobKey::path`] name.
 pub(crate) struct OssRepository {
     client: Arc<OssClient>,
     policy: PublishPolicy,
@@ -44,17 +34,6 @@ impl OssRepository {
                 compression: publish_compression.clone(),
                 image_storage: snapshot_image_storage,
             },
-        }
-    }
-
-    fn layout<'a>(&self, id: &'a SnapshotId) -> OssSnapshotArtifactLayout<'a> {
-        OssSnapshotArtifactLayout::new(id)
-    }
-
-    fn object_key(&self, key: &BlobKey) -> String {
-        match key {
-            BlobKey::Layer { digest, .. } => OssSnapshotArtifactLayout::managed_layer_key(digest),
-            BlobKey::Snapshot(id, file) => self.layout(id).artifact_key(file.name()),
         }
     }
 }
@@ -83,7 +62,7 @@ impl Repository for OssRepository {
     }
 
     fn managed_layers_repo_blob_url(&self) -> Option<String> {
-        Some(self.client.managed_layers_repo_blob_url())
+        Some(self.client.object_url(BlobKey::LAYERS_DIR))
     }
 
     /// Layers are keyed by digest, so concurrent writers of one layer write
@@ -93,7 +72,7 @@ impl Repository for OssRepository {
     /// `x-oss-forbid-overwrite` on multipart uploads, which opendal uses for
     /// large files.
     async fn put_blob(&self, key: &BlobKey, body: BlobBody<'_>) -> RepositoryResult<()> {
-        let object_key = self.object_key(key);
+        let object_key = key.path();
         if matches!(key, BlobKey::Layer { .. }) {
             let exists = self.client.exists(&object_key).await.map_err(|error| {
                 RepositoryError::backend("check managed layer existence", error)
@@ -111,13 +90,11 @@ impl Repository for OssRepository {
     }
 
     fn locate_blob(&self, key: &BlobKey) -> RepositoryResult<BlobLocation> {
-        Ok(BlobLocation::Remote(
-            self.client.object_url(&self.object_key(key)),
-        ))
+        Ok(BlobLocation::Remote(self.client.object_url(&key.path())))
     }
 
     async fn has_blob(&self, key: &BlobKey) -> RepositoryResult<bool> {
-        let object_key = self.object_key(key);
+        let object_key = key.path();
         self.client
             .exists(&object_key)
             .await
@@ -125,7 +102,7 @@ impl Repository for OssRepository {
     }
 
     async fn fetch_blob(&self, key: &BlobKey, destination: &Path) -> RepositoryResult<u64> {
-        let object_key = self.object_key(key);
+        let object_key = key.path();
         self.client
             .get_to_file(&object_key, destination)
             .await
@@ -133,7 +110,7 @@ impl Repository for OssRepository {
     }
 
     async fn read_blob(&self, key: &BlobKey) -> RepositoryResult<Vec<u8>> {
-        let object_key = self.object_key(key);
+        let object_key = key.path();
         match self.client.get_bytes(&object_key).await {
             Ok(bytes) => Ok(bytes.to_vec()),
             Err(error) if OssClient::is_not_found_error(&error) => {
@@ -149,7 +126,7 @@ impl Repository for OssRepository {
     }
 
     async fn delete_snapshot_blobs(&self, id: &SnapshotId) -> RepositoryResult<()> {
-        let prefix = self.layout(id).artifact_prefix();
+        let prefix = format!("{}/", BlobKey::snapshot_dir(id));
         self.client
             .delete_prefix(&prefix)
             .await

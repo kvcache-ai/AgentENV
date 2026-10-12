@@ -15,7 +15,7 @@ use super::target::{
 use crate::cfg::{ConfigManager, SnapshotImageStoragePolicy, SnapshotRepositoryBackendKind};
 use crate::digest;
 use crate::repository::backends::{oss, posixfs};
-use crate::repository::{Repository, RepositoryError, RepositoryResult};
+use crate::repository::{BlobKey, LayerRole, Repository, RepositoryError, RepositoryResult};
 use crate::snapshot::image_export::acr::{
     build_oci_image_manifest, host_architecture_for_oci, snapshot_oci_config_blob, OciDescriptor,
     SnapshotOciConfigInput, SourceRegistryRepository,
@@ -308,8 +308,7 @@ impl SnapshotImageService {
     ) -> RepositoryResult<PathBuf> {
         match &self.layers {
             ManagedLayerLocator::PosixFs { root } => {
-                let path =
-                    posixfs::PosixFsSnapshotArtifactLayout::managed_layer_path(root, &layer.digest);
+                let path = root.join(rootfs_layer_key(&layer.digest).posix_path());
                 let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
                     if error.kind() == std::io::ErrorKind::NotFound {
                         RepositoryError::ManagedLayerNotFound {
@@ -336,13 +335,20 @@ impl SnapshotImageService {
                 Ok(path)
             }
             ManagedLayerLocator::Oss { client } => {
-                let key = oss::OssSnapshotArtifactLayout::managed_layer_key(&layer.digest);
+                let key = rootfs_layer_key(&layer.digest).path();
                 let name = layer.digest.replace([':', '/'], "_");
                 let destination = tempdir.join(format!("{name}.overlaybd.commit"));
                 let download = client.get_to_file(&key, &destination);
                 materialize_downloaded_layer(layer, &destination, download).await
             }
         }
+    }
+}
+
+fn rootfs_layer_key(digest: &str) -> BlobKey {
+    BlobKey::Layer {
+        digest: digest.to_owned(),
+        role: LayerRole::Rootfs,
     }
 }
 
@@ -395,7 +401,6 @@ mod tests {
     };
     use super::super::target::SnapshotImageTargetError;
     use super::*;
-    use crate::repository::backends::posixfs::PosixFsSnapshotArtifactLayout;
     use crate::snapshot::mock::MockRepository;
     use crate::snapshot::{
         rootfs_snapshot_image_tag, CommandContext, PersistedDiskImagePublication, SnapshotRecord,
@@ -416,7 +421,7 @@ mod tests {
     }
 
     fn seed_posix_layer(root: &Path, digest: &str, bytes: &[u8]) -> PathBuf {
-        let path = PosixFsSnapshotArtifactLayout::managed_layer_path(root, digest);
+        let path = root.join(rootfs_layer_key(digest).posix_path());
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, bytes).unwrap();
         path
