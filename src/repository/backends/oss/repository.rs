@@ -11,6 +11,7 @@ use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
 use tracing::{debug, info, warn};
 
 use super::client::{OssClient, OssUploadArtifact};
+use super::documents;
 use super::layout::OssSnapshotArtifactLayout;
 use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::repository::backends::common::acr::{
@@ -56,7 +57,6 @@ pub(crate) struct OssRepository {
 }
 
 const MAX_ALIAS_BIND_ATTEMPTS: usize = 5;
-const MAX_DOCUMENT_CAS_ATTEMPTS: usize = 5;
 
 impl OssRepository {
     pub(crate) fn new(
@@ -595,24 +595,11 @@ impl Repository for OssRepository {
     }
 
     async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
-        let key = key.path();
-        match self.client.get_bytes(&key).await {
-            Ok(bytes) => Ok(Some(bytes.to_vec())),
-            Err(error) if OssClient::is_not_found_error(&error) => Ok(None),
-            Err(error) => Err(RepositoryError::backend(format!("read '{key}'"), error)),
-        }
+        documents::get(&self.client, &key).await
     }
 
     async fn put_document(&self, key: DocumentKey, bytes: Vec<u8>) -> RepositoryResult<()> {
-        let artifact = match key {
-            DocumentKey::BuildLog(_) => OssUploadArtifact::BuildLog,
-            _ => OssUploadArtifact::CatalogRecord,
-        };
-        let key = key.path();
-        self.client
-            .put_bytes(&key, bytes, artifact)
-            .await
-            .map_err(|error| RepositoryError::backend(format!("write '{key}'"), error))
+        documents::put(&self.client, &key, bytes).await
     }
 
     async fn update_document(
@@ -620,41 +607,11 @@ impl Repository for OssRepository {
         key: DocumentKey,
         update: DocumentUpdate,
     ) -> RepositoryResult<Option<Vec<u8>>> {
-        let key = key.path();
-        for _ in 0..MAX_DOCUMENT_CAS_ATTEMPTS {
-            let (current, etag) = match self.client.get_bytes_with_etag(&key).await {
-                Ok((bytes, Some(etag))) => (Some(bytes.to_vec()), Some(etag)),
-                Ok((_, None)) => {
-                    return Err(RepositoryError::InvalidRequest {
-                        reason: format!("updating '{key}' requires object storage ETags"),
-                    })
-                }
-                Err(error) if OssClient::is_not_found_error(&error) => (None, None),
-                Err(error) => return Err(RepositoryError::backend(format!("read '{key}'"), error)),
-            };
-            let Some(bytes) = update(current.as_deref())? else {
-                return Ok(current);
-            };
-            if self
-                .client
-                .put_bytes_conditionally(&key, bytes, etag.as_deref())
-                .await
-                .map_err(|error| RepositoryError::backend(format!("update '{key}'"), error))?
-            {
-                return Ok(current);
-            }
-        }
-        Err(RepositoryError::InvalidRequest {
-            reason: format!("'{key}' changed too often during update"),
-        })
+        documents::update(&self.client, &key, update).await
     }
 
     async fn delete_document(&self, key: DocumentKey) -> RepositoryResult<()> {
-        let key = key.path();
-        self.client
-            .delete(&key)
-            .await
-            .map_err(|error| RepositoryError::backend(format!("delete '{key}'"), error))
+        documents::delete(&self.client, &key).await
     }
 
     async fn list_documents(
@@ -663,24 +620,7 @@ impl Repository for OssRepository {
         after: Option<&str>,
         limit: usize,
     ) -> RepositoryResult<Vec<String>> {
-        let prefix = collection.prefix();
-        let start_after = after.map(|id| collection.key(id).path());
-        let keys = self
-            .client
-            .list_keys_page(prefix, start_after.as_deref(), limit)
-            .await
-            .map_err(|error| RepositoryError::backend(format!("list '{prefix}'"), error))?;
-        keys.iter()
-            .map(|key| {
-                key.strip_prefix(prefix)
-                    .filter(|name| !name.contains('/'))
-                    .and_then(|name| collection.id_from_file_name(name))
-                    .map(str::to_owned)
-                    .ok_or_else(|| RepositoryError::InvalidRequest {
-                        reason: format!("invalid document key '{key}'"),
-                    })
-            })
-            .collect()
+        documents::list(&self.client, collection, after, limit).await
     }
 
     async fn publish_volume_backing(

@@ -6,8 +6,8 @@ use bytes::Bytes;
 use object_store_operator::{
     build_object_store_operator, credential_source_from_fields, run_with_refresh, AddressingStyle,
     CachedCredentialSource, CredentialFields, CredentialSource, CredentialSourceOptions,
-    ObjectStoreOperatorConfig, ObjectStoreOperatorError, OpenDalError, OpenDalErrorKind,
-    OpenDalResult, Operator, OperatorWithCredential, ResolvedCredential,
+    ObjectStoreOperatorConfig, ObjectStoreOperatorError, ObjectStoreService, OpenDalError,
+    OpenDalErrorKind, OpenDalResult, Operator, OperatorWithCredential, ResolvedCredential,
 };
 use reqwest::Url;
 use std::cmp::min;
@@ -308,6 +308,7 @@ impl ParsedOssUrl {
 
     fn operator_config(&self, timeout: Duration, retry_count: u32) -> ObjectStoreOperatorConfig {
         ObjectStoreOperatorConfig {
+            service: ObjectStoreService::S3,
             bucket: self.bucket.clone(),
             endpoint: self.endpoint.clone(),
             region: self.region.clone(),

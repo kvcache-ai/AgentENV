@@ -9,8 +9,8 @@ pub use auth::{
 };
 pub use operator::{
     build_object_store_operator, run_with_refresh, AddressingStyle, ObjectStoreOperatorConfig,
-    ObjectStoreOperatorError, ObjectStoreOperatorResult, OperatorWithCredential,
-    DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT,
+    ObjectStoreOperatorError, ObjectStoreOperatorResult, ObjectStoreService,
+    OperatorWithCredential, DEFAULT_MAX_RETRIES, DEFAULT_TIMEOUT,
 };
 
 pub use opendal::{Error as OpenDalError, ErrorKind as OpenDalErrorKind, Operator};

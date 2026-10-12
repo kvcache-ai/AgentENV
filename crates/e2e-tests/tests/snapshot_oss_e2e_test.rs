@@ -896,6 +896,35 @@ async fn volume_catalog_on_oss_follows_shared_rules() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn concurrent_document_updates_on_oss_lose_none() -> Result<()> {
+    let fixture = MinioFixture::start().await?;
+    ensure_test_config()?;
+    let workspace = TempDir::new()?;
+    let oss = test_oss_config(&fixture, "snapshots/e2e-documents");
+    let (catalog, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
+    let mut shared = volume_record("vol_shared", "shared")?;
+    shared.mode = agentenv::volume::VolumeMode::ReadOnly;
+    catalog.create_volume(shared).await?;
+
+    let mut mounts = Vec::new();
+    for index in 0..16 {
+        let catalog = Arc::clone(&catalog);
+        mounts.push(tokio::spawn(async move {
+            catalog
+                .reserve_read_only_volume("vol_shared", &format!("sandbox-{index}"))
+                .await
+        }));
+    }
+    for mount in mounts {
+        mount.await??;
+    }
+    let shared = catalog.get_volume("shared").await?.context("shared")?;
+    assert_eq!(shared.read_only_mounts.len(), 16);
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires docker"]
 async fn build_cache_state_on_oss_retires_replaced_seeds() -> Result<()> {

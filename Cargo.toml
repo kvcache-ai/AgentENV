@@ -37,6 +37,7 @@ path = "src/lib.rs"
 vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
@@ -46,7 +47,7 @@ envd = { version = "0.1.0", path = "thirdparty/envd" }
 custom_extension_client = { version = "0.1.0", path = "src/custom_extension_api/generated" }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", features = ["json", "stream"] }
-opendal = { version = "0.55.0", features = ["services-s3"] }
+opendal = { version = "0.55.0", features = ["services-oss", "services-s3"] }
 object-store-operator = { path = "crates/object-store-operator" }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }

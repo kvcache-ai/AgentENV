@@ -1,6 +1,8 @@
 mod client;
 mod config;
+mod documents;
 mod layout;
+mod lease;
 mod repository;
 mod resolver;
 

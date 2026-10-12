@@ -1,13 +1,14 @@
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::{stream, TryStreamExt};
 use object_store_operator::{
     build_object_store_operator, run_with_refresh, AddressingStyle, CachedCredentialSource,
-    CredentialSource, ObjectStoreOperatorConfig, ObjectStoreOperatorError, OperatorWithCredential,
+    CredentialSource, ObjectStoreOperatorConfig, ObjectStoreOperatorError, ObjectStoreService,
+    OperatorWithCredential,
 };
 use opendal::{Error as OpenDalError, ErrorKind as OpenDalErrorKind, Operator};
 use overlaybd::backend::oss::upload_file_streaming;
@@ -36,6 +37,9 @@ const CHUNK_SIZE: usize = 64 * 1024 * 1024;
 /// endpoint; concurrent parts multiply effective throughput.
 const UPLOAD_CONCURRENCY: usize = 8;
 const OSS_OPERATION_DURATION: &str = "agentenv_snapshot_oss_operation_duration_seconds";
+/// The longest one attempt of [`OssClient::put_bytes_before`] or
+/// [`OssClient::delete_before`] takes.
+pub(super) const WRITE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Snapshot artifacts uploaded to OSS. Used as the `artifact` label on upload
 /// metrics and in upload completion logs so memory layers can be told apart
@@ -69,6 +73,22 @@ impl OssUploadArtifact {
     }
 }
 
+/// An operator configuration and the operator last built from it.
+#[derive(Clone, Debug)]
+struct CachedOperator {
+    config: ObjectStoreOperatorConfig,
+    operator: Arc<RwLock<Option<OperatorWithCredential>>>,
+}
+
+impl CachedOperator {
+    fn new(config: ObjectStoreOperatorConfig) -> Self {
+        Self {
+            config,
+            operator: Arc::new(RwLock::new(None)),
+        }
+    }
+}
+
 /// Thin wrapper around the OSS client used by the repository and resolver.
 #[derive(Clone, Debug)]
 pub(crate) struct OssClient {
@@ -76,6 +96,11 @@ pub(crate) struct OssClient {
     prefix: String,
     credentials: Arc<CachedCredentialSource>,
     cached_operator: Arc<RwLock<Option<OperatorWithCredential>>>,
+    /// Writes in one attempt of at most [`WRITE_ATTEMPT_TIMEOUT`].
+    single_attempt: CachedOperator,
+    /// Alibaba OSS's native API, which appends to objects. `None` on other
+    /// stores.
+    native_oss: Option<CachedOperator>,
 }
 
 impl OssClient {
@@ -91,19 +116,44 @@ impl OssClient {
         // explicit config override then wins over the detected style.
         let detected_style = detect_addressing_style(&endpoint, &bucket)?;
         let addressing_style = addressing_override.unwrap_or(detected_style);
-        Ok(Self {
-            operator_config: ObjectStoreOperatorConfig {
-                addressing_style,
-                bucket,
+        let native_oss = aliyun_service_endpoint(&endpoint, &bucket)?.map(|endpoint| {
+            CachedOperator::new(ObjectStoreOperatorConfig {
+                service: ObjectStoreService::AliyunOss,
+                addressing_style: AddressingStyle::Virtual,
+                bucket: bucket.clone(),
                 endpoint,
-                region,
+                region: region.clone(),
                 timeout: None,
                 max_retries: None,
-            },
+            })
+        });
+        let operator_config = ObjectStoreOperatorConfig {
+            service: ObjectStoreService::S3,
+            addressing_style,
+            bucket,
+            endpoint,
+            region,
+            timeout: None,
+            max_retries: None,
+        };
+        let single_attempt = CachedOperator::new(ObjectStoreOperatorConfig {
+            timeout: Some(WRITE_ATTEMPT_TIMEOUT),
+            max_retries: Some(0),
+            ..operator_config.clone()
+        });
+        Ok(Self {
+            operator_config,
             prefix,
             credentials: Arc::new(CachedCredentialSource::new(credential_source)),
             cached_operator: Arc::new(RwLock::new(None)),
+            single_attempt,
+            native_oss,
         })
+    }
+
+    /// Whether [`Self::append`] works: only Alibaba OSS appends to objects.
+    pub(crate) fn can_append(&self) -> bool {
+        self.native_oss.is_some()
     }
 
     fn full_key(&self, key: &str) -> String {
@@ -352,6 +402,111 @@ impl OssClient {
         .with_context(|| format!("oss conditional put '{key}'"))
     }
 
+    /// Writes a small object in attempts that each start before `deadline`
+    /// and take at most [`WRITE_ATTEMPT_TIMEOUT`]. There is one attempt, or a
+    /// second when credentials need a refresh.
+    pub(crate) async fn put_bytes_before(
+        &self,
+        key: &str,
+        data: impl Into<Bytes>,
+        artifact: OssUploadArtifact,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        let data = data.into();
+        let size = data.len() as u64;
+        let oss_key = self.full_key(key);
+        let mut metric = MetricGuard::operation_artifact(
+            OSS_OPERATION_DURATION,
+            "put_bytes_before",
+            artifact.as_str(),
+        );
+        let result = self
+            .run_with_cached(&self.single_attempt, |operator| {
+                let data = data.clone();
+                let oss_key = oss_key.clone();
+                async move {
+                    check_deadline(deadline)?;
+                    write_bytes_to_operator(&operator, &oss_key, data).await
+                }
+            })
+            .await
+            .with_context(|| format!("oss put '{key}'"));
+        metric.finish(&result);
+        if result.is_ok() {
+            metrics::counter!(
+                "agentenv_snapshot_oss_upload_bytes_total",
+                "operation" => "put_bytes_before",
+                "artifact" => artifact.as_str(),
+            )
+            .increment(size);
+        }
+        result
+    }
+
+    /// Deletes a single object like [`Self::delete`], in attempts like those
+    /// of [`Self::put_bytes_before`].
+    pub(crate) async fn delete_before(
+        &self,
+        key: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        let oss_key = self.full_key(key);
+        self.run_with_cached(&self.single_attempt, |operator| {
+            let oss_key = oss_key.clone();
+            async move {
+                check_deadline(deadline)?;
+                match operator.delete(&oss_key).await {
+                    Err(err) if err.kind() == OpenDalErrorKind::NotFound => Ok(()),
+                    result => result,
+                }
+            }
+        })
+        .await
+        .with_context(|| format!("oss delete '{key}'"))
+    }
+
+    /// Appends `data` to the object at `key`, creating it if absent. Returns
+    /// the offset `data` landed at, or `None` when the object grew while the
+    /// append was in flight. Only Alibaba OSS appends; see [`Self::can_append`].
+    pub(crate) async fn append(&self, key: &str, data: impl Into<Bytes>) -> Result<Option<u64>> {
+        let native_oss = self
+            .native_oss
+            .as_ref()
+            .context("only Alibaba OSS appends to objects")?;
+        let data = data.into();
+        let size = data.len() as u64;
+        let oss_key = self.full_key(key);
+        let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "append");
+        let result = self
+            .run_with_cached(native_oss, |operator| {
+                let data = data.clone();
+                let oss_key = oss_key.clone();
+                async move {
+                    // opendal appends at the length it reads first; Alibaba
+                    // OSS rejects the append if the object grew since.
+                    match operator.write_with(&oss_key, data).append(true).await {
+                        Ok(metadata) => {
+                            let landed = metadata.content_length().checked_sub(size);
+                            landed.map(Some).ok_or_else(|| {
+                                OpenDalError::new(
+                                    OpenDalErrorKind::Unexpected,
+                                    "append reported a length shorter than its data",
+                                )
+                            })
+                        }
+                        Err(error) if error.kind() == OpenDalErrorKind::ConditionNotMatch => {
+                            Ok(None)
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            })
+            .await
+            .with_context(|| format!("oss append '{key}'"));
+        metric.finish(&result);
+        result
+    }
+
     /// Upload a local file to OSS.
     pub(crate) async fn put_file(
         &self,
@@ -467,31 +622,54 @@ impl OssClient {
         F: Fn(Operator) -> Fut,
         Fut: std::future::Future<Output = opendal::Result<T>>,
     {
+        self.run_with(&self.operator_config, &self.cached_operator, operation)
+            .await
+    }
+
+    async fn run_with_cached<T, F, Fut>(&self, cached: &CachedOperator, operation: F) -> Result<T>
+    where
+        F: Fn(Operator) -> Fut,
+        Fut: std::future::Future<Output = opendal::Result<T>>,
+    {
+        self.run_with(&cached.config, &cached.operator, operation)
+            .await
+    }
+
+    async fn run_with<T, F, Fut>(
+        &self,
+        config: &ObjectStoreOperatorConfig,
+        cached_operator: &RwLock<Option<OperatorWithCredential>>,
+        operation: F,
+    ) -> Result<T>
+    where
+        F: Fn(Operator) -> Fut,
+        Fut: std::future::Future<Output = opendal::Result<T>>,
+    {
         // Centralizes one-shot operator construction plus credential-refresh
         // retry semantics so individual OSS operations don't each have to
         // reason about cached credentials and operator replacement.
-        let current = self.ensure_fresh_operator().await?;
-        let (value, refreshed) = run_with_refresh(
-            &current,
-            Some(self.credentials.as_ref()),
-            &self.operator_config,
-            operation,
-        )
-        .await
-        .map_err(anyhow::Error::from)?;
+        let current = self.ensure_fresh_operator(config, cached_operator).await?;
+        let (value, refreshed) =
+            run_with_refresh(&current, Some(self.credentials.as_ref()), config, operation)
+                .await
+                .map_err(anyhow::Error::from)?;
         if let Some(refreshed) = refreshed {
-            *self.cached_operator.write().await = Some(refreshed);
+            *cached_operator.write().await = Some(refreshed);
         }
         Ok(value)
     }
 
-    async fn ensure_fresh_operator(&self) -> Result<OperatorWithCredential> {
+    async fn ensure_fresh_operator(
+        &self,
+        config: &ObjectStoreOperatorConfig,
+        cached_operator: &RwLock<Option<OperatorWithCredential>>,
+    ) -> Result<OperatorWithCredential> {
         let credential = self.credentials.current().await?.ok_or_else(|| {
             anyhow::anyhow!("snapshot OSS client requires non-anonymous credentials")
         })?;
 
         {
-            let cached = self.cached_operator.read().await;
+            let cached = cached_operator.read().await;
             if let Some(state) = cached.as_ref() {
                 if state.credential() == Some(&credential) {
                     return Ok(state.clone());
@@ -500,10 +678,10 @@ impl OssClient {
         }
 
         let entry = OperatorWithCredential::new(
-            build_object_store_operator(&self.operator_config, Some(&credential))?,
+            build_object_store_operator(config, Some(&credential))?,
             Some(credential),
         );
-        *self.cached_operator.write().await = Some(entry.clone());
+        *cached_operator.write().await = Some(entry.clone());
         Ok(entry)
     }
 }
@@ -515,15 +693,46 @@ fn detect_addressing_style(endpoint: &str, bucket: &str) -> Result<AddressingSty
         .ok_or_else(|| anyhow::anyhow!("snapshot OSS endpoint host is missing"))?;
     let bucket_host = format!("{bucket}.");
     let is_bucket_virtual_host = host.starts_with(&bucket_host);
-    let is_aliyun_endpoint = host.ends_with(".aliyuncs.com") || host.ends_with(".aliyun-inc.com");
 
     if is_bucket_virtual_host {
         return Ok(AddressingStyle::Virtual);
     }
-    if is_aliyun_endpoint {
+    if is_aliyun_host(host) {
         return Ok(AddressingStyle::Virtual);
     }
     Ok(AddressingStyle::Path)
+}
+
+fn check_deadline(deadline: tokio::time::Instant) -> opendal::Result<()> {
+    if tokio::time::Instant::now() < deadline {
+        return Ok(());
+    }
+    Err(OpenDalError::new(
+        OpenDalErrorKind::Unexpected,
+        "deadline passed before the write started",
+    ))
+}
+
+fn is_aliyun_host(host: &str) -> bool {
+    host.ends_with(".aliyuncs.com") || host.ends_with(".aliyun-inc.com")
+}
+
+/// The region endpoint for Alibaba OSS's native API, or `None` for other
+/// stores. The native client adds the bucket to the host itself.
+fn aliyun_service_endpoint(endpoint: &str, bucket: &str) -> Result<Option<String>> {
+    let mut url = Url::parse(endpoint).context("parse snapshot OSS endpoint")?;
+    let Some(host) = url.host_str() else {
+        return Ok(None);
+    };
+    if !is_aliyun_host(host) {
+        return Ok(None);
+    }
+    if let Some(region_host) = host.strip_prefix(&format!("{bucket}.")) {
+        let region_host = region_host.to_owned();
+        url.set_host(Some(&region_host))
+            .context("strip bucket from snapshot OSS endpoint")?;
+    }
+    Ok(Some(url.as_str().trim_end_matches('/').to_owned()))
 }
 
 async fn download_object_to_file(
@@ -610,6 +819,29 @@ mod tests {
         assert_eq!(
             overridden.operator_config.addressing_style,
             AddressingStyle::Virtual
+        );
+    }
+
+    #[test]
+    fn only_alibaba_oss_endpoints_get_the_native_api() {
+        assert_eq!(
+            super::aliyun_service_endpoint("https://oss-cn-hangzhou.aliyuncs.com", "snaps")
+                .unwrap()
+                .as_deref(),
+            Some("https://oss-cn-hangzhou.aliyuncs.com")
+        );
+        assert_eq!(
+            super::aliyun_service_endpoint(
+                "https://snaps.oss-cn-hangzhou-internal.aliyuncs.com/",
+                "snaps"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("https://oss-cn-hangzhou-internal.aliyuncs.com")
+        );
+        assert_eq!(
+            super::aliyun_service_endpoint("http://127.0.0.1:9000", "snaps").unwrap(),
+            None
         );
     }
 

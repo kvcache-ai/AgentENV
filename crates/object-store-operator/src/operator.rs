@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use opendal::layers::{RetryLayer, TimeoutLayer};
-use opendal::services::S3;
+use opendal::services::{Oss, S3};
 use thiserror::Error;
 
 use crate::auth::{CachedCredentialSource, ResolvedCredential};
@@ -26,8 +26,18 @@ impl AddressingStyle {
     }
 }
 
+/// The API an operator speaks. Every supported store speaks S3; Alibaba OSS's
+/// native API additionally appends to objects, which its S3 API cannot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ObjectStoreService {
+    #[default]
+    S3,
+    AliyunOss,
+}
+
 #[derive(Clone, Debug)]
 pub struct ObjectStoreOperatorConfig {
+    pub service: ObjectStoreService,
     pub bucket: String,
     pub endpoint: String,
     pub region: String,
@@ -73,6 +83,46 @@ pub fn build_object_store_operator(
     config: &ObjectStoreOperatorConfig,
     credential: Option<&ResolvedCredential>,
 ) -> ObjectStoreOperatorResult<Operator> {
+    let operator = match config.service {
+        ObjectStoreService::S3 => Operator::new(s3_builder(config, credential)).map(|b| b.finish()),
+        ObjectStoreService::AliyunOss => {
+            Operator::new(aliyun_oss_builder(config, credential)).map(|b| b.finish())
+        }
+    }
+    .context("build OpenDAL object-store operator")
+    .map_err(ObjectStoreOperatorError::OperatorBuild)?;
+
+    let timeout = config.timeout.unwrap_or(DEFAULT_TIMEOUT);
+    let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
+    Ok(operator
+        .layer(
+            TimeoutLayer::new()
+                .with_timeout(timeout)
+                .with_io_timeout(timeout),
+        )
+        .layer(RetryLayer::new().with_max_times(max_retries)))
+}
+
+fn aliyun_oss_builder(
+    config: &ObjectStoreOperatorConfig,
+    credential: Option<&ResolvedCredential>,
+) -> Oss {
+    let mut builder = Oss::default()
+        .bucket(&config.bucket)
+        .endpoint(&config.endpoint);
+    if let Some(credential) = credential {
+        builder = builder.access_key_id(&credential.access_key_id);
+        builder = builder.access_key_secret(&credential.secret_access_key);
+        if let Some(token) = credential.security_token.as_deref() {
+            builder = builder.security_token(token);
+        }
+    } else {
+        builder = builder.allow_anonymous();
+    }
+    builder
+}
+
+fn s3_builder(config: &ObjectStoreOperatorConfig, credential: Option<&ResolvedCredential>) -> S3 {
     let mut builder = S3::default()
         .bucket(&config.bucket)
         .endpoint(&config.endpoint)
@@ -91,21 +141,7 @@ pub fn build_object_store_operator(
     } else {
         builder = builder.allow_anonymous();
     }
-
-    let timeout = config.timeout.unwrap_or(DEFAULT_TIMEOUT);
-    let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
-    let operator = Operator::new(builder)
-        .context("build OpenDAL object-store operator")
-        .map_err(ObjectStoreOperatorError::OperatorBuild)?
-        .finish()
-        .layer(
-            TimeoutLayer::new()
-                .with_timeout(timeout)
-                .with_io_timeout(timeout),
-        )
-        .layer(RetryLayer::new().with_max_times(max_retries));
-
-    Ok(operator)
+    builder
 }
 
 pub async fn run_with_refresh<T, F, Fut>(
