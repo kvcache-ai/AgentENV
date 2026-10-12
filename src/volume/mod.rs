@@ -13,6 +13,9 @@ use uuid::Uuid;
 use crate::repository::{Repository, RepositoryError};
 use crate::snapshot::OverlaybdLayerRef;
 
+mod catalog;
+pub use catalog::{VolumeCatalog, VolumeRecordPage};
+
 pub const DEFAULT_VOLUME_SIZE_MB: u64 = 64 * 1024;
 /// Firecracker exposes /dev/vdc through /dev/vdz for extra drives.
 pub const MAX_VOLUME_MOUNTS: usize = 24;

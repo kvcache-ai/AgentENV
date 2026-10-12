@@ -49,7 +49,7 @@ impl<R: Repository + ?Sized> BuildCacheStore for R {
                 Box::new(move |bytes| {
                     let mut state = BuildCacheState::load(bytes)?;
                     state.replace(&volume_id)?;
-                    state.encode()
+                    state.encode().map(Some)
                 }),
             )
             .await?;
@@ -63,7 +63,7 @@ impl<R: Repository + ?Sized> BuildCacheStore for R {
             Box::new(move |bytes| {
                 let mut state = BuildCacheState::load(bytes)?;
                 state.retired.remove(&volume_id);
-                state.encode()
+                state.encode().map(Some)
             }),
         )
         .await?;

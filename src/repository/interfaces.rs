@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::errors::{RepositoryError, RepositoryResult};
-use super::DocumentKey;
+use super::{DocumentCollection, DocumentKey};
 use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::{
     RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSourceKind,
@@ -44,17 +44,11 @@ pub struct SnapshotListFilter {
     pub template_statuses: Option<Vec<TemplateBuildStatus>>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct VolumeRecordPage {
-    pub records: Vec<crate::volume::VolumeRecord>,
-    /// The last returned volume ID. Supplying it to the next request resumes
-    /// after that record in the repository's stable shard-and-ID order.
-    pub next_volume_id: Option<String>,
-}
-
-/// Computes a document's new bytes from its current bytes, if any. Backends
-/// may call it again when a concurrent writer wins.
-pub type DocumentUpdate = Box<dyn Fn(Option<&[u8]>) -> RepositoryResult<Vec<u8>> + Send + Sync>;
+/// Computes a document's new bytes from its current bytes, if any, or `None`
+/// to leave it unchanged. Backends may call it again when a concurrent writer
+/// wins, so it must be a pure function of its input.
+pub type DocumentUpdate =
+    Box<dyn Fn(Option<&[u8]>) -> RepositoryResult<Option<Vec<u8>>> + Send + Sync>;
 
 fn unsupported<T>(feature: &str) -> RepositoryResult<T> {
     Err(RepositoryError::Unsupported {
@@ -233,8 +227,8 @@ pub trait Repository: Send + Sync {
         unsupported("repository documents")
     }
 
-    /// Atomically rewrites one shared document against concurrent writers on
-    /// every node, returning the document the update replaced.
+    /// Atomically applies `update` against concurrent writers on every node,
+    /// returning the document it was applied to.
     async fn update_document(
         &self,
         _key: DocumentKey,
@@ -243,31 +237,19 @@ pub trait Repository: Send + Sync {
         unsupported("repository documents")
     }
 
-    /// Resolves a volume by ID first, then by its unique name.
-    async fn get_volume(
-        &self,
-        _reference: &str,
-    ) -> RepositoryResult<Option<crate::volume::VolumeRecord>> {
-        unsupported("volume catalog")
+    /// Removes one shared document. Missing documents are considered success.
+    async fn delete_document(&self, _key: DocumentKey) -> RepositoryResult<()> {
+        unsupported("repository documents")
     }
 
-    /// Lists one bounded page ordered by the repository's stable volume cursor.
-    async fn list_volumes_page(
+    /// Lists up to `limit` document IDs after `after`, in the backend's stable order.
+    async fn list_documents(
         &self,
-        _after_volume_id: Option<&str>,
+        _collection: DocumentCollection,
+        _after: Option<&str>,
         _limit: usize,
-    ) -> RepositoryResult<VolumeRecordPage> {
-        unsupported("volume catalog")
-    }
-
-    /// Creates one durable volume record and atomically claims its unique name.
-    async fn create_volume(&self, _record: crate::volume::VolumeRecord) -> RepositoryResult<()> {
-        unsupported("volume catalog")
-    }
-
-    /// Updates one existing durable volume record.
-    async fn put_volume(&self, _record: crate::volume::VolumeRecord) -> RepositoryResult<()> {
-        unsupported("volume catalog")
+    ) -> RepositoryResult<Vec<String>> {
+        unsupported("repository documents")
     }
 
     /// Publishes the current node-local OverlayBD backing and returns logical
@@ -288,41 +270,6 @@ pub trait Repository: Send + Sync {
         _destination: &Path,
     ) -> RepositoryResult<PathBuf> {
         unsupported("volume backing materialization")
-    }
-
-    /// Removes one durable volume record. Missing records are considered success.
-    async fn delete_volume(&self, _volume_id: &str) -> RepositoryResult<()> {
-        unsupported("volume catalog")
-    }
-
-    /// Acquires an exclusive volume reservation atomically where the backend
-    /// supports it. `Ok(Some(owner))` reports an existing conflicting owner.
-    async fn reserve_volume(
-        &self,
-        _volume_id: &str,
-        _owner: &str,
-    ) -> RepositoryResult<Option<String>> {
-        unsupported("volume reservations")
-    }
-
-    /// Adds a shared lease for a read-only volume.
-    async fn reserve_read_only_volume(
-        &self,
-        _volume_id: &str,
-        _owner: &str,
-    ) -> RepositoryResult<()> {
-        unsupported("read-only volume reservations")
-    }
-
-    /// Conditionally releases or rebinds one known volume. Implementations
-    /// must change the record only when it is currently mounted by `from`.
-    async fn replace_volume_owner_for(
-        &self,
-        _volume_id: &str,
-        _from: &str,
-        _to: Option<&str>,
-    ) -> RepositoryResult<()> {
-        unsupported("volume reservations")
     }
 }
 

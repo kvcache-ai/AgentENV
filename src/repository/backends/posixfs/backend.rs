@@ -13,13 +13,12 @@ use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
 use crate::repository::interfaces::{Repository, SnapshotRuntimeResolver};
 use crate::repository::{
-    DocumentKey, DocumentUpdate, RepositoryError, RepositoryResult, SnapshotListFilter,
-    VolumeRecordPage,
+    DocumentCollection, DocumentKey, DocumentUpdate, RepositoryError, RepositoryResult,
+    SnapshotListFilter,
 };
 use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord};
-use crate::volume::VolumeRecord;
 
 #[derive(Clone, Debug)]
 pub struct PosixFsBackendConfig {
@@ -403,34 +402,22 @@ impl Repository for PosixFsRepository {
         .await
     }
 
-    async fn get_volume(&self, reference: &str) -> RepositoryResult<Option<VolumeRecord>> {
-        let reference = reference.to_owned();
-        self.run_catalog("get volume", move |store| store.get_volume(&reference))
+    async fn delete_document(&self, key: DocumentKey) -> RepositoryResult<()> {
+        self.run_catalog("delete document", move |store| store.delete_document(&key))
             .await
     }
 
-    async fn list_volumes_page(
+    async fn list_documents(
         &self,
-        after_volume_id: Option<&str>,
+        collection: DocumentCollection,
+        after: Option<&str>,
         limit: usize,
-    ) -> RepositoryResult<VolumeRecordPage> {
-        let after_volume_id = after_volume_id.map(str::to_owned);
-        self.run_catalog("list volumes", move |store| {
-            store.list_volumes_page(after_volume_id.as_deref(), limit)
+    ) -> RepositoryResult<Vec<String>> {
+        let after = after.map(str::to_owned);
+        self.run_catalog("list documents", move |store| {
+            store.list_documents(collection, after.as_deref(), limit)
         })
         .await
-    }
-
-    async fn create_volume(&self, record: VolumeRecord) -> RepositoryResult<()> {
-        self.run_catalog("create volume", move |store| store.create_volume(&record))
-            .await
-    }
-
-    async fn put_volume(&self, record: VolumeRecord) -> RepositoryResult<()> {
-        let mut record = record;
-        record.backing_image_config = None;
-        self.run_catalog("put volume", move |store| store.put_volume(&record))
-            .await
     }
 
     async fn publish_volume_backing(
@@ -466,51 +453,6 @@ impl Repository for PosixFsRepository {
                 uuid: layer.uuid.clone().unwrap_or_default(),
                 ..Default::default()
             }
-        })
-        .await
-    }
-
-    async fn delete_volume(&self, volume_id: &str) -> RepositoryResult<()> {
-        let volume_id = volume_id.to_owned();
-        self.run_catalog("delete volume", move |store| {
-            store.delete_volume(&volume_id)
-        })
-        .await
-    }
-
-    async fn reserve_volume(
-        &self,
-        volume_id: &str,
-        owner: &str,
-    ) -> RepositoryResult<Option<String>> {
-        let volume_id = volume_id.to_owned();
-        let owner = owner.to_owned();
-        self.run_catalog("reserve volume", move |store| {
-            store.reserve_volume(&volume_id, &owner)
-        })
-        .await
-    }
-
-    async fn reserve_read_only_volume(&self, volume_id: &str, owner: &str) -> RepositoryResult<()> {
-        let volume_id = volume_id.to_owned();
-        let owner = owner.to_owned();
-        self.run_catalog("reserve read-only volume", move |store| {
-            store.reserve_read_only_volume(&volume_id, &owner)
-        })
-        .await
-    }
-
-    async fn replace_volume_owner_for(
-        &self,
-        volume_id: &str,
-        from: &str,
-        to: Option<&str>,
-    ) -> RepositoryResult<()> {
-        let volume_id = volume_id.to_owned();
-        let from = from.to_owned();
-        let to = to.map(str::to_owned);
-        self.run_catalog("replace volume owner", move |store| {
-            store.replace_volume_owner_for(&volume_id, &from, to.as_deref())
         })
         .await
     }

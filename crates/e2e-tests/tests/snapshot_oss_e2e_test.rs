@@ -16,6 +16,7 @@ use agentenv::snapshot::{
     SnapshotPublishSource, SnapshotRuntimeVersions, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use agentenv::types::SandboxResources;
+use agentenv::volume::{VolumeCatalog, VolumeRecord, VolumeStatus};
 use agentenv_test_support::minio::{MinioFixture, MINIO_PASS, MINIO_USER};
 use anyhow::{Context, Result};
 use overlaybd::backend::local::LocalFile;
@@ -790,6 +791,108 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
             .await?
     );
 
+    Ok(())
+}
+
+fn volume_record(id: &str, name: &str) -> Result<VolumeRecord> {
+    Ok(serde_json::from_value(serde_json::json!({
+        "id": id,
+        "name": name,
+        "mode": "Exclusive",
+        "sizeMb": 1024,
+        "status": "ready",
+        "reservedBySandboxId": null,
+        "backingLayers": [],
+        "readOnlyMounts": [],
+    }))?)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires docker"]
+async fn volume_catalog_on_oss_follows_shared_rules() -> Result<()> {
+    let fixture = MinioFixture::start().await?;
+    ensure_test_config()?;
+    let workspace = TempDir::new()?;
+    let prefix = "snapshots/e2e-volumes";
+    let oss = test_oss_config(&fixture, prefix);
+    let repository = || -> Result<_> {
+        Ok(OssBackend::new(&oss, workspace.path().join("oss-cache"))?
+            .into_parts()
+            .0)
+    };
+
+    // Concurrent creates of one name leave exactly one volume behind.
+    let mut creates = Vec::new();
+    for index in 0..8 {
+        let repository = repository()?;
+        let record = volume_record(&format!("vol_race_{index}"), "shared")?;
+        creates.push(tokio::spawn(async move {
+            let id = record.id.clone();
+            repository.create_volume(record).await.map(|()| id)
+        }));
+    }
+    let mut created = Vec::new();
+    for create in creates {
+        match create.await? {
+            Ok(id) => created.push(id),
+            Err(RepositoryError::VolumeNameConflict { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    assert_eq!(created.len(), 1);
+    let catalog = repository()?;
+    let winner = catalog
+        .get_volume("shared")
+        .await?
+        .context("shared volume")?;
+    assert_eq!(winner.id, created[0]);
+    let listed = catalog.list_volumes_page(None, 100).await?;
+    assert_eq!(listed.records.len(), 1);
+
+    // Reservations need a ready volume and report conflicting owners.
+    assert_eq!(catalog.reserve_volume(&winner.id, "sandbox-a").await?, None);
+    assert_eq!(
+        catalog.reserve_volume(&winner.id, "sandbox-b").await?,
+        Some("sandbox-a".to_owned())
+    );
+    assert!(catalog.delete_volume(&winner.id).await.is_err());
+    catalog
+        .replace_volume_owner_for(&winner.id, "sandbox-a", None)
+        .await?;
+    let mut uploading = volume_record("vol_uploading", "uploading")?;
+    catalog.create_volume(uploading.clone()).await?;
+    uploading.status = VolumeStatus::Uploading;
+    catalog.put_volume(uploading.clone()).await?;
+    assert!(catalog
+        .reserve_volume(&uploading.id, "sandbox-a")
+        .await
+        .is_err());
+    catalog
+        .replace_volume_owner_for("vol_missing", "sandbox-a", None)
+        .await?;
+
+    // Pages resume after the cursor in ID order.
+    let first = catalog.list_volumes_page(None, 1).await?;
+    let next = first.next_volume_id.clone().context("second page")?;
+    let second = catalog.list_volumes_page(Some(&next), 1).await?;
+    assert_eq!(first.records[0].id, winner.id);
+    assert_eq!(second.records[0].id, uploading.id);
+    assert_eq!(second.next_volume_id, None);
+
+    // Deleting removes both the record and its name.
+    catalog.delete_volume(&winner.id).await?;
+    assert!(catalog.get_volume("shared").await?.is_none());
+    for key in [
+        format!("{prefix}/volumes/records/{}.json", winner.id),
+        format!("{prefix}/volumes/aliases/shared.json"),
+    ] {
+        assert!(!fixture.object_exists(&key).await?, "{key}");
+    }
+    assert!(
+        fixture
+            .object_exists(&format!("{prefix}/volumes/aliases/uploading.json"))
+            .await?
+    );
     Ok(())
 }
 

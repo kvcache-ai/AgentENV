@@ -1,7 +1,7 @@
 use super::*;
 use crate::api::impls::template_helpers::template_build_record_from_v3_request;
 use crate::snapshot::{SnapshotSource, TemplateBuildStatus};
-use crate::volume::{VolumeLimits, VolumeMode, VolumeRecord, VolumeStatus};
+use crate::volume::{VolumeCatalog, VolumeLimits, VolumeMode, VolumeRecord, VolumeStatus};
 
 pub(super) async fn test_api(
     limits: VolumeLimits,

@@ -168,7 +168,7 @@ never a live server's state. Set `AENV_CONFIG_PATH` for non-default test configs
 | Firecracker and drives | `src/sandbox/firecracker/`, `src/sandbox/ublk/`, `src/sandbox/extra_drive.rs` |
 | Snapshots and templates | `src/snapshot/`, `src/template/` |
 | Durable repository (OSS/POSIX) | `src/repository/` |
-| Volumes | `src/volume.rs`, `src/api/impls/volumes.rs`, `src/api/impls/sandbox.rs` |
+| Volumes | `src/volume/`, `src/api/impls/volumes.rs`, `src/api/impls/sandbox.rs` |
 | Layered storage | `storage/overlaybd/`, `storage/ublk/`, `storage/ublk-daemon/`, `storage/util/` |
 | Images and P2P | `src/image/`, `src/p2p/`, `src/overlaybd/p2p/` |
 | Control plane and metrics | `services/`, `src/observability/` |
