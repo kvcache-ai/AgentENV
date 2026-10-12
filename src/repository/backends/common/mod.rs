@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -6,70 +6,6 @@ use overlaybd::backend::local::LocalFile;
 use overlaybd::dense_export;
 use overlaybd::index_file::CommitArgs;
 use overlaybd::virtual_file::VirtualFile;
-
-use crate::repository::{RepositoryError, RepositoryResult};
-use crate::snapshot::{ManagedLayer, OverlaybdLayerRef};
-use uuid::Uuid;
-
-pub(crate) async fn materialize_volume_image_config(
-    layers: &[OverlaybdLayerRef],
-    destination: &Path,
-    managed_layer: impl Fn(&ManagedLayer) -> overlaybd::config::LayerConfig,
-) -> RepositoryResult<PathBuf> {
-    use overlaybd::config::{ImageConfig, LayerConfig};
-
-    let image_config = ImageConfig {
-        lowers: layers
-            .iter()
-            .map(|layer| match layer {
-                OverlaybdLayerRef::Managed(layer) => managed_layer(layer),
-                OverlaybdLayerRef::External(layer) => LayerConfig {
-                    repo_blob_url: layer.repo_blob_url.clone(),
-                    digest: layer.digest.clone(),
-                    size: layer.size,
-                    ..LayerConfig::default()
-                },
-            })
-            .collect(),
-        ..ImageConfig::default()
-    };
-    let parent = destination
-        .parent()
-        .ok_or_else(|| RepositoryError::Backend {
-            message: format!(
-                "volume image config '{}' has no parent",
-                destination.display()
-            ),
-            source: None,
-        })?;
-    tokio::fs::create_dir_all(parent).await.map_err(|error| {
-        RepositoryError::backend(
-            format!("create volume image config dir '{}'", parent.display()),
-            error,
-        )
-    })?;
-    let bytes = serde_json::to_vec_pretty(&image_config)
-        .map_err(|error| RepositoryError::backend("serialize volume image config", error))?;
-    let temporary = destination.with_extension(format!("tmp-{}", Uuid::now_v7().simple()));
-    if let Err(error) = tokio::fs::write(&temporary, bytes).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(RepositoryError::backend(
-            format!(
-                "write temporary volume image config '{}'",
-                temporary.display()
-            ),
-            error,
-        ));
-    }
-    if let Err(error) = tokio::fs::rename(&temporary, destination).await {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(RepositoryError::backend(
-            format!("install volume image config '{}'", destination.display()),
-            error,
-        ));
-    }
-    Ok(destination.to_path_buf())
-}
 
 pub(crate) async fn write_dense_overlaybd_layer_to_file(
     source: &Path,

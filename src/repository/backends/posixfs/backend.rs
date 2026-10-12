@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -5,17 +6,17 @@ use async_trait::async_trait;
 use tempfile::NamedTempFile;
 use tokio::task;
 
-use super::super::{common::materialize_volume_image_config, shared_runtime_cache_root};
+use super::super::shared_runtime_cache_root;
 use super::artifacts::PosixFsArtifactStore;
 use super::catalog::PosixFsCatalogStore;
-use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
 use crate::repository::interfaces::{Repository, SnapshotRuntimeResolver};
 use crate::repository::{
-    BlobBody, BlobKey, DocumentCollection, DocumentKey, DocumentUpdate, RepositoryError,
-    RepositoryResult,
+    BlobBody, BlobKey, BlobLocation, DocumentCollection, DocumentKey, DocumentUpdate,
+    RepositoryError, RepositoryResult,
 };
 use crate::snapshot::artifact_cache::LocalArtifactCache;
+use crate::snapshot::resolver::RepositoryRuntimeResolver;
 use crate::snapshot::SnapshotId;
 
 #[derive(Clone, Debug)]
@@ -74,9 +75,15 @@ impl PosixFsBackend {
         let artifact_store = Arc::new(PosixFsArtifactStore::new(root.clone()));
         let repository: Arc<dyn Repository> =
             Arc::new(PosixFsRepository::new(catalog_store, artifact_store));
-        let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> = Arc::new(
-            PosixFsRuntimeResolver::new(root, runtime_cache_root, store, cache),
-        );
+        // Files are read in place, so the resolver never fetches from peers.
+        let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> =
+            Arc::new(RepositoryRuntimeResolver::new(
+                Arc::clone(&repository),
+                cache,
+                runtime_cache_root,
+                store,
+                None,
+            ));
 
         Self {
             repository,
@@ -157,6 +164,43 @@ impl Repository for PosixFsRepository {
         }
     }
 
+    fn locate_blob(&self, key: &BlobKey) -> RepositoryResult<BlobLocation> {
+        Ok(BlobLocation::Local(self.artifact_store.blob_path(key)))
+    }
+
+    async fn has_blob(&self, key: &BlobKey) -> RepositoryResult<bool> {
+        let path = self.artifact_store.blob_path(key);
+        tokio::fs::try_exists(&path)
+            .await
+            .map_err(|error| RepositoryError::backend(format!("check '{}'", path.display()), error))
+    }
+
+    async fn fetch_blob(&self, key: &BlobKey, destination: &Path) -> RepositoryResult<u64> {
+        let path = self.artifact_store.blob_path(key);
+        tokio::fs::copy(&path, destination).await.map_err(|error| {
+            RepositoryError::backend(
+                format!("copy '{}' to '{}'", path.display(), destination.display()),
+                error,
+            )
+        })
+    }
+
+    async fn read_blob(&self, key: &BlobKey) -> RepositoryResult<Vec<u8>> {
+        let path = self.artifact_store.blob_path(key);
+        match tokio::fs::read(&path).await {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(RepositoryError::ArtifactNotFound {
+                    artifact: format!("'{}'", path.display()),
+                })
+            }
+            Err(error) => Err(RepositoryError::backend(
+                format!("read '{}'", path.display()),
+                error,
+            )),
+        }
+    }
+
     async fn delete_snapshot_blobs(&self, id: &SnapshotId) -> RepositoryResult<()> {
         let id = id.clone();
         self.run_artifacts("delete snapshot files", move |store| {
@@ -219,28 +263,6 @@ impl Repository for PosixFsRepository {
         })
         .await
     }
-
-    async fn materialize_volume_backing(
-        &self,
-        _volume_id: &str,
-        layers: &[crate::snapshot::OverlaybdLayerRef],
-        destination: &std::path::Path,
-    ) -> RepositoryResult<std::path::PathBuf> {
-        materialize_volume_image_config(layers, destination, |layer| {
-            overlaybd::config::LayerConfig {
-                file: self
-                    .artifact_store
-                    .managed_layer_path(&layer.digest)
-                    .to_string_lossy()
-                    .into_owned(),
-                digest: layer.digest.clone(),
-                size: layer.size,
-                uuid: layer.uuid.clone().unwrap_or_default(),
-                ..Default::default()
-            }
-        })
-        .await
-    }
 }
 
 async fn run_repository_blocking<T, F>(operation: &'static str, work: F) -> RepositoryResult<T>
@@ -265,13 +287,13 @@ mod tests {
     use overlaybd::config::ImageConfig as OverlaybdImageConfig;
     use tempfile::TempDir;
 
-    use super::super::runtime::PosixFsRuntimeResolver;
     use super::{PosixFsBackend, PosixFsBackendConfig, PosixFsRepository};
     use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
     use crate::repository::{RepositoryError, SnapshotRuntimeResolver};
     use crate::sandbox::{ExtraDrive, SandboxSnapshotManifest};
     use crate::snapshot::artifact_cache::LocalArtifactCache;
     use crate::snapshot::mock::write_mock_built_artifacts;
+    use crate::snapshot::resolver::RepositoryRuntimeResolver;
     use crate::snapshot::{
         CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotAlias, SnapshotCatalog,
         SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
@@ -333,6 +355,20 @@ mod tests {
         let cache = LocalArtifactCache::new(root.join("runtime-cache"), None)
             .expect("local artifact cache");
         PosixFsBackend::from_parts(config, test_overlaybd_layer_store(), cache)
+    }
+
+    fn test_resolver(
+        root: &Path,
+        runtime_root: std::path::PathBuf,
+        cache: Arc<LocalArtifactCache>,
+    ) -> RepositoryRuntimeResolver {
+        RepositoryRuntimeResolver::new(
+            Arc::new(test_repository(root)),
+            cache,
+            runtime_root,
+            test_overlaybd_layer_store(),
+            None,
+        )
     }
 
     fn test_repository(root: &Path) -> PosixFsRepository {
@@ -459,10 +495,9 @@ mod tests {
             .and_then(|value| value.memory_startup.as_ref())
             .expect("descriptor attached")
             .clone();
-        let resolver = PosixFsRuntimeResolver::new(
-            tempdir.path().to_path_buf(),
+        let resolver = test_resolver(
+            tempdir.path(),
             tempdir.path().join("runtime-consume"),
-            test_overlaybd_layer_store(),
             LocalArtifactCache::new(tempdir.path().join("cache-consume"), None)
                 .expect("local cache"),
         )
@@ -484,10 +519,9 @@ mod tests {
             std::fs::read(path).unwrap().len() as u64,
             descriptor.pack_size
         );
-        let disabled = PosixFsRuntimeResolver::new(
-            tempdir.path().to_path_buf(),
+        let disabled = test_resolver(
+            tempdir.path(),
             tempdir.path().join("runtime-disabled"),
-            test_overlaybd_layer_store(),
             LocalArtifactCache::new(tempdir.path().join("cache-disabled"), None).unwrap(),
         )
         .with_test_consume_enabled(false);
@@ -673,12 +707,7 @@ mod tests {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let cache =
             LocalArtifactCache::new(tempdir.path().join("cache"), None).expect("local cache");
-        let resolver = PosixFsRuntimeResolver::new(
-            tempdir.path().to_path_buf(),
-            tempdir.path().join("runtime-cache"),
-            test_overlaybd_layer_store(),
-            cache,
-        );
+        let resolver = test_resolver(tempdir.path(), tempdir.path().join("runtime-cache"), cache);
         let metadata = sample_metadata(SnapshotId::generate(), None);
         let committed = CommittedSnapshot {
             context: metadata.context.clone(),
@@ -712,12 +741,7 @@ mod tests {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let cache =
             LocalArtifactCache::new(tempdir.path().join("cache"), None).expect("local cache");
-        let resolver = PosixFsRuntimeResolver::new(
-            tempdir.path().to_path_buf(),
-            tempdir.path().join("runtime-cache"),
-            test_overlaybd_layer_store(),
-            cache,
-        );
+        let resolver = test_resolver(tempdir.path(), tempdir.path().join("runtime-cache"), cache);
         let layer_path = tempdir.path().join("managed-layers").join(
             super::super::layout::managed_layer_file_name("sharedfs:test"),
         );

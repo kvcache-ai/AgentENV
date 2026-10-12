@@ -18,7 +18,6 @@ use tracing::info;
 use url::Url;
 
 use crate::observability::prometheus::MetricGuard;
-use crate::snapshot::SnapshotId;
 
 /// Multipart part size for streaming file uploads. S3/OSS caps a multipart
 /// upload at 10,000 parts, so this bounds the largest uploadable object
@@ -180,12 +179,13 @@ impl OssClient {
     /// s3:// URL of a snapshot's startup memory pack artifact, in the same
     /// URL form as managed layers (credentials resolve from the global OSS
     /// config on the consuming side).
-    pub(crate) fn startup_pack_url(&self, snapshot_id: &SnapshotId) -> String {
-        let key = self.full_key(&format!(
-            "artifacts/{snapshot_id}/{}",
-            crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT
-        ));
-        format!("s3://{}/{key}", self.operator_config.bucket)
+    /// The `s3://` URL overlaybd reads an object from.
+    pub(crate) fn object_url(&self, key: &str) -> String {
+        format!(
+            "s3://{}/{}",
+            self.operator_config.bucket,
+            self.full_key(key)
+        )
     }
 
     /// Read a small object entirely into memory.

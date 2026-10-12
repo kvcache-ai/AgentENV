@@ -65,6 +65,14 @@ impl PosixFsArtifactStore {
         })
     }
 
+    /// Where `key` is stored.
+    pub(crate) fn blob_path(&self, key: &BlobKey) -> PathBuf {
+        match key {
+            BlobKey::Layer { digest, .. } => self.managed_layer_path(digest),
+            BlobKey::Snapshot(id, file) => self.committed_layout(id).path(file.name()),
+        }
+    }
+
     /// Stores one snapshot file from `source`, hard-linking it when possible.
     fn put_snapshot_file(
         &self,

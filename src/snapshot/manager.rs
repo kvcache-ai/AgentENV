@@ -567,6 +567,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn posix_resolve_never_repairs_missing_files_from_peers() {
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: tempdir.path().join("repository"),
+            cache_root: Some(tempdir.path().join("runtime-cache")),
+            runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
+        })
+        .expect("posix backend");
+        let repository = backend.repository();
+        let p2p = Arc::new(MockTransport::default());
+        let manager = SnapshotManager::from_parts(
+            Arc::clone(&repository),
+            backend.runtime_resolver(),
+            Some(p2p.clone()),
+        );
+        let workspace = TempDir::new().expect("tempdir should exist");
+        let (_, _, manifest) =
+            write_mock_built_artifacts(workspace.path()).expect("mock artifacts should write");
+        let snapshot_id = SnapshotId::generate();
+        let metadata = SnapshotPublishMetadata {
+            id: snapshot_id.clone(),
+            ..SnapshotPublishMetadata::mock()
+        };
+        let record = manager
+            .publish(metadata, manifest, None)
+            .await
+            .expect("publish should commit");
+        let crate::repository::BlobLocation::Local(vm_state) = repository
+            .locate_blob(&crate::repository::BlobKey::Snapshot(
+                snapshot_id.clone(),
+                crate::repository::SnapshotFile::VmState,
+            ))
+            .expect("posix locates snapshot files")
+        else {
+            panic!("posix reads snapshot files in place");
+        };
+        std::fs::remove_file(&vm_state).expect("remove vm state");
+
+        // Peers still have the file, even given to the resolver directly.
+        let resolver = crate::snapshot::resolver::RepositoryRuntimeResolver::new(
+            repository,
+            crate::snapshot::artifact_cache::LocalArtifactCache::new(
+                tempdir.path().join("other-cache"),
+                None,
+            )
+            .expect("local cache"),
+            tempdir.path().join("other-runtime"),
+            crate::image::cache::local_image_services_from_global_config().overlaybd_layers,
+            Some(p2p),
+        );
+        let error = resolver
+            .resolve(Arc::new(record))
+            .await
+            .expect_err("missing vm state must not be fetched from peers");
+        assert!(matches!(
+            error,
+            crate::repository::RepositoryError::ArtifactNotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
     async fn failed_repository_commit_does_not_publish_to_p2p() {
         let p2p = Arc::new(MockTransport::default());
         let manager = SnapshotManager::from_parts(

@@ -1,19 +1,18 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use overlaybd::config::LayerConfig;
 
 use super::client::{OssClient, OssUploadArtifact};
 use super::documents;
 use super::layout::OssSnapshotArtifactLayout;
 use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
-use crate::repository::backends::common::materialize_volume_image_config;
 use crate::repository::interfaces::{LayerRole, PublishPolicy, Repository};
 use crate::repository::{
-    BlobBody, BlobKey, DocumentCollection, DocumentKey, DocumentUpdate, RepositoryError,
-    RepositoryResult, SnapshotFile,
+    BlobBody, BlobKey, BlobLocation, DocumentCollection, DocumentKey, DocumentUpdate,
+    RepositoryError, RepositoryResult, SnapshotFile,
 };
-use crate::snapshot::{OverlaybdLayerRef, SnapshotId};
+use crate::snapshot::SnapshotId;
 
 /// Manages the committed‐state layer of the OSS snapshot repository.
 ///
@@ -111,6 +110,44 @@ impl Repository for OssRepository {
         .map_err(|error| RepositoryError::backend(format!("upload '{object_key}'"), error))
     }
 
+    fn locate_blob(&self, key: &BlobKey) -> RepositoryResult<BlobLocation> {
+        Ok(BlobLocation::Remote(
+            self.client.object_url(&self.object_key(key)),
+        ))
+    }
+
+    async fn has_blob(&self, key: &BlobKey) -> RepositoryResult<bool> {
+        let object_key = self.object_key(key);
+        self.client
+            .exists(&object_key)
+            .await
+            .map_err(|error| RepositoryError::backend(format!("check '{object_key}'"), error))
+    }
+
+    async fn fetch_blob(&self, key: &BlobKey, destination: &Path) -> RepositoryResult<u64> {
+        let object_key = self.object_key(key);
+        self.client
+            .get_to_file(&object_key, destination)
+            .await
+            .map_err(|error| RepositoryError::backend(format!("download '{object_key}'"), error))
+    }
+
+    async fn read_blob(&self, key: &BlobKey) -> RepositoryResult<Vec<u8>> {
+        let object_key = self.object_key(key);
+        match self.client.get_bytes(&object_key).await {
+            Ok(bytes) => Ok(bytes.to_vec()),
+            Err(error) if OssClient::is_not_found_error(&error) => {
+                Err(RepositoryError::ArtifactNotFound {
+                    artifact: format!("'{object_key}'"),
+                })
+            }
+            Err(error) => Err(RepositoryError::backend(
+                format!("read '{object_key}'"),
+                error,
+            )),
+        }
+    }
+
     async fn delete_snapshot_blobs(&self, id: &SnapshotId) -> RepositoryResult<()> {
         let prefix = self.layout(id).artifact_prefix();
         self.client
@@ -154,23 +191,6 @@ impl Repository for OssRepository {
     ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
         documents::read_all(&self.client, collection).await
     }
-
-    async fn materialize_volume_backing(
-        &self,
-        _volume_id: &str,
-        layers: &[OverlaybdLayerRef],
-        destination: &std::path::Path,
-    ) -> RepositoryResult<std::path::PathBuf> {
-        let managed_url = self.client.managed_layers_repo_blob_url();
-        materialize_volume_image_config(layers, destination, |layer| LayerConfig {
-            repo_blob_url: managed_url.clone(),
-            digest: layer.digest.clone(),
-            size: layer.size,
-            uuid: layer.uuid.clone().unwrap_or_default(),
-            ..LayerConfig::default()
-        })
-        .await
-    }
 }
 
 #[cfg(test)]
@@ -179,7 +199,7 @@ mod tests {
     use object_store_operator::CredentialSource;
     use overlaybd::config::ImageConfig;
 
-    use crate::snapshot::{ExternalLayer, ManagedLayer};
+    use crate::snapshot::{ExternalLayer, ManagedLayer, OverlaybdLayerRef};
 
     fn test_repository() -> OssRepository {
         let client = OssClient::new(
@@ -252,8 +272,7 @@ mod tests {
             }),
         ];
 
-        repository
-            .materialize_volume_backing("vol_test", &layers, &destination)
+        crate::snapshot::resolver::materialize_volume_backing(&repository, &layers, &destination)
             .await
             .expect("materialize volume config");
         let config: ImageConfig =

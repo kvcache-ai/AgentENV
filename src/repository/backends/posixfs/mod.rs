@@ -2,7 +2,6 @@ mod artifacts;
 mod backend;
 mod catalog;
 mod layout;
-mod runtime;
 
 pub(crate) use artifacts::PosixFsArtifactStore;
 pub(crate) use backend::PosixFsRepository;

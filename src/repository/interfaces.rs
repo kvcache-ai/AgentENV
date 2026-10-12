@@ -87,6 +87,15 @@ pub enum BlobBody<'a> {
     Bytes(Vec<u8>),
 }
 
+/// Where a stored blob is read from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlobLocation {
+    /// A path on this node.
+    Local(PathBuf),
+    /// The blob's URL.
+    Remote(String),
+}
+
 /// Snapshot record list filter.
 ///
 /// When multiple fields are present they combine with AND semantics.
@@ -185,8 +194,9 @@ impl SnapshotListFilter {
 /// records, aliases, and their rules, the same on every backend.
 ///
 /// The repository boundary excludes node-local derived state: runtime-ready
-/// `image.json` files are materialized by [`SnapshotRuntimeResolver`], and
-/// node-local cache directories never leak into durable records. Shared
+/// `image.json` files are materialized by one [`SnapshotRuntimeResolver`]
+/// over every backend, and node-local cache directories never leak into
+/// durable records. Shared
 /// layer imports must use atomic protocols so concurrent writers never expose
 /// half-written layers.
 pub trait Repository: Send + Sync {
@@ -204,6 +214,27 @@ pub trait Repository: Send + Sync {
     /// Stores one blob. A layer that is already stored is kept, since its
     /// digest names its contents; a snapshot file is replaced.
     async fn put_blob(&self, _key: &BlobKey, _body: BlobBody<'_>) -> RepositoryResult<()> {
+        unsupported("blob storage")
+    }
+
+    /// Where readers on this node find a blob: in place on a shared filesystem,
+    /// or by URL.
+    fn locate_blob(&self, _key: &BlobKey) -> RepositoryResult<BlobLocation> {
+        unsupported("blob storage")
+    }
+
+    /// Whether a blob is stored.
+    async fn has_blob(&self, _key: &BlobKey) -> RepositoryResult<bool> {
+        unsupported("blob storage")
+    }
+
+    /// Downloads one blob to `destination`, returning its size.
+    async fn fetch_blob(&self, _key: &BlobKey, _destination: &Path) -> RepositoryResult<u64> {
+        unsupported("blob storage")
+    }
+
+    /// Reads one small blob; `ArtifactNotFound` when it is absent.
+    async fn read_blob(&self, _key: &BlobKey) -> RepositoryResult<Vec<u8>> {
         unsupported("blob storage")
     }
 
@@ -260,16 +291,6 @@ pub trait Repository: Send + Sync {
         _collection: DocumentCollection,
     ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
         unsupported("repository documents")
-    }
-
-    /// Materializes a node-local runtime image config from shared logical layers.
-    async fn materialize_volume_backing(
-        &self,
-        _volume_id: &str,
-        _layers: &[crate::snapshot::OverlaybdLayerRef],
-        _destination: &Path,
-    ) -> RepositoryResult<PathBuf> {
-        unsupported("volume backing materialization")
     }
 }
 

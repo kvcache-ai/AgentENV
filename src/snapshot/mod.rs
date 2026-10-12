@@ -7,6 +7,7 @@ pub mod mock;
 pub(crate) mod p2p;
 pub(crate) mod publish;
 pub(crate) mod recontainerize;
+pub(crate) mod resolver;
 pub(crate) mod runtime_support;
 pub(crate) mod startup_pack;
 pub(crate) mod store;

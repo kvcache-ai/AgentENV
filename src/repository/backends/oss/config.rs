@@ -99,16 +99,6 @@ impl NormalizedOssConfig {
     pub(crate) fn snapshot_image_storage(&self) -> SnapshotImageStoragePolicy {
         self.snapshot_image_storage
     }
-
-    pub(crate) fn managed_layers_repo_blob_url(&self) -> String {
-        // overlaybd expects an S3-compatible repo blob URL here, including for
-        // Alibaba OSS, so the scheme remains `s3://` rather than `oss://`.
-        if self.prefix.is_empty() {
-            format!("s3://{}/managed-layers", self.bucket)
-        } else {
-            format!("s3://{}/{}/managed-layers", self.bucket, self.prefix)
-        }
-    }
 }
 
 #[cfg(test)]
@@ -143,10 +133,6 @@ mod tests {
             "https://oss-cn-hangzhou.aliyuncs.com"
         );
         assert_eq!(normalized.prefix(), "snapshots/managed");
-        assert_eq!(
-            normalized.managed_layers_repo_blob_url(),
-            "s3://demo-bucket/snapshots/managed/managed-layers"
-        );
         assert_eq!(
             normalized.snapshot_image_storage(),
             crate::cfg::SnapshotImageStoragePolicy::ObjectStorage

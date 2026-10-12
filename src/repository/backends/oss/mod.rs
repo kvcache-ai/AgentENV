@@ -4,7 +4,6 @@ mod documents;
 mod layout;
 mod lease;
 mod repository;
-mod resolver;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,12 +15,12 @@ use crate::image::cache::{local_image_services_from_global_config, OverlaybdLaye
 use crate::p2p::P2pTransport;
 use crate::repository::interfaces::{Repository, SnapshotRuntimeResolver};
 use crate::snapshot::artifact_cache::LocalArtifactCache;
+use crate::snapshot::resolver::RepositoryRuntimeResolver;
 
 pub(crate) use self::client::OssClient;
 pub(crate) use self::config::NormalizedOssConfig;
 pub(crate) use self::layout::OssSnapshotArtifactLayout;
 pub(crate) use self::repository::OssRepository;
-use self::resolver::OssRuntimeResolver;
 
 /// OSS-backed snapshot backend.
 ///
@@ -79,7 +78,6 @@ impl OssBackend {
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> Result<Self> {
         let config = NormalizedOssConfig::new(config, snapshot_image_storage)?;
-        let managed_layers_repo_blob_url = config.managed_layers_repo_blob_url();
         let client = Arc::new(OssClient::new(
             config.bucket().to_string(),
             config.endpoint().to_string(),
@@ -97,14 +95,14 @@ impl OssBackend {
 
         std::fs::create_dir_all(&runtime_root)
             .with_context(|| format!("create oss runtime root '{}'", runtime_root.display()))?;
-        let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> = Arc::new(OssRuntimeResolver::new(
-            client,
-            cache,
-            runtime_root,
-            store,
-            managed_layers_repo_blob_url,
-            p2p_transport,
-        )?);
+        let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> =
+            Arc::new(RepositoryRuntimeResolver::new(
+                Arc::clone(&repository),
+                cache,
+                runtime_root,
+                store,
+                p2p_transport,
+            ));
 
         Ok(Self {
             repository,
