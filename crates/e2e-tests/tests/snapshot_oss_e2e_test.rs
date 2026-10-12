@@ -8,7 +8,7 @@ use agentenv::cfg::{
 use agentenv::identity::NodeIdentity;
 use agentenv::p2p::{transport_from_config, P2pArtifactProviderHint, P2pTransport};
 use agentenv::repository::backends::OssBackend;
-use agentenv::repository::{RepositoryError, SnapshotListFilter};
+use agentenv::repository::{BuildCacheStore, RepositoryError, SnapshotListFilter};
 use agentenv::sandbox::{CapturedSandboxSnapshot, SandboxSnapshotManifest};
 use agentenv::snapshot::mock::write_mock_built_artifacts;
 use agentenv::snapshot::{
@@ -790,5 +790,30 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
             .await?
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires docker"]
+async fn build_cache_state_on_oss_retires_replaced_seeds() -> Result<()> {
+    let fixture = MinioFixture::start().await?;
+    ensure_test_config()?;
+    let workspace = TempDir::new()?;
+    let oss = test_oss_config(&fixture, "snapshots/e2e-build-cache");
+    let (repository, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
+    assert_eq!(repository.get_build_cache_head().await?, None);
+    assert_eq!(
+        repository.replace_build_cache_head("vol_seed_a").await?,
+        None
+    );
+    assert_eq!(
+        repository.replace_build_cache_head("vol_seed_b").await?,
+        Some("vol_seed_a".to_owned())
+    );
+    let state = repository.get_build_cache_state().await?;
+    assert_eq!(state.current.as_deref(), Some("vol_seed_b"));
+    assert!(state.retired.contains("vol_seed_a"));
+    repository.forget_retired_build_cache("vol_seed_a").await?;
+    assert!(repository.get_build_cache_state().await?.retired.is_empty());
     Ok(())
 }

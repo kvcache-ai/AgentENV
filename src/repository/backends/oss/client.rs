@@ -337,7 +337,9 @@ impl OssClient {
                 let write = operator.write_with(&oss_key, data);
                 let result = match etag.as_deref() {
                     Some(etag) => write.if_match(etag).await,
-                    None => write.if_none_match("*").await,
+                    // S3 rejects `If-None-Match: *` through opendal; this is its
+                    // create-only-if-absent form.
+                    None => write.if_not_exists(true).await,
                 };
                 match result {
                     Ok(_) => Ok(true),
