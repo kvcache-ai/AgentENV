@@ -14,7 +14,6 @@ use std::{sync::Mutex, thread};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use tokio::time::sleep;
 
 use super::backend::{
@@ -70,42 +69,20 @@ pub enum MockAction {
     FailAfter { delay: Duration, message: String },
 }
 
-pub type MetricsSampler = Arc<
-    dyn Fn() -> futures::future::BoxFuture<'static, Result<super::SandboxMetric>> + Send + Sync,
->;
-
-pub type LogsReader = Arc<
-    dyn Fn(
-            DateTime<Utc>,
-            DateTime<Utc>,
-            usize,
-            bool,
-            Option<crate::logging::LogLevel>,
-            Option<String>,
-        ) -> futures::future::BoxFuture<'static, Result<Vec<super::SandboxLogEntry>>>
-        + Send
-        + Sync,
->;
-
 #[derive(Default)]
 pub struct MockBehavior {
     actions: Mutex<HashMap<MockOperation, VecDeque<MockAction>>>,
     on_operation: Mutex<HashMap<MockOperation, Arc<dyn Fn() + Send + Sync>>>,
     runtime_info: Mutex<SandboxRuntimeInfo>,
-    metrics_sampler: Mutex<Option<MetricsSampler>>,
-    logs_reader: Mutex<Option<LogsReader>>,
+    envd: Mutex<Option<Arc<dyn super::EnvdApi>>>,
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
 }
 
 impl MockBehavior {
-    pub fn set_logs_reader(&self, reader: LogsReader) {
-        *self.logs_reader.lock().unwrap() = Some(reader);
-    }
-
-    pub fn set_metrics_sampler(&self, sampler: MetricsSampler) {
-        *self.metrics_sampler.lock().unwrap() = Some(sampler);
+    pub fn set_envd(&self, envd: Arc<dyn super::EnvdApi>) {
+        *self.envd.lock().unwrap() = Some(envd);
     }
 
     pub fn new() -> Self {
@@ -297,29 +274,8 @@ impl MockSandboxBackend {
 
 #[async_trait]
 impl SandboxBackend for MockSandboxBackend {
-    #[allow(clippy::too_many_arguments)]
-    fn logs_query(
-        &self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-        limit: usize,
-        backward: bool,
-        level: Option<crate::logging::LogLevel>,
-        search: Option<String>,
-    ) -> Option<futures::future::BoxFuture<'static, Result<Vec<super::SandboxLogEntry>>>> {
-        self.behavior
-            .logs_reader
-            .lock()
-            .unwrap()
-            .clone()
-            .map(|reader| reader(start, end, limit, backward, level, search))
-    }
-
-    fn metrics_sample(
-        &self,
-    ) -> Option<futures::future::BoxFuture<'static, Result<super::SandboxMetric>>> {
-        let sampler = self.behavior.metrics_sampler.lock().unwrap().clone();
-        sampler.map(|sample| sample())
+    fn envd(&self) -> Option<Arc<dyn super::EnvdApi>> {
+        self.behavior.envd.lock().unwrap().clone()
     }
 
     async fn start(&mut self) -> Result<()> {

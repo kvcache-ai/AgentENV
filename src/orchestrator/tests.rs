@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use serde_json::json;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
@@ -32,7 +33,8 @@ use crate::sandbox::mock::{
 };
 use crate::sandbox::{
     BaseSandboxNetworkPolicy, PausedSandboxState, RuntimeArtifactSet, SandboxLaunchConfig,
-    SandboxMetric, SandboxNetworkEgressPolicy, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    SandboxLogEntry, SandboxMetric, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+    SandboxRuntimeInfo,
 };
 use crate::snapshot::RunnableSnapshot;
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
@@ -5601,6 +5603,71 @@ fn sandbox_metric_sample(timestamp: i64) -> SandboxMetric {
     }
 }
 
+type FakeEnvdMetrics =
+    Box<dyn Fn() -> BoxFuture<'static, anyhow::Result<SandboxMetric>> + Send + Sync>;
+type FakeEnvdLogs = Box<
+    dyn Fn(
+            chrono::DateTime<chrono::Utc>,
+        ) -> BoxFuture<'static, anyhow::Result<Vec<SandboxLogEntry>>>
+        + Send
+        + Sync,
+>;
+
+/// Envd stand-in whose calls run test closures. Calls without one fail.
+#[derive(Default)]
+struct FakeEnvd {
+    metrics: Option<FakeEnvdMetrics>,
+    logs: Option<FakeEnvdLogs>,
+}
+
+#[async_trait]
+impl crate::sandbox::EnvdApi for FakeEnvd {
+    async fn metrics(&self) -> anyhow::Result<SandboxMetric> {
+        match &self.metrics {
+            Some(metrics) => metrics().await,
+            None => anyhow::bail!("fake envd has no metrics"),
+        }
+    }
+
+    async fn logs(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        _end: chrono::DateTime<chrono::Utc>,
+        _limit: usize,
+        _backward: bool,
+        _level: Option<crate::logging::LogLevel>,
+        _search: Option<String>,
+    ) -> anyhow::Result<Vec<SandboxLogEntry>> {
+        match &self.logs {
+            Some(logs) => logs(start).await,
+            None => anyhow::bail!("fake envd has no logs"),
+        }
+    }
+}
+
+fn fake_envd_metrics(
+    metrics: impl Fn() -> BoxFuture<'static, anyhow::Result<SandboxMetric>> + Send + Sync + 'static,
+) -> Arc<dyn crate::sandbox::EnvdApi> {
+    Arc::new(FakeEnvd {
+        metrics: Some(Box::new(metrics)),
+        ..Default::default()
+    })
+}
+
+fn fake_envd_logs(
+    logs: impl Fn(
+            chrono::DateTime<chrono::Utc>,
+        ) -> BoxFuture<'static, anyhow::Result<Vec<SandboxLogEntry>>>
+        + Send
+        + Sync
+        + 'static,
+) -> Arc<dyn crate::sandbox::EnvdApi> {
+    Arc::new(FakeEnvd {
+        logs: Some(Box::new(logs)),
+        ..Default::default()
+    })
+}
+
 async fn add_metrics_runtime(
     orchestrator: &TestOrchestrator,
     id: SandboxId,
@@ -5722,7 +5789,7 @@ async fn sandbox_metrics_collects_without_holding_runtime_lock_and_discards_old_
     let behavior = Arc::new(MockBehavior::new());
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    behavior.set_metrics_sampler(Arc::new({
+    behavior.set_envd(fake_envd_metrics({
         let entered = entered.clone();
         let release = release.clone();
         move || {
@@ -5763,7 +5830,7 @@ async fn sandbox_metrics_collects_without_holding_runtime_lock_and_discards_old_
         .unwrap()
         .is_empty());
 
-    behavior.set_metrics_sampler(Arc::new(|| {
+    behavior.set_envd(fake_envd_metrics(|| {
         Box::pin(async { Ok(sandbox_metric_sample(101)) })
     }));
     orchestrator.collect_sandbox_metrics(None).await;
@@ -5781,7 +5848,7 @@ async fn sandbox_metrics_failure_is_not_zero_and_paused_guests_are_not_polled() 
     let id = SandboxId::new();
     let calls = Arc::new(AtomicUsize::new(0));
     let behavior = Arc::new(MockBehavior::new());
-    behavior.set_metrics_sampler(Arc::new({
+    behavior.set_envd(fake_envd_metrics({
         let calls = calls.clone();
         move || {
             calls.fetch_add(1, Ordering::Relaxed);
@@ -5824,9 +5891,9 @@ async fn sandbox_logs_query_live_guest_and_reject_paused_sandbox() -> Result<()>
         message: "guest message".into(),
         fields: Default::default(),
     };
-    behavior.set_logs_reader(Arc::new({
+    behavior.set_envd(fake_envd_logs({
         let entry = entry.clone();
-        move |_, _, _, _, _, _| {
+        move |_| {
             let entry = entry.clone();
             Box::pin(async move { Ok(vec![entry]) })
         }
@@ -5846,7 +5913,7 @@ async fn sandbox_logs_query_live_guest_and_reject_paused_sandbox() -> Result<()>
         .contains("sandbox log limit cannot exceed 1000"));
 
     orchestrator.pause_sandbox(metadata.id).await?;
-    behavior.set_logs_reader(Arc::new(|_, _, _, _, _, _| {
+    behavior.set_envd(fake_envd_logs(|_| {
         panic!("paused query must not contact guest")
     }));
     let error = orchestrator
@@ -5873,10 +5940,10 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
     let behavior = Arc::new(MockBehavior::new());
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
-    behavior.set_logs_reader(Arc::new({
+    behavior.set_envd(fake_envd_logs({
         let entered = entered.clone();
         let release = release.clone();
-        move |start, _, _, _, _, _| {
+        move |start| {
             let entered = entered.clone();
             let release = release.clone();
             Box::pin(async move {

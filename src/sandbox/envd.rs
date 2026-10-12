@@ -5,12 +5,13 @@ use std::sync::{
 };
 
 use anyhow::{anyhow, ensure, Context, Result};
+use async_trait::async_trait;
 use tokio::time::{sleep, Duration};
 use tracing::{debug, trace};
 
 use crate::logging::LogLevel;
 use crate::sandbox::logs::{LogDecoder, LogPage, MAX_LOG_BYTES};
-use crate::sandbox::{EnvdAccessToken, SandboxLogEntry};
+use crate::sandbox::{EnvdAccessToken, SandboxLogEntry, SandboxMetric};
 use envd::filesystem::{FileType, FilesystemClient, ListDirRequest, StatRequest};
 use envd::http_client::apis::{
     configuration::{ApiKey, Configuration},
@@ -43,12 +44,6 @@ pub(crate) struct EnvdInstance {
 }
 
 impl EnvdInstance {
-    pub(crate) async fn metrics(&self) -> Result<super::SandboxMetric> {
-        self.ensure_live()?;
-        let raw = default_api::metrics_get(&self.config).await?;
-        raw.try_into()
-    }
-
     pub(crate) fn new(base_path: String, access_token: Option<EnvdAccessToken>) -> Self {
         let grpc_address = base_path.clone();
         Self {
@@ -208,9 +203,39 @@ impl EnvdInstance {
         debug!("envd initialized");
         Ok(())
     }
+}
+
+/// Calls the orchestrator makes into a running guest through envd.
+///
+/// `SandboxBackend::envd` hands this out under the runtime lock, and callers
+/// make the call after releasing it. A new guest call only needs a method here
+/// and its `EnvdInstance` implementation.
+#[async_trait]
+pub trait EnvdApi: Send + Sync {
+    async fn metrics(&self) -> Result<SandboxMetric>;
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn logs(
+    async fn logs(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        limit: usize,
+        backward: bool,
+        level: Option<LogLevel>,
+        search: Option<String>,
+    ) -> Result<Vec<SandboxLogEntry>>;
+}
+
+#[async_trait]
+impl EnvdApi for EnvdInstance {
+    async fn metrics(&self) -> Result<SandboxMetric> {
+        self.ensure_live()?;
+        let raw = default_api::metrics_get(&self.config).await?;
+        raw.try_into()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn logs(
         &self,
         start: chrono::DateTime<chrono::Utc>,
         end: chrono::DateTime<chrono::Utc>,

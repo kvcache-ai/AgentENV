@@ -15,10 +15,11 @@ use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
 use crate::sandbox::{
-    CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerSandboxFactory,
-    FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator,
-    SandboxBackend, SandboxBackendFactory, SandboxCaptureError, SandboxForkSpec,
-    SandboxLaunchConfig, SandboxLogEntry, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, EnvdApi,
+    FirecrackerSandboxFactory, FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet,
+    SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory, SandboxCaptureError,
+    SandboxForkSpec, SandboxLaunchConfig, SandboxLogEntry, SandboxNetworkPolicy,
+    SandboxRuntimeInfo,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
@@ -2922,44 +2923,45 @@ where
             }
             let (start, end) = log_query_window(cursor, backward);
             let start = start.max(metadata.created_at.into());
-            let handle = self
-                .sandboxes
-                .read()
+            let envd = self.running_envd(id).await?;
+            envd.logs(start, end, limit, backward, level, search)
                 .await
-                .get(&id)
-                .cloned()
-                .ok_or_else(|| {
-                    OrchestratorError::InternalError(
-                        "sandbox runtime is transitioning; retry log query".into(),
-                    )
-                })?;
-            let future = {
-                let sandbox = handle.lock().await;
-                let current = self
-                    .store
-                    .get(&id)
-                    .await?
-                    .ok_or(OrchestratorError::SandboxNotFound(id))?;
-                if current.state != SandboxState::Running {
-                    return Err(OrchestratorError::InvalidSandboxState {
-                        sandbox_id: id,
-                        state: current.state,
-                    });
-                }
-                sandbox
-                    .logs_query(start, end, limit, backward, level, search)
-                    .ok_or_else(|| {
-                        OrchestratorError::InternalError(
-                            "sandbox backend does not support logs".into(),
-                        )
-                    })?
-            };
-            future.await.map_err(Into::into)
+                .map_err(Into::into)
         };
 
         tokio::time::timeout(SANDBOX_LOG_QUERY_TIMEOUT, operation)
             .await
             .map_err(|_| OrchestratorError::InternalError("sandbox log query timed out".into()))?
+    }
+
+    /// Returns the envd API of a running sandbox for a request-time guest
+    /// call. The runtime lock is held only while the API is taken, and the
+    /// sandbox is confirmed to still be running under that lock.
+    async fn running_envd(&self, id: SandboxId) -> Result<Arc<dyn EnvdApi>> {
+        let handle = self
+            .sandboxes
+            .read()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| {
+                OrchestratorError::InternalError("sandbox runtime is transitioning; retry".into())
+            })?;
+        let sandbox = handle.lock().await;
+        let current = self
+            .store
+            .get(&id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(id))?;
+        if current.state != SandboxState::Running {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id: id,
+                state: current.state,
+            });
+        }
+        sandbox.envd().ok_or_else(|| {
+            OrchestratorError::InternalError("sandbox guest agent is not connected".into())
+        })
     }
 }
 

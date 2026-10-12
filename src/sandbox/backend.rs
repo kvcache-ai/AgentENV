@@ -12,12 +12,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::{
-    EnvdAccessToken, Executor, FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput,
-    SandboxLaunchConfig, SandboxNetworkPolicy,
+    EnvdAccessToken, EnvdApi, Executor, FreshSandboxBuildSpec, ProcessHandle, ProcessOpts,
+    ProcessOutput, SandboxLaunchConfig, SandboxNetworkPolicy,
 };
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::RunnableSnapshot;
@@ -191,27 +190,10 @@ impl fmt::Debug for CapturedSandboxSnapshot {
 /// `Arc<Mutex<Box<dyn SandboxBackend>>>` handles managed by the Orchestrator.
 #[async_trait]
 pub trait SandboxBackend: Send + 'static {
-    /// Capture a guest read without holding the runtime lock during network I/O.
-    #[allow(clippy::too_many_arguments)]
-    fn logs_query(
-        &self,
-        _start: DateTime<Utc>,
-        _end: DateTime<Utc>,
-        _limit: usize,
-        _backward: bool,
-        _level: Option<crate::logging::LogLevel>,
-        _search: Option<String>,
-    ) -> Option<futures::future::BoxFuture<'static, Result<Vec<super::SandboxLogEntry>>>> {
-        None
-    }
-
-    /// Capture an owned sampling future under the runtime lock, then poll it
-    /// after releasing the lock. Unsupported backends return None.
-    fn metrics_sample(
-        &self,
-    ) -> Option<futures::future::BoxFuture<'static, Result<super::SandboxMetric>>> {
-        None
-    }
+    /// The guest's envd API, or None while no guest agent is connected. Take
+    /// it under the runtime lock and call it after releasing the lock, so
+    /// guest I/O never blocks lifecycle operations.
+    fn envd(&self) -> Option<Arc<dyn EnvdApi>>;
 
     /// Start the sandbox and block until readiness.
     async fn start(&mut self) -> Result<()>;

@@ -180,12 +180,12 @@ where
                 }
                 let handle = self.sandboxes.read().await.get(&id).cloned();
                 let Some(handle) = handle else { return };
-                let future = match handle.try_lock() {
-                    Ok(backend) => backend.metrics_sample(),
+                let envd = match handle.try_lock() {
+                    Ok(backend) => backend.envd(),
                     Err(_) => return,
                 };
-                let Some(future) = future else { return };
-                match tokio::time::timeout(METRICS_REQUEST_TIMEOUT, future).await {
+                let Some(envd) = envd else { return };
+                match tokio::time::timeout(METRICS_REQUEST_TIMEOUT, envd.metrics()).await {
                     Ok(Ok(metric)) => {
                         if !matches!(self.store.get(&id).await, Ok(Some(metadata)) if metadata.state == SandboxState::Running) {
                             return;
