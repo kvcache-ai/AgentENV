@@ -1,11 +1,14 @@
 //! Save paused memory and capture independent OverlayBD memory snapshots.
-use super::overlaybd_snapshot::{
-    local_layer_config, local_layer_config_with_descriptor, record_sealed_upper_size,
-    rewrite_lowers_with_runtime_roots, runtime_owned_roots_for_live_config,
-    snapshot_compaction_range, write_image_config,
-};
 use super::process_vm_reader::ProcessVmReader;
 use crate::overlaybd::{create_commit_args, OverlaybdCompactOutput};
+use crate::sandbox::memory_snapshot::{
+    commit_memory_upper, prepare_sparse_memory_upper, remove_replaced_memory_layers,
+    write_virtual_file_memory_layer, OVERLAYBD_ALIGNMENT,
+};
+use crate::sandbox::overlaybd_snapshot::{
+    local_layer_config, local_layer_config_with_descriptor, record_sealed_upper_size,
+    rewrite_lowers_with_runtime_roots, runtime_owned_roots_for_live_config, write_image_config,
+};
 use crate::sandbox::{SandboxCaptureError, SandboxCaptureResult};
 use crate::snapshot::SnapshotPlacement;
 use anyhow::{ensure, Context, Result};
@@ -14,18 +17,15 @@ use nix::unistd::Pid;
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::{load_image_config, ImageConfig, UpperConfig, UpperMode};
 use overlaybd::index::{Segment, SegmentMapping};
-use overlaybd::index_file::{checkpoint_sparse_index, compact_to, open_file_rw};
+use overlaybd::index_file::{checkpoint_sparse_index, open_file_rw};
 use overlaybd::layer_metadata::resolve_local_layer_path;
 use overlaybd::virtual_file::VirtualFile;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::NamedTempFile;
-use tracing::warn;
 
 const FIRECRACKER_DIRTY_PAGE_SIZE: u64 = 4096;
-const OVERLAYBD_ALIGNMENT: u64 = 512;
 const SPARSE_MEMORY_WRITE_CHUNK_SIZE: usize = 4 * 1024 * 1024;
-const DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY: usize = 32;
 
 pub(super) async fn save_paused_memory(
     pid: Pid,
@@ -226,173 +226,6 @@ pub(super) async fn capture_memory_snapshot(
     })
 }
 
-/// Commit a resumed memory upper while retaining the current base until preparation succeeds.
-async fn commit_memory_upper(
-    image: &mut ImageConfig,
-    config_path: &Path,
-    global_config: &Path,
-    roots: &[PathBuf],
-) -> SandboxCaptureResult<()> {
-    let path = PathBuf::from(&image.upper.data);
-    let file: Arc<dyn VirtualFile> =
-        Arc::new(LocalFile::open_rw(&path, false).context("open paused memory upper")?);
-    let index: Arc<dyn VirtualFile> =
-        Arc::new(LocalFile::open_rw(path.with_extension("index"), false)?);
-    let upper = open_file_rw(file, Some(index)).await?;
-    // The resumed upper may contain the previous pause even when this capture has no dirty pages.
-    if !image.lowers.is_empty() && upper.index().read().await.upper_len() == 0 {
-        return Ok(());
-    }
-    let size = upper.size().await?;
-    let directory = tempfile::Builder::new()
-        .prefix("memory-base-")
-        .tempdir_in(path.parent().context("memory upper has no parent")?)
-        .context("prepare memory base directory")?;
-    let lower = directory.path().join("snapshot.commit");
-    let layer = local_layer_config(&lower);
-    let includes_delta = snapshot_compaction_range(image, roots, Some(&layer), false)
-        .is_some_and(|range| range.end > image.lowers.len());
-    // History merging and capacity rejection can finish before the irreversible seal.
-    let prepared = if includes_delta {
-        None
-    } else {
-        Some(
-            rewrite_lowers_with_runtime_roots(
-                image,
-                global_config,
-                directory.path(),
-                Some(layer.clone()),
-                "mem_compacted.commit",
-                roots,
-                OverlaybdCompactOutput::Raw,
-            )
-            .await?,
-        )
-    };
-    let mut previous: Vec<_> = image
-        .lowers
-        .iter()
-        .filter_map(resolve_local_layer_path)
-        .collect();
-    previous.push(lower.clone());
-    // After sealing, the live reader may own files here even if config commit fails.
-    let directory = directory.keep();
-    async {
-        upper.close_seal().await?;
-        drop(upper);
-        tokio::fs::rename(&path, &lower).await?;
-        prepare_sparse_memory_upper(&path, size)?;
-        let (lowers, compacted) = if let Some(prepared) = prepared {
-            prepared
-        } else {
-            rewrite_lowers_with_runtime_roots(
-                image,
-                global_config,
-                &directory,
-                Some(layer),
-                "mem_compacted.commit",
-                roots,
-                OverlaybdCompactOutput::Raw,
-            )
-            .await?
-        };
-        image.lowers = lowers;
-        write_image_config(config_path, image, "sealed memory base")?;
-        record_sealed_upper_size("memory", &lower, compacted).await;
-        Ok::<(), anyhow::Error>(())
-    }
-    .await
-    .map_err(SandboxCaptureError::terminal)?;
-    remove_replaced_memory_layers(config_path, &previous, &image.lowers).await;
-    Ok(())
-}
-
-fn prepare_sparse_memory_upper(path: &Path, virtual_size: u64) -> Result<()> {
-    overlaybd::helper::prepare_runtime_upper(
-        path,
-        Some(&path.with_extension("index")),
-        virtual_size,
-        UpperMode::Sparse,
-    )
-    .with_context(|| format!("prepare sparse memory upper {}", path.display()))
-}
-
-async fn remove_replaced_memory_layers(
-    config_path: &Path,
-    previous: &[PathBuf],
-    lowers: &[overlaybd::config::LayerConfig],
-) {
-    let Some(runtime_root) = config_path
-        .parent()
-        .and_then(|parent| std::fs::canonicalize(parent).ok())
-    else {
-        return;
-    };
-    let retained: Vec<_> = lowers
-        .iter()
-        .filter_map(resolve_local_layer_path)
-        .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
-        .collect();
-    for path in previous {
-        let Ok(path) = std::fs::canonicalize(path) else {
-            continue;
-        };
-        if !path.starts_with(&runtime_root) || retained.contains(&path) {
-            continue;
-        }
-        // The running device keeps its open inode; captured snapshots own their
-        // links. Only this runtime's replaced name is no longer needed.
-        if let Err(error) = tokio::fs::remove_file(&path).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                warn!(%error, path = %path.display(), "failed to reclaim memory layer");
-            }
-        }
-        let mut parent = path.parent();
-        while let Some(directory) = parent.filter(|directory| *directory != runtime_root) {
-            if tokio::fs::remove_dir(directory).await.is_err() {
-                break;
-            }
-            parent = directory.parent();
-        }
-    }
-}
-
-async fn write_memory_layer(
-    src_layers: &[Arc<dyn VirtualFile>],
-    mappings: &[SegmentMapping],
-    virtual_size: u64,
-    output_path: &Path,
-    mode: OverlaybdCompactOutput,
-    concurrency: usize,
-) -> Result<()> {
-    let lower_tmp = output_path.with_extension("commit.tmp");
-    let build_result = async {
-        let output_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&lower_tmp)
-                .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
-        );
-        let commit_args = create_commit_args(output_file, mode, concurrency).await?;
-        compact_to(src_layers, mappings, virtual_size, commit_args)
-            .await
-            .context("compact memory layer")?;
-        tokio::fs::rename(&lower_tmp, output_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "move sealed memory lower into place failed: {}",
-                    output_path.display()
-                )
-            })?;
-        Ok(())
-    }
-    .await;
-
-    if build_result.is_err() {
-        let _ = tokio::fs::remove_file(&lower_tmp).await;
-    }
-    build_result
-}
-
 fn checked_i64_to_u64(value: i64, field: &str) -> Result<u64> {
     u64::try_from(value).with_context(|| format!("{field} must be non-negative, got {value}"))
 }
@@ -489,25 +322,10 @@ async fn write_dirty_memory_layer(
         return Ok(None);
     }
 
-    tokio::fs::create_dir_all(output_dir)
-        .await
-        .with_context(|| format!("create mem overlaybd dir: {}", output_dir.display()))?;
-
-    let data_path = output_dir.join("overlaybd.commit");
     let source_file: Arc<dyn VirtualFile> = Arc::new(ProcessVmReader::new(firecracker_pid));
-    let src_layers = vec![source_file];
-    write_memory_layer(
-        &src_layers,
-        &mappings,
-        memory_size,
-        &data_path,
-        mode,
-        DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY,
-    )
-    .await
-    .context("compact dirty memory ranges as overlaybd layer")?;
-
-    Ok(Some(data_path))
+    write_virtual_file_memory_layer(&[source_file], &mappings, memory_size, output_dir, mode)
+        .await
+        .context("compact dirty memory ranges as overlaybd layer")
 }
 
 struct MemoryCopyRange {
@@ -676,6 +494,7 @@ async fn write_dirty_memory_to_sparse_upper(
 
 #[cfg(test)]
 mod tests {
+    use crate::sandbox::memory_snapshot::write_memory_layer;
     use super::*;
     use async_trait::async_trait;
     use bytes::Bytes;

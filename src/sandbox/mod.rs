@@ -6,10 +6,12 @@ mod extra_drive;
 mod firecracker;
 mod guest_volumes;
 pub(crate) mod logs;
+mod memory_snapshot;
 mod metrics;
 #[cfg(test)]
 pub(crate) mod mock;
 mod network;
+mod overlaybd_snapshot;
 mod process;
 mod runtime_versions;
 mod tools_image;
