@@ -17,7 +17,7 @@ use crate::snapshot::{
 #[derive(Debug)]
 pub struct SnapshotPublication {
     pub record: SnapshotRecord,
-    pub(crate) local_layers: Vec<super::backends::common::recontainerize::PreparedLayerUpload>,
+    pub(crate) local_layers: Vec<crate::snapshot::recontainerize::PreparedLayerUpload>,
 }
 
 /// What a backend stored for one snapshot before its record is committed.
@@ -28,7 +28,7 @@ pub struct StoredSnapshot {
     pub attached_drives: Vec<CommittedAttachedDrive>,
     pub disk_publications: Vec<PersistedDiskImagePublication>,
     /// Transformed local layer files, kept for post-commit P2P publication.
-    pub(crate) local_layers: Vec<super::backends::common::recontainerize::PreparedLayerUpload>,
+    pub(crate) local_layers: Vec<crate::snapshot::recontainerize::PreparedLayerUpload>,
 }
 
 /// Snapshot record list filter.

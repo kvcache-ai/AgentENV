@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use thiserror::Error;
 
-use crate::repository::backends::common::acr::SourceRegistryRepository;
+use crate::snapshot::image_export::acr::SourceRegistryRepository;
 use crate::snapshot::{
     rootfs_snapshot_image_tag, CommittedSnapshot, OverlaybdLayerRef, PersistedDiskImagePublication,
     SnapshotId,

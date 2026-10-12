@@ -11,12 +11,6 @@ use super::client::{OssClient, OssUploadArtifact};
 use super::documents;
 use super::layout::OssSnapshotArtifactLayout;
 use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
-use crate::repository::backends::common::acr::{
-    AcrDiskImageExporter, DiskImageExportOutcome, DiskImageSubject, SnapshotOciConfigInput,
-};
-use crate::repository::backends::common::recontainerize::{
-    prepare_layer_upload, PreparedLayerUpload,
-};
 use crate::repository::backends::common::{
     materialize_volume_image_config, write_dense_overlaybd_layer_to_file,
 };
@@ -25,6 +19,10 @@ use crate::repository::{
     DocumentCollection, DocumentKey, DocumentUpdate, RepositoryError, RepositoryResult,
 };
 use crate::sandbox::{OverlaybdCompactOutput, SandboxSnapshotManifest};
+use crate::snapshot::image_export::acr::{
+    AcrDiskImageExporter, DiskImageExportOutcome, DiskImageSubject, SnapshotOciConfigInput,
+};
+use crate::snapshot::recontainerize::{prepare_layer_upload, PreparedLayerUpload};
 use crate::snapshot::{
     CommittedAttachedDrive, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
     PersistedDiskImagePublication, SnapshotId, SnapshotPublishMetadata,

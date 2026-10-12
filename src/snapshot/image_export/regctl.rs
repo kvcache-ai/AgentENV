@@ -15,8 +15,8 @@ use crate::image::oci_image::{
     REGCTL_RETRY_BASE_DELAY,
 };
 use crate::image::ImageError;
-use crate::repository::backends::common::acr::OCI_IMAGE_MANIFEST_MEDIA_TYPE;
 use crate::repository::{RepositoryError, RepositoryResult};
+use crate::snapshot::image_export::acr::OCI_IMAGE_MANIFEST_MEDIA_TYPE;
 
 /// Stateless `regctl` CLI wrapper: no registry state of its own.
 pub(crate) struct Regctl {

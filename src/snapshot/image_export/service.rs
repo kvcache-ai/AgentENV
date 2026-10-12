@@ -14,12 +14,12 @@ use super::target::{
 };
 use crate::cfg::{ConfigManager, SnapshotImageStoragePolicy, SnapshotRepositoryBackendKind};
 use crate::digest;
-use crate::repository::backends::common::acr::{
+use crate::repository::backends::{oss, posixfs};
+use crate::repository::{Repository, RepositoryError, RepositoryResult};
+use crate::snapshot::image_export::acr::{
     build_oci_image_manifest, host_architecture_for_oci, snapshot_oci_config_blob, OciDescriptor,
     SnapshotOciConfigInput, SourceRegistryRepository,
 };
-use crate::repository::backends::{oss, posixfs};
-use crate::repository::{Repository, RepositoryError, RepositoryResult};
 use crate::snapshot::{
     CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotCatalog, SnapshotId,
 };
