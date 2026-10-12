@@ -115,7 +115,7 @@ pub(crate) fn shared_runtime_cache_root() -> PathBuf {
 mod tests {
     use super::*;
     use crate::cfg::{OssBackendConfig, PosixFsBackendConfig as PosixConfig};
-    use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotRecord};
+    use crate::snapshot::{SnapshotAlias, SnapshotCatalog, SnapshotId, SnapshotRecord};
 
     #[tokio::test]
     async fn builders_share_a_private_catalog_across_node_local_caches() -> Result<()> {

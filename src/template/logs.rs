@@ -386,6 +386,7 @@ async fn flush(
 mod tests {
     use super::*;
     use crate::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::SnapshotCatalog;
 
     #[tokio::test]
     async fn tracing_layer_routes_only_agentenv_events_from_the_matching_build_span() -> Result<()>

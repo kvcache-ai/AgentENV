@@ -1,13 +1,16 @@
 pub(crate) mod artifact_cache;
+mod catalog;
 pub mod image_export;
 mod manager;
 #[doc(hidden)]
 pub mod mock;
 pub(crate) mod p2p;
+pub(crate) mod publish;
 pub(crate) mod runtime_support;
 pub(crate) mod startup_pack;
 mod types;
 
+pub use catalog::SnapshotCatalog;
 pub use manager::SnapshotManager;
 pub use startup_pack::{
     drain_startup_manifest_tasks, MemoryStartupPackInfo, ResolvedStartupPack,

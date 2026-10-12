@@ -6,7 +6,7 @@ use tracing::warn;
 
 use super::{is_valid_volume_component, VolumeMode, VolumeRecord, VolumeStatus};
 use crate::repository::{
-    DocumentCollection, DocumentKey, Repository, RepositoryError, RepositoryResult,
+    DocumentChange, DocumentCollection, DocumentKey, Repository, RepositoryError, RepositoryResult,
 };
 
 const MAX_ALIAS_CLAIM_ATTEMPTS: usize = 5;
@@ -96,16 +96,14 @@ impl<R: Repository + ?Sized> VolumeCatalog for R {
             .await?;
         let has_more = ids.len() > limit;
         ids.truncate(limit);
+        let next_volume_id = has_more.then(|| ids.last().cloned()).flatten();
         let mut records = Vec::with_capacity(ids.len());
         for volume_id in ids {
-            let record = read_record(self, &volume_id)
-                .await?
-                .ok_or(RepositoryError::VolumeNotFound { lookup: volume_id })?;
-            records.push(record);
+            // Skips a volume deleted since the listing.
+            if let Some(record) = read_record(self, &volume_id).await? {
+                records.push(record);
+            }
         }
-        let next_volume_id = has_more
-            .then(|| records.last().map(|record| record.id.clone()))
-            .flatten();
         Ok(VolumeRecordPage {
             records,
             next_volume_id,
@@ -129,7 +127,12 @@ impl<R: Repository + ?Sized> VolumeCatalog for R {
         let existing = self
             .update_document(
                 DocumentKey::VolumeRecord(record.id.clone()),
-                Box::new(move |current| Ok(current.is_none().then(|| bytes.clone()))),
+                Box::new(move |current| {
+                    Ok(match current {
+                        None => DocumentChange::Put(bytes.clone()),
+                        Some(_) => DocumentChange::Keep,
+                    })
+                }),
             )
             .await?;
         if existing.is_some() {
@@ -207,10 +210,19 @@ impl<R: Repository + ?Sized> VolumeCatalog for R {
         };
         self.delete_document(DocumentKey::VolumeRecord(volume_id.to_owned()))
             .await?;
-        if read_alias(self, &record.name).await?.as_deref() == Some(volume_id) {
-            self.delete_document(DocumentKey::VolumeAlias(record.name))
-                .await?;
-        }
+        // A create may already have reclaimed the name from the deleting record.
+        let owned = encode_alias(volume_id)?;
+        self.update_document(
+            DocumentKey::VolumeAlias(record.name),
+            Box::new(move |current| {
+                Ok(if current == Some(owned.as_slice()) {
+                    DocumentChange::Delete
+                } else {
+                    DocumentChange::Keep
+                })
+            }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -305,7 +317,10 @@ where
             DocumentKey::VolumeRecord(volume_id.to_owned()),
             Box::new(move |bytes| {
                 let record = bytes.map(|bytes| decode_record(&id, bytes)).transpose()?;
-                update(record)?.0.as_ref().map(encode_record).transpose()
+                Ok(match update(record)?.0 {
+                    Some(next) => DocumentChange::Put(encode_record(&next)?),
+                    None => DocumentChange::Keep,
+                })
             }),
         )
         .await?;
@@ -334,8 +349,7 @@ where
     R: Repository + ?Sized,
 {
     let key = DocumentKey::VolumeAlias(name.to_owned());
-    let claimed = serde_json::to_vec(volume_id)
-        .map_err(|error| RepositoryError::backend("serialize volume alias", error))?;
+    let claimed = encode_alias(volume_id)?;
     for _ in 0..MAX_ALIAS_CLAIM_ATTEMPTS {
         let current = repository.get_document(key.clone()).await?;
         if let Some(bytes) = current.as_deref() {
@@ -356,7 +370,13 @@ where
         let applied_to = repository
             .update_document(
                 key.clone(),
-                Box::new(move |now| Ok((now == expected.as_deref()).then(|| claimed.clone()))),
+                Box::new(move |now| {
+                    Ok(if now == expected.as_deref() {
+                        DocumentChange::Put(claimed.clone())
+                    } else {
+                        DocumentChange::Keep
+                    })
+                }),
             )
             .await?;
         if applied_to == current {
@@ -410,6 +430,11 @@ fn decode_record(volume_id: &str, bytes: &[u8]) -> RepositoryResult<VolumeRecord
 fn encode_record(record: &VolumeRecord) -> RepositoryResult<Vec<u8>> {
     serde_json::to_vec_pretty(record)
         .map_err(|error| RepositoryError::backend("serialize volume record", error))
+}
+
+fn encode_alias(volume_id: &str) -> RepositoryResult<Vec<u8>> {
+    serde_json::to_vec(volume_id)
+        .map_err(|error| RepositoryError::backend("serialize volume alias", error))
 }
 
 fn decode_alias(bytes: &[u8]) -> RepositoryResult<String> {
@@ -535,6 +560,54 @@ mod tests {
         let record = repository.get_volume(id).await.unwrap().unwrap();
         assert_eq!(record.reserved_by_sandbox_id.as_deref(), Some("sandbox-b"));
         assert!(repository.delete_volume(id).await.is_err());
+    }
+
+    /// Hides one volume record from reads but not from listings, like a
+    /// delete that lands between the two.
+    struct DeletedAfterListing {
+        inner: Arc<dyn Repository>,
+        hidden: &'static str,
+    }
+
+    #[async_trait]
+    impl Repository for DeletedAfterListing {
+        async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
+            match &key {
+                DocumentKey::VolumeRecord(id) if id == self.hidden => Ok(None),
+                _ => self.inner.get_document(key).await,
+            }
+        }
+
+        async fn list_documents(
+            &self,
+            collection: DocumentCollection,
+            after: Option<&str>,
+            limit: usize,
+        ) -> RepositoryResult<Vec<String>> {
+            self.inner.list_documents(collection, after, limit).await
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_skips_volumes_deleted_since_the_listing() {
+        let temp = tempfile::tempdir().unwrap();
+        let inner = repository(temp.path());
+        for index in 0..3 {
+            inner.create_volume(volume_record(index)).await.unwrap();
+        }
+        let repository = DeletedAfterListing {
+            inner,
+            hidden: "vol_000001",
+        };
+        let page = repository.list_volumes_page(None, 2).await.unwrap();
+        assert_eq!(page.records, vec![volume_record(0)]);
+        assert_eq!(page.next_volume_id.as_deref(), Some("vol_000001"));
+        let page = repository
+            .list_volumes_page(page.next_volume_id.as_deref(), 2)
+            .await
+            .unwrap();
+        assert_eq!(page.records, vec![volume_record(2)]);
+        assert_eq!(page.next_volume_id, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

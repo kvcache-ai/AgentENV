@@ -33,6 +33,82 @@ impl PosixFsArtifactStore {
         PosixFsSnapshotArtifactLayout::new(&self.root, snapshot_id)
     }
 
+    /// Imports one snapshot's files into its own directory and its layers into
+    /// the shared managed-layer store, removing the directory on failure.
+    pub(crate) fn store_snapshot(
+        &self,
+        snapshot_id: &SnapshotId,
+        manifest: &SandboxSnapshotManifest,
+    ) -> RepositoryResult<CollectedBuiltArtifacts> {
+        let snapshot_dir = self.committed_layout(snapshot_id).snapshot_dir();
+        fs::create_dir_all(&snapshot_dir).map_err(|error| {
+            RepositoryError::backend(
+                format!("create snapshot dir '{}'", snapshot_dir.display()),
+                error,
+            )
+        })?;
+        self.import_built_artifacts(snapshot_id, manifest)
+            .inspect_err(|_| {
+                let _ = fs::remove_dir_all(&snapshot_dir);
+            })
+    }
+
+    /// Removes one snapshot's directory. Shared managed layers stay.
+    pub(crate) fn delete_snapshot_files(&self, snapshot_id: &SnapshotId) -> RepositoryResult<()> {
+        let snapshot_dir = self.committed_layout(snapshot_id).snapshot_dir();
+        match fs::remove_dir_all(&snapshot_dir) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(RepositoryError::backend(
+                format!("remove '{}'", snapshot_dir.display()),
+                error,
+            )),
+        }
+    }
+
+    /// Writes one snapshot's startup manifest, only while its directory exists.
+    pub(crate) fn put_startup_manifest(
+        &self,
+        snapshot_id: &SnapshotId,
+        bytes: &[u8],
+    ) -> RepositoryResult<()> {
+        let layout = self.committed_layout(snapshot_id);
+        let snapshot_dir = layout.snapshot_dir();
+        let path = layout.path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
+        let mut temp = NamedTempFile::new_in(&snapshot_dir).map_err(|error| {
+            RepositoryError::backend(
+                format!("create manifest temp in '{}'", snapshot_dir.display()),
+                error,
+            )
+        })?;
+        std::io::Write::write_all(&mut temp, bytes)
+            .and_then(|()| temp.as_file().sync_all())
+            .map_err(|error| {
+                RepositoryError::backend(format!("write manifest '{}'", path.display()), error)
+            })?;
+        temp.persist(&path).map_err(|error| {
+            RepositoryError::backend(
+                format!("persist manifest '{}'", path.display()),
+                error.error,
+            )
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn delete_startup_manifest(&self, snapshot_id: &SnapshotId) -> RepositoryResult<()> {
+        let path = self
+            .committed_layout(snapshot_id)
+            .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(RepositoryError::backend(
+                format!("remove '{}'", path.display()),
+                error,
+            )),
+        }
+    }
+
     pub(crate) fn publish_volume_backing(
         &self,
         image_config_path: &Path,
@@ -52,7 +128,7 @@ impl PosixFsArtifactStore {
     /// Note that committed snapshot metadata intentionally does not persist the
     /// build-time `image.json` files. Runtime resolvers regenerate those files
     /// from the committed manifest plus backend layout conventions.
-    pub(crate) fn import_built_artifacts(
+    fn import_built_artifacts(
         &self,
         snapshot_id: &SnapshotId,
         manifest: &SandboxSnapshotManifest,
@@ -626,7 +702,7 @@ fn finalize_hard_linked_file(path: &Path) -> RepositoryResult<()> {
     Ok(())
 }
 
-fn sync_dir(path: &Path) -> RepositoryResult<()> {
+pub(super) fn sync_dir(path: &Path) -> RepositoryResult<()> {
     fs::File::open(path)
         .map_err(|error| RepositoryError::backend(format!("open '{}'", path.display()), error))?
         .sync_all()

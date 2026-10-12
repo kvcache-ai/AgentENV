@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::{DocumentKey, Repository, RepositoryError, RepositoryResult};
+use super::{DocumentChange, DocumentKey, Repository, RepositoryError, RepositoryResult};
 
 /// The head and its pending retirements are committed in one repository write.
 #[derive(Default, Deserialize, Serialize)]
@@ -49,7 +49,7 @@ impl<R: Repository + ?Sized> BuildCacheStore for R {
                 Box::new(move |bytes| {
                     let mut state = BuildCacheState::load(bytes)?;
                     state.replace(&volume_id)?;
-                    state.encode().map(Some)
+                    state.encode().map(DocumentChange::Put)
                 }),
             )
             .await?;
@@ -63,7 +63,7 @@ impl<R: Repository + ?Sized> BuildCacheStore for R {
             Box::new(move |bytes| {
                 let mut state = BuildCacheState::load(bytes)?;
                 state.retired.remove(&volume_id);
-                state.encode().map(Some)
+                state.encode().map(DocumentChange::Put)
             }),
         )
         .await?;

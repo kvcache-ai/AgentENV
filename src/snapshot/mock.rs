@@ -4,70 +4,16 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::{
-    RunnableSnapshot, SnapshotId, SnapshotManager, SnapshotPublishMetadata, SnapshotRecord,
-    SNAPSHOT_ARTIFACT_LAYOUT,
-};
-use crate::repository::{
-    Repository, RepositoryError, RepositoryResult, SnapshotListFilter, SnapshotRuntimeResolver,
-};
+use super::{RunnableSnapshot, SnapshotManager, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT};
+use crate::repository::{Repository, RepositoryError, RepositoryResult, SnapshotRuntimeResolver};
 use crate::sandbox::SandboxSnapshotManifest;
 
-/// Test double for snapshot repository interactions that should stay unreachable.
+/// Test double for repository interactions that should stay unreachable:
+/// every operation reports itself unsupported.
 #[derive(Clone, Debug, Default)]
 pub struct MockRepository;
 
-impl MockRepository {
-    fn unsupported() -> RepositoryError {
-        RepositoryError::Unsupported {
-            feature: "mock snapshot repository should not be called in this test".to_string(),
-        }
-    }
-}
-
-#[async_trait]
-impl Repository for MockRepository {
-    async fn create(&self, _record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        Err(Self::unsupported())
-    }
-
-    async fn publish(
-        &self,
-        _metadata: SnapshotPublishMetadata,
-        _manifest: SandboxSnapshotManifest,
-        _recording: Option<crate::snapshot::StartupRecording>,
-    ) -> RepositoryResult<SnapshotRecord> {
-        Err(Self::unsupported())
-    }
-
-    async fn get(&self, _id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        Err(Self::unsupported())
-    }
-
-    async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        Err(Self::unsupported())
-    }
-
-    async fn delete(&self, _id_or_alias: &str) -> RepositoryResult<()> {
-        Err(Self::unsupported())
-    }
-
-    async fn resolve_alias(&self, _alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        Err(Self::unsupported())
-    }
-
-    async fn try_start_build(&self, _id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
-        Err(Self::unsupported())
-    }
-
-    async fn mark_build_error(
-        &self,
-        _id: &SnapshotId,
-        _reason: crate::snapshot::TemplateBuildErrorReason,
-    ) -> RepositoryResult<()> {
-        Err(Self::unsupported())
-    }
-}
+impl Repository for MockRepository {}
 
 /// Test double for runtime resolution that should stay unreachable.
 #[derive(Clone, Debug, Default)]

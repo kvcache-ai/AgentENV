@@ -20,7 +20,9 @@ use crate::repository::backends::common::acr::{
 };
 use crate::repository::backends::{oss, posixfs};
 use crate::repository::{Repository, RepositoryError, RepositoryResult};
-use crate::snapshot::{CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotId};
+use crate::snapshot::{
+    CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotCatalog, SnapshotId,
+};
 
 /// Outcome of one snapshot image export.
 #[derive(Clone, Debug, PartialEq, Eq)]

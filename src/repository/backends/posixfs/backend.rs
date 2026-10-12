@@ -1,24 +1,21 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::task;
-use tracing::warn;
 
 use super::super::{common::materialize_volume_image_config, shared_runtime_cache_root};
-use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
+use super::artifacts::PosixFsArtifactStore;
 use super::catalog::PosixFsCatalogStore;
 use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
-use crate::repository::interfaces::{Repository, SnapshotRuntimeResolver};
+use crate::repository::interfaces::{Repository, SnapshotRuntimeResolver, StoredSnapshot};
 use crate::repository::{
     DocumentCollection, DocumentKey, DocumentUpdate, RepositoryError, RepositoryResult,
-    SnapshotListFilter,
 };
 use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
-use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord};
+use crate::snapshot::{PersistedDiskImagePublication, SnapshotId, SnapshotPublishMetadata};
 
 #[derive(Clone, Debug)]
 pub struct PosixFsBackendConfig {
@@ -119,30 +116,6 @@ impl PosixFsRepository {
         }
     }
 
-    fn committed_snapshot(
-        metadata: &SnapshotPublishMetadata,
-        built: CollectedBuiltArtifacts,
-    ) -> CommittedSnapshot {
-        CommittedSnapshot {
-            context: metadata.context.clone(),
-            startup: metadata.startup.clone(),
-            runtime_versions: metadata.runtime_versions.clone(),
-            virtualization_mode: metadata.virtualization_mode,
-            image_configs: metadata.image_configs.clone(),
-            custom_extension_params: metadata.custom_extension_params.clone(),
-            rootfs_layers: built.rootfs_layers,
-            attached_drives: built.attached_drives,
-            volume_snapshots: metadata.volume_snapshots.clone(),
-            memory_layers: built.memory_layers,
-            disk_publications: Vec::new(),
-            memory_startup: None,
-        }
-    }
-
-    fn create_sync(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        self.catalog_store.create(record)
-    }
-
     async fn run_catalog<T, F>(&self, operation: &'static str, work: F) -> RepositoryResult<T>
     where
         T: Send + 'static,
@@ -152,229 +125,62 @@ impl PosixFsRepository {
         run_repository_blocking(operation, move || work(&store)).await
     }
 
-    fn publish_sync(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        manifest: SandboxSnapshotManifest,
-    ) -> RepositoryResult<SnapshotRecord> {
-        let mut drive_ids = HashSet::new();
-        for drive in &manifest.attached_drives {
-            if !drive_ids.insert(drive.drive_id.clone()) {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!(
-                        "duplicate attached drive id in publish request: {}",
-                        drive.drive_id
-                    ),
-                });
-            }
-            if drive.virtual_size == 0 {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!(
-                        "attached drive '{}' virtual_size must be non-zero",
-                        drive.drive_id
-                    ),
-                });
-            }
-        }
-
-        let session = self.catalog_store.begin_publish(&metadata.id)?;
-        let built = match self
-            .artifact_store
-            .import_built_artifacts(&metadata.id, &manifest)
-        {
-            Ok(built) => built,
-            Err(error) => {
-                let _ = self.catalog_store.abort_publish(&session);
-                return Err(error);
-            }
-        };
-
-        let committed = Self::committed_snapshot(&metadata, built);
-        match self
-            .catalog_store
-            .commit_publish(&session, metadata, committed)
-        {
-            Ok(stored) => Ok(stored),
-            Err(error) => {
-                let _ = self.catalog_store.abort_publish(&session);
-                Err(error)
-            }
-        }
-    }
-
-    fn get_sync(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        self.catalog_store.get(id_or_alias)
-    }
-
-    fn list_sync(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        self.catalog_store.list(filter)
-    }
-
-    fn delete_sync(&self, id_or_alias: &str) -> RepositoryResult<()> {
-        let Some(record) = self.catalog_store.get(id_or_alias)? else {
-            if let Ok(id) = SnapshotId::parse(id_or_alias) {
-                self.catalog_store.delete_record(&id)?;
-            }
-            return Ok(());
-        };
-        self.catalog_store.delete_record(&record.id)
-    }
-
-    fn resolve_alias_sync(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        self.catalog_store.resolve_alias(alias)
-    }
-
-    fn try_start_sync(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
-        self.catalog_store.try_start(id)
-    }
-
-    fn mark_error_sync(
-        &self,
-        id: &SnapshotId,
-        reason: crate::snapshot::TemplateBuildErrorReason,
-    ) -> RepositoryResult<()> {
-        self.catalog_store.mark_error(id, reason)
-    }
-}
-async fn finish_posix_startup_manifest(
-    catalog: Arc<PosixFsCatalogStore>,
-    id: SnapshotId,
-    recording: crate::snapshot::StartupRecording,
-    _guard: crate::snapshot::startup_pack::StartupManifestTaskGuard,
-) {
-    let crate::snapshot::StartupRecording {
-        mut trace,
-        keep_alive,
-    } = recording;
-    let _keep_alive = keep_alive;
-    let trace_path = match tokio::select! {
-        joined = &mut trace => joined,
-        _ = crate::snapshot::startup_pack::startup_manifest_abort_notify() => {
-            // The recorder owns a VM/device cleanup path. Keep its capture
-            // lease until it has actually finished, even during shutdown.
-            let _ = trace.await;
-            return;
-        }
-    } {
-        Ok(Some(path)) => path,
-        Ok(None) => return,
-        Err(error) => {
-            warn!(%error, snapshot_id = %id, "POSIX startup trace join failed");
-            return;
-        }
-    };
-    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
-        return;
-    }
-    let (info, manifest) =
-        match crate::snapshot::startup_pack::build_startup_manifest(&trace_path).await {
-            Ok(result) => result,
-            Err(error) => {
-                warn!(%error, snapshot_id = %id, "POSIX startup manifest build failed");
-                return;
-            }
-        };
-    if crate::snapshot::startup_pack::startup_manifest_abort_requested() {
-        return;
-    }
-    let attached = run_repository_blocking("attach POSIX startup manifest", move || {
-        catalog.attach_memory_startup(&id, info, &manifest)
-    })
-    .await;
-    if let Err(error) = attached {
-        warn!(%error, "POSIX startup manifest attach failed");
+    async fn run_artifacts<T, F>(&self, operation: &'static str, work: F) -> RepositoryResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&PosixFsArtifactStore) -> RepositoryResult<T> + Send + 'static,
+    {
+        let store = Arc::clone(&self.artifact_store);
+        run_repository_blocking(operation, move || work(&store)).await
     }
 }
 
 #[async_trait]
 impl Repository for PosixFsRepository {
-    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        let repository = self.clone();
-        run_repository_blocking("create snapshot record", move || {
-            repository.create_sync(record)
-        })
-        .await
-    }
-
-    async fn publish(
+    async fn store_snapshot(
         &self,
-        metadata: SnapshotPublishMetadata,
-        manifest: SandboxSnapshotManifest,
-        recording: Option<crate::snapshot::StartupRecording>,
-    ) -> RepositoryResult<SnapshotRecord> {
+        metadata: &SnapshotPublishMetadata,
+        manifest: &SandboxSnapshotManifest,
+    ) -> RepositoryResult<StoredSnapshot> {
         let id = metadata.id.clone();
-        let catalog = Arc::clone(&self.catalog_store);
-        let repository = self.clone();
-        let record = run_repository_blocking("publish snapshot", move || {
-            repository.publish_sync(metadata, manifest)
+        let manifest = manifest.clone();
+        let built = self
+            .run_artifacts("store snapshot", move |store| {
+                store.store_snapshot(&id, &manifest)
+            })
+            .await?;
+        Ok(StoredSnapshot {
+            rootfs_layers: built.rootfs_layers,
+            memory_layers: built.memory_layers,
+            attached_drives: built.attached_drives,
+            ..StoredSnapshot::default()
         })
-        .await?;
-        if crate::cfg::ConfigManager::global_config()
-            .snapshot
-            .memory_startup_pack
-            .enabled
-        {
-            if let Some(recording) = recording {
-                if let Some(guard) =
-                    crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()
-                {
-                    tokio::spawn(finish_posix_startup_manifest(catalog, id, recording, guard));
-                } else {
-                    // Cleanup retains the capture lease without delaying publication.
-                    recording.detach();
-                }
-            }
-        }
-        Ok(record)
     }
 
-    async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        let repository = self.clone();
-        let id_or_alias = id_or_alias.to_string();
-        run_repository_blocking("load snapshot", move || repository.get_sync(&id_or_alias)).await
-    }
-
-    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        let repository = self.clone();
-        run_repository_blocking("list snapshots", move || repository.list_sync(filter)).await
-    }
-
-    async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
-        let repository = self.clone();
-        let id_or_alias = id_or_alias.to_string();
-        run_repository_blocking("delete snapshot", move || {
-            repository.delete_sync(&id_or_alias)
-        })
-        .await
-    }
-
-    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        let repository = self.clone();
-        let alias = alias.to_string();
-        run_repository_blocking("resolve snapshot alias", move || {
-            repository.resolve_alias_sync(&alias)
-        })
-        .await
-    }
-
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
-        let repository = self.clone();
-        let id = id.clone();
-        run_repository_blocking("start template build", move || {
-            repository.try_start_sync(&id)
-        })
-        .await
-    }
-
-    async fn mark_build_error(
+    async fn delete_snapshot_files(
         &self,
         id: &SnapshotId,
-        reason: crate::snapshot::TemplateBuildErrorReason,
+        _publications: &[PersistedDiskImagePublication],
     ) -> RepositoryResult<()> {
-        let repository = self.clone();
         let id = id.clone();
-        run_repository_blocking("mark template build error", move || {
-            repository.mark_error_sync(&id, reason)
+        self.run_artifacts("delete snapshot files", move |store| {
+            store.delete_snapshot_files(&id)
+        })
+        .await
+    }
+
+    async fn put_startup_manifest(&self, id: &SnapshotId, bytes: Vec<u8>) -> RepositoryResult<()> {
+        let id = id.clone();
+        self.run_artifacts("store startup manifest", move |store| {
+            store.put_startup_manifest(&id, &bytes)
+        })
+        .await
+    }
+
+    async fn delete_startup_manifest(&self, id: &SnapshotId) -> RepositoryResult<()> {
+        let id = id.clone();
+        self.run_artifacts("delete startup manifest", move |store| {
+            store.delete_startup_manifest(&id)
         })
         .await
     }
@@ -416,6 +222,16 @@ impl Repository for PosixFsRepository {
         let after = after.map(str::to_owned);
         self.run_catalog("list documents", move |store| {
             store.list_documents(collection, after.as_deref(), limit)
+        })
+        .await
+    }
+
+    async fn read_documents(
+        &self,
+        collection: DocumentCollection,
+    ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
+        self.run_catalog("read documents", move |store| {
+            store.read_documents(collection)
         })
         .await
     }
@@ -481,17 +297,15 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::runtime::PosixFsRuntimeResolver;
-    use super::{
-        finish_posix_startup_manifest, PosixFsBackend, PosixFsBackendConfig, PosixFsRepository,
-    };
+    use super::{PosixFsBackend, PosixFsBackendConfig, PosixFsRepository};
     use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
-    use crate::repository::{Repository, RepositoryError, SnapshotRuntimeResolver};
+    use crate::repository::{RepositoryError, SnapshotRuntimeResolver};
     use crate::sandbox::{ExtraDrive, SandboxSnapshotManifest};
     use crate::snapshot::artifact_cache::LocalArtifactCache;
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::{
-        CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotAlias, SnapshotId,
-        SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
+        CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotAlias, SnapshotCatalog,
+        SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
         TemplateBuildErrorReason, SNAPSHOT_ARTIFACT_LAYOUT,
     };
 
@@ -603,7 +417,7 @@ mod tests {
         let local_artifacts = seed_built_snapshot(tempdir.path());
         let metadata = sample_metadata(snapshot_id, Some("mvp"));
         let stored = repository
-            .publish(metadata, local_artifacts, None)
+            .publish(metadata, local_artifacts)
             .await
             .expect("publish should work");
 
@@ -632,86 +446,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_publish_keeps_capture_lease_until_pending_recorder_finishes() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        struct LeaseProbe(Arc<AtomicBool>);
-        impl Drop for LeaseProbe {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-        let tempdir = TempDir::new().unwrap();
-        let repository = test_repository(tempdir.path());
-        let mut manifest = seed_built_snapshot(tempdir.path());
-        manifest.vm_state.path = tempdir.path().join("missing-vm-state");
-        let dropped = Arc::new(AtomicBool::new(false));
-        let (release, wait) = tokio::sync::oneshot::channel::<()>();
-        let recording = crate::snapshot::StartupRecording::spawn_with_capture_lease(
-            async move {
-                let _ = wait.await;
-                None
-            },
-            Arc::new(LeaseProbe(Arc::clone(&dropped))),
-        );
-        assert!(repository
-            .publish(
-                sample_metadata(SnapshotId::generate(), None),
-                manifest,
-                Some(recording)
-            )
-            .await
-            .is_err());
-        assert!(!dropped.load(Ordering::SeqCst));
-        release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while !dropped.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("recorder release");
-    }
-
-    #[tokio::test]
-    async fn cancelled_publish_keeps_capture_lease_until_pending_recorder_finishes() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        struct LeaseProbe(Arc<AtomicBool>);
-        impl Drop for LeaseProbe {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-        let tempdir = TempDir::new().unwrap();
-        let repository = test_repository(tempdir.path());
-        let manifest = seed_built_snapshot(tempdir.path());
-        let dropped = Arc::new(AtomicBool::new(false));
-        let (release, wait) = tokio::sync::oneshot::channel::<()>();
-        let recording = crate::snapshot::StartupRecording::spawn_with_capture_lease(
-            async move {
-                let _ = wait.await;
-                None
-            },
-            Arc::new(LeaseProbe(Arc::clone(&dropped))),
-        );
-        let publish = repository.publish(
-            sample_metadata(SnapshotId::generate(), None),
-            manifest,
-            Some(recording),
-        );
-        // Cancel before the first poll; the recorder is already detached.
-        drop(publish);
-        assert!(!dropped.load(Ordering::SeqCst));
-        release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            while !dropped.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("recorder release");
-    }
-
-    #[tokio::test]
     async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
         let tempdir = TempDir::new().expect("tempdir");
         let backend = test_backend(tempdir.path());
@@ -721,11 +455,7 @@ mod tests {
         let memory_size = overlaybd::startup_pack::PACK_PAGE_BYTES;
         local_artifacts.memory.virtual_size = memory_size;
         repository
-            .publish(
-                sample_metadata(snapshot_id.clone(), None),
-                local_artifacts,
-                None,
-            )
+            .publish(sample_metadata(snapshot_id.clone(), None), local_artifacts)
             .await
             .expect("publish");
 
@@ -740,11 +470,12 @@ mod tests {
         };
         let guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()
             .expect("register continuation");
-        finish_posix_startup_manifest(
-            Arc::new(PosixFsCatalogStore::new(tempdir.path().to_path_buf())),
+        crate::snapshot::publish::finish_startup_manifest(
+            Arc::clone(&repository),
             snapshot_id.clone(),
             recording,
             guard,
+            || false,
         )
         .await;
 
@@ -824,7 +555,7 @@ mod tests {
         let local_artifacts = seed_built_snapshot(tempdir.path());
         let first_metadata = sample_metadata(first_id.clone(), Some("conflict"));
         repository
-            .publish(first_metadata, local_artifacts, None)
+            .publish(first_metadata, local_artifacts)
             .await
             .expect("first publish should work");
 
@@ -834,7 +565,6 @@ mod tests {
             .publish(
                 sample_metadata(second_id.clone(), Some("conflict")),
                 local_artifacts,
-                None,
             )
             .await
             .expect_err("second publish should fail");
@@ -858,7 +588,7 @@ mod tests {
         let metadata = sample_metadata(snapshot_id.clone(), Some("cleanup"));
 
         repository
-            .publish(metadata, local_artifacts, None)
+            .publish(metadata, local_artifacts)
             .await
             .expect("publish should work");
 
@@ -961,11 +691,7 @@ mod tests {
             ],
         );
         let err = repository
-            .publish(
-                sample_metadata(snapshot_id, Some("dup-drive")),
-                manifest,
-                None,
-            )
+            .publish(sample_metadata(snapshot_id, Some("dup-drive")), manifest)
             .await
             .expect_err("duplicate attached drive ids should be rejected");
 

@@ -11,6 +11,7 @@ use agentenv::repository::backends::OssBackend;
 use agentenv::repository::{BuildCacheStore, RepositoryError, SnapshotListFilter};
 use agentenv::sandbox::{CapturedSandboxSnapshot, SandboxSnapshotManifest};
 use agentenv::snapshot::mock::write_mock_built_artifacts;
+use agentenv::snapshot::SnapshotCatalog;
 use agentenv::snapshot::{
     OverlaybdLayerRef, SnapshotAlias, SnapshotId, SnapshotManager, SnapshotPublishMetadata,
     SnapshotPublishSource, SnapshotRuntimeVersions, SNAPSHOT_ARTIFACT_LAYOUT,
@@ -634,10 +635,10 @@ async fn snapshot_oss_resolve_alias_cleans_up_stale_binding() -> Result<()> {
                 custom_extension_params: None,
             },
             manifest,
-            None,
         )
         .await?;
 
+    // Lose the record, as a crash between the two deletes would.
     let record_key = prefixed_key(prefix, &format!("catalog/records/{}.json", stored.id));
     fixture
         .client
@@ -698,7 +699,6 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
                 custom_extension_params: None,
             },
             manifest,
-            None,
         )
         .await?;
 
@@ -767,7 +767,6 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
                 custom_extension_params: None,
             },
             manifest,
-            None,
         )
         .await?;
 

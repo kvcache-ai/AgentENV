@@ -5,7 +5,9 @@ use anyhow::Context;
 use futures::{stream, StreamExt};
 use tracing::warn;
 
+use super::catalog::SnapshotCatalog;
 use super::p2p::SnapshotP2pArtifact;
+use super::publish::spawn_startup_manifest;
 use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
 use crate::p2p::P2pTransport;
 use crate::repository::backends::build_snapshot_backend;
@@ -113,12 +115,8 @@ impl SnapshotManager {
         manifest: SandboxSnapshotManifest,
         recording: Option<crate::snapshot::StartupRecording>,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        let publication = self
-            .repository
-            .publish_with_local_layers(metadata, manifest.clone(), recording)
-            .await?;
-        self.publish_p2p_artifacts(&publication, &manifest).await;
-        Ok(publication.record)
+        self.publish_with_recording(metadata, manifest, recording)
+            .await
     }
 
     #[tracing::instrument(skip(self, metadata), fields(snapshot_id = %metadata.id))]
@@ -146,10 +144,30 @@ impl SnapshotManager {
                 )
             });
 
+        self.publish_with_recording(metadata, manifest, recording)
+            .await
+    }
+
+    /// Publishes into the repository, then starts the startup-manifest
+    /// continuation and best-effort P2P publication. A failed publish drops
+    /// `recording`, whose recorder keeps its own capture lease.
+    async fn publish_with_recording(
+        &self,
+        metadata: SnapshotPublishMetadata,
+        manifest: SandboxSnapshotManifest,
+        recording: Option<crate::snapshot::StartupRecording>,
+    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
         let publication = self
             .repository
-            .publish_with_local_layers(metadata, manifest.clone(), recording)
+            .publish_with_local_layers(metadata, manifest.clone())
             .await?;
+        if let Some(recording) = recording {
+            spawn_startup_manifest(
+                Arc::clone(&self.repository),
+                publication.record.id.clone(),
+                recording,
+            );
+        }
         self.publish_p2p_artifacts(&publication, &manifest).await;
         Ok(publication.record)
     }
@@ -376,6 +394,72 @@ mod tests {
             .publish(metadata, manifest, None)
             .await
             .expect("seed publish should work");
+    }
+
+    struct LeaseProbe(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for LeaseProbe {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A recording whose recorder holds a capture lease until `release` fires.
+    fn pending_recording() -> (
+        crate::snapshot::StartupRecording,
+        tokio::sync::oneshot::Sender<()>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let recording = crate::snapshot::StartupRecording::spawn_with_capture_lease(
+            async move {
+                let _ = wait.await;
+                None
+            },
+            Arc::new(LeaseProbe(Arc::clone(&dropped))),
+        );
+        (recording, release, dropped)
+    }
+
+    async fn wait_for_lease_release(dropped: &std::sync::atomic::AtomicBool) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recorder release");
+    }
+
+    #[tokio::test]
+    async fn failed_publish_keeps_capture_lease_until_pending_recorder_finishes() {
+        let tempdir = TempDir::new().unwrap();
+        let manager = test_manager(tempdir.path());
+        let (_, _, mut manifest) = write_mock_built_artifacts(tempdir.path()).unwrap();
+        manifest.vm_state.path = tempdir.path().join("missing-vm-state");
+        let (recording, release, dropped) = pending_recording();
+        assert!(manager
+            .publish(SnapshotPublishMetadata::mock(), manifest, Some(recording))
+            .await
+            .is_err());
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        release.send(()).unwrap();
+        wait_for_lease_release(&dropped).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_publish_keeps_capture_lease_until_pending_recorder_finishes() {
+        let tempdir = TempDir::new().unwrap();
+        let manager = test_manager(tempdir.path());
+        let (_, _, manifest) = write_mock_built_artifacts(tempdir.path()).unwrap();
+        let (recording, release, dropped) = pending_recording();
+        let publish = manager.publish(SnapshotPublishMetadata::mock(), manifest, Some(recording));
+        // Cancel before the first poll; the recorder is already detached.
+        drop(publish);
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        release.send(()).unwrap();
+        wait_for_lease_release(&dropped).await;
     }
 
     #[tokio::test]

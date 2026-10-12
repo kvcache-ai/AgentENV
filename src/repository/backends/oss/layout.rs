@@ -10,14 +10,6 @@ impl<'a> OssSnapshotArtifactLayout<'a> {
         Self { snapshot_id }
     }
 
-    pub(super) fn alias_key(alias: &str) -> String {
-        format!("catalog/aliases/{alias}.json")
-    }
-
-    pub(super) fn record_key(id: &SnapshotId) -> String {
-        format!("catalog/records/{id}.json")
-    }
-
     pub(crate) fn managed_layer_key(digest: &str) -> String {
         format!("managed-layers/{digest}")
     }

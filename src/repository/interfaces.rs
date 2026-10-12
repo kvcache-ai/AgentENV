@@ -7,8 +7,9 @@ use super::errors::{RepositoryError, RepositoryResult};
 use super::{DocumentCollection, DocumentKey};
 use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::{
+    CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, PersistedDiskImagePublication,
     RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSourceKind,
-    TemplateBuildErrorReason, TemplateBuildStatus,
+    TemplateBuildStatus,
 };
 
 /// A committed snapshot and the local upload files kept alive for post-commit
@@ -16,6 +17,17 @@ use crate::snapshot::{
 #[derive(Debug)]
 pub struct SnapshotPublication {
     pub record: SnapshotRecord,
+    pub(crate) local_layers: Vec<super::backends::common::recontainerize::PreparedLayerUpload>,
+}
+
+/// What a backend stored for one snapshot before its record is committed.
+#[derive(Debug, Default)]
+pub struct StoredSnapshot {
+    pub rootfs_layers: Vec<OverlaybdLayerRef>,
+    pub memory_layers: Vec<ManagedLayer>,
+    pub attached_drives: Vec<CommittedAttachedDrive>,
+    pub disk_publications: Vec<PersistedDiskImagePublication>,
+    /// Transformed local layer files, kept for post-commit P2P publication.
     pub(crate) local_layers: Vec<super::backends::common::recontainerize::PreparedLayerUpload>,
 }
 
@@ -44,11 +56,19 @@ pub struct SnapshotListFilter {
     pub template_statuses: Option<Vec<TemplateBuildStatus>>,
 }
 
-/// Computes a document's new bytes from its current bytes, if any, or `None`
-/// to leave it unchanged. Backends may call it again when a concurrent writer
-/// wins, so it must be a pure function of its input.
+/// What an update does to a document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DocumentChange {
+    Keep,
+    Put(Vec<u8>),
+    Delete,
+}
+
+/// Decides how to change a document from its current bytes, if any. Backends
+/// may call it again when a concurrent writer wins, so it must be a pure
+/// function of its input.
 pub type DocumentUpdate =
-    Box<dyn Fn(Option<&[u8]>) -> RepositoryResult<Option<Vec<u8>>> + Send + Sync>;
+    Box<dyn Fn(Option<&[u8]>) -> RepositoryResult<DocumentChange> + Send + Sync>;
 
 fn unsupported<T>(feature: &str) -> RepositoryResult<T> {
     Err(RepositoryError::Unsupported {
@@ -100,122 +120,54 @@ impl SnapshotListFilter {
 }
 
 #[async_trait]
-/// Durable repository shared by every node: snapshots, volumes, and small
-/// shared documents.
+/// Durable storage shared by every node: small shared documents, snapshot
+/// files and layers, and volume backing layers.
 ///
-/// This trait owns the repository truth for [`SnapshotRecord`] values and committed snapshot
-/// artifacts. A record is the catalog identity and lifecycle state for a snapshot:
+/// A repository stores; it does not decide. The catalogs built on its
+/// documents ([`crate::snapshot::SnapshotCatalog`],
+/// [`crate::volume::VolumeCatalog`], [`super::BuildCacheStore`]) own the
+/// records, aliases, and their rules, the same on every backend.
 ///
-/// - template records may exist before build artifacts are committed
-/// - sandbox records are created by publishing an already captured runtime snapshot
-/// - committed records carry a [`crate::snapshot::CommittedSnapshot`] payload with artifact
-///   references
-///
-/// Implementations are responsible for durable state that may be shared across processes or nodes:
-///
-/// - snapshot records and template build state
-/// - alias-to-snapshot bindings
-/// - committed artifacts such as Firecracker snapshots and managed layers
-/// - publish / delete visibility rules
-///
-/// Callers may assume returned records describe durable repository state rather than process-local
-/// working directories or node-local runtime cache files.
-///
-/// The repository boundary intentionally excludes node-local derived state. In particular:
-///
-/// - local build-artifact allocation is owned by the manager rather than the repository
-/// - runtime-ready `image.json` files should be materialized by [`SnapshotRuntimeResolver`]
-/// - node-local cache directories should not leak back into snapshot records
-/// - repository implementations should not require sandbox launch code to understand backend-specific
-///   local build layouts
-///
-/// Backend guidance for shared POSIX or distributed filesystems:
-///
-/// - alias claim / release should be concurrency-safe
-/// - publish should only make aliases visible after the snapshot record and committed artifact
-///   payload are durable enough for subsequent readers to resolve
-/// - delete should avoid exposing partially removed records or committed artifacts
-/// - shared artifact imports should use atomic protocols so concurrent writers do not expose
-///   half-written managed layers
+/// The repository boundary excludes node-local derived state: runtime-ready
+/// `image.json` files are materialized by [`SnapshotRuntimeResolver`], and
+/// node-local cache directories never leak into durable records. Shared
+/// layer imports must use atomic protocols so concurrent writers never expose
+/// half-written layers.
 pub trait Repository: Send + Sync {
-    /// Creates a durable template snapshot record before build artifacts exist.
-    ///
-    /// Backends should reject records that already contain a committed artifact payload and should
-    /// only accept records whose source kind is template.
-    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
-
-    /// Publishes manager-owned local artifacts into committed repository state.
-    ///
-    /// Implementations are responsible for:
-    ///
-    /// - reading build artifacts from the provided local artifact description
-    /// - validating publish metadata
-    /// - importing any repository-owned managed layers
-    /// - committing a durable snapshot record with a committed artifact payload
-    /// - binding aliases only after the record is durable
-    /// - cleaning up or rolling back partially committed state on failure
-    ///
-    /// On success, the returned [`SnapshotRecord`] must contain committed artifact state.
-    /// On failure, callers may assume the backend attempted best-effort cleanup of partially published
-    /// state, but durable shared artifacts may still be retained when doing so is safe and intentional.
-    ///
-    /// `recording`, when present, is the in-flight startup-manifest recording
-    /// for this snapshot; the backend awaits it after the layer uploads and
-    /// before building the manifest, so the recording VM overlaps the upload
-    /// phase instead of serializing ahead of it.
-    async fn publish(
+    /// Stores one captured snapshot's per-snapshot files and layers, before
+    /// its record is committed. On failure the backend removes what it
+    /// stored, except shared content-addressed layers.
+    async fn store_snapshot(
         &self,
-        metadata: SnapshotPublishMetadata,
-        manifest: SandboxSnapshotManifest,
-        recording: Option<crate::snapshot::StartupRecording>,
-    ) -> RepositoryResult<SnapshotRecord>;
-
-    /// Like `publish`, retaining any transformed local layer files until the
-    /// caller finishes best-effort P2P publication after the durable commit.
-    async fn publish_with_local_layers(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        manifest: SandboxSnapshotManifest,
-        recording: Option<crate::snapshot::StartupRecording>,
-    ) -> RepositoryResult<SnapshotPublication> {
-        Ok(SnapshotPublication {
-            record: self.publish(metadata, manifest, recording).await?,
-            local_layers: Vec::new(),
-        })
+        _metadata: &SnapshotPublishMetadata,
+        _manifest: &SandboxSnapshotManifest,
+    ) -> RepositoryResult<StoredSnapshot> {
+        unsupported("snapshot storage")
     }
 
-    /// Loads one snapshot record by repository id or alias.
-    async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>>;
-
-    /// Lists snapshot records matching the provided filter.
-    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>>;
-
-    /// Deletes one snapshot record by repository id or alias.
-    ///
-    /// Returns `Ok(())` on success. The operation is idempotent:
-    /// if the snapshot does not exist, it is still considered success.
-    ///
-    /// For committed records, implementations should also remove per-snapshot committed artifacts and
-    /// any alias binding that still points at the deleted id.
-    async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()>;
-
-    /// Resolves a human-readable alias to the current snapshot id.
-    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>>;
-
-    /// Atomically transitions one template build from waiting to building.
-    ///
-    /// Backends should reject non-template records and template records that are no longer waiting.
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord>;
-
-    /// Marks one template build as failed.
-    ///
-    /// Backends should preserve the existing record identity, alias, resources, and source while
-    /// recording the failure state and reason.
-    async fn mark_build_error(
+    /// Removes one snapshot's per-snapshot files and external disk
+    /// publications. Shared layers stay. Missing files are considered success.
+    async fn delete_snapshot_files(
         &self,
-        id: &SnapshotId,
-        reason: TemplateBuildErrorReason,
-    ) -> RepositoryResult<()>;
+        _id: &SnapshotId,
+        _publications: &[PersistedDiskImagePublication],
+    ) -> RepositoryResult<()> {
+        unsupported("snapshot storage")
+    }
+
+    /// Stores one snapshot's startup memory manifest.
+    async fn put_startup_manifest(
+        &self,
+        _id: &SnapshotId,
+        _bytes: Vec<u8>,
+    ) -> RepositoryResult<()> {
+        unsupported("snapshot storage")
+    }
+
+    /// Removes one snapshot's startup memory manifest, if any.
+    async fn delete_startup_manifest(&self, _id: &SnapshotId) -> RepositoryResult<()> {
+        unsupported("snapshot storage")
+    }
 
     /// Reads one shared document; `None` when absent.
     async fn get_document(&self, _key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
@@ -249,6 +201,14 @@ pub trait Repository: Send + Sync {
         _after: Option<&str>,
         _limit: usize,
     ) -> RepositoryResult<Vec<String>> {
+        unsupported("repository documents")
+    }
+
+    /// Reads every live document in `collection`, in the backend's stable ID order.
+    async fn read_documents(
+        &self,
+        _collection: DocumentCollection,
+    ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
         unsupported("repository documents")
     }
 

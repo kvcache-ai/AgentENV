@@ -8,15 +8,18 @@
 
 use std::time::Duration;
 
+use futures::{stream, StreamExt, TryStreamExt};
 use rand::RngExt;
 
 use super::client::{OssClient, OssUploadArtifact};
 use super::lease;
 use crate::repository::{
-    DocumentCollection, DocumentKey, DocumentUpdate, RepositoryError, RepositoryResult,
+    DocumentChange, DocumentCollection, DocumentKey, DocumentUpdate, RepositoryError,
+    RepositoryResult,
 };
 
 const MAX_UPDATE_ATTEMPTS: usize = 32;
+const READ_CONCURRENCY: usize = 16;
 
 /// Jittered, growing pauses between attempts that lost to another writer.
 pub(super) struct Backoff {
@@ -78,23 +81,29 @@ pub(super) async fn update(
         return update_if_unchanged(client, &path, update).await;
     }
     let lease = lease::acquire(client, &path).await?;
-    let (current, bytes) = match read(client, &path).await {
-        Ok(current) => match update(current.as_deref()) {
-            Ok(Some(bytes)) => (current, bytes),
-            result => {
-                lease::release(client, lease).await;
-                return result.map(|_| current);
-            }
-        },
-        Err(error) => {
+    let decided = async {
+        let current = read(client, &path).await?;
+        let change = update(current.as_deref())?;
+        Ok((current, change))
+    }
+    .await;
+    let (current, bytes) = match decided {
+        Ok((current, DocumentChange::Put(bytes))) => (current, Some(bytes)),
+        Ok((current, DocumentChange::Delete)) if current.is_some() => (current, None),
+        decided => {
             lease::release(client, lease).await;
-            return Err(error);
+            return decided.map(|(current, _)| current);
         }
     };
-    client
-        .put_bytes_before(&path, bytes, upload_artifact(key), lease.deadline())
-        .await
-        .map_err(|error| RepositoryError::backend(format!("update '{path}'"), error))?;
+    let written = match bytes {
+        Some(bytes) => {
+            client
+                .put_bytes_before(&path, bytes, upload_artifact(key), lease.deadline())
+                .await
+        }
+        None => client.delete_before(&path, lease.deadline()).await,
+    };
+    written.map_err(|error| RepositoryError::backend(format!("update '{path}'"), error))?;
     lease::release(client, lease).await;
     Ok(current)
 }
@@ -124,22 +133,44 @@ pub(super) async fn list(
     limit: usize,
 ) -> RepositoryResult<Vec<String>> {
     let prefix = collection.prefix();
-    let start_after = after.map(|id| collection.key(id).path());
+    let start_after = after
+        .map(|id| {
+            collection.key(id).map(|key| key.path()).ok_or_else(|| {
+                RepositoryError::InvalidRequest {
+                    reason: format!("invalid document id '{id}'"),
+                }
+            })
+        })
+        .transpose()?;
     let keys = client
         .list_keys_page(prefix, start_after.as_deref(), limit)
         .await
         .map_err(|error| RepositoryError::backend(format!("list '{prefix}'"), error))?;
     keys.iter()
-        .map(|key| {
-            key.strip_prefix(prefix)
-                .filter(|name| !name.contains('/'))
-                .and_then(|name| collection.id_from_file_name(name))
-                .map(str::to_owned)
-                .ok_or_else(|| RepositoryError::InvalidRequest {
-                    reason: format!("invalid document key '{key}'"),
-                })
-        })
+        .map(|key| document_id(collection, key))
         .collect()
+}
+
+/// Reads every document in `collection`, in object key order.
+pub(super) async fn read_all(
+    client: &OssClient,
+    collection: DocumentCollection,
+) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
+    let prefix = collection.prefix();
+    let keys = client
+        .list_keys_recursive(prefix)
+        .await
+        .map_err(|error| RepositoryError::backend(format!("list '{prefix}'"), error))?;
+    let read = stream::iter(keys)
+        .map(|key| async move {
+            let id = document_id(collection, &key)?;
+            // Skips a document deleted since the listing.
+            RepositoryResult::Ok(read(client, &key).await?.map(|bytes| (id, bytes)))
+        })
+        .buffered(READ_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+    Ok(read.into_iter().flatten().collect())
 }
 
 async fn read(client: &OssClient, path: &str) -> RepositoryResult<Option<Vec<u8>>> {
@@ -148,6 +179,17 @@ async fn read(client: &OssClient, path: &str) -> RepositoryResult<Option<Vec<u8>
         Err(error) if OssClient::is_not_found_error(&error) => Ok(None),
         Err(error) => Err(RepositoryError::backend(format!("read '{path}'"), error)),
     }
+}
+
+/// The ID of the document stored at `key` in `collection`.
+fn document_id(collection: DocumentCollection, key: &str) -> RepositoryResult<String> {
+    key.strip_prefix(collection.prefix())
+        .filter(|name| !name.contains('/'))
+        .and_then(|name| collection.id_from_file_name(name))
+        .map(str::to_owned)
+        .ok_or_else(|| RepositoryError::InvalidRequest {
+            reason: format!("invalid document key '{key}'"),
+        })
 }
 
 /// Applies `update` with an ETag compare-and-swap.
@@ -168,14 +210,22 @@ async fn update_if_unchanged(
             Err(error) if OssClient::is_not_found_error(&error) => (None, None),
             Err(error) => return Err(RepositoryError::backend(format!("read '{path}'"), error)),
         };
-        let Some(bytes) = update(current.as_deref())? else {
-            return Ok(current);
-        };
-        if client
-            .put_bytes_conditionally(path, bytes, etag.as_deref())
-            .await
-            .map_err(|error| RepositoryError::backend(format!("update '{path}'"), error))?
-        {
+        let written = match update(current.as_deref())? {
+            DocumentChange::Keep => return Ok(current),
+            DocumentChange::Put(bytes) => {
+                client
+                    .put_bytes_conditionally(path, bytes, etag.as_deref())
+                    .await
+            }
+            DocumentChange::Delete if current.is_none() => return Ok(None),
+            // opendal cannot delete conditionally, so a write that lands
+            // between the read and this delete is lost. The catalogs delete
+            // conditionally only to release a name or to undo their own
+            // write, so losing that race leaves a name unbound.
+            DocumentChange::Delete => client.delete(path).await.map(|()| true),
+        }
+        .map_err(|error| RepositoryError::backend(format!("update '{path}'"), error))?;
+        if written {
             return Ok(current);
         }
         backoff.wait().await;
@@ -188,6 +238,7 @@ async fn update_if_unchanged(
 fn upload_artifact(key: &DocumentKey) -> OssUploadArtifact {
     match key {
         DocumentKey::BuildLog(_) => OssUploadArtifact::BuildLog,
+        DocumentKey::SnapshotAlias(_) | DocumentKey::VolumeAlias(_) => OssUploadArtifact::Alias,
         _ => OssUploadArtifact::CatalogRecord,
     }
 }

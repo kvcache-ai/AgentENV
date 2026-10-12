@@ -1,10 +1,7 @@
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use futures::{stream, StreamExt, TryStreamExt};
 use overlaybd::config::{load_image_config as load_overlaybd_image_config, LayerConfig};
 use overlaybd::dense_export;
 use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
@@ -23,17 +20,14 @@ use crate::repository::backends::common::recontainerize::{
 use crate::repository::backends::common::{
     materialize_volume_image_config, write_dense_overlaybd_layer_to_file,
 };
-use crate::repository::interfaces::{Repository, SnapshotPublication};
-use crate::repository::SnapshotListFilter;
+use crate::repository::interfaces::{Repository, StoredSnapshot};
 use crate::repository::{
     DocumentCollection, DocumentKey, DocumentUpdate, RepositoryError, RepositoryResult,
 };
 use crate::sandbox::{OverlaybdCompactOutput, SandboxSnapshotManifest};
 use crate::snapshot::{
-    CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer, MemoryStartupPackInfo,
-    OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotAlias, SnapshotId,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
+    CommittedAttachedDrive, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
+    PersistedDiskImagePublication, SnapshotId, SnapshotPublishMetadata,
     MEMORY_STARTUP_PACK_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
@@ -56,8 +50,6 @@ pub(crate) struct OssRepository {
     publish_compression: OverlaybdCompactOutput,
 }
 
-const MAX_ALIAS_BIND_ATTEMPTS: usize = 5;
-
 impl OssRepository {
     pub(crate) fn new(
         client: Arc<OssClient>,
@@ -77,27 +69,6 @@ impl OssRepository {
     fn layout<'a>(&self, id: &'a SnapshotId) -> OssSnapshotArtifactLayout<'a> {
         OssSnapshotArtifactLayout::new(id)
     }
-
-    async fn snapshot_exists(&self, id: &SnapshotId) -> RepositoryResult<bool> {
-        self.client
-            .exists(&OssSnapshotArtifactLayout::record_key(id))
-            .await
-            .map_err(|e| RepositoryError::backend(format!("check snapshot record '{id}'"), e))
-    }
-}
-
-fn validated_alias_key(alias: &str) -> RepositoryResult<String> {
-    SnapshotAlias::parse(alias).map_err(|e| RepositoryError::InvalidRequest {
-        reason: format!("invalid alias '{alias}': {e}"),
-    })?;
-    Ok(OssSnapshotArtifactLayout::alias_key(alias))
-}
-
-fn now_unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 fn same_repo_blob_url(left: &str, right: &str) -> bool {
@@ -164,93 +135,18 @@ fn fallback_to_object_storage_would_mix_sources(
 
 #[async_trait]
 impl Repository for OssRepository {
-    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        if !matches!(record.source, SnapshotSource::Template { .. }) {
-            return Err(RepositoryError::InvalidRequest {
-                reason: "only template snapshots can be pre-created".to_string(),
-            });
-        }
-        if record.committed.is_some() {
-            return Err(RepositoryError::InvalidRequest {
-                reason: "pre-created template snapshots must not already be committed".to_string(),
-            });
-        }
-        if self.snapshot_exists(&record.id).await? {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("snapshot '{}' already exists", record.id),
-            });
-        }
-        if let Some(alias) = record.alias.as_ref() {
-            if let Some(existing) = self.load_alias_target(alias.as_ref()).await? {
-                if existing != record.id && self.snapshot_exists(&existing).await? {
-                    return Err(RepositoryError::AliasConflict {
-                        alias: alias.to_string(),
-                        existing,
-                        new_id: record.id.clone(),
-                    });
-                }
-            }
-        }
-        self.write_record(&record).await?;
-        if let Some(alias) = record.alias.as_ref() {
-            if let Err(error) = self.bind_alias(alias.as_ref(), &record.id).await {
-                let _ = self
-                    .client
-                    .delete(&OssSnapshotArtifactLayout::record_key(&record.id))
-                    .await;
-                return Err(error);
-            }
-        }
-        Ok(record)
-    }
-
-    async fn publish(
+    async fn store_snapshot(
         &self,
-        metadata: SnapshotPublishMetadata,
-        manifest: SandboxSnapshotManifest,
-        recording: Option<crate::snapshot::StartupRecording>,
-    ) -> RepositoryResult<SnapshotRecord> {
-        Ok(self
-            .publish_with_local_layers(metadata, manifest, recording)
-            .await?
-            .record)
-    }
-
-    async fn publish_with_local_layers(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        manifest: SandboxSnapshotManifest,
-        recording: Option<crate::snapshot::StartupRecording>,
-    ) -> RepositoryResult<SnapshotPublication> {
+        metadata: &SnapshotPublishMetadata,
+        manifest: &SandboxSnapshotManifest,
+    ) -> RepositoryResult<StoredSnapshot> {
         let id = &metadata.id;
         let layout = self.layout(id);
-
-        // 0. Validate no duplicate drive ids.
-        let mut drive_ids_set = HashSet::new();
-        for drive in &manifest.attached_drives {
-            if !drive_ids_set.insert(drive.drive_id.clone()) {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!(
-                        "duplicate attached drive id in publish request: {}",
-                        drive.drive_id
-                    ),
-                });
-            }
-            if drive.virtual_size == 0 {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!(
-                        "attached drive '{}' virtual_size must be non-zero",
-                        drive.drive_id
-                    ),
-                });
-            }
-        }
-
         let mut disk_publications = Vec::new();
         let mut local_layers = Vec::new();
 
-        let publish_result = async {
-            validate_publish_manifest_image_configs(&manifest)?;
+        let stored = async {
+            validate_publish_manifest_image_configs(manifest)?;
 
             // 1. Export rootfs disk image with the effective runtime config.
             let rootfs_config = SnapshotOciConfigInput::new(
@@ -272,7 +168,10 @@ impl Repository for OssRepository {
             let rootfs_layers = rootfs_outcome.layers;
 
             let memory_layers = self
-                .derive_and_upload_memory_layers(&manifest.memory.image_config_path, &mut local_layers)
+                .derive_and_upload_memory_layers(
+                    &manifest.memory.image_config_path,
+                    &mut local_layers,
+                )
                 .await?;
 
             // 2. Upload per-snapshot fixed artifacts.
@@ -296,7 +195,7 @@ impl Repository for OssRepository {
                     )
                 })?;
 
-            let persisted_manifest_bytes = serde_json::to_vec_pretty(&manifest)
+            let persisted_manifest_bytes = serde_json::to_vec_pretty(manifest)
                 .map_err(|e| RepositoryError::backend("serialize firecracker manifest", e))?;
             self.client
                 .put_bytes(
@@ -307,291 +206,69 @@ impl Repository for OssRepository {
                 .await
                 .map_err(|e| RepositoryError::backend("write firecracker manifest to oss", e))?;
 
-            // The startup manifest is fully decoupled from this flow: the
-            // detached continuation spawned after the record commits builds
-            // and uploads it, then attaches the descriptor to the record.
-            let memory_startup = None;
-
             // 3. Export attached-drive disk images and derive their committed metadata.
             let attached_drives = self
-                .export_attached_drives(id, &manifest, &mut disk_publications, &mut local_layers)
+                .export_attached_drives(id, manifest, &mut disk_publications, &mut local_layers)
                 .await?;
-
-            // 4. Construct committed CommittedSnapshot.
-            let committed = CommittedSnapshot {
-                context: metadata.context.clone(),
-                startup: metadata.startup.clone(),
-                runtime_versions: metadata.runtime_versions.clone(),
-                virtualization_mode: metadata.virtualization_mode,
-                image_configs: metadata.image_configs.clone(),
-                custom_extension_params: metadata.custom_extension_params.clone(),
-                rootfs_layers,
-                attached_drives,
-                volume_snapshots: metadata.volume_snapshots.clone(),
-                memory_layers,
-                disk_publications: disk_publications.clone(),
-                memory_startup,
-            };
-
-            // 5. Bind alias (if present) with conflict detection.
-            if let Some(ref alias) = metadata.alias {
-                if let Err(e) = self.bind_alias(alias.as_ref(), id).await {
-                    // Best-effort rollback. Content-addressed managed layers are intentionally left
-                    // in place; they are shared across snapshots and require separate GC.
-                    if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
-                        warn!(snapshot_id = %id, error = %error, "failed to roll back snapshot artifacts after alias bind failure");
-                    }
-                    return Err(e);
-                }
-            }
-
-            self.write_committed_record(
-                metadata.id.clone(),
-                metadata.alias.clone(),
-                metadata.resources,
-                committed,
-                metadata.source.clone(),
-            )
-            .await
+            RepositoryResult::Ok((rootfs_layers, memory_layers, attached_drives))
         }
         .await;
 
-        let record = match publish_result {
-            Ok(record) => record,
-            Err(error) => {
-                // Best-effort rollback. Content-addressed managed layers are intentionally left
-                // in place; they are shared across snapshots and require separate GC.
-                if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
-                    warn!(snapshot_id = %id, error = %error, "failed to roll back snapshot artifacts after publish failure");
-                }
-                for publication in disk_publications.iter().rev() {
-                    if let Err(rollback_error) =
-                        self.acr_exporter.rollback_publication(publication).await
-                    {
-                        warn!(
-                            snapshot_id = %id,
-                            image_ref = %publication.image_ref,
-                            manifest_digest = %publication.manifest_digest,
-                            error = %rollback_error,
-                            "failed to roll back ACR snapshot publication; leaving cleanup to registry GC"
-                        );
-                    }
-                }
-                return Err(error);
-            }
-        };
-
-        // Fully decoupled startup manifest: the continuation joins the
-        // recording, builds and uploads the manifest, then attaches its
-        // descriptor to the record. Publish never waits on any of it.
-        if crate::cfg::ConfigManager::global_config()
-            .snapshot
-            .memory_startup_pack
-            .enabled
-        {
-            if let Some(recording) = recording {
-                if let Some(guard) =
-                    crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()
-                {
-                    tokio::spawn(finish_startup_manifest(
-                        self.client.clone(),
-                        metadata.id.clone(),
-                        recording,
-                        guard,
-                    ));
-                } else {
-                    recording.detach();
-                }
-            }
-        }
-
-        debug!(snapshot_id = %id, "published snapshot to oss");
-        Ok(SnapshotPublication {
-            record,
-            local_layers,
-        })
-    }
-
-    async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        // Try by id first.
-        if let Ok(direct_id) = crate::snapshot::SnapshotId::parse(id_or_alias) {
-            if let Some(record) = self.read_record(&direct_id).await? {
-                return Ok(Some(record));
-            }
-        }
-
-        // Try by alias.
-        let resolved_id = match self.resolve_alias(id_or_alias).await {
-            Ok(id) => id,
-            Err(error) => return Err(error),
-        };
-        let Some(resolved_id) = resolved_id else {
-            return Ok(None);
-        };
-        self.read_record(&resolved_id).await
-    }
-
-    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        let keys = self
-            .client
-            .list_keys_recursive("catalog/records/")
-            .await
-            .map_err(|e| RepositoryError::backend("list snapshot records", e))?;
-
-        let mut records: Vec<SnapshotRecord> = stream::iter(keys)
-            .map(|key| async move {
-                let bytes = self.client.get_bytes(&key).await.map_err(|e| {
-                    RepositoryError::backend(format!("read snapshot record '{key}'"), e)
-                })?;
-                serde_json::from_slice::<SnapshotRecord>(&bytes).map_err(|e| {
-                    RepositoryError::backend(format!("parse snapshot record '{key}'"), e)
+        match stored {
+            Ok((rootfs_layers, memory_layers, attached_drives)) => {
+                debug!(snapshot_id = %id, "stored snapshot in oss");
+                Ok(StoredSnapshot {
+                    rootfs_layers,
+                    memory_layers,
+                    attached_drives,
+                    disk_publications,
+                    local_layers,
                 })
-            })
-            .buffer_unordered(16)
-            .try_collect()
-            .await?;
-
-        records.retain(|record| Self::matches_record_filter(record, &filter));
-        records.sort_by(|a, b| {
-            b.created_at_unix_ms
-                .cmp(&a.created_at_unix_ms)
-                .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
-        });
-
-        Ok(records)
+            }
+            Err(error) => {
+                if let Err(cleanup) = self.delete_snapshot_files(id, &disk_publications).await {
+                    warn!(snapshot_id = %id, error = %cleanup, "failed to roll back snapshot files after store failure");
+                }
+                Err(error)
+            }
+        }
     }
 
-    async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
-        // Resolve the actual id + metadata.
-        let record = match self.get(id_or_alias).await? {
-            Some(record) => record,
-            None => {
-                if let Ok(id) = SnapshotId::parse(id_or_alias) {
-                    self.client
-                        .delete(&DocumentKey::BuildLog(id).path())
-                        .await
-                        .map_err(|error| RepositoryError::backend("delete build logs", error))?;
-                }
-                return Ok(());
-            }
-        };
-        let id = &record.id;
-        let layout = self.layout(id);
-
-        // 1. Delete alias binding.
-        if let Some(ref alias) = record.alias {
-            if self.load_alias_target(alias.as_ref()).await?.as_ref() == Some(id) {
-                if let Err(error) = self
-                    .client
-                    .delete(&OssSnapshotArtifactLayout::alias_key(alias.as_ref()))
-                    .await
-                {
-                    warn!(snapshot_id = %id, alias = %alias, error = %error, "failed to delete oss alias during snapshot removal");
-                }
-            }
-        }
-
-        self.client
-            .delete(&DocumentKey::BuildLog(id.clone()).path())
+    async fn delete_snapshot_files(
+        &self,
+        id: &SnapshotId,
+        publications: &[PersistedDiskImagePublication],
+    ) -> RepositoryResult<()> {
+        // External disk publications are removed on a best-effort basis.
+        self.delete_disk_publications(id, publications).await;
+        // Content-addressed managed layers are intentionally left in place;
+        // they are shared across snapshots and require separate GC.
+        if let Err(error) = self
+            .client
+            .delete_prefix(&self.layout(id).artifact_prefix())
             .await
-            .map_err(|error| RepositoryError::backend("delete build logs", error))?;
-
-        // 2. Delete the catalog record.
-        self.client
-            .delete(&OssSnapshotArtifactLayout::record_key(id))
-            .await
-            .map_err(|e| RepositoryError::backend("delete snapshot record from oss", e))?;
-
-        // 3. Delete external disk publications on a best-effort basis.
-        if let Some(committed) = record.committed.as_ref() {
-            self.delete_disk_publications(id, &committed.disk_publications)
-                .await;
-        }
-
-        // 4. Delete artifacts.
-        if let Err(error) = self.client.delete_prefix(&layout.artifact_prefix()).await {
+        {
             warn!(snapshot_id = %id, error = %error, "failed to delete oss snapshot artifacts");
         }
-
-        debug!(snapshot_id = %id, "deleted snapshot from oss");
         Ok(())
     }
 
-    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        let key = validated_alias_key(alias)?;
-        let data = match self.client.get_bytes(&key).await {
-            Ok(d) => d,
-            Err(e) if OssClient::is_not_found_error(&e) => return Ok(None),
-            Err(e) => {
-                return Err(RepositoryError::backend(format!("read alias '{alias}'"), e));
-            }
-        };
-
-        let id: SnapshotId = serde_json::from_slice(&data)
-            .map_err(|e| RepositoryError::backend(format!("parse alias '{alias}'"), e))?;
-
-        // Stale-alias cleanup: if the snapshot record doesn't exist, delete the alias
-        // and return None (mirrors PosixFs catalog.rs:236 behavior).
-        let snapshot_exists = self.snapshot_exists(&id).await?;
-        if !snapshot_exists {
-            warn!(alias = %alias, snapshot_id = %id, "cleaning up stale alias pointing to missing snapshot");
-            if let Err(error) = self.client.delete(&key).await {
-                warn!(alias = %alias, snapshot_id = %id, error = %error, "failed to delete stale oss alias");
-            }
-            return Ok(None);
-        }
-
-        Ok(Some(id))
+    async fn put_startup_manifest(&self, id: &SnapshotId, bytes: Vec<u8>) -> RepositoryResult<()> {
+        self.client
+            .put_bytes(
+                &self.layout(id).artifact_key(MEMORY_STARTUP_PACK_ARTIFACT),
+                bytes,
+                OssUploadArtifact::StartupPack,
+            )
+            .await
+            .map_err(|error| RepositoryError::backend("upload startup manifest", error))
     }
 
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
-        let mut record =
-            self.read_record(id)
-                .await?
-                .ok_or_else(|| RepositoryError::SnapshotNotFound {
-                    lookup: id.to_string(),
-                })?;
-        let now = now_unix_ms();
-        let SnapshotSource::Template { build } = &mut record.source else {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("snapshot '{id}' is not a template build"),
-            });
-        };
-        if build.status != TemplateBuildStatus::Waiting {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("template build '{id}' is not in waiting state"),
-            });
-        }
-        build.status = TemplateBuildStatus::Building;
-        build.started_at_unix_ms = Some(now);
-        build.error_reason = None;
-        record.updated_at_unix_ms = now;
-        self.write_record(&record).await?;
-        Ok(record)
-    }
-
-    async fn mark_build_error(
-        &self,
-        id: &SnapshotId,
-        reason: TemplateBuildErrorReason,
-    ) -> RepositoryResult<()> {
-        let mut record =
-            self.read_record(id)
-                .await?
-                .ok_or_else(|| RepositoryError::SnapshotNotFound {
-                    lookup: id.to_string(),
-                })?;
-        let now = now_unix_ms();
-        let SnapshotSource::Template { build } = &mut record.source else {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("snapshot '{id}' is not a template build"),
-            });
-        };
-        build.status = TemplateBuildStatus::Error;
-        build.finished_at_unix_ms = Some(now);
-        build.error_reason = Some(reason);
-        record.updated_at_unix_ms = now;
-        self.write_record(&record).await
+    async fn delete_startup_manifest(&self, id: &SnapshotId) -> RepositoryResult<()> {
+        self.client
+            .delete(&self.layout(id).artifact_key(MEMORY_STARTUP_PACK_ARTIFACT))
+            .await
+            .map_err(|error| RepositoryError::backend("delete startup manifest", error))
     }
 
     async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
@@ -621,6 +298,13 @@ impl Repository for OssRepository {
         limit: usize,
     ) -> RepositoryResult<Vec<String>> {
         documents::list(&self.client, collection, after, limit).await
+    }
+
+    async fn read_documents(
+        &self,
+        collection: DocumentCollection,
+    ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
+        documents::read_all(&self.client, collection).await
     }
 
     async fn publish_volume_backing(
@@ -653,167 +337,6 @@ impl Repository for OssRepository {
 // ── private helpers ────────────────────────────────────────────────────
 
 impl OssRepository {
-    async fn read_record(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>> {
-        let key = OssSnapshotArtifactLayout::record_key(id);
-        match self.client.get_bytes(&key).await {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(|e| RepositoryError::backend(format!("parse snapshot record '{id}'"), e)),
-            Err(e) if OssClient::is_not_found_error(&e) => Ok(None),
-            Err(e) => Err(RepositoryError::backend(
-                format!("read snapshot record '{id}'"),
-                e,
-            )),
-        }
-    }
-
-    async fn write_record(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
-        let bytes = serde_json::to_vec_pretty(record)
-            .map_err(|e| RepositoryError::backend("serialize snapshot record", e))?;
-        self.client
-            .put_bytes(
-                &OssSnapshotArtifactLayout::record_key(&record.id),
-                bytes,
-                OssUploadArtifact::CatalogRecord,
-            )
-            .await
-            .map_err(|e| RepositoryError::backend("write snapshot record", e))
-    }
-
-    async fn write_committed_record(
-        &self,
-        id: SnapshotId,
-        alias: Option<SnapshotAlias>,
-        resources: crate::types::SandboxResources,
-        committed: CommittedSnapshot,
-        source: SnapshotPublishSource,
-    ) -> RepositoryResult<SnapshotRecord> {
-        let now = now_unix_ms();
-        let record = if let Some(mut record) = self.read_record(&id).await? {
-            record.mark_committed(alias, resources, committed, source, now);
-            record
-        } else {
-            let source = match source {
-                SnapshotPublishSource::Template => SnapshotSource::Template {
-                    build: TemplateBuildInfo {
-                        status: TemplateBuildStatus::Ready,
-                        started_at_unix_ms: None,
-                        finished_at_unix_ms: Some(now),
-                        error_reason: None,
-                    },
-                },
-                SnapshotPublishSource::Sandbox { source_sandbox_id } => {
-                    SnapshotSource::Sandbox { source_sandbox_id }
-                }
-            };
-            SnapshotRecord {
-                id,
-                alias,
-                source,
-                resources,
-                created_at_unix_ms: now,
-                updated_at_unix_ms: now,
-                committed: Some(committed),
-            }
-        };
-        self.write_record(&record).await?;
-        Ok(record)
-    }
-
-    /// Bind an alias to a snapshot id with best-effort conflict detection.
-    ///
-    /// Alibaba Cloud OSS does not support conditional write headers
-    /// (`If-None-Match`, `x-oss-forbid-overwrite`) on any S3-compatible
-    /// write path, so we cannot use a true atomic `put_if_not_exists`.
-    ///
-    /// Instead the algorithm is:
-    ///   1. Read the current alias target.
-    ///   2. If it already points to `id`, return success (idempotent).
-    ///   3. If it points to a live snapshot, return `AliasConflict`.
-    ///   4. If it points to a deleted snapshot, remove the stale alias.
-    ///   5. Write our binding unconditionally.
-    ///   6. Read back and verify we won the race.  If someone else wrote a
-    ///      different binding between steps 5 and 6, detect it here and
-    ///      either retry or report a conflict.
-    ///
-    /// The read-back verification (step 6) narrows the race window to the
-    /// interval between our write and the subsequent read.  This is weaker
-    /// than a true CAS but sufficient for the current deployment model
-    /// where concurrent publishes for the *same alias* are rare.
-    async fn bind_alias(&self, alias: &str, id: &SnapshotId) -> RepositoryResult<()> {
-        let key = validated_alias_key(alias)?;
-        let payload = serde_json::to_vec(id)
-            .map_err(|e| RepositoryError::backend("serialize alias binding", e))?;
-
-        for _attempt in 0..MAX_ALIAS_BIND_ATTEMPTS {
-            // Step 1-4: check current state and clean up stale bindings.
-            if let Some(existing_id) = self.load_alias_target(alias).await? {
-                if existing_id == *id {
-                    return Ok(());
-                }
-
-                let still_exists = self.snapshot_exists(&existing_id).await?;
-                if still_exists {
-                    return Err(RepositoryError::AliasConflict {
-                        alias: alias.to_string(),
-                        existing: existing_id,
-                        new_id: id.clone(),
-                    });
-                }
-
-                self.client
-                    .delete(&key)
-                    .await
-                    .map_err(|e| RepositoryError::backend("delete stale alias", e))?;
-            }
-
-            // Step 5: write our binding (unconditional — OSS does not
-            // support conditional headers on S3-compatible writes).
-            self.client
-                .put_bytes(&key, payload.clone(), OssUploadArtifact::Alias)
-                .await
-                .map_err(|e| RepositoryError::backend("write alias binding", e))?;
-
-            // Step 6: read back and verify we won.
-            match self.load_alias_target(alias).await? {
-                Some(bound_id) if bound_id == *id => return Ok(()),
-                Some(existing_id) => {
-                    // A concurrent writer overwrote our binding.
-                    let still_exists = self.snapshot_exists(&existing_id).await?;
-                    if still_exists {
-                        return Err(RepositoryError::AliasConflict {
-                            alias: alias.to_string(),
-                            existing: existing_id,
-                            new_id: id.clone(),
-                        });
-                    }
-
-                    // The concurrent binding points to a deleted snapshot;
-                    // clean it up and retry.
-                    self.client
-                        .delete(&key)
-                        .await
-                        .map_err(|e| RepositoryError::backend("delete stale alias", e))?;
-                }
-                None => {
-                    warn!(
-                        alias,
-                        snapshot_id = %id,
-                        "alias disappeared after bind attempt; retrying"
-                    );
-                    continue;
-                }
-            }
-        }
-
-        Err(RepositoryError::Backend {
-            message: format!(
-                "alias bind for '{alias}' exceeded {MAX_ALIAS_BIND_ATTEMPTS} attempts"
-            ),
-            source: None,
-        })
-    }
-
     async fn export_managed_disk_image(
         &self,
         image_config_path: &Path,
@@ -1115,80 +638,6 @@ impl OssRepository {
 
         Ok(drives)
     }
-
-    async fn load_alias_target(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        let key = validated_alias_key(alias)?;
-        let data = match self.client.get_bytes(&key).await {
-            Ok(data) => data,
-            Err(e) if OssClient::is_not_found_error(&e) => return Ok(None),
-            Err(e) => {
-                return Err(RepositoryError::backend(
-                    format!("read alias target '{alias}'"),
-                    e,
-                ));
-            }
-        };
-
-        let target = serde_json::from_slice::<SnapshotId>(&data)
-            .map_err(|e| RepositoryError::backend(format!("parse alias target '{alias}'"), e))?;
-        Ok(Some(target))
-    }
-
-    fn matches_record_filter(record: &SnapshotRecord, filter: &SnapshotListFilter) -> bool {
-        if let Some(alias_prefix) = filter.alias_prefix.as_deref() {
-            match record.alias.as_ref() {
-                Some(alias) if alias.to_string().starts_with(alias_prefix) => {}
-                _ => return false,
-            }
-        }
-
-        if let Some(ids) = filter.snapshot_ids.as_ref() {
-            if !ids.iter().any(|id| id == &record.id) {
-                return false;
-            }
-        }
-
-        if let Some(id_or_alias) = filter.snapshot_id_or_alias.as_deref() {
-            if record.id.to_string() != id_or_alias
-                && record
-                    .alias
-                    .as_ref()
-                    .is_none_or(|alias| alias.as_ref() != id_or_alias)
-            {
-                return false;
-            }
-        }
-
-        if let Some(source_sandbox_id) = filter.source_sandbox_id.as_deref() {
-            match &record.source {
-                SnapshotSource::Sandbox {
-                    source_sandbox_id: record_source_sandbox_id,
-                } if record_source_sandbox_id == source_sandbox_id => {}
-                _ => return false,
-            }
-        }
-
-        if let Some(sources) = filter.sources.as_ref() {
-            let source = match &record.source {
-                SnapshotSource::Template { .. } => SnapshotSourceKind::Template,
-                SnapshotSource::Sandbox { .. } => SnapshotSourceKind::Sandbox,
-            };
-            if !sources.contains(&source) {
-                return false;
-            }
-        }
-
-        if let Some(statuses) = filter.template_statuses.as_ref() {
-            let SnapshotSource::Template { build } = &record.source else {
-                return false;
-            };
-            if !statuses.contains(&build.status) {
-                return false;
-            };
-        }
-
-        true
-    }
 }
 
 impl OssRepository {
@@ -1420,211 +869,6 @@ fn validate_publish_manifest_image_configs(
 /// uploads the manifest, then attaches its descriptor to the already
 /// committed record. Best-effort throughout — any failure only means the
 /// snapshot resumes on-demand.
-async fn finish_startup_manifest(
-    client: std::sync::Arc<OssClient>,
-    id: SnapshotId,
-    recording: crate::snapshot::StartupRecording,
-    guard: crate::snapshot::startup_pack::StartupManifestTaskGuard,
-) {
-    finish_startup_manifest_with_abort(
-        client,
-        id,
-        recording,
-        guard,
-        crate::snapshot::startup_pack::startup_manifest_abort_requested,
-    )
-    .await;
-}
-
-async fn finish_startup_manifest_with_abort(
-    client: std::sync::Arc<OssClient>,
-    id: SnapshotId,
-    recording: crate::snapshot::StartupRecording,
-    _guard: crate::snapshot::startup_pack::StartupManifestTaskGuard,
-    abort_requested: impl Fn() -> bool + Send,
-) {
-    let crate::snapshot::StartupRecording {
-        mut trace,
-        keep_alive,
-    } = recording;
-    // Hold the captured artifacts alive until the manifest is uploaded, and
-    // count this continuation for the shutdown drain.
-    let _keep_alive = keep_alive;
-    if abort_requested() {
-        // The recorder may still be using captured VM/device artifacts.
-        let _ = trace.await;
-        return;
-    }
-    let trace_path = match tokio::select! {
-        joined = &mut trace => joined,
-        _ = crate::snapshot::startup_pack::startup_manifest_abort_notify() => {
-            let _ = trace.await;
-            return;
-        },
-    } {
-        Ok(Some(path)) => path,
-        Ok(None) => {
-            debug!(snapshot_id = %id, "startup manifest recording produced no trace");
-            return;
-        }
-        Err(error) => {
-            warn!(%error, snapshot_id = %id, "startup manifest recording join failed");
-            return;
-        }
-    };
-    if abort_requested() {
-        return;
-    }
-    let layout = OssSnapshotArtifactLayout::new(&id);
-    let Some(info) = build_and_upload_manifest(&client, &layout, &id, &trace_path).await else {
-        return;
-    };
-    if abort_requested() {
-        return;
-    }
-    attach_memory_startup_descriptor(&client, &id, info).await;
-}
-
-/// Best-effort: build the v4 startup manifest (exact-order prefix pages
-/// plus merged ranges) from the recorded first-touch trace and upload it.
-/// No layer bytes are read, packed, or uploaded — the resume side prefetches
-/// the listed positions through the normal read path.
-async fn build_and_upload_manifest(
-    client: &OssClient,
-    layout: &OssSnapshotArtifactLayout<'_>,
-    id: &SnapshotId,
-    trace_path: &std::path::Path,
-) -> Option<MemoryStartupPackInfo> {
-    let pack_config = &crate::cfg::ConfigManager::global_config()
-        .snapshot
-        .memory_startup_pack;
-    let build = async {
-        let (info, manifest_bytes) =
-            match crate::snapshot::startup_pack::build_startup_manifest(trace_path).await {
-                Ok(built) => built,
-                Err(error) => {
-                    warn!(%error, snapshot_id = %id, "startup manifest build failed (best-effort)");
-                    return None;
-                }
-            };
-        info!(snapshot_id = %id, manifest_bytes = manifest_bytes.len(), "startup manifest built");
-        if let Err(error) = client
-            .put_bytes(
-                &layout.artifact_key(MEMORY_STARTUP_PACK_ARTIFACT),
-                manifest_bytes,
-                OssUploadArtifact::StartupPack,
-            )
-            .await
-        {
-            warn!(
-                %error,
-                snapshot_id = %id,
-                "upload startup manifest failed (best-effort)"
-            );
-            return None;
-        }
-        Some(info)
-    }
-    .await;
-
-    if build.is_none() && pack_config.enabled {
-        delete_stale_startup_pack(client, layout, id).await;
-    }
-    build
-}
-
-/// Attach the uploaded manifest's descriptor to the committed record via a
-/// read-modify-write pass. Alibaba OSS has no conditional-write CAS on the
-/// S3-compatible path (see `bind_alias`), so a delete racing this update can
-/// resurrect the record — accepted with the same documented model as alias
-/// binding. A missing record (deleted meanwhile) aborts and drops the
-/// manifest instead of resurrecting anything.
-async fn attach_memory_startup_descriptor(
-    client: &OssClient,
-    id: &SnapshotId,
-    info: MemoryStartupPackInfo,
-) {
-    let layout = OssSnapshotArtifactLayout::new(id);
-    let cleanup_manifest = || async {
-        if let Err(error) = client
-            .delete(&layout.artifact_key(MEMORY_STARTUP_PACK_ARTIFACT))
-            .await
-        {
-            debug!(%error, snapshot_id = %id, "delete manifest after aborted attach failed");
-        }
-    };
-    let record_key = OssSnapshotArtifactLayout::record_key(id);
-    let bytes = match client.get_bytes(&record_key).await {
-        Ok(bytes) => bytes,
-        Err(error) if OssClient::is_not_found_error(&error) => {
-            debug!(
-                snapshot_id = %id,
-                "record deleted while attaching startup manifest; dropping the manifest"
-            );
-            cleanup_manifest().await;
-            return;
-        }
-        Err(error) => {
-            warn!(%error, snapshot_id = %id, "read record for startup manifest attach failed");
-            return;
-        }
-    };
-    let mut record: SnapshotRecord = match serde_json::from_slice(&bytes) {
-        Ok(record) => record,
-        Err(error) => {
-            warn!(%error, snapshot_id = %id, "parse record for startup manifest attach failed");
-            return;
-        }
-    };
-    let Some(committed) = record.committed.as_mut() else {
-        cleanup_manifest().await;
-        return;
-    };
-    if committed.memory_startup.is_some() {
-        return;
-    }
-    committed.memory_startup = Some(info);
-    record.updated_at_unix_ms = now_unix_ms();
-    let bytes = match serde_json::to_vec_pretty(&record) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            warn!(%error, snapshot_id = %id, "serialize record for startup manifest attach failed");
-            return;
-        }
-    };
-    if let Err(error) = client
-        .put_bytes(&record_key, bytes, OssUploadArtifact::CatalogRecord)
-        .await
-    {
-        warn!(
-            %error,
-            snapshot_id = %id,
-            "attach startup manifest descriptor failed (best-effort)"
-        );
-    }
-}
-
-/// Clean a possible stale startup artifact when the feature expected one
-/// (a publish retry after a crash with recording enabled); a manifest-less
-/// publish with the feature off must not pay an extra OSS request. A None
-/// `memory_startup` descriptor already prevents consumption either way.
-async fn delete_stale_startup_pack(
-    client: &OssClient,
-    layout: &OssSnapshotArtifactLayout<'_>,
-    id: &SnapshotId,
-) {
-    if let Err(error) = client
-        .delete(&layout.artifact_key(MEMORY_STARTUP_PACK_ARTIFACT))
-        .await
-    {
-        debug!(
-            %error,
-            snapshot_id = %id,
-            "delete stale startup pack failed (best-effort)"
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1658,55 +902,6 @@ mod tests {
                 ..Default::default()
             },
         )
-    }
-
-    #[tokio::test]
-    async fn abort_before_oss_continuation_keeps_capture_lease_until_trace_finishes() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct LeaseProbe(Arc<AtomicBool>);
-        impl Drop for LeaseProbe {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let lease_dropped = Arc::new(AtomicBool::new(false));
-        let trace_finished = Arc::new(AtomicBool::new(false));
-        let (release_trace, trace_release) = tokio::sync::oneshot::channel::<()>();
-        let trace_finished_in_task = Arc::clone(&trace_finished);
-        let recording = crate::snapshot::StartupRecording {
-            trace: tokio::spawn(async move {
-                trace_release.await.expect("release trace");
-                trace_finished_in_task.store(true, Ordering::SeqCst);
-                None
-            }),
-            keep_alive: Box::new(LeaseProbe(Arc::clone(&lease_dropped))),
-        };
-        let guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()
-            .expect("register continuation");
-        let repository = test_repository();
-        let mut continuation = tokio::spawn(finish_startup_manifest_with_abort(
-            Arc::clone(&repository.client),
-            SnapshotId::generate(),
-            recording,
-            guard,
-            || true,
-        ));
-
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), &mut continuation)
-                .await
-                .is_err(),
-            "aborted continuation must wait for the pending recorder"
-        );
-        assert!(!trace_finished.load(Ordering::SeqCst));
-        assert!(!lease_dropped.load(Ordering::SeqCst));
-
-        release_trace.send(()).expect("release pending trace");
-        continuation.await.expect("continuation");
-        assert!(trace_finished.load(Ordering::SeqCst));
-        assert!(lease_dropped.load(Ordering::SeqCst));
     }
 
     #[test]
