@@ -10,7 +10,9 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::layout::PosixFsSnapshotArtifactLayout;
-use crate::snapshot::repository::{SnapshotListFilter, VolumeRecordPage};
+use crate::snapshot::repository::{
+    DocumentKey, DocumentUpdate, SnapshotListFilter, VolumeRecordPage,
+};
 use crate::snapshot::{
     CommittedSnapshot, MemoryStartupPackInfo, RepositoryError, RepositoryResult, SnapshotAlias,
     SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
@@ -39,35 +41,32 @@ impl PosixFsCatalogStore {
         Self { root }
     }
 
-    pub(crate) fn write_build_logs(
-        &self,
-        id: &SnapshotId,
-        entries: &[crate::template::logs::BuildLogEntry],
-    ) -> RepositoryResult<()> {
-        self.write_json(
-            &PosixFsSnapshotArtifactLayout::build_log_path(&self.root, id),
-            &entries,
-        )
+    pub(crate) fn get_document(&self, key: &DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
+        let path = self.root.join(key.path());
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(RepositoryError::backend(
+                format!("read '{}'", path.display()),
+                error,
+            )),
+        }
     }
 
-    pub(crate) fn read_build_logs(
+    pub(crate) fn put_document(&self, key: &DocumentKey, bytes: &[u8]) -> RepositoryResult<()> {
+        self.write_bytes(&self.root.join(key.path()), bytes)
+    }
+
+    pub(crate) fn update_document(
         &self,
-        id: &SnapshotId,
-    ) -> RepositoryResult<Vec<crate::template::logs::BuildLogEntry>> {
-        let path = PosixFsSnapshotArtifactLayout::build_log_path(&self.root, id);
-        match self.read_json(&path) {
-            Ok(entries) => Ok(entries),
-            Err(RepositoryError::Backend {
-                source: Some(error),
-                ..
-            }) if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                Ok(Vec::new())
-            }
-            Err(error) => Err(error),
-        }
+        key: &DocumentKey,
+        update: DocumentUpdate,
+    ) -> RepositoryResult<Option<Vec<u8>>> {
+        let _guard =
+            self.acquire_catalog_lock(self.root.join(key.posix_lock_path()), "document")?;
+        let current = self.get_document(key)?;
+        self.put_document(key, &update(current.as_deref())?)?;
+        Ok(current)
     }
 
     fn layout(&self, snapshot_id: &SnapshotId) -> PosixFsSnapshotArtifactLayout {
@@ -279,9 +278,7 @@ impl PosixFsCatalogStore {
 
     pub(crate) fn delete_record(&self, id: &SnapshotId) -> RepositoryResult<()> {
         let _record_guard = self.acquire_record_lock(id)?;
-        self.remove_file_if_exists(&PosixFsSnapshotArtifactLayout::build_log_path(
-            &self.root, id,
-        ))?;
+        self.remove_file_if_exists(&self.root.join(DocumentKey::BuildLog(id.clone()).path()))?;
         let Some(record) = self.load_record_by_id_unlocked(id)? else {
             return Ok(());
         };
@@ -490,42 +487,6 @@ impl PosixFsCatalogStore {
         durable_record.reserved_by_sandbox_id = existing.reserved_by_sandbox_id;
         durable_record.read_only_mounts = existing.read_only_mounts;
         self.write_json(&path, &durable_record)
-    }
-
-    pub(crate) fn get_build_cache_state(
-        &self,
-    ) -> RepositoryResult<crate::snapshot::repository::BuildCacheState> {
-        let path = self.root.join("template-build/cache-head.json");
-        match fs::read(&path) {
-            Ok(bytes) => crate::snapshot::repository::BuildCacheState::decode(&bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
-            Err(error) => Err(RepositoryError::backend("read build cache head", error)),
-        }
-    }
-
-    pub(crate) fn replace_build_cache_head(
-        &self,
-        volume_id: &str,
-    ) -> RepositoryResult<Option<String>> {
-        self.update_build_cache(|state| state.replace(volume_id))
-    }
-
-    pub(crate) fn forget_retired_build_cache(&self, volume_id: &str) -> RepositoryResult<()> {
-        self.update_build_cache(|state| {
-            state.retired.remove(volume_id);
-            Ok(())
-        })
-    }
-
-    fn update_build_cache<T>(
-        &self,
-        update: impl FnOnce(&mut crate::snapshot::repository::BuildCacheState) -> RepositoryResult<T>,
-    ) -> RepositoryResult<T> {
-        let _guard = self.acquire_volume_alias_lock("aenv-buildkit-cache-head")?;
-        let mut state = self.get_build_cache_state()?;
-        let result = update(&mut state)?;
-        self.write_json(&self.root.join("template-build/cache-head.json"), &state)?;
-        Ok(result)
     }
 
     pub(crate) fn delete_volume(&self, volume_id: &str) -> RepositoryResult<()> {
@@ -863,14 +824,18 @@ impl PosixFsCatalogStore {
     where
         T: Serialize,
     {
+        let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+            RepositoryError::backend(format!("serialize json '{}'", path.display()), error)
+        })?;
+        self.write_bytes(path, &bytes)
+    }
+
+    fn write_bytes(&self, path: &Path, bytes: &[u8]) -> RepositoryResult<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 RepositoryError::backend(format!("create '{}'", parent.display()), error)
             })?;
         }
-        let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
-            RepositoryError::backend(format!("serialize json '{}'", path.display()), error)
-        })?;
         let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
             message: format!("resolve parent for '{}'", path.display()),
             source: None,
@@ -878,7 +843,7 @@ impl PosixFsCatalogStore {
         let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
             RepositoryError::backend(format!("create temp file in '{}'", parent.display()), error)
         })?;
-        temp.write_all(&bytes).map_err(|error| {
+        temp.write_all(bytes).map_err(|error| {
             RepositoryError::backend(
                 format!("write temp json '{}'", temp.path().display()),
                 error,
@@ -1268,60 +1233,6 @@ mod tests {
         TemplateBuildStatus,
     };
     use crate::volume::{VolumeMode, VolumeRecord};
-
-    #[test]
-    fn build_cache_head_updates_are_atomic_across_catalog_instances() {
-        let temp = TempDir::new().unwrap();
-        let root = temp.path().to_path_buf();
-        let store = PosixFsCatalogStore::new(root.clone());
-        assert_eq!(store.get_build_cache_state().unwrap().current, None);
-        let ids = (0..16)
-            .map(|i| format!("vol_cache_{i}"))
-            .collect::<Vec<_>>();
-        let mut previous = std::thread::scope(|scope| {
-            let jobs = ids
-                .iter()
-                .map(|id| {
-                    let root = root.clone();
-                    scope.spawn(move || {
-                        PosixFsCatalogStore::new(root)
-                            .replace_build_cache_head(id)
-                            .unwrap()
-                    })
-                })
-                .collect::<Vec<_>>();
-            jobs.into_iter()
-                .map(|job| job.join().unwrap())
-                .collect::<Vec<_>>()
-        });
-        assert_eq!(previous.iter().filter(|id| id.is_none()).count(), 1);
-        previous.push(
-            PosixFsCatalogStore::new(root.clone())
-                .get_build_cache_state()
-                .unwrap()
-                .current,
-        );
-        let mut observed = previous.into_iter().flatten().collect::<Vec<_>>();
-        observed.sort();
-        let mut expected = ids;
-        expected.sort();
-        assert_eq!(observed, expected);
-        let state = PosixFsCatalogStore::new(root)
-            .get_build_cache_state()
-            .unwrap();
-        assert_eq!(state.retired.len(), 15);
-        assert!(!state.retired.contains(state.current.as_ref().unwrap()));
-        for id in &state.retired {
-            assert!(store.replace_build_cache_head(id).is_err());
-            store.forget_retired_build_cache(id).unwrap();
-        }
-        assert!(store.get_build_cache_state().unwrap().retired.is_empty());
-        assert_eq!(
-            store.get_build_cache_state().unwrap().current,
-            state.current
-        );
-        assert!(store.replace_build_cache_head("../invalid").is_err());
-    }
 
     #[test]
     fn begin_and_commit_make_snapshot_visible() {

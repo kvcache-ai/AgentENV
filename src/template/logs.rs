@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -16,7 +17,10 @@ use tracing::{
 use tracing_subscriber::{layer::Context as LayerContext, registry::LookupSpan, Layer};
 
 use crate::logging::LogLevel;
-use crate::snapshot::{repository::SnapshotRepository, SnapshotId};
+use crate::snapshot::repository::{
+    DocumentKey, RepositoryError, RepositoryResult, SnapshotRepository,
+};
+use crate::snapshot::SnapshotId;
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 32_768;
@@ -35,6 +39,42 @@ pub struct BuildLogEntry {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub step: Option<String>,
+}
+
+/// Typed access to persisted build logs.
+#[async_trait]
+pub trait BuildLogStore {
+    /// Atomically replaces the complete build log file.
+    async fn write_build_logs(
+        &self,
+        id: &SnapshotId,
+        entries: Vec<BuildLogEntry>,
+    ) -> RepositoryResult<()>;
+
+    /// Reads the complete build log file, which is empty when absent.
+    async fn read_build_logs(&self, id: &SnapshotId) -> RepositoryResult<Vec<BuildLogEntry>>;
+}
+
+#[async_trait]
+impl<R: SnapshotRepository + ?Sized> BuildLogStore for R {
+    async fn write_build_logs(
+        &self,
+        id: &SnapshotId,
+        entries: Vec<BuildLogEntry>,
+    ) -> RepositoryResult<()> {
+        let bytes = serde_json::to_vec(&entries)
+            .map_err(|error| RepositoryError::backend("encode build logs", error))?;
+        self.put_document(DocumentKey::BuildLog(id.clone()), bytes)
+            .await
+    }
+
+    async fn read_build_logs(&self, id: &SnapshotId) -> RepositoryResult<Vec<BuildLogEntry>> {
+        let Some(bytes) = self.get_document(DocumentKey::BuildLog(id.clone())).await? else {
+            return Ok(Vec::new());
+        };
+        serde_json::from_slice(&bytes)
+            .map_err(|error| RepositoryError::backend("decode build logs", error))
+    }
 }
 
 #[derive(Default, Debug)]

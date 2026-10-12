@@ -15,7 +15,8 @@ use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 use crate::snapshot::repository::{
-    RepositoryError, RepositoryResult, SnapshotListFilter, VolumeRecordPage,
+    DocumentKey, DocumentUpdate, RepositoryError, RepositoryResult, SnapshotListFilter,
+    VolumeRecordPage,
 };
 use crate::snapshot::types::{
     CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
@@ -388,48 +389,25 @@ impl SnapshotRepository for PosixFsSnapshotRepository {
         .await
     }
 
-    async fn write_build_logs(
-        &self,
-        id: &SnapshotId,
-        entries: Vec<crate::template::logs::BuildLogEntry>,
-    ) -> RepositoryResult<()> {
-        let id = id.clone();
-        self.run_catalog("write build logs", move |store| {
-            store.write_build_logs(&id, &entries)
-        })
-        .await
-    }
-
-    async fn read_build_logs(
-        &self,
-        id: &SnapshotId,
-    ) -> RepositoryResult<Vec<crate::template::logs::BuildLogEntry>> {
-        let id = id.clone();
-        self.run_catalog("read build logs", move |store| store.read_build_logs(&id))
+    async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
+        self.run_catalog("read document", move |store| store.get_document(&key))
             .await
     }
 
-    async fn get_build_cache_state(
+    async fn put_document(&self, key: DocumentKey, bytes: Vec<u8>) -> RepositoryResult<()> {
+        self.run_catalog("write document", move |store| {
+            store.put_document(&key, &bytes)
+        })
+        .await
+    }
+
+    async fn update_document(
         &self,
-    ) -> RepositoryResult<crate::snapshot::repository::BuildCacheState> {
-        self.run_catalog("read build cache head", |store| {
-            store.get_build_cache_state()
-        })
-        .await
-    }
-
-    async fn replace_build_cache_head(&self, volume_id: &str) -> RepositoryResult<Option<String>> {
-        let volume_id = volume_id.to_owned();
-        self.run_catalog("replace build cache head", move |store| {
-            store.replace_build_cache_head(&volume_id)
-        })
-        .await
-    }
-
-    async fn forget_retired_build_cache(&self, volume_id: &str) -> RepositoryResult<()> {
-        let volume_id = volume_id.to_owned();
-        self.run_catalog("retire build cache seed", move |store| {
-            store.forget_retired_build_cache(&volume_id)
+        key: DocumentKey,
+        update: DocumentUpdate,
+    ) -> RepositoryResult<Option<Vec<u8>>> {
+        self.run_catalog("update document", move |store| {
+            store.update_document(&key, update)
         })
         .await
     }

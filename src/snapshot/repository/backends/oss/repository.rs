@@ -25,7 +25,7 @@ use crate::snapshot::repository::backends::common::{
 };
 use crate::snapshot::repository::interfaces::{SnapshotPublication, SnapshotRepository};
 use crate::snapshot::repository::{
-    BuildCacheState, RepositoryError, RepositoryResult, VolumeRecordPage,
+    DocumentKey, DocumentUpdate, RepositoryError, RepositoryResult, VolumeRecordPage,
 };
 use crate::snapshot::{
     CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer, MemoryStartupPackInfo,
@@ -83,43 +83,6 @@ impl OssSnapshotRepository {
             .exists(&OssSnapshotArtifactLayout::record_key(id))
             .await
             .map_err(|e| RepositoryError::backend(format!("check snapshot record '{id}'"), e))
-    }
-
-    async fn update_build_cache<T>(
-        &self,
-        update: impl Fn(&mut BuildCacheState) -> RepositoryResult<T>,
-    ) -> RepositoryResult<T> {
-        let key = "template-build/cache-head.json";
-        for _ in 0..MAX_VOLUME_CAS_ATTEMPTS {
-            let (mut state, etag) = match self.client.get_bytes_with_etag(key).await {
-                Ok((bytes, Some(etag))) => (BuildCacheState::decode(&bytes)?, Some(etag)),
-                Ok((_, None)) => {
-                    return Err(RepositoryError::InvalidRequest {
-                        reason: "build cache publication requires object storage ETags".to_owned(),
-                    })
-                }
-                Err(error) if OssClient::is_not_found_error(&error) => {
-                    (BuildCacheState::default(), None)
-                }
-                Err(error) => {
-                    return Err(RepositoryError::backend("read build cache state", error))
-                }
-            };
-            let result = update(&mut state)?;
-            let bytes = serde_json::to_vec(&state)
-                .map_err(|error| RepositoryError::backend("encode build cache state", error))?;
-            if self
-                .client
-                .put_bytes_conditionally(key, bytes, etag.as_deref())
-                .await
-                .map_err(|error| RepositoryError::backend("update build cache state", error))?
-            {
-                return Ok(result);
-            }
-        }
-        Err(RepositoryError::InvalidRequest {
-            reason: "build cache state changed too often during publication".to_owned(),
-        })
     }
 }
 
@@ -539,7 +502,7 @@ impl SnapshotRepository for OssSnapshotRepository {
             None => {
                 if let Ok(id) = SnapshotId::parse(id_or_alias) {
                     self.client
-                        .delete(&OssSnapshotArtifactLayout::build_log_key(&id))
+                        .delete(&DocumentKey::BuildLog(id).path())
                         .await
                         .map_err(|error| RepositoryError::backend("delete build logs", error))?;
                 }
@@ -563,7 +526,7 @@ impl SnapshotRepository for OssSnapshotRepository {
         }
 
         self.client
-            .delete(&OssSnapshotArtifactLayout::build_log_key(id))
+            .delete(&DocumentKey::BuildLog(id.clone()).path())
             .await
             .map_err(|error| RepositoryError::backend("delete build logs", error))?;
 
@@ -802,60 +765,57 @@ impl SnapshotRepository for OssSnapshotRepository {
         })
     }
 
-    async fn write_build_logs(
-        &self,
-        id: &SnapshotId,
-        entries: Vec<crate::template::logs::BuildLogEntry>,
-    ) -> RepositoryResult<()> {
-        let bytes = serde_json::to_vec(&entries)
-            .map_err(|error| RepositoryError::backend("encode build logs", error))?;
-        self.client
-            .put_bytes(
-                &OssSnapshotArtifactLayout::build_log_key(id),
-                bytes,
-                OssUploadArtifact::BuildLog,
-            )
-            .await
-            .map_err(|error| RepositoryError::backend("write build logs", error))
-    }
-
-    async fn read_build_logs(
-        &self,
-        id: &SnapshotId,
-    ) -> RepositoryResult<Vec<crate::template::logs::BuildLogEntry>> {
-        let key = OssSnapshotArtifactLayout::build_log_key(id);
-        let bytes = match self.client.get_bytes(&key).await {
-            Ok(bytes) => bytes,
-            Err(error) if OssClient::is_not_found_error(&error) => return Ok(Vec::new()),
-            Err(error) => return Err(RepositoryError::backend("read build logs", error)),
-        };
-        serde_json::from_slice(&bytes)
-            .map_err(|error| RepositoryError::backend("decode build logs", error))
-    }
-
-    async fn get_build_cache_state(&self) -> RepositoryResult<BuildCacheState> {
-        match self
-            .client
-            .get_bytes("template-build/cache-head.json")
-            .await
-        {
-            Ok(bytes) => BuildCacheState::decode(&bytes),
-            Err(error) if OssClient::is_not_found_error(&error) => Ok(BuildCacheState::default()),
-            Err(error) => Err(RepositoryError::backend("read build cache head", error)),
+    async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
+        let key = key.path();
+        match self.client.get_bytes(&key).await {
+            Ok(bytes) => Ok(Some(bytes.to_vec())),
+            Err(error) if OssClient::is_not_found_error(&error) => Ok(None),
+            Err(error) => Err(RepositoryError::backend(format!("read '{key}'"), error)),
         }
     }
 
-    async fn replace_build_cache_head(&self, volume_id: &str) -> RepositoryResult<Option<String>> {
-        self.update_build_cache(|state| state.replace(volume_id))
+    async fn put_document(&self, key: DocumentKey, bytes: Vec<u8>) -> RepositoryResult<()> {
+        let artifact = match key {
+            DocumentKey::BuildLog(_) => OssUploadArtifact::BuildLog,
+            _ => OssUploadArtifact::CatalogRecord,
+        };
+        let key = key.path();
+        self.client
+            .put_bytes(&key, bytes, artifact)
             .await
+            .map_err(|error| RepositoryError::backend(format!("write '{key}'"), error))
     }
 
-    async fn forget_retired_build_cache(&self, volume_id: &str) -> RepositoryResult<()> {
-        self.update_build_cache(|state| {
-            state.retired.remove(volume_id);
-            Ok(())
+    async fn update_document(
+        &self,
+        key: DocumentKey,
+        update: DocumentUpdate,
+    ) -> RepositoryResult<Option<Vec<u8>>> {
+        let key = key.path();
+        for _ in 0..MAX_VOLUME_CAS_ATTEMPTS {
+            let (current, etag) = match self.client.get_bytes_with_etag(&key).await {
+                Ok((bytes, Some(etag))) => (Some(bytes.to_vec()), Some(etag)),
+                Ok((_, None)) => {
+                    return Err(RepositoryError::InvalidRequest {
+                        reason: format!("updating '{key}' requires object storage ETags"),
+                    })
+                }
+                Err(error) if OssClient::is_not_found_error(&error) => (None, None),
+                Err(error) => return Err(RepositoryError::backend(format!("read '{key}'"), error)),
+            };
+            let bytes = update(current.as_deref())?;
+            if self
+                .client
+                .put_bytes_conditionally(&key, bytes, etag.as_deref())
+                .await
+                .map_err(|error| RepositoryError::backend(format!("update '{key}'"), error))?
+            {
+                return Ok(current);
+            }
+        }
+        Err(RepositoryError::InvalidRequest {
+            reason: format!("'{key}' changed too often during update"),
         })
-        .await
     }
 
     async fn publish_volume_backing(

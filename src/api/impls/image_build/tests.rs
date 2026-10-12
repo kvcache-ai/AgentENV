@@ -687,7 +687,7 @@ async fn saturated_builder_api_leaves_template_waiting_without_allocating() -> R
 mod build_logs {
     use super::*;
     use crate::logging::LogLevel;
-    use crate::template::logs::BuildLogs;
+    use crate::template::logs::{BuildLogStore, BuildLogs};
     use axum::body::{to_bytes, Body};
     use http::{Request, StatusCode};
     use serde_json::{json, Value};

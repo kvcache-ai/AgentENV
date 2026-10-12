@@ -24,7 +24,8 @@ use crate::snapshot::{
     TemplateBuildErrorReason, TemplateBuildStatus,
 };
 use crate::template::{
-    logs::BuildLogEntry, TemplateBuildError, TemplateBuildFailure, TemplatePipelineError,
+    logs::{BuildLogEntry, BuildLogStore},
+    TemplateBuildError, TemplateBuildFailure, TemplatePipelineError,
 };
 use crate::types::ImageConfigs;
 

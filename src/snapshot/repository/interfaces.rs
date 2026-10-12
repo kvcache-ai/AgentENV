@@ -4,6 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::errors::{RepositoryError, RepositoryResult};
+use super::DocumentKey;
 use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::types::{
     RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSourceKind,
@@ -50,6 +51,10 @@ pub struct VolumeRecordPage {
     /// after that record in the repository's stable shard-and-ID order.
     pub next_volume_id: Option<String>,
 }
+
+/// Computes a document's new bytes from its current bytes, if any. Backends
+/// may call it again when a concurrent writer wins.
+pub type DocumentUpdate = Box<dyn Fn(Option<&[u8]>) -> RepositoryResult<Vec<u8>> + Send + Sync>;
 
 fn unsupported<T>(feature: &str) -> RepositoryResult<T> {
     Err(RepositoryError::Unsupported {
@@ -217,21 +222,24 @@ pub trait SnapshotRepository: Send + Sync {
         reason: TemplateBuildErrorReason,
     ) -> RepositoryResult<()>;
 
-    /// Atomically replaces the complete build log file.
-    async fn write_build_logs(
-        &self,
-        _id: &SnapshotId,
-        _entries: Vec<crate::template::logs::BuildLogEntry>,
-    ) -> RepositoryResult<()> {
-        unsupported("template build logs")
+    /// Reads one shared document; `None` when absent.
+    async fn get_document(&self, _key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
+        unsupported("repository documents")
     }
 
-    /// Reads the complete build log file; supporting backends return an empty list when absent.
-    async fn read_build_logs(
+    /// Atomically replaces one shared document.
+    async fn put_document(&self, _key: DocumentKey, _bytes: Vec<u8>) -> RepositoryResult<()> {
+        unsupported("repository documents")
+    }
+
+    /// Atomically rewrites one shared document against concurrent writers on
+    /// every node, returning the document the update replaced.
+    async fn update_document(
         &self,
-        _id: &SnapshotId,
-    ) -> RepositoryResult<Vec<crate::template::logs::BuildLogEntry>> {
-        unsupported("template build logs")
+        _key: DocumentKey,
+        _update: DocumentUpdate,
+    ) -> RepositoryResult<Option<Vec<u8>>> {
+        unsupported("repository documents")
     }
 
     /// Resolves a volume by ID first, then by its unique name.
@@ -259,25 +267,6 @@ pub trait SnapshotRepository: Send + Sync {
     /// Updates one existing durable volume record.
     async fn put_volume(&self, _record: crate::volume::VolumeRecord) -> RepositoryResult<()> {
         unsupported("volume catalog")
-    }
-
-    /// Shared immutable cache seed for Dockerfile builds, independent of node and template.
-    async fn get_build_cache_head(&self) -> RepositoryResult<Option<String>> {
-        Ok(self.get_build_cache_state().await?.current)
-    }
-
-    async fn get_build_cache_state(&self) -> RepositoryResult<super::BuildCacheState> {
-        unsupported("template build cache")
-    }
-
-    /// Atomically publishes a fresh seed and records the previous seed for retirement.
-    async fn replace_build_cache_head(&self, _volume_id: &str) -> RepositoryResult<Option<String>> {
-        unsupported("template build cache")
-    }
-
-    /// Acknowledges retirement after the volume has been deleted.
-    async fn forget_retired_build_cache(&self, _volume_id: &str) -> RepositoryResult<()> {
-        unsupported("template build cache")
     }
 
     /// Publishes the current node-local OverlayBD backing and returns logical

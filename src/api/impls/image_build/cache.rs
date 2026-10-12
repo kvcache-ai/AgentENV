@@ -4,6 +4,7 @@ use tracing::{info, warn};
 use super::{ApiImpl, BuildJournal};
 use crate::{
     cfg::ConfigManager,
+    snapshot::repository::BuildCacheStore,
     volume::{VolumeError, VolumeMode, VolumeRecord, VolumeStatus},
 };
 
