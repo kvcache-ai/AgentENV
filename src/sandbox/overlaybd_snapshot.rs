@@ -1,4 +1,4 @@
-//! Overlaybd-specific snapshot helpers for Firecracker sandboxes.
+//! Backend-neutral OverlayBD snapshot helpers.
 //!
 //! Organizes independent snapshot layers and preserves their local files.
 //! The caller supplies the directories whose artifacts need to be retained.
