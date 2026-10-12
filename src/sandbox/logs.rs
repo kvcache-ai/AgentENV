@@ -25,7 +25,7 @@ pub(crate) fn log_query_window(
 ) -> (DateTime<Utc>, DateTime<Utc>) {
     let now = Utc::now();
     let oldest = now - Duration::days(7);
-    let (mut start, mut end) = match cursor {
+    let (mut start, end) = match cursor {
         Some(ms) => {
             // i64 milliseconds can exceed chrono's representable range.
             let cursor = DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::<Utc>::MAX_UTC);
@@ -34,11 +34,15 @@ pub(crate) fn log_query_window(
                     cursor
                         .checked_sub_signed(Duration::days(7))
                         .unwrap_or(oldest),
-                    cursor,
+                    cursor
+                        .checked_sub_signed(Duration::nanoseconds(1))
+                        .unwrap_or(cursor),
                 )
             } else {
                 (
-                    cursor,
+                    cursor
+                        .checked_add_signed(Duration::milliseconds(1))
+                        .unwrap_or(cursor),
                     cursor
                         .checked_add_signed(Duration::days(7))
                         .unwrap_or(DateTime::<Utc>::MAX_UTC),
@@ -48,8 +52,6 @@ pub(crate) fn log_query_window(
         None => (oldest, now),
     };
     start = start.max(oldest);
-    end = end.max(oldest);
-    start = start.min(end);
     (start, end)
 }
 
@@ -300,16 +302,91 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_logs_cursor_is_inclusive_and_handles_int64_max() {
-        let cursor = DateTime::from_timestamp_millis(20).unwrap();
-        let mut page = LogPage::new(cursor, cursor, 10, true, None, None);
-        for ms in [19, 20, 20, 21] {
-            page.push(entry(ms, LogLevel::Info, "same"));
+    fn sandbox_logs_pagination_excludes_cursor_and_terminates() {
+        let base = Utc::now().timestamp_millis() - 1000;
+        let entries: Vec<_> = (0..10)
+            .map(|offset| entry(base + offset * 10, LogLevel::Info, "same"))
+            .collect();
+        for backward in [false, true] {
+            for limit in [1, 4, 20] {
+                let mut cursor = None;
+                let mut collected = Vec::new();
+                let mut terminated = false;
+                for _ in 0..=entries.len() {
+                    let (start, end) = log_query_window(cursor, backward);
+                    let mut page = LogPage::new(start, end, limit, backward, None, None);
+                    for entry in &entries {
+                        page.push(entry.clone());
+                    }
+                    let result = page.finish();
+                    assert!(result.len() <= limit);
+                    if result.is_empty() {
+                        terminated = true;
+                        break;
+                    }
+                    let next = result.last().unwrap().timestamp.timestamp_millis();
+                    if let Some(previous) = cursor {
+                        assert!(if backward {
+                            next < previous
+                        } else {
+                            next > previous
+                        });
+                    }
+                    cursor = Some(next);
+                    collected.extend(result);
+                }
+                assert!(terminated, "pagination must reach an empty page");
+                let mut expected = entries.clone();
+                expected.sort_by(|a, b| {
+                    if backward {
+                        b.timestamp.cmp(&a.timestamp)
+                    } else {
+                        a.timestamp.cmp(&b.timestamp)
+                    }
+                });
+                assert_eq!(collected, expected);
+            }
         }
-        assert_eq!(page.finish().len(), 2);
+    }
+
+    #[test]
+    fn sandbox_logs_hard_limit_can_skip_remaining_boundary_millisecond() {
+        let base = Utc::now().timestamp_millis() - 1000;
+        let mut entries = vec![entry(base - 1, LogLevel::Info, "before")];
+        for micros in [0, 0, 100, 500, 999] {
+            let mut log = entry(base, LogLevel::Info, "same");
+            log.timestamp += Duration::microseconds(micros);
+            entries.push(log);
+        }
+        entries.push(entry(base + 1, LogLevel::Info, "after"));
+        for backward in [false, true] {
+            let (start, end) = log_query_window(None, backward);
+            let mut page = LogPage::new(start, end, 3, backward, None, None);
+            for log in &entries {
+                page.push(log.clone());
+            }
+            let first = page.finish();
+            assert_eq!(first.len(), 3);
+            let cursor = first.last().unwrap().timestamp.timestamp_millis();
+            assert_eq!(cursor, base);
+            let (start, end) = log_query_window(Some(cursor), backward);
+            let mut page = LogPage::new(start, end, 3, backward, None, None);
+            for log in &entries {
+                page.push(log.clone());
+            }
+            let second = page.finish();
+            assert_eq!(second.len(), 1);
+            assert_eq!(second[0].message, if backward { "before" } else { "after" });
+            // The three unreturned logs in the cursor millisecond are skipped.
+            assert_eq!(first.len() + second.len(), entries.len() - 3);
+        }
+    }
+
+    #[test]
+    fn sandbox_logs_cursor_handles_int64_max_and_expired_window() {
         let future = log_query_window(Some(i64::MAX), false);
         assert!(future.0 <= future.1);
         let old = log_query_window(Some(0), true);
-        assert_eq!(old.0, old.1);
+        assert!(old.0 > old.1);
     }
 }
