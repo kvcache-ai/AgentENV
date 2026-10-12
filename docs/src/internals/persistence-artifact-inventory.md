@@ -14,7 +14,7 @@ This document lists AgentENV artifacts that can remain on disk or in object stor
 | `firecracker.serial_dir` | `$AENV_HOME/logs/serial` | `src/sandbox/firecracker/*` | Durable Firecracker stdout/stderr root, grouped by sandbox ID. An explicit `[firecracker].serial_dir` overrides the root. |
 | `managed_snapshot_root` | `<firecracker-work-base>/managed-snapshots` | `src/sandbox/firecracker/*` | In-process live snapshot artifact root used to keep captured snapshots alive until publish or drop. |
 | `persisted_sandbox_store_path` | `$AENV_HOME/persisted-sandboxes` | `src/orchestrator/persistence/*` | Durable paused sandbox records and artifacts. |
-| `snapshot_store` | `$AENV_HOME/snapshot-store` | `src/snapshot/repository/*` | Durable committed snapshot repository root. The configured backend uses `<snapshot_store>/repository`. Relative explicit paths are resolved against the config file directory. |
+| `snapshot_store` | `$AENV_HOME/snapshot-store` | `src/repository/*` | Durable committed snapshot repository root. The configured backend uses `<snapshot_store>/repository`. Relative explicit paths are resolved against the config file directory. |
 | `snapshot.local_cache_path` | `$AENV_HOME/snapshot-local-cache` | `src/snapshot/artifact_cache.rs`, runtime resolvers | Node-local cache for materialized runtime artifacts. Relative explicit paths are resolved against the config file directory. |
 | `image.cache.root_dir` | `$AENV_HOME/image-cache` | `src/image/*`, overlaybd runtime | Node-local image cache root. Contains `configs/`, `indexes/`, `commits/`, and `remote-blocks/`. The offline C++ tools own isolated sibling cache roots: `convert-blocks/` (`overlaybd-apply`) and `resize-blocks/` (`overlaybd-resize`). |
 | `p2p.store_dir` | `$AENV_HOME/p2p/store` | `src/p2p/*`, `src/cfg.rs` | Local store for P2P artifact transport backends. Relative explicit paths are resolved against the config file directory. |
@@ -122,7 +122,7 @@ Owned by `src/image/*`.
 
 ## Snapshot Repository
 
-Owned by `src/snapshot/repository/*` and `src/snapshot/types/*`.
+Owned by `src/repository/*` and `src/snapshot/types/*`.
 
 | Artifact | Location | Contents | Purpose | Lifecycle | Rebuildable |
 | --- | --- | --- | --- | --- | --- |
@@ -206,6 +206,6 @@ Owned by `storage/overlaybd/*`.
 - Snapshot repository artifacts are durable user-visible state. Do not delete them from node-local GC code.
 - Paused sandbox artifacts are durable only for the paused sandbox that owns them. Do not treat them as committed snapshots.
 - Runtime `image.json` files under snapshot local cache or ublk runtime dirs are derived artifacts. They should be rebuildable from committed metadata or source image configs.
-- Node-local `image-cache` artifacts are disposable cache, but content-addressed commits may be expensive to regenerate. The metadata-backed GC only reclaims commits no longer rooted by on-disk source configs, held by image-cache leases, or referenced by the in-process running set. Committed snapshots are durable SnapshotRepository state and do not pin ImageCache commits. See `[image.cache.gc]` in the configuration reference for scheduling.
+- Node-local `image-cache` artifacts are disposable cache, but content-addressed commits may be expensive to regenerate. The metadata-backed GC only reclaims commits no longer rooted by on-disk source configs, held by image-cache leases, or referenced by the in-process running set. Committed snapshots are durable repository state and do not pin ImageCache commits. See `[image.cache.gc]` in the configuration reference for scheduling.
 - P2P store contents are node-local and optional. Unpublish removes the local catalog entry and related blobs; clearing the store only affects peer-to-peer sharing and may require republishing or refetching artifacts.
 - Logs and dependency downloads are operational artifacts. They are not part of sandbox or snapshot correctness, but may require separate retention policy outside image-cache GC.

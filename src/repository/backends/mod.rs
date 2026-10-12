@@ -12,27 +12,22 @@ use crate::cfg::{
 };
 use crate::image::cache::local_image_services_from_app_config;
 use crate::p2p::P2pTransport;
+use crate::repository::interfaces::{Repository, SnapshotRuntimeResolver};
 use crate::snapshot::artifact_cache::LocalArtifactCache;
-use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 pub use oss::OssBackend;
 pub use posixfs::{PosixFsBackend, PosixFsBackendConfig};
 
 /// Builds the configured snapshot repository backend and its matching runtime resolver from the global configuration.
 pub fn build_snapshot_backend(
     p2p_transport: Option<Arc<dyn P2pTransport>>,
-) -> Result<(
-    Arc<dyn SnapshotRepository>,
-    Arc<dyn SnapshotRuntimeResolver>,
-)> {
+) -> Result<(Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>)> {
     build_snapshot_backend_from_config(ConfigManager::global_config(), p2p_transport)
 }
 
 /// Internal builders share the configured durable backend, but have a separate
 /// catalog so they cannot be listed or deleted through the public template API.
-pub(crate) fn build_builder_snapshot_backend() -> Result<(
-    Arc<dyn SnapshotRepository>,
-    Arc<dyn SnapshotRuntimeResolver>,
-)> {
+pub(crate) fn build_builder_snapshot_backend(
+) -> Result<(Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>)> {
     let config = builder_snapshot_config(ConfigManager::global_config());
     build_snapshot_backend_from_config(&config, None)
 }
@@ -58,10 +53,7 @@ fn builder_snapshot_config(config: &AppConfig) -> AppConfig {
 fn build_snapshot_backend_from_config(
     config: &AppConfig,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
-) -> Result<(
-    Arc<dyn SnapshotRepository>,
-    Arc<dyn SnapshotRuntimeResolver>,
-)> {
+) -> Result<(Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>)> {
     let shared_cache_root = config.snapshot.local_cache_path.clone();
     let overlaybd_layers = local_image_services_from_app_config(config).overlaybd_layers;
     match config.snapshot.repository_backend {

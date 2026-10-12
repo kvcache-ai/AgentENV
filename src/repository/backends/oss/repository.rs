@@ -13,26 +13,27 @@ use tracing::{debug, info, warn};
 use super::client::{OssClient, OssUploadArtifact};
 use super::layout::OssSnapshotArtifactLayout;
 use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
-use crate::sandbox::{OverlaybdCompactOutput, SandboxSnapshotManifest};
-use crate::snapshot::repository::backends::common::acr::{
+use crate::repository::backends::common::acr::{
     AcrDiskImageExporter, DiskImageExportOutcome, DiskImageSubject, SnapshotOciConfigInput,
 };
-use crate::snapshot::repository::backends::common::recontainerize::{
+use crate::repository::backends::common::recontainerize::{
     prepare_layer_upload, PreparedLayerUpload,
 };
-use crate::snapshot::repository::backends::common::{
+use crate::repository::backends::common::{
     materialize_volume_image_config, write_dense_overlaybd_layer_to_file,
 };
-use crate::snapshot::repository::interfaces::{SnapshotPublication, SnapshotRepository};
-use crate::snapshot::repository::{
+use crate::repository::interfaces::{Repository, SnapshotPublication};
+use crate::repository::SnapshotListFilter;
+use crate::repository::{
     DocumentKey, DocumentUpdate, RepositoryError, RepositoryResult, VolumeRecordPage,
 };
+use crate::sandbox::{OverlaybdCompactOutput, SandboxSnapshotManifest};
 use crate::snapshot::{
     CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer, MemoryStartupPackInfo,
     OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotAlias, SnapshotId,
-    SnapshotListFilter, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
-    SnapshotSource, SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo,
-    TemplateBuildStatus, MEMORY_STARTUP_PACK_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
+    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
+    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
+    MEMORY_STARTUP_PACK_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord, VolumeStatus};
 
@@ -48,7 +49,7 @@ use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord, VolumeS
 /// artifacts/{id}/vm_state.bin
 /// managed-layers/{digest}
 /// ```
-pub(crate) struct OssSnapshotRepository {
+pub(crate) struct OssRepository {
     client: Arc<OssClient>,
     snapshot_image_storage: SnapshotImageStoragePolicy,
     acr_exporter: AcrDiskImageExporter,
@@ -58,7 +59,7 @@ pub(crate) struct OssSnapshotRepository {
 const MAX_ALIAS_BIND_ATTEMPTS: usize = 5;
 const MAX_VOLUME_CAS_ATTEMPTS: usize = 5;
 
-impl OssSnapshotRepository {
+impl OssRepository {
     pub(crate) fn new(
         client: Arc<OssClient>,
         snapshot_image_storage: SnapshotImageStoragePolicy,
@@ -194,10 +195,10 @@ fn fallback_to_object_storage_would_mix_sources(
     }))
 }
 
-// ── SnapshotRepository impl ────────────────────────────────────────────
+// ── Repository impl ────────────────────────────────────────────
 
 #[async_trait]
-impl SnapshotRepository for OssSnapshotRepository {
+impl Repository for OssRepository {
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         if !matches!(record.source, SnapshotSource::Template { .. }) {
             return Err(RepositoryError::InvalidRequest {
@@ -1008,7 +1009,7 @@ impl SnapshotRepository for OssSnapshotRepository {
 
 // ── private helpers ────────────────────────────────────────────────────
 
-impl OssSnapshotRepository {
+impl OssRepository {
     async fn claim_volume_alias(&self, name: &str, volume_id: &str) -> RepositoryResult<bool> {
         let key = OssSnapshotArtifactLayout::volume_alias_key(name);
         let bytes = serde_json::to_vec(volume_id)
@@ -1685,7 +1686,7 @@ impl OssSnapshotRepository {
     }
 }
 
-impl OssSnapshotRepository {
+impl OssRepository {
     async fn import_descriptorless_rootfs_layer(
         &self,
         source: &Path,
@@ -2134,7 +2135,7 @@ mod tests {
         .expect("write image config");
     }
 
-    fn test_repository() -> OssSnapshotRepository {
+    fn test_repository() -> OssRepository {
         let client = OssClient::new(
             "bucket".to_string(),
             "https://oss.example.com".to_string(),
@@ -2144,7 +2145,7 @@ mod tests {
             None,
         )
         .expect("oss client");
-        OssSnapshotRepository::new(
+        OssRepository::new(
             Arc::new(client),
             SnapshotImageStoragePolicy::ObjectStorage,
             &SnapshotPublishCompressionConfig {
@@ -2219,7 +2220,7 @@ mod tests {
             )
         };
 
-        let disabled = OssSnapshotRepository::new(
+        let disabled = OssRepository::new(
             client(),
             SnapshotImageStoragePolicy::ObjectStorage,
             &SnapshotPublishCompressionConfig {
@@ -2229,7 +2230,7 @@ mod tests {
         );
         assert_eq!(disabled.publish_compression, OverlaybdCompactOutput::Raw);
 
-        let enabled = OssSnapshotRepository::new(
+        let enabled = OssRepository::new(
             client(),
             SnapshotImageStoragePolicy::ObjectStorage,
             &SnapshotPublishCompressionConfig {

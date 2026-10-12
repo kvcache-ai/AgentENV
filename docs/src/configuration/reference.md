@@ -164,7 +164,7 @@ Background hard-commit garbage collection for the image cache. When enabled,
 each pass reconciles metadata from the on-disk source configs and then deletes
 hard-commit objects that are no longer rooted by source configs, held by
 image-cache leases, or referenced by the in-process running set. Committed
-snapshots are durable SnapshotRepository state and do not pin ImageCache
+snapshots are durable repository state and do not pin ImageCache
 commits. With `capacity_gb` set, GC first evicts least-recently-used source
 configs over the high watermark so hard-commit GC can reclaim what they unrooted.
 

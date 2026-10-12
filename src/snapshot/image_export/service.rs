@@ -14,12 +14,12 @@ use super::target::{
 };
 use crate::cfg::{ConfigManager, SnapshotImageStoragePolicy, SnapshotRepositoryBackendKind};
 use crate::digest;
-use crate::snapshot::repository::backends::common::acr::{
+use crate::repository::backends::common::acr::{
     build_oci_image_manifest, host_architecture_for_oci, snapshot_oci_config_blob, OciDescriptor,
     SnapshotOciConfigInput, SourceRegistryRepository,
 };
-use crate::snapshot::repository::backends::{oss, posixfs};
-use crate::snapshot::repository::{RepositoryError, RepositoryResult, SnapshotRepository};
+use crate::repository::backends::{oss, posixfs};
+use crate::repository::{Repository, RepositoryError, RepositoryResult};
 use crate::snapshot::{CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotId};
 
 /// Outcome of one snapshot image export.
@@ -47,7 +47,7 @@ fn layer_digest_size(layer: &OverlaybdLayerRef) -> (&str, u64) {
 
 /// Orchestrates committed-snapshot rootfs image export.
 pub struct SnapshotImageService {
-    repository: Arc<dyn SnapshotRepository>,
+    repository: Arc<dyn Repository>,
     layers: ManagedLayerLocator,
     regctl: Regctl,
 }
@@ -57,14 +57,14 @@ impl SnapshotImageService {
     /// node-runtime resolver, artifact cache, layer store, and P2P machinery.
     pub fn from_global_config(regctl_binary: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let config = ConfigManager::global_config();
-        let (repository, layers): (Arc<dyn SnapshotRepository>, ManagedLayerLocator) =
+        let (repository, layers): (Arc<dyn Repository>, ManagedLayerLocator) =
             match config.snapshot.repository_backend {
                 SnapshotRepositoryBackendKind::PosixFs => {
                     let posix = config.backend.posix_fs.as_ref().context(
                         "backend.posix_fs config is required when repository_backend = posix_fs",
                     )?;
                     let root = posix.snapshot_store.join("repository");
-                    let repository = Arc::new(posixfs::PosixFsSnapshotRepository::new(
+                    let repository = Arc::new(posixfs::PosixFsRepository::new(
                         Arc::new(posixfs::PosixFsCatalogStore::new(root.clone())),
                         Arc::new(posixfs::PosixFsArtifactStore::new(root.clone())),
                     ));
@@ -90,7 +90,7 @@ impl SnapshotImageService {
                         config.credential_source(),
                         config.addressing_style(),
                     )?);
-                    let repository = Arc::new(oss::OssSnapshotRepository::new(
+                    let repository = Arc::new(oss::OssRepository::new(
                         Arc::clone(&client),
                         config.snapshot_image_storage(),
                         publish_compression,
@@ -393,8 +393,8 @@ mod tests {
     };
     use super::super::target::SnapshotImageTargetError;
     use super::*;
-    use crate::snapshot::mock::MockSnapshotRepository;
-    use crate::snapshot::repository::backends::posixfs::PosixFsSnapshotArtifactLayout;
+    use crate::repository::backends::posixfs::PosixFsSnapshotArtifactLayout;
+    use crate::snapshot::mock::MockRepository;
     use crate::snapshot::{
         rootfs_snapshot_image_tag, CommandContext, PersistedDiskImagePublication, SnapshotRecord,
     };
@@ -407,7 +407,7 @@ mod tests {
 
     fn posix_service(root: PathBuf, regctl: impl Into<PathBuf>) -> SnapshotImageService {
         SnapshotImageService {
-            repository: Arc::new(MockSnapshotRepository),
+            repository: Arc::new(MockRepository),
             layers: ManagedLayerLocator::PosixFs { root },
             regctl: Regctl::new(regctl),
         }
@@ -453,7 +453,7 @@ mod tests {
     async fn unknown_or_uncommitted_snapshot_is_rejected() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repository");
-        let repository = posixfs::PosixFsSnapshotRepository::new(
+        let repository = posixfs::PosixFsRepository::new(
             Arc::new(posixfs::PosixFsCatalogStore::new(root.clone())),
             Arc::new(posixfs::PosixFsArtifactStore::new(root.clone())),
         );

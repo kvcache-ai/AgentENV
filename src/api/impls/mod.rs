@@ -19,7 +19,7 @@ use crate::api_key::ApiKey;
 use crate::image::ImageResolver;
 use crate::observability::ObservabilityService;
 use crate::orchestrator::Orchestrator;
-use crate::snapshot::repository::RepositoryError;
+use crate::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
 use crate::volume::VolumeManager;

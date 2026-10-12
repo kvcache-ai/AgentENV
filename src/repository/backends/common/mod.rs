@@ -10,7 +10,8 @@ use overlaybd::dense_export;
 use overlaybd::index_file::CommitArgs;
 use overlaybd::virtual_file::VirtualFile;
 
-use crate::snapshot::{ManagedLayer, OverlaybdLayerRef, RepositoryError, RepositoryResult};
+use crate::repository::{RepositoryError, RepositoryResult};
+use crate::snapshot::{ManagedLayer, OverlaybdLayerRef};
 use uuid::Uuid;
 
 pub(crate) async fn materialize_volume_image_config(

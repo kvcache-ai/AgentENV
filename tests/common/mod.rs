@@ -3,9 +3,9 @@ use std::sync::Arc;
 
 use agentenv::cfg::ConfigManager;
 use agentenv::image::ImageResolver;
+use agentenv::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+use agentenv::repository::Repository;
 use agentenv::sandbox::{FirecrackerSandboxConfig, OverlaybdConfig, UblkDeviceManager};
-use agentenv::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
-use agentenv::snapshot::repository::SnapshotRepository;
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::{TemplateBuildSpec, TemplateBuilder};
 use anyhow::Result;
@@ -84,13 +84,7 @@ pub fn default_sandbox_config() -> Result<FirecrackerSandboxConfig> {
 }
 
 #[allow(dead_code)]
-pub fn snapshot_test_parts(
-    root: &Path,
-) -> (
-    TemplateBuilder,
-    SnapshotManager,
-    Arc<dyn SnapshotRepository>,
-) {
+pub fn snapshot_test_parts(root: &Path) -> (TemplateBuilder, SnapshotManager, Arc<dyn Repository>) {
     let backend = PosixFsBackend::new(PosixFsBackendConfig {
         root: root.join("repository"),
         cache_root: Some(root.join("runtime-cache")),

@@ -12,13 +12,13 @@ use anyhow::{Context, Result};
 use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
 use crate::p2p::P2pTransport;
+use crate::repository::interfaces::{Repository, SnapshotRuntimeResolver};
 use crate::snapshot::artifact_cache::LocalArtifactCache;
-use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 
 pub(crate) use self::client::OssClient;
 pub(crate) use self::config::NormalizedOssConfig;
 pub(crate) use self::layout::OssSnapshotArtifactLayout;
-pub(crate) use self::repository::OssSnapshotRepository;
+pub(crate) use self::repository::OssRepository;
 use self::resolver::OssRuntimeResolver;
 
 /// OSS-backed snapshot backend.
@@ -26,7 +26,7 @@ use self::resolver::OssRuntimeResolver;
 /// Combines the durable committed-state repository (stored in OSS) with a
 /// node-local runtime resolver that materializes runnable overlaybd configs.
 pub struct OssBackend {
-    repository: Arc<dyn SnapshotRepository>,
+    repository: Arc<dyn Repository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
 }
 
@@ -87,7 +87,7 @@ impl OssBackend {
             config.addressing_style(),
         )?);
 
-        let repository: Arc<dyn SnapshotRepository> = Arc::new(OssSnapshotRepository::new(
+        let repository: Arc<dyn Repository> = Arc::new(OssRepository::new(
             Arc::clone(&client),
             config.snapshot_image_storage(),
             publish_compression,
@@ -111,12 +111,7 @@ impl OssBackend {
     }
 
     /// Splits the backend into its repository and runtime-resolution components.
-    pub fn into_parts(
-        self,
-    ) -> (
-        Arc<dyn SnapshotRepository>,
-        Arc<dyn SnapshotRuntimeResolver>,
-    ) {
+    pub fn into_parts(self) -> (Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>) {
         (self.repository, self.runtime_resolver)
     }
 }

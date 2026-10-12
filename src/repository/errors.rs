@@ -1,7 +1,7 @@
 use anyhow::Error as AnyhowError;
 use thiserror::Error;
 
-use crate::snapshot::types::SnapshotId;
+use crate::snapshot::SnapshotId;
 
 pub type RepositoryResult<T> = Result<T, RepositoryError>;
 

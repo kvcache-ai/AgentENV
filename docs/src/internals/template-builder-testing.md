@@ -46,9 +46,9 @@ repository/runtime boundary, and what the relevant tests validate.
   - `RunnableSnapshot` is a node-local resolved view with concrete artifact
     paths and runtime-ready overlaybd image configs.
 
-- `SnapshotRepository` / `SnapshotRuntimeResolver`
-  (`src/snapshot/repository/interfaces.rs`)
-  - `SnapshotRepository` owns committed durable state.
+- `Repository` / `SnapshotRuntimeResolver`
+  (`src/repository/interfaces.rs`)
+  - `Repository` owns committed durable state.
   - `SnapshotRuntimeResolver` turns committed state into node-local runnable
     paths.
 
@@ -207,7 +207,7 @@ across sandbox capture, publish, resolve, launch, and rebuild flows, including:
 `crates/e2e-tests/tests/snapshot_oss_e2e_test.rs` covers OSS-backed snapshot publication,
 resolution, alias cleanup, missing managed-layer failure modes, and deletion.
 
-Repository/backend unit tests under `src/snapshot/repository/backends/` cover:
+Repository/backend unit tests under `src/repository/backends/` cover:
 
 - artifact import
 - alias handling

@@ -6,17 +6,17 @@ use overlaybd::config::{DownloadConfig, LayerConfig};
 
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::image::cache::OverlaybdLayerStore;
+use crate::repository::interfaces::SnapshotRuntimeResolver;
+use crate::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::artifact_cache::{CacheArtifactLease, CacheHandle, LocalArtifactCache};
-use crate::snapshot::repository::interfaces::SnapshotRuntimeResolver;
 use crate::snapshot::runtime_support::{
     hydrate_runtime_manifest, load_firecracker_manifest_from_path, materialize_image_config_error,
     runtime_image_cache_key, RuntimeImageMaterializer,
 };
-use crate::snapshot::types::RuntimeArtifactLease;
+use crate::snapshot::RuntimeArtifactLease;
 use crate::snapshot::{
-    CommittedAttachedDrive, CommittedSnapshot, OverlaybdLayerRef, RepositoryError,
-    RepositoryResult, ResolvedAttachedDrive, RunnableSnapshot, SnapshotId, SnapshotRecord,
-    SNAPSHOT_ARTIFACT_LAYOUT,
+    CommittedAttachedDrive, CommittedSnapshot, OverlaybdLayerRef, ResolvedAttachedDrive,
+    RunnableSnapshot, SnapshotId, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 /// Resolves committed snapshot artifacts into node-local runnable paths on a POSIX filesystem.
@@ -364,8 +364,9 @@ mod tests {
     use super::super::layout::managed_layer_file_name;
     use super::{MaterializeSpec, PosixFsRuntimeResolver};
     use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
+    use crate::repository::RepositoryError;
     use crate::snapshot::artifact_cache::LocalArtifactCache;
-    use crate::snapshot::{OverlaybdLayerRef, RepositoryError};
+    use crate::snapshot::OverlaybdLayerRef;
     use tempfile::TempDir;
 
     #[derive(Debug)]

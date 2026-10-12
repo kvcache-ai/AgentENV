@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use super::errors::{RepositoryError, RepositoryResult};
 use super::DocumentKey;
 use crate::sandbox::SandboxSnapshotManifest;
-use crate::snapshot::types::{
+use crate::snapshot::{
     RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSourceKind,
     TemplateBuildErrorReason, TemplateBuildStatus,
 };
@@ -106,7 +106,8 @@ impl SnapshotListFilter {
 }
 
 #[async_trait]
-/// Durable snapshot repository.
+/// Durable repository shared by every node: snapshots, volumes, and small
+/// shared documents.
 ///
 /// This trait owns the repository truth for [`SnapshotRecord`] values and committed snapshot
 /// artifacts. A record is the catalog identity and lifecycle state for a snapshot:
@@ -142,7 +143,7 @@ impl SnapshotListFilter {
 /// - delete should avoid exposing partially removed records or committed artifacts
 /// - shared artifact imports should use atomic protocols so concurrent writers do not expose
 ///   half-written managed layers
-pub trait SnapshotRepository: Send + Sync {
+pub trait Repository: Send + Sync {
     /// Creates a durable template snapshot record before build artifacts exist.
     ///
     /// Backends should reject records that already contain a committed artifact payload and should

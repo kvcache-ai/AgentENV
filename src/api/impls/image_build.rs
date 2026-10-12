@@ -258,10 +258,10 @@ impl ApiImpl {
             Ok(record) => record,
             Err(err) => {
                 return Err(match err {
-                    crate::snapshot::RepositoryError::SnapshotNotFound { .. } => {
+                    crate::repository::RepositoryError::SnapshotNotFound { .. } => {
                         Self::error(404, "template build not found")
                     }
-                    crate::snapshot::RepositoryError::InvalidRequest { .. } => {
+                    crate::repository::RepositoryError::InvalidRequest { .. } => {
                         Self::error(409, "build has already started")
                     }
                     _ => Self::repository_error(&err),

@@ -1,7 +1,7 @@
 use anyhow::Error as AnyhowError;
 use thiserror::Error;
 
-use crate::snapshot::repository::RepositoryError;
+use crate::repository::RepositoryError;
 use crate::snapshot::TemplateBuildErrorReason;
 
 pub type TemplateBuildResult<T> = Result<T, TemplateBuildError>;

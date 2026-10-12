@@ -17,9 +17,7 @@ use tracing::{
 use tracing_subscriber::{layer::Context as LayerContext, registry::LookupSpan, Layer};
 
 use crate::logging::LogLevel;
-use crate::snapshot::repository::{
-    DocumentKey, RepositoryError, RepositoryResult, SnapshotRepository,
-};
+use crate::repository::{DocumentKey, Repository, RepositoryError, RepositoryResult};
 use crate::snapshot::SnapshotId;
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -56,7 +54,7 @@ pub trait BuildLogStore {
 }
 
 #[async_trait]
-impl<R: SnapshotRepository + ?Sized> BuildLogStore for R {
+impl<R: Repository + ?Sized> BuildLogStore for R {
     async fn write_build_logs(
         &self,
         id: &SnapshotId,
@@ -260,11 +258,7 @@ impl BuildLogSession {
 }
 
 impl BuildLogs {
-    pub fn start(
-        &self,
-        id: SnapshotId,
-        repository: Arc<dyn SnapshotRepository>,
-    ) -> BuildLogSession {
+    pub fn start(&self, id: SnapshotId, repository: Arc<dyn Repository>) -> BuildLogSession {
         self.start_inner(id, repository, Duration::from_secs(1))
     }
 
@@ -272,7 +266,7 @@ impl BuildLogs {
     pub(crate) fn start_with_flush_interval(
         &self,
         id: SnapshotId,
-        repository: Arc<dyn SnapshotRepository>,
+        repository: Arc<dyn Repository>,
         flush_interval: Duration,
     ) -> BuildLogSession {
         self.start_inner(id, repository, flush_interval)
@@ -281,7 +275,7 @@ impl BuildLogs {
     fn start_inner(
         &self,
         id: SnapshotId,
-        repository: Arc<dyn SnapshotRepository>,
+        repository: Arc<dyn Repository>,
         flush_interval: Duration,
     ) -> BuildLogSession {
         let buffer = Arc::new(Mutex::new(Buffer::default()));
@@ -370,7 +364,7 @@ impl BuildLogs {
 }
 
 async fn flush(
-    repository: &Arc<dyn SnapshotRepository>,
+    repository: &Arc<dyn Repository>,
     id: &SnapshotId,
     buffer: &Mutex<Buffer>,
     offset: &mut usize,
@@ -391,7 +385,7 @@ async fn flush(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
 
     #[tokio::test]
     async fn tracing_layer_routes_only_agentenv_events_from_the_matching_build_span() -> Result<()>

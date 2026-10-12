@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::digest::FileDigest;
-use crate::snapshot::repository::{RepositoryError, RepositoryResult};
+use crate::repository::{RepositoryError, RepositoryResult};
 use overlaybd::config::{load_image_config as load_overlaybd_image_config, LayerConfig};
 use overlaybd::dense_export;
 use url::Url;

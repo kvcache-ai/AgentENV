@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::digest;
-use crate::snapshot::repository::{RepositoryError, RepositoryResult};
+use crate::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::CommandContext;
 
 pub(crate) const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";

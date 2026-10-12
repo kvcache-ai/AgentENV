@@ -7,7 +7,6 @@ mod layout;
 pub use build_cache::{BuildCacheState, BuildCacheStore};
 pub use errors::{RepositoryError, RepositoryResult};
 pub use interfaces::{
-    DocumentUpdate, SnapshotListFilter, SnapshotRepository, SnapshotRuntimeResolver,
-    VolumeRecordPage,
+    DocumentUpdate, Repository, SnapshotListFilter, SnapshotRuntimeResolver, VolumeRecordPage,
 };
 pub use layout::DocumentKey;

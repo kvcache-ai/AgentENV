@@ -9,10 +9,10 @@ use tempfile::NamedTempFile;
 use super::super::common::write_dense_overlaybd_layer_to_file_blocking;
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::digest::{self, FileDigest};
+use crate::repository::{RepositoryError, RepositoryResult};
 use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::{
-    CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, RepositoryError, RepositoryResult,
-    SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
+    CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 /// Artifact store backed by files in a POSIX-compatible shared filesystem.

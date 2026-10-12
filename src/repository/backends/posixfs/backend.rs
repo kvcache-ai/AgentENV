@@ -11,16 +11,14 @@ use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
 use super::catalog::PosixFsCatalogStore;
 use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
-use crate::sandbox::SandboxSnapshotManifest;
-use crate::snapshot::artifact_cache::LocalArtifactCache;
-use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
-use crate::snapshot::repository::{
+use crate::repository::interfaces::{Repository, SnapshotRuntimeResolver};
+use crate::repository::{
     DocumentKey, DocumentUpdate, RepositoryError, RepositoryResult, SnapshotListFilter,
     VolumeRecordPage,
 };
-use crate::snapshot::types::{
-    CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
-};
+use crate::sandbox::SandboxSnapshotManifest;
+use crate::snapshot::artifact_cache::LocalArtifactCache;
+use crate::snapshot::{CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord};
 use crate::volume::VolumeRecord;
 
 #[derive(Clone, Debug)]
@@ -38,7 +36,7 @@ pub struct PosixFsBackendConfig {
 }
 
 pub struct PosixFsBackend {
-    repository: Arc<dyn SnapshotRepository>,
+    repository: Arc<dyn Repository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
 }
 
@@ -77,10 +75,8 @@ impl PosixFsBackend {
         let runtime_cache_root = runtime_cache_root.unwrap_or_else(|| cache_root.join("runtime"));
         let catalog_store = Arc::new(PosixFsCatalogStore::new(root.clone()));
         let artifact_store = Arc::new(PosixFsArtifactStore::new(root.clone()));
-        let repository: Arc<dyn SnapshotRepository> = Arc::new(PosixFsSnapshotRepository::new(
-            catalog_store,
-            artifact_store,
-        ));
+        let repository: Arc<dyn Repository> =
+            Arc::new(PosixFsRepository::new(catalog_store, artifact_store));
         let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> = Arc::new(
             PosixFsRuntimeResolver::new(root, runtime_cache_root, store, cache),
         );
@@ -92,7 +88,7 @@ impl PosixFsBackend {
     }
 
     /// Returns the committed-state repository for publish/get/list/delete operations.
-    pub fn repository(&self) -> Arc<dyn SnapshotRepository> {
+    pub fn repository(&self) -> Arc<dyn Repository> {
         Arc::clone(&self.repository)
     }
 
@@ -102,23 +98,18 @@ impl PosixFsBackend {
     }
 
     /// Splits the backend into its repository and runtime-resolution components.
-    pub fn into_parts(
-        self,
-    ) -> (
-        Arc<dyn SnapshotRepository>,
-        Arc<dyn SnapshotRuntimeResolver>,
-    ) {
+    pub fn into_parts(self) -> (Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>) {
         (self.repository, self.runtime_resolver)
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct PosixFsSnapshotRepository {
+pub(crate) struct PosixFsRepository {
     catalog_store: Arc<PosixFsCatalogStore>,
     artifact_store: Arc<PosixFsArtifactStore>,
 }
 
-impl PosixFsSnapshotRepository {
+impl PosixFsRepository {
     pub(crate) fn new(
         catalog_store: Arc<PosixFsCatalogStore>,
         artifact_store: Arc<PosixFsArtifactStore>,
@@ -297,7 +288,7 @@ async fn finish_posix_startup_manifest(
 }
 
 #[async_trait]
-impl SnapshotRepository for PosixFsSnapshotRepository {
+impl Repository for PosixFsRepository {
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         let repository = self.clone();
         run_repository_blocking("create snapshot record", move || {
@@ -549,16 +540,13 @@ mod tests {
 
     use super::super::runtime::PosixFsRuntimeResolver;
     use super::{
-        finish_posix_startup_manifest, PosixFsBackend, PosixFsBackendConfig,
-        PosixFsSnapshotRepository,
+        finish_posix_startup_manifest, PosixFsBackend, PosixFsBackendConfig, PosixFsRepository,
     };
     use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
+    use crate::repository::{Repository, RepositoryError, SnapshotRuntimeResolver};
     use crate::sandbox::{ExtraDrive, SandboxSnapshotManifest};
     use crate::snapshot::artifact_cache::LocalArtifactCache;
     use crate::snapshot::mock::write_mock_built_artifacts;
-    use crate::snapshot::repository::{
-        RepositoryError, SnapshotRepository, SnapshotRuntimeResolver,
-    };
     use crate::snapshot::{
         CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotAlias, SnapshotId,
         SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
@@ -622,8 +610,8 @@ mod tests {
         PosixFsBackend::from_parts(config, test_overlaybd_layer_store(), cache)
     }
 
-    fn test_repository(root: &Path) -> PosixFsSnapshotRepository {
-        PosixFsSnapshotRepository::new(
+    fn test_repository(root: &Path) -> PosixFsRepository {
+        PosixFsRepository::new(
             Arc::new(PosixFsCatalogStore::new(root.to_path_buf())),
             Arc::new(PosixFsArtifactStore::new(root.to_path_buf())),
         )

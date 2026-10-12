@@ -8,14 +8,12 @@ use tracing::warn;
 use super::p2p::SnapshotP2pArtifact;
 use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
 use crate::p2p::P2pTransport;
+use crate::repository::backends::build_snapshot_backend;
+use crate::repository::interfaces::{Repository, SnapshotPublication, SnapshotRuntimeResolver};
+use crate::repository::SnapshotListFilter;
 use crate::sandbox::{
     CapturedSandboxSnapshot, FirecrackerCaptureArtifacts, SandboxSnapshotManifest,
 };
-use crate::snapshot::repository::backends::build_snapshot_backend;
-use crate::snapshot::repository::interfaces::{
-    SnapshotPublication, SnapshotRepository, SnapshotRuntimeResolver,
-};
-use crate::snapshot::repository::SnapshotListFilter;
 use crate::snapshot::{
     ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
     SnapshotRecord,
@@ -61,12 +59,12 @@ fn committed_memory_layer_digests(layers: &[ManagedLayer]) -> HashSet<String> {
 /// Coordinates committed snapshot lifecycle operations over repository-backed state.
 ///
 /// Durable reachability of committed snapshots is owned entirely by the
-/// [`SnapshotRepository`] (PosixFS `managed-layers/`, OSS object storage, or the
+/// [`Repository`] (PosixFS `managed-layers/`, OSS object storage, or the
 /// source registry). The node-local overlaybd layer cache (`image-cache/commits/`)
 /// is reclaimable - committed snapshots never pin it - so this manager records no
 /// local image ref pins.
 pub struct SnapshotManager {
-    repository: Arc<dyn SnapshotRepository>,
+    repository: Arc<dyn Repository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
 }
@@ -84,7 +82,7 @@ impl SnapshotManager {
 
     /// Builds a manager from the given components.
     pub fn from_parts(
-        repository: Arc<dyn SnapshotRepository>,
+        repository: Arc<dyn Repository>,
         runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> Self {
@@ -97,14 +95,14 @@ impl SnapshotManager {
 
     /// Returns the configured durable repository so sibling resource catalogs
     /// can share the same PosixFS/OSS source of truth.
-    pub fn repository(&self) -> Arc<dyn SnapshotRepository> {
+    pub fn repository(&self) -> Arc<dyn Repository> {
         Arc::clone(&self.repository)
     }
 
     pub async fn create(
         &self,
         record: SnapshotRecord,
-    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
         self.repository.create(record).await
     }
 
@@ -114,7 +112,7 @@ impl SnapshotManager {
         metadata: SnapshotPublishMetadata,
         manifest: SandboxSnapshotManifest,
         recording: Option<crate::snapshot::StartupRecording>,
-    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
         let publication = self
             .repository
             .publish_with_local_layers(metadata, manifest.clone(), recording)
@@ -128,7 +126,7 @@ impl SnapshotManager {
         &self,
         metadata: SnapshotPublishMetadata,
         captured_snapshot: CapturedSandboxSnapshot,
-    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
         let manifest = captured_snapshot.manifest().clone();
 
         // Spawn the startup-manifest recording up front (a no-op task when
@@ -328,7 +326,7 @@ impl SnapshotManager {
     pub async fn try_start_build(
         &self,
         id: &SnapshotId,
-    ) -> crate::snapshot::RepositoryResult<SnapshotRecord> {
+    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
         self.repository.try_start_build(id).await
     }
 
@@ -337,7 +335,7 @@ impl SnapshotManager {
         &self,
         id: &SnapshotId,
         reason: crate::snapshot::TemplateBuildErrorReason,
-    ) -> crate::snapshot::RepositoryResult<()> {
+    ) -> crate::repository::RepositoryResult<()> {
         self.repository.mark_build_error(id, reason).await
     }
 }
@@ -347,9 +345,9 @@ mod tests {
     use super::*;
     use crate::overlaybd::layer_key_from_digest;
     use crate::p2p::mock::MockTransport;
+    use crate::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::p2p::fixed_artifact_key;
-    use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotPublishMetadata};
     use std::path::Path;
     use tempfile::TempDir;
@@ -401,7 +399,7 @@ mod tests {
         assert_eq!(loaded.id, snapshot_id);
 
         let listed = manager
-            .list(crate::snapshot::repository::SnapshotListFilter::matches_all())
+            .list(crate::repository::SnapshotListFilter::matches_all())
             .await
             .expect("list should work");
         assert_eq!(listed.len(), 1);
@@ -488,7 +486,7 @@ mod tests {
     async fn failed_repository_commit_does_not_publish_to_p2p() {
         let p2p = Arc::new(MockTransport::default());
         let manager = SnapshotManager::from_parts(
-            Arc::new(crate::snapshot::mock::MockSnapshotRepository),
+            Arc::new(crate::snapshot::mock::MockRepository),
             Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver),
             Some(p2p.clone()),
         );

@@ -10,7 +10,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::snapshot::repository::{RepositoryError, SnapshotRepository};
+use crate::repository::{Repository, RepositoryError};
 use crate::snapshot::OverlaybdLayerRef;
 
 pub const DEFAULT_VOLUME_SIZE_MB: u64 = 64 * 1024;
@@ -163,7 +163,7 @@ pub enum VolumeError {
 pub struct VolumeManager {
     records: Arc<RwLock<HashMap<String, VolumeRecord>>>,
     root: PathBuf,
-    repository: Arc<dyn SnapshotRepository>,
+    repository: Arc<dyn Repository>,
     limits: VolumeLimits,
 }
 
@@ -186,14 +186,14 @@ impl Default for VolumeLimits {
 impl VolumeManager {
     pub async fn open_with_repository(
         path: impl Into<std::path::PathBuf>,
-        repository: Arc<dyn SnapshotRepository>,
+        repository: Arc<dyn Repository>,
     ) -> anyhow::Result<Self> {
         Self::open_with_repository_and_limits(path, repository, VolumeLimits::default()).await
     }
 
     pub async fn open_with_repository_and_limits(
         path: impl Into<std::path::PathBuf>,
-        repository: Arc<dyn SnapshotRepository>,
+        repository: Arc<dyn Repository>,
         mut limits: VolumeLimits,
     ) -> anyhow::Result<Self> {
         let path = path.into();
@@ -955,7 +955,7 @@ mod tests {
 
     use super::{VolumeError, VolumeManager, VolumeMode, VolumeRecord, VolumeStatus};
     use crate::digest::sha256_digest;
-    use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{ManagedLayer, OverlaybdLayerRef};
 
     async fn manager_at(root: &Path) -> VolumeManager {

@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::{DocumentKey, RepositoryError, RepositoryResult, SnapshotRepository};
+use super::{DocumentKey, Repository, RepositoryError, RepositoryResult};
 
 /// The head and its pending retirements are committed in one repository write.
 #[derive(Default, Deserialize, Serialize)]
@@ -28,7 +28,7 @@ pub trait BuildCacheStore {
 }
 
 #[async_trait]
-impl<R: SnapshotRepository + ?Sized> BuildCacheStore for R {
+impl<R: Repository + ?Sized> BuildCacheStore for R {
     async fn get_build_cache_head(&self) -> RepositoryResult<Option<String>> {
         Ok(self.get_build_cache_state().await?.current)
     }
@@ -128,7 +128,7 @@ impl BuildCacheState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn build_cache_head_updates_are_atomic_across_repository_instances() {

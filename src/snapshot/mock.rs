@@ -4,21 +4,20 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::repository::{
-    RepositoryError, RepositoryResult, SnapshotListFilter, SnapshotRepository,
-    SnapshotRuntimeResolver,
-};
 use super::{
     RunnableSnapshot, SnapshotId, SnapshotManager, SnapshotPublishMetadata, SnapshotRecord,
     SNAPSHOT_ARTIFACT_LAYOUT,
+};
+use crate::repository::{
+    Repository, RepositoryError, RepositoryResult, SnapshotListFilter, SnapshotRuntimeResolver,
 };
 use crate::sandbox::SandboxSnapshotManifest;
 
 /// Test double for snapshot repository interactions that should stay unreachable.
 #[derive(Clone, Debug, Default)]
-pub struct MockSnapshotRepository;
+pub struct MockRepository;
 
-impl MockSnapshotRepository {
+impl MockRepository {
     fn unsupported() -> RepositoryError {
         RepositoryError::Unsupported {
             feature: "mock snapshot repository should not be called in this test".to_string(),
@@ -27,7 +26,7 @@ impl MockSnapshotRepository {
 }
 
 #[async_trait]
-impl SnapshotRepository for MockSnapshotRepository {
+impl Repository for MockRepository {
     async fn create(&self, _record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         Err(Self::unsupported())
     }
@@ -92,7 +91,7 @@ impl SnapshotRuntimeResolver for MockSnapshotRuntimeResolver {
 /// Builds a snapshot manager backed by snapshot test doubles.
 pub fn mock_snapshot_manager() -> SnapshotManager {
     SnapshotManager::from_parts(
-        Arc::new(MockSnapshotRepository),
+        Arc::new(MockRepository),
         Arc::new(MockSnapshotRuntimeResolver),
         None,
     )

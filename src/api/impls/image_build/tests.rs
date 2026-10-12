@@ -11,12 +11,9 @@ pub(super) async fn test_api(
         cfg::AppConfig,
         image::ImageResolver,
         orchestrator::{FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator},
+        repository::backends::{PosixFsBackend, PosixFsBackendConfig},
         sandbox::FirecrackerSandboxFactory,
-        snapshot::{
-            mock::write_mock_built_artifacts,
-            repository::backends::{PosixFsBackend, PosixFsBackendConfig},
-            SnapshotManager, SnapshotPublishMetadata,
-        },
+        snapshot::{mock::write_mock_built_artifacts, SnapshotManager, SnapshotPublishMetadata},
         template::TemplateBuilder,
         volume::VolumeManager,
     };

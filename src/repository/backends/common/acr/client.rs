@@ -20,7 +20,7 @@ use tokio::time::sleep;
 use url::Url;
 
 use crate::digest;
-use crate::snapshot::repository::RepositoryError;
+use crate::repository::RepositoryError;
 
 use super::manifest::OCI_IMAGE_MANIFEST_MEDIA_TYPE;
 

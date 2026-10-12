@@ -10,13 +10,12 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 
 use super::layout::PosixFsSnapshotArtifactLayout;
-use crate::snapshot::repository::{
-    DocumentKey, DocumentUpdate, SnapshotListFilter, VolumeRecordPage,
-};
+use crate::repository::{DocumentKey, DocumentUpdate, SnapshotListFilter, VolumeRecordPage};
+use crate::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::{
-    CommittedSnapshot, MemoryStartupPackInfo, RepositoryError, RepositoryResult, SnapshotAlias,
-    SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
+    CommittedSnapshot, MemoryStartupPackInfo, SnapshotAlias, SnapshotId, SnapshotPublishMetadata,
+    SnapshotPublishSource, SnapshotRecord, SnapshotSource, SnapshotSourceKind,
+    TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };
 use crate::volume::{is_valid_volume_component, VolumeMode, VolumeRecord};
 const FILE_LOCK_TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
@@ -1226,9 +1225,10 @@ mod tests {
 
     use super::super::layout::PosixFsSnapshotArtifactLayout;
     use super::PosixFsCatalogStore;
-    use crate::snapshot::RepositoryError;
+    use crate::repository::RepositoryError;
+    use crate::repository::SnapshotListFilter;
     use crate::snapshot::{
-        CommittedSnapshot, MemoryStartupPackInfo, SnapshotAlias, SnapshotId, SnapshotListFilter,
+        CommittedSnapshot, MemoryStartupPackInfo, SnapshotAlias, SnapshotId,
         SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind,
         TemplateBuildStatus,
     };
@@ -1587,7 +1587,10 @@ mod tests {
             .get("../../etc/passwd")
             .expect_err("path traversal should be rejected");
         assert!(
-            matches!(err, crate::snapshot::RepositoryError::InvalidRequest { .. }),
+            matches!(
+                err,
+                crate::repository::RepositoryError::InvalidRequest { .. }
+            ),
             "expected InvalidRequest, got: {err:?}"
         );
     }

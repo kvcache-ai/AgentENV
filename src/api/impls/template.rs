@@ -19,9 +19,10 @@ use super::template_helpers::{
 use super::ApiImpl;
 use crate::image::ResolvedBlockImage;
 use crate::logging::LogLevel;
+use crate::repository::SnapshotListFilter;
 use crate::snapshot::{
-    SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
-    TemplateBuildErrorReason, TemplateBuildStatus,
+    SnapshotAlias, SnapshotId, SnapshotRecord, SnapshotSource, TemplateBuildErrorReason,
+    TemplateBuildStatus,
 };
 use crate::template::{
     logs::{BuildLogEntry, BuildLogStore},
@@ -910,7 +911,7 @@ impl Templates<()> for ApiImpl {
 
         match self.snapshot_manager.try_start_build(&build_id).await {
             Ok(_) => {}
-            Err(crate::snapshot::RepositoryError::SnapshotNotFound { .. }) => {
+            Err(crate::repository::RepositoryError::SnapshotNotFound { .. }) => {
                 return Ok(
                     V2TemplatesTemplateIdBuildsBuildIdPostResponse::Status404_NotFound(
                         Self::error(
@@ -1112,7 +1113,7 @@ mod tests {
     #[test]
     fn pipeline_build_error_maps_repository_conflict_to_bad_request() {
         let error = pipeline_build_error(&crate::template::TemplatePipelineError::Repository(
-            crate::snapshot::RepositoryError::AliasConflict {
+            crate::repository::RepositoryError::AliasConflict {
                 alias: "dup".to_string(),
                 existing: crate::snapshot::SnapshotId::generate(),
                 new_id: crate::snapshot::SnapshotId::generate(),

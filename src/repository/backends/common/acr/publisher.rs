@@ -7,12 +7,12 @@ use tempfile::NamedTempFile;
 use tracing::warn;
 
 use crate::digest;
-use crate::sandbox::OverlaybdCompactOutput;
-use crate::snapshot::repository::backends::common::recontainerize::{
+use crate::repository::backends::common::recontainerize::{
     prepare_layer_upload, PreparedLayerUpload,
 };
-use crate::snapshot::repository::backends::common::write_dense_overlaybd_layer_to_file;
-use crate::snapshot::repository::{RepositoryError, RepositoryResult};
+use crate::repository::backends::common::write_dense_overlaybd_layer_to_file;
+use crate::repository::{RepositoryError, RepositoryResult};
+use crate::sandbox::OverlaybdCompactOutput;
 use crate::snapshot::rootfs_snapshot_image_tag;
 use crate::snapshot::{
     ExternalLayer, OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotId,
