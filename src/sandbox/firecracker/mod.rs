@@ -10,7 +10,6 @@ mod factory;
 mod instance;
 mod memory_snapshot;
 mod mmds;
-mod overlaybd_snapshot;
 mod pool;
 mod process_vm_reader;
 mod resources;
