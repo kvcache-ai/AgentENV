@@ -20,13 +20,13 @@ use super::config::{
 };
 use super::memory_snapshot::{capture_memory_snapshot, save_paused_memory};
 use super::mmds::MmdsMetadata;
-use super::overlaybd_snapshot::capture_disk_snapshot;
 use super::pool::{warm_stdio_paths, FirecrackerPool};
 use super::resources::SandboxResources;
 use super::FirecrackerInstance;
 use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
 };
+use crate::sandbox::overlaybd_snapshot::capture_disk_snapshot;
 use crate::snapshot::SandboxSnapshotManifest;
 
 use crate::cfg::ConfigManager;
