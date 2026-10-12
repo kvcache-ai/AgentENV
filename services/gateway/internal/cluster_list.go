@@ -20,6 +20,10 @@ import (
 
 const maxCursorSandboxID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
 
+// clusterListCursorTimeFormat matches the node API, which always writes nine
+// fraction digits in UTC.
+const clusterListCursorTimeFormat = "2006-01-02T15:04:05.000000000Z07:00"
+
 type listedSandbox struct {
 	payload   json.RawMessage
 	sandboxID string
@@ -342,15 +346,15 @@ func paginateListedSandboxes(items []listedSandbox, nextToken string, limit *int
 		}
 	}
 
-	if limit != nil && *limit < len(page) {
-		if *limit <= 0 {
-			page = page[:0]
-		} else {
-			page = page[:*limit]
-		}
+	if limit == nil || *limit >= len(page) {
+		return page, "", nil
 	}
-
-	return page, nextClusterListToken(page, limit, descending), nil
+	if *limit <= 0 {
+		return page[:0], "", nil
+	}
+	// Like the node API, issue a next token only when more items remain.
+	page = page[:*limit]
+	return page, encodeClusterListToken(page[len(page)-1], descending), nil
 }
 
 func parseClusterListNextToken(token string, descending bool) (time.Time, string, error) {
@@ -393,12 +397,8 @@ func parseClusterListNextToken(token string, descending bool) (time.Time, string
 	return cursorTime.UTC(), parts[1], nil
 }
 
-func nextClusterListToken(items []listedSandbox, limit *int, descending bool) string {
-	if limit == nil || *limit <= 0 || len(items) != *limit {
-		return ""
-	}
-	last := items[len(items)-1]
-	raw := fmt.Sprintf("%s__%s", last.startedAt.UTC().Format(time.RFC3339Nano), last.sandboxID)
+func encodeClusterListToken(last listedSandbox, descending bool) string {
+	raw := fmt.Sprintf("%s__%s", last.startedAt.UTC().Format(clusterListCursorTimeFormat), last.sandboxID)
 	if !descending {
 		raw += "__asc"
 	}

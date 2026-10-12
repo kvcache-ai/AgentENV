@@ -6,11 +6,15 @@ on:
     paths:
       - "services/**"
       - "deploy/**"
+      - "src/api/openapi.yml"
+      - "src/api/testdata/pagination.json"
       - ".github/workflows/services-ci.yml"
   push:
     paths:
       - "services/**"
       - "deploy/**"
+      - "src/api/openapi.yml"
+      - "src/api/testdata/pagination.json"
       - ".github/workflows/services-ci.yml"
 
 jobs:

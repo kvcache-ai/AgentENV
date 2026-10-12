@@ -458,4 +458,112 @@ mod tests {
             Ordering::Greater
         );
     }
+
+    #[derive(serde::Deserialize)]
+    struct SharedVectors {
+        tokens: Vec<TokenVector>,
+        items: Vec<ItemVector>,
+        pages: Vec<PageVector>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct TokenVector {
+        name: String,
+        token: String,
+        #[serde(default)]
+        canonical: bool,
+        cursor: Option<CursorVector>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CursorVector {
+        time: chrono::DateTime<chrono::Utc>,
+        id: crate::types::SandboxId,
+        order: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ItemVector {
+        id: crate::types::SandboxId,
+        started_at: chrono::DateTime<chrono::Utc>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct PageVector {
+        name: String,
+        order: String,
+        limit: Option<u32>,
+        after: Option<String>,
+        want: Vec<crate::types::SandboxId>,
+        next: Option<String>,
+    }
+
+    /// The gateway's cluster list runs the same vectors in
+    /// services/gateway/internal/cluster_list_test.go.
+    #[test]
+    fn sandbox_cursors_match_shared_vectors() {
+        use crate::types::SandboxId;
+
+        let vectors: SharedVectors =
+            serde_json::from_str(include_str!("../testdata/pagination.json")).unwrap();
+
+        for case in vectors.tokens {
+            let parsed = PaginationCursor::<SandboxId>::parse(&case.token);
+            let Some(want) = case.cursor else {
+                assert!(parsed.is_err(), "{}: token accepted", case.name);
+                continue;
+            };
+            let cursor = parsed.unwrap_or_else(|err| panic!("{}: {err}", case.name));
+            let want_time = SystemTime::from(want.time);
+            assert_eq!(cursor.time(), want_time, "{}", case.name);
+            assert_eq!(cursor.value(), &want.id, "{}", case.name);
+            assert_eq!(
+                cursor.is_descending(),
+                want.order == "desc",
+                "{}",
+                case.name
+            );
+            if case.canonical {
+                let encoded =
+                    PaginationCursor::new(want_time, want.id, want.order == "desc").encode();
+                assert_eq!(encoded, case.token, "{}", case.name);
+            }
+        }
+
+        for case in vectors.pages {
+            let descending = case.order == "desc";
+            // Start cursors match the v2 sandbox list handler.
+            let cursor = match case.after.as_deref() {
+                Some(token) => PaginationCursor::<SandboxId>::parse(token).unwrap(),
+                None if descending => {
+                    PaginationCursor::new_descending(SystemTime::now(), SandboxId::max())
+                }
+                None => PaginationCursor::new_ascending(UNIX_EPOCH, SandboxId::max()),
+            };
+            let items: Vec<_> = vectors
+                .items
+                .iter()
+                .map(|item| (SystemTime::from(item.started_at), item.id))
+                .collect();
+            let page = cursor.paginate(
+                items,
+                case.limit,
+                |a, b| PaginationCursor::compare(descending, a.0, &a.1, b.0, &b.1),
+                |item, cursor| {
+                    PaginationCursor::compare(
+                        descending,
+                        item.0,
+                        &item.1,
+                        cursor.time(),
+                        cursor.value(),
+                    )
+                },
+                |item| PaginationCursor::new(item.0, item.1, descending),
+            );
+            let ids: Vec<_> = page.items.iter().map(|item| item.1).collect();
+            assert_eq!(ids, case.want, "{}", case.name);
+            assert_eq!(page.next_token, case.next, "{}", case.name);
+        }
+    }
 }

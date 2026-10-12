@@ -1,0 +1,170 @@
+{
+  "_comment": "Sandbox list cursors shared by the node API (src/api/impls/pagination.rs) and the gateway's cluster list (services/gateway/internal/cluster_list.go). Both test suites read this file.",
+  "tokens": [
+    {
+      "name": "descending cursor",
+      "token": "MjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTY3ODlaX18xMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTE=",
+      "canonical": true,
+      "cursor": {
+        "time": "2026-01-02T03:04:05.123456789Z",
+        "id": "11111111-1111-4111-8111-111111111111",
+        "order": "desc"
+      }
+    },
+    {
+      "name": "ascending cursor",
+      "token": "MjAyNi0wMS0wMlQwMzowNDowNS4xMjM0NTY3ODlaX18xMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTFfX2FzYw==",
+      "canonical": true,
+      "cursor": {
+        "time": "2026-01-02T03:04:05.123456789Z",
+        "id": "11111111-1111-4111-8111-111111111111",
+        "order": "asc"
+      }
+    },
+    {
+      "name": "whole seconds keep nine fraction digits",
+      "token": "MjAyNi0wMS0wMlQwMzowNDowNS4wMDAwMDAwMDBaX18yMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjI=",
+      "canonical": true,
+      "cursor": {
+        "time": "2026-01-02T03:04:05.000000000Z",
+        "id": "22222222-2222-4222-8222-222222222222",
+        "order": "desc"
+      }
+    },
+    {
+      "name": "short fraction is accepted",
+      "token": "MjAyNi0wMS0wMlQwMzowNDowNVpfXzIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMl9fYXNj",
+      "canonical": false,
+      "cursor": {
+        "time": "2026-01-02T03:04:05.000000000Z",
+        "id": "22222222-2222-4222-8222-222222222222",
+        "order": "asc"
+      }
+    },
+    {
+      "name": "numeric offset is accepted",
+      "token": "MjAyNi0wMS0wMlQwNTowNDowNS41KzAyOjAwX18zMzMzMzMzMy0zMzMzLTQzMzMtODMzMy0zMzMzMzMzMzMzMzM=",
+      "canonical": false,
+      "cursor": {
+        "time": "2026-01-02T03:04:05.500000000Z",
+        "id": "33333333-3333-4333-8333-333333333333",
+        "order": "desc"
+      }
+    },
+    {
+      "name": "not base64",
+      "token": "not-base64!",
+      "cursor": null
+    },
+    {
+      "name": "missing separator",
+      "token": "MjAyNi0wMS0wMlQwMzowNDowNVo=",
+      "cursor": null
+    },
+    {
+      "name": "unknown direction",
+      "token": "MjAyNi0wMS0wMlQwMzowNDowNVpfXzExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMV9fZGVzYw==",
+      "cursor": null
+    },
+    {
+      "name": "bad timestamp",
+      "token": "eWVzdGVyZGF5X18xMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTE=",
+      "cursor": null
+    },
+    {
+      "name": "bad sandbox ID",
+      "token": "MjAyNi0wMS0wMlQwMzowNDowNVpfX25vdC1hLXV1aWQ=",
+      "cursor": null
+    },
+    {
+      "name": "not UTF-8",
+      "token": "__79",
+      "cursor": null
+    }
+  ],
+  "items": [
+    {
+      "id": "11111111-1111-4111-8111-111111111111",
+      "startedAt": "2026-01-03T00:00:00.000000000Z"
+    },
+    {
+      "id": "33333333-3333-4333-8333-333333333333",
+      "startedAt": "2026-01-02T00:00:00.500000000Z"
+    },
+    {
+      "id": "22222222-2222-4222-8222-222222222222",
+      "startedAt": "2026-01-02T00:00:00.500000000Z"
+    },
+    {
+      "id": "44444444-4444-4444-8444-444444444444",
+      "startedAt": "2026-01-01T00:00:00.000000000Z"
+    }
+  ],
+  "pages": [
+    {
+      "name": "descending first page",
+      "order": "desc",
+      "limit": 2,
+      "after": null,
+      "want": [
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222"
+      ],
+      "next": "MjAyNi0wMS0wMlQwMDowMDowMC41MDAwMDAwMDBaX18yMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjI="
+    },
+    {
+      "name": "descending last page is exactly the limit",
+      "order": "desc",
+      "limit": 2,
+      "after": "MjAyNi0wMS0wMlQwMDowMDowMC41MDAwMDAwMDBaX18yMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjI=",
+      "want": [
+        "33333333-3333-4333-8333-333333333333",
+        "44444444-4444-4444-8444-444444444444"
+      ],
+      "next": null
+    },
+    {
+      "name": "ascending breaks time ties by descending ID",
+      "order": "asc",
+      "limit": 3,
+      "after": null,
+      "want": [
+        "44444444-4444-4444-8444-444444444444",
+        "33333333-3333-4333-8333-333333333333",
+        "22222222-2222-4222-8222-222222222222"
+      ],
+      "next": "MjAyNi0wMS0wMlQwMDowMDowMC41MDAwMDAwMDBaX18yMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjJfX2FzYw=="
+    },
+    {
+      "name": "ascending last page",
+      "order": "asc",
+      "limit": 3,
+      "after": "MjAyNi0wMS0wMlQwMDowMDowMC41MDAwMDAwMDBaX18yMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjJfX2FzYw==",
+      "want": [
+        "11111111-1111-4111-8111-111111111111"
+      ],
+      "next": null
+    },
+    {
+      "name": "no limit",
+      "order": "desc",
+      "limit": null,
+      "after": null,
+      "want": [
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+        "33333333-3333-4333-8333-333333333333",
+        "44444444-4444-4444-8444-444444444444"
+      ],
+      "next": null
+    },
+    {
+      "name": "zero limit",
+      "order": "desc",
+      "limit": 0,
+      "after": null,
+      "want": [],
+      "next": null
+    }
+  ]
+}
