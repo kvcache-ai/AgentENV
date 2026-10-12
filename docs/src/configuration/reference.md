@@ -59,6 +59,17 @@ Linux kernel image for microVMs.
 | `url` | string | manifest value | Optional download URL template override with `{version}` placeholder |
 | `image_path` | string | derived from manifest/config version | Explicit path to a local `vmlinux.bin`. Setup skips the kernel download and requires this to be a readable, non-empty regular file |
 
+## `[overlaybd]`
+
+Optional override for the OverlayBD tools release that setup downloads. When the
+section is omitted, the release in `config/deps_manifest.toml` is used.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `version` | string | manifest value | OverlayBD tools release; required when the section is set |
+| `package_url` | string | manifest value | Download URL template for the tools archive, with `{version}` and `{arch}` placeholders |
+| `url` | string | unset | Fallback for `package_url` |
+
 ## `[tools]`
 
 Tools drive image used to boot the AgentENV control plane inside each microVM.
@@ -104,6 +115,7 @@ User-visible rootfs images are selected at the template API layer.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `default_image` | string | `ubuntu:24.04` | Image used when template builds omit `fromImage` |
+| `convert_standard_oci` | boolean | `true` | Convert standard OCI tar layers into local OverlayBD commits. Set `false` to require OverlayBD-native images or referrers and fail fast otherwise |
 | `search_registries` | array of strings | `["docker.io", "ghcr.io"]` | Registries tried when resolving short image references |
 | `allowed_registries` | array of strings | unset (no restriction) | Whitelist of registry hosts (e.g. `docker.io`, `registry.example.com:5000`). **Omitting the key** imposes no restriction; an **explicit empty list `[]`** denies every registry. When set to a non-empty list, only references whose registry host is in the list resolve; any other host is rejected as a client (4xx, `ImageReferenceError`) error. See *How the three registry settings interact* below. |
 | `try_referrers_overlaybd_prefixes` | array of strings | `[]` | Image reference prefixes for which AgentENV tries OCI Referrers API via `regctl` for an overlaybd-native artifact before converting a standard OCI image locally. Prefixes are matched with simple `starts_with`; include the trailing slash yourself, for example `registry.example.com/` or `registry.example.com/team/`. Requires `regctl` on `PATH`; lookup failures fall back to the source image. |
@@ -254,6 +266,18 @@ Default VM resources for sandboxes.
 | `mem_size_mib` | integer | `1024` | Guest RAM in MiB |
 | `vcpu_count` | integer | `2` | Number of virtual CPUs |
 
+## `[machine.disk_rate_limit]`
+
+Per-sandbox disk I/O limits, applied through Firecracker's virtio-blk rate limiter.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable per-sandbox disk I/O rate limiting |
+| `bandwidth_bytes_per_sec` | integer | `0` | Sustained disk bandwidth limit in bytes per second; `0` means unlimited |
+| `bandwidth_burst_bytes` | integer | `0` | One-time bandwidth burst in bytes, granted once when the VM starts (Firecracker's `one_time_burst`). It is consumed before the sustained bucket and never replenished, so it only absorbs the initial I/O spike. Requires `bandwidth_bytes_per_sec` |
+| `iops` | integer | `0` | Sustained IOPS limit; `0` means unlimited |
+| `iops_burst` | integer | `0` | One-time IOPS burst, granted once when the VM starts. Consumed before the sustained bucket and never replenished. Requires `iops` |
+
 ## `[envd]`
 
 In-guest `envd` daemon settings.
@@ -309,8 +333,11 @@ Component sections:
 
 | Section | Key | Type | Default | Description |
 |---------|-----|------|---------|-------------|
+| `[pool.network]` | `enabled` | boolean | `true` | When `false`, disables the network-slot maintenance worker; slots are still created on demand |
 | `[pool.network]` | `maintenance_enabled` | boolean | `true` | Enable the background network-slot maintenance worker |
+| `[pool.network]` | `startup_prewarm` | boolean | `true` | Accepted but currently unused |
 | `[pool.block]` | `enabled` | boolean | `true` | Enable the ublk overlaybd warm-device pool |
+| `[pool.block]` | `maintenance_enabled` | boolean | `true` | Ignored: the block pool always refills at request time, because the reusable device shape depends on the image and size |
 | `[pool.block]` | `startup_prewarm` | boolean | capability-based | Prewarm block devices after the first reusable image shape is known. When omitted, it is enabled only if the kernel supports `UBLK_F_UPDATE_SIZE`; an explicit value overrides detection |
 | `[pool.firecracker]` | `enabled` | boolean | `true` | Enable pre-spawned Firecracker processes for snapshot resume |
 | `[pool.firecracker]` | `maintenance_enabled` | boolean | `true` | Enable the background Firecracker process maintenance worker |
@@ -571,6 +598,7 @@ OverlayBD configuration for ublk. Legacy `enabled` and `device_type` keys are ig
 | `runtime_upper_mode` | string | `"hybridLogStructured"` | Runtime upper format for newly materialized writable rootfs OverlayBD images. Supported values are `"logStructured"`, `"hybridLogStructured"`, and `"sparse"`. Existing source uppers keep their own mode |
 | `allow_shrink` | boolean | `false` | Allows an explicit cold-start `diskSizeMB` smaller than the source rootfs. Explicit sizes use MiB and must be divisible by 1024. Growth is always allowed; snapshot resume never resizes. |
 | `resize_timeout_secs` | integer | `120` | Timeout in seconds for the cold-start OverlayBD resize tool. Must be greater than zero. |
+| `remote_io_workers` | integer | `4` | Worker threads of the overlaybd runtime's dedicated remote-I/O runtime (OSS and registry downloads), written as `remoteIoWorkers` into generated overlaybd global configs. Must be greater than zero. |
 | `download_enable` | boolean | `false` | Enables overlaybd layer-level background download for remote layers |
 | `p2p_lookup_timeout_ms` | integer | `300` | Timeout for one foreground Overlaybd descriptor lookup through the localhost P2P HTTP facade. Timeout is treated as a cacheable miss. |
 | `p2p_fetch_range_timeout_ms` | integer | `2000` | Timeout for one foreground Overlaybd range fetch through the localhost P2P HTTP facade before falling back to the origin registry. |

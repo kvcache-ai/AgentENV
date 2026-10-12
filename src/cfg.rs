@@ -1477,6 +1477,7 @@ impl SandboxProxyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use tempfile::tempdir;
 
     #[test]
@@ -1484,6 +1485,135 @@ mod tests {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
         Ok(())
+    }
+
+    /// Dotted paths of every leaf key in the configuration schema.
+    fn config_keys(meta: &confique::meta::Meta, prefix: &str, keys: &mut BTreeSet<String>) {
+        for field in meta.fields {
+            let path = if prefix.is_empty() {
+                field.name.to_string()
+            } else {
+                format!("{prefix}.{}", field.name)
+            };
+            match field.kind {
+                confique::meta::FieldKind::Leaf { .. } => {
+                    keys.insert(path);
+                }
+                confique::meta::FieldKind::Nested { meta } => config_keys(meta, &path, keys),
+            }
+        }
+    }
+
+    /// Keys in the reference's tables. A `` ## `[section]` `` heading sets the
+    /// table prefix, `## Global Settings` selects top-level keys, and any
+    /// other `##` heading ends the current section. A row may name a
+    /// subsection in its first column, as in `` | `[pool.block]` | `enabled` | ``.
+    fn documented_config_keys(reference: &str) -> BTreeSet<String> {
+        // Documents config/deps_manifest.toml, not the runtime configuration.
+        const OTHER_FILE_SECTIONS: &[&str] = &["protoc"];
+
+        let mut keys = BTreeSet::new();
+        let mut section = None;
+        for line in reference.lines() {
+            if let Some(heading) = line.strip_prefix("## ") {
+                section = match heading {
+                    "Global Settings" => Some(String::new()),
+                    _ => heading
+                        .strip_prefix("`[")
+                        .and_then(|rest| rest.strip_suffix("]`"))
+                        .filter(|name| !OTHER_FILE_SECTIONS.contains(name))
+                        .map(|name| format!("{name}.")),
+                };
+                continue;
+            }
+            let (Some(section), Some(row)) = (&section, line.strip_prefix("| `")) else {
+                continue;
+            };
+            let Some((first, rest)) = row.split_once("` |") else {
+                continue;
+            };
+            let key = match first.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                Some(subsection) => match rest.trim_start().strip_prefix('`') {
+                    Some(rest) => match rest.split_once('`') {
+                        Some((key, _)) => format!("{subsection}.{key}"),
+                        None => continue,
+                    },
+                    None => continue,
+                },
+                None => format!("{section}{first}"),
+            };
+            keys.insert(key);
+        }
+        keys
+    }
+
+    #[test]
+    fn configuration_reference_documents_every_key() {
+        let mut keys = BTreeSet::new();
+        config_keys(&AppConfig::META, "", &mut keys);
+        let documented =
+            documented_config_keys(include_str!("../docs/src/configuration/reference.md"));
+
+        // A leaf such as `backend.oss` deserializes a whole table that the
+        // schema cannot list, so its documented subkeys stand for it.
+        let within_leaf = |key: &String| {
+            keys.iter()
+                .any(|leaf| key.starts_with(leaf) && key[leaf.len()..].starts_with('.'))
+        };
+        let undocumented: Vec<_> = keys
+            .iter()
+            .filter(|key| {
+                !documented.contains(*key)
+                    && !documented.iter().any(|doc| {
+                        doc.starts_with(key.as_str()) && doc[key.len()..].starts_with('.')
+                    })
+            })
+            .collect();
+        let unknown: Vec<_> = documented
+            .iter()
+            .filter(|key| !keys.contains(*key) && !within_leaf(key))
+            .collect();
+        assert!(
+            undocumented.is_empty() && unknown.is_empty(),
+            "docs/src/configuration/reference.md is out of date\n\
+             missing keys: {undocumented:?}\n\
+             keys not in src/cfg.rs: {unknown:?}"
+        );
+    }
+
+    #[test]
+    fn bundled_default_config_sets_only_known_keys() {
+        fn walk(
+            table: &toml::Table,
+            prefix: &str,
+            keys: &BTreeSet<String>,
+            unknown: &mut Vec<String>,
+        ) {
+            for (name, value) in table {
+                let path = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                if keys.contains(&path) {
+                    continue;
+                }
+                match value {
+                    toml::Value::Table(table) => walk(table, &path, keys, unknown),
+                    _ => unknown.push(path),
+                }
+            }
+        }
+
+        let mut keys = BTreeSet::new();
+        config_keys(&AppConfig::META, "", &mut keys);
+        let bundled: toml::Table = toml::from_str(include_str!("../config/default.toml")).unwrap();
+        let mut unknown = Vec::new();
+        walk(&bundled, "", &keys, &mut unknown);
+        assert!(
+            unknown.is_empty(),
+            "config/default.toml sets keys that src/cfg.rs does not read: {unknown:?}"
+        );
     }
 
     #[test]
