@@ -11,9 +11,12 @@ use super::startup_pack::{
     build_startup_manifest, startup_manifest_abort_notify, startup_manifest_abort_requested,
     StartupManifestTaskGuard,
 };
+use super::store::{self, StoredSnapshot};
 use super::{CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, StartupRecording};
-use crate::repository::interfaces::{SnapshotPublication, StoredSnapshot};
-use crate::repository::{DocumentKey, Repository, RepositoryError, RepositoryResult};
+use crate::repository::interfaces::SnapshotPublication;
+use crate::repository::{
+    BlobBody, BlobKey, DocumentKey, Repository, RepositoryError, RepositoryResult, SnapshotFile,
+};
 use crate::sandbox::SandboxSnapshotManifest;
 
 pub(crate) async fn publish<R>(
@@ -31,7 +34,7 @@ where
         catalog::ensure_alias_available(repository, alias, &metadata.id).await?;
     }
 
-    let stored = repository.store_snapshot(&metadata, &manifest).await?;
+    let stored = store::store_snapshot(repository, &metadata, &manifest).await?;
     let StoredSnapshot {
         rootfs_layers,
         memory_layers,
@@ -63,10 +66,8 @@ where
             })
         }
         Err(error) => {
-            // Content-addressed managed layers stay; other snapshots may share them.
-            if let Err(cleanup) = repository
-                .delete_snapshot_files(&metadata.id, &disk_publications)
-                .await
+            if let Err(cleanup) =
+                store::delete_snapshot(repository, &metadata.id, &disk_publications).await
             {
                 warn!(snapshot_id = %metadata.id, error = %cleanup, "failed to roll back snapshot files");
             }
@@ -197,7 +198,8 @@ pub(crate) async fn finish_startup_manifest(
             }
         })?;
         info!(snapshot_id = %id, manifest_bytes = manifest.len(), "startup manifest built");
-        repository.put_startup_manifest(&id, manifest).await?;
+        let key = BlobKey::Snapshot(id.clone(), SnapshotFile::StartupManifest);
+        repository.put_blob(&key, BlobBody::Bytes(manifest)).await?;
         RepositoryResult::Ok(info)
     }
     .await;
@@ -205,29 +207,23 @@ pub(crate) async fn finish_startup_manifest(
         Ok(info) => info,
         Err(error) => {
             warn!(%error, snapshot_id = %id, "startup manifest failed (best-effort)");
-            // A retried publish may have left a manifest from an earlier attempt.
-            remove_startup_manifest(repository.as_ref(), &id).await;
             return;
         }
     };
-    if abort_requested() {
-        return;
-    }
+    // Attach even when aborting, or the stored manifest is never removed.
     match catalog::attach_startup_manifest(repository.as_ref(), &id, info).await {
         Ok(true) => {}
         Ok(false) => {
+            // The delete may have removed the snapshot's files before the
+            // manifest was stored.
             debug!(snapshot_id = %id, "snapshot deleted while attaching its startup manifest");
-            remove_startup_manifest(repository.as_ref(), &id).await;
+            if let Err(error) = repository.delete_snapshot_blobs(&id).await {
+                warn!(%error, snapshot_id = %id, "failed to remove the files of a deleted snapshot");
+            }
         }
         Err(error) => {
             warn!(%error, snapshot_id = %id, "attach startup manifest failed (best-effort)");
         }
-    }
-}
-
-async fn remove_startup_manifest(repository: &dyn Repository, id: &SnapshotId) {
-    if let Err(error) = repository.delete_startup_manifest(id).await {
-        debug!(%error, snapshot_id = %id, "remove startup manifest failed");
     }
 }
 

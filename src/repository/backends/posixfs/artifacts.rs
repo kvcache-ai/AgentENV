@@ -1,19 +1,12 @@
-use overlaybd::config::load_image_config as load_overlaybd_image_config;
-use overlaybd::dense_export;
-use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
-use super::super::common::write_dense_overlaybd_layer_to_file_blocking;
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::digest::{self, FileDigest};
-use crate::repository::{RepositoryError, RepositoryResult};
-use crate::sandbox::SandboxSnapshotManifest;
-use crate::snapshot::{
-    CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
-};
+use crate::repository::{BlobBody, BlobKey, RepositoryError, RepositoryResult};
+use crate::snapshot::SnapshotId;
 
 /// Artifact store backed by files in a POSIX-compatible shared filesystem.
 pub struct PosixFsArtifactStore {
@@ -33,13 +26,62 @@ impl PosixFsArtifactStore {
         PosixFsSnapshotArtifactLayout::new(&self.root, snapshot_id)
     }
 
-    /// Imports one snapshot's files into its own directory and its layers into
-    /// the shared managed-layer store, removing the directory on failure.
-    pub(crate) fn store_snapshot(
+    pub(crate) fn put_blob(&self, key: &BlobKey, body: BlobBody<'_>) -> RepositoryResult<()> {
+        match (key, body) {
+            (BlobKey::Layer { digest, .. }, BlobBody::File(source)) => {
+                self.put_layer(digest, source)
+            }
+            (BlobKey::Layer { digest, .. }, BlobBody::Bytes(bytes)) => {
+                let mut staged = self.staging_file()?;
+                std::io::Write::write_all(&mut staged, &bytes).map_err(|error| {
+                    RepositoryError::backend(format!("write '{}'", staged.path().display()), error)
+                })?;
+                self.put_layer(digest, staged.path())
+            }
+            (BlobKey::Snapshot(id, file), BlobBody::File(source)) => {
+                self.put_snapshot_file(id, file.name(), source)
+            }
+            (BlobKey::Snapshot(id, file), BlobBody::Bytes(bytes)) => {
+                self.put_snapshot_bytes(id, file.name(), &bytes)
+            }
+        }
+    }
+
+    /// A temporary file on the repository's filesystem, so storing it as a
+    /// layer links it in without copying.
+    pub(crate) fn staging_file(&self) -> RepositoryResult<NamedTempFile> {
+        let staging_dir = PosixFsSnapshotArtifactLayout::staging_dir(&self.root);
+        fs::create_dir_all(&staging_dir).map_err(|error| {
+            RepositoryError::backend(
+                format!("create staging dir '{}'", staging_dir.display()),
+                error,
+            )
+        })?;
+        NamedTempFile::new_in(&staging_dir).map_err(|error| {
+            RepositoryError::backend(
+                format!("create staging file in '{}'", staging_dir.display()),
+                error,
+            )
+        })
+    }
+
+    /// Stores one snapshot file from `source`, hard-linking it when possible.
+    fn put_snapshot_file(
         &self,
         snapshot_id: &SnapshotId,
-        manifest: &SandboxSnapshotManifest,
-    ) -> RepositoryResult<CollectedBuiltArtifacts> {
+        name: &str,
+        source: &Path,
+    ) -> RepositoryResult<()> {
+        self.copy_local_artifact(self.committed_layout(snapshot_id).path(name), source)
+    }
+
+    /// Stores one snapshot file, creating the snapshot's directory.
+    fn put_snapshot_bytes(
+        &self,
+        snapshot_id: &SnapshotId,
+        name: &str,
+        bytes: &[u8],
+    ) -> RepositoryResult<()> {
         let snapshot_dir = self.committed_layout(snapshot_id).snapshot_dir();
         fs::create_dir_all(&snapshot_dir).map_err(|error| {
             RepositoryError::backend(
@@ -47,17 +89,14 @@ impl PosixFsArtifactStore {
                 error,
             )
         })?;
-        self.import_built_artifacts(snapshot_id, manifest)
-            .inspect_err(|_| {
-                let _ = fs::remove_dir_all(&snapshot_dir);
-            })
+        self.write_snapshot_file(snapshot_id, name, bytes)
     }
 
     /// Removes one snapshot's directory. Shared managed layers stay.
     pub(crate) fn delete_snapshot_files(&self, snapshot_id: &SnapshotId) -> RepositoryResult<()> {
         let snapshot_dir = self.committed_layout(snapshot_id).snapshot_dir();
         match fs::remove_dir_all(&snapshot_dir) {
-            Ok(()) => Ok(()),
+            Ok(()) => snapshot_dir.parent().map_or(Ok(()), sync_dir),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(RepositoryError::backend(
                 format!("remove '{}'", snapshot_dir.display()),
@@ -66,141 +105,31 @@ impl PosixFsArtifactStore {
         }
     }
 
-    /// Writes one snapshot's startup manifest, only while its directory exists.
-    pub(crate) fn put_startup_manifest(
+    /// Atomically replaces one file in an existing snapshot directory.
+    fn write_snapshot_file(
         &self,
         snapshot_id: &SnapshotId,
+        name: &str,
         bytes: &[u8],
     ) -> RepositoryResult<()> {
         let layout = self.committed_layout(snapshot_id);
         let snapshot_dir = layout.snapshot_dir();
-        let path = layout.path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
+        let path = layout.path(name);
         let mut temp = NamedTempFile::new_in(&snapshot_dir).map_err(|error| {
             RepositoryError::backend(
-                format!("create manifest temp in '{}'", snapshot_dir.display()),
+                format!("create temp file in '{}'", snapshot_dir.display()),
                 error,
             )
         })?;
         std::io::Write::write_all(&mut temp, bytes)
             .and_then(|()| temp.as_file().sync_all())
             .map_err(|error| {
-                RepositoryError::backend(format!("write manifest '{}'", path.display()), error)
+                RepositoryError::backend(format!("write '{}'", path.display()), error)
             })?;
         temp.persist(&path).map_err(|error| {
-            RepositoryError::backend(
-                format!("persist manifest '{}'", path.display()),
-                error.error,
-            )
+            RepositoryError::backend(format!("persist '{}'", path.display()), error.error)
         })?;
-        Ok(())
-    }
-
-    pub(crate) fn delete_startup_manifest(&self, snapshot_id: &SnapshotId) -> RepositoryResult<()> {
-        let path = self
-            .committed_layout(snapshot_id)
-            .path(crate::snapshot::MEMORY_STARTUP_PACK_ARTIFACT);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(RepositoryError::backend(
-                format!("remove '{}'", path.display()),
-                error,
-            )),
-        }
-    }
-
-    pub(crate) fn publish_volume_backing(
-        &self,
-        image_config_path: &Path,
-    ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
-        self.derive_rootfs_layers(image_config_path, true)
-    }
-
-    /// Imports manager-owned local build artifacts into committed repository storage.
-    ///
-    /// Flow:
-    /// 1. copy committed fixed-layout runtime files into the snapshot directory
-    ///    (currently only `vm_state.bin`)
-    /// 2. derive committed logical layer manifests from the local build-time image configs
-    /// 3. import any managed lower layers into the shared managed-layer store
-    /// 4. convert attached-drive publish input into committed attached-drive metadata
-    ///
-    /// Note that committed snapshot metadata intentionally does not persist the
-    /// build-time `image.json` files. Runtime resolvers regenerate those files
-    /// from the committed manifest plus backend layout conventions.
-    fn import_built_artifacts(
-        &self,
-        snapshot_id: &SnapshotId,
-        manifest: &SandboxSnapshotManifest,
-    ) -> RepositoryResult<CollectedBuiltArtifacts> {
-        let committed_layout = self.committed_layout(snapshot_id);
-
-        self.copy_local_artifact(
-            committed_layout.path(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
-            &manifest.vm_state.path,
-        )?;
-        self.persist_firecracker_manifest(
-            committed_layout.path(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest),
-            manifest,
-        )?;
-        let memory_layers = self.derive_memory_layers(&manifest.memory.image_config_path)?;
-
-        let attached_drives = manifest
-            .attached_drives
-            .iter()
-            .map(|drive| {
-                // The committed attached-drive manifest stores logical layers only.
-                // The build-time image config is used here as an input for deriving
-                // those layers, but is not copied into the committed repository.
-                let rootfs_layers = self.derive_rootfs_layers(&drive.image_config_path, false)?;
-                Ok(CommittedAttachedDrive::Overlaybd {
-                    drive_id: drive.drive_id.clone(),
-                    layers: rootfs_layers,
-                    read_only: drive.read_only,
-                    virtual_size: drive.virtual_size,
-                    mount_path: crate::sandbox::normalize_mount_path_for_drive(
-                        &drive.drive_id,
-                        drive.mount_path.clone(),
-                    )
-                    .unwrap_or_else(|_| {
-                        crate::sandbox::ExtraDrive::default_mount_path(&drive.drive_id)
-                    }),
-                    sub_path: drive.sub_path.clone(),
-                })
-            })
-            .collect::<RepositoryResult<Vec<_>>>()?;
-
-        let rootfs_layers = self.derive_rootfs_layers(&manifest.rootfs.image_config_path, false)?;
-
-        Ok(CollectedBuiltArtifacts {
-            rootfs_layers,
-            memory_layers,
-            attached_drives,
-        })
-    }
-
-    fn persist_firecracker_manifest(
-        &self,
-        destination: PathBuf,
-        manifest: &crate::sandbox::SandboxSnapshotManifest,
-    ) -> RepositoryResult<()> {
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                RepositoryError::backend(
-                    format!("create firecracker manifest dir '{}'", parent.display()),
-                    error,
-                )
-            })?;
-        }
-        let bytes = serde_json::to_vec_pretty(manifest)
-            .map_err(|error| RepositoryError::backend("serialize firecracker manifest", error))?;
-        fs::write(&destination, bytes).map_err(|error| {
-            RepositoryError::backend(
-                format!("write firecracker manifest '{}'", destination.display()),
-                error,
-            )
-        })?;
-        Ok(())
+        sync_dir(&snapshot_dir)
     }
 
     fn copy_local_artifact(&self, destination: PathBuf, source: &Path) -> RepositoryResult<()> {
@@ -248,15 +177,19 @@ impl PosixFsArtifactStore {
         Ok(())
     }
 
-    fn store_managed_layer(
-        &self,
-        source: &Path,
-        digest: &str,
-        size: u64,
-        uuid: Option<String>,
-    ) -> RepositoryResult<crate::snapshot::ManagedLayer> {
+    /// Stores a content-addressed layer unless one is already there,
+    /// hard-linking it when possible.
+    fn put_layer(&self, digest: &str, source: &Path) -> RepositoryResult<()> {
         let destination = PosixFsSnapshotArtifactLayout::managed_layer_path(&self.root, digest);
         if destination.exists() {
+            let size = fs::metadata(source)
+                .map_err(|error| {
+                    RepositoryError::backend(
+                        format!("read managed layer metadata '{}'", source.display()),
+                        error,
+                    )
+                })?
+                .len();
             let destination_size = fs::metadata(&destination)
                 .map_err(|error| {
                     RepositoryError::backend(
@@ -268,17 +201,13 @@ impl PosixFsArtifactStore {
             if destination_size != size {
                 return Err(RepositoryError::Backend {
                     message: format!(
-                        "managed layer '{}' size mismatch: descriptor says {}, existing file has {}",
+                        "managed layer '{}' size mismatch: new file has {}, existing file has {}",
                         digest, size, destination_size
                     ),
                     source: None,
                 });
             }
-            return Ok(crate::snapshot::ManagedLayer {
-                digest: digest.to_string(),
-                size,
-                uuid,
-            });
+            return Ok(());
         }
 
         let Some(parent) = destination.parent() else {
@@ -300,311 +229,8 @@ impl PosixFsArtifactStore {
         // safe for layers produced by AgentENV/image-cache/snapshot restack
         // because they are sealed or content-addressed after publication.
         hard_link_or_copy_managed_layer(source, &destination, parent)?;
-        sync_dir(parent)?;
-
-        Ok(crate::snapshot::ManagedLayer {
-            digest: digest.to_string(),
-            size,
-            uuid,
-        })
+        sync_dir(parent)
     }
-
-    fn store_sparse_overlaybd_layer_dense(
-        &self,
-        source: &Path,
-    ) -> RepositoryResult<crate::snapshot::ManagedLayer> {
-        let destination_parent = PosixFsSnapshotArtifactLayout::managed_layers_dir(&self.root);
-        fs::create_dir_all(&destination_parent).map_err(|error| {
-            RepositoryError::backend(
-                format!(
-                    "create managed layer dir '{}'",
-                    destination_parent.display()
-                ),
-                error,
-            )
-        })?;
-
-        let temp = NamedTempFile::new_in(&destination_parent).map_err(|error| {
-            RepositoryError::backend(
-                format!(
-                    "create temp dense managed layer in '{}'",
-                    destination_parent.display()
-                ),
-                error,
-            )
-        })?;
-        let temp_path = temp.path().to_path_buf();
-        let descriptor =
-            write_dense_overlaybd_layer_to_file_blocking(source, &temp_path).map_err(|error| {
-                RepositoryError::backend(
-                    format!("dense-export sparse overlaybd layer '{}'", source.display()),
-                    error,
-                )
-            })?;
-
-        let destination =
-            PosixFsSnapshotArtifactLayout::managed_layer_path(&self.root, &descriptor.digest);
-        if destination.exists() {
-            let destination_size = fs::metadata(&destination)
-                .map_err(|error| {
-                    RepositoryError::backend(
-                        format!("read managed layer metadata '{}'", destination.display()),
-                        error,
-                    )
-                })?
-                .len();
-            if destination_size != descriptor.size {
-                return Err(RepositoryError::Backend {
-                    message: format!(
-                        "managed layer '{}' size mismatch: descriptor says {}, existing file has {}",
-                        descriptor.digest, descriptor.size, destination_size
-                    ),
-                    source: None,
-                });
-            }
-            return Ok(crate::snapshot::ManagedLayer {
-                digest: descriptor.digest,
-                size: descriptor.size,
-                uuid: None,
-            });
-        }
-
-        temp.as_file().sync_all().map_err(|error| {
-            RepositoryError::backend(
-                format!("sync temp managed layer '{}'", temp_path.display()),
-                error,
-            )
-        })?;
-        match temp.persist_noclobber(&destination) {
-            Ok(_) => {}
-            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(RepositoryError::backend(
-                    format!(
-                        "persist dense managed layer temp '{}' -> '{}'",
-                        error.file.path().display(),
-                        destination.display()
-                    ),
-                    error.error,
-                ));
-            }
-        }
-
-        Ok(crate::snapshot::ManagedLayer {
-            digest: descriptor.digest,
-            size: descriptor.size,
-            uuid: None,
-        })
-    }
-
-    fn import_managed_layer_with_descriptor(
-        &self,
-        source: &Path,
-        digest: &str,
-        size: u64,
-    ) -> RepositoryResult<crate::snapshot::ManagedLayer> {
-        let canonical = fs::canonicalize(source).map_err(|error| {
-            RepositoryError::backend(
-                format!("canonicalize managed layer source '{}'", source.display()),
-                error,
-            )
-        })?;
-        let source_size = fs::metadata(&canonical)
-            .map_err(|error| {
-                RepositoryError::backend(
-                    format!(
-                        "read managed layer source metadata '{}'",
-                        canonical.display()
-                    ),
-                    error,
-                )
-            })?
-            .len();
-        if source_size != size {
-            return Err(RepositoryError::Backend {
-                message: format!(
-                    "managed layer descriptor size mismatch for '{}': descriptor says {}, file has {}",
-                    canonical.display(),
-                    size,
-                    source_size
-                ),
-                source: None,
-            });
-        }
-
-        // Descriptor-backed imports intentionally trust internally generated
-        // content digests and only validate the cheap size invariant here.
-        let managed =
-            self.store_managed_layer(&canonical, digest, size, overlaybd_layer_uuid(&canonical))?;
-        Ok(managed)
-    }
-
-    fn import_managed_layer_by_hash(
-        &self,
-        source: &Path,
-    ) -> RepositoryResult<crate::snapshot::ManagedLayer> {
-        let canonical = fs::canonicalize(source).map_err(|error| {
-            RepositoryError::backend(
-                format!("canonicalize managed layer source '{}'", source.display()),
-                error,
-            )
-        })?;
-        let descriptor = FileDigest::describe_blocking(&canonical).map_err(|error| {
-            RepositoryError::backend(
-                format!("describe managed layer source '{}'", canonical.display()),
-                error,
-            )
-        })?;
-        let managed = self.store_managed_layer(
-            &canonical,
-            &descriptor.sha256,
-            descriptor.size,
-            overlaybd_layer_uuid(&canonical),
-        )?;
-        Ok(managed)
-    }
-
-    fn import_descriptorless_rootfs_layer(
-        &self,
-        source: &Path,
-    ) -> RepositoryResult<crate::snapshot::ManagedLayer> {
-        let canonical = fs::canonicalize(source).map_err(|error| {
-            RepositoryError::backend(
-                format!("canonicalize managed layer source '{}'", source.display()),
-                error,
-            )
-        })?;
-        if dense_export::should_dense_export_layer(&canonical) {
-            return self.store_sparse_overlaybd_layer_dense(&canonical);
-        }
-        self.import_managed_layer_by_hash(&canonical)
-    }
-
-    fn derive_rootfs_layers(
-        &self,
-        image_config_path: &Path,
-        allow_descriptorless: bool,
-    ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
-        let image_config = load_overlaybd_image_config(image_config_path).map_err(|error| {
-            RepositoryError::backend(
-                format!(
-                    "load overlaybd image config for rootfs layout '{}'",
-                    image_config_path.display()
-                ),
-                error,
-            )
-        })?;
-
-        let layers = image_config
-            .lowers
-            .into_iter()
-            .enumerate()
-            .map(|(index, layer)| {
-                if !layer.file.is_empty() {
-                    let layer_path = Path::new(&layer.file);
-                    if !layer.digest.is_empty() && layer.size > 0 {
-                        return self
-                            .import_managed_layer_with_descriptor(
-                                layer_path,
-                                &layer.digest,
-                                layer.size,
-                            )
-                            .map(OverlaybdLayerRef::Managed);
-                    }
-                    if allow_descriptorless
-                        || crate::image::local_layer::rootfs_layer_is_runtime_generated_delta(
-                            layer_path,
-                        )
-                    {
-                        return self
-                            .import_descriptorless_rootfs_layer(layer_path)
-                            .map(OverlaybdLayerRef::Managed);
-                    }
-                    return Err(RepositoryError::Unsupported {
-                        feature: format!(
-                            "local overlaybd lower layer {index} '{}' missing digest/size",
-                            layer_path.display()
-                        ),
-                    });
-                }
-
-                let repo_blob_url = layer
-                    .effective_repo_blob_url(&image_config.repo_blob_url)
-                    .to_string();
-                if !repo_blob_url.is_empty() {
-                    return Ok(OverlaybdLayerRef::External(
-                        crate::snapshot::ExternalLayer {
-                            digest: if !layer.digest.is_empty() {
-                                layer.digest
-                            } else if !layer.target_digest.is_empty() {
-                                layer.target_digest
-                            } else {
-                                format!("external:{index}")
-                            },
-                            repo_blob_url: repo_blob_url.clone(),
-                            size: layer.size,
-                        },
-                    ));
-                }
-
-                Err(RepositoryError::Unsupported {
-                    feature: format!(
-                        "overlaybd lower layer {index} without local file or repoBlobUrl"
-                    ),
-                })
-            })
-            .collect::<RepositoryResult<Vec<_>>>()?;
-
-        Ok(layers)
-    }
-
-    /// Derive memory layers from a committed memory image config.
-    ///
-    /// Each lower with a local `file` path is imported as a managed layer,
-    /// exactly like `derive_rootfs_layout` does for disk layers.
-    fn derive_memory_layers(
-        &self,
-        mem_image_config_path: &Path,
-    ) -> RepositoryResult<Vec<ManagedLayer>> {
-        let image_config = load_overlaybd_image_config(mem_image_config_path).map_err(|error| {
-            RepositoryError::backend(
-                format!(
-                    "load mem image config for memory layers '{}'",
-                    mem_image_config_path.display()
-                ),
-                error,
-            )
-        })?;
-
-        image_config
-            .lowers
-            .into_iter()
-            .enumerate()
-            .map(|(index, layer)| {
-                if layer.file.is_empty() {
-                    return Err(RepositoryError::Unsupported {
-                        feature: format!("memory layer {index} without local file path"),
-                    });
-                }
-                let layer_path = Path::new(&layer.file);
-                if !layer.digest.is_empty() && layer.size > 0 {
-                    return self.import_managed_layer_with_descriptor(
-                        layer_path,
-                        &layer.digest,
-                        layer.size,
-                    );
-                }
-                self.import_managed_layer_by_hash(layer_path)
-            })
-            .collect()
-    }
-}
-
-fn overlaybd_layer_uuid(source: &Path) -> Option<String> {
-    read_overlaybd_layer_uuid(source)
-        .ok()
-        .filter(|uuid| !uuid.is_nil())
-        .map(|uuid| uuid.to_string())
 }
 
 fn same_file(source_metadata: &fs::Metadata, destination: &Path) -> RepositoryResult<bool> {
@@ -784,13 +410,6 @@ fn copy_file_with_sha256(source: &Path, destination: &Path) -> RepositoryResult<
     Ok(())
 }
 
-#[derive(Debug)]
-pub(crate) struct CollectedBuiltArtifacts {
-    pub(crate) rootfs_layers: Vec<OverlaybdLayerRef>,
-    pub(crate) memory_layers: Vec<ManagedLayer>,
-    pub(crate) attached_drives: Vec<CommittedAttachedDrive>,
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -802,20 +421,31 @@ mod tests {
     use overlaybd::index_file::{CommitArgs, LSMTFile};
     use overlaybd::virtual_file::VirtualFile;
     use overlaybd::zfile::{is_zfile, CompressArgs, CompressOptions, ZFileCompactWriter};
-    use serde_json::json;
     use tempfile::TempDir;
 
+    use super::super::backend::PosixFsRepository;
+    use super::super::catalog::PosixFsCatalogStore;
     use super::super::layout::{managed_layer_file_name, PosixFsSnapshotArtifactLayout};
     use super::PosixFsArtifactStore;
     use crate::digest::FileDigest;
     use crate::snapshot::mock::write_mock_built_artifacts;
+    use crate::snapshot::store::store_snapshot;
     use crate::snapshot::{
-        CommittedAttachedDrive, ExternalLayer, OverlaybdLayerRef, SnapshotId,
-        SNAPSHOT_ARTIFACT_LAYOUT,
+        CommittedAttachedDrive, SnapshotId, SnapshotPublishMetadata, SNAPSHOT_ARTIFACT_LAYOUT,
     };
 
-    fn test_store(root: &std::path::Path) -> PosixFsArtifactStore {
-        PosixFsArtifactStore::new(root.to_path_buf())
+    fn test_repository(root: &std::path::Path) -> PosixFsRepository {
+        PosixFsRepository::new(
+            Arc::new(PosixFsCatalogStore::new(root.to_path_buf())),
+            Arc::new(PosixFsArtifactStore::new(root.to_path_buf())),
+        )
+    }
+
+    fn metadata(id: &SnapshotId) -> SnapshotPublishMetadata {
+        SnapshotPublishMetadata {
+            id: id.clone(),
+            ..SnapshotPublishMetadata::mock()
+        }
     }
 
     fn assert_same_inode(left: &std::path::Path, right: &std::path::Path) {
@@ -825,59 +455,10 @@ mod tests {
         assert_eq!(left_metadata.ino(), right_metadata.ino());
     }
 
-    #[test]
-    fn derives_external_layers_from_layer_repo_blob_urls() {
+    #[tokio::test]
+    async fn attached_drive_rootfs_layers_are_derived_from_resolved_lower_paths() {
         let tempdir = TempDir::new().expect("tempdir");
-        let store = test_store(tempdir.path());
-        let image = tempdir.path().join("image.json");
-        fs::write(
-            &image,
-            serde_json::to_vec_pretty(&json!({
-                "repoBlobUrl": "",
-                "lowers": [
-                    {
-                        "digest": "sha256:base",
-                        "size": 4096,
-                        "repoBlobUrl": "https://registry.example/v2/ns/image/blobs"
-                    },
-                    {
-                        "digest": "sha256:delta",
-                        "size": 8192,
-                        "repoBlobUrl": "s3://bucket/prefix/managed-layers"
-                    }
-                ],
-                "upper": {},
-                "resultFile": ""
-            }))
-            .expect("serialize image config"),
-        )
-        .expect("write image config");
-
-        let layers = store
-            .derive_rootfs_layers(&image, false)
-            .expect("derive layers");
-
-        assert_eq!(
-            layers,
-            vec![
-                OverlaybdLayerRef::External(ExternalLayer {
-                    digest: "sha256:base".to_string(),
-                    repo_blob_url: "https://registry.example/v2/ns/image/blobs".to_string(),
-                    size: 4096,
-                }),
-                OverlaybdLayerRef::External(ExternalLayer {
-                    digest: "sha256:delta".to_string(),
-                    repo_blob_url: "s3://bucket/prefix/managed-layers".to_string(),
-                    size: 8192,
-                }),
-            ]
-        );
-    }
-
-    #[test]
-    fn attached_drive_rootfs_layers_are_derived_from_resolved_lower_paths() {
-        let tempdir = TempDir::new().expect("tempdir");
-        let store = test_store(tempdir.path());
+        let repository = test_repository(tempdir.path());
         let snapshot_id = SnapshotId::generate();
         let local_dir = tempdir.path().join("local");
         let (_, _, mut manifest) = write_mock_built_artifacts(local_dir.as_path())
@@ -926,8 +507,8 @@ mod tests {
             }])
             .expect("attached drive manifest should include virtual size");
 
-        let built = store
-            .import_built_artifacts(&snapshot_id, &manifest)
+        let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
+            .await
             .expect("import built artifacts");
 
         let path = match &built.attached_drives[0] {
@@ -950,16 +531,16 @@ mod tests {
         assert!(tempdir.path().join(&path).exists());
     }
 
-    #[test]
-    fn import_built_artifacts_extracts_rootfs_layers_from_image_config() {
+    #[tokio::test]
+    async fn store_snapshot_extracts_rootfs_layers_from_image_config() {
         let tempdir = TempDir::new().expect("tempdir");
-        let store = test_store(tempdir.path());
+        let repository = test_repository(tempdir.path());
         let snapshot_id = SnapshotId::generate();
         let local_dir = tempdir.path().join("local");
         let (_, _, manifest) = write_mock_built_artifacts(local_dir.as_path())
             .expect("mock built artifacts should write");
-        let built = store
-            .import_built_artifacts(&snapshot_id, &manifest)
+        let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
+            .await
             .expect("collect built artifacts");
 
         assert_eq!(built.rootfs_layers.len(), 1);
@@ -976,18 +557,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn import_built_artifacts_hard_links_local_publish_artifacts_when_possible() {
+    #[tokio::test]
+    async fn store_snapshot_hard_links_local_publish_artifacts_when_possible() {
         let tempdir = TempDir::new().expect("tempdir");
-        let store = test_store(tempdir.path());
+        let repository = test_repository(tempdir.path());
         let snapshot_id = SnapshotId::generate();
         let local_dir = tempdir.path().join("local");
         let (rootfs_lower, memory_lower, manifest) =
             write_mock_built_artifacts(local_dir.as_path())
                 .expect("mock built artifacts should write");
 
-        let built = store
-            .import_built_artifacts(&snapshot_id, &manifest)
+        let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
+            .await
             .expect("collect built artifacts");
 
         let committed_layout = PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id);
@@ -1019,10 +600,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn import_built_artifacts_uses_declared_local_layer_descriptor() {
+    #[tokio::test]
+    async fn store_snapshot_uses_declared_local_layer_descriptor() {
         let tempdir = TempDir::new().expect("tempdir");
-        let store = test_store(tempdir.path());
+        let repository = test_repository(tempdir.path());
         let snapshot_id = SnapshotId::generate();
         let local_dir = tempdir.path().join("local");
         let (rootfs_lower, _, manifest) = write_mock_built_artifacts(local_dir.as_path())
@@ -1045,8 +626,8 @@ mod tests {
         )
         .expect("write descriptor rootfs image config");
 
-        let built = store
-            .import_built_artifacts(&snapshot_id, &manifest)
+        let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
+            .await
             .expect("collect built artifacts");
 
         match &built.rootfs_layers[0] {
@@ -1063,16 +644,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn import_built_artifacts_keeps_mem_image_config_local_only() {
+    #[tokio::test]
+    async fn store_snapshot_keeps_mem_image_config_local_only() {
         let tempdir = TempDir::new().expect("tempdir");
-        let store = test_store(tempdir.path());
+        let repository = test_repository(tempdir.path());
         let snapshot_id = SnapshotId::generate();
         let local_dir = tempdir.path().join("local");
         let (_, _, manifest) = write_mock_built_artifacts(local_dir.as_path())
             .expect("mock built artifacts should write");
-        let built = store
-            .import_built_artifacts(&snapshot_id, &manifest)
+        let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
+            .await
             .expect("collect built artifacts");
 
         assert_eq!(built.memory_layers.len(), 1);
@@ -1095,6 +676,55 @@ mod tests {
                 .exists(),
             "committed snapshot dir should not persist mem_image.json"
         );
+    }
+
+    #[tokio::test]
+    async fn store_snapshot_links_dense_exports_in_from_staging() {
+        let tempdir = TempDir::new().expect("tempdir");
+        let repository = test_repository(tempdir.path());
+        let snapshot_id = SnapshotId::generate();
+        let local_dir = tempdir.path().join("local");
+        let (_, _, manifest) = write_mock_built_artifacts(local_dir.as_path())
+            .expect("mock built artifacts should write");
+        // A captured sparse rootfs delta, which is dense-exported to be stored.
+        let delta_path = local_dir.join("snapshot.commit");
+        let data: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::new(&delta_path).expect("create delta"));
+        let delta = LSMTFile::create(data, None, 2 * 4096, true)
+            .await
+            .expect("create sparse delta");
+        delta.write_at(0, &[0xBC; 4096]).await.expect("write delta");
+        delta.close_seal().await.expect("seal delta");
+        drop(delta);
+        fs::write(
+            &manifest.rootfs.image_config_path,
+            format!(r#"{{"lowers":[{{"file":"{}"}}]}}"#, delta_path.display()),
+        )
+        .expect("write rootfs image config");
+
+        let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
+            .await
+            .expect("store snapshot");
+
+        let crate::snapshot::OverlaybdLayerRef::Managed(layer) = &built.rootfs_layers[0] else {
+            panic!("expected managed rootfs layer");
+        };
+        let staged = built
+            .local_layers
+            .iter()
+            .find(|upload| upload.digest() == layer.digest)
+            .expect("dense export kept for publication");
+        let staging_dir = tempdir.path().join("staging");
+        assert!(staged.path().starts_with(&staging_dir));
+        assert_same_inode(
+            staged.path(),
+            &tempdir
+                .path()
+                .join("managed-layers")
+                .join(managed_layer_file_name(&layer.digest)),
+        );
+        drop(built);
+        assert_eq!(fs::read_dir(&staging_dir).expect("staging dir").count(), 0);
     }
 
     /// Write a real ZFile-compressed sealed LSMT layer, mirroring a compressed
@@ -1135,9 +765,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn import_built_artifacts_preserves_zfile_memory_lower_bytes() {
+    async fn store_snapshot_preserves_zfile_memory_lower_bytes() {
         let tempdir = TempDir::new().expect("tempdir");
-        let store = test_store(tempdir.path());
+        let repository = test_repository(tempdir.path());
         let snapshot_id = SnapshotId::generate();
         let local_dir = tempdir.path().join("local");
         let (_, _, manifest) = write_mock_built_artifacts(local_dir.as_path())
@@ -1156,8 +786,8 @@ mod tests {
         )
         .expect("write zfile memory image config");
 
-        let built = store
-            .import_built_artifacts(&snapshot_id, &manifest)
+        let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
+            .await
             .expect("import built artifacts");
 
         assert_eq!(built.memory_layers.len(), 1);

@@ -135,14 +135,11 @@ impl<R: Repository + ?Sized> SnapshotCatalog for R {
         publish::publish(self, metadata, manifest).await
     }
 
+    /// Snapshots being deleted are hidden, since their files may be gone.
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        if let Ok(id) = SnapshotId::parse(id_or_alias) {
-            if let Some(record) = read_record(self, &id).await? {
-                return Ok(Some(record));
-            }
-        }
-        let alias = parse_alias(id_or_alias)?;
-        Ok(alias_owner(self, &alias).await?.map(|(_, record)| record))
+        Ok(find_record(self, id_or_alias)
+            .await?
+            .filter(|record| !record.deleting))
     }
 
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
@@ -152,7 +149,7 @@ impl<R: Repository + ?Sized> SnapshotCatalog for R {
             .await?
         {
             let record = decode_record(&id, &bytes)?;
-            if matches_filter(&record, &filter) {
+            if !record.deleting && matches_filter(&record, &filter) {
                 records.push(record);
             }
         }
@@ -166,37 +163,64 @@ impl<R: Repository + ?Sized> SnapshotCatalog for R {
     }
 
     async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
-        let Some(record) = self.get(id_or_alias).await? else {
+        // A delete that failed partway leaves the record marked; retrying
+        // finishes it.
+        let Some(record) = find_record(self, id_or_alias).await? else {
             if let Ok(id) = SnapshotId::parse(id_or_alias) {
                 self.delete_document(DocumentKey::BuildLog(id)).await?;
             }
             return Ok(());
         };
         let id = record.id;
-        if let Some(alias) = record.alias {
-            release_alias(self, alias, &id).await?;
-        }
+        // A startup manifest stored from now on is removed rather than
+        // attached, even if it lands after the files are deleted, and the
+        // snapshot can no longer be committed. Cleanup uses the record as
+        // marked, which includes any commit that landed before.
+        let marked = update_record(self, &id, |_, record| {
+            Ok(match record {
+                Some(mut record) if !record.deleting => {
+                    record.deleting = true;
+                    (Some(record.clone()), Some(record))
+                }
+                record => (None, record),
+            })
+        })
+        .await?;
+        let Some(record) = marked else {
+            // Another delete finished first.
+            return Ok(());
+        };
         let publications = record
             .committed
             .map(|committed| committed.disk_publications)
             .unwrap_or_default();
-        // Files go before the record, so a failed delete can be retried.
-        self.delete_snapshot_files(&id, &publications).await?;
+        // Files go before the record, and the alias after it, so a failed
+        // delete can be retried by ID or alias.
+        super::store::delete_snapshot(self, &id, &publications).await?;
         self.delete_document(DocumentKey::BuildLog(id.clone()))
             .await?;
-        self.delete_document(DocumentKey::SnapshotRecord(id)).await
+        self.delete_document(DocumentKey::SnapshotRecord(id.clone()))
+            .await?;
+        if let Some(alias) = record.alias {
+            release_alias(self, alias, &id).await?;
+        }
+        Ok(())
     }
 
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
         let alias = parse_alias(alias)?;
-        Ok(alias_owner(self, &alias).await?.map(|(id, _)| id))
+        Ok(alias_owner(self, &alias)
+            .await?
+            .and_then(|(id, record)| (!record.deleting).then_some(id)))
     }
 
     async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
         let now = now_unix_ms();
         update_record(self, id, move |id, record| {
-            let mut record = record.ok_or_else(|| RepositoryError::SnapshotNotFound {
-                lookup: id.to_string(),
+            let mut record = record.filter(|record| !record.deleting).ok_or_else(|| {
+                RepositoryError::SnapshotNotFound {
+                    lookup: id.to_string(),
+                }
             })?;
             let build = template_build(&mut record)?;
             if build.status != TemplateBuildStatus::Waiting {
@@ -220,8 +244,10 @@ impl<R: Repository + ?Sized> SnapshotCatalog for R {
     ) -> RepositoryResult<()> {
         let now = now_unix_ms();
         update_record(self, id, move |id, record| {
-            let mut record = record.ok_or_else(|| RepositoryError::SnapshotNotFound {
-                lookup: id.to_string(),
+            let mut record = record.filter(|record| !record.deleting).ok_or_else(|| {
+                RepositoryError::SnapshotNotFound {
+                    lookup: id.to_string(),
+                }
             })?;
             let build = template_build(&mut record)?;
             build.status = TemplateBuildStatus::Error;
@@ -255,6 +281,11 @@ where
             if record.committed.is_some() {
                 return Err(RepositoryError::InvalidRequest {
                     reason: format!("snapshot '{}' is already committed", record.id),
+                });
+            }
+            if record.deleting {
+                return Err(RepositoryError::InvalidRequest {
+                    reason: format!("snapshot '{}' is being deleted", record.id),
                 });
             }
             record.mark_committed(
@@ -318,7 +349,8 @@ where
 }
 
 /// Records a stored startup manifest on a committed snapshot. Returns false
-/// when the snapshot is gone, so the caller can remove the manifest.
+/// when the snapshot is gone or being deleted, so the caller can remove its
+/// files.
 pub(crate) async fn attach_startup_manifest<R>(
     repository: &R,
     id: &SnapshotId,
@@ -329,11 +361,13 @@ where
 {
     let now = now_unix_ms();
     update_record(repository, id, move |_, record| {
-        let Some(mut record) = record else {
+        let Some(mut record) = record.filter(|record| !record.deleting) else {
             return Ok((None, false));
         };
         let Some(committed) = record.committed.as_mut() else {
-            return Ok((None, false));
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("snapshot '{}' is not committed", record.id),
+            });
         };
         if committed.memory_startup.is_some() {
             return Ok((None, true));
@@ -371,6 +405,7 @@ fn new_committed_record(
         created_at_unix_ms: now,
         updated_at_unix_ms: now,
         committed: Some(committed),
+        deleting: false,
     }
 }
 
@@ -522,6 +557,25 @@ where
     warn!(alias = %alias, snapshot_id = %id, "cleaning up stale alias pointing to missing snapshot");
     release_alias(repository, alias.clone(), &id).await?;
     Ok(None)
+}
+
+/// Finds a snapshot by ID or alias, including one being deleted.
+async fn find_record<R>(
+    repository: &R,
+    id_or_alias: &str,
+) -> RepositoryResult<Option<SnapshotRecord>>
+where
+    R: Repository + ?Sized,
+{
+    if let Ok(id) = SnapshotId::parse(id_or_alias) {
+        if let Some(record) = read_record(repository, &id).await? {
+            return Ok(Some(record));
+        }
+    }
+    let alias = parse_alias(id_or_alias)?;
+    Ok(alias_owner(repository, &alias)
+        .await?
+        .map(|(_, record)| record))
 }
 
 async fn read_record<R>(repository: &R, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>>
@@ -865,6 +919,33 @@ mod tests {
         assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
     }
 
+    #[tokio::test]
+    async fn template_builds_being_deleted_cannot_be_committed() {
+        let tempdir = TempDir::new().unwrap();
+        let repository = repository(tempdir.path());
+        let metadata = metadata(None, SnapshotPublishSource::Template);
+        let mut record =
+            SnapshotRecord::template_waiting(metadata.id.clone(), None, Default::default());
+        // A delete that stopped right after marking the record.
+        record.deleting = true;
+        repository
+            .put_document(
+                DocumentKey::SnapshotRecord(metadata.id.clone()),
+                encode_record(&record).unwrap(),
+            )
+            .await
+            .unwrap();
+        let error = commit(repository.as_ref(), &metadata, CommittedSnapshot::mock())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
+        let record = read_record(repository.as_ref(), &metadata.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(record.deleting && record.committed.is_none());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn one_builder_starts_each_template_build() {
         let tempdir = TempDir::new().unwrap();
@@ -929,5 +1010,84 @@ mod tests {
             .await
             .unwrap());
         assert!(repository.get(&id.to_string()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn startup_manifests_are_not_attached_once_a_delete_starts() {
+        let tempdir = TempDir::new().unwrap();
+        let repository = repository(tempdir.path());
+        let repository = repository.as_ref();
+        let id = committed(repository, None, SnapshotPublishSource::Template)
+            .await
+            .unwrap();
+        // A delete that stopped right after marking the record.
+        update_record(repository, &id, |_, record| {
+            let mut record = record.expect("committed record");
+            record.deleting = true;
+            Ok((Some(record), ()))
+        })
+        .await
+        .unwrap();
+
+        let info = MemoryStartupPackInfo {
+            pack_size: 1,
+            mem_virtual_size: 4096,
+            index_sha256: "digest".to_owned(),
+        };
+        assert!(!attach_startup_manifest(repository, &id, info)
+            .await
+            .unwrap());
+        repository.delete(&id.to_string()).await.unwrap();
+        assert!(repository.get(&id.to_string()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn snapshots_being_deleted_are_hidden_until_the_delete_finishes() {
+        let tempdir = TempDir::new().unwrap();
+        let repository = repository(tempdir.path());
+        let repository = repository.as_ref();
+        let id = committed(repository, Some("hidden"), SnapshotPublishSource::Template)
+            .await
+            .unwrap();
+        // A delete that failed after marking the record.
+        update_record(repository, &id, |_, record| {
+            let mut record = record.expect("committed record");
+            record.deleting = true;
+            Ok((Some(record), ()))
+        })
+        .await
+        .unwrap();
+
+        assert!(repository.get(&id.to_string()).await.unwrap().is_none());
+        assert!(repository.get("hidden").await.unwrap().is_none());
+        assert_eq!(repository.resolve_alias("hidden").await.unwrap(), None);
+        assert!(repository
+            .list(SnapshotListFilter::default())
+            .await
+            .unwrap()
+            .is_empty());
+
+        assert!(matches!(
+            repository.try_start_build(&id).await.unwrap_err(),
+            RepositoryError::SnapshotNotFound { .. }
+        ));
+        assert!(matches!(
+            repository
+                .mark_build_error(&id, TemplateBuildErrorReason::new("late"))
+                .await
+                .unwrap_err(),
+            RepositoryError::SnapshotNotFound { .. }
+        ));
+
+        // Retrying the delete by alias finishes it.
+        repository.delete("hidden").await.unwrap();
+        assert!(read_record(repository, &id).await.unwrap().is_none());
+        assert!(repository
+            .get_document(DocumentKey::SnapshotAlias(
+                SnapshotAlias::parse("hidden").unwrap()
+            ))
+            .await
+            .unwrap()
+            .is_none());
     }
 }

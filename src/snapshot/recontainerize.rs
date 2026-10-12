@@ -77,6 +77,28 @@ pub(crate) async fn prepare_layer_upload(
     mode: OverlaybdCompactOutput,
     trusted: Option<(&str, u64)>,
 ) -> RepositoryResult<PreparedLayerUpload> {
+    prepare_layer_upload_with(source, mode, trusted, || {
+        NamedTempFile::new().map_err(|e| {
+            RepositoryError::backend(
+                format!(
+                    "create temp zfile layer for recontainerizing '{}'",
+                    source.display()
+                ),
+                e,
+            )
+        })
+    })
+    .await
+}
+
+/// Like [`prepare_layer_upload`], recontainerizing into the temporary file
+/// `staging` creates.
+pub(crate) async fn prepare_layer_upload_with(
+    source: &Path,
+    mode: OverlaybdCompactOutput,
+    trusted: Option<(&str, u64)>,
+    staging: impl FnOnce() -> RepositoryResult<NamedTempFile>,
+) -> RepositoryResult<PreparedLayerUpload> {
     if matches!(mode, OverlaybdCompactOutput::Raw) {
         return passthrough(source, trusted).await;
     }
@@ -97,15 +119,7 @@ pub(crate) async fn prepare_layer_upload(
         return passthrough(source, trusted).await;
     }
 
-    let temp = NamedTempFile::new().map_err(|e| {
-        RepositoryError::backend(
-            format!(
-                "create temp zfile layer for recontainerizing '{}'",
-                source.display()
-            ),
-            e,
-        )
-    })?;
+    let temp = staging()?;
     let layer = LayerConfig {
         file: source.display().to_string(),
         ..LayerConfig::default()

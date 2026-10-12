@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use tempfile::NamedTempFile;
 use tokio::task;
 
 use super::super::{common::materialize_volume_image_config, shared_runtime_cache_root};
@@ -9,13 +10,13 @@ use super::artifacts::PosixFsArtifactStore;
 use super::catalog::PosixFsCatalogStore;
 use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
-use crate::repository::interfaces::{Repository, SnapshotRuntimeResolver, StoredSnapshot};
+use crate::repository::interfaces::{Repository, SnapshotRuntimeResolver};
 use crate::repository::{
-    DocumentCollection, DocumentKey, DocumentUpdate, RepositoryError, RepositoryResult,
+    BlobBody, BlobKey, DocumentCollection, DocumentKey, DocumentUpdate, RepositoryError,
+    RepositoryResult,
 };
-use crate::sandbox::SandboxSnapshotManifest;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
-use crate::snapshot::{PersistedDiskImagePublication, SnapshotId, SnapshotPublishMetadata};
+use crate::snapshot::SnapshotId;
 
 #[derive(Clone, Debug)]
 pub struct PosixFsBackendConfig {
@@ -137,31 +138,26 @@ impl PosixFsRepository {
 
 #[async_trait]
 impl Repository for PosixFsRepository {
-    async fn store_snapshot(
-        &self,
-        metadata: &SnapshotPublishMetadata,
-        manifest: &SandboxSnapshotManifest,
-    ) -> RepositoryResult<StoredSnapshot> {
-        let id = metadata.id.clone();
-        let manifest = manifest.clone();
-        let built = self
-            .run_artifacts("store snapshot", move |store| {
-                store.store_snapshot(&id, &manifest)
-            })
-            .await?;
-        Ok(StoredSnapshot {
-            rootfs_layers: built.rootfs_layers,
-            memory_layers: built.memory_layers,
-            attached_drives: built.attached_drives,
-            ..StoredSnapshot::default()
-        })
+    async fn put_blob(&self, key: &BlobKey, body: BlobBody<'_>) -> RepositoryResult<()> {
+        let key = key.clone();
+        match body {
+            BlobBody::File(source) => {
+                let source = source.to_path_buf();
+                self.run_artifacts("store blob", move |store| {
+                    store.put_blob(&key, BlobBody::File(&source))
+                })
+                .await
+            }
+            BlobBody::Bytes(bytes) => {
+                self.run_artifacts("store blob", move |store| {
+                    store.put_blob(&key, BlobBody::Bytes(bytes))
+                })
+                .await
+            }
+        }
     }
 
-    async fn delete_snapshot_files(
-        &self,
-        id: &SnapshotId,
-        _publications: &[PersistedDiskImagePublication],
-    ) -> RepositoryResult<()> {
+    async fn delete_snapshot_blobs(&self, id: &SnapshotId) -> RepositoryResult<()> {
         let id = id.clone();
         self.run_artifacts("delete snapshot files", move |store| {
             store.delete_snapshot_files(&id)
@@ -169,20 +165,8 @@ impl Repository for PosixFsRepository {
         .await
     }
 
-    async fn put_startup_manifest(&self, id: &SnapshotId, bytes: Vec<u8>) -> RepositoryResult<()> {
-        let id = id.clone();
-        self.run_artifacts("store startup manifest", move |store| {
-            store.put_startup_manifest(&id, &bytes)
-        })
-        .await
-    }
-
-    async fn delete_startup_manifest(&self, id: &SnapshotId) -> RepositoryResult<()> {
-        let id = id.clone();
-        self.run_artifacts("delete startup manifest", move |store| {
-            store.delete_startup_manifest(&id)
-        })
-        .await
+    fn staging_file(&self) -> RepositoryResult<NamedTempFile> {
+        self.artifact_store.staging_file()
     }
 
     async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
@@ -232,21 +216,6 @@ impl Repository for PosixFsRepository {
     ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
         self.run_catalog("read documents", move |store| {
             store.read_documents(collection)
-        })
-        .await
-    }
-
-    async fn publish_volume_backing(
-        &self,
-        _volume_id: &str,
-        image_config_path: &std::path::Path,
-    ) -> RepositoryResult<Vec<crate::snapshot::OverlaybdLayerRef>> {
-        let repository = self.clone();
-        let image_config_path = image_config_path.to_path_buf();
-        run_repository_blocking("publish volume backing", move || {
-            repository
-                .artifact_store
-                .publish_volume_backing(&image_config_path)
         })
         .await
     }

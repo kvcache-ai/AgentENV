@@ -783,11 +783,10 @@ impl VolumeManager {
 
     async fn publish_backing(&self, record: &mut VolumeRecord) -> Result<(), VolumeError> {
         if let Some(path) = record.backing_image_config.as_deref() {
-            record.backing_layers = self
-                .repository
-                .publish_volume_backing(&record.id, path)
-                .await
-                .map_err(repository_error)?;
+            record.backing_layers =
+                crate::snapshot::store::store_volume_layers(self.repository.as_ref(), path)
+                    .await
+                    .map_err(repository_error)?;
         }
         Ok(())
     }

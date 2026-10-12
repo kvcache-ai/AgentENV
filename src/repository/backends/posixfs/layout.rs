@@ -32,6 +32,11 @@ impl PosixFsSnapshotArtifactLayout {
         Self::managed_layers_dir(root).join(managed_layer_file_name(digest))
     }
 
+    /// Temporary files that blobs are prepared in before they are stored.
+    pub(super) fn staging_dir(root: &Path) -> PathBuf {
+        root.join("staging")
+    }
+
     pub(super) fn snapshot_dir(&self) -> PathBuf {
         Self::snapshots_dir(&self.root).join(self.snapshot_id.to_string())
     }

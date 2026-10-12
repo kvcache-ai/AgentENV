@@ -9,6 +9,7 @@ pub(crate) mod publish;
 pub(crate) mod recontainerize;
 pub(crate) mod runtime_support;
 pub(crate) mod startup_pack;
+pub(crate) mod store;
 mod types;
 
 pub use catalog::SnapshotCatalog;

@@ -2,14 +2,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tempfile::NamedTempFile;
 
 use super::errors::{RepositoryError, RepositoryResult};
 use super::{DocumentCollection, DocumentKey};
-use crate::sandbox::SandboxSnapshotManifest;
+use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::snapshot::{
-    CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, PersistedDiskImagePublication,
-    RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotSourceKind,
-    TemplateBuildStatus,
+    RunnableSnapshot, SnapshotId, SnapshotRecord, SnapshotSourceKind, TemplateBuildStatus,
+    MEMORY_STARTUP_PACK_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 /// A committed snapshot and the local upload files kept alive for post-commit
@@ -20,15 +20,71 @@ pub struct SnapshotPublication {
     pub(crate) local_layers: Vec<crate::snapshot::recontainerize::PreparedLayerUpload>,
 }
 
-/// What a backend stored for one snapshot before its record is committed.
-#[derive(Debug, Default)]
-pub struct StoredSnapshot {
-    pub rootfs_layers: Vec<OverlaybdLayerRef>,
-    pub memory_layers: Vec<ManagedLayer>,
-    pub attached_drives: Vec<CommittedAttachedDrive>,
-    pub disk_publications: Vec<PersistedDiskImagePublication>,
-    /// Transformed local layer files, kept for post-commit P2P publication.
-    pub(crate) local_layers: Vec<crate::snapshot::recontainerize::PreparedLayerUpload>,
+/// How snapshots and volumes are published into one repository.
+#[derive(Clone, Debug)]
+pub struct PublishPolicy {
+    /// Recontainerizes raw local layers as zfile before they are stored.
+    pub compression: SnapshotPublishCompressionConfig,
+    /// Whether disk images go to their source registry or to managed layers.
+    pub image_storage: SnapshotImageStoragePolicy,
+}
+
+impl Default for PublishPolicy {
+    /// Raw layers, stored as managed layers.
+    fn default() -> Self {
+        Self {
+            compression: SnapshotPublishCompressionConfig {
+                enabled: false,
+                ..SnapshotPublishCompressionConfig::default()
+            },
+            image_storage: SnapshotImageStoragePolicy::default(),
+        }
+    }
+}
+
+/// What a stored layer is used for. It labels metrics and logs only; layers
+/// are stored by digest alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerRole {
+    Rootfs,
+    AttachedDrive,
+    Memory,
+}
+
+/// One file a repository stores.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BlobKey {
+    /// A content-addressed layer, stored once for every snapshot and volume
+    /// that uses it.
+    Layer { digest: String, role: LayerRole },
+    /// One file of one snapshot, removed with the snapshot.
+    Snapshot(SnapshotId, SnapshotFile),
+}
+
+/// The files a snapshot stores besides its layers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotFile {
+    VmState,
+    FirecrackerManifest,
+    StartupManifest,
+}
+
+impl SnapshotFile {
+    /// The file's name among the snapshot's files.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::VmState => SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
+            Self::FirecrackerManifest => SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
+            Self::StartupManifest => MEMORY_STARTUP_PACK_ARTIFACT,
+        }
+    }
+}
+
+/// The contents [`Repository::put_blob`] stores.
+#[derive(Debug)]
+pub enum BlobBody<'a> {
+    File(&'a Path),
+    Bytes(Vec<u8>),
 }
 
 /// Snapshot record list filter.
@@ -134,39 +190,33 @@ impl SnapshotListFilter {
 /// layer imports must use atomic protocols so concurrent writers never expose
 /// half-written layers.
 pub trait Repository: Send + Sync {
-    /// Stores one captured snapshot's per-snapshot files and layers, before
-    /// its record is committed. On failure the backend removes what it
-    /// stored, except shared content-addressed layers.
-    async fn store_snapshot(
-        &self,
-        _metadata: &SnapshotPublishMetadata,
-        _manifest: &SandboxSnapshotManifest,
-    ) -> RepositoryResult<StoredSnapshot> {
-        unsupported("snapshot storage")
+    /// How snapshots and volumes are published into this repository.
+    fn publish_policy(&self) -> PublishPolicy {
+        PublishPolicy::default()
     }
 
-    /// Removes one snapshot's per-snapshot files and external disk
-    /// publications. Shared layers stay. Missing files are considered success.
-    async fn delete_snapshot_files(
-        &self,
-        _id: &SnapshotId,
-        _publications: &[PersistedDiskImagePublication],
-    ) -> RepositoryResult<()> {
-        unsupported("snapshot storage")
+    /// The overlaybd `repoBlobUrl` that reads layers stored here, if remote
+    /// readers address them by URL.
+    fn managed_layers_repo_blob_url(&self) -> Option<String> {
+        None
     }
 
-    /// Stores one snapshot's startup memory manifest.
-    async fn put_startup_manifest(
-        &self,
-        _id: &SnapshotId,
-        _bytes: Vec<u8>,
-    ) -> RepositoryResult<()> {
-        unsupported("snapshot storage")
+    /// Stores one blob. A layer that is already stored is kept, since its
+    /// digest names its contents; a snapshot file is replaced.
+    async fn put_blob(&self, _key: &BlobKey, _body: BlobBody<'_>) -> RepositoryResult<()> {
+        unsupported("blob storage")
     }
 
-    /// Removes one snapshot's startup memory manifest, if any.
-    async fn delete_startup_manifest(&self, _id: &SnapshotId) -> RepositoryResult<()> {
-        unsupported("snapshot storage")
+    /// Removes every file of one snapshot. Shared layers stay. Missing files
+    /// are considered success.
+    async fn delete_snapshot_blobs(&self, _id: &SnapshotId) -> RepositoryResult<()> {
+        unsupported("blob storage")
+    }
+
+    /// A new temporary file to prepare a blob in. It is placed where putting
+    /// it costs least: a POSIX repository links it in without copying.
+    fn staging_file(&self) -> RepositoryResult<NamedTempFile> {
+        NamedTempFile::new().map_err(|error| RepositoryError::backend("create staging file", error))
     }
 
     /// Reads one shared document; `None` when absent.
@@ -210,16 +260,6 @@ pub trait Repository: Send + Sync {
         _collection: DocumentCollection,
     ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
         unsupported("repository documents")
-    }
-
-    /// Publishes the current node-local OverlayBD backing and returns logical
-    /// layer references suitable for the shared volume catalog.
-    async fn publish_volume_backing(
-        &self,
-        _volume_id: &str,
-        _image_config_path: &Path,
-    ) -> RepositoryResult<Vec<crate::snapshot::OverlaybdLayerRef>> {
-        unsupported("volume backing publication")
     }
 
     /// Materializes a node-local runtime image config from shared logical layers.

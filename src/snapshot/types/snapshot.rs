@@ -382,6 +382,9 @@ pub struct SnapshotRecord {
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
     pub committed: Option<CommittedSnapshot>,
+    /// Set when a delete starts, so nothing is attached to the snapshot after.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleting: bool,
 }
 
 impl SnapshotRecord {
@@ -401,6 +404,7 @@ impl SnapshotRecord {
             created_at_unix_ms: now_unix_ms,
             updated_at_unix_ms: now_unix_ms,
             committed: None,
+            deleting: false,
         }
     }
 
@@ -455,6 +459,7 @@ impl SnapshotRecord {
             created_at_unix_ms: 0,
             updated_at_unix_ms: 0,
             committed: Some(committed),
+            deleting: false,
         }
     }
 }
