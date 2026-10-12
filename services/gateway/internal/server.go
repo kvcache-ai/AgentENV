@@ -213,15 +213,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		sandboxID = hostRoute.sandboxID
 		hasSandbox = true
 		routeSource = routeSourceHost
-	} else if isSandboxControlPlaneRequest(r) {
-		sandboxID, hasSandbox = sandboxIDFromPath(r.URL.Path)
-		routeSource = routeSourcePath
-	} else if isTemplateBuilderAllocation(r) {
-		routeSource = routeSourceSchedule
-	} else if buildID, ok := templateBuildIDFromPath(r.URL.Path); ok {
-		sandboxID, hasSandbox = buildID, true
-		buildReadRequest = r.Method == http.MethodGet && (strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/status") || strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/logs"))
-		routeSource = routeSourcePath
+	} else if route, ok := matchPathRoute(r.Method, r.URL.Path); ok {
+		if route.allocatesBuild() {
+			routeSource = routeSourceSchedule
+		} else {
+			sandboxID, hasSandbox = route.id, true
+			buildReadRequest = route.owner == ownerBuildRead
+			routeSource = routeSourcePath
+		}
 	} else {
 		sandboxID, hasSandbox = sandboxIDFromHeaders(r.Header)
 	}
@@ -371,7 +370,7 @@ func (s *Server) proxyRequest(
 			if !options.recordAssignment || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				return nil
 			}
-			return s.recordAssignmentFromResponse(originalCtx, resp, node, proxyReq.URL.Path)
+			return s.recordAssignmentFromResponse(originalCtx, resp, node, proxyReq.Method, proxyReq.URL.Path)
 		},
 		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
 			if errors.Is(err, context.Canceled) {
@@ -438,21 +437,22 @@ func (e *proxyResponseError) Error() string {
 	return e.message
 }
 
-func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestPath string) error {
+func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestMethod, requestPath string) error {
 	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
 	defer cancelRecord()
-	if buildID, ok := v2TemplateBuildIDFromPath(requestPath); ok {
-		if err := s.recordAssignment(recordCtx, buildID, node, "template_build"); err != nil {
+	route, _ := matchPathRoute(requestMethod, requestPath)
+	if route.owner == ownerNewBuild {
+		if err := s.recordAssignment(recordCtx, route.id, node, "template_build"); err != nil {
 			return &proxyResponseError{statusCode: http.StatusServiceUnavailable, message: "failed to route allocated build", cause: err}
 		}
 		return nil
 	}
-	if expectedID, ok := templateBuildIDFromPath(requestPath); ok && strings.HasSuffix(strings.TrimRight(requestPath, "/"), "/builder") {
+	if route.owner == ownerNewBuildConfirmed {
 		buildID := strings.TrimSpace(resp.Header.Get("x-agentenv-build-id"))
 		if buildID == "" {
 			return &proxyResponseError{statusCode: http.StatusBadGateway, message: "upstream build response is missing its build ID"}
 		}
-		if buildID != expectedID {
+		if buildID != route.id {
 			return &proxyResponseError{statusCode: http.StatusBadGateway, message: "upstream build response ID does not match the request"}
 		}
 		if err := s.recordAssignment(recordCtx, buildID, node, "template_build"); err != nil {
@@ -495,7 +495,7 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 
 	ids := extractSandboxIDsFromResponse(body)
-	if isForkPath(requestPath) {
+	if route.owner == ownerSandboxFork {
 		ids = extractForkSandboxIDsFromResponse(body)
 	}
 	for _, sandboxID := range ids {
@@ -554,7 +554,8 @@ func flushInterval(flushImmediately bool) time.Duration {
 }
 
 func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox bool) bool {
-	if isTemplateBuilderAllocation(r) {
+	route, _ := matchPathRoute(r.Method, r.URL.Path)
+	if route.allocatesBuild() {
 		return true
 	}
 	if r.Method != http.MethodPost {
@@ -569,12 +570,7 @@ func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox
 	}
 
 	// Fork is routed by the source sandbox but creates child sandbox assignments.
-	return isForkPath(path)
-}
-
-func isForkPath(path string) bool {
-	parts := strings.Split(strings.Trim(strings.TrimRight(path, "/"), "/"), "/")
-	return len(parts) == 3 && parts[0] == "sandboxes" && strings.TrimSpace(parts[1]) != "" && parts[2] == "fork"
+	return route.owner == ownerSandboxFork
 }
 
 func sandboxIDFromHeaders(h http.Header) (string, bool) {
@@ -615,90 +611,6 @@ func targetPortFromHeaders(h http.Header) (string, bool) {
 		}
 	}
 	return "", false
-}
-
-func sandboxIDFromPath(path string) (string, bool) {
-	const marker = "/sandboxes/"
-	rest, found := strings.CutPrefix(path, marker)
-	if !found {
-		_, rest, found = strings.Cut(path, marker)
-	}
-	if !found {
-		return "", false
-	}
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return "", false
-	}
-	if id, _, hasSlash := strings.Cut(rest, "/"); hasSlash {
-		rest = id
-	}
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return "", false
-	}
-	return rest, true
-}
-
-func isSandboxControlPlaneRequest(r *http.Request) bool {
-	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(parts) == 4 && parts[0] == "v2" && parts[1] == "sandboxes" && strings.TrimSpace(parts[2]) != "" && parts[3] == "logs" {
-		return r.Method == http.MethodGet
-	}
-	if len(parts) == 4 && parts[0] == "v2" && parts[1] == "sandboxes" && strings.TrimSpace(parts[2]) != "" && parts[3] == "connect" {
-		return r.Method == http.MethodPost
-	}
-	if len(parts) < 2 || parts[0] != "sandboxes" || strings.TrimSpace(parts[1]) == "" {
-		return false
-	}
-
-	if len(parts) == 2 {
-		return r.Method == http.MethodGet || r.Method == http.MethodDelete
-	}
-	if len(parts) != 3 {
-		return false
-	}
-
-	switch parts[2] {
-	case "metrics":
-		return r.Method == http.MethodGet
-	case "pause", "resume", "fork", "connect", "timeout", "refreshes", "snapshots":
-		return r.Method == http.MethodPost
-	case "network":
-		return r.Method == http.MethodPut
-	case "custom-extension-params":
-		return r.Method == http.MethodGet || r.Method == http.MethodPatch
-	default:
-		return false
-	}
-}
-
-func isTemplateBuilderAllocation(r *http.Request) bool {
-	if _, ok := v2TemplateBuildIDFromPath(r.URL.Path); ok {
-		return r.Method == http.MethodPost
-	}
-	_, ok := templateBuildIDFromPath(r.URL.Path)
-	return ok && r.Method == http.MethodPut && strings.HasSuffix(strings.TrimRight(r.URL.Path, "/"), "/builder")
-}
-
-func v2TemplateBuildIDFromPath(path string) (string, bool) {
-	parts := strings.Split(strings.Trim(path, "/"), "/")
-	if len(parts) != 5 || parts[0] != "v2" || parts[1] != "templates" || parts[2] == "" || parts[3] != "builds" || parts[4] == "" {
-		return "", false
-	}
-	return parts[4], true
-}
-
-// Build sessions use scheduler bindings internally without exposing worker IDs.
-func templateBuildIDFromPath(path string) (string, bool) {
-	parts := strings.Split(strings.Trim(path, "/"), "/")
-	if len(parts) != 5 {
-		return "", false
-	}
-	if parts[0] != "templates" || parts[1] == "" || parts[2] != "builds" || parts[3] == "" || (parts[4] != "builder" && parts[4] != "status" && parts[4] != "logs") {
-		return "", false
-	}
-	return parts[3], true
 }
 
 func (s *Server) logHostRoutingHeaderConflicts(r *http.Request, route *hostRoute) {
@@ -977,11 +889,8 @@ func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
 		return false
 	}
 
-	_, templateBuildRequest := templateBuildIDFromPath(r.URL.Path)
-	return !isSandboxControlPlaneRequest(r) &&
-		!templateBuildRequest &&
-		!isTemplateBuilderAllocation(r) &&
-		hasCompleteProxyRouteHeaders(r.Header)
+	_, pathRouted := matchPathRoute(r.Method, r.URL.Path)
+	return !pathRouted && hasCompleteProxyRouteHeaders(r.Header)
 }
 
 func isExplicitProxyPath(path string) bool {

@@ -428,68 +428,6 @@ func TestHasProxyRoutingHeaders(t *testing.T) {
 	}
 }
 
-func TestSandboxIDFromPath(t *testing.T) {
-	tests := []struct {
-		name string
-		path string
-		want string
-		ok   bool
-	}{
-		{name: "base sandbox path", path: "/sandboxes/sbx-123", want: "sbx-123", ok: true},
-		{name: "sandbox pause path", path: "/sandboxes/sbx-123/pause", want: "sbx-123", ok: true},
-		{name: "sandbox timeout path", path: "/sandboxes/sbx-123/timeout", want: "sbx-123", ok: true},
-		{name: "sandbox list path", path: "/sandboxes", ok: false},
-		{name: "cold sandbox create path", path: "/sandboxes-cold", ok: false},
-		{name: "v2 sandbox list path", path: "/v2/sandboxes", ok: false},
-		{name: "other resource", path: "/templates/abc", ok: false},
-		{name: "empty segment", path: "/sandboxes//pause", ok: false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got, ok := sandboxIDFromPath(tc.path)
-			if ok != tc.ok || got != tc.want {
-				t.Fatalf("path %q expected (%q, %v), got (%q, %v)", tc.path, tc.want, tc.ok, got, ok)
-			}
-		})
-	}
-}
-
-func TestIsSandboxControlPlaneRequest(t *testing.T) {
-	tests := []struct {
-		name   string
-		method string
-		path   string
-		want   bool
-	}{
-		{name: "sandbox detail", method: http.MethodGet, path: "/sandboxes/sbx-123", want: true},
-		{name: "sandbox delete", method: http.MethodDelete, path: "/sandboxes/sbx-123", want: true},
-		{name: "v2 sandbox logs", method: http.MethodGet, path: "/v2/sandboxes/sbx-123/logs", want: true},
-		{name: "v2 logs wrong method", method: http.MethodPost, path: "/v2/sandboxes/sbx-123/logs", want: false},
-		{name: "v2 logs missing ID", method: http.MethodGet, path: "/v2/sandboxes//logs", want: false},
-		{name: "v2 sandbox connect", method: http.MethodPost, path: "/v2/sandboxes/sbx-123/connect", want: true},
-		{name: "v2 connect wrong method", method: http.MethodGet, path: "/v2/sandboxes/sbx-123/connect", want: false},
-		{name: "v2 connect missing ID", method: http.MethodPost, path: "/v2/sandboxes//connect", want: false},
-		{name: "sandbox pause", method: http.MethodPost, path: "/sandboxes/sbx-123/pause", want: true},
-		{name: "sandbox fork", method: http.MethodPost, path: "/sandboxes/sbx-123/fork", want: true},
-		{name: "sandbox network update", method: http.MethodPut, path: "/sandboxes/sbx-123/network", want: true},
-		{name: "network update wrong method", method: http.MethodPost, path: "/sandboxes/sbx-123/network", want: false},
-		{name: "sandbox custom extension params get", method: http.MethodGet, path: "/sandboxes/sbx-123/custom-extension-params", want: true},
-		{name: "sandbox custom extension params patch", method: http.MethodPatch, path: "/sandboxes/sbx-123/custom-extension-params", want: true},
-		{name: "sandbox custom extension params post", method: http.MethodPost, path: "/sandboxes/sbx-123/custom-extension-params", want: false},
-		{name: "data-plane shaped path", method: http.MethodGet, path: "/sandboxes/sbx-123/files", want: false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			request := httptest.NewRequest(tc.method, "http://gateway.test"+tc.path, nil)
-			if got := isSandboxControlPlaneRequest(request); got != tc.want {
-				t.Fatalf("isSandboxControlPlaneRequest(%s %s) = %v, want %v", tc.method, tc.path, got, tc.want)
-			}
-		})
-	}
-}
-
 func TestNodeIDFromPath(t *testing.T) {
 	tests := []struct {
 		name string
@@ -698,7 +636,8 @@ func TestSandboxIDExtractionPathPreferredOverHeader(t *testing.T) {
 	h := http.Header{}
 	h.Set("x-agentenv-sandbox-id", "from-header")
 
-	id, ok := sandboxIDFromPath("/sandboxes/from-path/pause")
+	route, ok := matchPathRoute(http.MethodPost, "/sandboxes/from-path/pause")
+	id := route.id
 	if !ok {
 		id, ok = sandboxIDFromHeaders(h)
 	}
@@ -1788,7 +1727,7 @@ func TestRecordAssignmentFromResponseUsesHeaderWithoutReadingBody(t *testing.T) 
 	resp.Header.Set(headerSandboxID, "sbx-from-header")
 
 	node := &schedulerv1.Node{NodeId: "node-1", Endpoint: "http://node"}
-	if err := server.recordAssignmentFromResponse(context.Background(), resp, node, "/sandboxes/sbx-from-header"); err != nil {
+	if err := server.recordAssignmentFromResponse(context.Background(), resp, node, http.MethodPost, "/sandboxes/sbx-from-header"); err != nil {
 		t.Fatalf("recordAssignmentFromResponse returned error: %v", err)
 	}
 
