@@ -30,6 +30,9 @@ pub struct StartResumeHookRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub custom_extension_params: Option<serde_json::Value>,
+    /// User-provided sandbox metadata from the create-sandbox request. Only the launch-provided value is sent: metadata is never inherited from a source snapshot. It is retained across pause/resume of the same sandbox.
+    #[serde(rename = "metadata", skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<std::collections::HashMap<String, String>>,
 }
 
 impl StartResumeHookRequest {
@@ -45,6 +48,7 @@ impl StartResumeHookRequest {
             network_namespace_path,
             host_interaction_ip,
             custom_extension_params: None,
+            metadata: None,
         }
     }
 }
