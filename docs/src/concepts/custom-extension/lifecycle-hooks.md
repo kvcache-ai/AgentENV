@@ -12,9 +12,9 @@ and 5xx for extension-internal failures.
 
 | Hook | When | Request | Response |
 |------|------|---------|----------|
-| `start-fresh` | Before a fresh sandbox boots, after its network slot is allocated | `sandboxId`, `sandboxInstanceId`, `networkNamespacePath`, `hostInteractionIp`, `customExtensionParams` | optional `extraBootArgs` appended to the kernel cmdline |
+| `start-fresh` | Before a fresh sandbox boots, after its network slot is allocated | `sandboxId`, `sandboxInstanceId`, `networkNamespacePath`, `hostInteractionIp`, `customExtensionParams`, `metadata` | optional `extraBootArgs` appended to the kernel cmdline |
 | `start-resume` | Before a sandbox resumes from a snapshot (template launch, resume after pause, fork child) | same as above | none |
-| `patch-params` | When a user PATCHes the sandbox's params | `sandboxId`, `patch` (verbatim user body) | updated **full** `customExtensionParams` |
+| `patch-params` | When a user PATCHes the sandbox's params | `sandboxId`, `patch` (verbatim user body), `metadata` | updated **full** `customExtensionParams` |
 | `stop` | When the sandbox runtime is torn down, before the network slot is released | `sandboxId`, `sandboxInstanceId` | none |
 
 Notes:
@@ -25,6 +25,8 @@ Notes:
 - `networkNamespacePath` is the host path of the sandbox's netns file (e.g. `/var/run/netns/agentenv-ns-*`), so the extension can enter the namespace (e.g. `nsenter --net=...`) to set up firewall rules or VPN interfaces.
 - `hostInteractionIp` is the per-runtime IPv4 address that AgentENV routes to this sandbox. It can change after pause/resume, so extensions must use the value from the current start hook rather than caching an older one.
 - Concurrent `patch-params` calls to the same sandbox are not serialized; if your patch semantics are not commutative, handle concurrency in the extension.
+
+- `metadata` is the user-provided string map from the create request. A new sandbox does not inherit the source snapshot's metadata. Pause/resume preserves the same sandbox's metadata, and fork children inherit their parent's metadata. `patch-params` receives the current sandbox metadata separately from the verbatim patch.
 
 ## Minimal Extension Example
 

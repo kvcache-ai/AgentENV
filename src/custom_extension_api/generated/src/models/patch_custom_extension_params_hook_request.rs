@@ -18,6 +18,9 @@ pub struct PatchCustomExtensionParamsHookRequest {
     /// Opaque JSON patch document passed through verbatim from the user's PATCH request. Its semantics are defined entirely by the extension.
     #[serde(rename = "patch", deserialize_with = "Option::deserialize")]
     pub patch: Option<serde_json::Value>,
+    /// User-provided sandbox metadata from the create-sandbox request. Only the launch-provided value is sent: metadata is never inherited from a source snapshot. It is retained across pause/resume of the same sandbox.
+    #[serde(rename = "metadata", skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<std::collections::HashMap<String, String>>,
 }
 
 impl PatchCustomExtensionParamsHookRequest {
@@ -25,6 +28,10 @@ impl PatchCustomExtensionParamsHookRequest {
         sandbox_id: String,
         patch: Option<serde_json::Value>,
     ) -> PatchCustomExtensionParamsHookRequest {
-        PatchCustomExtensionParamsHookRequest { sandbox_id, patch }
+        PatchCustomExtensionParamsHookRequest {
+            sandbox_id,
+            patch,
+            metadata: None,
+        }
     }
 }
