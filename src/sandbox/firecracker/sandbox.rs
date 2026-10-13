@@ -38,7 +38,7 @@ use crate::sandbox::backend::{
 };
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{prepare_extra_drives, DriveMount, ExtraDrivePrepareMode};
-use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy};
+use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
 use crate::sandbox::process::Executor;
 use crate::sandbox::ublk::{
     OverlaybdConfig, OverlaybdRuntimeHandle, PackRecordingWindow, UblkBackend, UblkCreateSpec,
@@ -1708,25 +1708,15 @@ impl FirecrackerSandbox {
         }
 
         // ── Allocate network slot and create network infrastructure ──
-        let slot = NetworkManager::global()
-            .allocate_any()
-            .context("Failed to allocate network slot")?;
-        debug!(slot = slot.idx, "allocated network slot");
+        let slot = self.allocate_network_slot()?;
+        slot.set_egress_policy(config.common.network_policy.as_ref())
+            .context("Failed to configure sandbox egress policy")?;
         let interaction_ip = slot.host_interaction_ip;
-
+        let netns = slot.namespace_path();
         // Add IP configuration to boot args for the VM.
         // Uses Slot::build_ip_boot_arg() to produce the kernel ip= parameter with a
         // valid DNS server IP in the 8th field. See that method for format details.
-        let ip_config = slot.build_ip_boot_arg();
-        let netns = slot.namespace_path();
-        self.resources.network_slot = Some(slot);
-        self.resources
-            .network_slot
-            .as_mut()
-            .expect("network slot was just assigned")
-            .set_egress_policy(config.common.network_policy.as_ref())
-            .context("Failed to configure sandbox egress policy")?;
-        append_boot_arg(&mut boot_args, &ip_config);
+        append_boot_arg(&mut boot_args, &slot.build_ip_boot_arg());
 
         // ── Custom extension hook: start-fresh (may contribute extra boot args) ──
         if let Some(client) = CustomExtensionClient::global() {
@@ -1747,27 +1737,8 @@ impl FirecrackerSandbox {
         boot_args =
             add_damon_monitor_region(boot_args, config.mem_size_mib, std::env::consts::ARCH);
 
-        // ── Spawn Firecracker inside the network namespace so it can access tap0 ──
-        let firecracker_binary = config.common.firecracker_binary.clone();
-        let (stdout_path, stderr_path) = self.firecracker_stdio_paths();
-
-        self.fc_instance
-            .spawn_with_netns(
-                &firecracker_binary,
-                stdout_path.as_deref(),
-                stderr_path.as_deref(),
-                Some(&netns),
-            )
-            .await?;
-
-        let envd_base_url = format!(
-            "http://{}:{}",
-            interaction_ip, config.common.control_plane_port
-        );
-        self.envd_instance = Some(EnvdInstance::new(
-            envd_base_url,
-            config.common.envd_access_token.clone(),
-        ));
+        self.spawn_firecracker(&config.common, &netns).await?;
+        self.init_envd_instance(interaction_ip, &config.common);
 
         // ── Configure microVM: tools drive as rootfs + user image + extras ──
         self.fc_instance
@@ -1799,8 +1770,6 @@ impl FirecrackerSandbox {
              because memory restore uses a shared ublk device"
         );
 
-        let global_config = ConfigManager::global_config();
-
         let rootfs_virtual_size = config
             .common
             .rootfs_virtual_size
@@ -1812,34 +1781,7 @@ impl FirecrackerSandbox {
             .context("snapshot rootfs image config is missing")?;
         self.current_rootfs_virtual_size = Some(rootfs_virtual_size);
 
-        let capture_output = logging_enabled(config.common.firecracker_log_level.as_deref());
-        if config.common.stdout_path.is_none() && config.common.stderr_path.is_none() {
-            if let Some(warm) =
-                FirecrackerPool::global().and_then(|pool| pool.try_acquire(capture_output))
-            {
-                let warm_dir = warm.work_dir.path();
-                let (warm_stdout, warm_stderr) = warm_stdio_paths(warm_dir, capture_output);
-                debug!(
-                    slot = warm.slot.idx,
-                    pool_work_dir = %warm_dir.display(),
-                    "using warm firecracker from pool"
-                );
-
-                self.resources.network_slot = Some(warm.slot);
-                self.work_dir = warm.work_dir; // Update self.work_dir before relocating logs since the fallback log paths are relative to the work_dir.
-                let _cold = std::mem::replace(&mut self.fc_instance, warm.fc_instance);
-                if let Err(err) =
-                    relocate_warm_log(warm_stdout.as_deref(), &self.firecracker_stdout_path())
-                {
-                    warn!(error = %err, "failed to relocate warm firecracker stdout log");
-                }
-                if let Err(err) =
-                    relocate_warm_log(warm_stderr.as_deref(), &self.firecracker_stderr_path())
-                {
-                    warn!(error = %err, "failed to relocate warm firecracker stderr log");
-                }
-            }
-        }
+        self.adopt_warm_firecracker(&config.common);
 
         let fc_cwd = self.work_dir.path();
         let vm_state_src = fs::canonicalize(&config.vm_state_path)
@@ -1864,90 +1806,35 @@ impl FirecrackerSandbox {
             .await?;
         }
 
-        // ── Extra drives ──
-        let extra_drive_attachments = self
-            .prepare_snapshot_backing_drives(&config.common.extra_drives)
-            .await
-            .context("prepare snapshot-backed extra drives for resume")?;
-        // Snapshot loading reopens every serialized slot path, so all
-        // placeholders must exist. Restored volumes replace their placeholders
-        // before load; only volumes absent from the source state are patched.
-        let volume_slots = self
-            .prepare_volume_drive_slots(
-                config.common.physical_extra_drive_count,
-                config.common.volume_drive_slots,
-            )
-            .context("prepare reserved volume drive slots for resume")?;
-        let physical_count = config.common.physical_extra_drive_count;
-        anyhow::ensure!(
-            physical_count <= extra_drive_attachments.len(),
-            "snapshot expects {physical_count} physical extra drives, but only {} were prepared",
-            extra_drive_attachments.len()
-        );
-        let volume_drive_attachments = &extra_drive_attachments[physical_count..];
-        anyhow::ensure!(
-            volume_drive_attachments.len() <= volume_slots.len(),
-            "snapshot has more launch-time drives than reserved volume slots"
-        );
-        let has_new_volume_attachments = !self.initial_guest_drive_mounts.is_empty();
-        if !has_new_volume_attachments {
-            for (slot, drive) in volume_slots.iter().zip(volume_drive_attachments) {
-                self.bind_volume_drive_slot(slot, drive).with_context(|| {
-                    format!(
-                        "bind restored volume {} to reserved drive {} before snapshot load",
-                        drive.drive_id, slot.drive_id
-                    )
-                })?;
-            }
-        }
+        // ── Extra drives and reserved volume slots ──
+        let new_volume_binds = self.prepare_resume_drives(&config.common).await?;
 
-        // ── Network + Firecracker spawn ──
+        // ── Network + Firecracker spawn (a warm Firecracker already has both) ──
         let needs_socket_wait = self.resources.network_slot.is_none();
-        let interaction_ip = if let Some(slot) = self.resources.network_slot.as_ref() {
-            slot.host_interaction_ip
-        } else {
-            let slot = NetworkManager::global()
-                .allocate_any()
-                .context("Failed to allocate network slot for resume")?;
-            debug!(slot = slot.idx, "allocated network slot for resume");
-            let netns = slot.namespace_path();
-            let interaction_ip = slot.host_interaction_ip;
-            self.resources.network_slot = Some(slot);
-
-            let firecracker_binary = config.common.firecracker_binary.clone();
-            let (stdout_path, stderr_path) = self.firecracker_stdio_paths();
-
-            self.fc_instance
-                .spawn_with_netns(
-                    &firecracker_binary,
-                    stdout_path.as_deref(),
-                    stderr_path.as_deref(),
-                    Some(&netns),
-                )
-                .await?;
-
-            interaction_ip
-        };
-        if let Some(slot) = self.resources.network_slot.as_mut() {
-            slot.set_egress_policy(config.common.network_policy.as_ref())
-                .context("Failed to configure sandbox egress policy for resume")?;
+        if needs_socket_wait {
+            let netns = self.allocate_network_slot()?.namespace_path();
+            self.spawn_firecracker(&config.common, &netns).await?;
         }
+        let slot = self
+            .resources
+            .network_slot
+            .as_mut()
+            .expect("network slot comes from the warm pool or was just allocated");
+        slot.set_egress_policy(config.common.network_policy.as_ref())
+            .context("Failed to configure sandbox egress policy for resume")?;
+        let interaction_ip = slot.host_interaction_ip;
+        let netns = slot.namespace_path();
 
         // ── Custom extension hook: start-resume ──
         // Pack-recording VMs are throwaway recorders: hooks must not fire
         // for them (the extension would see a phantom sandbox start/stop).
         if !config.pack_recording {
             if let Some(client) = CustomExtensionClient::global() {
-                let slot = self
-                    .resources
-                    .network_slot
-                    .as_ref()
-                    .context("network slot must be allocated before start-resume hook")?;
                 let mut guard = CustomExtensionHookGuard::new(client, self.id);
                 guard
                     .start_resume(
-                        &slot.namespace_path().to_string_lossy(),
-                        slot.host_interaction_ip,
+                        &netns.to_string_lossy(),
+                        interaction_ip,
                         config.common.custom_extension_params.as_ref(),
                     )
                     .await?;
@@ -1955,115 +1842,16 @@ impl FirecrackerSandbox {
             }
         }
 
-        let envd_base_url = format!(
-            "http://{}:{}",
-            interaction_ip, config.common.control_plane_port
-        );
-        self.envd_instance = Some(EnvdInstance::new(
-            envd_base_url,
-            config.common.envd_access_token.clone(),
-        ));
+        self.init_envd_instance(interaction_ip, &config.common);
 
-        let mem_global_config = global_config
-            .memory_snapshot
-            .overlaybd_global_config_path
-            .clone();
+        // ── Memory device ──
         let mem_device_path = if config.pack_recording {
-            // Pack-recording VMs get a dedicated, non-shared memory device:
-            // sharing one (or the block-device page cache behind it) would
-            // hide first-touch reads from the recorder.
-            let device = UblkDeviceManager::global()
-                .create_dedicated_mem_device(&UblkCreateSpec::Overlaybd {
-                    image_config: config.mem_overlaybd_config.image_config_path.clone(),
-                    global_config: mem_global_config.clone(),
-                })
-                .await
-                .context("create dedicated memory ublk device for pack recording")?;
-            let device_path = device.device_path().to_path_buf();
-            let device_id = device.dev_id();
-            // Store the device BEFORE any fallible step below: `stop()` owns
-            // its deletion, so an arming failure cannot leak the device.
-            self.resources.mem_dedicated_device = Some(device);
-
-            // Arm the first-touch recorder BEFORE the snapshot loads so FC's
-            // load-time reads and the guest's first faults are all recorded.
-            let pack_config = &global_config.snapshot.memory_startup_pack;
-            let output = config
-                .vm_state_path
-                .parent()
-                .map(|dir| dir.join(crate::snapshot::MEMORY_STARTUP_TRACE_ARTIFACT))
-                .context("pack recording requires a snapshot artifact dir")?;
-            UblkDeviceManager::global()
-                .start_pack_recording(
-                    device_id,
-                    &output,
-                    PackRecordingWindow {
-                        max_pages: u32::try_from(
-                            (pack_config.max_pack_bytes / overlaybd::startup_pack::PACK_PAGE_BYTES)
-                                .min(u64::from(overlaybd::startup_pack::MAX_PACK_PAGES)),
-                        )
-                        .unwrap_or(overlaybd::startup_pack::MAX_PACK_PAGES),
-                        min_window_ms: pack_config.record_min_window_ms,
-                        quiet_ms: pack_config.record_quiet_ms,
-                        max_window_ms: pack_config.record_max_window_ms,
-                    },
-                )
-                .await
-                .context("arm startup pack recorder")?;
-            device_path
+            self.create_pack_recording_mem_device(&config).await?
         } else {
-            if let Some(pack) = &config.memory_startup_pack {
-                match &pack.source {
-                    crate::snapshot::ResolvedStartupPackSource::OssUrl(_) => {
-                        UblkDeviceManager::global()
-                            .prefetch_startup_pack(
-                                &config.mem_overlaybd_config.image_config_path,
-                                &mem_global_config,
-                                pack,
-                            )
-                            .await;
-                    }
-                    crate::snapshot::ResolvedStartupPackSource::LocalPath(_) => {
-                        // Local prefetch needs the actual shared memory device,
-                        // acquired below. Warming lower files is insufficient.
-                    }
-                }
-            }
-            let mem_device = UblkDeviceManager::global()
-                .get_or_create_shared_mem(
-                    &UblkCreateSpec::Overlaybd {
-                        image_config: config.mem_overlaybd_config.image_config_path.clone(),
-                        global_config: mem_global_config.clone(),
-                    },
-                    config.mem_virtual_size,
-                )
-                .await
-                .context("create or reuse shared memory ublk device for resume")?;
-            let device_path = mem_device.device_path().to_path_buf();
-
-            if let Some(pack) = &config.memory_startup_pack {
-                if matches!(
-                    &pack.source,
-                    crate::snapshot::ResolvedStartupPackSource::LocalPath(_)
-                ) {
-                    if let Some(task) = self.resources.startup_prefetch_task.take() {
-                        task.stop(self.runtime_policy.socket_timeout).await;
-                    }
-                    self.resources.startup_prefetch_task =
-                        Some(super::startup_pack::submit_local_startup_prefetch(
-                            mem_device.clone(),
-                            mem_global_config.clone(),
-                            pack.clone(),
-                        ));
-                }
-            }
-
-            self.resources.mem_snapshot_image_config_path =
-                Some(config.mem_overlaybd_config.image_config_path.clone());
-            self.resources.mem_ublk_device = Some(mem_device);
-            device_path
+            self.acquire_shared_mem_device(&config).await?
         };
 
+        // ── Load snapshot and resume ──
         if needs_socket_wait {
             self.fc_instance
                 .wait_for_ready(
@@ -2087,28 +1875,7 @@ impl FirecrackerSandbox {
             )
             .await?;
 
-        // A volume absent from the source state was loaded as a placeholder.
-        // Replace and PATCH it once so Firecracker reopens the path and reports
-        // the real capacity. Existing volumes were bound before snapshot load.
-        if has_new_volume_attachments {
-            for (slot, drive) in volume_slots.iter().zip(volume_drive_attachments) {
-                self.bind_volume_drive_slot(slot, drive).with_context(|| {
-                    format!(
-                        "bind new volume {} to reserved drive {}",
-                        drive.drive_id, slot.drive_id
-                    )
-                })?;
-                self.fc_instance
-                    .patch_drive_path(&slot.drive_id, &slot.attachment_path)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "attach new volume {} through reserved drive {}",
-                            drive.drive_id, slot.drive_id
-                        )
-                    })?;
-            }
-        }
+        self.attach_new_volume_drives(&new_volume_binds).await?;
         let mmds_metadata = self.mmds_metadata(&config.common);
         self.fc_instance.set_mmds(&mmds_metadata).await?;
 
@@ -2128,6 +1895,269 @@ impl FirecrackerSandbox {
 
         debug!("sandbox restored from snapshot config");
         Ok(())
+    }
+
+    /// Take a pre-spawned Firecracker and its network slot from the warm pool
+    /// when this launch uses the default log paths.
+    fn adopt_warm_firecracker(&mut self, common: &FirecrackerCommonConfig) {
+        if common.stdout_path.is_some() || common.stderr_path.is_some() {
+            return;
+        }
+        let capture_output = logging_enabled(common.firecracker_log_level.as_deref());
+        let Some(warm) =
+            FirecrackerPool::global().and_then(|pool| pool.try_acquire(capture_output))
+        else {
+            return;
+        };
+        let warm_dir = warm.work_dir.path();
+        let (warm_stdout, warm_stderr) = warm_stdio_paths(warm_dir, capture_output);
+        debug!(
+            slot = warm.slot.idx,
+            pool_work_dir = %warm_dir.display(),
+            "using warm firecracker from pool"
+        );
+
+        self.resources.network_slot = Some(warm.slot);
+        self.work_dir = warm.work_dir; // Update self.work_dir before relocating logs since the fallback log paths are relative to the work_dir.
+        let _cold = std::mem::replace(&mut self.fc_instance, warm.fc_instance);
+        if let Err(err) = relocate_warm_log(warm_stdout.as_deref(), &self.firecracker_stdout_path())
+        {
+            warn!(error = %err, "failed to relocate warm firecracker stdout log");
+        }
+        if let Err(err) = relocate_warm_log(warm_stderr.as_deref(), &self.firecracker_stderr_path())
+        {
+            warn!(error = %err, "failed to relocate warm firecracker stderr log");
+        }
+    }
+
+    /// Allocate a network slot, storing it before any fallible setup so that
+    /// `stop()` or `Drop` releases it.
+    fn allocate_network_slot(&mut self) -> Result<&mut Slot> {
+        let slot = NetworkManager::global()
+            .allocate_any()
+            .context("Failed to allocate network slot")?;
+        debug!(slot = slot.idx, "allocated network slot");
+        Ok(self.resources.network_slot.insert(slot))
+    }
+
+    /// Spawn Firecracker inside the network namespace so it can access tap0.
+    async fn spawn_firecracker(
+        &mut self,
+        common: &FirecrackerCommonConfig,
+        netns: &Path,
+    ) -> Result<()> {
+        let (stdout_path, stderr_path) = self.firecracker_stdio_paths();
+        self.fc_instance
+            .spawn_with_netns(
+                &common.firecracker_binary,
+                stdout_path.as_deref(),
+                stderr_path.as_deref(),
+                Some(netns),
+            )
+            .await
+    }
+
+    fn init_envd_instance(
+        &mut self,
+        interaction_ip: std::net::Ipv4Addr,
+        common: &FirecrackerCommonConfig,
+    ) {
+        let envd_base_url = format!("http://{}:{}", interaction_ip, common.control_plane_port);
+        self.envd_instance = Some(EnvdInstance::new(
+            envd_base_url,
+            common.envd_access_token.clone(),
+        ));
+    }
+
+    /// Prepare snapshot-backed extra drives and the reserved volume slots.
+    ///
+    /// Snapshot loading reopens every serialized slot path, so all
+    /// placeholders must exist. Restored volumes replace their placeholders
+    /// before load. Volumes newly supplied for this launch are absent from the
+    /// source state; they are returned as `(slot, drive)` pairs to attach with
+    /// [`attach_new_volume_drives`](Self::attach_new_volume_drives) after load.
+    async fn prepare_resume_drives(
+        &mut self,
+        common: &FirecrackerCommonConfig,
+    ) -> Result<Vec<(DriveMount, DriveMount)>> {
+        let extra_drive_attachments = self
+            .prepare_snapshot_backing_drives(&common.extra_drives)
+            .await
+            .context("prepare snapshot-backed extra drives for resume")?;
+        let volume_slots = self
+            .prepare_volume_drive_slots(
+                common.physical_extra_drive_count,
+                common.volume_drive_slots,
+            )
+            .context("prepare reserved volume drive slots for resume")?;
+        let physical_count = common.physical_extra_drive_count;
+        anyhow::ensure!(
+            physical_count <= extra_drive_attachments.len(),
+            "snapshot expects {physical_count} physical extra drives, but only {} were prepared",
+            extra_drive_attachments.len()
+        );
+        let volume_drive_attachments = &extra_drive_attachments[physical_count..];
+        anyhow::ensure!(
+            volume_drive_attachments.len() <= volume_slots.len(),
+            "snapshot has more launch-time drives than reserved volume slots"
+        );
+        let volume_binds = volume_slots
+            .into_iter()
+            .zip(volume_drive_attachments.iter().cloned())
+            .collect::<Vec<_>>();
+        if !self.initial_guest_drive_mounts.is_empty() {
+            return Ok(volume_binds);
+        }
+        for (slot, drive) in &volume_binds {
+            self.bind_volume_drive_slot(slot, drive).with_context(|| {
+                format!(
+                    "bind restored volume {} to reserved drive {} before snapshot load",
+                    drive.drive_id, slot.drive_id
+                )
+            })?;
+        }
+        Ok(Vec::new())
+    }
+
+    /// A volume absent from the source state was loaded as a placeholder.
+    /// Replace and PATCH it once so Firecracker reopens the path and reports
+    /// the real capacity.
+    async fn attach_new_volume_drives(
+        &self,
+        volume_binds: &[(DriveMount, DriveMount)],
+    ) -> Result<()> {
+        for (slot, drive) in volume_binds {
+            self.bind_volume_drive_slot(slot, drive).with_context(|| {
+                format!(
+                    "bind new volume {} to reserved drive {}",
+                    drive.drive_id, slot.drive_id
+                )
+            })?;
+            self.fc_instance
+                .patch_drive_path(&slot.drive_id, &slot.attachment_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "attach new volume {} through reserved drive {}",
+                        drive.drive_id, slot.drive_id
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Pack-recording VMs get a dedicated, non-shared memory device: sharing
+    /// one (or the block-device page cache behind it) would hide first-touch
+    /// reads from the recorder.
+    async fn create_pack_recording_mem_device(
+        &mut self,
+        config: &FirecrackerSnapshotConfig,
+    ) -> Result<PathBuf> {
+        let global_config = ConfigManager::global_config();
+        let device = UblkDeviceManager::global()
+            .create_dedicated_mem_device(&UblkCreateSpec::Overlaybd {
+                image_config: config.mem_overlaybd_config.image_config_path.clone(),
+                global_config: global_config
+                    .memory_snapshot
+                    .overlaybd_global_config_path
+                    .clone(),
+            })
+            .await
+            .context("create dedicated memory ublk device for pack recording")?;
+        let device_path = device.device_path().to_path_buf();
+        let device_id = device.dev_id();
+        // Store the device BEFORE any fallible step below: `stop()` owns
+        // its deletion, so an arming failure cannot leak the device.
+        self.resources.mem_dedicated_device = Some(device);
+
+        // Arm the first-touch recorder BEFORE the snapshot loads so FC's
+        // load-time reads and the guest's first faults are all recorded.
+        let pack_config = &global_config.snapshot.memory_startup_pack;
+        let output = config
+            .vm_state_path
+            .parent()
+            .map(|dir| dir.join(crate::snapshot::MEMORY_STARTUP_TRACE_ARTIFACT))
+            .context("pack recording requires a snapshot artifact dir")?;
+        UblkDeviceManager::global()
+            .start_pack_recording(
+                device_id,
+                &output,
+                PackRecordingWindow {
+                    max_pages: u32::try_from(
+                        (pack_config.max_pack_bytes / overlaybd::startup_pack::PACK_PAGE_BYTES)
+                            .min(u64::from(overlaybd::startup_pack::MAX_PACK_PAGES)),
+                    )
+                    .unwrap_or(overlaybd::startup_pack::MAX_PACK_PAGES),
+                    min_window_ms: pack_config.record_min_window_ms,
+                    quiet_ms: pack_config.record_quiet_ms,
+                    max_window_ms: pack_config.record_max_window_ms,
+                },
+            )
+            .await
+            .context("arm startup pack recorder")?;
+        Ok(device_path)
+    }
+
+    /// Create or reuse the shared memory device for this snapshot and start
+    /// any configured startup-pack prefetch.
+    async fn acquire_shared_mem_device(
+        &mut self,
+        config: &FirecrackerSnapshotConfig,
+    ) -> Result<PathBuf> {
+        let mem_global_config = ConfigManager::global_config()
+            .memory_snapshot
+            .overlaybd_global_config_path
+            .clone();
+        if let Some(pack) = &config.memory_startup_pack {
+            match &pack.source {
+                crate::snapshot::ResolvedStartupPackSource::OssUrl(_) => {
+                    UblkDeviceManager::global()
+                        .prefetch_startup_pack(
+                            &config.mem_overlaybd_config.image_config_path,
+                            &mem_global_config,
+                            pack,
+                        )
+                        .await;
+                }
+                crate::snapshot::ResolvedStartupPackSource::LocalPath(_) => {
+                    // Local prefetch needs the actual shared memory device,
+                    // acquired below. Warming lower files is insufficient.
+                }
+            }
+        }
+        let mem_device = UblkDeviceManager::global()
+            .get_or_create_shared_mem(
+                &UblkCreateSpec::Overlaybd {
+                    image_config: config.mem_overlaybd_config.image_config_path.clone(),
+                    global_config: mem_global_config.clone(),
+                },
+                config.mem_virtual_size,
+            )
+            .await
+            .context("create or reuse shared memory ublk device for resume")?;
+        let device_path = mem_device.device_path().to_path_buf();
+
+        if let Some(pack) = &config.memory_startup_pack {
+            if matches!(
+                &pack.source,
+                crate::snapshot::ResolvedStartupPackSource::LocalPath(_)
+            ) {
+                self.resources
+                    .stop_startup_prefetch(self.runtime_policy.socket_timeout)
+                    .await;
+                self.resources.startup_prefetch_task =
+                    Some(super::startup_pack::submit_local_startup_prefetch(
+                        mem_device.clone(),
+                        mem_global_config.clone(),
+                        pack.clone(),
+                    ));
+            }
+        }
+
+        self.resources.mem_snapshot_image_config_path =
+            Some(config.mem_overlaybd_config.image_config_path.clone());
+        self.resources.mem_ublk_device = Some(mem_device);
+        Ok(device_path)
     }
 
     /// Create the writable user-image overlaybd device and link it into the
