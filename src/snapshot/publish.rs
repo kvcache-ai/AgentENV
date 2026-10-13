@@ -7,17 +7,27 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use super::catalog;
+use super::recontainerize::PreparedLayerUpload;
 use super::startup_pack::{
     build_startup_manifest, startup_manifest_abort_notify, startup_manifest_abort_requested,
     StartupManifestTaskGuard,
 };
 use super::store::{self, StoredSnapshot};
-use super::{CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, StartupRecording};
-use crate::repository::interfaces::SnapshotPublication;
+use super::{
+    CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, StartupRecording,
+};
 use crate::repository::{
     BlobBody, BlobKey, DocumentKey, Repository, RepositoryError, RepositoryResult, SnapshotFile,
 };
 use crate::sandbox::SandboxSnapshotManifest;
+
+/// A committed snapshot and the local upload files kept alive for post-commit
+/// publication. Temporary paths are never stored in the durable record.
+#[derive(Debug)]
+pub struct SnapshotPublication {
+    pub record: SnapshotRecord,
+    pub(crate) local_layers: Vec<PreparedLayerUpload>,
+}
 
 pub(crate) async fn publish<R>(
     repository: &R,

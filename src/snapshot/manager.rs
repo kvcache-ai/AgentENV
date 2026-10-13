@@ -5,14 +5,14 @@ use anyhow::Context;
 use futures::{stream, StreamExt};
 use tracing::warn;
 
+use super::backends::build_snapshot_backend;
 use super::catalog::SnapshotCatalog;
 use super::p2p::SnapshotP2pArtifact;
 use super::publish::spawn_startup_manifest;
 use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
+use super::{SnapshotListFilter, SnapshotPublication, SnapshotRuntimeResolver};
 use crate::p2p::P2pTransport;
-use crate::repository::backends::build_snapshot_backend;
-use crate::repository::interfaces::{Repository, SnapshotPublication, SnapshotRuntimeResolver};
-use crate::repository::SnapshotListFilter;
+use crate::repository::Repository;
 use crate::sandbox::{
     CapturedSandboxSnapshot, FirecrackerCaptureArtifacts, SandboxSnapshotManifest,
 };
@@ -363,7 +363,7 @@ mod tests {
     use super::*;
     use crate::overlaybd::layer_key_from_digest;
     use crate::p2p::mock::MockTransport;
-    use crate::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::p2p::fixed_artifact_key;
     use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotPublishMetadata};
@@ -483,7 +483,7 @@ mod tests {
         assert_eq!(loaded.id, snapshot_id);
 
         let listed = manager
-            .list(crate::repository::SnapshotListFilter::matches_all())
+            .list(SnapshotListFilter::matches_all())
             .await
             .expect("list should work");
         assert_eq!(listed.len(), 1);

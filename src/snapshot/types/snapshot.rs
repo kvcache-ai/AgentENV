@@ -14,10 +14,10 @@ use crate::volume::VolumeMode;
 use shell_util::shell_quote;
 
 use super::drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
-use super::value::{SnapshotAlias, SnapshotId};
 use super::version::SnapshotRuntimeVersions;
 use crate::sandbox::SandboxSnapshotManifest;
 use crate::types::{ImageConfigs, SandboxResources};
+use crate::types::{SnapshotAlias, SnapshotId};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

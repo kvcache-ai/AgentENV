@@ -10,19 +10,86 @@ use async_trait::async_trait;
 use tracing::warn;
 
 use super::publish;
+use super::publish::SnapshotPublication;
 use super::{
     CommittedSnapshot, MemoryStartupPackInfo, SnapshotAlias, SnapshotId, SnapshotPublishMetadata,
     SnapshotPublishSource, SnapshotRecord, SnapshotSource, SnapshotSourceKind,
     TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };
-use crate::repository::interfaces::SnapshotPublication;
 use crate::repository::{
     DocumentChange, DocumentCollection, DocumentKey, Repository, RepositoryError, RepositoryResult,
-    SnapshotListFilter,
 };
 use crate::sandbox::SandboxSnapshotManifest;
 
 const MAX_ALIAS_CLAIM_ATTEMPTS: usize = 5;
+
+/// Snapshot record list filter.
+///
+/// When multiple fields are present they combine with AND semantics.
+/// When all fields are `None`, the filter matches all snapshot records,
+/// including pending template builds and committed snapshots.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotListFilter {
+    /// Match aliases that start with this prefix.
+    pub alias_prefix: Option<String>,
+    /// Restrict results to this exact set of snapshot ids.
+    pub snapshot_ids: Option<Vec<SnapshotId>>,
+    /// Restrict results to a single snapshot id or exact alias.
+    pub snapshot_id_or_alias: Option<String>,
+    /// Restrict results to snapshots captured from this source sandbox id.
+    ///
+    /// This only matches records whose source is [`SnapshotSourceKind::Sandbox`].
+    pub source_sandbox_id: Option<String>,
+    /// Restrict results to records with these source kinds.
+    pub sources: Option<Vec<SnapshotSourceKind>>,
+    /// Restrict results to template records whose build status is in this set.
+    ///
+    /// Sandbox records never match this field.
+    pub template_statuses: Option<Vec<TemplateBuildStatus>>,
+}
+
+impl SnapshotListFilter {
+    pub fn matches_all() -> Self {
+        Self::default()
+    }
+
+    pub fn by_ids<I>(snapshot_ids: I) -> Self
+    where
+        I: IntoIterator<Item = SnapshotId>,
+    {
+        Self {
+            snapshot_ids: Some(snapshot_ids.into_iter().collect()),
+            ..Self::default()
+        }
+    }
+
+    pub fn templates() -> Self {
+        Self {
+            sources: Some(vec![SnapshotSourceKind::Template]),
+            ..Self::default()
+        }
+    }
+
+    pub fn sandbox_snapshots(
+        source_sandbox_id: Option<String>,
+        snapshot_id_or_alias: Option<String>,
+    ) -> Self {
+        Self {
+            sources: Some(vec![SnapshotSourceKind::Sandbox]),
+            source_sandbox_id,
+            snapshot_id_or_alias: snapshot_id_or_alias.map(|value| {
+                let unqualified = value
+                    .rsplit_once('/')
+                    .map_or(value.as_str(), |(_, name)| name);
+                unqualified
+                    .split_once(':')
+                    .map_or(unqualified, |(name, _)| name)
+                    .to_string()
+            }),
+            ..Self::default()
+        }
+    }
+}
 
 /// Snapshot records and alias bindings shared by every node.
 #[async_trait]
@@ -693,7 +760,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
 
     fn repository(root: &Path) -> Arc<dyn Repository> {
         PosixFsBackend::new(PosixFsBackendConfig {

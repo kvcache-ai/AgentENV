@@ -12,9 +12,12 @@ use crate::{
     orchestrator::{
         CreateSandboxRequest, ProxyLookupResult, SandboxLaunchSource, SandboxTimeoutAction,
     },
-    repository::{backends::build_builder_snapshot_backend, RepositoryError},
+    repository::RepositoryError,
     sandbox::{Executor, ProcessOpts, SandboxNetworkPolicy},
-    snapshot::{CommandContext, RunnableSnapshot, SnapshotManager, SnapshotRecord},
+    snapshot::{
+        backends::build_builder_snapshot_backend, CommandContext, RunnableSnapshot,
+        SnapshotManager, SnapshotRecord,
+    },
     template::TemplateBuildSpec,
     types::{ImageConfigs, SandboxId},
 };

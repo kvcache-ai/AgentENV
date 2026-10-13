@@ -66,10 +66,7 @@ impl SnapshotImageService {
                         "backend.posix_fs config is required when repository_backend = posix_fs",
                     )?;
                     let root = posix.snapshot_store.join("repository");
-                    let repository = Arc::new(posixfs::PosixFsRepository::new(
-                        Arc::new(posixfs::PosixFsCatalogStore::new(root.clone())),
-                        Arc::new(posixfs::PosixFsArtifactStore::new(root.clone())),
-                    ));
+                    let repository = Arc::new(posixfs::PosixFsRepository::new(root.clone()));
                     (repository, ManagedLayerLocator::PosixFs { root })
                 }
                 SnapshotRepositoryBackendKind::Oss => {
@@ -460,10 +457,7 @@ mod tests {
     async fn unknown_or_uncommitted_snapshot_is_rejected() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repository");
-        let repository = posixfs::PosixFsRepository::new(
-            Arc::new(posixfs::PosixFsCatalogStore::new(root.clone())),
-            Arc::new(posixfs::PosixFsArtifactStore::new(root.clone())),
-        );
+        let repository = posixfs::PosixFsRepository::new(root.clone());
         let uncommitted =
             SnapshotRecord::template_waiting(SnapshotId::generate(), None, Default::default());
         let lookup = uncommitted.id.to_string();

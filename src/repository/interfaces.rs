@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use tempfile::NamedTempFile;
@@ -7,17 +6,7 @@ use tempfile::NamedTempFile;
 use super::errors::{RepositoryError, RepositoryResult};
 use super::{BlobKey, DocumentCollection, DocumentKey};
 use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
-use crate::snapshot::{
-    RunnableSnapshot, SnapshotId, SnapshotRecord, SnapshotSourceKind, TemplateBuildStatus,
-};
-
-/// A committed snapshot and the local upload files kept alive for post-commit
-/// publication. Temporary paths are never stored in the durable record.
-#[derive(Debug)]
-pub struct SnapshotPublication {
-    pub record: SnapshotRecord,
-    pub(crate) local_layers: Vec<crate::snapshot::recontainerize::PreparedLayerUpload>,
-}
+use crate::types::SnapshotId;
 
 /// How snapshots and volumes are published into one repository.
 #[derive(Clone, Debug)]
@@ -66,31 +55,6 @@ pub enum BlobLocation {
     Remote(String),
 }
 
-/// Snapshot record list filter.
-///
-/// When multiple fields are present they combine with AND semantics.
-/// When all fields are `None`, the filter matches all snapshot records,
-/// including pending template builds and committed snapshots.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SnapshotListFilter {
-    /// Match aliases that start with this prefix.
-    pub alias_prefix: Option<String>,
-    /// Restrict results to this exact set of snapshot ids.
-    pub snapshot_ids: Option<Vec<SnapshotId>>,
-    /// Restrict results to a single snapshot id or exact alias.
-    pub snapshot_id_or_alias: Option<String>,
-    /// Restrict results to snapshots captured from this source sandbox id.
-    ///
-    /// This only matches records whose source is [`SnapshotSourceKind::Sandbox`].
-    pub source_sandbox_id: Option<String>,
-    /// Restrict results to records with these source kinds.
-    pub sources: Option<Vec<SnapshotSourceKind>>,
-    /// Restrict results to template records whose build status is in this set.
-    ///
-    /// Sandbox records never match this field.
-    pub template_statuses: Option<Vec<TemplateBuildStatus>>,
-}
-
 /// What an update does to a document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocumentChange {
@@ -111,62 +75,19 @@ fn unsupported<T>(feature: &str) -> RepositoryResult<T> {
     })
 }
 
-impl SnapshotListFilter {
-    pub fn matches_all() -> Self {
-        Self::default()
-    }
-
-    pub fn by_ids<I>(snapshot_ids: I) -> Self
-    where
-        I: IntoIterator<Item = SnapshotId>,
-    {
-        Self {
-            snapshot_ids: Some(snapshot_ids.into_iter().collect()),
-            ..Self::default()
-        }
-    }
-
-    pub fn templates() -> Self {
-        Self {
-            sources: Some(vec![SnapshotSourceKind::Template]),
-            ..Self::default()
-        }
-    }
-
-    pub fn sandbox_snapshots(
-        source_sandbox_id: Option<String>,
-        snapshot_id_or_alias: Option<String>,
-    ) -> Self {
-        Self {
-            sources: Some(vec![SnapshotSourceKind::Sandbox]),
-            source_sandbox_id,
-            snapshot_id_or_alias: snapshot_id_or_alias.map(|value| {
-                let unqualified = value
-                    .rsplit_once('/')
-                    .map_or(value.as_str(), |(_, name)| name);
-                unqualified
-                    .split_once(':')
-                    .map_or(unqualified, |(name, _)| name)
-                    .to_string()
-            }),
-            ..Self::default()
-        }
-    }
-}
-
 #[async_trait]
 /// Durable storage shared by every node: small shared documents, snapshot
 /// files and layers, and volume backing layers.
 ///
 /// A repository stores; it does not decide. The catalogs built on its
-/// documents ([`crate::snapshot::SnapshotCatalog`],
-/// [`crate::volume::VolumeCatalog`], [`super::BuildCacheStore`]) own the
-/// records, aliases, and their rules, the same on every backend.
+/// documents (the snapshot and volume catalogs, and
+/// [`super::BuildCacheStore`]) own the records, aliases, and their rules, the
+/// same on every backend. It depends on no module that builds on it.
 ///
 /// The repository boundary excludes node-local derived state: runtime-ready
-/// `image.json` files are materialized by one [`SnapshotRuntimeResolver`]
-/// over every backend, and node-local cache directories never leak into
-/// durable records. Shared
+/// `image.json` files are materialized by the snapshot runtime resolver over
+/// every backend, and node-local cache directories never leak into durable
+/// records. Shared
 /// layer imports must use atomic protocols so concurrent writers never expose
 /// half-written layers.
 pub trait Repository: Send + Sync {
@@ -262,29 +183,4 @@ pub trait Repository: Send + Sync {
     ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
         unsupported("repository documents")
     }
-}
-
-#[async_trait]
-/// Resolves committed snapshot records into node-local runnable paths.
-///
-/// This trait sits at the boundary between repository truth and launch-time derived state.
-/// Implementations consume a committed [`SnapshotRecord`] and may materialize node-local helper files
-/// such as runnable overlaybd `image.json` configs for the current node.
-///
-/// Contract:
-///
-/// - consumes a [`SnapshotRecord`] whose committed payload is present
-/// - returns paths that are directly usable by sandbox / firecracker launch code on the current node
-/// - may materialize node-local derived files such as runnable `image.json`
-/// - must not mutate committed repository truth when generating node-local cache files
-///
-/// Backend guidance:
-///
-/// - runtime cache directories should be treated as node-local derived state
-/// - shared repository storage and node-local runtime cache should be separated whenever possible
-/// - concurrent resolves on one node should prefer atomic cache writes so readers never observe
-///   partially written derived configs
-pub trait SnapshotRuntimeResolver: Send + Sync {
-    /// Resolves one committed snapshot record into a runtime-ready view for the current node.
-    async fn resolve(&self, snapshot: Arc<SnapshotRecord>) -> RepositoryResult<RunnableSnapshot>;
 }

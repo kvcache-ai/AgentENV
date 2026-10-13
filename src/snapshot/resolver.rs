@@ -28,11 +28,35 @@ use crate::image::cache::OverlaybdLayerStore;
 use crate::p2p::P2pTransport;
 use crate::repository::{
     BlobKey, BlobLocation, LayerRole, Repository, RepositoryError, RepositoryResult, SnapshotFile,
-    SnapshotRuntimeResolver,
 };
 use crate::sandbox::SandboxSnapshotManifest;
 
 const LAYER_EXISTS_CONCURRENCY: usize = 16;
+
+#[async_trait]
+/// Resolves committed snapshot records into node-local runnable paths.
+///
+/// This trait sits at the boundary between repository truth and launch-time derived state.
+/// Implementations consume a committed [`SnapshotRecord`] and may materialize node-local helper files
+/// such as runnable overlaybd `image.json` configs for the current node.
+///
+/// Contract:
+///
+/// - consumes a [`SnapshotRecord`] whose committed payload is present
+/// - returns paths that are directly usable by sandbox / firecracker launch code on the current node
+/// - may materialize node-local derived files such as runnable `image.json`
+/// - must not mutate committed repository truth when generating node-local cache files
+///
+/// Backend guidance:
+///
+/// - runtime cache directories should be treated as node-local derived state
+/// - shared repository storage and node-local runtime cache should be separated whenever possible
+/// - concurrent resolves on one node should prefer atomic cache writes so readers never observe
+///   partially written derived configs
+pub trait SnapshotRuntimeResolver: Send + Sync {
+    /// Resolves one committed snapshot record into a runtime-ready view for the current node.
+    async fn resolve(&self, snapshot: Arc<SnapshotRecord>) -> RepositoryResult<RunnableSnapshot>;
+}
 
 /// Resolves committed snapshots stored in one repository.
 pub(crate) struct RepositoryRuntimeResolver {
@@ -503,12 +527,71 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use object_store_operator::CredentialSource;
     use tokio::sync::Barrier;
 
     use super::*;
+    use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
+    use crate::repository::backends::oss::{OssClient, OssRepository};
+    use crate::snapshot::ExternalLayer;
 
     fn digest(index: usize) -> String {
         format!("sha256:{index:064x}")
+    }
+
+    fn oss_repository() -> OssRepository {
+        let client = OssClient::new(
+            "bucket".to_string(),
+            "https://oss.example.com".to_string(),
+            "region".to_string(),
+            "prefix".to_string(),
+            CredentialSource::Anonymous,
+            None,
+        )
+        .expect("oss client");
+        OssRepository::new(
+            Arc::new(client),
+            SnapshotImageStoragePolicy::ObjectStorage,
+            &SnapshotPublishCompressionConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn materializes_volume_backing_with_backend_layer_urls() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repository = oss_repository();
+        let destination = temp.path().join("volume/image.json");
+        let layers = vec![
+            OverlaybdLayerRef::Managed(ManagedLayer {
+                digest: "sha256:managed".to_string(),
+                size: 12,
+                uuid: None,
+            }),
+            OverlaybdLayerRef::External(ExternalLayer {
+                digest: "sha256:external".to_string(),
+                repo_blob_url: "https://registry.example/v2/data/blobs".to_string(),
+                size: 24,
+            }),
+        ];
+
+        materialize_volume_backing(&repository, &layers, &destination)
+            .await
+            .expect("materialize volume config");
+        let config: ImageConfig =
+            serde_json::from_slice(&tokio::fs::read(&destination).await.unwrap()).unwrap();
+        assert_eq!(config.lowers.len(), 2);
+        assert_eq!(
+            config.lowers[0].repo_blob_url,
+            "s3://bucket/prefix/managed-layers"
+        );
+        assert_eq!(
+            config.lowers[1].repo_blob_url,
+            "https://registry.example/v2/data/blobs"
+        );
+        assert!(config.lowers.iter().all(|layer| layer.file.is_empty()));
     }
 
     #[tokio::test]

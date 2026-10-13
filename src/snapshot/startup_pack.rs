@@ -5,9 +5,11 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::repository::SnapshotFile;
+
 /// File name of the per-snapshot startup memory pack, stored as
 /// `BlobKey::Snapshot(id, SnapshotFile::StartupManifest)`.
-pub const MEMORY_STARTUP_PACK_ARTIFACT: &str = "memory-startup.pack";
+pub const MEMORY_STARTUP_PACK_ARTIFACT: &str = SnapshotFile::StartupManifest.name();
 
 /// File name of the local first-touch trace the recorder emits next to the
 /// snapshot artifacts. The publisher expands it into the v4 startup manifest

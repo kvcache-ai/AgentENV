@@ -1,4 +1,5 @@
 pub(crate) mod artifact_cache;
+pub mod backends;
 mod catalog;
 pub mod image_export;
 mod manager;
@@ -13,8 +14,10 @@ pub(crate) mod startup_pack;
 pub(crate) mod store;
 mod types;
 
-pub use catalog::SnapshotCatalog;
+pub use catalog::{SnapshotCatalog, SnapshotListFilter};
 pub use manager::SnapshotManager;
+pub use publish::SnapshotPublication;
+pub use resolver::SnapshotRuntimeResolver;
 pub use startup_pack::{
     drain_startup_manifest_tasks, MemoryStartupPackInfo, ResolvedStartupPack,
     ResolvedStartupPackSource, StartupRecording, MEMORY_STARTUP_PACK_ARTIFACT,

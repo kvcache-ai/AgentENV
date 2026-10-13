@@ -1,3 +1,5 @@
+use crate::repository::SnapshotFile;
+
 #[derive(Clone, Copy, Debug)]
 /// Shared relative artifact names used by local and committed snapshot layouts.
 pub struct SnapshotArtifactLayoutSpec {
@@ -13,8 +15,8 @@ pub struct SnapshotArtifactLayoutSpec {
 }
 
 pub const SNAPSHOT_ARTIFACT_LAYOUT: SnapshotArtifactLayoutSpec = SnapshotArtifactLayoutSpec {
-    firecracker_manifest: "firecracker-manifest.json",
-    vm_state: "vm_state.bin",
+    firecracker_manifest: SnapshotFile::FirecrackerManifest.name(),
+    vm_state: SnapshotFile::VmState.name(),
     memory_dump: "mem.bin",
     memory_image_config: "mem_image.json",
     rootfs_dir: "rootfs",

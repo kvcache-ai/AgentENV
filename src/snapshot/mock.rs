@@ -4,8 +4,9 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
+use super::SnapshotRuntimeResolver;
 use super::{RunnableSnapshot, SnapshotManager, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT};
-use crate::repository::{Repository, RepositoryError, RepositoryResult, SnapshotRuntimeResolver};
+use crate::repository::{Repository, RepositoryError, RepositoryResult};
 use crate::sandbox::SandboxSnapshotManifest;
 
 /// Test double for repository interactions that should stay unreachable:

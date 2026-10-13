@@ -2840,7 +2840,7 @@ async fn volume_deletion_capture_failure_preserves_runtime() -> Result<()> {
 #[tokio::test]
 async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable(
 ) -> anyhow::Result<()> {
-    use crate::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::volume::{VolumeCatalog, VolumeMode, VolumeRecord, VolumeStatus};
 
     let temp = TempDir::new()?;
@@ -3110,7 +3110,7 @@ async fn buildkit_worker_capture_failure_discards_optional_cache() -> Result<()>
 
 #[tokio::test]
 async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyhow::Result<()> {
-    use crate::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::volume::{VolumeCatalog, VolumeMode, VolumeRecord, VolumeStatus};
 
     let temp = TempDir::new()?;

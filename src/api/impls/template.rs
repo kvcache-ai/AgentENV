@@ -19,10 +19,9 @@ use super::template_helpers::{
 use super::ApiImpl;
 use crate::image::ResolvedBlockImage;
 use crate::logging::LogLevel;
-use crate::repository::SnapshotListFilter;
 use crate::snapshot::{
-    SnapshotAlias, SnapshotId, SnapshotRecord, SnapshotSource, TemplateBuildErrorReason,
-    TemplateBuildStatus,
+    SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
+    TemplateBuildErrorReason, TemplateBuildStatus,
 };
 use crate::template::{
     logs::{BuildLogEntry, BuildLogStore},

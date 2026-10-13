@@ -7,14 +7,15 @@ use agentenv::cfg::{
 };
 use agentenv::identity::NodeIdentity;
 use agentenv::p2p::{transport_from_config, P2pArtifactProviderHint, P2pTransport};
-use agentenv::repository::backends::OssBackend;
-use agentenv::repository::{BuildCacheStore, RepositoryError, SnapshotListFilter};
+use agentenv::repository::{BuildCacheStore, RepositoryError};
 use agentenv::sandbox::{CapturedSandboxSnapshot, SandboxSnapshotManifest};
+use agentenv::snapshot::backends::OssBackend;
 use agentenv::snapshot::mock::write_mock_built_artifacts;
 use agentenv::snapshot::SnapshotCatalog;
 use agentenv::snapshot::{
-    OverlaybdLayerRef, SnapshotAlias, SnapshotId, SnapshotManager, SnapshotPublishMetadata,
-    SnapshotPublishSource, SnapshotRuntimeVersions, SNAPSHOT_ARTIFACT_LAYOUT,
+    OverlaybdLayerRef, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotManager,
+    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRuntimeVersions,
+    SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use agentenv::types::SandboxResources;
 use agentenv::volume::{VolumeCatalog, VolumeRecord, VolumeStatus};

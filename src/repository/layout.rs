@@ -1,7 +1,5 @@
 use super::LayerRole;
-use crate::snapshot::{
-    SnapshotAlias, SnapshotId, MEMORY_STARTUP_PACK_ARTIFACT, SNAPSHOT_ARTIFACT_LAYOUT,
-};
+use crate::types::{SnapshotAlias, SnapshotId};
 
 /// A small shared document that every backend stores at the same path relative
 /// to its repository root. This is the only place that names those paths;
@@ -57,6 +55,16 @@ impl DocumentKey {
             Self::BuildLog(_) => format!("{}.lock", self.path()),
         }
     }
+}
+
+/// Whether `value` can be a volume ID or name: one path segment of the
+/// documents that store volumes and build-cache seeds.
+pub(crate) fn is_valid_volume_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 const VOLUME_RECORDS_PREFIX: &str = "volumes/records/";
@@ -116,11 +124,11 @@ pub enum SnapshotFile {
 
 impl SnapshotFile {
     /// The file's name among the snapshot's files.
-    pub(crate) fn name(self) -> &'static str {
+    pub(crate) const fn name(self) -> &'static str {
         match self {
-            Self::VmState => SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
-            Self::FirecrackerManifest => SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
-            Self::StartupManifest => MEMORY_STARTUP_PACK_ARTIFACT,
+            Self::VmState => "vm_state.bin",
+            Self::FirecrackerManifest => "firecracker-manifest.json",
+            Self::StartupManifest => "memory-startup.pack",
         }
     }
 }

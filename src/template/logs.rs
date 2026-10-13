@@ -385,7 +385,7 @@ async fn flush(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::SnapshotCatalog;
 
     #[tokio::test]

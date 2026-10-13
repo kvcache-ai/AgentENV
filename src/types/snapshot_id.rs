@@ -77,7 +77,7 @@ impl AsRef<str> for SnapshotAlias {
 
 #[cfg(test)]
 mod tests {
-    use crate::snapshot::{SnapshotAlias, SnapshotId};
+    use super::{SnapshotAlias, SnapshotId};
 
     #[test]
     fn alias_parse_accepts_valid_chars() {

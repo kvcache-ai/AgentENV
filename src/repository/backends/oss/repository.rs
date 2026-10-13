@@ -3,15 +3,18 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use anyhow::Result;
+
 use super::client::{OssClient, OssUploadArtifact};
+use super::config::NormalizedOssConfig;
 use super::documents;
-use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
+use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::repository::interfaces::{LayerRole, PublishPolicy, Repository};
 use crate::repository::{
     BlobBody, BlobKey, BlobLocation, DocumentCollection, DocumentKey, DocumentUpdate,
     RepositoryError, RepositoryResult, SnapshotFile,
 };
-use crate::snapshot::SnapshotId;
+use crate::types::SnapshotId;
 
 /// Manages the committed‐state layer of the OSS snapshot repository.
 ///
@@ -23,6 +26,28 @@ pub(crate) struct OssRepository {
 }
 
 impl OssRepository {
+    /// Connects to the bucket and prefix that `config` names.
+    pub(crate) fn from_config(
+        config: &OssBackendConfig,
+        snapshot_image_storage: SnapshotImageStoragePolicy,
+        publish_compression: &SnapshotPublishCompressionConfig,
+    ) -> Result<Self> {
+        let config = NormalizedOssConfig::new(config, snapshot_image_storage)?;
+        let client = Arc::new(OssClient::new(
+            config.bucket().to_string(),
+            config.endpoint().to_string(),
+            config.region().to_string(),
+            config.prefix().to_string(),
+            config.credential_source(),
+            config.addressing_style(),
+        )?);
+        Ok(Self::new(
+            client,
+            config.snapshot_image_storage(),
+            publish_compression,
+        ))
+    }
+
     pub(crate) fn new(
         client: Arc<OssClient>,
         snapshot_image_storage: SnapshotImageStoragePolicy,
@@ -174,29 +199,6 @@ impl Repository for OssRepository {
 mod tests {
     use super::*;
     use object_store_operator::CredentialSource;
-    use overlaybd::config::ImageConfig;
-
-    use crate::snapshot::{ExternalLayer, ManagedLayer, OverlaybdLayerRef};
-
-    fn test_repository() -> OssRepository {
-        let client = OssClient::new(
-            "bucket".to_string(),
-            "https://oss.example.com".to_string(),
-            "region".to_string(),
-            "prefix".to_string(),
-            CredentialSource::Anonymous,
-            None,
-        )
-        .expect("oss client");
-        OssRepository::new(
-            Arc::new(client),
-            SnapshotImageStoragePolicy::ObjectStorage,
-            &SnapshotPublishCompressionConfig {
-                enabled: false,
-                ..Default::default()
-            },
-        )
-    }
 
     #[test]
     fn publish_policy_carries_the_configured_compression_and_image_storage() {
@@ -229,40 +231,5 @@ mod tests {
             repository.managed_layers_repo_blob_url().as_deref(),
             Some("s3://bucket/prefix/managed-layers")
         );
-    }
-
-    #[tokio::test]
-    async fn materializes_volume_backing_with_backend_layer_urls() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let repository = test_repository();
-        let destination = temp.path().join("volume/image.json");
-        let layers = vec![
-            OverlaybdLayerRef::Managed(ManagedLayer {
-                digest: "sha256:managed".to_string(),
-                size: 12,
-                uuid: None,
-            }),
-            OverlaybdLayerRef::External(ExternalLayer {
-                digest: "sha256:external".to_string(),
-                repo_blob_url: "https://registry.example/v2/data/blobs".to_string(),
-                size: 24,
-            }),
-        ];
-
-        crate::snapshot::resolver::materialize_volume_backing(&repository, &layers, &destination)
-            .await
-            .expect("materialize volume config");
-        let config: ImageConfig =
-            serde_json::from_slice(&tokio::fs::read(&destination).await.unwrap()).unwrap();
-        assert_eq!(config.lowers.len(), 2);
-        assert_eq!(
-            config.lowers[0].repo_blob_url,
-            "s3://bucket/prefix/managed-layers"
-        );
-        assert_eq!(
-            config.lowers[1].repo_blob_url,
-            "https://registry.example/v2/data/blobs"
-        );
-        assert!(config.lowers.iter().all(|layer| layer.file.is_empty()));
     }
 }

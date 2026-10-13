@@ -22,13 +22,7 @@ pub const MAX_VOLUME_MOUNTS: usize = 24;
 pub const DEFAULT_VOLUME_PAGE_SIZE: usize = 100;
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
-pub(crate) fn is_valid_volume_component(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-}
+pub(crate) use crate::repository::is_valid_volume_component;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VolumePage {
@@ -959,7 +953,7 @@ mod tests {
 
     use super::{VolumeError, VolumeManager, VolumeMode, VolumeRecord, VolumeStatus};
     use crate::digest::sha256_digest;
-    use crate::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{ManagedLayer, OverlaybdLayerRef};
 
     async fn manager_at(root: &Path) -> VolumeManager {

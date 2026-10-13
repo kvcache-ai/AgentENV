@@ -727,3 +727,6 @@ mod tests {
         .unwrap());
     }
 }
+
+#[cfg(test)]
+mod posix_tests;

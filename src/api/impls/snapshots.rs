@@ -80,7 +80,7 @@ impl Snapshots<()> for ApiImpl {
 
         let summaries = match self
             .snapshot_manager
-            .list(crate::repository::SnapshotListFilter::sandbox_snapshots(
+            .list(crate::snapshot::SnapshotListFilter::sandbox_snapshots(
                 query_params.sandbox_id.clone(),
                 query_params.name.clone(),
             ))

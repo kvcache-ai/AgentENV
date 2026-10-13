@@ -459,7 +459,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
 
     fn repository(root: &Path) -> Arc<dyn Repository> {
         PosixFsBackend::new(PosixFsBackendConfig {

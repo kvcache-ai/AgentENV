@@ -3,7 +3,10 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::{DocumentChange, DocumentKey, Repository, RepositoryError, RepositoryResult};
+use super::{
+    is_valid_volume_component, DocumentChange, DocumentKey, Repository, RepositoryError,
+    RepositoryResult,
+};
 
 /// The head and its pending retirements are committed in one repository write.
 #[derive(Default, Deserialize, Serialize)]
@@ -100,7 +103,7 @@ impl BuildCacheState {
     }
 
     fn validate_id(id: &str) -> RepositoryResult<()> {
-        if !crate::volume::is_valid_volume_component(id) {
+        if !is_valid_volume_component(id) {
             return Err(RepositoryError::InvalidRequest {
                 reason: format!("invalid build cache volume ID '{id}'"),
             });
@@ -127,18 +130,17 @@ impl BuildCacheState {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
-    use crate::repository::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::repository::backends::PosixFsRepository;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn build_cache_head_updates_are_atomic_across_repository_instances() {
         let temp = tempfile::tempdir().unwrap();
-        let config = PosixFsBackendConfig {
-            root: temp.path().join("repository"),
-            cache_root: Some(temp.path().join("cache")),
-            runtime_cache_root: None,
-        };
-        let repository = || PosixFsBackend::new(config.clone()).unwrap().repository();
+        let root = temp.path().join("repository");
+        let repository =
+            || -> Arc<dyn Repository> { Arc::new(PosixFsRepository::new(root.clone())) };
         let store = repository();
         assert_eq!(store.get_build_cache_head().await.unwrap(), None);
         let ids = (0..16)
