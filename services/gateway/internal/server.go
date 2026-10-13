@@ -288,7 +288,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstreamCtx, cancelUpstream := requestContextForProxy(r, routingCtx, longLived)
+	// Data-plane requests may legitimately wait for a guest service longer than
+	// the route-resolution deadline. Keep the client context after the node has
+	// been selected; control-plane and scheduled requests retain the bounded
+	// gateway request timeout.
+	upstreamCtx, cancelUpstream := requestContextForProxy(
+		r,
+		routingCtx,
+		longLived || isDataPlaneRouteSource(routeSource),
+	)
 	defer cancelUpstream()
 
 	s.proxyRequest(

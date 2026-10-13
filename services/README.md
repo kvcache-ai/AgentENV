@@ -156,7 +156,7 @@ When all nodes are filtered out, the scheduler returns `Unavailable` to the call
 - `gateway.scheduler_addr` points to the primary scheduler. The gateway uses it for scheduling, assignment writes, node listing, node detail resolution, and P2P scheduler APIs.
 - `gateway.query_only_scheduler_addr` optionally points to a query-only scheduler. When set, sandbox `LookupNode` routing uses this client; when unset, gateway falls back to `gateway.scheduler_addr`.
 - `gateway.request_timeout` must be a duration string such as `"30s"` in JSON config files.
-- `gateway.request_timeout` applies to regular proxied HTTP requests. Streaming requests and WebSocket connections reuse the client context and are not cut off by this timeout.
+- `gateway.request_timeout` bounds scheduler route resolution and regular control-plane requests. Data-plane requests routed by sandbox headers or host-based sandbox domains, streaming requests, and WebSocket connections reuse the client context after routing and are not cut off by this timeout.
 - `gateway.forward_response_size` only limits how much of a successful `POST /sandboxes` response the gateway buffers while extracting a sandbox ID for `RecordAssignment`; it is not a global response-size cap for all proxied traffic.
 - Cluster list requests (`GET /sandboxes`, `GET /v2/sandboxes`) fan out to every scheduler node and merge results in the gateway. Direct requests to a backend node remain node-scoped.
 - Cluster list requests are strict all-or-nothing: if any node times out, returns a non-2xx response, or cannot be reached, the gateway fails the whole list request rather than returning partial data.

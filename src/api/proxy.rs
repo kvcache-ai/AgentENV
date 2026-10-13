@@ -96,9 +96,14 @@ const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(test)]
-const PROXY_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_millis(100);
+const PROXY_HTTP_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
-const PROXY_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const PROXY_HTTP_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
+
+#[cfg(test)]
+const PROXY_WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const PROXY_WEBSOCKET_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[cfg(test)]
 const PROXY_REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -476,7 +481,7 @@ async fn proxy_http_request(
                 method = %upstream_method,
                 upstream = %upstream_uri_for_log,
                 request_body_idle_timeout_ms = PROXY_REQUEST_BODY_IDLE_TIMEOUT.as_millis(),
-                response_header_timeout_ms = PROXY_RESPONSE_HEADER_TIMEOUT.as_millis(),
+                response_header_timeout_ms = PROXY_HTTP_RESPONSE_HEADER_TIMEOUT.as_millis(),
                 "timed out waiting for upstream response headers or request body progress"
             );
             return StatusCode::GATEWAY_TIMEOUT.into_response();
@@ -552,7 +557,7 @@ where
                     timer.as_mut().reset(tokio::time::Instant::now() + PROXY_REQUEST_BODY_IDLE_TIMEOUT);
                 } else {
                     activity_open = false;
-                    timer.as_mut().reset(tokio::time::Instant::now() + PROXY_RESPONSE_HEADER_TIMEOUT);
+                    timer.as_mut().reset(tokio::time::Instant::now() + PROXY_HTTP_RESPONSE_HEADER_TIMEOUT);
                 }
             }
         }
@@ -631,7 +636,7 @@ async fn proxy_websocket_request(
     );
 
     let (upstream_websocket, upstream_response) = match timeout(
-        PROXY_RESPONSE_HEADER_TIMEOUT,
+        PROXY_WEBSOCKET_HANDSHAKE_TIMEOUT,
         connect_async(upstream_request),
     )
     .await
@@ -650,7 +655,7 @@ async fn proxy_websocket_request(
         Err(_) => {
             warn!(
                 sandbox_id = %sandbox_id,
-                timeout_ms = PROXY_RESPONSE_HEADER_TIMEOUT.as_millis(),
+                timeout_ms = PROXY_WEBSOCKET_HANDSHAKE_TIMEOUT.as_millis(),
                 "timed out waiting for upstream websocket handshake"
             );
             return StatusCode::GATEWAY_TIMEOUT.into_response();
