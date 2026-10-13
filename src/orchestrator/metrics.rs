@@ -89,6 +89,7 @@ impl SandboxContribution {
         let counts_as_running = matches!(
             state,
             SandboxState::Running
+                | SandboxState::Resizing
                 | SandboxState::Pausing
                 | SandboxState::Snapshotting
                 | SandboxState::Forking

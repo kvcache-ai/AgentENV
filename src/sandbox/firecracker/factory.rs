@@ -10,7 +10,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use super::config::FirecrackerSandboxConfig;
+use super::config::{FirecrackerCommonConfig, FirecrackerSandboxConfig};
 use super::sandbox::{FirecrackerPausedState, FirecrackerSandbox};
 use crate::cfg::ConfigManager;
 use crate::sandbox::backend::{PausedSandboxState, SandboxBackend, SandboxBackendFactory};
@@ -105,7 +105,23 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
             runtime_upper_mode,
         ));
         config.vcpu_count = build_spec.resources.cpu_count;
-        config.mem_size_mib = build_spec.resources.memory_mib;
+        config.mem_size_mib = if config.common.memory_hotplug.enabled {
+            let initial_hotplug = config.common.memory_hotplug.requested_size_mib;
+            let boot_memory = build_spec
+                .resources
+                .memory_mib
+                .checked_sub(initial_hotplug)
+                .context("sandbox memoryMB must exceed the initial requested hotplug memory")?;
+            anyhow::ensure!(
+                boot_memory >= 128,
+                "sandbox boot memory must be at least 128 MiB after subtracting initial hotplug memory: total={} MiB initial_hotplug={} MiB",
+                build_spec.resources.memory_mib,
+                initial_hotplug
+            );
+            boot_memory
+        } else {
+            build_spec.resources.memory_mib
+        };
         config.common.rootfs_virtual_size = if build_spec.resources.disk_size_mib == 0 {
             None
         } else {
@@ -172,8 +188,18 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         let paused_state = state
             .downcast_ref::<FirecrackerPausedState>()
             .context("The provided PausedSandboxState is not a Firecracker paused state")?;
+        let mut snapshot_config = paused_state.snapshot_config().clone();
+        let current_common = FirecrackerCommonConfig::from_global_config()
+            .context("load current node runtime policy for paused sandbox resume")?;
+        snapshot_config.common.runtime_policy = current_common.runtime_policy;
+        snapshot_config.common.memory_hotplug.resize_timeout_secs =
+            current_common.memory_hotplug.resize_timeout_secs;
+        snapshot_config
+            .common
+            .memory_hotplug
+            .resize_poll_interval_ms = current_common.memory_hotplug.resize_poll_interval_ms;
         let sandbox = FirecrackerSandbox::from_snapshot_config_with_override(
-            paused_state.snapshot_config().clone(),
+            snapshot_config,
             sandbox_id,
             envd_access_token,
         )?;

@@ -22,7 +22,8 @@ pub use store::{
 };
 pub use types::{
     CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource, SandboxLifecycleEvent,
-    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
+    SandboxLifecycleEventType, SandboxMemoryHotplugStatus, SandboxMemoryResizeState, SandboxState,
+    SnapshotCaptureResult,
 };
 
 pub type Result<T> = std::result::Result<T, OrchestratorError>;
@@ -39,6 +40,7 @@ pub enum SandboxOperation {
     SnapshotVolumes,
     Fork,
     UpdateNetwork,
+    ResizeMemory,
     PatchCustomExtensionParams,
     Stop,
 }
@@ -93,6 +95,24 @@ pub enum OrchestratorError {
     InvalidTimeout {
         sandbox_id: SandboxId,
         timeout: String,
+    },
+
+    #[error("invalid memory resize for sandbox {sandbox_id}: {reason}")]
+    InvalidMemoryResize {
+        sandbox_id: SandboxId,
+        reason: String,
+    },
+
+    #[error("memory hotplug is unsupported for sandbox {sandbox_id}: {reason}")]
+    MemoryHotplugUnsupported {
+        sandbox_id: SandboxId,
+        reason: String,
+    },
+
+    #[error("memory resize did not converge for sandbox {sandbox_id}: {status:?}")]
+    MemoryResizeIncomplete {
+        sandbox_id: SandboxId,
+        status: Box<SandboxMemoryHotplugStatus>,
     },
 
     #[error("internal error: {0}")]

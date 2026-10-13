@@ -16,9 +16,11 @@ use crate::image::cache::{
 };
 use crate::sandbox::{
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerSandboxFactory,
-    FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator,
-    SandboxBackend, SandboxBackendFactory, SandboxCaptureError, SandboxForkSpec,
-    SandboxLaunchConfig, SandboxLogEntry, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    FreshSandboxBuildSpec, MemoryHotplugStatus, MemoryHotplugUnsupported,
+    MemoryResizeConvergenceError, PausedSandboxState, RuntimeArtifactSet,
+    SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory, SandboxCaptureError,
+    SandboxForkSpec, SandboxLaunchConfig, SandboxLogEntry, SandboxNetworkPolicy,
+    SandboxRuntimeInfo,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
@@ -33,7 +35,8 @@ use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
 use super::types::{
     CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource, SandboxLifecycleEvent,
-    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
+    SandboxLifecycleEventType, SandboxMemoryHotplugStatus, SandboxMemoryResizeState, SandboxState,
+    SnapshotCaptureResult,
 };
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
@@ -64,6 +67,50 @@ const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
 const MAX_SANDBOX_LOG_LIMIT: usize = 1000;
 const SANDBOX_LOG_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[allow(clippy::too_many_arguments)]
+fn memory_hotplug_status(
+    sandbox_id: SandboxId,
+    previous_requested_size_mib: u32,
+    target_size_mib: u32,
+    observed: &MemoryHotplugStatus,
+    boot_memory_mib: u32,
+    accounted_memory_mib: u32,
+    elapsed_ms: u64,
+    state: SandboxMemoryResizeState,
+    rollback_target_size_mib: Option<u32>,
+    reason: Option<String>,
+) -> Result<SandboxMemoryHotplugStatus> {
+    let effective_memory_mib = boot_memory_mib
+        .checked_add(observed.plugged_size_mib)
+        .ok_or_else(|| {
+            OrchestratorError::InternalError(format!(
+                "sandbox {sandbox_id} effective memory exceeds u32 range"
+            ))
+        })?;
+    Ok(SandboxMemoryHotplugStatus {
+        previous_requested_size_mib,
+        target_size_mib,
+        requested_size_mib: observed.requested_size_mib,
+        plugged_size_mib: observed.plugged_size_mib,
+        total_size_mib: observed.total_size_mib,
+        slot_size_mib: observed.slot_size_mib,
+        block_size_mib: observed.block_size_mib,
+        boot_memory_mib,
+        effective_memory_mib,
+        accounted_memory_mib,
+        elapsed_ms,
+        state,
+        rollback_target_size_mib,
+        reason,
+    })
+}
+
+fn memory_hotplug_unsupported(error: &anyhow::Error) -> Option<String> {
+    error
+        .downcast_ref::<MemoryHotplugUnsupported>()
+        .map(|error| error.reason.clone())
+}
 
 #[derive(Clone, Debug)]
 enum ShutdownOutcome {
@@ -120,6 +167,7 @@ pub struct Orchestrator<
     sandboxes: RwLock<HashMap<SandboxId, SandboxHandle>>,
     template_build_ids: RwLock<HashSet<SandboxId>>,
     deletions: Mutex<HashMap<SandboxId, Arc<Mutex<DeleteProgress>>>>,
+    memory_resize_statuses: RwLock<HashMap<SandboxId, SandboxMemoryHotplugStatus>>,
     proxy_routes: RwLock<ProxyRouteTable>,
     next_proxy_route_version: AtomicU64,
     counters: OrchestratorCounters,
@@ -239,6 +287,7 @@ where
             sandboxes: RwLock::new(HashMap::new()),
             template_build_ids: RwLock::new(HashSet::new()),
             deletions: Mutex::new(HashMap::new()),
+            memory_resize_statuses: RwLock::new(HashMap::new()),
             proxy_routes: RwLock::new(ProxyRouteTable::default()),
             next_proxy_route_version: AtomicU64::new(1),
             counters: OrchestratorCounters::default(),
@@ -1003,6 +1052,7 @@ where
             metadata.state,
             SandboxState::Creating
                 | SandboxState::Resuming
+                | SandboxState::Resizing
                 | SandboxState::Snapshotting
                 | SandboxState::Forking
         ) {
@@ -1108,7 +1158,11 @@ where
                 .update_state_if_state(
                     &sandbox_id,
                     SandboxState::Killing,
-                    &[SandboxState::Running, SandboxState::Paused],
+                    &[
+                        SandboxState::Running,
+                        SandboxState::Paused,
+                        SandboxState::Resizing,
+                    ],
                 )
                 .await
             {
@@ -1337,6 +1391,10 @@ where
 
     async fn remove_deleted_sandbox(&self, sandbox_id: SandboxId) -> Result<()> {
         let metadata = self.store.remove(&sandbox_id).await?;
+        self.memory_resize_statuses
+            .write()
+            .await
+            .remove(&sandbox_id);
         if let Some(metadata) = metadata {
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Delete,
@@ -1933,6 +1991,471 @@ where
             metadata,
             captured_snapshot,
         })
+    }
+
+    /// Resize the virtio-mem region of a running sandbox. The transitional
+    /// state owns the lifecycle operation, while the backend handle serializes
+    /// the Firecracker request with kill and other backend mutations.
+    pub async fn resize_sandbox_memory(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        requested_hotplug_memory_mib: u32,
+    ) -> Result<SandboxMemoryHotplugStatus> {
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("resize_memory", sandbox_id, async move {
+            this.resize_sandbox_memory_inner(sandbox_id, requested_hotplug_memory_mib)
+                .await
+        })
+        .await
+    }
+
+    #[tracing::instrument(
+        name = "resize_sandbox_memory",
+        skip(self),
+        fields(sandbox_id = %sandbox_id, requested_hotplug_memory_mib)
+    )]
+    async fn resize_sandbox_memory_inner(
+        &self,
+        sandbox_id: SandboxId,
+        requested_hotplug_memory_mib: u32,
+    ) -> Result<SandboxMemoryHotplugStatus> {
+        self.ensure_accepting_lifecycle_operations()?;
+        self.store
+            .update_state_if_state(
+                &sandbox_id,
+                SandboxState::Resizing,
+                &[SandboxState::Running],
+            )
+            .await
+            .map_err(|err| match err {
+                StoreError::StateConflict { .. } => OrchestratorError::SandboxOperationConflict {
+                    sandbox_id,
+                    operation: SandboxOperation::ResizeMemory,
+                },
+                other => OrchestratorError::from(other),
+            })?;
+
+        let handle = self
+            .sandboxes
+            .read()
+            .await
+            .get(&sandbox_id)
+            .cloned()
+            .ok_or_else(|| OrchestratorError::SandboxOperationConflict {
+                sandbox_id,
+                operation: SandboxOperation::ResizeMemory,
+            });
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(err) => {
+                let _ = self
+                    .store
+                    .update_state_if_state(
+                        &sandbox_id,
+                        SandboxState::Running,
+                        &[SandboxState::Resizing],
+                    )
+                    .await;
+                return Err(err);
+            }
+        };
+
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        let mut sandbox = handle.lock().await;
+        let before = match sandbox.memory_hotplug_status().await {
+            Ok(status) => status,
+            Err(source) => {
+                let _ = self
+                    .store
+                    .update_state_if_state(
+                        &sandbox_id,
+                        SandboxState::Running,
+                        &[SandboxState::Resizing],
+                    )
+                    .await;
+                return if let Some(reason) = memory_hotplug_unsupported(&source) {
+                    Err(OrchestratorError::MemoryHotplugUnsupported { sandbox_id, reason })
+                } else {
+                    Err(OrchestratorError::SandboxOperationFailed {
+                        sandbox_id,
+                        operation: SandboxOperation::ResizeMemory,
+                        source,
+                    })
+                };
+            }
+        };
+        if before.requested_size_mib != before.plugged_size_mib {
+            let boot_memory_mib = metadata
+                .resources
+                .memory_mib
+                .checked_sub(before.plugged_size_mib)
+                .ok_or_else(|| {
+                    OrchestratorError::InternalError(format!(
+                        "sandbox {sandbox_id} memory accounting is smaller than plugged virtio-mem"
+                    ))
+                })?;
+            let accounted_memory_mib = metadata.resources.memory_mib.max(
+                boot_memory_mib
+                    .saturating_add(before.requested_size_mib.max(before.plugged_size_mib)),
+            );
+            self.store
+                .update_if_state(&sandbox_id, &[SandboxState::Resizing], |metadata| {
+                    metadata.resources.memory_mib = accounted_memory_mib
+                })
+                .await?;
+            let status = memory_hotplug_status(
+                sandbox_id,
+                before.requested_size_mib,
+                before.requested_size_mib,
+                &before,
+                boot_memory_mib,
+                accounted_memory_mib,
+                0,
+                SandboxMemoryResizeState::Partial,
+                None,
+                Some("virtio-mem was already partially converged before resize".to_string()),
+            )?;
+            self.memory_resize_statuses
+                .write()
+                .await
+                .insert(sandbox_id, status.clone());
+            return Err(OrchestratorError::MemoryResizeIncomplete {
+                sandbox_id,
+                status: Box::new(status),
+            });
+        }
+        if requested_hotplug_memory_mib > before.total_size_mib
+            || !requested_hotplug_memory_mib.is_multiple_of(before.block_size_mib)
+        {
+            let _ = self
+                .store
+                .update_state_if_state(
+                    &sandbox_id,
+                    SandboxState::Running,
+                    &[SandboxState::Resizing],
+                )
+                .await;
+            return Err(OrchestratorError::InvalidMemoryResize {
+                sandbox_id,
+                reason: format!(
+                    "requestedHotplugMemoryMB must be <= {} and aligned to {} MiB",
+                    before.total_size_mib, before.block_size_mib
+                ),
+            });
+        }
+
+        let boot_memory_mib = metadata
+            .resources
+            .memory_mib
+            .checked_sub(before.plugged_size_mib)
+            .ok_or_else(|| {
+                OrchestratorError::InternalError(format!(
+                    "sandbox {sandbox_id} memory accounting is smaller than plugged virtio-mem"
+                ))
+            })?;
+        let target_total_mib = boot_memory_mib
+            .checked_add(requested_hotplug_memory_mib)
+            .ok_or_else(|| OrchestratorError::InvalidMemoryResize {
+                sandbox_id,
+                reason: "effective memory exceeds u32 range".to_string(),
+            })?;
+
+        // Expansion obtains its accounting grant before touching Firecracker.
+        // Shrink retains the old grant until exact requested/plugged convergence.
+        if requested_hotplug_memory_mib > before.plugged_size_mib {
+            self.store
+                .update_if_state(&sandbox_id, &[SandboxState::Resizing], |metadata| {
+                    metadata.resources.memory_mib = target_total_mib;
+                })
+                .await?;
+        }
+
+        let accounting_grant_mib = metadata.resources.memory_mib.max(target_total_mib);
+        let active_status = memory_hotplug_status(
+            sandbox_id,
+            before.requested_size_mib,
+            requested_hotplug_memory_mib,
+            &before,
+            boot_memory_mib,
+            accounting_grant_mib,
+            0,
+            SandboxMemoryResizeState::Resizing,
+            None,
+            None,
+        )?;
+        self.memory_resize_statuses
+            .write()
+            .await
+            .insert(sandbox_id, active_status);
+
+        let resize = sandbox
+            .resize_memory_hotplug(requested_hotplug_memory_mib)
+            .await;
+        let observed_after_error = if resize.is_err() {
+            sandbox.memory_hotplug_status().await.ok()
+        } else {
+            None
+        };
+        drop(sandbox);
+        match resize {
+            Ok(result) => {
+                self.store
+                    .update_if_state(&sandbox_id, &[SandboxState::Resizing], |metadata| {
+                        metadata.resources.memory_mib = target_total_mib;
+                        metadata.state = SandboxState::Running;
+                    })
+                    .await?;
+                let observed = MemoryHotplugStatus {
+                    requested_size_mib: result.requested_size_mib,
+                    plugged_size_mib: result.plugged_size_mib,
+                    total_size_mib: result.total_size_mib,
+                    slot_size_mib: result.slot_size_mib,
+                    block_size_mib: result.block_size_mib,
+                };
+                let status = memory_hotplug_status(
+                    sandbox_id,
+                    result.previous_requested_size_mib,
+                    requested_hotplug_memory_mib,
+                    &observed,
+                    boot_memory_mib,
+                    target_total_mib,
+                    result.elapsed_ms,
+                    SandboxMemoryResizeState::Converged,
+                    None,
+                    None,
+                )?;
+                self.memory_resize_statuses
+                    .write()
+                    .await
+                    .insert(sandbox_id, status.clone());
+                Ok(status)
+            }
+            Err(source) => {
+                if let Some(reason) = memory_hotplug_unsupported(&source) {
+                    let _ = self
+                        .store
+                        .update_if_state(&sandbox_id, &[SandboxState::Resizing], |metadata| {
+                            metadata.resources.memory_mib =
+                                boot_memory_mib.saturating_add(before.plugged_size_mib);
+                            metadata.state = SandboxState::Running;
+                        })
+                        .await;
+                    self.memory_resize_statuses
+                        .write()
+                        .await
+                        .remove(&sandbox_id);
+                    return Err(OrchestratorError::MemoryHotplugUnsupported { sandbox_id, reason });
+                }
+
+                if let Some(convergence) = source.downcast_ref::<MemoryResizeConvergenceError>() {
+                    let (observed, elapsed_ms, state, rollback_target_size_mib, reason) =
+                        match convergence {
+                            MemoryResizeConvergenceError::RolledBack {
+                                observed,
+                                elapsed_ms,
+                                rollback_target_size_mib,
+                                ..
+                            } => (
+                                observed,
+                                *elapsed_ms,
+                                SandboxMemoryResizeState::RolledBack,
+                                Some(*rollback_target_size_mib),
+                                Some(convergence.to_string()),
+                            ),
+                            MemoryResizeConvergenceError::Partial {
+                                observed,
+                                elapsed_ms,
+                                rollback_target_size_mib,
+                                reason,
+                                ..
+                            } => (
+                                observed,
+                                *elapsed_ms,
+                                SandboxMemoryResizeState::Partial,
+                                Some(*rollback_target_size_mib),
+                                Some(reason.clone()),
+                            ),
+                        };
+                    let observed_accounting_mib = boot_memory_mib
+                        .saturating_add(observed.requested_size_mib.max(observed.plugged_size_mib));
+                    let accounted_memory_mib = if state == SandboxMemoryResizeState::RolledBack {
+                        boot_memory_mib.saturating_add(observed.plugged_size_mib)
+                    } else {
+                        accounting_grant_mib.max(observed_accounting_mib)
+                    };
+                    self.store
+                        .update_if_state(&sandbox_id, &[SandboxState::Resizing], |metadata| {
+                            metadata.resources.memory_mib = accounted_memory_mib;
+                            if state == SandboxMemoryResizeState::RolledBack {
+                                metadata.state = SandboxState::Running;
+                            }
+                        })
+                        .await?;
+                    let status = memory_hotplug_status(
+                        sandbox_id,
+                        before.requested_size_mib,
+                        requested_hotplug_memory_mib,
+                        observed,
+                        boot_memory_mib,
+                        accounted_memory_mib,
+                        elapsed_ms,
+                        state,
+                        rollback_target_size_mib,
+                        reason,
+                    )?;
+                    self.memory_resize_statuses
+                        .write()
+                        .await
+                        .insert(sandbox_id, status.clone());
+                    return Err(OrchestratorError::MemoryResizeIncomplete {
+                        sandbox_id,
+                        status: Box::new(status),
+                    });
+                }
+
+                if let Some(observed) = observed_after_error.as_ref() {
+                    if observed.requested_size_mib != observed.plugged_size_mib {
+                        let observed_accounting_mib = boot_memory_mib.saturating_add(
+                            observed.requested_size_mib.max(observed.plugged_size_mib),
+                        );
+                        let accounted_memory_mib =
+                            accounting_grant_mib.max(observed_accounting_mib);
+                        self.store
+                            .update_if_state(&sandbox_id, &[SandboxState::Resizing], |metadata| {
+                                metadata.resources.memory_mib = accounted_memory_mib
+                            })
+                            .await?;
+                        let status = memory_hotplug_status(
+                            sandbox_id,
+                            before.requested_size_mib,
+                            requested_hotplug_memory_mib,
+                            observed,
+                            boot_memory_mib,
+                            accounted_memory_mib,
+                            0,
+                            SandboxMemoryResizeState::Partial,
+                            Some(before.requested_size_mib),
+                            Some(source.to_string()),
+                        )?;
+                        self.memory_resize_statuses
+                            .write()
+                            .await
+                            .insert(sandbox_id, status.clone());
+                        return Err(OrchestratorError::MemoryResizeIncomplete {
+                            sandbox_id,
+                            status: Box::new(status),
+                        });
+                    }
+                }
+
+                let stable = observed_after_error.as_ref().unwrap_or(&before);
+                let stable_accounting_mib = boot_memory_mib.saturating_add(stable.plugged_size_mib);
+                let _ = self
+                    .store
+                    .update_if_state(&sandbox_id, &[SandboxState::Resizing], |metadata| {
+                        metadata.resources.memory_mib = stable_accounting_mib;
+                        metadata.state = SandboxState::Running;
+                    })
+                    .await;
+                self.memory_resize_statuses
+                    .write()
+                    .await
+                    .remove(&sandbox_id);
+                Err(OrchestratorError::SandboxOperationFailed {
+                    sandbox_id,
+                    operation: SandboxOperation::ResizeMemory,
+                    source,
+                })
+            }
+        }
+    }
+
+    pub async fn get_sandbox_memory_status(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<SandboxMemoryHotplugStatus> {
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        if !matches!(
+            metadata.state,
+            SandboxState::Running | SandboxState::Resizing
+        ) {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: metadata.state,
+            });
+        }
+        if let Some(status) = self
+            .memory_resize_statuses
+            .read()
+            .await
+            .get(&sandbox_id)
+            .cloned()
+        {
+            return Ok(status);
+        }
+
+        let handle = self
+            .sandboxes
+            .read()
+            .await
+            .get(&sandbox_id)
+            .cloned()
+            .ok_or(OrchestratorError::SandboxOperationConflict {
+                sandbox_id,
+                operation: SandboxOperation::ResizeMemory,
+            })?;
+        let observed = {
+            let mut sandbox = handle.lock().await;
+            sandbox.memory_hotplug_status().await
+        };
+        let observed = match observed {
+            Ok(observed) => observed,
+            Err(source) => {
+                return if let Some(reason) = memory_hotplug_unsupported(&source) {
+                    Err(OrchestratorError::MemoryHotplugUnsupported { sandbox_id, reason })
+                } else {
+                    Err(OrchestratorError::SandboxOperationFailed {
+                        sandbox_id,
+                        operation: SandboxOperation::ResizeMemory,
+                        source,
+                    })
+                }
+            }
+        };
+        let boot_memory_mib = metadata
+            .resources
+            .memory_mib
+            .checked_sub(observed.plugged_size_mib)
+            .ok_or_else(|| {
+                OrchestratorError::InternalError(format!(
+                    "sandbox {sandbox_id} memory accounting is smaller than plugged virtio-mem"
+                ))
+            })?;
+        let state = if observed.requested_size_mib == observed.plugged_size_mib {
+            SandboxMemoryResizeState::Converged
+        } else {
+            SandboxMemoryResizeState::Partial
+        };
+        memory_hotplug_status(
+            sandbox_id,
+            observed.requested_size_mib,
+            observed.requested_size_mib,
+            &observed,
+            boot_memory_mib,
+            metadata.resources.memory_mib,
+            0,
+            state,
+            None,
+            None,
+        )
     }
 
     pub async fn replace_sandbox_network_policy(
@@ -2826,6 +3349,7 @@ where
                         }
                     }
                     SandboxState::Creating
+                    | SandboxState::Resizing
                     | SandboxState::Snapshotting
                     | SandboxState::Forking
                     | SandboxState::Pausing
