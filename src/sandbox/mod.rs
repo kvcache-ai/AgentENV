@@ -4,6 +4,7 @@ pub(crate) mod custom_extension;
 mod envd;
 mod extra_drive;
 mod firecracker;
+mod guest_volumes;
 pub(crate) mod logs;
 mod metrics;
 #[cfg(test)]
