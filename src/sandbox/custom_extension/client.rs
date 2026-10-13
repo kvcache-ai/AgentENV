@@ -33,6 +33,7 @@
 //! a process-wide singleton derived from the global config; when no URL is
 //! configured, all calls are skipped.
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -126,6 +127,7 @@ impl CustomExtensionClient {
         network_namespace_path: &str,
         host_interaction_ip: Ipv4Addr,
         custom_extension_params: Option<&CustomExtensionParams>,
+        user_metadata: Option<&HashMap<String, String>>,
     ) -> Result<Option<String>> {
         let request = models::StartFreshHookRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -138,6 +140,7 @@ impl CustomExtensionClient {
                     .map(serde_json::Value::Object)
                     .unwrap_or_else(empty_params),
             ),
+            metadata: user_metadata.cloned(),
         };
         let response = default_api::sandbox_start_fresh(&self.configuration, request)
             .await
@@ -153,6 +156,7 @@ impl CustomExtensionClient {
         network_namespace_path: &str,
         host_interaction_ip: Ipv4Addr,
         custom_extension_params: Option<&CustomExtensionParams>,
+        user_metadata: Option<&HashMap<String, String>>,
     ) -> Result<()> {
         let request = models::StartResumeHookRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -165,6 +169,7 @@ impl CustomExtensionClient {
                     .map(serde_json::Value::Object)
                     .unwrap_or_else(empty_params),
             ),
+            metadata: user_metadata.cloned(),
         };
         default_api::sandbox_start_resume(&self.configuration, request)
             .await
@@ -182,10 +187,12 @@ impl CustomExtensionClient {
         &self,
         sandbox_id: SandboxId,
         patch: serde_json::Map<String, serde_json::Value>,
+        user_metadata: Option<&HashMap<String, String>>,
     ) -> Result<Option<CustomExtensionParams>> {
         let request = models::PatchCustomExtensionParamsHookRequest {
             sandbox_id: sandbox_id.to_string(),
             patch: Some(serde_json::Value::Object(patch)),
+            metadata: user_metadata.cloned(),
         };
         let response = default_api::sandbox_patch_params(&self.configuration, request)
             .await
@@ -269,6 +276,7 @@ impl CustomExtensionHookGuard {
         network_namespace_path: &str,
         host_interaction_ip: Ipv4Addr,
         custom_extension_params: Option<&CustomExtensionParams>,
+        user_metadata: Option<&HashMap<String, String>>,
     ) -> Result<Option<String>> {
         // Record the instance id before delivering the hook: if the request
         // fails after the extension already processed it (e.g. client-side
@@ -283,6 +291,7 @@ impl CustomExtensionHookGuard {
                 network_namespace_path,
                 host_interaction_ip,
                 custom_extension_params,
+                user_metadata,
             )
             .await?;
         debug!(
@@ -300,6 +309,7 @@ impl CustomExtensionHookGuard {
         network_namespace_path: &str,
         host_interaction_ip: Ipv4Addr,
         custom_extension_params: Option<&CustomExtensionParams>,
+        user_metadata: Option<&HashMap<String, String>>,
     ) -> Result<()> {
         // Recorded before delivery for the same reason as `start_fresh`.
         let sandbox_instance_id = SandboxInstanceId::new();
@@ -311,6 +321,7 @@ impl CustomExtensionHookGuard {
                 network_namespace_path,
                 host_interaction_ip,
                 custom_extension_params,
+                user_metadata,
             )
             .await?;
         debug!(
@@ -435,6 +446,14 @@ pub(crate) mod tests {
             .clone()
     }
 
+    /// Build user metadata from string key-value pairs.
+    fn user_metadata(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
     pub(crate) fn test_client(base: &str) -> CustomExtensionClient {
         CustomExtensionClient {
             configuration: Configuration {
@@ -549,6 +568,7 @@ pub(crate) mod tests {
                 "/var/run/netns/agentenv-ns-test",
                 Ipv4Addr::new(10, 11, 0, 123),
                 Some(&params(serde_json::json!({"team": "alpha"}))),
+                Some(&user_metadata(&[("team", "alpha"), ("env", "prod")])),
             )
             .await
             .expect("start-fresh hook should succeed");
@@ -568,6 +588,10 @@ pub(crate) mod tests {
             json["customExtensionParams"],
             serde_json::json!({"team": "alpha"})
         );
+        assert_eq!(
+            json["metadata"],
+            serde_json::json!({"team": "alpha", "env": "prod"})
+        );
     }
 
     #[tokio::test]
@@ -582,6 +606,7 @@ pub(crate) mod tests {
                 "/var/run/netns/agentenv-ns-test",
                 Ipv4Addr::new(10, 11, 0, 124),
                 None,
+                None,
             )
             .await
             .expect("start-fresh hook should succeed");
@@ -589,6 +614,7 @@ pub(crate) mod tests {
         let (_, body) = rx.recv().unwrap();
         let json: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["customExtensionParams"], serde_json::json!({}));
+        assert!(json.get("metadata").is_none());
     }
 
     #[tokio::test]
@@ -602,6 +628,7 @@ pub(crate) mod tests {
                 SandboxInstanceId::new(),
                 "/var/run/netns/agentenv-ns-test",
                 Ipv4Addr::new(10, 11, 0, 125),
+                None,
                 None,
             )
             .await
@@ -622,6 +649,7 @@ pub(crate) mod tests {
                 "/proc/1000/task/1001/ns/net",
                 Ipv4Addr::new(10, 11, 0, 131),
                 None,
+                None,
             )
             .await
             .expect_err("4xx response must fail the hook");
@@ -641,7 +669,7 @@ pub(crate) mod tests {
         let client = test_client(&base);
 
         let err = client
-            .hook_patch_params(SandboxId::new(), params(serde_json::json!({})))
+            .hook_patch_params(SandboxId::new(), params(serde_json::json!({})), None)
             .await
             .expect_err("5xx response must fail the hook");
 
@@ -666,6 +694,7 @@ pub(crate) mod tests {
                 "/var/run/netns/agentenv-ns-resume",
                 Ipv4Addr::new(10, 11, 0, 126),
                 None,
+                Some(&user_metadata(&[("team", "beta")])),
             )
             .await
             .expect("start-resume hook should succeed");
@@ -680,6 +709,7 @@ pub(crate) mod tests {
             "/var/run/netns/agentenv-ns-resume"
         );
         assert_eq!(json["hostInteractionIp"], "10.11.0.126");
+        assert_eq!(json["metadata"], serde_json::json!({"team": "beta"}));
     }
 
     #[tokio::test]
@@ -693,6 +723,7 @@ pub(crate) mod tests {
             .start_fresh(
                 "/var/run/netns/agentenv-ns-test",
                 Ipv4Addr::new(10, 11, 0, 127),
+                None,
                 None,
             )
             .await
@@ -726,6 +757,7 @@ pub(crate) mod tests {
             .hook_patch_params(
                 sandbox_id,
                 params(serde_json::json!({"op": "set", "team": "beta"})),
+                Some(&user_metadata(&[("team", "beta")])),
             )
             .await
             .expect("patch-params hook should succeed");
@@ -742,6 +774,7 @@ pub(crate) mod tests {
             json["patch"],
             serde_json::json!({"op": "set", "team": "beta"})
         );
+        assert_eq!(json["metadata"], serde_json::json!({"team": "beta"}));
     }
 
     #[tokio::test]
@@ -751,7 +784,11 @@ pub(crate) mod tests {
         let client = test_client(&base);
 
         let new_params = client
-            .hook_patch_params(SandboxId::new(), params(serde_json::json!({"op": "clear"})))
+            .hook_patch_params(
+                SandboxId::new(),
+                params(serde_json::json!({"op": "clear"})),
+                None,
+            )
             .await
             .expect("patch-params hook should succeed");
 
@@ -764,7 +801,7 @@ pub(crate) mod tests {
         let client = test_client(&base);
 
         let err = client
-            .hook_patch_params(SandboxId::new(), params(serde_json::json!({})))
+            .hook_patch_params(SandboxId::new(), params(serde_json::json!({})), None)
             .await
             .expect_err("non-2xx response must fail the hook");
 
@@ -798,6 +835,7 @@ pub(crate) mod tests {
             .start_resume(
                 "/var/run/netns/agentenv-ns-resume",
                 Ipv4Addr::new(10, 11, 0, 128),
+                None,
                 None,
             )
             .await
@@ -836,6 +874,7 @@ pub(crate) mod tests {
                 .start_fresh(
                     "/var/run/netns/agentenv-ns-test",
                     Ipv4Addr::new(10, 11, 0, 129),
+                    None,
                     None,
                 )
                 .await
@@ -878,6 +917,7 @@ pub(crate) mod tests {
                 .start_fresh(
                     "/var/run/netns/agentenv-ns-test",
                     Ipv4Addr::new(10, 11, 0, 130),
+                    None,
                     None,
                 )
                 .await

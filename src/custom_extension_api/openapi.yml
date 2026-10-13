@@ -121,6 +121,16 @@ components:
         absent value and an empty object are equivalent: both mean empty
         params.
 
+    SandboxMetadata:
+      type: object
+      additionalProperties:
+        type: string
+      description: >-
+        User-provided sandbox metadata from the create-sandbox request.
+        Only the launch-provided value is sent: metadata is never
+        inherited from a source snapshot. It is retained across
+        pause/resume of the same sandbox.
+
     StartFreshHookRequest:
       type: object
       required:
@@ -146,6 +156,8 @@ components:
           description: Per-runtime host interaction address routed to this sandbox.
         customExtensionParams:
           $ref: "#/components/schemas/CustomExtensionParams"
+        metadata:
+          $ref: "#/components/schemas/SandboxMetadata"
 
     StartFreshHookResponse:
       type: object
@@ -180,6 +192,8 @@ components:
           description: Per-runtime host interaction address routed to this sandbox.
         customExtensionParams:
           $ref: "#/components/schemas/CustomExtensionParams"
+        metadata:
+          $ref: "#/components/schemas/SandboxMetadata"
 
     PatchCustomExtensionParamsHookRequest:
       type: object
@@ -194,6 +208,8 @@ components:
             Opaque JSON patch document passed through verbatim from the
             user's PATCH request. Its semantics are defined entirely by the
             extension.
+        metadata:
+          $ref: "#/components/schemas/SandboxMetadata"
 
     PatchCustomExtensionParamsHookResponse:
       type: object

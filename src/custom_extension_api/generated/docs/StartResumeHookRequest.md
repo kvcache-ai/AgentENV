@@ -9,6 +9,7 @@ Name | Type | Description | Notes
 **network_namespace_path** | **String** | Host path of the sandbox's network namespace file (e.g. /var/run/netns/agentenv-ns-*). | 
 **host_interaction_ip** | **String** | Per-runtime host interaction address routed to this sandbox. | 
 **custom_extension_params** | Option<**serde_json::Value**> | Opaque JSON object interpreted only by the custom extension. An absent value and an empty object are equivalent: both mean empty params. | [optional]
+**metadata** | Option<**std::collections::HashMap<String, String>**> | User-provided sandbox metadata from the create-sandbox request. Only the launch-provided value is sent: metadata is never inherited from a source snapshot. It is retained across pause/resume of the same sandbox. | [optional]
 
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)
 
