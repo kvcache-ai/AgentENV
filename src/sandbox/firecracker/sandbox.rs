@@ -1545,6 +1545,14 @@ fn build_drives_boot_arg(extra_drives: &[ExtraDrive]) -> Option<String> {
     Some(format!("agentenv_drives={}", entries.join(",")))
 }
 
+/// Append a space-separated argument to an optional kernel command line.
+fn append_boot_arg(boot_args: &mut Option<String>, arg: &str) {
+    *boot_args = Some(match boot_args.take() {
+        Some(existing) => format!("{existing} {arg}"),
+        None => arg.to_owned(),
+    });
+}
+
 fn relocate_warm_log(src: Option<&Path>, target: &Path) -> Result<()> {
     let Some(src) = src else {
         return Ok(());
@@ -1649,50 +1657,18 @@ impl FirecrackerSandbox {
         self.link_tools_drive(&config.common, work_dir)?;
 
         // ── User image: overlaybd via ublk, writable, per-sandbox ──
-        let user_image_symlink = work_dir.join(USER_ROOTFS_DRIVE_PATH);
-        let global_cfg_path = global_config.ublk.overlaybd.global_config_path.clone();
         let rootfs_image_config = config
             .common
             .rootfs_image_config
             .as_ref()
             .context("fresh sandbox rootfs image config is missing")?;
-        let runtime_dir = work_dir.join("overlaybd");
-        let runtime_device = UblkDeviceManager::global()
-            .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                source_image_config: &rootfs_image_config.image_config_path,
-                global_config: &global_cfg_path,
-                runtime_dir: &runtime_dir,
-                read_only: rootfs_image_config.read_only,
-                runtime_upper_mode: rootfs_image_config.runtime_upper_mode,
-                requested_virtual_size: config.common.rootfs_virtual_size,
-                known_source_virtual_size: None,
-                allow_shrink: config.common.rootfs_allow_shrink,
-            })
-            .await
-            .context("create user image overlaybd runtime device")?;
-        self.resources.rootfs_image_config_path =
-            Some(rootfs_image_config.image_config_path.clone());
-        let device_path = runtime_device.device.device_path().to_path_buf();
-        let symlink_result = std::os::unix::fs::symlink(&device_path, &user_image_symlink)
-            .context("symlink user-rootfs to ublk device");
-        if let Err(err) = symlink_result {
-            if let Err(release_err) = UblkDeviceManager::global()
-                .release_device(&runtime_device.device)
-                .await
-            {
-                warn!(
-                    error = %release_err,
-                    "failed to release user image ublk device after symlink failure"
-                );
-            }
-            return Err(err);
-        }
-        self.resources.rootfs_runtime = Some(OverlaybdRuntimeHandle {
-            device: runtime_device.device,
-            image_config_path: runtime_device.image_config_path,
-            actual_virtual_size: runtime_device.actual_virtual_size,
-        });
-        self.current_rootfs_virtual_size = Some(runtime_device.actual_virtual_size);
+        self.attach_user_rootfs(
+            rootfs_image_config,
+            config.common.rootfs_virtual_size,
+            None,
+            config.common.rootfs_allow_shrink,
+        )
+        .await?;
 
         // ── Boot args: init=/init (tools drive has init baked in) ──
         let mut boot_args = config.boot_args.clone();
@@ -1702,11 +1678,7 @@ impl FirecrackerSandbox {
             None => true,
         };
         if missing_explicit_init_arg {
-            let init_arg = "init=/init";
-            boot_args = Some(match boot_args.take() {
-                Some(existing) => format!("{existing} {init_arg}"),
-                None => init_arg.to_string(),
-            });
+            append_boot_arg(&mut boot_args, "init=/init");
         }
 
         // ── Extra drives ──
@@ -1732,10 +1704,7 @@ impl FirecrackerSandbox {
 
         // ── Boot args: extra drive mount points (agentenv_drives=vdc:...) ──
         if let Some(drives_arg) = build_drives_boot_arg(&config.common.extra_drives) {
-            boot_args = Some(match boot_args.take() {
-                Some(existing) => format!("{existing} {drives_arg}"),
-                None => drives_arg,
-            });
+            append_boot_arg(&mut boot_args, &drives_arg);
         }
 
         // ── Allocate network slot and create network infrastructure ──
@@ -1757,10 +1726,7 @@ impl FirecrackerSandbox {
             .expect("network slot was just assigned")
             .set_egress_policy(config.common.network_policy.as_ref())
             .context("Failed to configure sandbox egress policy")?;
-        boot_args = Some(match boot_args.take() {
-            Some(existing) => format!("{existing} {ip_config}"),
-            None => ip_config,
-        });
+        append_boot_arg(&mut boot_args, &ip_config);
 
         // ── Custom extension hook: start-fresh (may contribute extra boot args) ──
         if let Some(client) = CustomExtensionClient::global() {
@@ -1774,10 +1740,7 @@ impl FirecrackerSandbox {
                 .await?;
             self.resources.custom_extension_hook_guard = Some(guard);
             if let Some(extra) = extra_boot_args.filter(|args| !args.trim().is_empty()) {
-                boot_args = Some(match boot_args.take() {
-                    Some(existing) => format!("{existing} {extra}"),
-                    None => extra,
-                });
+                append_boot_arg(&mut boot_args, &extra);
             }
         }
 
@@ -1892,45 +1855,13 @@ impl FirecrackerSandbox {
 
         // ── User image: restore overlaybd via ublk ──
         if config.common.ublk_config.is_some() {
-            let user_image_symlink = fc_cwd.join(USER_ROOTFS_DRIVE_PATH);
-            let global_cfg_path = global_config.ublk.overlaybd.global_config_path.clone();
-            let runtime_dir = fc_cwd.join("overlaybd");
-            let runtime_device = UblkDeviceManager::global()
-                .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                    source_image_config: &rootfs_image_config.image_config_path,
-                    global_config: &global_cfg_path,
-                    runtime_dir: &runtime_dir,
-                    read_only: rootfs_image_config.read_only,
-                    runtime_upper_mode: rootfs_image_config.runtime_upper_mode,
-                    requested_virtual_size: Some(rootfs_virtual_size),
-                    known_source_virtual_size: Some(rootfs_virtual_size),
-                    allow_shrink: false,
-                })
-                .await
-                .context("create user image overlaybd runtime device for resume")?;
-            self.resources.rootfs_image_config_path =
-                Some(rootfs_image_config.image_config_path.clone());
-            let device_path = runtime_device.device.device_path().to_path_buf();
-            let symlink_result = std::os::unix::fs::symlink(&device_path, &user_image_symlink)
-                .context("symlink user-rootfs to ublk device for resume");
-            if let Err(err) = symlink_result {
-                if let Err(release_err) = UblkDeviceManager::global()
-                    .release_device(&runtime_device.device)
-                    .await
-                {
-                    warn!(
-                        error = %release_err,
-                        "failed to release resumed user image ublk device after symlink failure"
-                    );
-                }
-                return Err(err);
-            }
-            self.resources.rootfs_runtime = Some(OverlaybdRuntimeHandle {
-                device: runtime_device.device,
-                image_config_path: runtime_device.image_config_path,
-                actual_virtual_size: runtime_device.actual_virtual_size,
-            });
-            self.current_rootfs_virtual_size = Some(runtime_device.actual_virtual_size);
+            self.attach_user_rootfs(
+                rootfs_image_config,
+                Some(rootfs_virtual_size),
+                Some(rootfs_virtual_size),
+                false,
+            )
+            .await?;
         }
 
         // ── Extra drives ──
@@ -2196,6 +2127,62 @@ impl FirecrackerSandbox {
         self.fc_instance.resume().await?;
 
         debug!("sandbox restored from snapshot config");
+        Ok(())
+    }
+
+    /// Create the writable user-image overlaybd device and link it into the
+    /// Firecracker work directory as `user-rootfs`.
+    async fn attach_user_rootfs(
+        &mut self,
+        rootfs_image_config: &OverlaybdConfig,
+        requested_virtual_size: Option<u64>,
+        known_source_virtual_size: Option<u64>,
+        allow_shrink: bool,
+    ) -> Result<()> {
+        let work_dir = self.work_dir.path();
+        let global_cfg_path = ConfigManager::global_config()
+            .ublk
+            .overlaybd
+            .global_config_path
+            .clone();
+        let runtime_device = UblkDeviceManager::global()
+            .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
+                source_image_config: &rootfs_image_config.image_config_path,
+                global_config: &global_cfg_path,
+                runtime_dir: &work_dir.join("overlaybd"),
+                read_only: rootfs_image_config.read_only,
+                runtime_upper_mode: rootfs_image_config.runtime_upper_mode,
+                requested_virtual_size,
+                known_source_virtual_size,
+                allow_shrink,
+            })
+            .await
+            .context("create user image overlaybd runtime device")?;
+        self.resources.rootfs_image_config_path =
+            Some(rootfs_image_config.image_config_path.clone());
+        let symlink_result = std::os::unix::fs::symlink(
+            runtime_device.device.device_path(),
+            work_dir.join(USER_ROOTFS_DRIVE_PATH),
+        )
+        .context("symlink user-rootfs to ublk device");
+        if let Err(err) = symlink_result {
+            if let Err(release_err) = UblkDeviceManager::global()
+                .release_device(&runtime_device.device)
+                .await
+            {
+                warn!(
+                    error = %release_err,
+                    "failed to release user image ublk device after symlink failure"
+                );
+            }
+            return Err(err);
+        }
+        self.resources.rootfs_runtime = Some(OverlaybdRuntimeHandle {
+            device: runtime_device.device,
+            image_config_path: runtime_device.image_config_path,
+            actual_virtual_size: runtime_device.actual_virtual_size,
+        });
+        self.current_rootfs_virtual_size = Some(runtime_device.actual_virtual_size);
         Ok(())
     }
 
