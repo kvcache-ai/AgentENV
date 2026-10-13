@@ -496,6 +496,7 @@ where
                     network: network_policy.runtime_policy(),
                     extra_mmds,
                     custom_extension_params: effective_custom_extension_params.clone(),
+                    user_metadata: user_metadata.clone(),
                     envd_access_token: envd_access_token.clone(),
                     extra_drives: launch_extra_drives.clone(),
                     extra_drives_in_snapshot,
@@ -556,6 +557,7 @@ where
                     network: network_policy.runtime_policy(),
                     extra_mmds,
                     custom_extension_params: custom_extension_params.clone(),
+                    user_metadata: user_metadata.clone(),
                     envd_access_token,
                     extra_drives: Vec::new(),
                     extra_drives_in_snapshot: false,
@@ -2056,7 +2058,7 @@ where
             }
         })?;
         let new_params = client
-            .hook_patch_params(sandbox_id, patch)
+            .hook_patch_params(sandbox_id, patch, metadata.user_metadata.as_ref())
             .await
             .map_err(|source| OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
