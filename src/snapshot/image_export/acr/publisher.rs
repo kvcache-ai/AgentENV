@@ -7,9 +7,9 @@ use tempfile::NamedTempFile;
 use tracing::warn;
 
 use crate::digest;
+use crate::overlaybd::OverlaybdCompactOutput;
 use crate::repository::backends::common::write_dense_overlaybd_layer_to_file;
 use crate::repository::{RepositoryError, RepositoryResult};
-use crate::sandbox::OverlaybdCompactOutput;
 use crate::snapshot::recontainerize::{prepare_layer_upload, PreparedLayerUpload};
 use crate::snapshot::rootfs_snapshot_image_tag;
 use crate::snapshot::{

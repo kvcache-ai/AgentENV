@@ -189,9 +189,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
         custom_extension_params: None,
     };
 
-    Ok(snapshot_manager
-        .publish_captured(metadata, captured)
-        .await?)
+    Ok(agentenv::sandbox::publish_captured(snapshot_manager, metadata, captured).await?)
 }
 
 #[tokio::test]

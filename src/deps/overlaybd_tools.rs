@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 
 use crate::cfg::OverlaybdDependencyConfig;
 
-use super::deps::{copy_file, download_file, set_executable, set_file_mode};
+use super::{copy_file, download_file, set_executable, set_file_mode};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct OverlaybdInstalledRelease {
@@ -30,7 +30,7 @@ struct ConfiguredOverlaybdRelease {
 
 /// OCI tools v1 must keep the same block layout when the runtime is upgraded.
 pub(crate) async fn ensure_tools_converter_v1(deps: &Path) -> Result<std::path::PathBuf> {
-    let arch = super::deps::detect_arch()?;
+    let arch = super::detect_arch()?;
     let release = OverlaybdDependencyConfig {
         version: "v1.0.18-aenv.1".into(),
         url: None,
@@ -436,7 +436,7 @@ mod tests {
         let package = archive.into_inner()?.finish()?;
         let downloads = Arc::new(AtomicUsize::new(0));
         let requests = Arc::clone(&downloads);
-        let arch = crate::setup::deps::detect_arch()?;
+        let arch = crate::deps::detect_arch()?;
         let asset = format!("overlaybd-tools-v1.0.18-aenv.1-linux-{arch}.tar.gz");
         let app = axum::Router::new().route(
             &format!("/{asset}"),

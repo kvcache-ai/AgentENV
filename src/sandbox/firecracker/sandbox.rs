@@ -26,29 +26,29 @@ use super::FirecrackerInstance;
 use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
 };
-use crate::sandbox::manifest::SandboxSnapshotManifest;
+use crate::snapshot::SandboxSnapshotManifest;
 
 use crate::cfg::ConfigManager;
+use crate::overlaybd::OverlaybdCompactOutput;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
-    SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec,
-    SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend, SandboxCaptureError,
+    SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 use crate::sandbox::envd::EnvdInstance;
-use crate::sandbox::extra_drive::{
-    prepare_extra_drives, DriveMount, ExtraDrive, ExtraDrivePrepareMode, ROOTFS_DRIVE_ID,
-    USER_ROOTFS_DRIVE_ID, VOLUME_DRIVE_SLOT_PREFIX,
-};
+use crate::sandbox::extra_drive::{prepare_extra_drives, DriveMount, ExtraDrivePrepareMode};
 use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
 use crate::sandbox::process::Executor;
 use crate::sandbox::ublk::{
-    OverlaybdCompactOutput, OverlaybdConfig, OverlaybdRuntimeHandle, PackRecordingWindow,
-    SharedReadOnlyDevice, UblkBackend, UblkCreateSpec, UblkDevice, UblkDeviceManager,
+    OverlaybdConfig, OverlaybdRuntimeHandle, PackRecordingWindow, SharedReadOnlyDevice,
+    UblkBackend, UblkCreateSpec, UblkDevice, UblkDeviceManager,
 };
 use crate::sandbox::SandboxLaunchConfig;
 use crate::snapshot::RunnableSnapshot;
-use crate::types::SandboxId;
+use crate::types::{
+    ExtraDrive, RuntimeArtifactSet, SandboxId, ROOTFS_DRIVE_ID, USER_ROOTFS_DRIVE_ID,
+    VOLUME_DRIVE_SLOT_PREFIX,
+};
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -870,7 +870,7 @@ impl FirecrackerSandbox {
         }
         let config = ConfigManager::global_config();
         if let Some(image_config) =
-            crate::setup::resolve_tools_image(config, &self.launch.common().tools_drive_version)
+            crate::sandbox::resolve_tools_image(config, &self.launch.common().tools_drive_version)
                 .await?
         {
             self.tools_ublk_device = Some(

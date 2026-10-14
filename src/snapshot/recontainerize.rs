@@ -18,8 +18,8 @@ use tempfile::NamedTempFile;
 use tracing::debug;
 
 use crate::digest::FileDigest;
+use crate::overlaybd::{compact_layers, OverlaybdCompactOutput};
 use crate::repository::{RepositoryError, RepositoryResult};
-use crate::sandbox::{compact_layers, OverlaybdCompactOutput};
 
 /// A local layer file prepared for upload, plus the content descriptor of
 /// exactly the bytes that will be uploaded.

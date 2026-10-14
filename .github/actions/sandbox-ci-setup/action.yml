@@ -60,8 +60,8 @@ runs:
         set -euo pipefail
         files=(
           config/deps_manifest.toml
-          src/setup/deps.rs
-          src/setup/overlaybd.rs
+          src/deps/mod.rs
+          src/deps/overlaybd_tools.rs
           storage/overlaybd/src/tools/packaging.rs
           storage/overlaybd/src/tools/oci.rs
           .github/actions/sandbox-ci-setup/action.yml

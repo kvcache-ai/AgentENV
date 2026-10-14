@@ -19,7 +19,7 @@ use super::{
 use crate::repository::{
     DocumentChange, DocumentCollection, DocumentKey, Repository, RepositoryError, RepositoryResult,
 };
-use crate::sandbox::SandboxSnapshotManifest;
+use crate::snapshot::SandboxSnapshotManifest;
 
 const MAX_ALIAS_CLAIM_ATTEMPTS: usize = 5;
 

@@ -5,7 +5,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// Keep in sync with src/observability/prometheus.rs.
+// Keep in sync with src/prometheus.rs.
 var DurationBuckets = []float64{
 	0.001,
 	0.002,

@@ -4,7 +4,7 @@
 
 pub(crate) mod client;
 
+pub(crate) use crate::types::CustomExtensionParams;
 pub(crate) use client::{
     custom_extension_params_is_empty, CustomExtensionClient, CustomExtensionHookGuard,
-    CustomExtensionParams,
 };

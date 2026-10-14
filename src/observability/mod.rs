@@ -13,7 +13,6 @@
 mod host;
 mod machine;
 mod model;
-pub mod prometheus;
 mod reporter;
 mod service;
 

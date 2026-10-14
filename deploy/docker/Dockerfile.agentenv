@@ -106,7 +106,7 @@ FROM runtime-base
 ARG AENV_VIRTUALIZATION_MODE
 
 # Pre-baked runtime deps from `deps-stage`. Paths must match what `--setup-only`
-# produces; see src/setup/deps.rs and src/setup/overlaybd.rs.
+# produces; see src/deps/mod.rs and src/deps/overlaybd_tools.rs.
 COPY --from=deps-stage /workspace/env /workspace/env
 
 # Binaries: ublk-daemon first (less likely to change) so a server-only code

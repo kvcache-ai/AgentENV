@@ -4,7 +4,6 @@
 //! [`SandboxBackendFactory`] is responsible for constructing new sandbox
 //! instances (from scratch, from a committed snapshot, or from paused state).
 
-use super::manifest::SandboxSnapshotManifest;
 use std::any::Any;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -15,12 +14,17 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    EnvdAccessToken, EnvdApi, Executor, FreshSandboxBuildSpec, ProcessHandle, ProcessOpts,
-    ProcessOutput, SandboxLaunchConfig, SandboxNetworkPolicy,
+    record_startup_pack, EnvdAccessToken, EnvdApi, Executor, FirecrackerCaptureArtifacts,
+    FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput, SandboxLaunchConfig,
+    SandboxNetworkPolicy,
 };
+use crate::repository::RepositoryResult;
 use crate::sandbox::CustomExtensionParams;
-use crate::snapshot::RunnableSnapshot;
-use crate::types::SandboxId;
+use crate::snapshot::{
+    RunnableSnapshot, SandboxSnapshotManifest, SnapshotManager, SnapshotPublishMetadata,
+    SnapshotRecord, StartupRecording,
+};
+use crate::types::{RuntimeArtifactSet, SandboxId};
 
 /// A concrete sandbox backend's paused state.
 ///
@@ -94,39 +98,6 @@ pub struct SandboxForkSpec {
     pub replace_drive_ids: Vec<(String, String)>,
 }
 
-/// Opaque set of local runtime artifacts a sandbox needs while it is alive.
-///
-/// Sandbox backends construct this from their runtime config, the orchestrator
-/// carries it across lifecycle boundaries, and the image-liveness layer decides
-/// how to protect the concrete local artifacts.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RuntimeArtifactSet {
-    overlaybd_image_config_paths: Vec<PathBuf>,
-}
-
-impl RuntimeArtifactSet {
-    /// No local runtime artifacts.
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Build from overlaybd image configs whose local-only layers must stay
-    /// available while the sandbox may reopen them.
-    pub(crate) fn from_overlaybd_image_configs(overlaybd_image_config_paths: Vec<PathBuf>) -> Self {
-        Self {
-            overlaybd_image_config_paths,
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.overlaybd_image_config_paths.is_empty()
-    }
-
-    pub(crate) fn into_overlaybd_image_config_paths(self) -> Vec<PathBuf> {
-        self.overlaybd_image_config_paths
-    }
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SandboxRuntimeInfo {
     pub rootfs_virtual_size: Option<u64>,
@@ -182,6 +153,36 @@ impl fmt::Debug for CapturedSandboxSnapshot {
             .field("backend", &self.manifest.backend)
             .finish_non_exhaustive()
     }
+}
+
+/// Publishes `captured_snapshot` through `snapshots`. Its artifacts stay
+/// alive until publication is over.
+#[tracing::instrument(skip(snapshots, metadata), fields(snapshot_id = %metadata.id))]
+pub async fn publish_captured(
+    snapshots: &SnapshotManager,
+    metadata: SnapshotPublishMetadata,
+    captured_snapshot: CapturedSandboxSnapshot,
+) -> RepositoryResult<SnapshotRecord> {
+    let manifest = captured_snapshot.manifest().clone();
+
+    // Spawn the startup-manifest recording up front (a no-op task when
+    // the feature is disabled): the throwaway recording VM overlaps the
+    // backend's layer uploads, and a detached continuation uploads the
+    // manifest once the trace lands — publish never waits on it. The
+    // capture root guard travels with the task so the artifacts outlive
+    // the whole continuation.
+    let recording = captured_snapshot
+        .downcast_artifacts_ref::<FirecrackerCaptureArtifacts>()
+        .map(|artifacts| {
+            let snapshot_config = artifacts.snapshot_config().clone();
+            let snapshot_dir = artifacts.snapshot_dir().to_path_buf();
+            StartupRecording::spawn_with_capture_lease(
+                record_startup_pack(snapshot_config, snapshot_dir),
+                artifacts.snapshot_root_guard(),
+            )
+        });
+
+    snapshots.publish(metadata, manifest, recording).await
 }
 
 /// Lifecycle interface for a single sandbox instance.

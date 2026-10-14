@@ -6,7 +6,7 @@ use overlaybd::config::{DownloadConfig, ImageConfig, LayerConfig};
 
 use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
 use crate::repository::{RepositoryError, RepositoryResult};
-use crate::sandbox::SandboxSnapshotManifest;
+use crate::snapshot::SandboxSnapshotManifest;
 use crate::snapshot::{
     ManagedLayer, OverlaybdLayerRef, ResolvedAttachedDrive, SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
 };

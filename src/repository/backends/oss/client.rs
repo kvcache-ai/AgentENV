@@ -17,7 +17,7 @@ use tokio::sync::RwLock;
 use tracing::info;
 use url::Url;
 
-use crate::observability::prometheus::MetricGuard;
+use crate::prometheus::MetricGuard;
 
 /// Multipart part size for streaming file uploads. S3/OSS caps a multipart
 /// upload at 10,000 parts, so this bounds the largest uploadable object

@@ -87,14 +87,14 @@ async fn attached_drive_rootfs_layers_are_derived_from_resolved_lower_paths() {
     .expect("write drive image config");
 
     manifest = manifest
-        .with_extra_drives(&[crate::sandbox::ExtraDrive::Overlaybd {
+        .with_extra_drives(&[crate::types::ExtraDrive::Overlaybd {
             drive_id: "data".to_string(),
             image_config_path: local_dir
                 .join(SNAPSHOT_ARTIFACT_LAYOUT.drives_dir)
                 .join("data")
                 .join(SNAPSHOT_ARTIFACT_LAYOUT.overlaybd_image_config_file),
             read_only: true,
-            mount_path: crate::sandbox::ExtraDrive::default_mount_path("data"),
+            mount_path: crate::types::ExtraDrive::default_mount_path("data"),
             virtual_size: Some(4096),
             sub_path: None,
             snapshot_output_dir: None,

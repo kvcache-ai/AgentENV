@@ -77,31 +77,30 @@ async fn publish_captured_snapshot_for_test(
     source_sandbox_id: SandboxId,
     captured_snapshot: CapturedSandboxSnapshot,
 ) -> Result<SnapshotRecord> {
-    Ok(snapshot_manager
-        .publish_captured(
-            SnapshotPublishMetadata {
-                id: SnapshotId::generate(),
-                alias: Some(SnapshotAlias::parse(alias)?),
-                source: SnapshotPublishSource::Sandbox {
-                    source_sandbox_id: source_sandbox_id.to_string(),
-                },
-                context: agentenv::snapshot::CommandContext::default(),
-                startup: None,
-                resources: SandboxResources {
-                    cpu_count: 1,
-                    memory_mib: 128,
-                    disk_size_mib: 0,
-                },
-                runtime_versions: sample_runtime_versions(),
-                virtualization_mode: agentenv::cfg::ConfigManager::global_config()
-                    .virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
-                volume_snapshots: Vec::new(),
-                custom_extension_params: None,
+    Ok(agentenv::sandbox::publish_captured(
+        snapshot_manager,
+        SnapshotPublishMetadata {
+            id: SnapshotId::generate(),
+            alias: Some(SnapshotAlias::parse(alias)?),
+            source: SnapshotPublishSource::Sandbox {
+                source_sandbox_id: source_sandbox_id.to_string(),
             },
-            captured_snapshot,
-        )
-        .await?)
+            context: agentenv::snapshot::CommandContext::default(),
+            startup: None,
+            resources: SandboxResources {
+                cpu_count: 1,
+                memory_mib: 128,
+                disk_size_mib: 0,
+            },
+            runtime_versions: sample_runtime_versions(),
+            virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
+            image_configs: agentenv::types::ImageConfigs::new(),
+            volume_snapshots: Vec::new(),
+            custom_extension_params: None,
+        },
+        captured_snapshot,
+    )
+    .await?)
 }
 
 struct DeterministicRng {

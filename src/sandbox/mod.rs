@@ -5,12 +5,13 @@ mod envd;
 mod extra_drive;
 mod firecracker;
 pub(crate) mod logs;
-pub mod manifest;
 mod metrics;
 #[cfg(test)]
 pub(crate) mod mock;
 mod network;
 mod process;
+mod runtime_versions;
+mod tools_image;
 mod ublk;
 
 use std::{collections::HashMap, path::PathBuf};
@@ -19,20 +20,22 @@ pub(crate) use custom_extension::{
     custom_extension_params_is_empty, CustomExtensionClient, CustomExtensionParams,
 };
 
+pub use crate::types::RuntimeArtifactSet;
 use crate::types::{ImageConfigs, SandboxId};
 
+pub use crate::snapshot::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
+pub use crate::types::{
+    normalize_mount_path, normalize_mount_path_for_drive, validate_drive_id, validate_mount_path,
+    validate_sub_path, ExtraDrive,
+};
 pub use ::envd::process::Signal;
 pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
+    publish_captured, CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend,
     SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
     SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 pub use envd::EnvdApi;
-pub use extra_drive::{
-    normalize_mount_path, normalize_mount_path_for_drive, validate_drive_id, validate_mount_path,
-    validate_sub_path, ExtraDrive,
-};
 pub(crate) use firecracker::record_startup_pack;
 pub use firecracker::{
     FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
@@ -40,7 +43,6 @@ pub use firecracker::{
     FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
 };
 pub use logs::SandboxLogEntry;
-pub use manifest::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
 pub use metrics::SandboxMetric;
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
 pub use network::{
@@ -48,7 +50,8 @@ pub use network::{
     ALL_INTERNET_TRAFFIC_CIDR,
 };
 pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
-pub(crate) use ublk::{compact_layers, OverlaybdCompactOutput};
+pub use runtime_versions::probe_runtime_versions;
+pub(crate) use tools_image::resolve_tools_image;
 pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
 
 #[derive(Clone, Debug)]

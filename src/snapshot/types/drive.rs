@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::snapshot::OverlaybdLayerRef;
-use crate::sandbox::ExtraDrive;
+use crate::types::ExtraDrive;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 /// Attached-drive state resolved into local runtime inputs for the current node.
@@ -103,7 +103,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{CommittedAttachedDrive, ResolvedAttachedDrive};
-    use crate::sandbox::ExtraDrive;
+    use crate::types::ExtraDrive;
 
     fn sample_resolved() -> ResolvedAttachedDrive {
         ResolvedAttachedDrive::Overlaybd {

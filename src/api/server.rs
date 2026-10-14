@@ -9,7 +9,7 @@ use axum::{
 };
 
 use super::{impls::auth, proxy, ApiImpl};
-use crate::observability::prometheus;
+use crate::prometheus;
 use agentenv_http_server::apis;
 use agentenv_observability::metrics_handler;
 

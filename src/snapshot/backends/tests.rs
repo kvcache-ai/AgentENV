@@ -8,13 +8,14 @@ use super::*;
 use crate::cfg::PosixFsBackendConfig as PosixConfig;
 use crate::image::cache::OverlaybdLayerLocation;
 use crate::repository::RepositoryError;
-use crate::sandbox::{ExtraDrive, SandboxSnapshotManifest};
 use crate::snapshot::mock::write_mock_built_artifacts;
+use crate::snapshot::SandboxSnapshotManifest;
 use crate::snapshot::{
     CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotAlias, SnapshotCatalog, SnapshotId,
     SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
     TemplateBuildErrorReason, SNAPSHOT_ARTIFACT_LAYOUT,
 };
+use crate::types::ExtraDrive;
 
 #[tokio::test]
 async fn builders_share_a_private_catalog_across_node_local_caches() -> Result<()> {
@@ -168,7 +169,7 @@ fn seed_committed_firecracker_manifest(
         .join(snapshot_id.to_string());
     fs::create_dir_all(&snapshot_dir).expect("snapshot dir");
     let manifest = SandboxSnapshotManifest::new(
-        crate::sandbox::FIRECRACKER_BACKEND,
+        crate::snapshot::FIRECRACKER_BACKEND,
         snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
         snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config),
         memory_virtual_size,

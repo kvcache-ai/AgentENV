@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use super::ExtraDrive;
+use crate::types::ExtraDrive;
 
 pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 1;
 
@@ -141,7 +141,7 @@ impl SandboxSnapshotManifest {
                 image_config_path: drive.image_config_path.clone(),
                 read_only: drive.read_only,
                 virtual_size: Some(drive.virtual_size),
-                mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                mount_path: crate::types::normalize_mount_path_for_drive(
                     &drive.drive_id,
                     drive.mount_path.clone(),
                 )

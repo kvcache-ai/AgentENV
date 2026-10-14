@@ -29,7 +29,7 @@ use crate::p2p::P2pTransport;
 use crate::repository::{
     BlobKey, BlobLocation, LayerRole, Repository, RepositoryError, RepositoryResult, SnapshotFile,
 };
-use crate::sandbox::SandboxSnapshotManifest;
+use crate::snapshot::SandboxSnapshotManifest;
 
 const LAYER_EXISTS_CONCURRENCY: usize = 16;
 
@@ -317,11 +317,11 @@ impl RepositoryRuntimeResolver {
                 image_config_path,
                 read_only: *read_only,
                 virtual_size: *virtual_size,
-                mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                mount_path: crate::types::normalize_mount_path_for_drive(
                     drive_id,
                     mount_path.clone(),
                 )
-                .unwrap_or_else(|_| crate::sandbox::ExtraDrive::default_mount_path(drive_id)),
+                .unwrap_or_else(|_| crate::types::ExtraDrive::default_mount_path(drive_id)),
                 sub_path: sub_path.clone(),
             });
         }

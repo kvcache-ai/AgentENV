@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::identity::NodeIdentity;
 
-pub use config::P2pTransportKind;
+pub use crate::cfg::P2pTransportKind;
 pub use discovery::{
     NoopP2pPeerDiscovery, P2pPeerDiscovery, SchedulerPeerDiscovery, StaticP2pPeerDiscovery,
 };

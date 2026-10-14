@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -9,26 +9,15 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::oneshot, task::JoinHandle};
-use tracing::{
-    field::{Field, Visit},
-    span::{Attributes, Id},
-    Event, Subscriber,
-};
-use tracing_subscriber::{layer::Context as LayerContext, registry::LookupSpan, Layer};
 
-use crate::logging::LogLevel;
+pub use crate::logging::BuildLogger;
+use crate::logging::{BuildLogSink, LogLevel};
 use crate::repository::{DocumentKey, Repository, RepositoryError, RepositoryResult};
 use crate::snapshot::SnapshotId;
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 32_768;
 const MAX_MESSAGE_BYTES: usize = 16 * 1024;
-
-static ACTIVE_BUILD_LOGS: OnceLock<Mutex<HashMap<String, Weak<Mutex<Buffer>>>>> = OnceLock::new();
-
-fn active_build_logs() -> &'static Mutex<HashMap<String, Weak<Mutex<Buffer>>>> {
-    ACTIVE_BUILD_LOGS.get_or_init(Default::default)
-}
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct BuildLogEntry {
@@ -83,17 +72,13 @@ struct Buffer {
     sealed: bool,
 }
 
-#[derive(Clone, Default, Debug)]
-pub struct BuildLogger(Option<Arc<Mutex<Buffer>>>);
-
-impl BuildLogger {
-    pub fn log(&self, level: LogLevel, step: Option<&str>, message: impl Into<String>) {
-        let Some(buffer) = &self.0 else { return };
-        let mut buffer = buffer.lock().unwrap();
+impl BuildLogSink for Mutex<Buffer> {
+    fn log(&self, level: LogLevel, step: Option<&str>, message: String) {
+        let mut buffer = self.lock().unwrap();
         if buffer.truncated || buffer.sealed {
             return;
         }
-        let mut message = message.into();
+        let mut message = message;
         if message.len() > MAX_MESSAGE_BYTES {
             let mut end = MAX_MESSAGE_BYTES;
             while !message.is_char_boundary(end) {
@@ -122,118 +107,6 @@ impl BuildLogger {
             message,
             step,
         });
-    }
-
-    pub(crate) fn output(&self, step: Option<&str>, stderr: bool, bytes: &[u8]) {
-        for line in String::from_utf8_lossy(bytes).lines() {
-            self.log(
-                if stderr {
-                    LogLevel::Warn
-                } else {
-                    LogLevel::Info
-                },
-                step,
-                line,
-            );
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct BuildLogLayer;
-
-#[derive(Clone, Debug)]
-struct BuildSpan {
-    build_id: String,
-}
-
-#[derive(Default)]
-struct FieldVisitor {
-    build_id: Option<String>,
-    message: Option<String>,
-    fields: Vec<String>,
-}
-
-impl Visit for FieldVisitor {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        let value = format!("{value:?}");
-        match field.name() {
-            "build_id" => self.build_id = Some(value.trim_matches('"').to_owned()),
-            "message" => self.message = Some(value),
-            name => self.fields.push(format!("{name}={value}")),
-        }
-    }
-
-    fn record_str(&mut self, field: &Field, value: &str) {
-        match field.name() {
-            "build_id" => self.build_id = Some(value.to_owned()),
-            "message" => self.message = Some(value.to_owned()),
-            name => self.fields.push(format!("{name}={value:?}")),
-        }
-    }
-}
-
-impl<S> Layer<S> for BuildLogLayer
-where
-    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
-{
-    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: LayerContext<'_, S>) {
-        let mut visitor = FieldVisitor::default();
-        attrs.record(&mut visitor);
-        let inherited = if attrs.is_contextual() {
-            ctx.lookup_current()
-        } else {
-            attrs.parent().and_then(|parent| ctx.span(parent))
-        }
-        .and_then(|span| {
-            span.extensions()
-                .get::<BuildSpan>()
-                .map(|build| build.build_id.clone())
-        });
-        let Some(build_id) = visitor.build_id.or(inherited) else {
-            return;
-        };
-        if let Some(span) = ctx.span(id) {
-            span.extensions_mut().insert(BuildSpan { build_id });
-        }
-    }
-
-    fn on_event(&self, event: &Event<'_>, ctx: LayerContext<'_, S>) {
-        if !event.metadata().target().starts_with("agentenv::") {
-            return;
-        }
-        let Some(build_id) = ctx.event_scope(event).and_then(|scope| {
-            scope.from_root().find_map(|span| {
-                span.extensions()
-                    .get::<BuildSpan>()
-                    .map(|build| build.build_id.clone())
-            })
-        }) else {
-            return;
-        };
-        let buffer = active_build_logs()
-            .lock()
-            .unwrap()
-            .get(&build_id)
-            .and_then(Weak::upgrade);
-        let Some(buffer) = buffer else { return };
-
-        let mut visitor = FieldVisitor::default();
-        event.record(&mut visitor);
-        let mut message = visitor
-            .message
-            .unwrap_or_else(|| event.metadata().name().to_owned());
-        if !visitor.fields.is_empty() {
-            message.push(' ');
-            message.push_str(&visitor.fields.join(" "));
-        }
-        let level = match *event.metadata().level() {
-            tracing::Level::DEBUG | tracing::Level::TRACE => LogLevel::Debug,
-            tracing::Level::INFO => LogLevel::Info,
-            tracing::Level::WARN => LogLevel::Warn,
-            tracing::Level::ERROR => LogLevel::Error,
-        };
-        BuildLogger(Some(buffer)).log(level, None, message);
     }
 }
 
@@ -283,11 +156,9 @@ impl BuildLogs {
             .lock()
             .unwrap()
             .insert(id.clone(), buffer.clone());
-        active_build_logs()
-            .lock()
-            .unwrap()
-            .insert(id.to_string(), Arc::downgrade(&buffer));
-        let logger = BuildLogger(Some(buffer.clone()));
+        let sink = Arc::downgrade(&buffer) as Weak<dyn BuildLogSink>;
+        crate::logging::route_build_logs(id.to_string(), sink.clone());
+        let logger = BuildLogger::new(buffer.clone());
         let (stop, mut stopped) = oneshot::channel();
         let buffers = self.buffers.clone();
         let writer = tokio::spawn(async move {
@@ -324,14 +195,7 @@ impl BuildLogs {
             {
                 buffers.remove(&id);
             }
-            let mut active = active_build_logs().lock().unwrap();
-            if active
-                .get(&id.to_string())
-                .and_then(Weak::upgrade)
-                .is_some_and(|current| Arc::ptr_eq(&current, &buffer))
-            {
-                active.remove(&id.to_string());
-            }
+            crate::logging::stop_build_log_routing(&id.to_string(), &sink);
             result
         });
         BuildLogSession {
@@ -352,14 +216,8 @@ impl BuildLogs {
     pub fn remove(&self, id: &SnapshotId) {
         let removed = self.buffers.lock().unwrap().remove(id);
         let Some(removed) = removed else { return };
-        let mut active = active_build_logs().lock().unwrap();
-        if active
-            .get(&id.to_string())
-            .and_then(Weak::upgrade)
-            .is_some_and(|current| Arc::ptr_eq(&current, &removed))
-        {
-            active.remove(&id.to_string());
-        }
+        let sink = Arc::downgrade(&removed) as Weak<dyn BuildLogSink>;
+        crate::logging::stop_build_log_routing(&id.to_string(), &sink);
     }
 }
 
@@ -385,6 +243,7 @@ async fn flush(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging::BuildLogLayer;
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::SnapshotCatalog;
 
@@ -521,7 +380,7 @@ mod tests {
     #[test]
     fn build_log_limits_emit_one_notice() {
         let buffer = Arc::new(Mutex::new(Buffer::default()));
-        let logger = BuildLogger(Some(buffer.clone()));
+        let logger = BuildLogger::new(buffer.clone());
         for _ in 0..MAX_ENTRIES + 2 {
             logger.log(LogLevel::Info, None, "");
         }

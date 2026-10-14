@@ -8,14 +8,14 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::sandbox::CustomExtensionParams;
+use crate::types::CustomExtensionParams;
+use crate::types::VolumeMode;
 use crate::virtualization::VirtualizationMode;
-use crate::volume::VolumeMode;
 use shell_util::shell_quote;
 
 use super::drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
 use super::version::SnapshotRuntimeVersions;
-use crate::sandbox::SandboxSnapshotManifest;
+use crate::snapshot::SandboxSnapshotManifest;
 use crate::types::{ImageConfigs, SandboxResources};
 use crate::types::{SnapshotAlias, SnapshotId};
 
@@ -555,13 +555,11 @@ impl RunnableSnapshot {
                 image_config_path: drive.image_config_path.clone(),
                 read_only: drive.read_only,
                 virtual_size: drive.virtual_size,
-                mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                mount_path: crate::types::normalize_mount_path_for_drive(
                     &drive.drive_id,
                     drive.mount_path.clone(),
                 )
-                .unwrap_or_else(|_| {
-                    crate::sandbox::ExtraDrive::default_mount_path(&drive.drive_id)
-                }),
+                .unwrap_or_else(|_| crate::types::ExtraDrive::default_mount_path(&drive.drive_id)),
                 sub_path: drive.sub_path.clone(),
             })
             .collect()
@@ -602,7 +600,7 @@ impl RunnableSnapshot {
         record: SnapshotRecord,
         attached_drives: Vec<ResolvedAttachedDrive>,
     ) -> Self {
-        let extra_drives: Vec<crate::sandbox::ExtraDrive> = attached_drives
+        let extra_drives: Vec<crate::types::ExtraDrive> = attached_drives
             .iter()
             .map(ResolvedAttachedDrive::to_extra_drive)
             .collect();
@@ -636,7 +634,7 @@ impl fmt::Debug for RunnableSnapshot {
 
 #[cfg(test)]
 mod tests {
-    use crate::volume::VolumeMode;
+    use crate::types::VolumeMode;
 
     use super::{
         rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ManagedLayer,

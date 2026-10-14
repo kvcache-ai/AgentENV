@@ -12,11 +12,11 @@ use uuid::Uuid;
 
 use crate::cfg::ConfigManager;
 use crate::image::ResolvedBlockImage;
-use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
     CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxForkChildSpec, SandboxLaunchSource,
     SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
 };
+use crate::prometheus::SandboxStageTimer;
 use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
@@ -1841,7 +1841,8 @@ impl Sandboxes<()> for ApiImpl {
         let published = match timer
             .time(
                 "publish",
-                self.snapshot_manager.publish_captured(
+                crate::sandbox::publish_captured(
+                    &self.snapshot_manager,
                     SnapshotPublishMetadata {
                         id: SnapshotId::generate(),
                         alias: alias.clone(),

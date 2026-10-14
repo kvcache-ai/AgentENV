@@ -12,7 +12,7 @@ use super::reference::{image_ref_candidates, registry_host_of};
 use super::{ImageBaseContext, ImageError, ImageResolutionMetadata, ImageResult};
 use crate::cfg::AppConfig;
 use crate::image::oci_image::ImageFormat;
-use crate::observability::prometheus::MetricGuard;
+use crate::prometheus::MetricGuard;
 
 const IMAGE_RESOLVE_STAGE_DURATION: &str = "agentenv_image_resolve_stage_duration_seconds";
 
@@ -177,7 +177,7 @@ impl ImageResolver {
                 .parent()
                 .context("overlaybd dependency root")?;
             self.overlaybd_install_root =
-                crate::setup::overlaybd::ensure_tools_converter_v1(deps).await?;
+                crate::deps::overlaybd_tools::ensure_tools_converter_v1(deps).await?;
             self.overlaybd_oci_converter_id = "tools-oci-rootfs-v1:overlaybd-v1.0.18-aenv.1".into();
             self.convert_standard_oci = true;
             self.try_referrers_overlaybd_prefixes.clear();

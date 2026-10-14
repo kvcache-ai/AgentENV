@@ -286,26 +286,26 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
 
         let published_alias = format!("orchestrator-captured-{}", Uuid::now_v7());
         let sandbox_id_str = sandbox_id.to_string();
-        let published = snapshot_manager
-            .publish_captured(
-                SnapshotPublishMetadata {
-                    id: SnapshotId::generate(),
-                    alias: Some(SnapshotAlias::parse(&published_alias)?),
-                    source: SnapshotPublishSource::Sandbox {
-                        source_sandbox_id: sandbox_id_str.clone(),
-                    },
-                    context: capture.metadata.context.clone(),
-                    startup: capture.metadata.startup.clone(),
-                    resources: capture.metadata.resources,
-                    runtime_versions: capture.metadata.runtime_versions.clone(),
-                    virtualization_mode: capture.metadata.virtualization_mode,
-                    image_configs: capture.metadata.image_configs.clone(),
-                    volume_snapshots: Vec::new(),
-                    custom_extension_params: None,
+        let published = agentenv::sandbox::publish_captured(
+            &snapshot_manager,
+            SnapshotPublishMetadata {
+                id: SnapshotId::generate(),
+                alias: Some(SnapshotAlias::parse(&published_alias)?),
+                source: SnapshotPublishSource::Sandbox {
+                    source_sandbox_id: sandbox_id_str.clone(),
                 },
-                capture.captured_snapshot,
-            )
-            .await?;
+                context: capture.metadata.context.clone(),
+                startup: capture.metadata.startup.clone(),
+                resources: capture.metadata.resources,
+                runtime_versions: capture.metadata.runtime_versions.clone(),
+                virtualization_mode: capture.metadata.virtualization_mode,
+                image_configs: capture.metadata.image_configs.clone(),
+                volume_snapshots: Vec::new(),
+                custom_extension_params: None,
+            },
+            capture.captured_snapshot,
+        )
+        .await?;
         let record = snapshot_manager
             .get(published.id.to_string())
             .await?

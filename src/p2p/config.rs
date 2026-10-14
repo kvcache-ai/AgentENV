@@ -1,16 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use serde::Deserialize;
-
-use crate::cfg::P2pConfig;
-
-#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum P2pTransportKind {
-    Disabled,
-    Iroh,
-}
+use crate::cfg::{P2pConfig, P2pTransportKind};
 
 impl P2pTransportKind {
     pub(crate) fn backend_id(self) -> Option<&'static str> {

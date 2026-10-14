@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use super::SnapshotRuntimeResolver;
 use super::{RunnableSnapshot, SnapshotManager, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT};
 use crate::repository::{Repository, RepositoryError, RepositoryResult};
-use crate::sandbox::SandboxSnapshotManifest;
+use crate::snapshot::SandboxSnapshotManifest;
 
 /// Test double for repository interactions that should stay unreachable:
 /// every operation reports itself unsupported.
@@ -83,7 +83,7 @@ pub fn write_mock_built_artifacts(
     )?;
 
     let manifest = SandboxSnapshotManifest::new(
-        crate::sandbox::FIRECRACKER_BACKEND,
+        crate::snapshot::FIRECRACKER_BACKEND,
         root.join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
         root.join(SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config),
         0,

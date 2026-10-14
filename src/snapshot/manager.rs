@@ -13,12 +13,9 @@ use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
 use super::{SnapshotListFilter, SnapshotPublication, SnapshotRuntimeResolver};
 use crate::p2p::P2pTransport;
 use crate::repository::Repository;
-use crate::sandbox::{
-    CapturedSandboxSnapshot, FirecrackerCaptureArtifacts, SandboxSnapshotManifest,
-};
 use crate::snapshot::{
-    ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
-    SnapshotRecord,
+    ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SandboxSnapshotManifest, SnapshotId,
+    SnapshotPublishMetadata, SnapshotRecord,
 };
 
 /// Concurrency limit for publishing snapshot artifacts to P2P after commit.
@@ -115,35 +112,6 @@ impl SnapshotManager {
         manifest: SandboxSnapshotManifest,
         recording: Option<crate::snapshot::StartupRecording>,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        self.publish_with_recording(metadata, manifest, recording)
-            .await
-    }
-
-    #[tracing::instrument(skip(self, metadata), fields(snapshot_id = %metadata.id))]
-    pub async fn publish_captured(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        captured_snapshot: CapturedSandboxSnapshot,
-    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        let manifest = captured_snapshot.manifest().clone();
-
-        // Spawn the startup-manifest recording up front (a no-op task when
-        // the feature is disabled): the throwaway recording VM overlaps the
-        // backend's layer uploads, and a detached continuation uploads the
-        // manifest once the trace lands — publish never waits on it. The
-        // capture root guard travels with the task so the artifacts outlive
-        // the whole continuation.
-        let recording = captured_snapshot
-            .downcast_artifacts_ref::<FirecrackerCaptureArtifacts>()
-            .map(|artifacts| {
-                let snapshot_config = artifacts.snapshot_config().clone();
-                let snapshot_dir = artifacts.snapshot_dir().to_path_buf();
-                crate::snapshot::StartupRecording::spawn_with_capture_lease(
-                    crate::sandbox::record_startup_pack(snapshot_config, snapshot_dir),
-                    artifacts.snapshot_root_guard(),
-                )
-            });
-
         self.publish_with_recording(metadata, manifest, recording)
             .await
     }

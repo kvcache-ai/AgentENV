@@ -14,11 +14,10 @@ use crate::repository::{Repository, RepositoryError};
 use crate::snapshot::OverlaybdLayerRef;
 
 mod catalog;
+pub use crate::types::VolumeMode;
 pub use catalog::{VolumeCatalog, VolumeRecordPage};
 
 pub const DEFAULT_VOLUME_SIZE_MB: u64 = 64 * 1024;
-/// Firecracker exposes /dev/vdc through /dev/vdz for extra drives.
-pub const MAX_VOLUME_MOUNTS: usize = 24;
 pub const DEFAULT_VOLUME_PAGE_SIZE: usize = 100;
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
@@ -28,13 +27,6 @@ pub(crate) use crate::repository::is_valid_volume_component;
 pub struct VolumePage {
     pub records: Vec<VolumeRecord>,
     pub next_token: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub enum VolumeMode {
-    ReadOnly,
-    #[default]
-    Exclusive,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -198,7 +190,7 @@ impl VolumeManager {
             .parent()
             .ok_or_else(|| anyhow::anyhow!("volume catalog path has no parent"))?
             .to_path_buf();
-        limits.max_mounts = limits.max_mounts.min(MAX_VOLUME_MOUNTS);
+        limits.max_mounts = limits.max_mounts.min(crate::cfg::MAX_VOLUME_MOUNTS);
         Ok(Self {
             records: Arc::new(RwLock::new(HashMap::new())),
             root,

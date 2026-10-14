@@ -17,13 +17,13 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 
 use super::backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
-    SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult, SandboxForkSpec,
-    SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend, SandboxBackendFactory,
+    SandboxCaptureResult, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::RunnableSnapshot;
+use crate::types::RuntimeArtifactSet;
 
 #[derive(Debug)]
 pub struct MockSnapshot;
@@ -321,7 +321,7 @@ impl SandboxBackend for MockSandboxBackend {
             .apply_capture_result(MockOperation::Snapshot)
             .await?;
         Ok(CapturedSandboxSnapshot::new(
-            crate::sandbox::manifest::SandboxSnapshotManifest::for_test(4096, &[]),
+            crate::snapshot::SandboxSnapshotManifest::for_test(4096, &[]),
             MockCapturedSnapshot,
         ))
     }

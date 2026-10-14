@@ -17,7 +17,7 @@ use uvm_ublk_daemon::{
 };
 
 use super::overlaybd::OverlaybdConfig;
-use crate::observability::prometheus::MetricGuard;
+use crate::prometheus::MetricGuard;
 use crate::sandbox::SandboxCaptureError;
 
 const UBLK_OPERATION_DURATION: &str = "agentenv_ublk_operation_duration_seconds";

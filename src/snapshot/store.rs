@@ -16,11 +16,12 @@ use super::{
     PersistedDiskImagePublication, SnapshotId, SnapshotPublishMetadata,
 };
 use crate::cfg::SnapshotImageStoragePolicy;
+use crate::overlaybd::OverlaybdCompactOutput;
 use crate::repository::backends::common::write_dense_overlaybd_layer_to_file;
 use crate::repository::{
     BlobBody, BlobKey, LayerRole, Repository, RepositoryError, RepositoryResult, SnapshotFile,
 };
-use crate::sandbox::{OverlaybdCompactOutput, SandboxSnapshotManifest};
+use crate::snapshot::SandboxSnapshotManifest;
 
 /// What was stored for one snapshot before its record is committed.
 #[derive(Debug)]
@@ -195,13 +196,11 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                 layers,
                 read_only: drive.read_only,
                 virtual_size: drive.virtual_size,
-                mount_path: crate::sandbox::normalize_mount_path_for_drive(
+                mount_path: crate::types::normalize_mount_path_for_drive(
                     &drive.drive_id,
                     drive.mount_path.clone(),
                 )
-                .unwrap_or_else(|_| {
-                    crate::sandbox::ExtraDrive::default_mount_path(&drive.drive_id)
-                }),
+                .unwrap_or_else(|_| crate::types::ExtraDrive::default_mount_path(&drive.drive_id)),
                 sub_path: drive.sub_path.clone(),
             });
         }

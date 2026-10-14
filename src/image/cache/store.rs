@@ -13,7 +13,7 @@ use super::service::{HoldNamespace, ImageCacheService};
 use crate::cfg::{AppConfig, ConfigManager};
 use crate::image::oci_image::ImageConversion;
 use crate::image::ImageResolutionMetadata;
-use crate::sandbox::RuntimeArtifactSet;
+use crate::types::RuntimeArtifactSet;
 use crate::types::SandboxId;
 
 pub(crate) enum CachedImageConfig {

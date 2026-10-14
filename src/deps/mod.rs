@@ -18,6 +18,8 @@ use crate::cfg::{
 use crate::digest::FileDigest;
 use crate::virtualization::VirtualizationMode;
 
+pub(crate) mod overlaybd_tools;
+
 #[derive(Debug, Deserialize)]
 struct SetupDependencyManifest {
     firecracker: ManifestVirtualizationDownloads,
@@ -104,7 +106,7 @@ pub async fn ensure(config: &AppConfig, deps_path: &Path) -> Result<()> {
     let overlaybd_dir = deps_path.join("overlaybd");
     std::fs::create_dir_all(&overlaybd_dir)?;
     let overlaybd_config = config.overlaybd.as_ref().unwrap_or(&manifest.overlaybd);
-    super::overlaybd::ensure_release_tools(overlaybd_config, &overlaybd_dir, &arch).await?;
+    overlaybd_tools::ensure_release_tools(overlaybd_config, &overlaybd_dir, &arch).await?;
     ensure_tools(config)?;
 
     info!(path = %deps_path.display(), "dependencies ready");
@@ -193,10 +195,18 @@ fn ensure_tools(config: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn resolve_tools_image(
+/// Prepares the tools drive for `version`. When no local drive is installed,
+/// `resolve` turns the tools image reference into a local overlaybd image
+/// config, or returns `None` when the release only ships a legacy drive.
+pub(crate) async fn prepare_tools_image<F, Fut>(
     config: &AppConfig,
     version: &str,
-) -> Result<Option<PathBuf>> {
+    resolve: F,
+) -> Result<Option<PathBuf>>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<PathBuf>>>,
+{
     static PREPARATIONS: LazyLock<dashmap::DashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>> =
         LazyLock::new(dashmap::DashMap::new);
 
@@ -220,17 +230,12 @@ pub(crate) async fn resolve_tools_image(
         .as_deref()
         .unwrap_or(&bundled_manifest().tools.url);
     let image_ref = resolve_url(template, &[("version", version)]);
-    match crate::image::ImageResolver::new(config)
-        .resolve_tools(&image_ref)
-        .await?
-    {
-        Some(resolved) => {
+    match resolve(image_ref).await? {
+        Some(image_config) => {
             let destination = image_path.clone();
-            tokio::task::spawn_blocking(move || {
-                install_tools_image(&resolved.overlaybd_config_path, &destination)
-            })
-            .await
-            .context("join tools image installation")??;
+            tokio::task::spawn_blocking(move || install_tools_image(&image_config, &destination))
+                .await
+                .context("join tools image installation")??;
             Ok(Some(image_path))
         }
         None => {

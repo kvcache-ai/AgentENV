@@ -3,7 +3,7 @@ use std::time::Duration;
 use agentenv::sandbox::{FirecrackerSandbox, SandboxBackend, SandboxLaunchConfig};
 use agentenv::snapshot::{
     ResolvedStartupPackSource, SnapshotAlias, SnapshotId, SnapshotPublishMetadata,
-    SnapshotPublishSource, SnapshotRuntimeVersions,
+    SnapshotPublishSource,
 };
 use agentenv::types::{SandboxId, SandboxResources};
 use anyhow::{bail, Context, Result};
@@ -35,38 +35,39 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
     let result = async {
         original.start().await?;
         let runtime_versions =
-            SnapshotRuntimeVersions::probe(&original, vmm_binary, tools_drive_version).await?;
+            agentenv::sandbox::probe_runtime_versions(&original, vmm_binary, tools_drive_version)
+                .await?;
         let rootfs_bytes = SandboxBackend::runtime_info(&original)
             .rootfs_virtual_size
             .context("source sandbox has no rootfs virtual size")?;
         let captured = SandboxBackend::snapshot(&mut original).await?;
-        let record = manager
-            .publish_captured(
-                SnapshotPublishMetadata {
-                    id: SnapshotId::generate(),
-                    alias: Some(SnapshotAlias::parse(&format!(
-                        "posix-startup-pack-{}",
-                        std::process::id()
-                    ))?),
-                    source: SnapshotPublishSource::Sandbox {
-                        source_sandbox_id: source_id.to_string(),
-                    },
-                    context: agentenv::snapshot::CommandContext::default(),
-                    startup: None,
-                    resources: SandboxResources {
-                        cpu_count,
-                        memory_mib,
-                        disk_size_mib: rootfs_bytes.div_ceil(1 << 20).try_into()?,
-                    },
-                    runtime_versions,
-                    virtualization_mode: config.virtualization_mode,
-                    image_configs: agentenv::types::ImageConfigs::new(),
-                    volume_snapshots: Vec::new(),
-                    custom_extension_params: None,
+        let record = agentenv::sandbox::publish_captured(
+            &manager,
+            SnapshotPublishMetadata {
+                id: SnapshotId::generate(),
+                alias: Some(SnapshotAlias::parse(&format!(
+                    "posix-startup-pack-{}",
+                    std::process::id()
+                ))?),
+                source: SnapshotPublishSource::Sandbox {
+                    source_sandbox_id: source_id.to_string(),
                 },
-                captured,
-            )
-            .await?;
+                context: agentenv::snapshot::CommandContext::default(),
+                startup: None,
+                resources: SandboxResources {
+                    cpu_count,
+                    memory_mib,
+                    disk_size_mib: rootfs_bytes.div_ceil(1 << 20).try_into()?,
+                },
+                runtime_versions,
+                virtualization_mode: config.virtualization_mode,
+                image_configs: agentenv::types::ImageConfigs::new(),
+                volume_snapshots: Vec::new(),
+                custom_extension_params: None,
+            },
+            captured,
+        )
+        .await?;
 
         let attached = tokio::time::timeout(Duration::from_secs(15), async {
             loop {

@@ -287,12 +287,12 @@ async fn snapshot_oss_publish_retains_dense_delta_for_p2p() -> Result<()> {
             volume_snapshots: Vec::new(),
             custom_extension_params: None,
         };
-        let stored = manager
-            .publish_captured(
-                metadata,
-                CapturedSandboxSnapshot::new(manifest, capture_root),
-            )
-            .await?;
+        let stored = agentenv::sandbox::publish_captured(
+            &manager,
+            metadata,
+            CapturedSandboxSnapshot::new(manifest, capture_root),
+        )
+        .await?;
         assert!(
             !delta_path.exists(),
             "capture guard should be released after publication"

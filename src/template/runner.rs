@@ -286,7 +286,7 @@ impl TemplateBuildRunner {
                         ensure_default_user(&sandbox, &build_context).await?;
                         let startup = prepare_startup(startup, override_startup, &build_context);
                         run_startup_commands(&sandbox, startup.as_ref(), &logger).await?;
-                        let runtime_versions = SnapshotRuntimeVersions::probe(
+                        let runtime_versions = crate::sandbox::probe_runtime_versions(
                             &sandbox,
                             vmm_binary,
                             tools_drive_version,

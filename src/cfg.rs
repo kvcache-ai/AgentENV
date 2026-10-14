@@ -294,6 +294,9 @@ impl std::fmt::Debug for SandboxConfig {
     }
 }
 
+/// Firecracker exposes /dev/vdc through /dev/vdz for extra drives.
+pub const MAX_VOLUME_MOUNTS: usize = 24;
+
 #[derive(Debug, Config, Clone)]
 pub struct VolumeConfig {
     /// Operator-configured maximum persistent volume size in MiB.
@@ -669,12 +672,19 @@ pub struct CustomExtensionConfig {
     pub timeout_ms: u64,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum P2pTransportKind {
+    Disabled,
+    Iroh,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct P2pConfig {
     #[config(default = false)]
     pub enabled: bool,
     #[config(default = "iroh")]
-    pub transport: crate::p2p::P2pTransportKind,
+    pub transport: P2pTransportKind,
     #[config(default = "$AENV_HOME/p2p/store")]
     pub store_dir: PathBuf,
     #[config(default = "0.0.0.0:0")]
@@ -1065,12 +1075,10 @@ impl AppConfig {
                 u64::MAX / (1024 * 1024)
             );
         }
-        if self.volume.max_volume_count == 0
-            || self.volume.max_volume_count > crate::volume::MAX_VOLUME_MOUNTS
-        {
+        if self.volume.max_volume_count == 0 || self.volume.max_volume_count > MAX_VOLUME_MOUNTS {
             bail!(
                 "volume.max_volume_count must be between 1 and {}",
-                crate::volume::MAX_VOLUME_MOUNTS
+                MAX_VOLUME_MOUNTS
             );
         }
         Ok(())
@@ -1809,7 +1817,7 @@ mod tests {
         assert!(error.to_string().contains("volume.max_size_mb"));
 
         let mut config = AppConfig::default();
-        config.volume.max_volume_count = crate::volume::MAX_VOLUME_MOUNTS + 1;
+        config.volume.max_volume_count = MAX_VOLUME_MOUNTS + 1;
         let error = config.validate().unwrap_err();
         assert!(error.to_string().contains("volume.max_volume_count"));
     }

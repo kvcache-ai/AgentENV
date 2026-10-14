@@ -37,11 +37,11 @@ use tracing::{debug, info, trace, warn};
 use crate::{
     api::{impls::auth::TRAFFIC_ACCESS_TOKEN_HEADER, ApiImpl},
     cfg::ConfigManager,
-    observability::prometheus::HttpRouteSource,
     orchestrator::{
         NewTimeout, OrchestratorError, ProxyLookupResult, ProxyTarget, SandboxMetadata,
         SandboxState,
     },
+    prometheus::HttpRouteSource,
     types::SandboxId,
 };
 

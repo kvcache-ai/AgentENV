@@ -1,7 +1,6 @@
 use std::{net::SocketAddr, time::Duration};
 
-use crate::logging::LogLevel;
-use crate::template::logs::BuildLogger;
+use crate::logging::{BuildLogger, LogLevel};
 use anyhow::{bail, Context, Result};
 use tonic::transport::{Channel, Endpoint};
 
@@ -246,14 +245,24 @@ fn completed_image(event: proto::BuildHistoryEvent, image_name: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logging::BuildLogSink;
     use proto::{
         control_server::{Control, ControlServer},
         BuildHistoryEvent, BuildHistoryRecord, BuildResultInfo, Descriptor, Exporter,
     };
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
+
+    #[derive(Default)]
+    struct Entries(Mutex<Vec<(LogLevel, String)>>);
+
+    impl BuildLogSink for Entries {
+        fn log(&self, level: LogLevel, _step: Option<&str>, message: String) {
+            self.0.lock().unwrap().push((level, message));
+        }
+    }
 
     #[test]
     fn vertex_progress_does_not_regress_or_repeat_replayed_states() {
@@ -453,37 +462,23 @@ mod tests {
                 .unwrap();
         });
         let client = BuildkitHistory::connect(address).await?;
-        let root = tempfile::tempdir()?;
-        let repository = crate::snapshot::backends::PosixFsBackend::new(
-            crate::snapshot::backends::PosixFsBackendConfig {
-                root: root.path().join("repository"),
-                cache_root: Some(root.path().join("cache")),
-                runtime_cache_root: None,
-            },
-        )?
-        .repository();
-        let logs = crate::template::logs::BuildLogs::default();
-        let id = crate::snapshot::SnapshotId::generate();
-        let session = logs.start(id.clone(), repository);
+        let entries = Arc::new(Entries::default());
+        let logger = BuildLogger::new(entries.clone());
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            client.wait_for_image("current", &session.logger),
+            client.wait_for_image("current", &logger),
         )
         .await;
         server.abort();
         assert_eq!(result??, crate::digest::sha256_digest(b"image"));
-        let entries = logs.temporary(&id).unwrap();
-        session.finish().await?;
-        assert!(logs.temporary(&id).is_none());
         assert_eq!(
-            entries
-                .iter()
-                .map(|entry| entry.message.as_str())
-                .collect::<Vec<_>>(),
-            vec!["output", "output", "last"]
+            *entries.0.lock().unwrap(),
+            vec![
+                (LogLevel::Warn, "output".to_owned()),
+                (LogLevel::Warn, "output".to_owned()),
+                (LogLevel::Info, "last".to_owned()),
+            ]
         );
-        assert_eq!(entries[0].level, LogLevel::Warn);
-        assert_eq!(entries[2].level, LogLevel::Info);
         assert_eq!(status_calls.load(Ordering::SeqCst), 2);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         Ok(())

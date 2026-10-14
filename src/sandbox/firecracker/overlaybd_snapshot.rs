@@ -29,10 +29,8 @@ use tracing::{debug, warn};
 use super::process_vm_reader::ProcessVmReader;
 use super::sandbox::managed_snapshot_base;
 use crate::cfg::ConfigManager;
-use crate::sandbox::ublk::UblkDevice;
-use crate::sandbox::ublk::{
-    compact_layers, create_commit_args, OverlaybdCompactOutput, UblkDeviceManager,
-};
+use crate::overlaybd::{compact_layers, create_commit_args, OverlaybdCompactOutput};
+use crate::sandbox::ublk::{UblkDevice, UblkDeviceManager};
 use crate::sandbox::SandboxCaptureError;
 
 /// Base budget of runtime-owned overlaybd snapshot lowers before compaction
