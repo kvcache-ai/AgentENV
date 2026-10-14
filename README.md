@@ -111,6 +111,21 @@ aenv start ubuntu            # starts a sandbox and attaches an interactive shel
 
 ---
 
+## 🐳 Docker Compose environments
+
+Run an image-based Docker Compose project inside one Firecracker sandbox, with
+pause/resume, snapshot, and fork support. After
+[enabling the Compose runtime](docs/src/concepts/sandboxes/starting.md#enable-the-runtime):
+
+```bash
+aenv compose up -f compose.yaml --cpu 2 --memory 2048
+```
+
+See the [Compose quickstart](docs/src/getting-started/quickstart.md#run-a-docker-compose-project)
+for a two-service example and sandbox cleanup.
+
+---
+
 ## 🗂 Deployment
 
 For Docker Compose / Kubernetes cluster deployment and build-from-source instructions,

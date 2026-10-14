@@ -17,9 +17,9 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 
 use super::backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
-    SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult, SandboxForkSpec,
-    SandboxRuntimeInfo,
+    check_startup_deadline, CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet,
+    SandboxBackend, SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult,
+    SandboxForkSpec, SandboxRuntimeInfo,
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
@@ -48,6 +48,7 @@ pub enum MockOperation {
     Start,
     StartNowait,
     WaitForReady,
+    InitializeCompose,
     Pause,
     Resume,
     Snapshot,
@@ -288,6 +289,18 @@ impl SandboxBackend for MockSandboxBackend {
 
     async fn wait_for_ready(&self) -> Result<()> {
         self.behavior.apply_async(MockOperation::WaitForReady).await
+    }
+
+    async fn initialize_compose(
+        &mut self,
+        _input: &[u8],
+        deadline: tokio::time::Instant,
+    ) -> Result<()> {
+        check_startup_deadline(Some(deadline))?;
+        self.behavior
+            .apply_async(MockOperation::InitializeCompose)
+            .await?;
+        check_startup_deadline(Some(deadline))
     }
 
     async fn pause(

@@ -15,7 +15,7 @@ const (
 	// ownerSandboxFork routes to the source sandbox's node and records the
 	// forked children from the response.
 	ownerSandboxFork
-	// ownerBuild routes to the node that runs the {id} template build.
+	// ownerBuild routes to the node that runs the {id} template or image build.
 	ownerBuild
 	// ownerBuildRead routes like ownerBuild, but a build without a binding is
 	// finished and is read from the shared template repository instead.
@@ -60,6 +60,10 @@ var pathRoutes = []pathRoute{
 	{"", "/templates/{templateID}/builds/{id}/builder", ownerBuild},
 	{"", "/templates/{templateID}/builds/{id}/status", ownerBuild},
 	{"", "/templates/{templateID}/builds/{id}/logs", ownerBuild},
+
+	{"", "/images/builds/{id}", ownerBuild},
+	// BuildKit WebSocket tunnel, served outside the generated API.
+	{"", "/images/builds/{id}/builder", ownerBuild},
 }
 
 type pathRouteMatch struct {

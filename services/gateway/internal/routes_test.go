@@ -47,6 +47,12 @@ func TestMatchPathRoute(t *testing.T) {
 		{name: "build status other method", method: http.MethodPost, path: "/templates/tmpl/builds/build-1/status", owner: ownerBuild, id: "build-1"},
 		{name: "build missing template", method: http.MethodGet, path: "/templates//builds/build-1/status"},
 		{name: "unknown build child", method: http.MethodGet, path: "/templates/tmpl/builds/build-1/other"},
+		{name: "image build allocation", method: http.MethodPost, path: "/images/builds"},
+		{name: "image build status", method: http.MethodGet, path: "/images/builds/build-1", owner: ownerBuild, id: "build-1"},
+		{name: "image build delete", method: http.MethodDelete, path: "/images/builds/build-1", owner: ownerBuild, id: "build-1"},
+		{name: "image builder tunnel", method: http.MethodGet, path: "/images/builds/build-1/builder", owner: ownerBuild, id: "build-1"},
+		{name: "image builder extra segment", method: http.MethodGet, path: "/images/builds/build-1/builder/extra"},
+		{name: "unknown image build child", method: http.MethodGet, path: "/images/builds/build-1/logs"},
 	}
 
 	for _, tc := range tests {
@@ -100,8 +106,10 @@ func TestPathRoutesCoverOpenAPI(t *testing.T) {
 			}
 		}
 	}
+	// WebSocket tunnels are served outside the generated API.
+	tunnels := map[string]bool{"/images/builds/{id}/builder": true}
 	for i, route := range pathRoutes {
-		if !used[i] {
+		if !used[i] && !tunnels[route.pattern] {
 			t.Errorf("pathRoutes entry %q %s matches no OpenAPI operation", route.method, route.pattern)
 		}
 	}

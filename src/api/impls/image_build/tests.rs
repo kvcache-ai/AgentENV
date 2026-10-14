@@ -85,6 +85,347 @@ async fn cache_volume(api: &ApiImpl, name: &str, mode: VolumeMode, owner: &str) 
     Ok(id)
 }
 
+async fn reopen_journal(api: &mut ApiImpl, path: &std::path::Path) -> Result<()> {
+    api.build_sessions = Arc::new(BuildSessions::default());
+    let journal = LocalKvStore::open(path, LocalStoreDurability::Sync).await?;
+    api.build_sessions.journal.set(journal).unwrap();
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_only_cleanup_retains_results_until_delete() -> Result<()> {
+    let digest = format!("sha256:{}", "ab".repeat(32));
+    for outcome in ["imported", "failure", "restart", "restart-after-import"] {
+        let (root, mut api, existing) = test_api(VolumeLimits::default()).await?;
+        let journal_path = root.path().join("durable-journal");
+        reopen_journal(&mut api, &journal_path).await?;
+        let id = SnapshotId::generate().to_string();
+        let entry = BuildJournal {
+            cache: cache_volume(&api, "image-only-work", VolumeMode::Exclusive, &id).await?,
+            parent: None,
+            image_only: true,
+        };
+        entry.persist(api.build_journal().await?, &id).await?;
+        let imported = outcome == "imported" || outcome == "restart-after-import";
+        if imported {
+            api.build_journal()
+                .await?
+                .put(
+                    format!("image/{id}"),
+                    serde_json::to_vec(&ImageBuildResult::Ready {
+                        digest: digest.clone(),
+                    })?,
+                )
+                .await?;
+        }
+        if outcome.starts_with("restart") {
+            reopen_journal(&mut api, &journal_path).await?;
+        } else {
+            let session = BuildSession::new();
+            session.state.send_replace(SessionState::Finished(
+                (outcome == "failure").then(|| TemplateBuildErrorReason::new("push failed")),
+            ));
+            api.build_sessions
+                .active
+                .lock()
+                .unwrap()
+                .insert(id.clone(), session);
+        }
+        api.recover_image_builds().await?;
+        assert!(api
+            .snapshot_manager
+            .get(existing.id.to_string())
+            .await?
+            .is_some());
+        assert!(api
+            .build_journal()
+            .await?
+            .get(format!("build/{id}"))
+            .await?
+            .is_none());
+        assert!(!api.build_sessions.contains(&id));
+        // Recovery must retain both the original error and its routing without
+        // retaining a worker, even after all in-memory sessions have been lost.
+        reopen_journal(&mut api, &journal_path).await?;
+        api.recover_image_builds().await?;
+        let info = api.image_build_info(&id).await?.expect("retained result");
+        if imported {
+            assert_eq!(info.status, models::ImageBuildStatus::Ready);
+            assert_eq!(info.image_digest.as_deref(), Some(digest.as_str()));
+        } else {
+            assert_eq!(info.status, models::ImageBuildStatus::Error);
+            let expected = if outcome == "failure" {
+                "push failed"
+            } else {
+                "build interrupted by server restart"
+            };
+            assert_eq!(info.reason.unwrap().message, expected);
+        }
+        let route = SandboxId::parse_str(&id)?;
+        assert!(api.orchestrator.list_sandbox_ids().await?.contains(&route));
+        // Template routes cannot release an independent image build.
+        assert_eq!(
+            api.cancel_image_build(&id, &id).await.unwrap_err().code,
+            404
+        );
+        api.cancel_build(&id, &id)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        assert!(api.image_build_info(&id).await?.is_none());
+        api.recover_image_builds().await?;
+        assert!(!api.orchestrator.list_sandbox_ids().await?.contains(&route));
+    }
+    let legacy: BuildJournal = serde_json::from_str(r#"{"cache":"old-cache","parent":null}"#)?;
+    assert!(!legacy.image_only);
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_build_result_is_served_until_delete_and_keeps_the_image() -> Result<()> {
+    use crate::{
+        image::{ImageCatalog, PublishedImage},
+        snapshot::{ManagedLayer, OverlaybdLayerRef},
+    };
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let (_root, api, _) = test_api(VolumeLimits::default()).await?;
+    let id = SnapshotId::generate().to_string();
+    let repository = api.snapshot_manager.repository();
+    let digest = repository
+        .put_image(&PublishedImage::new(
+            "amd64".into(),
+            vec![OverlaybdLayerRef::Managed(ManagedLayer {
+                digest: crate::digest::sha256_digest(b"layer"),
+                size: 5,
+                uuid: None,
+            })],
+            serde_json::json!({}),
+        ))
+        .await?;
+    api.build_journal()
+        .await?
+        .put(
+            format!("image/{id}"),
+            serde_json::to_vec(&ImageBuildResult::Ready {
+                digest: digest.clone(),
+            })?,
+        )
+        .await?;
+    api.recover_image_builds().await?;
+    let app = crate::api::server::new(Arc::new(api.clone()));
+    let request = |method: http::Method| {
+        Request::builder()
+            .method(method)
+            .uri(format!("/images/builds/{id}"))
+            .header("host", "localhost")
+            .header("x-api-key", "build-cleanup-test-api-key-0123456789")
+            .body(Body::empty())
+    };
+    let response = app.clone().oneshot(request(http::Method::GET)?).await?;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let info: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 4096).await?)?;
+    assert_eq!(info["status"], "ready");
+    assert_eq!(info["imageDigest"], digest);
+    let response = app.oneshot(request(http::Method::DELETE)?).await?;
+    assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
+    assert!(api.image_build_info(&id).await?.is_none());
+    // Releasing the build result must preserve the independently published image.
+    assert!(repository.get_image(&digest).await?.is_some());
+    assert!(!api
+        .orchestrator
+        .list_sandbox_ids()
+        .await?
+        .contains(&SandboxId::parse_str(&id)?));
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_tags_point_only_at_published_images() -> Result<()> {
+    use crate::{
+        image::{ImageCatalog, PublishedImage},
+        snapshot::{ManagedLayer, OverlaybdLayerRef},
+    };
+    use axum::{body::Body, http::Request};
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+    let (_root, api, _) = test_api(VolumeLimits::default()).await?;
+    let repository = api.snapshot_manager.repository();
+    let digest = repository
+        .put_image(&PublishedImage::new(
+            "amd64".into(),
+            vec![OverlaybdLayerRef::Managed(ManagedLayer {
+                digest: crate::digest::sha256_digest(b"layer"),
+                size: 5,
+                uuid: None,
+            })],
+            json!({}),
+        ))
+        .await?;
+    let app = crate::api::server::new(Arc::new(api.clone()));
+    let send = |method: http::Method, tag: &str, body: Option<Value>| {
+        let request = Request::builder()
+            .method(method)
+            .uri(format!("/images/tags/{tag}"))
+            .header("host", "localhost")
+            .header("x-api-key", "build-cleanup-test-api-key-0123456789")
+            .header("content-type", "application/json")
+            .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
+            .unwrap();
+        app.clone().oneshot(request)
+    };
+    let expected = json!({"tag": "web:latest", "imageDigest": digest});
+    for (method, tag, body) in [
+        (
+            http::Method::PUT,
+            "web",
+            Some(json!({"imageDigest": digest})),
+        ),
+        (http::Method::GET, "web:latest", None),
+    ] {
+        let response = send(method, tag, body).await?;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let tagged: Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 4096).await?)?;
+        assert_eq!(tagged, expected);
+    }
+
+    let missing = crate::digest::sha256_digest(b"missing");
+    for (method, tag, body, status) in [
+        (
+            http::Method::GET,
+            "web:v2",
+            None,
+            http::StatusCode::NOT_FOUND,
+        ),
+        (
+            http::Method::PUT,
+            "web:v2",
+            Some(json!({"imageDigest": missing})),
+            http::StatusCode::NOT_FOUND,
+        ),
+        (
+            http::Method::GET,
+            "Web",
+            None,
+            http::StatusCode::BAD_REQUEST,
+        ),
+        (
+            http::Method::PUT,
+            "web:.v2",
+            Some(json!({"imageDigest": digest})),
+            http::StatusCode::BAD_REQUEST,
+        ),
+        (
+            http::Method::PUT,
+            "web:v2",
+            Some(json!({"imageDigest": "sha256:short"})),
+            http::StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let response = send(method.clone(), tag, body).await?;
+        assert_eq!(response.status(), status, "{method} {tag}");
+    }
+    let v2 = ImageTag::parse("web:v2")?;
+    assert!(repository.get_image_tag(&v2).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_build_status_waits_for_cache_publication_before_reporting_ready() -> Result<()> {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let (_root, api, _) = test_api(VolumeLimits::default()).await?;
+    let id = SnapshotId::generate().to_string();
+    let digest = crate::digest::sha256_digest(b"published image");
+    api.build_journal()
+        .await?
+        .put(
+            format!("image/{id}"),
+            serde_json::to_vec(&ImageBuildResult::Ready {
+                digest: digest.clone(),
+            })?,
+        )
+        .await?;
+    let session = BuildSession::new();
+    session.state.send_replace(SessionState::Publishing);
+    api.build_sessions
+        .active
+        .lock()
+        .unwrap()
+        .insert(id.clone(), session.clone());
+    let app = crate::api::server::new(Arc::new(api));
+    for expected in ["building", "ready"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/images/builds/{id}"))
+                    .header("host", "localhost")
+                    .header("x-api-key", "build-cleanup-test-api-key-0123456789")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 4096).await?)?;
+        assert_eq!(body["status"], expected);
+        if expected == "building" {
+            assert!(body.get("imageDigest").is_none());
+        } else {
+            assert_eq!(body["imageDigest"], digest);
+        }
+        session.state.send_replace(SessionState::Finished(None));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_build_finalization_retains_logs_without_a_template() -> Result<()> {
+    use crate::template::logs::BuildLogStore;
+    let (_root, api, existing) = test_api(VolumeLimits::default()).await?;
+    let record = SnapshotRecord::template_waiting(SnapshotId::generate(), None, existing.resources);
+    let id = record.id.to_string();
+    BuildJournal {
+        cache: "missing-cache".into(),
+        parent: None,
+        image_only: true,
+    }
+    .persist(api.build_journal().await?, &id)
+    .await?;
+    let session = BuildSession::new();
+    api.build_sessions
+        .active
+        .lock()
+        .unwrap()
+        .insert(id.clone(), session.clone());
+    let logs = api.build_logs.start_with_flush_interval(
+        record.id.clone(),
+        api.snapshot_manager.repository(),
+        Duration::from_secs(3600),
+    );
+    logs.logger
+        .log(crate::logging::LogLevel::Info, None, "exported image");
+    api.supervise_image_build(&record.id, &session, logs, async { Ok(()) })
+        .await;
+    assert!(api.snapshot_manager.get(&id).await?.is_none());
+    assert_eq!(
+        api.snapshot_manager
+            .repository()
+            .read_build_logs(&record.id)
+            .await?
+            .len(),
+        1
+    );
+    assert_eq!(
+        api.image_build_info(&id).await?.unwrap().status,
+        models::ImageBuildStatus::Error
+    );
+    assert!(api.build_logs.temporary(&record.id).is_none());
+    assert!(!api.build_sessions.contains(&id));
+    Ok(())
+}
+
 #[tokio::test]
 async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() -> Result<()> {
     for (cancel_retry, succeeded) in [(false, true), (true, true), (false, false), (true, false)] {
@@ -99,6 +440,7 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
         let entry = BuildJournal {
             cache: cache_volume(&api, "work", VolumeMode::Exclusive, &id).await?,
             parent: Some(cache_volume(&api, "parent", VolumeMode::ReadOnly, &id).await?),
+            image_only: false,
         };
         entry.persist(api.build_journal().await?, &id).await?;
         let session = BuildSession::new();
@@ -126,9 +468,13 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
             .path()
             .join("repository/template-build/cache-head.json");
         tokio::fs::create_dir_all(&fault).await?;
+        let logs = api
+            .build_logs
+            .start(record.id.clone(), api.snapshot_manager.repository());
         api.finish_image_build(
-            &record,
+            &record.id,
             &session,
+            logs,
             if succeeded {
                 Ok(())
             } else {
@@ -220,6 +566,7 @@ async fn buildkit_recovery_isolates_bad_entries_and_skips_active_builds() -> Res
     let entry = BuildJournal {
         cache: "missing-cache".into(),
         parent: None,
+        image_only: false,
     };
     let live_id = SnapshotId::generate().to_string();
     let live = BuildSession::new();
@@ -275,6 +622,7 @@ async fn buildkit_worker_panic_releases_journal_and_scheduler_binding() -> Resul
     let entry = BuildJournal {
         cache: cache_volume(&api, "work", VolumeMode::Exclusive, &id).await?,
         parent: None,
+        image_only: false,
     };
     entry.persist(api.build_journal().await?, &id).await?;
     let session = BuildSession::new();
@@ -289,7 +637,7 @@ async fn buildkit_worker_panic_releases_journal_and_scheduler_binding() -> Resul
     let logs = api
         .build_logs
         .start(record.id.clone(), api.snapshot_manager.repository());
-    api.supervise_image_build(&record, &session, logs, async {
+    api.supervise_image_build(&record.id, &session, logs, async {
         panic!("injected worker panic");
     })
     .await;

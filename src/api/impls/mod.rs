@@ -77,6 +77,7 @@ impl ApiImpl {
         sandbox_proxy_domains: Vec<String>,
         api_key: ApiKey,
     ) -> Self {
+        image_resolver.set_repository(snapshot_manager.repository());
         Self {
             orchestrator,
             snapshot_manager,

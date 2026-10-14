@@ -1,4 +1,8 @@
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::Args as ClapArgs;
@@ -11,7 +15,7 @@ use tokio::{
 
 use crate::client::{
     buildkit,
-    templates::{CreateTemplateV3, TemplateBuildInfo, TemplateV3Response},
+    templates::{BuildStatusReason, CreateTemplateV3, TemplateV3Response},
     Client,
 };
 use crate::progress::BuildProgress;
@@ -22,29 +26,41 @@ Examples:
   aenv build --name my-ubuntu .
   aenv build --name my-python ./my-python
   aenv build --name my-app -f ./my-app/Dockerfile.custom ./my-app
+  aenv build --image ./my-app
+  aenv build --image ./my-app --tag my-app:v1
+  aenv build --compose compose.yaml
 ")]
 pub struct Args {
     /// Local build context directory
-    context: PathBuf,
+    #[arg(required_unless_present = "compose", conflicts_with = "compose")]
+    context: Option<PathBuf>,
     /// Dockerfile path (defaults to CONTEXT/Dockerfile)
-    #[arg(short = 'f', long = "file")]
+    #[arg(short = 'f', long = "file", conflicts_with = "compose")]
     dockerfile: Option<PathBuf>,
     /// Template name
-    #[arg(long)]
-    name: String,
+    #[arg(long, required_unless_present_any = ["compose", "image"], conflicts_with_all = ["compose", "image"])]
+    name: Option<String>,
+    /// Build an immutable image and print its digest
+    #[arg(long, conflicts_with_all = ["compose", "start_cmd", "ready_cmd", "cpu_count", "memory_mb"])]
+    image: bool,
+    /// Point an image tag at the built image, referenced as aenv/NAME[:TAG]; repeatable
+    #[arg(long = "tag", conflicts_with_all = ["compose", "name"], value_name = "NAME[:TAG]", value_parser = parse_image_tag)]
+    tags: Vec<String>,
+    #[command(flatten)]
+    compose: compose::BuildArgs,
     #[command(flatten)]
     resources: super::CpuMemoryArgs,
     /// Override image ENTRYPOINT/CMD; an empty value disables startup
-    #[arg(long)]
+    #[arg(long, conflicts_with = "compose")]
     start_cmd: Option<String>,
     /// Override the image HEALTHCHECK with a command that must succeed before capture
-    #[arg(long)]
+    #[arg(long, conflicts_with = "compose")]
     ready_cmd: Option<String>,
     /// Build argument, KEY=VALUE; repeatable
-    #[arg(long = "build-arg")]
+    #[arg(long = "build-arg", conflicts_with = "compose")]
     build_args: Vec<String>,
     /// BuildKit secret, for example id=token,src=./token; repeatable
-    #[arg(long)]
+    #[arg(long, conflicts_with = "compose")]
     secret: Vec<String>,
     /// Rebuild without cached instructions or their cache mounts
     #[arg(long)]
@@ -64,9 +80,12 @@ pub struct Args {
 #[cfg(target_os = "linux")]
 pub(super) fn codex_template(context: PathBuf, name: String) -> Result<()> {
     run(Args {
-        context,
+        context: Some(context),
         dockerfile: None,
-        name,
+        name: Some(name),
+        image: false,
+        tags: vec![],
+        compose: compose::BuildArgs::default(),
         resources: super::CpuMemoryArgs {
             cpu_count: Some(2),
             memory_mb: Some(1024),
@@ -90,7 +109,6 @@ pub fn run(mut args: Args) -> Result<()> {
     if args.buildctl.is_none() {
         args.buildctl = Some(std::env::current_exe()?.with_file_name("aenv-buildctl"));
     }
-    let context = BuildContext::prepare(&args)?;
     let buildctl = args
         .buildctl
         .as_ref()
@@ -110,10 +128,52 @@ pub fn run(mut args: Args) -> Result<()> {
         "CPU and memory must be greater than zero"
     );
     let client = Client::from_env()?;
-    super::tokio_rt()?.block_on(run_async(client, args, context))
+    if args.compose.compose.is_some() {
+        return compose::run_build(client, args);
+    }
+    let build = Build {
+        name: args.name.clone().unwrap_or_default(),
+        context: BuildContext::prepare(
+            args.context.as_deref().context("missing build context")?,
+            args.dockerfile.as_deref(),
+        )?,
+        build_args: args.build_args.clone(),
+        no_cache: args.no_cache,
+        image: args.image.then_some(ImageBuild {
+            target: None,
+            push: None,
+        }),
+    };
+    let runtime = super::tokio_rt()?;
+    let result = runtime.block_on(run_async(&client, &args, &build))?;
+    if args.image {
+        let digest = result.published_digest()?;
+        println!("{digest}");
+        runtime.block_on(tag_image(&client, &args.tags, digest))?;
+    }
+    Ok(())
 }
 
-async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<()> {
+struct Build {
+    name: String,
+    context: BuildContext,
+    build_args: Vec<String>,
+    no_cache: bool,
+    image: Option<ImageBuild>,
+}
+
+/// Publish a portable OverlayBD image; `push` also exports an OCI registry copy.
+struct ImageBuild {
+    target: Option<String>,
+    push: Option<ImagePush>,
+}
+
+struct ImagePush {
+    image: String,
+    insecure: bool,
+}
+
+async fn run_async(client: &Client, args: &Args, input: &Build) -> Result<BuildInfo> {
     let request = json!({
         "timeout": args.timeout,
         "startCmd": args.start_cmd,
@@ -122,36 +182,62 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
     let mut session = None;
     let progress = BuildProgress::new(args.progress == "auto")?;
     let operation = async {
-        let allocated: TemplateV3Response = serde_json::from_slice(
-            &client
-                .build_request(
-                    Method::POST,
-                    "/v3/templates",
-                    Some(serde_json::to_value(CreateTemplateV3 {
-                        name: args.name.clone(),
-                        tags: vec![],
-                        cpu_count: args.resources.cpu_count,
-                        memory_mb: args.resources.memory_mb,
-                    })?),
-                )
-                .await?,
-        )?;
-        println!(
-            "Created template {} (build {})",
-            allocated.template_id, allocated.build_id
-        );
-        let allocated = session.insert(allocated);
-        progress.stage(0, "Preparing template builder");
-        let builder: Builder = serde_json::from_slice(
-            &client
-                .build_request(Method::PUT, &builder_path(allocated), Some(request))
-                .await?,
-        )?;
+        let builder: Builder = if input.image.is_some() {
+            progress.stage(0, "Preparing image builder");
+            let builder: Builder = serde_json::from_slice(
+                &client
+                    .build_request(
+                        Method::POST,
+                        "/images/builds",
+                        Some(json!({"timeout": args.timeout})),
+                    )
+                    .await?,
+            )?;
+            let build_id = builder
+                .build_id
+                .clone()
+                .context("image build response has no build ID")?;
+            eprintln!("Allocated image build {build_id}");
+            session = Some(BuildSession {
+                build_id,
+                template_id: None,
+            });
+            builder
+        } else {
+            let allocated: TemplateV3Response = serde_json::from_slice(
+                &client
+                    .build_request(
+                        Method::POST,
+                        "/v3/templates",
+                        Some(serde_json::to_value(CreateTemplateV3 {
+                            name: input.name.clone(),
+                            tags: vec![],
+                            cpu_count: args.resources.cpu_count,
+                            memory_mb: args.resources.memory_mb,
+                        })?),
+                    )
+                    .await?,
+            )?;
+            println!(
+                "Created template {} (build {})",
+                allocated.template_id, allocated.build_id
+            );
+            let allocated = session.insert(BuildSession {
+                build_id: allocated.build_id,
+                template_id: Some(allocated.template_id),
+            });
+            progress.stage(0, "Preparing template builder");
+            serde_json::from_slice(
+                &client
+                    .build_request(Method::PUT, &builder_path(allocated), Some(request))
+                    .await?,
+            )?
+        };
         build(
-            &client,
-            allocated,
-            &args,
-            &context,
+            client,
+            session.as_ref().context("missing build session")?,
+            args,
+            input,
             &progress,
             &builder.image_name,
         )
@@ -166,68 +252,156 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
         progress.finish();
     }
     drop(progress);
-    if let Err(error) = result {
-        if let Some(session) = session {
-            let path = builder_path(&session);
-            let cleanup = tokio::time::timeout(
-                Duration::from_secs(5),
-                client.build_request(Method::DELETE, &path, None),
+    if result.is_err() || input.image.is_some() {
+        if let Some(session) = &session {
+            delete_builder(client, session).await;
+        }
+    }
+    let built = result?;
+    if let Some(image) = &input.image {
+        match &image.push {
+            Some(push) => eprintln!("Image {} is ready.", push.image),
+            None => eprintln!("Image is ready."),
+        }
+    } else {
+        println!(
+            "Template {} is ready.",
+            session
+                .context("missing build session")?
+                .template_id
+                .context("missing template ID")?
+        );
+    }
+    Ok(built)
+}
+
+async fn tag_image(client: &Client, tags: &[String], digest: &str) -> Result<()> {
+    for tag in tags {
+        client
+            .build_request(
+                Method::PUT,
+                &format!("/images/tags/{tag}"),
+                Some(json!({"imageDigest": digest})),
             )
             .await
-            .context("cleanup request timed out")
-            .and_then(|result| result);
-            if let Err(cleanup) = cleanup {
-                eprintln!(
-                    "Build cleanup: {cleanup:#}. Check build {} with `aenv template watch`.",
-                    session.build_id
-                );
-            }
-        }
-        return Err(error);
+            .with_context(|| format!("tag the built image as {tag}"))?;
+        eprintln!("Tagged aenv/{tag}");
     }
-    println!(
-        "Template {} is ready.",
-        session.context("missing build session")?.template_id
-    );
     Ok(())
+}
+
+/// Validates an image tag before the build starts and returns its canonical
+/// `name:tag` form, matching the server's rules.
+fn parse_image_tag(value: &str) -> Result<String, String> {
+    let (name, tag) = value.split_once(':').unwrap_or((value, "latest"));
+    let name_ok = name.len() <= 128
+        && name.split(['.', '_', '-']).all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        });
+    let tag_ok = tag.len() <= 128
+        && tag
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b));
+    if !name_ok || !tag_ok {
+        return Err("expected NAME[:TAG]: NAME uses lowercase letters and digits joined by single '.', '_', or '-'; TAG uses letters, digits, '.', '_', or '-' and does not start with '.' or '-'".into());
+    }
+    Ok(format!("{name}:{tag}"))
+}
+
+#[derive(serde::Deserialize)]
+struct BuildInfo {
+    #[serde(rename = "buildID")]
+    build_id: String,
+    #[serde(default, rename = "templateID")]
+    template_id: Option<String>,
+    status: String,
+    #[serde(default)]
+    reason: Option<BuildStatusReason>,
+    #[serde(default, rename = "imageDigest")]
+    image_digest: Option<String>,
+}
+
+impl BuildInfo {
+    fn published_digest(&self) -> Result<&str> {
+        self.image_digest
+            .as_deref()
+            .context("server does not report the built image digest; upgrade the AgentENV server")
+    }
+}
+
+struct BuildSession {
+    build_id: String,
+    template_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct Builder {
     #[serde(rename = "imageName")]
     image_name: String,
+    #[serde(default, rename = "buildID")]
+    build_id: Option<String>,
 }
 
-fn builder_path(session: &TemplateV3Response) -> String {
-    format!(
-        "/templates/{}/builds/{}/builder",
-        session.template_id, session.build_id
+fn builder_path(session: &BuildSession) -> String {
+    match &session.template_id {
+        Some(template) => format!("/templates/{template}/builds/{}/builder", session.build_id),
+        None => format!("/images/builds/{}/builder", session.build_id),
+    }
+}
+
+/// Best-effort builder release; the server keeps image build records until
+/// this DELETE, so failure only leaves a stale record behind.
+async fn delete_builder(client: &Client, session: &BuildSession) {
+    let path = if session.template_id.is_some() {
+        builder_path(session)
+    } else {
+        format!("/images/builds/{}", session.build_id)
+    };
+    let cleanup = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.build_request(Method::DELETE, &path, None),
     )
+    .await
+    .context("cleanup request timed out")
+    .and_then(|result| result);
+    if let Err(cleanup) = cleanup {
+        eprintln!(
+            "Build cleanup for {}: {cleanup:#}. Retry deleting the build if needed.",
+            session.build_id
+        );
+    }
 }
 
 async fn wait_for_status(
     client: &Client,
-    session: &TemplateV3Response,
+    session: &BuildSession,
     expected: &str,
-) -> Result<()> {
+) -> Result<BuildInfo> {
     loop {
-        let path = format!(
-            "/templates/{}/builds/{}/status",
-            session.template_id, session.build_id
-        );
-        let status: TemplateBuildInfo =
+        let path = match &session.template_id {
+            Some(template) => format!("/templates/{template}/builds/{}/status", session.build_id),
+            None => format!("/images/builds/{}", session.build_id),
+        };
+        let status: BuildInfo =
             serde_json::from_slice(&client.build_request(Method::GET, &path, None).await?)?;
         ensure!(
             status.template_id == session.template_id && status.build_id == session.build_id,
             "build status response ID mismatch"
         );
         if status.status == expected {
-            return Ok(());
+            return Ok(status);
         }
         match status.status.as_str() {
             "waiting" | "building" => tokio::time::sleep(Duration::from_secs(1)).await,
             "error" => bail!(
-                "template build failed: {}",
+                "build failed: {}",
                 status
                     .reason
                     .map_or_else(|| "unknown error".into(), |r| r.message)
@@ -250,13 +424,14 @@ async fn interrupted() -> Result<()> {
 
 async fn build(
     client: &Client,
-    session: &TemplateV3Response,
+    session: &BuildSession,
     args: &Args,
-    context: &BuildContext,
+    input: &Build,
     progress: &BuildProgress,
     image_name: &str,
-) -> Result<()> {
+) -> Result<BuildInfo> {
     let path = builder_path(session);
+    let context = &input.context;
     wait_for_status(client, session, "building").await?;
     progress.stage(1, "Building image");
     let (_work, listener, address) = buildkit::bind_local().await?;
@@ -290,13 +465,31 @@ async fn build(
             .arg(format!("type=image,name={image_name},oci-mediatypes=true"))
             .stdin(Stdio::null())
             .kill_on_drop(true);
-        for arg in &args.build_args {
+        if let Some(image) = &input.image {
+            command.stdout(Stdio::null());
+            if let Some(push) = &image.push {
+                command.arg("--output").arg(format!(
+                    "type=image,name={},push=true,oci-mediatypes=true{}",
+                    push.image,
+                    if push.insecure {
+                        ",registry.insecure=true"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            command.args(["--opt", "platform=linux/amd64"]);
+            if let Some(target) = &image.target {
+                command.arg("--opt").arg(format!("target={target}"));
+            }
+        }
+        for arg in &input.build_args {
             command.arg("--opt").arg(format!("build-arg:{arg}"));
         }
         for secret in &args.secret {
             command.arg("--secret").arg(secret);
         }
-        if args.no_cache {
+        if input.no_cache {
             command.arg("--no-cache");
         }
         if progress.visible() {
@@ -317,7 +510,14 @@ async fn build(
         result = command => result?,
         result = client.buildkit_tunnel(&path, listener) => { result?; bail!("BuildKit tunnel closed"); }
     }
-    progress.stage(2, "Converting image and publishing template");
+    progress.stage(
+        2,
+        if input.image.is_some() {
+            "Publishing image to the shared repository"
+        } else {
+            "Converting image and publishing template"
+        },
+    );
     wait_for_status(client, session, "ready").await
 }
 
@@ -328,18 +528,14 @@ struct BuildContext {
 }
 
 impl BuildContext {
-    fn prepare(args: &Args) -> Result<Self> {
-        let context = args
-            .context
-            .canonicalize()
-            .context("locate build context")?;
+    fn prepare(context: &Path, dockerfile: Option<&Path>) -> Result<Self> {
+        let context = context.canonicalize().context("locate build context")?;
         ensure!(
             context.is_dir(),
             "build context must be a directory; use -f <Dockerfile> to select a Dockerfile"
         );
-        let file = args
-            .dockerfile
-            .clone()
+        let file = dockerfile
+            .map(Path::to_owned)
             .unwrap_or_else(|| context.join("Dockerfile"))
             .canonicalize()
             .context("locate Dockerfile")?;
@@ -396,7 +592,7 @@ mod tests {
         .args;
         assert_eq!(args.resources.cpu_count, Some(2));
         assert_eq!(args.build_args, ["VALUE=a b"]);
-        assert_eq!(args.context, PathBuf::from("."));
+        assert_eq!(args.context, Some(PathBuf::from(".")));
         assert_eq!(
             args.dockerfile,
             Some("deploy/docker/Dockerfile.agentenv".into())
@@ -457,20 +653,327 @@ mod tests {
         std::fs::write(context.join("Dockerfile"), "FROM scratch\n")?;
         let mut args =
             Cli::try_parse_from(["aenv", context.to_str().unwrap(), "--name", "demo"])?.args;
-        let prepared = BuildContext::prepare(&args)?;
+        let prepared =
+            BuildContext::prepare(args.context.as_deref().unwrap(), args.dockerfile.as_deref())?;
         assert_eq!(prepared.context, context.canonicalize()?);
         assert_eq!(prepared.dockerfile_dir, prepared.context);
         args.dockerfile = Some(custom.clone());
-        let prepared = BuildContext::prepare(&args)?;
+        let prepared =
+            BuildContext::prepare(args.context.as_deref().unwrap(), args.dockerfile.as_deref())?;
         assert_eq!(prepared.context, context.canonicalize()?);
         assert_eq!(prepared.dockerfile_dir, dockerfiles.canonicalize()?);
         assert_eq!(prepared.filename, "Custom.Dockerfile");
-        args.context = custom;
-        assert!(BuildContext::prepare(&args)
-            .err()
-            .unwrap()
-            .to_string()
-            .contains("use -f"));
+        args.context = Some(custom);
+        assert!(BuildContext::prepare(
+            args.context.as_deref().unwrap(),
+            args.dockerfile.as_deref()
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("use -f"));
         Ok(())
+    }
+
+    #[test]
+    fn native_image_flags_preserve_template_builds() {
+        crate::Cli::command().debug_assert();
+        for (args, valid) in [
+            ("aenv build --image .", true),
+            (
+                "aenv build --image . -f Dockerfile --build-arg A=B --secret id=token,src=token",
+                true,
+            ),
+            ("aenv build --image", false),
+            ("aenv build --image . --name template", false),
+            ("aenv build --image . --start-cmd true", false),
+            ("aenv build --image . --ready-cmd true", false),
+            ("aenv build --image . --cpu 2", false),
+            ("aenv build --image . --memory 512", false),
+            ("aenv build --image . --tag web --tag web:v1.2_rc-1", true),
+            ("aenv build . --name template --tag web:v1", false),
+            ("aenv build --image . --tag Web:v1", false),
+            ("aenv build --image . --tag team/web:v1", false),
+            ("aenv build --image . --tag web:.v1", false),
+            ("aenv build --image . --tag web:v1:extra", false),
+        ] {
+            assert_eq!(
+                crate::Cli::try_parse_from(args.split_whitespace()).is_ok(),
+                valid,
+                "{args}"
+            );
+        }
+        let Ok(crate::Cli {
+            cmd: crate::Cmd::Build(args),
+            ..
+        }) = crate::Cli::try_parse_from(["aenv", "build", "--image", ".", "--tag", "web"])
+        else {
+            panic!("image build with a tag should parse");
+        };
+        assert_eq!(args.tags, ["web:latest"]);
+    }
+}
+
+/// Compose image builds share the ordinary BuildKit transport and cleanup.
+pub(super) mod compose {
+    use crate::client::Client;
+    use crate::commands::build::{self, Build, BuildContext, ImageBuild, ImagePush};
+    use crate::commands::compose::{parse_env, read_compose};
+    use anyhow::{ensure, Context, Result};
+    use clap::Args as ClapArgs;
+    use reqwest::Method;
+    use serde::Deserialize;
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+    use std::io::Write;
+    use std::path::PathBuf;
+    #[derive(Clone, Default, ClapArgs)]
+    #[group(id = "compose-build")]
+    pub(super) struct BuildArgs {
+        /// Build service images from a Compose file instead of creating a VM template
+        #[arg(long, value_name = "PATH")]
+        pub compose: Option<PathBuf>,
+        /// Apply Harbor task defaults: build main from ./Dockerfile and keep it alive unless overridden
+        #[arg(long, requires = "compose", conflicts_with_all = ["context", "name"])]
+        harbor: bool,
+        /// Registry repository for unique service image tags, e.g. registry.example.com/team/images;
+        /// optional, only needed to distribute images through a registry
+        #[arg(long, requires = "compose", conflicts_with_all = ["context", "name"])]
+        image_repository: Option<String>,
+        /// Write an image-only Compose file (default: compose.built.yaml beside the input); must not exist
+        #[arg(long, requires = "compose", conflicts_with_all = ["context", "name"], value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// Compose interpolation variable; repeatable, last value wins; .env is not loaded
+        #[arg(long = "env", requires = "compose", conflicts_with_all = ["context", "name"], value_name = "KEY=VALUE", value_parser = parse_env)]
+        environment: Vec<(String, String)>,
+        /// Enable an optional Compose profile (repeatable)
+        #[arg(long = "profile", requires = "compose", conflicts_with_all = ["context", "name"], value_name = "NAME")]
+        profiles: Vec<String>,
+        /// Allow HTTP or untrusted TLS for image pushes (development registries only)
+        #[arg(long, requires = "compose", conflicts_with_all = ["context", "name"])]
+        registry_insecure: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct Plan {
+        compose: Value,
+        services: Vec<Service>,
+    }
+
+    #[derive(Deserialize)]
+    struct Service {
+        name: String,
+        context: PathBuf,
+        dockerfile: PathBuf,
+        args: BTreeMap<String, String>,
+        target: Option<String>,
+        #[serde(default, rename = "noCache")]
+        no_cache: bool,
+    }
+
+    fn validate_repository(repository: &str) -> Result<()> {
+        let (host, path) = repository
+            .split_once('/')
+            .context("--image-repository must include a registry host and repository path")?;
+        ensure!(
+            !host.is_empty()
+                && (host.contains('.') || host.contains(':') || host == "localhost")
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-:".contains(&b))
+                && !path.is_empty()
+                && path.len() <= 200
+                && path.split('/').all(|part| !part.is_empty()
+                    && part.bytes().all(|b| b.is_ascii_lowercase()
+                        || b.is_ascii_digit()
+                        || b"._-".contains(&b))),
+            "invalid --image-repository; use REGISTRY/REPOSITORY without a scheme, tag, or digest"
+        );
+        Ok(())
+    }
+
+    pub(super) fn run_build(client: Client, args: build::Args) -> Result<()> {
+        let options = &args.compose;
+        let repository = options.image_repository.as_deref();
+        if let Some(repository) = repository {
+            validate_repository(repository)?;
+        }
+        let source = options
+            .compose
+            .as_ref()
+            .context("missing Compose file")?
+            .canonicalize()
+            .context("locate Compose file")?;
+        let base = source
+            .parent()
+            .context("Compose file has no parent directory")?;
+        let output = options
+            .output
+            .clone()
+            .unwrap_or_else(|| base.join("compose.built.yaml"));
+        // Refuse an existing destination before allocating remote resources. Persist
+        // without clobbering also closes the race with another writer during builds.
+        ensure!(
+            !output.try_exists()? && output.symlink_metadata().is_err(),
+            "output {} already exists; choose another --output",
+            output.display()
+        );
+        let parent = output
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let mut destination =
+            tempfile::NamedTempFile::new_in(parent).context("prepare Compose output directory")?;
+        let compose = read_compose(std::fs::File::open(&source)?)?;
+        let request = json!({
+            "compose": compose, "harbor": options.harbor,
+            "composeEnv": options.environment.iter().cloned().collect::<BTreeMap<_, _>>(),
+            "profiles": options.profiles,
+        });
+        ensure!(
+            serde_json::to_vec(&request)?.len() <= 2 * 1024 * 1024,
+            "Compose planner request exceeds 2 MiB"
+        );
+        let response = crate::commands::tokio_rt()?
+            .block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    client.build_request(Method::POST, "/sandboxes-compose/plan", Some(request)),
+                )
+                .await
+                .context("Compose planning timed out")?
+            })
+            .context("plan Compose build on the server")?;
+        let mut plan: Plan =
+            serde_json::from_slice(&response).context("decode Compose build plan")?;
+        ensure!(
+            !plan.services.is_empty(),
+            "Compose file selects no services with build; use aenv compose up directly"
+        );
+
+        // Validate every path before the first build, resolving context relative to
+        // the Compose file and Dockerfile relative to that context, per Compose.
+        let mut builds = Vec::new();
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        for (index, service) in plan.services.into_iter().enumerate() {
+            let context = base.join(service.context);
+            let build = Build {
+                name: format!("compose-{id}-{index}"),
+                context: BuildContext::prepare(&context, Some(&context.join(service.dockerfile)))
+                    .with_context(|| format!("service {}", service.name))?,
+                build_args: service
+                    .args
+                    .into_iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect(),
+                no_cache: args.no_cache || service.no_cache,
+                image: Some(ImageBuild {
+                    target: service.target,
+                    push: repository.map(|repository| ImagePush {
+                        image: format!("{repository}:aenv-{id}-{index}"),
+                        insecure: options.registry_insecure,
+                    }),
+                }),
+            };
+            builds.push((service.name, build));
+        }
+        // Each published image is independently recoverable from the repository.
+        let images = crate::commands::tokio_rt()?.block_on(async {
+            let mut images = Vec::new();
+            for (name, build) in builds {
+                let pushed = build.image.as_ref().and_then(|image| image.push.as_ref());
+                match pushed {
+                    Some(push) => eprintln!("Building Compose service {name} -> {}", push.image),
+                    None => eprintln!("Building Compose service {name}"),
+                }
+                let info = build::run_async(&client, &args, &build)
+                    .await
+                    .with_context(|| format!("building Compose service {name}"))?;
+                let reference = match pushed {
+                    Some(push) => push.image.clone(),
+                    None => info.published_digest()?.to_owned(),
+                };
+                images.push((name, reference));
+            }
+            Ok::<_, anyhow::Error>(images)
+        })?;
+        for (name, image) in images {
+            plan.compose["services"][&name]["image"] = Value::String(image);
+        }
+        plan.compose
+            .as_object_mut()
+            .context("invalid Compose plan")?
+            .remove("x-aenv-build");
+        let mut encoded = serde_json::to_vec_pretty(&plan.compose)?;
+        encoded.push(b'\n');
+        // compose up accepts YAML and JSON, both bounded to 1 MiB.
+        ensure!(
+            encoded.len() <= 1024 * 1024,
+            "generated Compose file exceeds 1 MiB"
+        );
+        destination.write_all(&encoded)?;
+        destination.as_file().sync_all()?;
+        destination
+            .persist_noclobber(&output)
+            .with_context(|| format!("publish Compose output {}", output.display()))?;
+        eprintln!("Built Compose file: {}", output.display());
+        eprintln!("Start it with: aenv compose up -f {}", output.display());
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use clap::{CommandFactory, Parser};
+        #[test]
+        fn compose_build_flags_do_not_change_template_builds() {
+            crate::Cli::command().debug_assert();
+            for (args, valid) in [
+            ("aenv build --compose compose.yaml", true),
+            ("aenv build --image --compose compose.yaml", false),
+            ("aenv build --compose compose.yaml --image-repository example.com/team/images --env TAG=a=b --profile worker", true),
+            ("aenv build . --name demo --image-repository example.com/team/images", false),
+            ("aenv build . --name demo --harbor", false),
+            ("aenv build . --name demo --output out.yaml", false),
+        ] {
+            assert_eq!(crate::Cli::try_parse_from(args.split_whitespace()).is_ok(), valid, "{args}");
+        }
+            for extra in [
+                "--start-cmd",
+                "--ready-cmd",
+                "--name",
+                "--file",
+                "--build-arg",
+                "--secret",
+                "--tag",
+            ] {
+                let args = format!("aenv build --compose compose.yaml {extra} value");
+                assert!(
+                    crate::Cli::try_parse_from(args.split_whitespace()).is_err(),
+                    "{args}"
+                );
+            }
+        }
+        #[test]
+        fn repository_cannot_inject_exporter_options_or_reuse_a_tag() {
+            for value in [
+                "example.com/team/images",
+                "localhost:5000/images",
+                "192.0.2.10:5000/build",
+            ] {
+                assert!(validate_repository(value).is_ok(), "{value}");
+            }
+            for value in [
+                "images",
+                "https://example.com/images",
+                "example.com/images:latest",
+                "example.com/images,push=false",
+                "example.com//images",
+                "example.com/images@sha256:abc",
+                "example.com/Upper",
+            ] {
+                assert!(validate_repository(value).is_err(), "{value}");
+            }
+        }
     }
 }

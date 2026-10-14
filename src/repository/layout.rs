@@ -1,5 +1,5 @@
-use super::LayerRole;
-use crate::types::{SnapshotAlias, SnapshotId};
+use super::{LayerRole, RepositoryError, RepositoryResult};
+use crate::types::{ImageTag, SnapshotAlias, SnapshotId};
 
 /// A small shared document that every backend stores at the same path relative
 /// to its repository root. This is the only place that names those paths;
@@ -18,9 +18,23 @@ pub enum DocumentKey {
     SnapshotRecord(SnapshotId),
     /// The snapshot ID that currently owns an alias.
     SnapshotAlias(SnapshotAlias),
+    /// One immutable published image description, named by its digest.
+    /// Construct it with [`DocumentKey::image`], which validates the digest.
+    Image(String),
+    /// The image digest that an image tag currently points to.
+    ImageTag(ImageTag),
 }
 
 impl DocumentKey {
+    pub(crate) fn image(digest: &str) -> RepositoryResult<Self> {
+        if !crate::digest::is_sha256_digest(digest) {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("invalid image digest '{digest}'"),
+            });
+        }
+        Ok(Self::Image(digest.to_owned()))
+    }
+
     pub(crate) fn path(&self) -> String {
         match self {
             Self::BuildLog(id) => format!("snapshots/build-logs/{id}.json"),
@@ -29,6 +43,8 @@ impl DocumentKey {
             Self::VolumeAlias(name) => format!("volumes/aliases/{name}.json"),
             Self::SnapshotRecord(id) => format!("{SNAPSHOT_RECORDS_PREFIX}{id}.json"),
             Self::SnapshotAlias(alias) => format!("catalog/aliases/{alias}.json"),
+            Self::Image(digest) => format!("{IMAGES_PREFIX}{digest}.json"),
+            Self::ImageTag(tag) => format!("{IMAGE_TAGS_PREFIX}{tag}.json"),
         }
     }
 
@@ -52,6 +68,8 @@ impl DocumentKey {
             Self::VolumeAlias(name) => format!("volumes/aliases/{name}.lock"),
             Self::SnapshotRecord(id) => format!("{SNAPSHOT_RECORDS_PREFIX}{id}.lock"),
             Self::SnapshotAlias(alias) => format!("catalog/aliases/{alias}.lock"),
+            Self::Image(digest) => format!("{IMAGES_PREFIX}{digest}.lock"),
+            Self::ImageTag(tag) => format!("{IMAGE_TAGS_PREFIX}{tag}.lock"),
             Self::BuildLog(_) => format!("{}.lock", self.path()),
         }
     }
@@ -68,6 +86,8 @@ pub(crate) fn is_valid_volume_component(value: &str) -> bool {
 }
 
 const VOLUME_RECORDS_PREFIX: &str = "volumes/records/";
+const IMAGES_PREFIX: &str = "catalog/images/";
+const IMAGE_TAGS_PREFIX: &str = "catalog/image-tags/";
 const SNAPSHOT_RECORDS_PREFIX: &str = "catalog/records/";
 
 /// Documents that are listed together, in ID order.
@@ -230,6 +250,20 @@ mod tests {
         assert!(record.path().starts_with(records.prefix()));
         assert_eq!(records.id_from_file_name("vol_test.json"), Some("vol_test"));
         assert_eq!(records.id_from_file_name("vol_test.lock"), None);
+
+        let digest = crate::digest::sha256_digest(b"image");
+        let image = DocumentKey::image(&digest).unwrap();
+        assert_eq!(image.path(), format!("catalog/images/{digest}.json"));
+        assert_eq!(image.posix_path(), image.path());
+        assert_eq!(
+            image.posix_lock_path(),
+            format!("catalog/images/{digest}.lock")
+        );
+        assert!(DocumentKey::image("sha256:../../outside").is_err());
+        let tag = DocumentKey::ImageTag(ImageTag::parse("web").unwrap());
+        assert_eq!(tag.path(), "catalog/image-tags/web:latest.json");
+        assert_eq!(tag.posix_path(), tag.path());
+        assert_eq!(tag.posix_lock_path(), "catalog/image-tags/web:latest.lock");
     }
 
     #[test]
