@@ -45,11 +45,13 @@ pub(super) async fn test_api(
         limits,
     )
     .await?;
+    let mut image_config = AppConfig::default();
+    crate::cfg::ImageConfig::normalize(&mut image_config.image, root.path(), root.path());
     let api = ApiImpl::new(
         orchestrator,
         manager.clone(),
         Arc::new(TemplateBuilder::new()),
-        Arc::new(ImageResolver::new(&AppConfig::default())),
+        Arc::new(ImageResolver::new(&image_config)),
         Arc::new(volumes),
         None,
         Vec::new(),
@@ -86,6 +88,586 @@ async fn cache_volume(api: &ApiImpl, name: &str, mode: VolumeMode, owner: &str) 
 }
 
 #[tokio::test]
+async fn image_catalog_api_paginates_and_deletes_without_removing_shared_layers() -> Result<()> {
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+        Router,
+    };
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+    async fn call(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        authorized: bool,
+    ) -> Result<(StatusCode, Value)> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "localhost");
+        if authorized {
+            request = request.header("x-api-key", "build-cleanup-test-api-key-0123456789");
+        }
+        let response = app.clone().oneshot(request.body(Body::empty())?).await?;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 65536).await?;
+        Ok((
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        ))
+    }
+    let (root, api, _) = test_api(VolumeLimits::default()).await?;
+    let app = crate::api::server::new(Arc::new(api.clone()));
+    assert_eq!(
+        call(&app, "GET", "/images", false).await?.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        call(&app, "GET", "/images", true).await?.1,
+        json!({"images": []})
+    );
+    let repository = api.snapshot_manager.repository();
+    let (_, _, manifest) =
+        crate::snapshot::mock::write_mock_built_artifacts(&root.path().join("image-source"))?;
+    let layers = crate::snapshot::store::store_volume_layers(
+        repository.as_ref(),
+        &manifest.rootfs.image_config_path,
+    )
+    .await?;
+    let image =
+        crate::image::PublishedImage::new("amd64".into(), layers.clone(), json!({"Cmd": ["true"]}));
+    let (first, repeat) = tokio::join!(repository.put_image(&image), repository.put_image(&image));
+    let first = first?;
+    assert_eq!(first, repeat?);
+    let other =
+        crate::image::PublishedImage::new("amd64".into(), layers, json!({"Cmd": ["false"]}));
+    let mut digests = [first.clone(), repository.put_image(&other).await?];
+    digests.sort();
+    let (status, page) = call(&app, "GET", "/images?limit=1", true).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(page["images"][0]["imageDigest"], digests[0]);
+    assert_eq!(page["nextToken"], digests[0]);
+    assert!(page["images"][0].get("description").is_none());
+    let detail = call(&app, "GET", &format!("/images/{first}"), true).await?;
+    assert_eq!(detail.0, StatusCode::OK);
+    assert_eq!(detail.1["description"], serde_json::to_value(&image)?);
+    let resolved = api.image_resolver.resolve(&digests[0]).await?;
+    let config = overlaybd::config::load_image_config(&resolved.overlaybd_config_path)?;
+    for _ in 0..2 {
+        assert_eq!(
+            call(&app, "DELETE", &format!("/images/{}", digests[0]), true)
+                .await?
+                .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    assert_eq!(
+        call(&app, "GET", &format!("/images/{}", digests[0]), true)
+            .await?
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    assert!(matches!(
+        api.image_resolver.resolve(&digests[0]).await,
+        Err(crate::image::ImageError::NotFound { .. })
+    ));
+    assert!(resolved.overlaybd_config_path.exists());
+    assert!(config
+        .lowers
+        .iter()
+        .all(|layer| std::path::Path::new(&layer.file).is_file()));
+    let page = call(
+        &app,
+        "GET",
+        &format!("/images?limit=1&nextToken={}", digests[0]),
+        true,
+    )
+    .await?
+    .1;
+    assert_eq!(page["images"][0]["imageDigest"], digests[1]);
+    assert!(page.get("nextToken").is_none());
+    assert!(api
+        .image_resolver
+        .resolve(&digests[1])
+        .await?
+        .overlaybd_config_path
+        .is_file());
+    for uri in [
+        "/images?limit=0",
+        "/images?limit=101",
+        "/images?nextToken=invalid",
+        "/images/sha256:invalid",
+    ] {
+        assert_eq!(
+            call(&app, "GET", uri, true).await?.0,
+            StatusCode::BAD_REQUEST,
+            "{uri}"
+        );
+    }
+    assert_eq!(
+        call(&app, "DELETE", "/images/invalid", true).await?.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(&app, "GET", "/images/builds", true).await?.0,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    assert_eq!(
+        call(&app, "GET", "/images/builds/missing", true).await?.0,
+        StatusCode::NOT_FOUND
+    );
+    assert!(api
+        .volume_manager
+        .list_page(None, 100)
+        .await?
+        .records
+        .is_empty());
+    let deleted = if digests[0] == first { &image } else { &other };
+    assert_eq!(repository.put_image(deleted).await?, digests[0]);
+    assert_eq!(
+        call(&app, "GET", &format!("/images/{}", digests[0]), true)
+            .await?
+            .0,
+        StatusCode::OK
+    );
+    Ok(())
+}
+
+async fn reopen_journal(api: &mut ApiImpl, path: &std::path::Path) -> Result<()> {
+    api.build_sessions = Arc::new(BuildSessions::default());
+    let journal = LocalKvStore::open(path, LocalStoreDurability::Sync).await?;
+    api.build_sessions.journal.set(journal).unwrap();
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_only_cleanup_retains_results_until_delete() -> Result<()> {
+    let digest = format!("sha256:{}", "ab".repeat(32));
+    for outcome in ["imported", "failure", "restart", "restart-after-import"] {
+        let (root, mut api, existing) = test_api(VolumeLimits::default()).await?;
+        let journal_path = root.path().join("durable-journal");
+        reopen_journal(&mut api, &journal_path).await?;
+        let id = SnapshotId::generate().to_string();
+        let entry = BuildJournal {
+            cache: cache_volume(&api, "image-only-work", VolumeMode::Exclusive, &id).await?,
+            parent: None,
+            image_only: true,
+        };
+        entry.persist(api.build_journal().await?, &id).await?;
+        let imported = outcome == "imported" || outcome == "restart-after-import";
+        if imported {
+            api.build_journal()
+                .await?
+                .put(
+                    format!("image/{id}"),
+                    serde_json::to_vec(&ImageBuildResult::Ready {
+                        digest: digest.clone(),
+                    })?,
+                )
+                .await?;
+        }
+        if outcome.starts_with("restart") {
+            reopen_journal(&mut api, &journal_path).await?;
+        } else {
+            let session = BuildSession::new();
+            session.state.send_replace(SessionState::Finished(
+                (outcome == "failure").then(|| TemplateBuildErrorReason::new("push failed")),
+            ));
+            api.build_sessions
+                .active
+                .lock()
+                .unwrap()
+                .insert(id.clone(), session);
+        }
+        api.recover_image_builds().await?;
+        assert!(api
+            .snapshot_manager
+            .get(existing.id.to_string())
+            .await?
+            .is_some());
+        assert!(api
+            .build_journal()
+            .await?
+            .get(format!("build/{id}"))
+            .await?
+            .is_none());
+        assert!(!api.build_sessions.contains(&id));
+        // Recovery must retain both the original error and its routing without
+        // retaining a worker, even after all in-memory sessions have been lost.
+        reopen_journal(&mut api, &journal_path).await?;
+        api.recover_image_builds().await?;
+        let info = api.image_build_info(&id).await?.expect("retained result");
+        if imported {
+            assert_eq!(info.status, models::ImageBuildStatus::Ready);
+            assert_eq!(info.image_digest.as_deref(), Some(digest.as_str()));
+        } else {
+            assert_eq!(info.status, models::ImageBuildStatus::Error);
+            let expected = if outcome == "failure" {
+                "push failed"
+            } else {
+                "build interrupted by server restart"
+            };
+            assert_eq!(info.reason.unwrap().message, expected);
+        }
+        let route = SandboxId::parse_str(&id)?;
+        assert!(api.orchestrator.list_sandbox_ids().await?.contains(&route));
+        // Template routes cannot release an independent image build.
+        assert_eq!(
+            api.cancel_image_build(&id, &id).await.unwrap_err().code,
+            404
+        );
+        api.cancel_build(&id, &id)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.message))?;
+        assert!(api.image_build_info(&id).await?.is_none());
+        api.recover_image_builds().await?;
+        assert!(!api.orchestrator.list_sandbox_ids().await?.contains(&route));
+    }
+    let legacy: BuildJournal = serde_json::from_str(r#"{"cache":"old-cache","parent":null}"#)?;
+    assert!(!legacy.image_only);
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_build_result_is_served_until_delete_and_keeps_the_image() -> Result<()> {
+    use crate::{
+        image::{ImageCatalog, PublishedImage},
+        snapshot::{ManagedLayer, OverlaybdLayerRef},
+    };
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let (_root, api, _) = test_api(VolumeLimits::default()).await?;
+    let id = SnapshotId::generate().to_string();
+    let repository = api.snapshot_manager.repository();
+    let digest = repository
+        .put_image(&PublishedImage::new(
+            "amd64".into(),
+            vec![OverlaybdLayerRef::Managed(ManagedLayer {
+                digest: crate::digest::sha256_digest(b"layer"),
+                size: 5,
+                uuid: None,
+            })],
+            serde_json::json!({}),
+        ))
+        .await?;
+    api.build_journal()
+        .await?
+        .put(
+            format!("image/{id}"),
+            serde_json::to_vec(&ImageBuildResult::Ready {
+                digest: digest.clone(),
+            })?,
+        )
+        .await?;
+    api.recover_image_builds().await?;
+    let app = crate::api::server::new(Arc::new(api.clone()));
+    let request = |method: http::Method| {
+        Request::builder()
+            .method(method)
+            .uri(format!("/images/builds/{id}"))
+            .header("host", "localhost")
+            .header("x-api-key", "build-cleanup-test-api-key-0123456789")
+            .body(Body::empty())
+    };
+    let response = app.clone().oneshot(request(http::Method::GET)?).await?;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let info: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 4096).await?)?;
+    assert_eq!(info["status"], "ready");
+    assert_eq!(info["imageDigest"], digest);
+    let response = app.oneshot(request(http::Method::DELETE)?).await?;
+    assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
+    assert!(api.image_build_info(&id).await?.is_none());
+    // Releasing the build result must preserve the independently published image.
+    assert!(repository.get_image(&digest).await?.is_some());
+    assert!(!api
+        .orchestrator
+        .list_sandbox_ids()
+        .await?
+        .contains(&SandboxId::parse_str(&id)?));
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_tags_point_only_at_published_images() -> Result<()> {
+    use crate::{
+        image::{ImageCatalog, PublishedImage},
+        snapshot::{ManagedLayer, OverlaybdLayerRef},
+    };
+    use axum::{body::Body, http::Request};
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+    let (_root, api, _) = test_api(VolumeLimits::default()).await?;
+    let repository = api.snapshot_manager.repository();
+    let digest = repository
+        .put_image(&PublishedImage::new(
+            "amd64".into(),
+            vec![OverlaybdLayerRef::Managed(ManagedLayer {
+                digest: crate::digest::sha256_digest(b"layer"),
+                size: 5,
+                uuid: None,
+            })],
+            json!({}),
+        ))
+        .await?;
+    let app = crate::api::server::new(Arc::new(api.clone()));
+    let send = |method: http::Method, tag: &str, body: Option<Value>| {
+        let request = Request::builder()
+            .method(method)
+            .uri(format!("/images/tags/{tag}"))
+            .header("host", "localhost")
+            .header("x-api-key", "build-cleanup-test-api-key-0123456789")
+            .header("content-type", "application/json")
+            .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
+            .unwrap();
+        app.clone().oneshot(request)
+    };
+    let expected = json!({"tag": "web:latest", "imageDigest": digest});
+    for (method, tag, body) in [
+        (
+            http::Method::PUT,
+            "web",
+            Some(json!({"imageDigest": digest})),
+        ),
+        (http::Method::GET, "web:latest", None),
+    ] {
+        let response = send(method, tag, body).await?;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let tagged: Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 4096).await?)?;
+        assert_eq!(tagged, expected);
+    }
+
+    let missing = crate::digest::sha256_digest(b"missing");
+    for (method, tag, body, status) in [
+        (
+            http::Method::GET,
+            "web:v2",
+            None,
+            http::StatusCode::NOT_FOUND,
+        ),
+        (
+            http::Method::PUT,
+            "web:v2",
+            Some(json!({"imageDigest": missing})),
+            http::StatusCode::NOT_FOUND,
+        ),
+        (
+            http::Method::GET,
+            "Web",
+            None,
+            http::StatusCode::BAD_REQUEST,
+        ),
+        (
+            http::Method::PUT,
+            "web:.v2",
+            Some(json!({"imageDigest": digest})),
+            http::StatusCode::BAD_REQUEST,
+        ),
+        (
+            http::Method::PUT,
+            "web:v2",
+            Some(json!({"imageDigest": "sha256:short"})),
+            http::StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let response = send(method.clone(), tag, body).await?;
+        assert_eq!(response.status(), status, "{method} {tag}");
+    }
+    let v2 = ImageTag::parse("web:v2")?;
+    assert!(repository.get_image_tag(&v2).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_tag_catalog_lists_and_deletes_tags_independently_of_images() -> Result<()> {
+    use crate::{
+        image::{ImageCatalog, PublishedImage},
+        snapshot::{ManagedLayer, OverlaybdLayerRef},
+    };
+    use axum::{body::Body, http::Request};
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+    let (_root, api, _) = test_api(VolumeLimits::default()).await?;
+    let repository = api.snapshot_manager.repository();
+    let image = PublishedImage::new(
+        "amd64".into(),
+        vec![OverlaybdLayerRef::Managed(ManagedLayer {
+            digest: crate::digest::sha256_digest(b"layer"),
+            size: 5,
+            uuid: None,
+        })],
+        json!({}),
+    );
+    let digest = repository.put_image(&image).await?;
+    for tag in ["web:v1", "web:v2", "api:latest"] {
+        repository
+            .put_image_tag(&ImageTag::parse(tag)?, &digest)
+            .await?;
+    }
+    let app = crate::api::server::new(Arc::new(api.clone()));
+    let call = |method: http::Method, uri: String| {
+        let request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("host", "localhost")
+            .header("x-api-key", "build-cleanup-test-api-key-0123456789")
+            .body(Body::empty())
+            .unwrap();
+        let app = app.clone();
+        async move {
+            let response = app.oneshot(request).await?;
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 65536).await?;
+            Ok::<_, anyhow::Error>((
+                status,
+                serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            ))
+        }
+    };
+    let entry = |tag: &str| json!({"tag": tag, "imageDigest": digest});
+    let (status, page) = call(http::Method::GET, "/images/tags?limit=2".into()).await?;
+    assert_eq!(status, http::StatusCode::OK);
+    assert_eq!(
+        page,
+        json!({"tags": [entry("api:latest"), entry("web:v1")], "nextToken": "web:v1"})
+    );
+    let (_, page) = call(http::Method::GET, "/images/tags?nextToken=web:v1".into()).await?;
+    assert_eq!(page, json!({"tags": [entry("web:v2")]}));
+
+    // Deleting the image leaves its tags in place, but they no longer resolve.
+    let (status, _) = call(http::Method::DELETE, format!("/images/{digest}")).await?;
+    assert_eq!(status, http::StatusCode::NO_CONTENT);
+    let (status, tag) = call(http::Method::GET, "/images/tags/web:v1".into()).await?;
+    assert_eq!((status, tag), (http::StatusCode::OK, entry("web:v1")));
+    assert!(matches!(
+        api.image_resolver.resolve("aenv/web:v1").await,
+        Err(crate::image::ImageError::NotFound { .. })
+    ));
+
+    for _ in 0..2 {
+        let (status, _) = call(http::Method::DELETE, "/images/tags/web:v1".into()).await?;
+        assert_eq!(status, http::StatusCode::NO_CONTENT);
+    }
+    let (status, _) = call(http::Method::GET, "/images/tags/web:v1".into()).await?;
+    assert_eq!(status, http::StatusCode::NOT_FOUND);
+    let (_, page) = call(http::Method::GET, "/images/tags".into()).await?;
+    assert_eq!(
+        page,
+        json!({"tags": [entry("api:latest"), entry("web:v2")]})
+    );
+    assert_eq!(repository.put_image(&image).await?, digest);
+    assert!(repository.get_image(&digest).await?.is_some());
+
+    for (method, uri) in [
+        (http::Method::GET, "/images/tags?limit=0"),
+        (http::Method::GET, "/images/tags?limit=101"),
+        (http::Method::GET, "/images/tags?nextToken=Web"),
+        (http::Method::DELETE, "/images/tags/Web"),
+    ] {
+        let (status, _) = call(method, uri.into()).await?;
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{uri}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_build_status_waits_for_cache_publication_before_reporting_ready() -> Result<()> {
+    use axum::{body::Body, http::Request};
+    use tower::ServiceExt;
+    let (_root, api, _) = test_api(VolumeLimits::default()).await?;
+    let id = SnapshotId::generate().to_string();
+    let digest = crate::digest::sha256_digest(b"published image");
+    api.build_journal()
+        .await?
+        .put(
+            format!("image/{id}"),
+            serde_json::to_vec(&ImageBuildResult::Ready {
+                digest: digest.clone(),
+            })?,
+        )
+        .await?;
+    let session = BuildSession::new();
+    session.state.send_replace(SessionState::Publishing);
+    api.build_sessions
+        .active
+        .lock()
+        .unwrap()
+        .insert(id.clone(), session.clone());
+    let app = crate::api::server::new(Arc::new(api));
+    for expected in ["building", "ready"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/images/builds/{id}"))
+                    .header("host", "localhost")
+                    .header("x-api-key", "build-cleanup-test-api-key-0123456789")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 4096).await?)?;
+        assert_eq!(body["status"], expected);
+        if expected == "building" {
+            assert!(body.get("imageDigest").is_none());
+        } else {
+            assert_eq!(body["imageDigest"], digest);
+        }
+        session.state.send_replace(SessionState::Finished(None));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_build_finalization_retains_logs_without_a_template() -> Result<()> {
+    use crate::template::logs::BuildLogStore;
+    let (_root, api, existing) = test_api(VolumeLimits::default()).await?;
+    let record = SnapshotRecord::template_waiting(SnapshotId::generate(), None, existing.resources);
+    let id = record.id.to_string();
+    BuildJournal {
+        cache: "missing-cache".into(),
+        parent: None,
+        image_only: true,
+    }
+    .persist(api.build_journal().await?, &id)
+    .await?;
+    let session = BuildSession::new();
+    api.build_sessions
+        .active
+        .lock()
+        .unwrap()
+        .insert(id.clone(), session.clone());
+    let logs = api.build_logs.start_with_flush_interval(
+        record.id.clone(),
+        api.snapshot_manager.repository(),
+        Duration::from_secs(3600),
+    );
+    logs.logger
+        .log(crate::logging::LogLevel::Info, None, "exported image");
+    api.supervise_image_build(&record.id, &session, logs, async { Ok(()) })
+        .await;
+    assert!(api.snapshot_manager.get(&id).await?.is_none());
+    assert_eq!(
+        api.snapshot_manager
+            .repository()
+            .read_build_logs(&record.id)
+            .await?
+            .len(),
+        1
+    );
+    assert_eq!(
+        api.image_build_info(&id).await?.unwrap().status,
+        models::ImageBuildStatus::Error
+    );
+    assert!(api.build_logs.temporary(&record.id).is_none());
+    assert!(!api.build_sessions.contains(&id));
+    Ok(())
+}
+
+#[tokio::test]
 async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() -> Result<()> {
     for (cancel_retry, succeeded) in [(false, true), (true, true), (false, false), (true, false)] {
         let (root, api, mut record) = test_api(VolumeLimits::default()).await?;
@@ -99,6 +681,7 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
         let entry = BuildJournal {
             cache: cache_volume(&api, "work", VolumeMode::Exclusive, &id).await?,
             parent: Some(cache_volume(&api, "parent", VolumeMode::ReadOnly, &id).await?),
+            image_only: false,
         };
         entry.persist(api.build_journal().await?, &id).await?;
         let session = BuildSession::new();
@@ -126,9 +709,13 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
             .path()
             .join("repository/template-build/cache-head.json");
         tokio::fs::create_dir_all(&fault).await?;
+        let logs = api
+            .build_logs
+            .start(record.id.clone(), api.snapshot_manager.repository());
         api.finish_image_build(
-            &record,
+            &record.id,
             &session,
+            logs,
             if succeeded {
                 Ok(())
             } else {
@@ -220,6 +807,7 @@ async fn buildkit_recovery_isolates_bad_entries_and_skips_active_builds() -> Res
     let entry = BuildJournal {
         cache: "missing-cache".into(),
         parent: None,
+        image_only: false,
     };
     let live_id = SnapshotId::generate().to_string();
     let live = BuildSession::new();
@@ -275,6 +863,7 @@ async fn buildkit_worker_panic_releases_journal_and_scheduler_binding() -> Resul
     let entry = BuildJournal {
         cache: cache_volume(&api, "work", VolumeMode::Exclusive, &id).await?,
         parent: None,
+        image_only: false,
     };
     entry.persist(api.build_journal().await?, &id).await?;
     let session = BuildSession::new();
@@ -289,7 +878,7 @@ async fn buildkit_worker_panic_releases_journal_and_scheduler_binding() -> Resul
     let logs = api
         .build_logs
         .start(record.id.clone(), api.snapshot_manager.repository());
-    api.supervise_image_build(&record, &session, logs, async {
+    api.supervise_image_build(&record.id, &session, logs, async {
         panic!("injected worker panic");
     })
     .await;

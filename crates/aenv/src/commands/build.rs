@@ -11,7 +11,7 @@ use tokio::{
 
 use crate::client::{
     buildkit,
-    templates::{CreateTemplateV3, TemplateBuildInfo, TemplateV3Response},
+    templates::{BuildStatusReason, CreateTemplateV3, TemplateV3Response},
     Client,
 };
 use crate::progress::BuildProgress;
@@ -22,6 +22,8 @@ Examples:
   aenv build --name my-ubuntu .
   aenv build --name my-python ./my-python
   aenv build --name my-app -f ./my-app/Dockerfile.custom ./my-app
+  aenv build --image ./my-app
+  aenv build --image ./my-app --tag my-app:v1
 ")]
 pub struct Args {
     /// Local build context directory
@@ -30,8 +32,14 @@ pub struct Args {
     #[arg(short = 'f', long = "file")]
     dockerfile: Option<PathBuf>,
     /// Template name
-    #[arg(long)]
-    name: String,
+    #[arg(long, required_unless_present = "image", conflicts_with = "image")]
+    name: Option<String>,
+    /// Build an immutable image and print its digest
+    #[arg(long, conflicts_with_all = ["start_cmd", "ready_cmd", "cpu_count", "memory_mb"])]
+    image: bool,
+    /// Point an image tag at the built image, referenced as aenv/NAME[:TAG]; repeatable
+    #[arg(long = "tag", conflicts_with = "name", value_name = "NAME[:TAG]", value_parser = parse_image_tag)]
+    tags: Vec<String>,
     #[command(flatten)]
     resources: super::CpuMemoryArgs,
     /// Override image ENTRYPOINT/CMD; an empty value disables startup
@@ -66,7 +74,9 @@ pub(super) fn codex_template(context: PathBuf, name: String) -> Result<()> {
     run(Args {
         context,
         dockerfile: None,
-        name,
+        name: Some(name),
+        image: false,
+        tags: vec![],
         resources: super::CpuMemoryArgs {
             cpu_count: Some(2),
             memory_mb: Some(1024),
@@ -122,34 +132,60 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
     let mut session = None;
     let progress = BuildProgress::new(args.progress == "auto")?;
     let operation = async {
-        let allocated: TemplateV3Response = serde_json::from_slice(
-            &client
-                .build_request(
-                    Method::POST,
-                    "/v3/templates",
-                    Some(serde_json::to_value(CreateTemplateV3 {
-                        name: args.name.clone(),
-                        tags: vec![],
-                        cpu_count: args.resources.cpu_count,
-                        memory_mb: args.resources.memory_mb,
-                    })?),
-                )
-                .await?,
-        )?;
-        println!(
-            "Created template {} (build {})",
-            allocated.template_id, allocated.build_id
-        );
-        let allocated = session.insert(allocated);
-        progress.stage(0, "Preparing template builder");
-        let builder: Builder = serde_json::from_slice(
-            &client
-                .build_request(Method::PUT, &builder_path(allocated), Some(request))
-                .await?,
-        )?;
+        let builder: Builder = if args.image {
+            progress.stage(0, "Preparing image builder");
+            let builder: Builder = serde_json::from_slice(
+                &client
+                    .build_request(
+                        Method::POST,
+                        "/images/builds",
+                        Some(json!({"timeout": args.timeout})),
+                    )
+                    .await?,
+            )?;
+            let build_id = builder
+                .build_id
+                .clone()
+                .context("image build response has no build ID")?;
+            eprintln!("Allocated image build {build_id}");
+            session = Some(BuildSession {
+                build_id,
+                template_id: None,
+            });
+            builder
+        } else {
+            let allocated: TemplateV3Response = serde_json::from_slice(
+                &client
+                    .build_request(
+                        Method::POST,
+                        "/v3/templates",
+                        Some(serde_json::to_value(CreateTemplateV3 {
+                            name: args.name.clone().unwrap_or_default(),
+                            tags: vec![],
+                            cpu_count: args.resources.cpu_count,
+                            memory_mb: args.resources.memory_mb,
+                        })?),
+                    )
+                    .await?,
+            )?;
+            println!(
+                "Created template {} (build {})",
+                allocated.template_id, allocated.build_id
+            );
+            let allocated = session.insert(BuildSession {
+                build_id: allocated.build_id,
+                template_id: Some(allocated.template_id),
+            });
+            progress.stage(0, "Preparing template builder");
+            serde_json::from_slice(
+                &client
+                    .build_request(Method::PUT, &builder_path(allocated), Some(request))
+                    .await?,
+            )?
+        };
         build(
             &client,
-            allocated,
+            session.as_ref().context("missing build session")?,
             &args,
             &context,
             &progress,
@@ -166,68 +202,138 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
         progress.finish();
     }
     drop(progress);
-    if let Err(error) = result {
-        if let Some(session) = session {
-            let path = builder_path(&session);
-            let cleanup = tokio::time::timeout(
-                Duration::from_secs(5),
-                client.build_request(Method::DELETE, &path, None),
+    if result.is_err() || args.image {
+        if let Some(session) = &session {
+            delete_builder(&client, session).await;
+        }
+    }
+    let built = result?;
+    if let Some(template) = session.context("missing build session")?.template_id {
+        println!("Template {template} is ready.");
+        return Ok(());
+    }
+    let digest = built
+        .image_digest
+        .context("server does not report the built image digest; upgrade the AgentENV server")?;
+    println!("{digest}");
+    for tag in &args.tags {
+        client
+            .build_request(
+                Method::PUT,
+                &format!("/images/tags/{tag}"),
+                Some(json!({"imageDigest": digest})),
             )
             .await
-            .context("cleanup request timed out")
-            .and_then(|result| result);
-            if let Err(cleanup) = cleanup {
-                eprintln!(
-                    "Build cleanup: {cleanup:#}. Check build {} with `aenv template watch`.",
-                    session.build_id
-                );
-            }
-        }
-        return Err(error);
+            .with_context(|| format!("tag the built image as {tag}"))?;
+        eprintln!("Tagged aenv/{tag}");
     }
-    println!(
-        "Template {} is ready.",
-        session.context("missing build session")?.template_id
-    );
     Ok(())
+}
+
+/// Validates an image tag before the build starts and returns its canonical
+/// `name:tag` form, matching the server's rules.
+fn parse_image_tag(value: &str) -> Result<String, String> {
+    let (name, tag) = value.split_once(':').unwrap_or((value, "latest"));
+    let name_ok = name.len() <= 128
+        && name.split(['.', '_', '-']).all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        });
+    let tag_ok = tag.len() <= 128
+        && tag
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b));
+    if !name_ok || !tag_ok {
+        return Err("expected NAME[:TAG]: NAME uses lowercase letters and digits joined by single '.', '_', or '-'; TAG uses letters, digits, '.', '_', or '-' and does not start with '.' or '-'".into());
+    }
+    Ok(format!("{name}:{tag}"))
+}
+
+#[derive(serde::Deserialize)]
+struct BuildInfo {
+    #[serde(rename = "buildID")]
+    build_id: String,
+    #[serde(default, rename = "templateID")]
+    template_id: Option<String>,
+    status: String,
+    #[serde(default)]
+    reason: Option<BuildStatusReason>,
+    #[serde(default, rename = "imageDigest")]
+    image_digest: Option<String>,
+}
+
+struct BuildSession {
+    build_id: String,
+    template_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct Builder {
     #[serde(rename = "imageName")]
     image_name: String,
+    #[serde(default, rename = "buildID")]
+    build_id: Option<String>,
 }
 
-fn builder_path(session: &TemplateV3Response) -> String {
-    format!(
-        "/templates/{}/builds/{}/builder",
-        session.template_id, session.build_id
+fn builder_path(session: &BuildSession) -> String {
+    match &session.template_id {
+        Some(template) => format!("/templates/{template}/builds/{}/builder", session.build_id),
+        None => format!("/images/builds/{}/builder", session.build_id),
+    }
+}
+
+/// Best-effort builder release; the server keeps image build records until
+/// this DELETE, so failure only leaves a stale record behind.
+async fn delete_builder(client: &Client, session: &BuildSession) {
+    let path = if session.template_id.is_some() {
+        builder_path(session)
+    } else {
+        format!("/images/builds/{}", session.build_id)
+    };
+    let cleanup = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.build_request(Method::DELETE, &path, None),
     )
+    .await
+    .context("cleanup request timed out")
+    .and_then(|result| result);
+    if let Err(cleanup) = cleanup {
+        eprintln!(
+            "Build cleanup for {}: {cleanup:#}. Retry deleting the build if needed.",
+            session.build_id
+        );
+    }
 }
 
 async fn wait_for_status(
     client: &Client,
-    session: &TemplateV3Response,
+    session: &BuildSession,
     expected: &str,
-) -> Result<()> {
+) -> Result<BuildInfo> {
     loop {
-        let path = format!(
-            "/templates/{}/builds/{}/status",
-            session.template_id, session.build_id
-        );
-        let status: TemplateBuildInfo =
+        let path = match &session.template_id {
+            Some(template) => format!("/templates/{template}/builds/{}/status", session.build_id),
+            None => format!("/images/builds/{}", session.build_id),
+        };
+        let status: BuildInfo =
             serde_json::from_slice(&client.build_request(Method::GET, &path, None).await?)?;
         ensure!(
             status.template_id == session.template_id && status.build_id == session.build_id,
             "build status response ID mismatch"
         );
         if status.status == expected {
-            return Ok(());
+            return Ok(status);
         }
         match status.status.as_str() {
             "waiting" | "building" => tokio::time::sleep(Duration::from_secs(1)).await,
             "error" => bail!(
-                "template build failed: {}",
+                "build failed: {}",
                 status
                     .reason
                     .map_or_else(|| "unknown error".into(), |r| r.message)
@@ -250,12 +356,12 @@ async fn interrupted() -> Result<()> {
 
 async fn build(
     client: &Client,
-    session: &TemplateV3Response,
+    session: &BuildSession,
     args: &Args,
     context: &BuildContext,
     progress: &BuildProgress,
     image_name: &str,
-) -> Result<()> {
+) -> Result<BuildInfo> {
     let path = builder_path(session);
     wait_for_status(client, session, "building").await?;
     progress.stage(1, "Building image");
@@ -290,6 +396,10 @@ async fn build(
             .arg(format!("type=image,name={image_name},oci-mediatypes=true"))
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        if args.image {
+            command.stdout(Stdio::null());
+            command.args(["--opt", "platform=linux/amd64"]);
+        }
         for arg in &args.build_args {
             command.arg("--opt").arg(format!("build-arg:{arg}"));
         }
@@ -317,7 +427,14 @@ async fn build(
         result = command => result?,
         result = client.buildkit_tunnel(&path, listener) => { result?; bail!("BuildKit tunnel closed"); }
     }
-    progress.stage(2, "Converting image and publishing template");
+    progress.stage(
+        2,
+        if args.image {
+            "Publishing image to the shared repository"
+        } else {
+            "Converting image and publishing template"
+        },
+    );
     wait_for_status(client, session, "ready").await
 }
 
@@ -472,5 +589,43 @@ mod tests {
             .to_string()
             .contains("use -f"));
         Ok(())
+    }
+
+    #[test]
+    fn native_image_flags_preserve_template_builds() {
+        crate::Cli::command().debug_assert();
+        for (args, valid) in [
+            ("aenv build --image .", true),
+            (
+                "aenv build --image . -f Dockerfile --build-arg A=B --secret id=token,src=token",
+                true,
+            ),
+            ("aenv build --image", false),
+            ("aenv build --image . --name template", false),
+            ("aenv build --image . --start-cmd true", false),
+            ("aenv build --image . --ready-cmd true", false),
+            ("aenv build --image . --cpu 2", false),
+            ("aenv build --image . --memory 512", false),
+            ("aenv build --image . --tag web --tag web:v1.2_rc-1", true),
+            ("aenv build . --name template --tag web:v1", false),
+            ("aenv build --image . --tag Web:v1", false),
+            ("aenv build --image . --tag team/web:v1", false),
+            ("aenv build --image . --tag web:.v1", false),
+            ("aenv build --image . --tag web:v1:extra", false),
+        ] {
+            assert_eq!(
+                crate::Cli::try_parse_from(args.split_whitespace()).is_ok(),
+                valid,
+                "{args}"
+            );
+        }
+        let Ok(crate::Cli {
+            cmd: crate::Cmd::Build(args),
+            ..
+        }) = crate::Cli::try_parse_from(["aenv", "build", "--image", ".", "--tag", "web"])
+        else {
+            panic!("image build with a tag should parse");
+        };
+        assert_eq!(args.tags, ["web:latest"]);
     }
 }

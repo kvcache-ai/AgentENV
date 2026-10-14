@@ -208,7 +208,7 @@ func gatewayRouteLabel(path string) string {
 	}
 
 	switch trimmed {
-	case "/sandboxes", "/sandboxes-cold", "/v2/sandboxes", "/nodes":
+	case "/sandboxes", "/sandboxes-cold", "/v2/sandboxes", "/nodes", "/images", "/images/builds", "/images/tags":
 		return trimmed
 	}
 
@@ -217,6 +217,20 @@ func gatewayRouteLabel(path string) string {
 		return "unmatched"
 	}
 	switch parts[0] {
+	case "images":
+		if route, ok := matchPathRoute(http.MethodGet, trimmed); ok && route.owner == ownerBuild {
+			label := "/images/builds/{build_id}"
+			if len(parts) == 4 {
+				label += "/" + parts[3]
+			}
+			return label
+		}
+		if len(parts) == 2 {
+			return "/images/{image_digest}"
+		}
+		if len(parts) == 3 && parts[1] == "tags" {
+			return "/images/tags/{tag}"
+		}
 	case "sandboxes":
 		if len(parts) == 2 {
 			return "/sandboxes/{sandbox_id}"

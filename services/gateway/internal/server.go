@@ -213,6 +213,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		sandboxID = hostRoute.sandboxID
 		hasSandbox = true
 		routeSource = routeSourceHost
+	} else if isImageBuilderAllocation(r) || isImageCatalogRequest(r) {
+		routeSource = routeSourceSchedule
 	} else if route, ok := matchPathRoute(r.Method, r.URL.Path); ok {
 		if route.allocatesBuild() {
 			routeSource = routeSourceSchedule
@@ -448,6 +450,16 @@ func (e *proxyResponseError) Error() string {
 func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node, requestMethod, requestPath string) error {
 	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
 	defer cancelRecord()
+	if strings.TrimRight(requestPath, "/") == "/images/builds" {
+		buildID := strings.TrimSpace(resp.Header.Get("x-agentenv-build-id"))
+		if buildID == "" {
+			return &proxyResponseError{statusCode: http.StatusBadGateway, message: "upstream image build response is missing its build ID"}
+		}
+		if err := s.recordAssignment(recordCtx, buildID, node, "image_build"); err != nil {
+			return &proxyResponseError{statusCode: http.StatusServiceUnavailable, message: "failed to route allocated image build", cause: err}
+		}
+		return nil
+	}
 	route, _ := matchPathRoute(requestMethod, requestPath)
 	if route.owner == ownerNewBuild {
 		if err := s.recordAssignment(recordCtx, route.id, node, "template_build"); err != nil {
@@ -563,7 +575,7 @@ func flushInterval(flushImmediately bool) time.Duration {
 
 func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox bool) bool {
 	route, _ := matchPathRoute(r.Method, r.URL.Path)
-	if route.allocatesBuild() {
+	if route.allocatesBuild() || isImageBuilderAllocation(r) {
 		return true
 	}
 	if r.Method != http.MethodPost {
@@ -619,6 +631,23 @@ func targetPortFromHeaders(h http.Header) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// Image builds learn their ID from the upstream response, so the allocation
+// is scheduled before path routing and bound in recordAssignmentFromResponse.
+func isImageBuilderAllocation(r *http.Request) bool {
+	return r.Method == http.MethodPost && strings.TrimRight(r.URL.Path, "/") == "/images/builds"
+}
+
+// Image records and tags live in the shared repository and have no worker binding.
+func isImageCatalogRequest(r *http.Request) bool {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if parts[0] != "images" {
+		return false
+	}
+	return len(parts) == 1 && r.Method == http.MethodGet ||
+		len(parts) == 2 && parts[1] != "builds" && (r.Method == http.MethodGet || r.Method == http.MethodDelete) ||
+		len(parts) == 3 && parts[1] == "tags" && (r.Method == http.MethodGet || r.Method == http.MethodPut || r.Method == http.MethodDelete)
 }
 
 func (s *Server) logHostRoutingHeaderConflicts(r *http.Request, route *hostRoute) {
@@ -898,7 +927,7 @@ func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
 	}
 
 	_, pathRouted := matchPathRoute(r.Method, r.URL.Path)
-	return !pathRouted && hasCompleteProxyRouteHeaders(r.Header)
+	return !pathRouted && !isImageBuilderAllocation(r) && !isImageCatalogRequest(r) && hasCompleteProxyRouteHeaders(r.Header)
 }
 
 func isExplicitProxyPath(path string) bool {
