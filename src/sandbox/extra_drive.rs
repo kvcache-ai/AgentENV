@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
+use crate::sandbox::backend::check_startup_deadline;
 use crate::sandbox::ublk::{OverlaybdRuntimeHandle, UblkDeviceManager};
 
 pub const DEFAULT_EXTRA_DRIVE_MOUNT_ROOT: &str = "/mnt";
@@ -435,6 +436,7 @@ pub(crate) async fn prepare_extra_drives(
     sandbox_work_dir: &Path,
     runtime_upper_mode: UpperMode,
     mode: ExtraDrivePrepareMode,
+    deadline: Option<tokio::time::Instant>,
 ) -> Result<PreparedDrives> {
     let mut mounts = Vec::with_capacity(extra_drives.len());
     let mut cleanup_paths = Vec::with_capacity(extra_drives.len());
@@ -442,6 +444,7 @@ pub(crate) async fn prepare_extra_drives(
 
     for drive in extra_drives {
         let result = async {
+            check_startup_deadline(deadline)?;
             let runtime_dir = drive.runtime_dir(sandbox_work_dir);
             let (requested_virtual_size, known_source_virtual_size) = mode.device_sizes(drive);
             let allow_shrink = mode.allow_shrink();
@@ -523,11 +526,16 @@ pub(crate) async fn prepare_extra_drives(
         }
     }
 
-    Ok(PreparedDrives {
+    let prepared = PreparedDrives {
         mounts,
         cleanup_paths,
         runtimes,
-    })
+    };
+    if let Err(error) = check_startup_deadline(deadline) {
+        prepared.cleanup().await;
+        return Err(error);
+    }
+    Ok(prepared)
 }
 
 #[cfg(test)]
