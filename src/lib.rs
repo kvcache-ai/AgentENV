@@ -8,6 +8,8 @@ pub mod image;
 mod local_store;
 pub mod logging;
 mod managed_secret;
+#[cfg(test)]
+mod module_cycles;
 pub mod observability;
 pub mod orchestrator;
 pub mod overlaybd;

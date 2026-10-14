@@ -29,8 +29,7 @@ use crate::types::{RuntimeArtifactSet, SandboxId};
 /// A concrete sandbox backend's paused state.
 ///
 /// The Orchestrator treats this value as completely opaque: it stores it in
-/// [`SandboxMetadata`][crate::orchestrator::SandboxMetadata] after a
-/// `pause` call and passes it back to
+/// its `SandboxMetadata` after a `pause` call and passes it back to
 /// [`SandboxBackendFactory::build_from_paused_state`] when a resume is requested.
 /// Concrete implementations own their serialized form.
 pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
@@ -317,9 +316,8 @@ pub trait SandboxBackend: Send + 'static {
 
 /// Factory interface for creating and restoring sandbox backend instances.
 ///
-/// A single factory instance is stored inside the
-/// [`Orchestrator`][crate::orchestrator::Orchestrator] and is used for every
-/// `create_sandbox` and `resume_sandbox` request.
+/// A single factory instance is stored inside the `Orchestrator` and is
+/// used for every `create_sandbox` and `resume_sandbox` request.
 pub trait SandboxBackendFactory: Send + Sync + 'static {
     /// Build a brand-new sandbox backend from a high-level launch request.
     fn build(

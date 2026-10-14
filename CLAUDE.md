@@ -182,6 +182,9 @@ Reuse shared helpers: `src/local_store.rs` (`LocalKvStore`, explicit
 
 ## Constraints to Preserve
 
+- **Layering:** Top-level `src/` modules must not depend on each other in a
+  cycle (`src/module_cycles.rs` tests this). Move shared data down rather than
+  importing upward.
 - **Lifecycle:** Recoverable capture/fork errors restore `Running`; terminal
   errors require teardown. Graceful shutdown persists sandboxes as `Paused`.
   Keep `CapturedSandboxSnapshot` alive until repository publication completes.
