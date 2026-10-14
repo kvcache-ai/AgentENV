@@ -1460,7 +1460,7 @@ fn host_arch_to_oci(host_arch: &str) -> Result<&'static str> {
 /// `..`, and other traversal payloads.
 fn is_valid_digest_algorithm(algo: &str) -> bool {
     !algo.is_empty()
-        && algo.split(|c| matches!(c, '.' | '_' | '+' | '-')).all(|part| {
+        && algo.split(['.', '_', '+', '-']).all(|part| {
             !part.is_empty()
                 && part
                     .bytes()
