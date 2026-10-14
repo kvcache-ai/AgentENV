@@ -21,3 +21,4 @@ pub mod template;
 pub mod types;
 pub mod virtualization;
 pub mod volume;
+pub mod webhook;
