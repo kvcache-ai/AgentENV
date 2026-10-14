@@ -187,26 +187,24 @@ impl OssClient {
     }
 
     /// Reads a small object together with its backend version token for a
-    /// conditional update.
-    pub(crate) async fn get_bytes_with_etag(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+    /// conditional update. Returns `None` when the object changed between
+    /// reading its version and its bytes; the caller backs off and retries.
+    pub(crate) async fn get_bytes_with_etag(
+        &self,
+        key: &str,
+    ) -> Result<Option<(Bytes, Option<String>)>> {
         self.run_with_key(key, |operator, key| async move {
-            for _attempt in 0..5 {
-                let metadata = operator.stat(&key).await?;
-                let etag = metadata.etag().map(str::to_owned);
-                let read = match etag.as_deref() {
-                    Some(etag) => operator.read_with(&key).if_match(etag).await,
-                    None => operator.read(&key).await,
-                };
-                match read {
-                    Ok(bytes) => return Ok((bytes.to_bytes(), etag)),
-                    Err(error) if error.kind() == OpenDalErrorKind::ConditionNotMatch => continue,
-                    Err(error) => return Err(error),
-                }
+            let metadata = operator.stat(&key).await?;
+            let etag = metadata.etag().map(str::to_owned);
+            let read = match etag.as_deref() {
+                Some(etag) => operator.read_with(&key).if_match(etag).await,
+                None => operator.read(&key).await,
+            };
+            match read {
+                Ok(bytes) => Ok(Some((bytes.to_bytes(), etag))),
+                Err(error) if error.kind() == OpenDalErrorKind::ConditionNotMatch => Ok(None),
+                Err(error) => Err(error),
             }
-            Err(OpenDalError::new(
-                OpenDalErrorKind::Unexpected,
-                "object changed too often while reading its version",
-            ))
         })
         .await
         .with_context(|| format!("oss get versioned object '{key}'"))

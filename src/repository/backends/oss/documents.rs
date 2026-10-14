@@ -201,11 +201,15 @@ async fn update_if_unchanged(
     let mut backoff = Backoff::new();
     for _ in 0..MAX_UPDATE_ATTEMPTS {
         let (current, etag) = match client.get_bytes_with_etag(path).await {
-            Ok((bytes, Some(etag))) => (Some(bytes.to_vec()), Some(etag)),
-            Ok((_, None)) => {
+            Ok(Some((bytes, Some(etag)))) => (Some(bytes.to_vec()), Some(etag)),
+            Ok(Some((_, None))) => {
                 return Err(RepositoryError::InvalidRequest {
                     reason: format!("updating '{path}' requires object storage ETags"),
                 })
+            }
+            Ok(None) => {
+                backoff.wait().await;
+                continue;
             }
             Err(error) if OssClient::is_not_found_error(&error) => (None, None),
             Err(error) => return Err(RepositoryError::backend(format!("read '{path}'"), error)),
