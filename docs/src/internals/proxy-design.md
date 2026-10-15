@@ -190,6 +190,30 @@ Handshake failure behavior:
 - Transport or connection failures return `502 Bad Gateway`.
 - Handshake timeout returns `504 Gateway Timeout`.
 
+## CONNECT Semantics
+
+The proxy supports the HTTP `CONNECT` method as a raw TCP tunnel into a
+sandbox. The CONNECT authority (the host:port in the request line) is
+ignored; the routing headers (or the host-based route) select the sandbox
+and target port exactly like the HTTP path.
+
+- Routing headers, paused auto-resume, host-based routing, and sandbox
+  authorization apply unchanged. Private service ports require the traffic
+  access token; secure envd ports require the envd access token before the
+  tunnel opens. An API key does not replace either token.
+- Only HTTP/1.1 is supported; other versions return `501 Not Implemented`
+  (HTTP/2 CONNECT has no upgrade mechanism).
+- The upstream TCP connection is established before the `200 OK` reply, so
+  an unreachable sandbox port yields an HTTP error instead of a silently
+  broken tunnel.
+- After `200 OK`, bytes are forwarded bidirectionally with no framing,
+  idle timeout, or inspection.
+
+Tunnel failure behavior:
+
+- Sandbox TCP connect failure returns `502 Bad Gateway`.
+- Sandbox TCP connect timeout returns `504 Gateway Timeout`.
+
 ## Error Mapping
 
 - `400 Bad Request`
@@ -201,6 +225,8 @@ Handshake failure behavior:
 - `410 Gone`
   - Sandbox is paused and auto-resume is disabled
   - Sandbox exists but is not proxyable in current state
+- `501 Not Implemented`
+  - CONNECT over a non-HTTP/1.1 connection
 - `502 Bad Gateway`
   - Upstream transport/connect failure
   - Sandbox is `Running` but runtime route is missing (`RouteMissing`)
@@ -209,6 +235,7 @@ Handshake failure behavior:
   - Paused sandbox auto-resume timed out
   - Upstream response header timeout
   - Upstream websocket handshake timeout
+  - CONNECT sandbox TCP connect timeout
 
 ## Usage Examples
 
@@ -250,11 +277,24 @@ curl -i \
   'http://8080-<sandbox-uuid>.sandbox.example.com/status'
 ```
 
+### CONNECT
+
+```bash
+curl -i --proxytunnel -x 'http://127.0.0.1:8000' \
+  --proxy-header 'x-agentenv-sandbox-id: <sandbox-uuid>' \
+  --proxy-header 'x-agentenv-target-port: 8080' \
+  --proxy-header 'e2b-traffic-access-token: <trafficAccessToken>' \
+  'http://ignored.example/'
+```
+
+The host-based route works as well: point the CONNECT authority at
+`<port>-<sandbox-uuid>.<proxy-domain>` and no routing headers are needed.
+
 ## Testing Notes
 
 Relevant test coverage exists in:
 
-- `src/api/proxy.rs` unit tests (HTTP, SSE, large body, websocket, headers, path preservation, error mapping)
+- `src/api/proxy.rs` unit tests (HTTP, SSE, large body, websocket, CONNECT tunnel, headers, path preservation, error mapping)
 - `src/orchestrator/service.rs` unit tests (route publication/removal behavior and stale-handle guard)
 - Integration lifecycle tests in `tests/integration/orchestrator.rs`
 - E2E proxy suite in `scripts/tests/e2e/suites/06_proxy.sh` (header compatibility and paused auto-resume behavior)
