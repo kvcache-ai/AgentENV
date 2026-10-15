@@ -30,13 +30,16 @@
 //! reaching this module.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, ensure, Context, Result};
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use overlaybd::tools::{ConvertLayerRequest, OverlaybdTools};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
@@ -51,6 +54,166 @@ use super::{
 };
 use crate::digest;
 use crate::p2p::P2pArtifactKey;
+
+/// Intentionally does not implement Debug: variants contain secrets.
+#[derive(Clone)]
+pub(crate) enum RegistryAuth {
+    General {
+        username: String,
+        password: String,
+    },
+    Gcp {
+        service_account_json: String,
+    },
+    Aws {
+        access_key_id: String,
+        secret_access_key: String,
+        region: String,
+    },
+}
+
+impl RegistryAuth {
+    pub(crate) fn validate(&self) -> Result<()> {
+        match self {
+            Self::General { username, password } => {
+                ensure!(
+                    !username.is_empty() && !password.is_empty(),
+                    "registry username and password must be non-empty"
+                );
+            }
+            Self::Gcp {
+                service_account_json,
+            } => {
+                let key = serde_json::from_str::<serde_json::Value>(service_account_json)
+                    .ok()
+                    .filter(|value| value.is_object());
+                ensure!(key.is_some(), "serviceAccountJson must be a JSON object");
+            }
+            Self::Aws {
+                access_key_id,
+                secret_access_key,
+                region,
+            } => {
+                ensure!(
+                    !access_key_id.is_empty() && !secret_access_key.is_empty(),
+                    "AWS access keys must be non-empty"
+                );
+                ensure!(
+                    !region.is_empty()
+                        && region
+                            .bytes()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-'),
+                    "invalid AWS region"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn config(&self, host: &str) -> Result<RegistryConfig> {
+        let (username, password) = match self {
+            Self::General { username, password } => (username.clone(), password.clone()),
+            Self::Gcp {
+                service_account_json,
+            } => ("_json_key".into(), service_account_json.clone()),
+            Self::Aws {
+                access_key_id,
+                secret_access_key,
+                region,
+            } => ecr_credentials(access_key_id, secret_access_key, region).await?,
+        };
+        RegistryConfig::new(host, &username, &password)
+    }
+}
+
+pub(crate) struct RegistryConfig(tempfile::NamedTempFile);
+
+impl RegistryConfig {
+    fn new(host: &str, username: &str, password: &str) -> Result<Self> {
+        let mut file = tempfile::Builder::new()
+            .prefix("aenv-registry-")
+            .tempfile()?;
+        serde_json::to_writer(
+            &mut file,
+            &json!({
+                "version": 1,
+                "incDockerCred": false,
+                "hosts": {host: {"user": username, "pass": password}}
+            }),
+        )?;
+        file.flush()?;
+        Ok(Self(file))
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+async fn ecr_credentials(
+    access_key_id: &str,
+    secret_access_key: &str,
+    region: &str,
+) -> Result<(String, String)> {
+    let suffix = if region.starts_with("cn-") {
+        "amazonaws.com.cn"
+    } else {
+        "amazonaws.com"
+    };
+    let endpoint = format!("https://api.ecr.{region}.{suffix}/");
+    let mut request = http::Request::post(&endpoint)
+        .header("content-type", "application/x-amz-json-1.1")
+        .header(
+            "x-amz-target",
+            "AmazonEC2ContainerRegistry_V20150921.GetAuthorizationToken",
+        )
+        .header(
+            "x-amz-content-sha256",
+            crate::digest::sha256_digest(b"{}").trim_start_matches("sha256:"),
+        )
+        .body(())?;
+    reqsign::AwsV4Signer::new("ecr", region)
+        .sign(
+            &mut request,
+            &reqsign::AwsCredential {
+                access_key_id: access_key_id.into(),
+                secret_access_key: secret_access_key.into(),
+                ..Default::default()
+            },
+        )
+        .context("sign ECR authorization request")?;
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .post(endpoint)
+        .headers(request.into_parts().0.headers)
+        .body("{}")
+        .send()
+        .await
+        .context("request ECR authorization token")?;
+    ensure!(
+        response.status().is_success(),
+        "ECR authorization request failed with HTTP {}",
+        response.status()
+    );
+    let value: serde_json::Value = response
+        .json()
+        .await
+        .context("decode ECR authorization response")?;
+    let token = value["authorizationData"][0]["authorizationToken"]
+        .as_str()
+        .context("ECR returned no authorization token")?;
+    let decoded = STANDARD
+        .decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .context("invalid ECR authorization token")?;
+    let (username, password) = decoded
+        .split_once(':')
+        .context("invalid ECR authorization token format")?;
+    Ok((username.into(), password.into()))
+}
 
 /// GOMAXPROCS ceiling applied to every spawned `regctl` process; see
 /// [`regctl_command`] for the rationale.
@@ -108,6 +271,7 @@ pub(crate) struct OverlaybdConversionEnv<'a> {
     pub(crate) global_config: &'a Path,
     pub(crate) converter_id: &'a str,
     pub(crate) regctl_binary: &'a Path,
+    pub(crate) registry_config: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,11 +350,12 @@ pub(crate) async fn fetch_oci_manifest(
     regctl_binary: &Path,
     image_ref: &str,
     host_arch: &str,
+    registry_config: Option<&Path>,
 ) -> ImageResult<FetchedManifest> {
     ensure_regctl_binary(regctl_binary)?;
     let oci_arch = host_arch_to_oci(host_arch)?;
 
-    fetch_manifest(regctl_binary, image_ref, oci_arch, "linux").await
+    fetch_manifest(regctl_binary, image_ref, oci_arch, "linux", registry_config).await
 }
 
 /// Fetch the image config blob by `config_digest` and parse runtime metadata
@@ -199,11 +364,13 @@ pub(crate) async fn fetch_oci_image_config_metadata(
     regctl_binary: &Path,
     image_ref: &str,
     config_digest: &str,
+    registry_config: Option<&Path>,
 ) -> ImageResult<ImageResolutionMetadata> {
     let repository = image_ref_repository(image_ref)?;
     let output = run_regctl(
         regctl_binary,
         &["blob", "get", repository.as_str(), config_digest],
+        registry_config,
     )
     .await?;
     let bytes = output.stdout;
@@ -391,7 +558,13 @@ async fn convert_standard_oci_layers_pipeline(
     converter: &OverlaybdLayerConverter,
 ) -> Result<Vec<LocalLayer>> {
     let layout_dir = work_root.join("oci");
-    let mut producer = RegctlImageCopyProducer::start(regctl_binary, image_ref, layout_dir).await?;
+    let mut producer = RegctlImageCopyProducer::start(
+        regctl_binary,
+        image_ref,
+        layout_dir,
+        conversion.registry_config,
+    )
+    .await?;
     let result = convert_standard_oci_layers_pipeline_inner(
         manifest,
         image_ref,
@@ -486,6 +659,7 @@ async fn convert_standard_oci_layers_pipeline_inner(
 
 struct RegctlImageCopyProducer {
     regctl_binary: PathBuf,
+    registry_config: Option<PathBuf>,
     image_ref: String,
     layout_dir: PathBuf,
     child: Option<tokio::process::Child>,
@@ -619,10 +793,12 @@ impl RegctlImageCopyProducer {
         regctl_binary: &Path,
         image_ref: &str,
         layout_dir: PathBuf,
+        registry_config: Option<&Path>,
     ) -> ImageResult<Self> {
         ensure_regctl_binary(regctl_binary)?;
         let mut producer = Self {
             regctl_binary: regctl_binary.to_path_buf(),
+            registry_config: registry_config.map(Path::to_path_buf),
             image_ref: image_ref.to_string(),
             layout_dir,
             child: None,
@@ -642,7 +818,7 @@ impl RegctlImageCopyProducer {
         self.exit_status = None;
         self.stderr = None;
         let dest = format!("ocidir://{}:latest", self.layout_dir.display());
-        let mut command = regctl_command(&self.regctl_binary);
+        let mut command = regctl_command(&self.regctl_binary, self.registry_config.as_deref());
         command
             .args([
                 "image",
@@ -863,12 +1039,14 @@ async fn fetch_manifest(
     image_ref: &str,
     arch: &str,
     os: &str,
+    registry_config: Option<&Path>,
 ) -> ImageResult<FetchedManifest> {
     let mut current_ref = image_ref.to_string();
     for _ in 0..MAX_INDEX_RESOLUTION_DEPTH {
         let output = run_regctl(
             regctl_binary,
             &["manifest", "get", "--format", "raw-body", &current_ref],
+            registry_config,
         )
         .await?;
         let raw = String::from_utf8(output.stdout).with_context(|| {
@@ -945,8 +1123,14 @@ pub(crate) fn regctl_stderr_is_not_found(stderr: &str) -> bool {
 ///
 /// All `regctl` invocations must be constructed through this so the cap is
 /// applied uniformly.
-pub(crate) fn regctl_command(binary: impl AsRef<std::ffi::OsStr>) -> Command {
+pub(crate) fn regctl_command(
+    binary: impl AsRef<std::ffi::OsStr>,
+    registry_config: Option<&Path>,
+) -> Command {
     let mut command = Command::new(binary);
+    if let Some(path) = registry_config {
+        command.env("REGCTL_CONFIG", path);
+    }
     command.env("GOMAXPROCS", REGCTL_GOMAXPROCS);
     command
 }
@@ -956,12 +1140,13 @@ pub(crate) fn regctl_command(binary: impl AsRef<std::ffi::OsStr>) -> Command {
 pub(crate) async fn run_regctl(
     regctl_binary: &Path,
     args: &[&str],
+    registry_config: Option<&Path>,
 ) -> ImageResult<std::process::Output> {
     ensure_regctl_binary(regctl_binary)?;
     let mut backoff = REGCTL_RETRY_BASE_DELAY;
     let mut last_stderr = String::new();
     for attempt in 1..=REGCTL_RETRY_ATTEMPTS {
-        let output = regctl_command(regctl_binary)
+        let output = regctl_command(regctl_binary, registry_config)
             .args(args)
             .output()
             .await
@@ -1552,6 +1737,63 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
     use uuid::{Variant, Version};
+
+    #[tokio::test]
+    async fn registry_auth_configs_are_isolated_private_and_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let first = RegistryAuth::General {
+            username: "one".into(),
+            password: "secret-one".into(),
+        };
+        let second = RegistryAuth::General {
+            username: "two".into(),
+            password: "secret-two".into(),
+        };
+        let (first, second) = tokio::join!(
+            first.config("registry.example"),
+            second.config("registry.example")
+        );
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert_ne!(first.path(), second.path());
+        for (config, username, password) in [
+            (&first, "one", "secret-one"),
+            (&second, "two", "secret-two"),
+        ] {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(config.path()).unwrap()).unwrap();
+            assert_eq!(value["hosts"]["registry.example"]["user"], username);
+            assert_eq!(value["hosts"]["registry.example"]["pass"], password);
+            assert_eq!(value["hosts"].as_object().unwrap().len(), 1);
+            assert_eq!(value["incDockerCred"], false);
+            assert_eq!(
+                std::fs::metadata(config.path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let path = first.path().to_path_buf();
+        drop(first);
+        assert!(!path.exists());
+        assert!(second.path().exists());
+    }
+
+    #[tokio::test]
+    async fn registry_auth_gcp_uses_json_key_credentials() {
+        let json = r#"{"type":"service_account","private_key":"test-only"}"#;
+        let config = RegistryAuth::Gcp {
+            service_account_json: json.into(),
+        }
+        .config("example.pkg.dev")
+        .await
+        .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config.path()).unwrap()).unwrap();
+        assert_eq!(value["hosts"]["example.pkg.dev"]["user"], "_json_key");
+        assert_eq!(value["hosts"]["example.pkg.dev"]["pass"], json);
+    }
 
     fn annotations(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
         entries
