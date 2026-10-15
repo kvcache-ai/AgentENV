@@ -171,9 +171,37 @@ fn run_server(project_root: &std::path::Path) -> Result<()> {
     // Port of fix_rust_axum_duplicate_auth_trait.py
     let mod_rs = server_dir.join("src/apis/mod.rs");
     fix_duplicate_auth_trait(&mod_rs)?;
+    fix_registry_auth_discriminators(&server_dir.join("src/models.rs"))?;
 
     util::cmd("cargo", &["fmt", "-p", "agentenv_http_server"])?;
     util::info("AENV server generated.");
+    Ok(())
+}
+
+/// rust-axum 7.22 emits Rust model names as discriminator values when
+/// serializing these oneOf children, even with an explicit OpenAPI mapping.
+/// Keep this correction in codegen so regeneration preserves the wire contract.
+fn fix_registry_auth_discriminators(path: &std::path::Path) -> Result<()> {
+    let mut content = std::fs::read_to_string(path)?;
+    for (model, wire_value) in [
+        ("AwsRegistry", "aws"),
+        ("GcpRegistry", "gcp"),
+        ("GeneralRegistry", "registry"),
+    ] {
+        let expected = format!(
+            "impl {model} {{\n    fn _name_for_r_type() -> String {{\n        String::from(\"{model}\")\n    }}"
+        );
+        let count = content.matches(&expected).count();
+        anyhow::ensure!(
+            count == 1,
+            "expected exactly one {model} discriminator method, found {count}; check OpenAPI generator output"
+        );
+        let replacement = format!(
+            "impl {model} {{\n    fn _name_for_r_type() -> String {{\n        String::from(\"{wire_value}\")\n    }}"
+        );
+        content = content.replacen(&expected, &replacement, 1);
+    }
+    std::fs::write(path, content)?;
     Ok(())
 }
 

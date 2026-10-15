@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use tracing::{debug, info, trace, warn};
 
 use super::cache::{local_image_services_from_app_config, CachedImageConfig, SourceImageStore};
-use super::oci_image::{self, ResolvedImage};
+use super::oci_image::{self, RegistryAuth, ResolvedImage};
 use super::reference::{image_ref_candidates, registry_host_of};
 use super::{
     ImageBaseContext, ImageCatalog, ImageError, ImageResolutionMetadata, ImageResult,
@@ -133,6 +133,7 @@ impl ImageResolver {
                 global_config: &self.overlaybd_convert_global_config,
                 converter_id: &self.overlaybd_oci_converter_id,
                 regctl_binary: &self.regctl_binary,
+                registry_config: None,
             },
             &mut *conversion,
         )
@@ -159,12 +160,13 @@ impl ImageResolver {
         // of the admission policy and conversion settings for user images.
         let arch = detect_arch()?;
         let mut fetched =
-            oci_image::fetch_oci_manifest(&self.regctl_binary, image_ref, &arch).await?;
+            oci_image::fetch_oci_manifest(&self.regctl_binary, image_ref, &arch, None).await?;
         if fetched.format() != ImageFormat::OverlaybdNative {
             let metadata = oci_image::fetch_oci_image_config_metadata(
                 &self.regctl_binary,
                 &fetched.selected_image_ref,
                 fetched.config_digest(),
+                None,
             )
             .await?;
             match metadata
@@ -195,7 +197,7 @@ impl ImageResolver {
             self.try_referrers_overlaybd_prefixes.clear();
             fetched.repository_scope = Some("tools-oci-rootfs-v1".into());
         }
-        self.resolve_fetched_manifest(image_ref, &arch, fetched)
+        self.resolve_fetched_manifest(image_ref, &arch, fetched, None)
             .await
             .map(Some)
     }
@@ -316,13 +318,33 @@ impl ImageResolver {
     }
 
     pub async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage> {
+        self.resolve_with_registry_auth(image_ref, None).await
+    }
+
+    pub(crate) async fn resolve_with_registry_auth(
+        &self,
+        image_ref: &str,
+        auth: Option<&RegistryAuth>,
+    ) -> ImageResult<ResolvedBlockImage> {
         // Bare digests identify repository-owned OverlayBD descriptions, not
         // OCI manifests or node-local conversion cache entries.
         let trimmed = image_ref.trim();
         if let Some(reference) = trimmed.strip_prefix(IMAGE_TAG_PREFIX) {
+            if auth.is_some() {
+                return Err(ImageError::InvalidReference {
+                    reason: "fromImageRegistry cannot be used with AgentENV published images"
+                        .into(),
+                });
+            }
             return self.resolve_tag(reference).await;
         }
         if trimmed.starts_with("sha256:") {
+            if auth.is_some() {
+                return Err(ImageError::InvalidReference {
+                    reason: "fromImageRegistry cannot be used with AgentENV published images"
+                        .into(),
+                });
+            }
             return self.resolve_published(trimmed).await;
         }
         let candidates = image_ref_candidates(
@@ -330,6 +352,19 @@ impl ImageResolver {
             &self.search_registries,
             self.allowed_registries.as_deref(),
         )?;
+        if auth.is_some() && candidates.len() != 1 {
+            return Err(ImageError::InvalidReference {
+                reason: "fromImageRegistry requires an unambiguous image registry; use a fully-qualified fromImage".into(),
+            });
+        }
+        let registry_config = match auth {
+            Some(auth) => Some(
+                auth.config(registry_host_of(&candidates[0]).context("image registry host")?)
+                    .await?,
+            ),
+            None => None,
+        };
+        let config_path = registry_config.as_ref().map(|config| config.path());
         let arch = detect_arch()?;
         let mut manifest_failures = Vec::new();
         // Track whether every candidate failed specifically because the
@@ -344,7 +379,8 @@ impl ImageResolver {
             // aborts the whole resolve.
             let mut metric = MetricGuard::stage(IMAGE_RESOLVE_STAGE_DURATION, "manifest_fetch");
             let fetched =
-                oci_image::fetch_oci_manifest(&self.regctl_binary, &candidate, &arch).await;
+                oci_image::fetch_oci_manifest(&self.regctl_binary, &candidate, &arch, config_path)
+                    .await;
             metric.finish(&fetched);
             let fetched = match fetched {
                 Ok(fetched) => fetched,
@@ -376,7 +412,7 @@ impl ImageResolver {
                 }
             };
             return self
-                .resolve_fetched_manifest(&candidate, &arch, fetched)
+                .resolve_fetched_manifest(&candidate, &arch, fetched, config_path)
                 .await;
         }
 
@@ -392,14 +428,14 @@ impl ImageResolver {
         }
     }
 
-    /// Resolve a successfully-fetched manifest into a block image. Every failure
-    /// here is fatal (the manifest already proved the candidate registry has
-    /// the image), so all errors collapse into [`ImageError::Other`].
+    /// Resolve a successfully-fetched manifest into a block image. Failures
+    /// here are fatal: the manifest already proved the registry has the image.
     async fn resolve_fetched_manifest(
         &self,
         image_ref: &str,
         arch: &str,
         fetched: oci_image::FetchedManifest,
+        registry_config: Option<&std::path::Path>,
     ) -> ImageResult<ResolvedBlockImage> {
         let source_image_ref = fetched.selected_image_ref.clone();
         // Config metadata comes from the source image even when layer
@@ -411,7 +447,13 @@ impl ImageResolver {
             &self.try_referrers_overlaybd_prefixes,
         ) && fetched.format() != ImageFormat::OverlaybdNative
         {
-            match try_resolve_overlaybd_referrer(&self.regctl_binary, &source_image_ref, arch).await
+            match try_resolve_overlaybd_referrer(
+                &self.regctl_binary,
+                &source_image_ref,
+                arch,
+                registry_config,
+            )
+            .await
             {
                 Ok(Some((referrer, artifact_type))) => {
                     overlaybd_image_ref = referrer.selected_image_ref.clone();
@@ -446,6 +488,7 @@ impl ImageResolver {
         } else {
             fetched
         };
+        validate_registry_auth_for_format(fetched.format(), registry_config.is_some())?;
         if fetched.format() == ImageFormat::StandardOci && !self.convert_standard_oci {
             return Err(ImageError::InvalidReference {
                 reason: format!(
@@ -491,6 +534,7 @@ impl ImageResolver {
                     &self.regctl_binary,
                     &source_image_ref,
                     &source_config_digest,
+                    registry_config,
                 )
                 .await
                 .map_err(|e| e.context(format!("fetch image metadata for '{source_image_ref}'")))?;
@@ -518,6 +562,7 @@ impl ImageResolver {
             &self.regctl_binary,
             &source_image_ref,
             &source_config_digest,
+            registry_config,
         )
         .await
         .map_err(|e| e.context(format!("fetch image metadata for '{source_image_ref}'")));
@@ -533,6 +578,7 @@ impl ImageResolver {
                 global_config: &self.overlaybd_convert_global_config,
                 converter_id: &self.overlaybd_oci_converter_id,
                 regctl_binary: &self.regctl_binary,
+                registry_config,
             },
             &mut *conversion,
             arch,
@@ -564,6 +610,20 @@ impl ImageResolver {
     }
 }
 
+/// Validate the final selected format, including any OverlayBD referrer,
+/// before accessing the image cache or fetching config/layer blobs.
+fn validate_registry_auth_for_format(
+    format: ImageFormat,
+    has_registry_auth: bool,
+) -> ImageResult<()> {
+    if format == ImageFormat::OverlaybdNative && has_registry_auth {
+        return Err(ImageError::UnsupportedImage {
+            reason: "fromImageRegistry is not supported for OverlayBD images (including OverlayBD referrers); use a standard OCI image or omit fromImageRegistry and configure server-side registry credentials".into(),
+        });
+    }
+    Ok(())
+}
+
 fn resolved_from_cached_config(
     source_image_ref: &str,
     image_config_path: PathBuf,
@@ -585,17 +645,19 @@ async fn try_resolve_overlaybd_referrer(
     regctl_binary: &std::path::Path,
     subject_ref: &str,
     arch: &str,
+    registry_config: Option<&std::path::Path>,
 ) -> Result<Option<(oci_image::FetchedManifest, &'static str)>> {
     let Some((referrer_digest, artifact_type)) =
-        discover_overlaybd_referrer(regctl_binary, subject_ref).await?
+        discover_overlaybd_referrer(regctl_binary, subject_ref, registry_config).await?
     else {
         return Ok(None);
     };
     let referrer_ref = oci_image::image_ref_with_digest(subject_ref, &referrer_digest)
         .with_context(|| format!("build overlaybd referrer reference for {subject_ref}"))?;
-    let referrer = oci_image::fetch_oci_manifest(regctl_binary, &referrer_ref, arch)
-        .await
-        .with_context(|| format!("fetch overlaybd referrer manifest for {referrer_ref}"))?;
+    let referrer =
+        oci_image::fetch_oci_manifest(regctl_binary, &referrer_ref, arch, registry_config)
+            .await
+            .with_context(|| format!("fetch overlaybd referrer manifest for {referrer_ref}"))?;
     if referrer.format() != ImageFormat::OverlaybdNative {
         bail!(
             "OCI referrer {referrer_ref} advertised artifactType {artifact_type} but its manifest is not overlaybd-native"
@@ -607,6 +669,7 @@ async fn try_resolve_overlaybd_referrer(
 async fn discover_overlaybd_referrer(
     regctl_binary: &std::path::Path,
     subject_ref: &str,
+    registry_config: Option<&std::path::Path>,
 ) -> Result<Option<(String, &'static str)>> {
     oci_image::ensure_regctl_binary(regctl_binary)
         .context("regctl is required to query OCI referrers")?;
@@ -615,7 +678,7 @@ async fn discover_overlaybd_referrer(
     // OVERLAYBD_REFERRER_ARTIFACT_TYPES: `regctl artifact list` takes a single
     // `--filter-artifact-type`, which cannot express "any of these types" in
     // one call.
-    let output = oci_image::regctl_command(regctl_binary)
+    let output = oci_image::regctl_command(regctl_binary, registry_config)
         .arg("artifact")
         .arg("list")
         .arg("--format")
@@ -751,6 +814,62 @@ mod tests {
         };
         ImageConfig::normalize(&mut config.image, temp.path(), temp.path());
         ImageResolver::new(&config)
+    }
+
+    #[tokio::test]
+    async fn registry_auth_rejects_ambiguous_search_before_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let resolver = test_resolver_with_search(&temp, vec!["one.example", "two.example"]);
+        let auth = RegistryAuth::General {
+            username: "reader".into(),
+            password: "secret".into(),
+        };
+        let error = resolver
+            .resolve_with_registry_auth("team/base", Some(&auth))
+            .await
+            .unwrap_err();
+        assert!(error.is_user_error());
+        assert!(error.to_string().contains("unambiguous"));
+    }
+
+    #[test]
+    fn registry_auth_validates_selected_image_format() {
+        for (format, has_auth, rejected) in [
+            (ImageFormat::StandardOci, false, false),
+            (ImageFormat::StandardOci, true, false),
+            (ImageFormat::OverlaybdNative, false, false),
+            (ImageFormat::OverlaybdNative, true, true),
+        ] {
+            let result = validate_registry_auth_for_format(format, has_auth);
+            if rejected {
+                assert!(matches!(result, Err(ImageError::UnsupportedImage { .. })));
+                assert!(result.unwrap_err().is_user_error());
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_auth_rejects_published_images_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        // No repository is configured: rejection must precede tag/digest lookup.
+        let resolver = test_resolver_with_search(&temp, vec!["registry.example"]);
+        let auth = RegistryAuth::General {
+            username: "reader".into(),
+            password: "secret".into(),
+        };
+        let digest = crate::digest::sha256_digest(b"published image");
+        for reference in [" aenv/web:v1 ", digest.as_str()] {
+            let error = resolver
+                .resolve_with_registry_auth(reference, Some(&auth))
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ImageError::InvalidReference { .. }));
+            assert!(error
+                .to_string()
+                .contains("fromImageRegistry cannot be used with AgentENV published images"));
+        }
     }
 
     #[test]
@@ -1218,7 +1337,7 @@ mod tests {
         });
         let regctl = fake_regctl(temp.path(), &body.to_string(), "", 0);
 
-        let discovered = discover_overlaybd_referrer(&regctl, subject)
+        let discovered = discover_overlaybd_referrer(&regctl, subject, None)
             .await
             .expect("discover referrer");
 
@@ -1258,7 +1377,7 @@ mod tests {
             1,
         );
 
-        let error = discover_overlaybd_referrer(&regctl, "demo.azurecr.io/python:3.11-slim")
+        let error = discover_overlaybd_referrer(&regctl, "demo.azurecr.io/python:3.11-slim", None)
             .await
             .expect_err("regctl failure must not be reported as 'no referrer'");
 

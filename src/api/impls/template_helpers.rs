@@ -81,6 +81,46 @@ pub(super) fn template_build_spec_from_start_request(
     Ok(spec)
 }
 
+pub(super) fn template_registry_auth(
+    body: &models::TemplateBuildStartV2,
+) -> Result<Option<crate::image::oci_image::RegistryAuth>, models::Error> {
+    use crate::image::oci_image::RegistryAuth;
+    let Some(registry) = body.from_image_registry.as_ref() else {
+        return Ok(None);
+    };
+    if body
+        .from_image
+        .as_deref()
+        .is_none_or(|image| image.trim().is_empty())
+        || body
+            .from_template
+            .as_deref()
+            .is_some_and(|template| !template.trim().is_empty())
+    {
+        return Err(models::Error::new(
+            400,
+            "fromImageRegistry requires fromImage and cannot be used with fromTemplate".into(),
+        ));
+    }
+    let auth = match registry {
+        models::FromImageRegistry::GeneralRegistry(value) => RegistryAuth::General {
+            username: value.username.clone(),
+            password: value.password.clone(),
+        },
+        models::FromImageRegistry::GcpRegistry(value) => RegistryAuth::Gcp {
+            service_account_json: value.service_account_json.clone(),
+        },
+        models::FromImageRegistry::AwsRegistry(value) => RegistryAuth::Aws {
+            access_key_id: value.aws_access_key_id.clone(),
+            secret_access_key: value.aws_secret_access_key.clone(),
+            region: value.aws_region.clone(),
+        },
+    };
+    auth.validate()
+        .map_err(|error| models::Error::new(400, error.to_string()))?;
+    Ok(Some(auth))
+}
+
 pub(super) fn template_build_start_base_source(
     body: &models::TemplateBuildStartV2,
 ) -> Result<TemplateBuildStartBaseSource, models::Error> {
@@ -227,7 +267,7 @@ fn apply_e2b_template_step(
 mod tests {
     use super::{
         template_build_spec_from_start_request, template_build_start_base_source,
-        TemplateBuildStartBaseSource,
+        template_registry_auth, TemplateBuildStartBaseSource,
     };
     use crate::types::SandboxResources;
     use agentenv_http_server::models;
@@ -296,5 +336,54 @@ mod tests {
                 crate::snapshot::SnapshotAlias::parse("base-template").expect("alias should parse")
             )
         );
+    }
+    #[test]
+    fn registry_auth_wire_types_round_trip_and_validate() {
+        for registry in [
+            serde_json::json!({"type":"registry", "username":"reader", "password":"secret"}),
+            serde_json::json!({"type":"aws", "awsAccessKeyId":"key", "awsSecretAccessKey":"secret", "awsRegion":"us-east-1"}),
+            serde_json::json!({"type":"gcp", "serviceAccountJson":"{\"type\":\"service_account\"}"}),
+        ] {
+            let request = serde_json::json!({"fromImage":"registry.example/team/base:v1", "fromImageRegistry":registry});
+            let body: models::TemplateBuildStartV2 =
+                serde_json::from_value(request.clone()).unwrap();
+            assert!(template_registry_auth(&body).unwrap().is_some());
+            assert_eq!(serde_json::to_value(body).unwrap(), request);
+        }
+    }
+
+    #[test]
+    fn registry_auth_rejects_invalid_sources_and_credentials() {
+        for source in [
+            serde_json::json!({}),
+            serde_json::json!({"fromImage":" "}),
+            serde_json::json!({"fromTemplate":"base"}),
+        ] {
+            let mut request = source;
+            request["fromImageRegistry"] =
+                serde_json::json!({"type":"registry", "username":"reader", "password":"secret"});
+            let body = serde_json::from_value(request).unwrap();
+            assert_eq!(template_registry_auth(&body).err().unwrap().code, 400);
+        }
+        for registry in [
+            serde_json::json!({"type":"registry", "username":"reader", "password":""}),
+            serde_json::json!({"type":"aws", "awsAccessKeyId":"key", "awsSecretAccessKey":"secret", "awsRegion":"bad/region"}),
+            serde_json::json!({"type":"gcp", "serviceAccountJson":"not-json-secret"}),
+        ] {
+            let body = serde_json::from_value(serde_json::json!({"fromImage":"registry.example/base", "fromImageRegistry":registry})).unwrap();
+            let error = template_registry_auth(&body).err().unwrap();
+            assert_eq!(error.code, 400);
+            assert!(!error.message.contains("secret"));
+        }
+        for registry in [
+            serde_json::json!({"type":"unknown", "username":"reader", "password":"secret"}),
+            serde_json::json!({"username":"reader", "password":"secret"}),
+            serde_json::json!({"type":"registry", "username":"reader"}),
+        ] {
+            assert!(serde_json::from_value::<models::TemplateBuildStartV2>(serde_json::json!({"fromImage":"registry.example/base", "fromImageRegistry":registry})).is_err());
+        }
+        assert!(template_registry_auth(&models::TemplateBuildStartV2::new())
+            .unwrap()
+            .is_none());
     }
 }

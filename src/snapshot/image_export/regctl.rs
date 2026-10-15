@@ -32,7 +32,7 @@ impl Regctl {
 
     /// Digest published at `image_ref`, or `None` when the ref does not exist.
     pub(crate) async fn manifest_head(&self, image_ref: &str) -> RepositoryResult<Option<String>> {
-        match run_regctl(&self.binary, &["manifest", "head", image_ref]).await {
+        match run_regctl(&self.binary, &["manifest", "head", image_ref], None).await {
             Ok(output) => Ok(Some(
                 String::from_utf8_lossy(&output.stdout).trim().to_string(),
             )),
@@ -65,7 +65,7 @@ impl Regctl {
 
     /// Probes whether `digest` exists as a blob in `repository`.
     pub(crate) async fn blob_head(&self, repository: &str, digest: &str) -> RepositoryResult<bool> {
-        match run_regctl(&self.binary, &["blob", "head", repository, digest]).await {
+        match run_regctl(&self.binary, &["blob", "head", repository, digest], None).await {
             Ok(_) => Ok(true),
             Err(ImageError::NotFound { .. }) => Ok(false),
             Err(error) => Err(RepositoryError::backend(
@@ -99,19 +99,23 @@ impl Regctl {
         target: &str,
         digest: &str,
     ) -> RepositoryResult<()> {
-        run_regctl(&self.binary, &["blob", "copy", source, target, digest])
-            .await
-            .map_err(|error| match error {
-                ImageError::NotFound { reason } => RepositoryError::ArtifactNotFound {
-                    artifact: format!(
-                        "external rootfs layer blob {digest} in source repository {source}: {reason}"
-                    ),
-                },
-                other => RepositoryError::backend(
-                    format!("regctl blob copy {source} {target} {digest}"),
-                    other,
+        run_regctl(
+            &self.binary,
+            &["blob", "copy", source, target, digest],
+            None,
+        )
+        .await
+        .map_err(|error| match error {
+            ImageError::NotFound { reason } => RepositoryError::ArtifactNotFound {
+                artifact: format!(
+                    "external rootfs layer blob {digest} in source repository {source}: {reason}"
                 ),
-            })?;
+            },
+            other => RepositoryError::backend(
+                format!("regctl blob copy {source} {target} {digest}"),
+                other,
+            ),
+        })?;
         Ok(())
     }
 
@@ -160,7 +164,7 @@ impl Regctl {
             let stdin = std::fs::File::open(payload).map_err(|e| {
                 RepositoryError::backend(format!("open regctl {description} payload"), e)
             })?;
-            let output = regctl_command(&self.binary)
+            let output = regctl_command(&self.binary, None)
                 .args(args)
                 .stdin(Stdio::from(stdin))
                 .output()
@@ -198,7 +202,7 @@ impl Regctl {
         target: &str,
         digest: &str,
     ) -> RepositoryResult<Result<(), String>> {
-        let mut get_child = regctl_command(&self.binary)
+        let mut get_child = regctl_command(&self.binary, None)
             .args(["blob", "get", source, digest])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -206,7 +210,7 @@ impl Regctl {
             .map_err(|e| {
                 RepositoryError::backend(format!("spawn regctl blob get {source} {digest}"), e)
             })?;
-        let mut put_child = match regctl_command(&self.binary)
+        let mut put_child = match regctl_command(&self.binary, None)
             .args(["blob", "put", target, "--digest", digest])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

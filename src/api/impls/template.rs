@@ -15,7 +15,7 @@ use super::image_build::record::{self as image_build_record, ImageBuildRecord};
 use super::pagination::PaginationCursor;
 use super::template_helpers::{
     template_build_record_from_v3_request, template_build_spec_from_start_request,
-    template_build_start_base_source, TemplateBuildStartBaseSource,
+    template_build_start_base_source, template_registry_auth, TemplateBuildStartBaseSource,
 };
 use super::ApiImpl;
 use crate::image::ResolvedBlockImage;
@@ -127,22 +127,26 @@ fn handle_v2_pipeline_error(
     reason
 }
 
-#[tracing::instrument(skip(api))]
+#[tracing::instrument(skip(api, registry_auth))]
 async fn resolve_template_rootfs_image(
     api: &ApiImpl,
     requested_image: Option<&str>,
+    registry_auth: Option<&crate::image::oci_image::RegistryAuth>,
 ) -> Result<ResolvedBlockImage, models::Error> {
     let image_resolver = api.image_resolver();
     let image_ref = requested_image
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| image_resolver.default_image());
-    image_resolver.resolve(image_ref).await.map_err(|err| {
-        models::Error::new(
-            if err.is_user_error() { 400 } else { 500 },
-            format!("{err:#}"),
-        )
-    })
+    image_resolver
+        .resolve_with_registry_auth(image_ref, registry_auth)
+        .await
+        .map_err(|err| {
+            models::Error::new(
+                if err.is_user_error() { 400 } else { 500 },
+                format!("{err:#}"),
+            )
+        })
 }
 
 impl From<TemplateBuildStatus> for models::TemplateBuildStatus {
@@ -971,6 +975,10 @@ impl Templates<()> for ApiImpl {
             Ok(source) => source,
             Err(err) => return Ok(v2_start_build_error(err)),
         };
+        let registry_auth = match template_registry_auth(body) {
+            Ok(auth) => auth,
+            Err(err) => return Ok(v2_start_build_error(err)),
+        };
         let spec = match template_build_spec_from_start_request(
             body,
             pending_record.alias.as_ref(),
@@ -1020,6 +1028,7 @@ impl Templates<()> for ApiImpl {
                             let resolved_rootfs = match resolve_template_rootfs_image(
                                 &api,
                                 requested_image.as_deref(),
+                                registry_auth.as_ref(),
                             )
                             .await
                             {

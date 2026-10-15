@@ -819,6 +819,218 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<AttachedDriv
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct AwsRegistry {
+    /// Type of registry authentication
+    /// Note: inline enums are not fully supported by openapi-generator
+    #[serde(default = "AwsRegistry::_name_for_r_type")]
+    #[serde(serialize_with = "AwsRegistry::_serialize_r_type")]
+    #[serde(rename = "type")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub r_type: String,
+
+    /// AWS Access Key ID for ECR authentication
+    #[serde(rename = "awsAccessKeyId")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub aws_access_key_id: String,
+
+    /// AWS Secret Access Key for ECR authentication
+    #[serde(rename = "awsSecretAccessKey")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub aws_secret_access_key: String,
+
+    /// AWS Region where the ECR registry is located
+    #[serde(rename = "awsRegion")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub aws_region: String,
+}
+
+impl AwsRegistry {
+    fn _name_for_r_type() -> String {
+        String::from("aws")
+    }
+
+    fn _serialize_r_type<S>(_: &String, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        s.serialize_str(&Self::_name_for_r_type())
+    }
+}
+
+impl AwsRegistry {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        aws_access_key_id: String,
+        aws_secret_access_key: String,
+        aws_region: String,
+    ) -> AwsRegistry {
+        AwsRegistry {
+            r_type: Self::_name_for_r_type(),
+            aws_access_key_id,
+            aws_secret_access_key,
+            aws_region,
+        }
+    }
+}
+
+/// Converts the AwsRegistry value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for AwsRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("type".to_string()),
+            Some(self.r_type.to_string()),
+            Some("awsAccessKeyId".to_string()),
+            Some(self.aws_access_key_id.to_string()),
+            Some("awsSecretAccessKey".to_string()),
+            Some(self.aws_secret_access_key.to_string()),
+            Some("awsRegion".to_string()),
+            Some(self.aws_region.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a AwsRegistry value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for AwsRegistry {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub r_type: Vec<String>,
+            pub aws_access_key_id: Vec<String>,
+            pub aws_secret_access_key: Vec<String>,
+            pub aws_region: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing AwsRegistry".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "type" => intermediate_rep.r_type.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "awsAccessKeyId" => intermediate_rep.aws_access_key_id.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "awsSecretAccessKey" => intermediate_rep.aws_secret_access_key.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "awsRegion" => intermediate_rep.aws_region.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing AwsRegistry".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(AwsRegistry {
+            r_type: intermediate_rep
+                .r_type
+                .into_iter()
+                .next()
+                .ok_or_else(|| "type missing in AwsRegistry".to_string())?,
+            aws_access_key_id: intermediate_rep
+                .aws_access_key_id
+                .into_iter()
+                .next()
+                .ok_or_else(|| "awsAccessKeyId missing in AwsRegistry".to_string())?,
+            aws_secret_access_key: intermediate_rep
+                .aws_secret_access_key
+                .into_iter()
+                .next()
+                .ok_or_else(|| "awsSecretAccessKey missing in AwsRegistry".to_string())?,
+            aws_region: intermediate_rep
+                .aws_region
+                .into_iter()
+                .next()
+                .ok_or_else(|| "awsRegion missing in AwsRegistry".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<AwsRegistry> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<AwsRegistry>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<AwsRegistry>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for AwsRegistry - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<AwsRegistry> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <AwsRegistry as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into AwsRegistry - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct BuildLogEntry {
     /// Timestamp of the log entry
     #[serde(rename = "timestamp")]
@@ -2085,6 +2297,430 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<Error> {
                     r#"Unable to convert header value '{value}' into Error - {err}"#
                 )),
             },
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(tag = "type")]
+#[allow(non_camel_case_types, clippy::large_enum_variant)]
+pub enum FromImageRegistry {
+    #[serde(alias = "aws")]
+    AwsRegistry(models::AwsRegistry),
+    #[serde(alias = "gcp")]
+    GcpRegistry(models::GcpRegistry),
+    #[serde(alias = "registry")]
+    GeneralRegistry(models::GeneralRegistry),
+}
+
+impl validator::Validate for FromImageRegistry {
+    fn validate(&self) -> std::result::Result<(), validator::ValidationErrors> {
+        match self {
+            Self::AwsRegistry(v) => v.validate(),
+            Self::GcpRegistry(v) => v.validate(),
+            Self::GeneralRegistry(v) => v.validate(),
+        }
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a FromImageRegistry value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for FromImageRegistry {
+    type Err = serde_json::Error;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        serde_json::from_str(s)
+    }
+}
+
+impl serde::Serialize for FromImageRegistry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::AwsRegistry(x) => x.serialize(serializer),
+            Self::GcpRegistry(x) => x.serialize(serializer),
+            Self::GeneralRegistry(x) => x.serialize(serializer),
+        }
+    }
+}
+
+impl From<models::AwsRegistry> for FromImageRegistry {
+    fn from(value: models::AwsRegistry) -> Self {
+        Self::AwsRegistry(value)
+    }
+}
+impl From<models::GcpRegistry> for FromImageRegistry {
+    fn from(value: models::GcpRegistry) -> Self {
+        Self::GcpRegistry(value)
+    }
+}
+impl From<models::GeneralRegistry> for FromImageRegistry {
+    fn from(value: models::GeneralRegistry) -> Self {
+        Self::GeneralRegistry(value)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct GcpRegistry {
+    /// Type of registry authentication
+    /// Note: inline enums are not fully supported by openapi-generator
+    #[serde(default = "GcpRegistry::_name_for_r_type")]
+    #[serde(serialize_with = "GcpRegistry::_serialize_r_type")]
+    #[serde(rename = "type")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub r_type: String,
+
+    /// Service Account JSON for GCP authentication
+    #[serde(rename = "serviceAccountJson")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub service_account_json: String,
+}
+
+impl GcpRegistry {
+    fn _name_for_r_type() -> String {
+        String::from("gcp")
+    }
+
+    fn _serialize_r_type<S>(_: &String, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        s.serialize_str(&Self::_name_for_r_type())
+    }
+}
+
+impl GcpRegistry {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(service_account_json: String) -> GcpRegistry {
+        GcpRegistry {
+            r_type: Self::_name_for_r_type(),
+            service_account_json,
+        }
+    }
+}
+
+/// Converts the GcpRegistry value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for GcpRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("type".to_string()),
+            Some(self.r_type.to_string()),
+            Some("serviceAccountJson".to_string()),
+            Some(self.service_account_json.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a GcpRegistry value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for GcpRegistry {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub r_type: Vec<String>,
+            pub service_account_json: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing GcpRegistry".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "type" => intermediate_rep.r_type.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "serviceAccountJson" => intermediate_rep.service_account_json.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing GcpRegistry".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(GcpRegistry {
+            r_type: intermediate_rep
+                .r_type
+                .into_iter()
+                .next()
+                .ok_or_else(|| "type missing in GcpRegistry".to_string())?,
+            service_account_json: intermediate_rep
+                .service_account_json
+                .into_iter()
+                .next()
+                .ok_or_else(|| "serviceAccountJson missing in GcpRegistry".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<GcpRegistry> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<GcpRegistry>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<GcpRegistry>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for GcpRegistry - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<GcpRegistry> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <GcpRegistry as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into GcpRegistry - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct GeneralRegistry {
+    /// Type of registry authentication
+    /// Note: inline enums are not fully supported by openapi-generator
+    #[serde(default = "GeneralRegistry::_name_for_r_type")]
+    #[serde(serialize_with = "GeneralRegistry::_serialize_r_type")]
+    #[serde(rename = "type")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub r_type: String,
+
+    /// Username to use for the registry
+    #[serde(rename = "username")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub username: String,
+
+    /// Password to use for the registry
+    #[serde(rename = "password")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub password: String,
+}
+
+impl GeneralRegistry {
+    fn _name_for_r_type() -> String {
+        String::from("registry")
+    }
+
+    fn _serialize_r_type<S>(_: &String, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        s.serialize_str(&Self::_name_for_r_type())
+    }
+}
+
+impl GeneralRegistry {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(username: String, password: String) -> GeneralRegistry {
+        GeneralRegistry {
+            r_type: Self::_name_for_r_type(),
+            username,
+            password,
+        }
+    }
+}
+
+/// Converts the GeneralRegistry value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for GeneralRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("type".to_string()),
+            Some(self.r_type.to_string()),
+            Some("username".to_string()),
+            Some(self.username.to_string()),
+            Some("password".to_string()),
+            Some(self.password.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a GeneralRegistry value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for GeneralRegistry {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub r_type: Vec<String>,
+            pub username: Vec<String>,
+            pub password: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing GeneralRegistry".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "type" => intermediate_rep.r_type.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "username" => intermediate_rep.username.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "password" => intermediate_rep.password.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing GeneralRegistry".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(GeneralRegistry {
+            r_type: intermediate_rep
+                .r_type
+                .into_iter()
+                .next()
+                .ok_or_else(|| "type missing in GeneralRegistry".to_string())?,
+            username: intermediate_rep
+                .username
+                .into_iter()
+                .next()
+                .ok_or_else(|| "username missing in GeneralRegistry".to_string())?,
+            password: intermediate_rep
+                .password
+                .into_iter()
+                .next()
+                .ok_or_else(|| "password missing in GeneralRegistry".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<GeneralRegistry> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<GeneralRegistry>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<GeneralRegistry>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for GeneralRegistry - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<GeneralRegistry> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <GeneralRegistry as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into GeneralRegistry - {err}"#
+                    )),
+                }
+            }
             std::result::Result::Err(e) => std::result::Result::Err(format!(
                 r#"Unable to convert header: {hdr_value:?} to string: {e}"#
             )),
@@ -10154,6 +10790,11 @@ pub struct TemplateBuildStartV2 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from_template: Option<String>,
 
+    #[serde(rename = "fromImageRegistry")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_image_registry: Option<models::FromImageRegistry>,
+
     /// Whether the whole build should be forced to run regardless of the cache
     #[serde(rename = "force")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10184,6 +10825,7 @@ impl TemplateBuildStartV2 {
         TemplateBuildStartV2 {
             from_image: None,
             from_template: None,
+            from_image_registry: None,
             force: Some(false),
             steps: None,
             start_cmd: None,
@@ -10204,6 +10846,7 @@ impl std::fmt::Display for TemplateBuildStartV2 {
             self.from_template.as_ref().map(|from_template| {
                 ["fromTemplate".to_string(), from_template.to_string()].join(",")
             }),
+            // Skipping fromImageRegistry in query parameter serialization
             self.force
                 .as_ref()
                 .map(|force| ["force".to_string(), force.to_string()].join(",")),
@@ -10237,6 +10880,7 @@ impl std::str::FromStr for TemplateBuildStartV2 {
         struct IntermediateRep {
             pub from_image: Vec<String>,
             pub from_template: Vec<String>,
+            pub from_image_registry: Vec<models::FromImageRegistry>,
             pub force: Vec<bool>,
             pub steps: Vec<Vec<models::TemplateStep>>,
             pub start_cmd: Vec<String>,
@@ -10267,6 +10911,8 @@ impl std::str::FromStr for TemplateBuildStartV2 {
                     #[allow(clippy::redundant_clone)]
                     "fromTemplate" => intermediate_rep.from_template.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     #[allow(clippy::redundant_clone)]
+                    "fromImageRegistry" => intermediate_rep.from_image_registry.push(<models::FromImageRegistry as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
                     "force" => intermediate_rep.force.push(<bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     "steps" => return std::result::Result::Err("Parsing a container in this style is not supported in TemplateBuildStartV2".to_string()),
                     #[allow(clippy::redundant_clone)]
@@ -10285,6 +10931,7 @@ impl std::str::FromStr for TemplateBuildStartV2 {
         std::result::Result::Ok(TemplateBuildStartV2 {
             from_image: intermediate_rep.from_image.into_iter().next(),
             from_template: intermediate_rep.from_template.into_iter().next(),
+            from_image_registry: intermediate_rep.from_image_registry.into_iter().next(),
             force: intermediate_rep.force.into_iter().next(),
             steps: intermediate_rep.steps.into_iter().next(),
             start_cmd: intermediate_rep.start_cmd.into_iter().next(),

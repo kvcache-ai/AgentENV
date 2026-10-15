@@ -1151,6 +1151,72 @@ components:
           type: string
           description: Required BuildKit image exporter name for this build. The server observes its successful completion and automatically imports and publishes the template.
 
+    FromImageRegistry:
+      oneOf:
+        - $ref: "#/components/schemas/AwsRegistry"
+        - $ref: "#/components/schemas/GcpRegistry"
+        - $ref: "#/components/schemas/GeneralRegistry"
+      discriminator:
+        propertyName: type
+        mapping:
+          aws: "#/components/schemas/AwsRegistry"
+          gcp: "#/components/schemas/GcpRegistry"
+          registry: "#/components/schemas/GeneralRegistry"
+
+    AwsRegistry:
+      type: object
+      required:
+        - type
+        - awsAccessKeyId
+        - awsSecretAccessKey
+        - awsRegion
+      properties:
+        type:
+          type: string
+          enum: [aws]
+          description: Type of registry authentication
+        awsAccessKeyId:
+          type: string
+          description: AWS Access Key ID for ECR authentication
+        awsSecretAccessKey:
+          type: string
+          description: AWS Secret Access Key for ECR authentication
+        awsRegion:
+          type: string
+          description: AWS Region where the ECR registry is located
+
+    GcpRegistry:
+      type: object
+      required:
+        - type
+        - serviceAccountJson
+      properties:
+        type:
+          type: string
+          enum: [gcp]
+          description: Type of registry authentication
+        serviceAccountJson:
+          type: string
+          description: Service Account JSON for GCP authentication
+
+    GeneralRegistry:
+      type: object
+      required:
+        - type
+        - username
+        - password
+      properties:
+        type:
+          type: string
+          enum: [registry]
+          description: Type of registry authentication
+        username:
+          type: string
+          description: Username to use for the registry
+        password:
+          type: string
+          description: Password to use for the registry
+
     TemplateBuildStartV2:
       type: object
       properties:
@@ -1160,6 +1226,9 @@ components:
         fromTemplate:
           type: string
           description: Template to use as a base for the template build
+        fromImageRegistry:
+          $ref: "#/components/schemas/FromImageRegistry"
+          description: Temporary credentials for standard OCI base images.
         force:
           default: false
           type: boolean
