@@ -172,6 +172,17 @@ impl BlobKey {
     /// The directory or object prefix that holds every managed layer.
     pub(crate) const LAYERS_DIR: &'static str = "managed-layers";
 
+    pub(crate) fn managed_layers_repo_blob_url(bucket: &str, prefix: &str) -> String {
+        let bucket = bucket.trim();
+        let prefix = prefix.trim().trim_matches('/');
+        let key = Self::LAYERS_DIR;
+        if prefix.is_empty() {
+            format!("s3://{bucket}/{key}")
+        } else {
+            format!("s3://{bucket}/{prefix}/{key}")
+        }
+    }
+
     /// Where a POSIX repository prepares blobs before storing them, so they
     /// are on the repository's filesystem.
     pub(crate) const POSIX_STAGING_DIR: &'static str = "staging";
