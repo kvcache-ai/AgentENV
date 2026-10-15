@@ -5,7 +5,7 @@ pub struct SnapshotRuntimeVersions {
     pub kernel_version: String,
     pub firecracker_version: String,
     pub envd_version: String,
-    /// Content identity of the Firecracker executable used for this capture.
+    /// Legacy executable digest retained for reading existing metadata. New captures omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub firecracker_binary_sha256: Option<String>,
     /// Actual snapshot wire format, independent of the software version string.

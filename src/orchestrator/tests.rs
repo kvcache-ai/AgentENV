@@ -6032,7 +6032,6 @@ async fn pause_persists_current_runtime_identity_across_restart() -> anyhow::Res
         let directory = TempDir::new()?;
         std::fs::write(directory.path().join("vm_state.bin"), "v1000.0.0\n")?;
         let binary = identity_probe_executable(directory.path())?;
-        let digest = crate::digest::FileDigest::describe(&binary).await?.sha256;
         let behavior = Arc::new(MockBehavior::new());
         behavior.set_runtime_info(SandboxRuntimeInfo {
             firecracker_binary: Some(binary),
@@ -6070,7 +6069,7 @@ async fn pause_persists_current_runtime_identity_across_restart() -> anyhow::Res
                 .runtime_versions
                 .firecracker_binary_sha256
                 .as_deref(),
-            Some(digest.as_str())
+            None
         );
         drop(orchestrator);
         let reloaded =
@@ -6080,10 +6079,7 @@ async fn pause_persists_current_runtime_identity_across_restart() -> anyhow::Res
         assert_eq!(reloaded.len(), 1);
         let versions = &reloaded[0].runtime_versions;
         assert_eq!(versions.firecracker_version, "2.0.0");
-        assert_eq!(
-            versions.firecracker_binary_sha256.as_deref(),
-            Some(digest.as_str())
-        );
+        assert_eq!(versions.firecracker_binary_sha256.as_deref(), None);
         assert_eq!(
             versions.firecracker_snapshot_version.as_deref(),
             Some("1000.0.0")
