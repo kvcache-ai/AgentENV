@@ -144,6 +144,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rand 0.10.1",
+ "reqsign",
  "reqwest 0.13.3",
  "rocksdb",
  "rtnetlink",
