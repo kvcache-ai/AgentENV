@@ -9,10 +9,13 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
-use overlaybd::config::{ImageConfig, UpperConfig, UpperMode};
+use overlaybd::backend::local::LocalFile;
+use overlaybd::config::{DownloadConfig, ImageConfig, LayerConfig, UpperConfig, UpperMode};
 use overlaybd::helper::prepare_runtime_upper;
 use overlaybd::image_file::ImageFile;
 use overlaybd::image_service::ImageService;
+use overlaybd::snapshot::OverlaybdCompactOutput;
+use overlaybd::virtual_file::VirtualFile;
 use overlaybd::RestackSnapshotTerminalFailure;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
@@ -637,12 +640,12 @@ async fn handle_connection(
         DaemonRequest::Delete { dev_id } => {
             handle_delete(&devices, ctrl_ring, &pack_recordings, dev_id).await
         }
-        DaemonRequest::RestackSnapshot {
+        DaemonRequest::SnapshotDevice {
             dev_id,
             output_layer_path,
             compact_from,
         } => {
-            handle_restack_snapshot(
+            handle_snapshot_device(
                 &devices,
                 &pool_state,
                 &image_service_cache,
@@ -651,6 +654,49 @@ async fn handle_connection(
                 compact_from,
             )
             .await
+        }
+        DaemonRequest::CompactLayers {
+            lowers,
+            repo_blob_url,
+            global_config,
+            output_layer_path,
+            output,
+        } => {
+            let input_layers = lowers.len();
+            let started = std::time::Instant::now();
+            tracing::info!(
+                input_layers,
+                output_path = %output_layer_path.display(),
+                encoding = ?output,
+                "starting overlaybd layer compaction"
+            );
+            let result = handle_compact_layers(
+                &image_service_cache,
+                lowers,
+                repo_blob_url,
+                &global_config,
+                &output_layer_path,
+                output,
+            )
+            .await;
+            match &result {
+                Ok(_) => tracing::info!(
+                    input_layers,
+                    output_path = %output_layer_path.display(),
+                    encoding = ?output,
+                    elapsed = ?started.elapsed(),
+                    "compacted overlaybd layers"
+                ),
+                Err(error) => tracing::warn!(
+                    input_layers,
+                    output_path = %output_layer_path.display(),
+                    encoding = ?output,
+                    elapsed = ?started.elapsed(),
+                    ?error,
+                    "failed to compact overlaybd layers"
+                ),
+            }
+            result
         }
         DaemonRequest::FlushForCheckpoint { dev_id } => {
             handle_flush_for_checkpoint(&devices, &pool_state, dev_id).await
@@ -1436,7 +1482,7 @@ async fn stop_overlaybd_device(
     }
 }
 
-async fn handle_restack_snapshot(
+async fn handle_snapshot_device(
     devices: &DashMap<u32, ManagedDevice>,
     pool_state: &Option<Arc<PoolState>>,
     image_service_cache: &ImageServiceCache,
@@ -1449,7 +1495,7 @@ async fn handle_restack_snapshot(
     tracing::info!(
         dev_id,
         output = %output_layer_path.display(),
-        "creating restack snapshot"
+        "creating overlaybd device snapshot"
     );
 
     let result = {
@@ -1459,7 +1505,7 @@ async fn handle_restack_snapshot(
     };
     let (descriptor, lowers) = result.with_context(|| {
         format!(
-            "restack overlaybd snapshot for dev_id={dev_id} to {}",
+            "snapshot overlaybd device dev_id={dev_id} to {}",
             output_layer_path.display()
         )
     })?;
@@ -1472,14 +1518,53 @@ async fn handle_restack_snapshot(
     tracing::info!(
         dev_id,
         output = %output_layer_path.display(),
-        "ublk daemon restack snapshot completed"
+        "ublk daemon device snapshot completed"
     );
-    Ok(DaemonResponse::RestackSnapshotCreated {
+    Ok(DaemonResponse::SnapshotDeviceCreated {
         descriptor,
         lowers,
         data_stat,
         ext4_used_bytes,
     })
+}
+
+async fn handle_compact_layers(
+    image_service_cache: &ImageServiceCache,
+    lowers: Vec<LayerConfig>,
+    repo_blob_url: String,
+    global_config: &Path,
+    output_layer_path: &Path,
+    output: OverlaybdCompactOutput,
+) -> Result<DaemonResponse> {
+    let service = image_service_cache.get_or_create(global_config).await?;
+    let image = ImageFile::open(
+        ImageConfig {
+            repo_blob_url,
+            lowers,
+            download_override: Some(DownloadConfig {
+                enable: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        service,
+        None,
+    )
+    .await?;
+    let parent = output_layer_path
+        .parent()
+        .context("compacted layer output has no parent directory")?;
+    let temporary = tempfile::NamedTempFile::new_in(parent)?;
+    let output_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(temporary.path(), false)?);
+    image
+        .compact(output_file, output)
+        .await
+        .context("merge overlaybd layers")?;
+    temporary
+        .persist(output_layer_path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish compacted layer to {}", output_layer_path.display()))?;
+    Ok(DaemonResponse::Ok)
 }
 
 async fn handle_flush_for_checkpoint(

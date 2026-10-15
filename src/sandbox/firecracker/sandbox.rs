@@ -20,7 +20,7 @@ use super::config::{
 };
 use super::memory_snapshot::{capture_memory_snapshot, save_paused_memory};
 use super::mmds::MmdsMetadata;
-use super::overlaybd_snapshot::restack_snapshot_overlaybd_device;
+use super::overlaybd_snapshot::capture_disk_snapshot;
 use super::pool::{warm_stdio_paths, FirecrackerPool};
 use super::resources::SandboxResources;
 use super::FirecrackerInstance;
@@ -1105,6 +1105,9 @@ impl FirecrackerSandbox {
             &dirty,
             source,
             root,
+            &ConfigManager::global_config()
+                .memory_snapshot
+                .overlaybd_global_config_path,
             canonicalized_runtime_owned_roots(),
         );
         let disks = async {
@@ -1197,7 +1200,7 @@ impl FirecrackerSandbox {
             let memory_encoding = OverlaybdCompactOutput::Raw;
             let source = self.resources.mem_ublk_device.as_ref().map(crate::sandbox::ublk::SharedReadOnlyDevice::opened_image_config_path);
             let mem_overlaybd_config = capture_memory_snapshot(
-                pid, &dirty, source, snapshot_dir, memory_encoding,
+                pid, &dirty, source, snapshot_dir, &ConfigManager::global_config().memory_snapshot.overlaybd_global_config_path, memory_encoding,
                 &mut self.memory_upper_needs_sealing, placement, canonicalized_runtime_owned_roots(),
             ).await?;
 
@@ -1205,7 +1208,7 @@ impl FirecrackerSandbox {
                 .context("snapshot rootfs image config")?;
             let rootfs_runtime = self.resources.rootfs_runtime.as_ref()
                 .context("snapshot rootfs device")?;
-            let base_rootfs_path = restack_snapshot_overlaybd_device(
+            let base_rootfs_path = capture_disk_snapshot(
                 rootfs_runtime, rootfs_source.read_only, &snapshot_dir.join("rootfs"),
                 "rootfs", canonicalized_runtime_owned_roots(),
             ).await.context("snapshot overlaybd runtime state to persistent dir")?;
@@ -2483,7 +2486,7 @@ impl FirecrackerSandbox {
                     || snapshot_dir.join("drives").join(drive.drive_id()),
                     PathBuf::from,
                 );
-                let path = restack_snapshot_overlaybd_device(
+                let path = capture_disk_snapshot(
                     runtime,
                     drive.read_only(),
                     &output_dir,
@@ -2537,7 +2540,7 @@ impl FirecrackerSandbox {
             if drive.read_only() {
                 continue;
             }
-            restack_snapshot_overlaybd_device(
+            capture_disk_snapshot(
                 runtime,
                 false,
                 output_dir,

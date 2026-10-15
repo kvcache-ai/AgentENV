@@ -130,7 +130,7 @@ fn snapshot_disk_usage(root: &Path) -> std::io::Result<u64> {
 
 /// Finish private-file ownership before any reader can acquire this snapshot.
 pub(crate) fn finish_snapshot(manifest: &SandboxSnapshotManifest, root: &Path) -> Result<()> {
-    crate::snapshot::publish::validate_attached_drives(manifest)?;
+    manifest.validate_attached_drives()?;
     ensure!(
         manifest.vm_state.path.is_file(),
         "snapshot VM state is missing"

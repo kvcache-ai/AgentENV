@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use overlaybd::config::{LayerConfig, UpperMode};
 use overlaybd::index_file::DataStat;
+use overlaybd::snapshot::OverlaybdCompactOutput;
 use overlaybd::LayerDescriptor;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -51,11 +52,21 @@ pub enum DaemonRequest {
     Delete {
         dev_id: u32,
     },
-    RestackSnapshot {
+    // Keep the existing wire tag when renaming the Rust API.
+    #[serde(rename = "restack_snapshot")]
+    SnapshotDevice {
         dev_id: u32,
         output_layer_path: PathBuf,
         /// Merge this suffix of existing lowers before sealing the upper.
         compact_from: Option<usize>,
+    },
+    /// Merge immutable lower layers without creating or changing a device.
+    CompactLayers {
+        lowers: Vec<LayerConfig>,
+        repo_blob_url: String,
+        global_config: PathBuf,
+        output_layer_path: PathBuf,
+        output: OverlaybdCompactOutput,
     },
     /// Flush a live image while excluding concurrent image I/O.
     FlushForCheckpoint {
@@ -206,7 +217,8 @@ pub enum DaemonResponse {
         flags: u64,
     },
     Deleted,
-    RestackSnapshotCreated {
+    #[serde(rename = "restack_snapshot_created")]
+    SnapshotDeviceCreated {
         descriptor: Option<LayerDescriptor>,
         /// Actual live lowers after restack, including any compaction.
         lowers: Vec<LayerConfig>,
@@ -235,9 +247,9 @@ pub enum DaemonResponse {
 
 // ── Wire helpers ────────────────────────────────────────────────────────────
 
-/// Client-side outcome of a restack snapshot RPC.
+/// Client-side outcome of a device snapshot RPC.
 #[derive(Debug, Clone, Default)]
-pub struct RestackSnapshotResult {
+pub struct SnapshotDeviceResult {
     pub descriptor: Option<LayerDescriptor>,
     pub lowers: Vec<LayerConfig>,
     pub data_stat: Option<DataStat>,

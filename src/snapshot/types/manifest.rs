@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
@@ -96,6 +97,25 @@ pub struct SnapshotAttachedDriveArtifacts {
 }
 
 impl SandboxSnapshotManifest {
+    pub(crate) fn validate_attached_drives(&self) -> Result<()> {
+        let mut drive_ids = HashSet::with_capacity(self.attached_drives.len());
+        for drive in &self.attached_drives {
+            if !drive_ids.insert(drive.drive_id.as_str()) {
+                bail!(
+                    "duplicate attached drive id in publish request: {}",
+                    drive.drive_id
+                );
+            }
+            if drive.virtual_size == 0 {
+                bail!(
+                    "attached drive '{}' virtual_size must be non-zero",
+                    drive.drive_id
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Describe a capture `backend` wrote. Pass the backend's own name, one
     /// of the `*_BACKEND` constants, so a restore reaches the VMM which took
     /// it. A name no restore knows is refused here, before it reaches a

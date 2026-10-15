@@ -118,9 +118,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         let policy = repository.publish_policy();
         Self {
             repository,
-            compression: OverlaybdCompactOutput::from_publish_compression_config(
-                &policy.compression,
-            ),
+            compression: OverlaybdCompactOutput::from(&policy.compression),
             image_storage: policy.image_storage,
             managed_layers_repo_blob_url: repository.managed_layers_repo_blob_url(),
             disk_publications: Vec::new(),
