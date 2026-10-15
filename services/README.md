@@ -15,7 +15,7 @@ Go implementation of a distributed Gateway and pluggable Scheduler for AgentENV.
 - Scheduler sandbox binding store can be in-memory or Redis-backed.
 - Scheduler can run as a primary read/write service or as query-only replicas that serve only `LookupNode` from Redis.
 - Scheduler observes node health and sandbox roster from heartbeats, and drops expired sandbox-to-node bindings on heartbeat, node unregistration, or lookup.
-- HTTP and WebSocket forwarding.
+- HTTP, WebSocket, and HTTP/1.1 CONNECT forwarding.
 - Optional gateway HTTPS with manual certificates or CertMagic automatic issuance
   and renewal. Local HTTP remains the default. See [Gateway HTTPS](#gateway-https).
 
@@ -40,6 +40,15 @@ Sandbox data-plane routing is host- or header-based. Path-derived sandbox IDs ar
 only used for sandbox control-plane APIs such as `/sandboxes/{id}/pause`; clients
 that proxy sandbox traffic through the gateway must use a sandbox proxy host or a
 sandbox routing header.
+
+HTTP CONNECT data-plane requests are supported as raw TCP tunnels into the sandbox
+(the CONNECT authority is ignored; routing headers or the proxy host select the
+sandbox and port). Since the reverse proxy only bridges 101 upgrades, the gateway
+relays CONNECT explicitly: it hijacks the client connection, replays the CONNECT
+request with routing headers to the owning node, forwards the node's response head,
+and then bridges bytes bidirectionally. The routing timeout bounds node lookup and
+the initial dial and response handshake but does not apply to an established
+tunnel. CONNECT currently requires an `http://` node endpoint.
 
 ## Build
 
