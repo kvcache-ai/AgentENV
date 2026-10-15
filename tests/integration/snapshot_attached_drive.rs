@@ -178,6 +178,8 @@ async fn publish_sandbox_snapshot_with_attached_drive(
         runtime_versions: SnapshotRuntimeVersions {
             kernel_version: "test-kernel".to_string(),
             firecracker_version: "test-firecracker".to_string(),
+            firecracker_binary_sha256: None,
+            firecracker_snapshot_version: None,
             envd_version: "test-envd".to_string(),
             tools_drive_version: ConfigManager::global_config()
                 .resolved_tools_version()

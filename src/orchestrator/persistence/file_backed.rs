@@ -693,6 +693,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persistence_failure_removes_only_staged_links_and_allows_retry() -> anyhow::Result<()>
+    {
+        for encode_failure in [false, true] {
+            let temp = TempDir::new()?;
+            let persister = test_persister(&temp.path().join("persistence"));
+            let live_dir = temp.path().join("live-disk");
+            std::fs::create_dir_all(&live_dir)?;
+            let live_layer = live_dir.join("sealed.commit");
+            std::fs::write(&live_layer, b"live disk writes")?;
+            let metadata = SandboxMetadata::default();
+            let root = persister
+                .allocate_artifact_root(&metadata.id)
+                .await?
+                .unwrap();
+            std::fs::hard_link(&live_layer, root.join("snapshot.commit"))?;
+            let state: Arc<dyn PausedSandboxState> = if encode_failure {
+                Arc::new(FailingEncodeState)
+            } else {
+                // Fail the actual database open without filling a shared disk.
+                std::fs::write(persister.records_db_path(), b"not a database directory")?;
+                Arc::new(MockSnapshot)
+            };
+            assert!(persister
+                .persist_paused(&metadata, Some(&root), state.as_ref())
+                .await
+                .is_err());
+            assert!(!root.exists());
+            assert_eq!(std::fs::read(&live_layer)?, b"live disk writes");
+            if !encode_failure {
+                std::fs::remove_file(persister.records_db_path())?;
+            }
+            let retry = persister
+                .allocate_artifact_root(&metadata.id)
+                .await?
+                .unwrap();
+            std::fs::hard_link(&live_layer, retry.join("snapshot.commit"))?;
+            persister
+                .persist_paused(&metadata, Some(&retry), &MockSnapshot)
+                .await?;
+            assert!(has_record(&persister, &metadata.id).await?);
+            std::fs::remove_dir_all(&live_dir)?;
+            assert_eq!(
+                std::fs::read(retry.join("snapshot.commit"))?,
+                b"live disk writes"
+            );
+            persister.delete_record_and_artifacts(&metadata.id).await?;
+            assert!(!retry.exists());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn mark_resuming_and_rollback_preserve_loadability() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());

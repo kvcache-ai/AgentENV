@@ -3,6 +3,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use firecracker_client::models::drive::IoEngine;
@@ -37,6 +38,7 @@ pub(crate) struct FirecrackerInstance {
     socket_path: PathBuf,
     stderr_path: Option<PathBuf>,
     process: Option<Child>,
+    binary_file: Option<Arc<fs::File>>,
 }
 
 impl FirecrackerInstance {
@@ -48,7 +50,20 @@ impl FirecrackerInstance {
             socket_path,
             stderr_path: None,
             process: None,
+            binary_file: None,
         }
+    }
+
+    /// Keep the actual executed inode available for snapshot metadata, even if
+    /// its installation path is subsequently replaced or removed.
+    pub(crate) fn runtime_binary(&self) -> Option<Arc<fs::File>> {
+        self.binary_file.clone()
+    }
+
+    pub(crate) fn runtime_binary_path(&self) -> Option<PathBuf> {
+        self.binary_file
+            .as_ref()
+            .map(|file| PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())))
     }
 
     pub fn pid(&self) -> Result<Pid> {
@@ -96,7 +111,15 @@ impl FirecrackerInstance {
             })
             .transpose()?;
 
-        let mut cmd = Command::new(&firecracker_binary);
+        let binary_file = Arc::new(
+            fs::File::open(&firecracker_binary)
+                .context("retain Firecracker executable before launch")?,
+        );
+        #[cfg(target_os = "linux")]
+        let executable = PathBuf::from(format!("/proc/self/fd/{}", binary_file.as_raw_fd()));
+        #[cfg(not(target_os = "linux"))]
+        let executable = firecracker_binary;
+        let mut cmd = Command::new(&executable);
         cmd.process_group(0);
 
         cmd.arg("--api-sock")
@@ -117,6 +140,7 @@ impl FirecrackerInstance {
 
         cmd.stdout(stdout).stderr(stderr);
 
+        let launch_binary = binary_file.clone();
         let child = crate::privileges::spawn_tokio_command_scoped(cmd, &[], move || {
             if let Some(netns) = netns {
                 // SAFETY: `netns` is an open network namespace descriptor and
@@ -126,7 +150,7 @@ impl FirecrackerInstance {
                     return Err(std::io::Error::last_os_error());
                 }
             }
-            Ok(())
+            Ok(launch_binary)
         })
         .await
         .context("failed to spawn firecracker")?;
@@ -141,6 +165,7 @@ impl FirecrackerInstance {
             }
         }
 
+        self.binary_file = Some(binary_file);
         self.process = Some(child);
         Ok(())
     }
@@ -775,6 +800,58 @@ mod tests {
             PathBuf::from("/tmp/vm_state.bin")
         );
 
+        Ok(())
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod executable_identity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn short_lived_launch_retains_the_executed_file_after_exit() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir()?;
+        let binary = dir.path().join("runtime");
+        fs::copy("/bin/echo", &binary)?;
+        let expected = fs::metadata(&binary)?;
+        let mut instance = FirecrackerInstance::new(dir.path().to_path_buf());
+        instance.spawn_with_netns(&binary, None, None, None).await?;
+        instance.process.as_mut().unwrap().wait().await?;
+        fs::remove_file(&binary)?;
+        let held = instance.runtime_binary().context("missing executed file")?;
+        let actual = held.metadata()?;
+        assert_eq!(
+            (actual.dev(), actual.ino()),
+            (expected.dev(), expected.ino())
+        );
+        let output = Command::new(instance.runtime_binary_path().unwrap())
+            .arg("retained-executable")
+            .output()
+            .await?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"retained-executable\n");
+        instance.stop(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_executable_identity_survives_installation_path_replacement() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let binary = dir.path().join("firecracker");
+        fs::write(&binary, b"original running runtime")?;
+        let original = crate::digest::FileDigest::describe(&binary).await?;
+        let mut instance = FirecrackerInstance::new(dir.path().to_path_buf());
+        instance.binary_file = Some(Arc::new(fs::File::open(&binary)?));
+        let replacement = dir.path().join("replacement");
+        fs::write(&replacement, b"different installed runtime")?;
+        fs::rename(replacement, &binary)?;
+        let probe = instance.runtime_binary_path().expect("retained executable");
+        assert_eq!(crate::digest::FileDigest::describe(&probe).await?, original);
+        assert_ne!(
+            crate::digest::FileDigest::describe(&binary).await?,
+            original
+        );
         Ok(())
     }
 }

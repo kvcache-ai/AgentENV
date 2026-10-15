@@ -5,38 +5,76 @@ use anyhow::{bail, Context, Result};
 use tracing::{debug, warn};
 
 use crate::sandbox::SandboxExecutor;
+
 use crate::snapshot::SnapshotRuntimeVersions;
 
-/// Read the versions a sandbox is running under. `vmm_binary` is the
-/// VMM the sandbox runs on, asked for its version, and
-/// `tools_drive_version` is the one the sandbox was given.
-#[tracing::instrument(skip(sandbox))]
+/// Read the guest versions and the identity of its actual VMM executable.
 pub async fn probe_runtime_versions(
     sandbox: &impl SandboxExecutor,
     vmm_binary: PathBuf,
     tools_drive_version: String,
 ) -> Result<SnapshotRuntimeVersions> {
-    let (kernel_version, firecracker_version, envd_version) = tokio::join!(
-        probe_kernel_version(sandbox),
-        probe_vmm_version(vmm_binary),
-        probe_envd_version(sandbox),
-    );
+    SnapshotRuntimeVersions::probe(sandbox, vmm_binary, tools_drive_version).await
+}
 
-    let kernel_version = version_or_unknown("kernel", kernel_version);
-    let firecracker_version = version_or_unknown("vmm", firecracker_version);
-    let envd_version = envd_version?;
+impl SnapshotRuntimeVersions {
+    /// Refresh the VMM version for a new capture without changing captured guest assets.
+    pub(crate) async fn refresh_firecracker(
+        &mut self,
+        binary: PathBuf,
+        snapshot: PathBuf,
+    ) -> Result<()> {
+        let (version, digest, format) = tokio::join!(
+            probe_vmm_version(binary.clone()),
+            crate::digest::FileDigest::describe(&binary),
+            probe_snapshot_format(binary.clone(), Some(snapshot)),
+        );
+        let digest = digest.context("read Firecracker binary identity")?;
+        let format = format?;
+        self.firecracker_version = version_or_unknown("vmm", version);
+        self.firecracker_binary_sha256 = Some(digest.sha256);
+        self.firecracker_snapshot_version = Some(format);
+        Ok(())
+    }
 
-    debug!(
-        kernel_version,
-        firecracker_version, envd_version, tools_drive_version, "probed runtime versions"
-    );
+    /// Read the versions a sandbox is running under. `vmm_binary` is the
+    /// VMM the sandbox runs on, asked for its version, and
+    /// `tools_drive_version` is the one the sandbox was given.
+    #[tracing::instrument(skip(sandbox))]
+    pub async fn probe(
+        sandbox: &impl SandboxExecutor,
+        vmm_binary: PathBuf,
+        tools_drive_version: String,
+    ) -> Result<Self> {
+        let (kernel_version, firecracker_version, envd_version) = tokio::join!(
+            probe_kernel_version(sandbox),
+            probe_vmm_version(vmm_binary.clone()),
+            probe_envd_version(sandbox),
+        );
 
-    Ok(SnapshotRuntimeVersions::new(
-        kernel_version,
-        firecracker_version,
-        envd_version,
-        tools_drive_version,
-    ))
+        let kernel_version = version_or_unknown("kernel", kernel_version);
+        let firecracker_version = version_or_unknown("vmm", firecracker_version);
+        let envd_version = envd_version?;
+
+        debug!(
+            kernel_version,
+            firecracker_version, envd_version, tools_drive_version, "probed runtime versions"
+        );
+
+        let mut versions = Self::new(
+            kernel_version,
+            firecracker_version,
+            envd_version,
+            tools_drive_version,
+        );
+        versions.firecracker_binary_sha256 = Some(
+            crate::digest::FileDigest::describe(&vmm_binary)
+                .await
+                .context("read template runtime identity")?
+                .sha256,
+        );
+        Ok(versions)
+    }
 }
 
 async fn probe_envd_version(sandbox: &impl SandboxExecutor) -> Result<String> {
@@ -75,27 +113,74 @@ async fn probe_kernel_version(sandbox: &impl SandboxExecutor) -> Result<String> 
     parse_kernel_version(&output.stdout)
 }
 
-async fn probe_vmm_version(vmm_binary: PathBuf) -> Result<String> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(5),
-        tokio::task::spawn_blocking(move || {
-            std::process::Command::new(&vmm_binary)
-                .arg("--version")
-                .output()
-                .with_context(|| {
-                    format!(
-                        "run firecracker version probe using {}",
-                        vmm_binary.display()
-                    )
-                })
-        }),
-    )
-    .await
-    .context("timed out waiting for firecracker version probe task")?
-    .context("join firecracker version probe task")??;
+async fn probe_vmm_version(binary: PathBuf) -> Result<String> {
+    parse_firecracker_version(&probe_vmm_output(binary, "--version", None).await?)
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+async fn probe_snapshot_format(binary: PathBuf, snapshot: Option<PathBuf>) -> Result<String> {
+    let flag = if snapshot.is_some() {
+        "--describe-snapshot"
+    } else {
+        "--snapshot-version"
+    };
+    let output = probe_vmm_output(binary, flag, snapshot).await?;
+    output
+        .lines()
+        .find_map(|line| {
+            let version = line.trim().strip_prefix('v')?;
+            let parts: Vec<_> = version.split('.').collect();
+            (parts.len() == 3 && parts.iter().all(|part| part.parse::<u64>().is_ok()))
+                .then(|| version.to_string())
+        })
+        .context("Firecracker did not report a snapshot format")
+}
+
+async fn probe_vmm_output(
+    vmm_binary: PathBuf,
+    flag: &'static str,
+    snapshot: Option<PathBuf>,
+) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+    let mut command = tokio::process::Command::new(&vmm_binary);
+    command
+        .arg(flag)
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(snapshot) = snapshot {
+        command.arg(snapshot);
+    }
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "run firecracker version probe using {}",
+            vmm_binary.display()
+        )
+    })?;
+    let mut stdout_pipe = child.stdout.take().context("missing probe stdout pipe")?;
+    let mut stderr_pipe = child.stderr.take().context("missing probe stderr pipe")?;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let collect = async {
+        let (status, _, _) = tokio::try_join!(
+            child.wait(),
+            stdout_pipe.read_to_end(&mut stdout),
+            stderr_pipe.read_to_end(&mut stderr)
+        )?;
+        Ok::<_, std::io::Error>(status)
+    };
+    let status = match tokio::time::timeout(Duration::from_secs(5), collect).await {
+        Ok(result) => result.context("wait for firecracker version probe")?,
+        Err(_) => {
+            // kill() also waits: a timeout never leaves a running or zombie child.
+            child
+                .kill()
+                .await
+                .context("terminate timed out firecracker version probe")?;
+            bail!("timed out waiting for firecracker version probe");
+        }
+    };
+    let stdout = String::from_utf8_lossy(&stdout);
+    let stderr = String::from_utf8_lossy(&stderr);
     let combined = if stderr.trim().is_empty() {
         stdout.into_owned()
     } else if stdout.trim().is_empty() {
@@ -104,10 +189,10 @@ async fn probe_vmm_version(vmm_binary: PathBuf) -> Result<String> {
         format!("{}\n{}", stdout.trim(), stderr.trim())
     };
 
-    if !output.status.success() {
+    if !status.success() {
         bail!(
             "firecracker version probe failed: status={}, output='{}'",
-            output.status.code().map_or_else(
+            status.code().map_or_else(
                 || "terminated by signal".to_string(),
                 |code| code.to_string()
             ),
@@ -115,7 +200,7 @@ async fn probe_vmm_version(vmm_binary: PathBuf) -> Result<String> {
         );
     }
 
-    parse_firecracker_version(&combined)
+    Ok(combined)
 }
 
 fn parse_envd_version(output: &str) -> Result<String> {
@@ -182,6 +267,90 @@ mod tests {
     use anyhow::anyhow;
 
     use super::*;
+
+    #[test]
+    fn legacy_metadata_has_no_invented_runtime_identity() {
+        let legacy = serde_json::json!({"kernel_version":"6.1.175", "firecracker_version":"source", "envd_version":"0.5.15", "tools_drive_version":"0.1.1"});
+        let metadata: SnapshotRuntimeVersions = serde_json::from_value(legacy).unwrap();
+        assert!(metadata.firecracker_binary_sha256.is_none());
+        assert!(metadata.firecracker_snapshot_version.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_runtime_identity_preserves_guest_versions() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let binary = dir.path().join("firecracker");
+        std::fs::write(&binary, "#!/bin/sh\ncase $1 in --version) echo 'Firecracker v1.15.1-patch-v1';; --snapshot-version|--describe-snapshot) echo v1000.0.0;; esac\n")?;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))?;
+        let mut metadata = SnapshotRuntimeVersions::new(
+            "6.1.175".into(),
+            "source-only".into(),
+            "captured-envd".into(),
+            "captured-tools".into(),
+        );
+        metadata
+            .refresh_firecracker(binary.clone(), dir.path().join("state.bin"))
+            .await?;
+        assert_eq!(metadata.firecracker_version, "1.15.1-patch-v1");
+        assert_eq!(
+            metadata.firecracker_binary_sha256,
+            Some(crate::digest::FileDigest::describe(&binary).await?.sha256)
+        );
+        assert_eq!(
+            metadata.firecracker_snapshot_version.as_deref(),
+            Some("1000.0.0")
+        );
+        assert_eq!(metadata.kernel_version, "6.1.175");
+        assert_eq!(metadata.envd_version, "captured-envd");
+        assert_eq!(metadata.tools_drive_version, "captured-tools");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn timed_out_and_cancelled_probes_reap_their_processes() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let binary = dir.path().join("probe");
+            let pid_file = dir.path().join("pid");
+            std::fs::write(
+                &binary,
+                format!(
+                    "#!/bin/sh\necho $$ > '{}'\nexec sleep 60\n",
+                    pid_file.display()
+                ),
+            )?;
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))?;
+            let task = tokio::spawn(probe_vmm_output(binary, "--version", None));
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while !pid_file.exists() {
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "probe did not start"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let pid = std::fs::read_to_string(&pid_file)?.trim().to_string();
+            if cancel {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                let error = task.await?.unwrap_err();
+                assert!(error.to_string().contains("timed out"), "{error:#}");
+            }
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while PathBuf::from(format!("/proc/{pid}")).exists() {
+                anyhow::ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "probe process was not reaped"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn parse_plain_semver() {

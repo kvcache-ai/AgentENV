@@ -286,9 +286,13 @@ impl TemplateBuildRunner {
                         ensure_default_user(&sandbox, &build_context).await?;
                         let startup = prepare_startup(startup, override_startup, &build_context);
                         run_startup_commands(&sandbox, startup.as_ref(), &logger).await?;
-                        let runtime_versions = crate::sandbox::probe_runtime_versions(
+                        let vmm_binary = sandbox
+                            .runtime_info()
+                            .firecracker_binary
+                            .unwrap_or(vmm_binary);
+                        let mut runtime_versions = crate::sandbox::probe_runtime_versions(
                             &sandbox,
-                            vmm_binary,
+                            vmm_binary.clone(),
                             tools_drive_version,
                         )
                         .await?;
@@ -296,6 +300,9 @@ impl TemplateBuildRunner {
                         info!("capturing template snapshot");
                         let (manifest, capture_artifacts) =
                             sandbox.capture_to_dir(&output_dir).await?;
+                        runtime_versions
+                            .refresh_firecracker(vmm_binary, output_dir.join("vm_state.bin"))
+                            .await?;
                         debug!("template snapshot captured");
 
                         Ok(TemplateBuildExecution {

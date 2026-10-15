@@ -1551,7 +1551,7 @@ where
             }
         };
 
-        let persisted_metadata = {
+        let mut persisted_metadata = {
             let mut metadata = self
                 .store
                 .get(&sandbox_id)
@@ -1561,15 +1561,45 @@ where
             metadata.paused_state = Some(paused_state.clone());
             metadata
         };
-        if let Err(err) = self
-            .persister
-            .persist_paused(
-                &persisted_metadata,
-                artifact_root.as_deref(),
-                paused_state.as_ref(),
-            )
-            .await
-        {
+        let mut attempted_persistence = false;
+        let persistence_result: anyhow::Result<()> = async {
+            if let Some(state) =
+                paused_state.downcast_ref::<crate::sandbox::FirecrackerPausedState>()
+            {
+                // Keep the executed binary descriptor alive through the probe.
+                let sandbox = handle.lock().await;
+                let binary = sandbox
+                    .runtime_info()
+                    .firecracker_binary
+                    .context("paused runtime executable is unavailable")?;
+                persisted_metadata
+                    .runtime_versions
+                    .refresh_firecracker(binary, state.snapshot_config().vm_state_path.clone())
+                    .await
+                    .context("read paused runtime identity")?;
+            }
+            attempted_persistence = true;
+            self.persister
+                .persist_paused(
+                    &persisted_metadata,
+                    artifact_root.as_deref(),
+                    paused_state.as_ref(),
+                )
+                .await
+                .map_err(anyhow::Error::new)
+        }
+        .await;
+        if let Err(err) = persistence_result {
+            // A probe failure occurs before the persister can clean its new root.
+            if !attempted_persistence {
+                if let Some(root) = artifact_root.as_deref() {
+                    if let Err(error) = tokio::fs::remove_dir_all(root).await {
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            warn!(error = %error, "failed to clean paused identity artifacts");
+                        }
+                    }
+                }
+            }
             warn!(error = ?err, "failed to persist paused sandbox state");
             let resume_result = {
                 let mut sandbox = handle.lock().await;
@@ -1921,13 +1951,34 @@ where
         };
 
         self.finish_snapshot_operation(sandbox_id).await?;
-        let metadata = match self.store.get(&sandbox_id).await? {
+        let mut metadata = match self.store.get(&sandbox_id).await? {
             Some(metadata) => metadata,
             None => {
                 warn!("sandbox disappeared after snapshotting");
                 return Err(OrchestratorError::SandboxNotFound(sandbox_id));
             }
         };
+
+        if let Some(artifacts) = captured_snapshot
+            .downcast_artifacts_ref::<crate::sandbox::FirecrackerCaptureArtifacts>()
+        {
+            metadata
+                .runtime_versions
+                .refresh_firecracker(
+                    artifacts.runtime_binary_path().ok_or_else(|| {
+                        OrchestratorError::InternalError(
+                            "captured runtime executable is unavailable".into(),
+                        )
+                    })?,
+                    artifacts.snapshot_config().vm_state_path.clone(),
+                )
+                .await
+                .map_err(|error| {
+                    OrchestratorError::InternalError(format!(
+                        "read captured runtime identity: {error:#}"
+                    ))
+                })?;
+        }
 
         info!("snapshot captured");
         Ok(SnapshotCaptureResult {

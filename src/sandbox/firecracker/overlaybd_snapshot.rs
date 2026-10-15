@@ -12,7 +12,6 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -45,21 +44,21 @@ const DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY: usize = 32;
 
 enum LiveOverlaybdSnapshotState {
     ReadOnly,
-    Restacked(PathBuf),
+    Restacked { live: PathBuf, staged: PathBuf },
 }
 
 impl LiveOverlaybdSnapshotState {
-    fn snapshot_layer_path(&self) -> Option<&Path> {
+    fn snapshot_layer_paths(&self) -> Option<(&Path, &Path)> {
         match self {
             Self::ReadOnly => None,
-            Self::Restacked(path) => Some(path.as_path()),
+            Self::Restacked { live, staged } => Some((live.as_path(), staged.as_path())),
         }
     }
 
     fn finish_staging(self, staged_snapshot: Result<PathBuf>) -> Result<PathBuf> {
         match self {
             Self::ReadOnly => staged_snapshot,
-            Self::Restacked(_) => staged_snapshot.map_err(into_terminal_snapshot_failure),
+            Self::Restacked { .. } => staged_snapshot.map_err(into_terminal_snapshot_failure),
         }
     }
 }
@@ -136,6 +135,14 @@ fn split_runtime_suffix(
 }
 
 fn link_or_copy_file_blocking(source: &Path, destination: &Path) -> std::io::Result<()> {
+    link_or_copy_file_blocking_with_sync(source, destination, fs::File::sync_all)
+}
+
+fn link_or_copy_file_blocking_with_sync(
+    source: &Path,
+    destination: &Path,
+    sync_destination: impl FnOnce(&fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     if source == destination {
         return Ok(());
     }
@@ -165,7 +172,11 @@ fn link_or_copy_file_blocking(source: &Path, destination: &Path) -> std::io::Res
     }
     let status = cmd.arg(source).arg(destination).status();
     match status {
-        Ok(status) if status.success() => Ok(()),
+        Ok(status) if status.success() => {
+            // A copied layer must be durable before its snapshot can be saved.
+            // Hard links above retain their existing path and do not enter here.
+            sync_destination(&fs::File::open(destination)?)
+        }
         Ok(status) => {
             let _ = fs::remove_file(destination);
             Err(std::io::Error::other(format!(
@@ -244,14 +255,6 @@ fn restack_target_upper_data_path(live_runtime_image_config_path: &Path) -> Resu
     Ok(PathBuf::from(image_config.upper.data))
 }
 
-fn on_same_filesystem(src_path: &Path, dst_dir: &Path) -> Result<bool> {
-    let src_meta = fs::metadata(src_path)
-        .with_context(|| format!("stat restack source path {}", src_path.display()))?;
-    let dst_meta = fs::metadata(dst_dir)
-        .with_context(|| format!("stat restack destination dir {}", dst_dir.display()))?;
-    Ok(src_meta.dev() == dst_meta.dev())
-}
-
 fn write_bytes_atomically(path: &Path, bytes: &[u8], description: &str) -> Result<()> {
     let parent = path.parent().with_context(|| {
         format!(
@@ -272,37 +275,6 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8], description: &str) -> Resul
             "persist {description} {} -> {}",
             temp_path.display(),
             path.display()
-        ))
-    })?;
-    Ok(())
-}
-
-async fn copy_file_atomically(src: &Path, dst: &Path, description: &str) -> Result<()> {
-    let parent = dst.parent().with_context(|| {
-        format!(
-            "{description} destination has no parent directory: {}",
-            dst.display()
-        )
-    })?;
-    let temp = tempfile::NamedTempFile::new_in(parent)
-        .with_context(|| format!("create temp {description} in {}", parent.display()))?;
-    let temp_path = temp.path().to_path_buf();
-    tokio::fs::copy(src, &temp_path).await.with_context(|| {
-        format!(
-            "copy {description} {} -> {}",
-            src.display(),
-            temp_path.display()
-        )
-    })?;
-    std::fs::File::open(&temp_path)
-        .with_context(|| format!("open temp {description} {}", temp_path.display()))?
-        .sync_all()
-        .with_context(|| format!("sync temp {description} {}", temp_path.display()))?;
-    temp.persist(dst).map_err(|error| {
-        anyhow::Error::new(error.error).context(format!(
-            "persist {description} {} -> {}",
-            temp_path.display(),
-            dst.display()
         ))
     })?;
     Ok(())
@@ -337,7 +309,7 @@ async fn rewrite_live_runtime_config_for_restack(
 pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
-    snapshot_layer_path: Option<&Path>,
+    snapshot_layer_paths: Option<(&Path, &Path)>,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -351,32 +323,44 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
             )
         })?;
 
-    let appended_layer = if let Some(snapshot_layer_path) = snapshot_layer_path {
-        let expected_snapshot_path = fs::canonicalize(snapshot_layer_path)
-            .unwrap_or_else(|_| snapshot_layer_path.to_path_buf());
-        let Some(latest_lower) = image_config.lowers.last() else {
-            anyhow::bail!(
+    let appended_layer =
+        if let Some((snapshot_layer_path, staged_layer_path)) = snapshot_layer_paths {
+            let expected_snapshot_path = fs::canonicalize(snapshot_layer_path)
+                .unwrap_or_else(|_| snapshot_layer_path.to_path_buf());
+            let Some(latest_lower) = image_config.lowers.last() else {
+                anyhow::bail!(
                 "restack snapshot expected latest lower to be the newly claimed sealed upper layer"
             );
+            };
+            let actual_snapshot_path = fs::canonicalize(&latest_lower.file)
+                .unwrap_or_else(|_| PathBuf::from(&latest_lower.file));
+            anyhow::ensure!(
+                actual_snapshot_path == expected_snapshot_path,
+                "restack snapshot expected latest lower {} but found {}",
+                expected_snapshot_path.display(),
+                actual_snapshot_path.display()
+            );
+            let mut lower = image_config.lowers.pop().expect("checked latest lower");
+            // The live device owns its sealed layer. A failed snapshot may remove
+            // only this independent link/copy, never the live runtime's path.
+            link_or_copy_runtime_layer(snapshot_layer_path, staged_layer_path).await?;
+            lower.file = staged_layer_path.display().to_string();
+            Some(lower)
+        } else {
+            None
         };
-        let actual_snapshot_path = fs::canonicalize(&latest_lower.file)
-            .unwrap_or_else(|_| PathBuf::from(&latest_lower.file));
-        anyhow::ensure!(
-            actual_snapshot_path == expected_snapshot_path,
-            "restack snapshot expected latest lower {} but found {}",
-            expected_snapshot_path.display(),
-            actual_snapshot_path.display()
-        );
-        Some(image_config.lowers.pop().expect("checked latest lower"))
-    } else {
-        None
-    };
 
-    let rewritten_lowers = rewrite_lowers_with_owned_runtime_suffix(
+    let mut runtime_roots = canonicalized_runtime_owned_roots().to_vec();
+    let live_dir = live_runtime_image_config_path
+        .parent()
+        .context("live runtime image config has no parent directory")?;
+    runtime_roots.push(fs::canonicalize(live_dir).unwrap_or_else(|_| live_dir.to_path_buf()));
+    let rewritten_lowers = rewrite_lowers_with_runtime_roots(
         image_config.lowers,
         output_dir,
         appended_layer,
         MANAGED_BASE_LAYER_FILE,
+        &runtime_roots,
         // Sealed rootfs layers always stay raw; compression happens once at
         // publish time under `[snapshot.publish_compression]`.
         OverlaybdCompactOutput::Raw,
@@ -494,53 +478,26 @@ async fn capture_live_overlaybd_snapshot(
         .context("resolve restack source upper path")?;
     let snapshot_layer_path = output_dir.join(snapshot_layer_file_name);
     prepare_specific_snapshot_layer_path(&snapshot_layer_path).await?;
-    let live_snapshot_layer_path = if on_same_filesystem(&live_upper_data_path, output_dir)
-        .context("validate restack snapshot filesystem precondition")?
-    {
-        snapshot_layer_path.clone()
-    } else {
-        let live_snapshot_layer_path = live_upper_data_path
-            .parent()
-            .context("restack source upper path has no parent directory")?
-            .join(snapshot_layer_file_name);
-        prepare_specific_snapshot_layer_path(&live_snapshot_layer_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "prepare same-filesystem restack snapshot layer {}",
-                    live_snapshot_layer_path.display()
-                )
-            })?;
-        live_snapshot_layer_path
-    };
+    // Seal in the runtime-owned directory on the upper's filesystem.
+    // Unique names preserve every previous lower across failed/repeated pauses.
+    let live_snapshot_layer_path = live_upper_data_path
+        .parent()
+        .context("restack source upper path has no parent directory")?
+        .join(format!("snapshot-{}.commit", uuid::Uuid::now_v7().simple()));
+    prepare_specific_snapshot_layer_path(&live_snapshot_layer_path).await?;
 
     let descriptor = UblkDeviceManager::global()
         .restack_snapshot_device(ublk_device, &live_snapshot_layer_path, kind)
         .await
         .context("request overlaybd restack snapshot from ublk device")?;
 
-    if live_snapshot_layer_path != snapshot_layer_path {
-        // If this cross-filesystem copy fails, leave the live runtime config
-        // untouched and surface a terminal pause failure. The daemon has
-        // already sealed the old upper and reopened a fresh one, so callers
-        // must not continue treating the live runtime as safely resumable.
-        copy_file_atomically(
-            &live_snapshot_layer_path,
-            &snapshot_layer_path,
-            "restack snapshot layer",
-        )
-        .await
-        .context("copy restack snapshot layer into managed snapshot dir")
-        .map_err(into_terminal_snapshot_failure)?;
-    }
-
     if let Some(descriptor) = descriptor.as_ref() {
-        let copied_size = tokio::fs::metadata(&snapshot_layer_path)
+        let copied_size = tokio::fs::metadata(&live_snapshot_layer_path)
             .await
             .with_context(|| {
                 format!(
                     "read restack snapshot layer metadata {}",
-                    snapshot_layer_path.display()
+                    live_snapshot_layer_path.display()
                 )
             })
             .map_err(into_terminal_snapshot_failure)?
@@ -559,14 +516,17 @@ async fn capture_live_overlaybd_snapshot(
 
     rewrite_live_runtime_config_for_restack(
         live_runtime_image_config_path,
-        &snapshot_layer_path,
+        &live_snapshot_layer_path,
         descriptor.as_ref(),
     )
     .await
     .context("rewrite live runtime config after restack snapshot")
     .map_err(into_terminal_snapshot_failure)?;
 
-    Ok(LiveOverlaybdSnapshotState::Restacked(snapshot_layer_path))
+    Ok(LiveOverlaybdSnapshotState::Restacked {
+        live: live_snapshot_layer_path,
+        staged: snapshot_layer_path,
+    })
 }
 
 pub(super) async fn build_mem_snapshot_image_config(
@@ -625,7 +585,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     let staged_snapshot = stage_overlaybd_snapshot_from_live_runtime(
         live_runtime_image_config_path,
         output_dir,
-        live_snapshot.snapshot_layer_path(),
+        live_snapshot.snapshot_layer_paths(),
     )
     .await;
 
@@ -807,6 +767,79 @@ mod tests {
     use bytes::Bytes;
     use firecracker_client::models::DirtyMemoryRange;
     use serde_json::json;
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn copy_fallback_cross_filesystem_syncs_destination() -> Result<()> {
+        // Linux /dev/shm supplies a second filesystem without mounting devices.
+        let source_dir = tempfile::tempdir_in("/dev/shm")?;
+        let destination_dir = tempfile::tempdir()?;
+        assert_ne!(
+            source_dir.path().metadata()?.dev(),
+            destination_dir.path().metadata()?.dev()
+        );
+        let source = source_dir.path().join("sealed.commit");
+        let destination = destination_dir.path().join("copied.commit");
+        let contents = vec![0x5a; 32 * 1024];
+        fs::write(&source, &contents)?;
+        link_or_copy_runtime_layer(&source, &destination).await?;
+        assert_eq!(fs::read(&destination)?, contents);
+        assert_eq!(fs::read(&source)?, contents);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn copy_fallback_waits_for_sync_and_propagates_failure() -> Result<()> {
+        for fail_sync in [false, true] {
+            let source_dir = tempfile::tempdir_in("/dev/shm")?;
+            let destination_dir = tempfile::tempdir()?;
+            assert_ne!(
+                source_dir.path().metadata()?.dev(),
+                destination_dir.path().metadata()?.dev()
+            );
+            let source = source_dir.path().join("sealed.commit");
+            let destination = destination_dir.path().join("copied.commit");
+            fs::write(&source, b"sealed disk data")?;
+            let synchronized = std::cell::Cell::new(false);
+            let result = link_or_copy_file_blocking_with_sync(&source, &destination, |file| {
+                // Copy completion alone cannot acknowledge the operation.
+                assert_eq!(fs::read(&destination)?, b"sealed disk data");
+                synchronized.set(true);
+                if fail_sync {
+                    Err(std::io::Error::from_raw_os_error(nix::libc::EIO))
+                } else {
+                    file.sync_all()
+                }
+            });
+            assert!(synchronized.get());
+            if fail_sync {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(nix::libc::EIO));
+            } else {
+                result?;
+            }
+            assert_eq!(fs::read(&source)?, b"sealed disk data");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn same_filesystem_link_does_not_enter_copy_sync() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let source = dir.path().join("sealed.commit");
+        let destination = dir.path().join("linked.commit");
+        fs::write(&source, b"sealed disk data")?;
+        link_or_copy_file_blocking_with_sync(&source, &destination, |_| {
+            panic!("hard-link path must not enter copy synchronization")
+        })?;
+        assert_eq!(source.metadata()?.ino(), destination.metadata()?.ino());
+        link_or_copy_file_blocking_with_sync(&source, &source, |_| {
+            panic!("existing path must not enter copy synchronization")
+        })?;
+        fs::remove_file(&destination)?;
+        assert_eq!(fs::read(&source)?, b"sealed disk data");
+        Ok(())
+    }
 
     #[test]
     fn dirty_ranges_to_segment_mappings_splits_large_ranges() {
@@ -1170,7 +1203,7 @@ mod tests {
         let output_path = stage_overlaybd_snapshot_from_live_runtime(
             &live_runtime_image_config_path,
             &output_dir,
-            Some(&snapshot_lower),
+            Some((&snapshot_lower, &snapshot_lower)),
         )
         .await
         .expect("stage snapshot");
@@ -1181,6 +1214,53 @@ mod tests {
         assert_eq!(PathBuf::from(&latest.file), snapshot_lower);
         assert_eq!(latest.digest, "sha256:descriptor");
         assert_eq!(latest.size, 8);
+    }
+
+    #[tokio::test]
+    async fn discarded_snapshot_keeps_live_layers_and_retry_owns_its_lowers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let live = temp.path().join("live");
+        fs::create_dir_all(&live)?;
+        let config = live.join("image.json");
+        let first = live.join("first.commit");
+        fs::write(&first, b"first writes")?;
+        fs::write(
+            &config,
+            serde_json::to_vec(&ImageConfig {
+                lowers: vec![local_layer_config(&first)],
+                ..Default::default()
+            })?,
+        )?;
+        let discarded = temp.path().join("discarded");
+        stage_overlaybd_snapshot_from_live_runtime(
+            &config,
+            &discarded,
+            Some((&first, &discarded.join("snapshot.commit"))),
+        )
+        .await?;
+        fs::remove_dir_all(&discarded)?;
+        assert_eq!(fs::read(&first)?, b"first writes");
+        let second = live.join("second.commit");
+        fs::write(&second, b"writes after rollback")?;
+        rewrite_live_runtime_config_for_restack(&config, &second, None).await?;
+        let retry = temp.path().join("retry");
+        let staged = stage_overlaybd_snapshot_from_live_runtime(
+            &config,
+            &retry,
+            Some((&second, &retry.join("snapshot.commit"))),
+        )
+        .await?;
+        let saved = overlaybd::config::load_image_config(&staged)?;
+        assert_eq!(saved.lowers.len(), 2);
+        assert!(saved
+            .lowers
+            .iter()
+            .all(|layer| Path::new(&layer.file).starts_with(&retry)));
+        // Successful pause can destroy the source runtime after persisting.
+        fs::remove_dir_all(&live)?;
+        assert_eq!(fs::read(&saved.lowers[0].file)?, b"first writes");
+        assert_eq!(fs::read(&saved.lowers[1].file)?, b"writes after rollback");
+        Ok(())
     }
 
     #[tokio::test]

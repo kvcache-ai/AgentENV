@@ -46,6 +46,7 @@ pub(crate) struct WarmFirecracker {
     pub slot: Slot,
     pub fc_instance: FirecrackerInstance,
     pub work_dir: TempDir,
+    binary_identity: (u64, u64),
 }
 
 pub struct FirecrackerPool {
@@ -137,12 +138,27 @@ impl FirecrackerPool {
         });
     }
 
-    pub(crate) fn try_acquire(&self, capture_output: bool) -> Option<WarmFirecracker> {
+    pub(crate) async fn try_acquire(
+        &self,
+        binary: &Path,
+        capture_output: bool,
+    ) -> Option<WarmFirecracker> {
         // Stdio destinations are fixed when the warm process is spawned.
         if capture_output != self.capture_output {
             return None;
         }
         let warm = self.pool.try_acquire()?;
+        // Capture the executable identity when spawning. Capability-constrained
+        // nodes cannot always inspect /proc/<pid>/exe, and software versions may
+        // be identical across incompatible runtime builds.
+        let matches = executable_identity(binary).ok() == Some(warm.binary_identity);
+        if !matches {
+            if let Err(err) = self.cleanup_warm_async(warm).await {
+                warn!(error = %err, "failed to discard warm process from a different runtime");
+            }
+            self.pool.request_maintenance();
+            return None;
+        }
         if self.pool.len() < self.pool.config().low_watermark {
             self.pool.request_maintenance();
         }
@@ -296,6 +312,8 @@ impl FirecrackerPool {
 
     #[tracing::instrument(skip(self))]
     async fn create_warm_async(&self) -> Result<WarmFirecracker> {
+        let binary_identity = executable_identity(&self.binary)
+            .context("firecracker pool: read executable identity")?;
         let slot = NetworkManager::global()
             .allocate_any()
             .context("firecracker pool: allocate network slot")?;
@@ -324,7 +342,12 @@ impl FirecrackerPool {
             fc_instance
                 .wait_for_ready(self.socket_timeout, self.socket_poll_interval)
                 .await
-                .context("wait for warm firecracker api socket")
+                .context("wait for warm firecracker api socket")?;
+            anyhow::ensure!(
+                executable_identity(&self.binary)? == binary_identity,
+                "firecracker executable changed while creating a warm process"
+            );
+            Ok(())
         }
         .await;
 
@@ -343,6 +366,7 @@ impl FirecrackerPool {
             slot,
             fc_instance,
             work_dir,
+            binary_identity,
         })
     }
 
@@ -355,6 +379,7 @@ impl FirecrackerPool {
             slot,
             mut fc_instance,
             work_dir,
+            ..
         } = warm;
         let slot_idx = slot.idx;
 
@@ -388,6 +413,7 @@ impl FirecrackerPool {
             slot,
             mut fc_instance,
             work_dir,
+            ..
         } = warm;
         let slot_idx = slot.idx;
 
@@ -405,6 +431,12 @@ impl FirecrackerPool {
             .cleanup_allocated_slot(slot, false)
             .context("firecracker pool: cleanup warm network slot")
     }
+}
+
+fn executable_identity(path: &Path) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path)?;
+    Ok((metadata.dev(), metadata.ino()))
 }
 
 fn firecracker_pool_cleanup_result(failures: Vec<String>) -> Result<()> {
@@ -426,4 +458,24 @@ pub(crate) fn warm_stdio_paths(
         capture_output.then(|| work_dir.join("firecracker-stdout.log")),
         capture_output.then(|| work_dir.join("firecracker-stderr.log")),
     )
+}
+
+#[cfg(test)]
+mod runtime_identity_tests {
+    use super::executable_identity;
+
+    #[test]
+    fn distinguishes_executables_without_using_version_strings() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let old = dir.path().join("old");
+        let new = dir.path().join("new");
+        let alias = dir.path().join("alias");
+        std::fs::write(&old, b"same reported software version, old runtime")?;
+        std::fs::write(&new, b"same reported software version, new runtime")?;
+        std::fs::hard_link(&new, &alias)?;
+        assert_ne!(executable_identity(&old)?, executable_identity(&new)?);
+        assert_eq!(executable_identity(&new)?, executable_identity(&alias)?);
+        assert!(executable_identity(&dir.path().join("missing")).is_err());
+        Ok(())
+    }
 }

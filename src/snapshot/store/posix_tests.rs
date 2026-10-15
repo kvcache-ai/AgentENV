@@ -402,3 +402,46 @@ async fn store_snapshot_preserves_zfile_memory_lower_bytes() {
         1
     );
 }
+
+#[tokio::test]
+async fn unique_descriptorless_inherited_delta_is_published_with_content_identity() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let repository = test_repository(tempdir.path());
+    let snapshot_id = SnapshotId::generate();
+    let local_dir = tempdir.path().join("local");
+    let (_, _, manifest) = write_mock_built_artifacts(&local_dir).expect("mock artifacts");
+    let inherited = local_dir.join("rootfs/inherited-layers/0000");
+    fs::create_dir_all(&inherited).expect("inherited directory");
+    let source = inherited.join("snapshot-0123456789abcdef0123456789abcdef.commit");
+    write_zfile_lsmt_layer(&source).await;
+    let expected = FileDigest::describe_blocking(&source).expect("source identity");
+    fs::write(
+        &manifest.rootfs.image_config_path,
+        serde_json::to_vec(&serde_json::json!({"lowers":[{"file":source}]})).unwrap(),
+    )
+    .expect("descriptorless image config");
+    let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
+        .await
+        .expect("publish unique inherited delta");
+    let crate::snapshot::OverlaybdLayerRef::Managed(layer) = &built.rootfs_layers[0] else {
+        panic!("expected managed layer");
+    };
+    assert_eq!(layer.digest, expected.sha256);
+    assert_eq!(layer.size, expected.size);
+    assert_eq!(
+        fs::read(tempdir.path().join(layer_file(&layer.digest))).unwrap(),
+        fs::read(&source).unwrap()
+    );
+    let arbitrary = inherited.join("unrelated.commit");
+    fs::copy(&source, &arbitrary).expect("arbitrary layer");
+    fs::write(
+        &manifest.rootfs.image_config_path,
+        serde_json::to_vec(&serde_json::json!({"lowers":[{"file":arbitrary}]})).unwrap(),
+    )
+    .expect("arbitrary descriptorless config");
+    assert!(
+        store_snapshot(&repository, &metadata(&SnapshotId::generate()), &manifest)
+            .await
+            .is_err()
+    );
+}

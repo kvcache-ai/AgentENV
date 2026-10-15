@@ -81,17 +81,19 @@ where
 /// Spawn a Tokio command from a short-lived thread with an exact capability set.
 ///
 /// `before_capability_scope` runs on the launcher thread before its capabilities
-/// are replaced, allowing namespace entry that requires `CAP_SYS_ADMIN`. The
+/// are replaced, allowing namespace entry that requires `CAP_SYS_ADMIN`. Its
+/// returned guard stays alive until the command has been spawned. The
 /// launcher thread then scopes its capabilities and uses the normal command
 /// spawn path, so the multi-threaded server process does not need a `pre_exec`
 /// hook and remains eligible for `posix_spawn`.
-pub async fn spawn_tokio_command_scoped<F>(
+pub async fn spawn_tokio_command_scoped<F, T>(
     mut command: tokio::process::Command,
     capabilities: &'static [i32],
     before_capability_scope: F,
 ) -> io::Result<tokio::process::Child>
 where
-    F: FnOnce() -> io::Result<()> + Send + 'static,
+    F: FnOnce() -> io::Result<T> + Send + 'static,
+    T: Send + 'static,
 {
     let runtime = tokio::runtime::Handle::try_current().map_err(|err| {
         io::Error::other(format!(
@@ -104,7 +106,7 @@ where
         .name("aenv-process-launcher".to_string())
         .spawn(move || {
             let result = (|| {
-                before_capability_scope()?;
+                let _launch_guard = before_capability_scope()?;
                 linux_cap::configure_current_process_capabilities(capabilities)?;
 
                 let _runtime_guard = runtime.enter();
@@ -213,6 +215,19 @@ mod tests {
         let sets = linux_cap::CapabilitySets::from_proc_status(status).unwrap();
         assert!(sets.is_delegable(CAP_NET_ADMIN).unwrap());
         assert!(!sets.is_delegable(CAP_SYS_ADMIN).unwrap());
+    }
+
+    #[tokio::test]
+    async fn scoped_spawn_keeps_executable_guard_until_exec() -> Result<()> {
+        let file = fs::File::open("/bin/echo")?;
+        let mut command =
+            tokio::process::Command::new(format!("/proc/self/fd/{}", file.as_raw_fd()));
+        command.arg("held-launch-file").stdout(Stdio::piped());
+        let child = spawn_tokio_command_scoped(command, &[], move || Ok(file)).await?;
+        let output = child.wait_with_output().await?;
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"held-launch-file\n");
+        Ok(())
     }
 
     #[tokio::test]

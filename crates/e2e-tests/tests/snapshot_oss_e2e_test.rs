@@ -34,6 +34,8 @@ fn test_runtime_versions() -> SnapshotRuntimeVersions {
     SnapshotRuntimeVersions {
         kernel_version: "kernel".to_string(),
         firecracker_version: "fc".to_string(),
+        firecracker_binary_sha256: None,
+        firecracker_snapshot_version: None,
         envd_version: "envd".to_string(),
         tools_drive_version: "0.1.0".to_string(),
     }
