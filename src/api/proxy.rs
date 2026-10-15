@@ -17,12 +17,12 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use hyper::body::Incoming;
+use hyper::{body::Incoming, upgrade};
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
 };
-use tokio::{sync::watch, time::timeout};
+use tokio::{io::copy_bidirectional, net::TcpStream, sync::watch, time::timeout};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{
@@ -308,12 +308,17 @@ async fn proxy_request(
     forward_path: String,
 ) -> Response<Body> {
     let is_websocket_request = is_websocket_upgrade_request(request.headers());
+    let is_connect_request = request.method() == Method::CONNECT;
     let (parts, body) = request.into_parts();
     let resolved =
         match resolve_proxy_request(api_impl, &forward_path, &parts, is_websocket_request).await {
             Ok(resolved) => resolved,
             Err(error) => return proxy_error_response(&error),
         };
+
+    if is_connect_request {
+        return proxy_connect_request(parts, resolved).await;
+    }
 
     if is_websocket_request {
         return proxy_websocket_request(websocket_upgrade, parts, resolved).await;
@@ -518,6 +523,96 @@ async fn proxy_http_request(
     };
 
     map_upstream_response(upstream_response)
+}
+
+/// Tunnels an HTTP CONNECT request to the resolved sandbox as a raw TCP stream.
+/// The CONNECT authority is ignored; routing headers select the sandbox and
+/// port, and everything after the 200 response is forwarded byte-for-byte.
+async fn proxy_connect_request(
+    parts: http::request::Parts,
+    resolved: ResolvedProxyRequest,
+) -> Response<Body> {
+    let ResolvedProxyRequest {
+        sandbox_id,
+        upstream_uri,
+        ..
+    } = resolved;
+
+    // The CONNECT upgrade mechanism only exists on HTTP/1.1.
+    if parts.version != http::Version::HTTP_11 {
+        debug!(
+            sandbox_id = %sandbox_id,
+            version = ?parts.version,
+            "rejecting CONNECT tunnel over non-HTTP/1.1 connection"
+        );
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
+
+    let Some(authority) = upstream_uri
+        .authority()
+        .map(|authority| authority.as_str().to_owned())
+    else {
+        return StatusCode::BAD_GATEWAY.into_response();
+    };
+
+    // Connect upstream before replying so unreachable sandbox ports still
+    // produce an HTTP error instead of a silently broken tunnel.
+    let mut upstream = match timeout(
+        PROXY_CONNECT_TIMEOUT,
+        TcpStream::connect(authority.as_str()),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => {
+            debug!(
+                sandbox_id = %sandbox_id,
+                upstream = %authority,
+                error = %err,
+                "failed to connect to sandbox for CONNECT tunnel"
+            );
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+        Err(_) => {
+            warn!(
+                sandbox_id = %sandbox_id,
+                upstream = %authority,
+                timeout_ms = PROXY_CONNECT_TIMEOUT.as_millis(),
+                "timed out connecting to sandbox for CONNECT tunnel"
+            );
+            return StatusCode::GATEWAY_TIMEOUT.into_response();
+        }
+    };
+    if let Err(err) = upstream.set_nodelay(true) {
+        debug!(sandbox_id = %sandbox_id, error = %err, "failed to set TCP_NODELAY on CONNECT tunnel");
+    }
+
+    tokio::spawn(async move {
+        // The upgrade only completes once hyper flushes the 200 response, so
+        // it must be awaited from a separate task.
+        let mut upgraded = match upgrade::on(Request::from_parts(parts, Body::empty())).await {
+            Ok(upgraded) => hyper_util::rt::TokioIo::new(upgraded),
+            Err(err) => {
+                debug!(sandbox_id = %sandbox_id, error = %err, "CONNECT client upgrade failed");
+                return;
+            }
+        };
+        match copy_bidirectional(&mut upgraded, &mut upstream).await {
+            Ok((client_to_upstream, upstream_to_client)) => {
+                trace!(
+                    sandbox_id = %sandbox_id,
+                    client_to_upstream,
+                    upstream_to_client,
+                    "CONNECT tunnel closed"
+                );
+            }
+            Err(err) => {
+                debug!(sandbox_id = %sandbox_id, error = %err, "CONNECT tunnel terminated");
+            }
+        }
+    });
+
+    StatusCode::OK.into_response()
 }
 
 fn track_request_body_activity(body: Body) -> (Body, watch::Receiver<()>) {
@@ -1710,6 +1805,25 @@ mod tests {
         }
     }
 
+    async fn start_tcp_echo_server() -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = socket.split();
+                    let _ = tokio::io::copy(&mut reader, &mut writer).await;
+                });
+            }
+        });
+        addr
+    }
+
     async fn build_api() -> Arc<ApiImpl> {
         build_api_with_sandbox_proxy_domains(Vec::new()).await
     }
@@ -1829,6 +1943,19 @@ mod tests {
 
     async fn start_proxy_server(sandbox_id: &SandboxId) -> SocketAddr {
         spawn_upstream(proxy_app_for_sandbox(sandbox_id).await).await
+    }
+
+    async fn read_http_response_head(stream: &mut tokio::net::TcpStream) -> String {
+        let mut response = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let bytes_read = stream.read(&mut buffer).await.unwrap();
+            assert!(bytes_read > 0, "connection closed before response head");
+            response.extend_from_slice(&buffer[..bytes_read]);
+            if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                return String::from_utf8(response).unwrap();
+            }
+        }
     }
 
     async fn get_status(app: &axum::Router, uri: &str, headers: &[(&str, &str)]) -> StatusCode {
@@ -3157,6 +3284,141 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from_static(b"16"));
+    }
+
+    #[tokio::test]
+    async fn proxy_connect_tunnels_raw_tcp_via_header_route() {
+        let upstream_addr = start_tcp_echo_server().await;
+        let sandbox_id = SandboxId::new();
+        let proxy_addr = start_proxy_server(&sandbox_id).await;
+
+        let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "CONNECT ignored.example:443 HTTP/1.1\r\n\
+                     Host: ignored.example:443\r\n\
+                     {SANDBOX_ID_HEADER}: {sandbox_id}\r\n\
+                     {TARGET_PORT_HEADER}: {port}\r\n\
+                     \r\n",
+                    port = upstream_addr.port(),
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let head = read_http_response_head(&mut stream).await;
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "unexpected CONNECT response: {head}"
+        );
+
+        // The tunnel forwards bytes in both directions and stays open.
+        for payload in [b"ping".as_slice(), b"second message".as_slice()] {
+            stream.write_all(payload).await.unwrap();
+            let mut echoed = vec![0_u8; payload.len()];
+            stream.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(echoed, payload);
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_connect_tunnels_raw_tcp_via_host_route() {
+        let upstream_addr = start_tcp_echo_server().await;
+        let sandbox_id = SandboxId::new();
+        let domain = "sandbox.example.invalid";
+        let (app, access_token) =
+            proxy_app_for_sandbox_with_domains(&sandbox_id, vec![domain.to_string()]).await;
+        let proxy_addr = spawn_upstream(app).await;
+        let authority = format!("{}-{sandbox_id}.{domain}", upstream_addr.port());
+
+        let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        stream
+            .write_all(
+                format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n{TRAFFIC_ACCESS_TOKEN_HEADER}: {access_token}\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let head = read_http_response_head(&mut stream).await;
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "unexpected CONNECT response: {head}"
+        );
+
+        stream.write_all(b"ping").await.unwrap();
+        let mut echoed = [0_u8; 4];
+        stream.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(&echoed, b"ping");
+    }
+
+    /// Finds an ephemeral port that is verifiably refusing connections. A
+    /// bind-then-drop port can be snatched by a parallel test between the
+    /// drop and the connect, so verify with a real connection attempt and
+    /// retry on collision.
+    async fn refusing_local_port() -> u16 {
+        for _ in 0..10 {
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            if tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                .await
+                .is_err()
+            {
+                return port;
+            }
+        }
+        panic!("failed to find a refusing local port");
+    }
+
+    #[tokio::test]
+    async fn proxy_connect_returns_bad_gateway_for_unreachable_sandbox_port() {
+        let closed_port = refusing_local_port().await;
+
+        let sandbox_id = SandboxId::new();
+        let proxy_addr = start_proxy_server(&sandbox_id).await;
+
+        let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "CONNECT ignored.example:443 HTTP/1.1\r\n\
+                     Host: ignored.example:443\r\n\
+                     {SANDBOX_ID_HEADER}: {sandbox_id}\r\n\
+                     {TARGET_PORT_HEADER}: {closed_port}\r\n\
+                     \r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let head = read_http_response_head(&mut stream).await;
+        assert!(
+            head.starts_with("HTTP/1.1 502"),
+            "unexpected CONNECT response: {head}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_connect_requires_routing_headers() {
+        let sandbox_id = SandboxId::new();
+        let proxy_addr = start_proxy_server(&sandbox_id).await;
+
+        let mut stream = tokio::net::TcpStream::connect(proxy_addr).await.unwrap();
+        stream
+            .write_all(b"CONNECT ignored.example:443 HTTP/1.1\r\nHost: ignored.example:443\r\n\r\n")
+            .await
+            .unwrap();
+
+        let head = read_http_response_head(&mut stream).await;
+        assert!(
+            head.starts_with("HTTP/1.1 401"),
+            "unexpected CONNECT response: {head}"
+        );
     }
 
     #[tokio::test]
