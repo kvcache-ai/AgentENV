@@ -75,13 +75,13 @@ build:
 	$(CARGO) build
 
 release:
-	$(CARGO) build --release
+	$(CARGO) build --release --features p2p-iroh
 
 build-server:
 	$(CARGO) build -p agentenv --bin server
 
 build-server-release:
-	$(CARGO) build --release -p agentenv --bin server
+	$(CARGO) build --release -p agentenv --bin server --features p2p-iroh
 
 build-snapshot-image:
 	$(CARGO) build -p agentenv --bin aenv-snapshot-image
@@ -225,7 +225,7 @@ start-server:
 
 start-server-release:
 	$(MAKE) install-ublk PROFILE=release
-	$(CAPABILITY_RUNNER) $(CARGO) run --release --bin server
+	$(CAPABILITY_RUNNER) $(CARGO) run --release --bin server --features p2p-iroh
 
 deploy-up:
 	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" $(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) up --build -d
