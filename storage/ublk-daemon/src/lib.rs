@@ -10,7 +10,7 @@ pub use client::{
 pub use overlaybd::RestackSnapshotTerminalFailure;
 pub use protocol::{
     AccessMode, DaemonRequest, DaemonResponse, DeviceRole, DeviceSpec, FailedRecovery,
-    ResizeToolSpec, RestackSnapshotResult, SourceStateStrategy,
+    ResizeToolSpec, SnapshotDeviceResult, SourceStateStrategy,
 };
 pub use server::UblkDaemonServer;
 pub use warm_pool::PoolConfig;
