@@ -1,4 +1,8 @@
-use std::path::PathBuf;
+use std::fs::File;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -26,7 +30,7 @@ impl SnapshotRuntimeVersions {
     ) -> Result<()> {
         let (version, digest, format) = tokio::join!(
             probe_vmm_version(binary.clone()),
-            crate::digest::FileDigest::describe(&binary),
+            describe_firecracker_binary(&binary),
             probe_snapshot_format(binary.clone(), Some(snapshot)),
         );
         let digest = digest.context("read Firecracker binary identity")?;
@@ -34,6 +38,27 @@ impl SnapshotRuntimeVersions {
         self.firecracker_version = version_or_unknown("vmm", version);
         self.firecracker_binary_sha256 = Some(digest.sha256);
         self.firecracker_snapshot_version = Some(format);
+        Ok(())
+    }
+
+    /// Reuse this build's executable identity, but validate the captured state.
+    pub(crate) async fn refresh_firecracker_after_capture(
+        &mut self,
+        binary: PathBuf,
+        snapshot: PathBuf,
+        probed_binary: &File,
+    ) -> Result<()> {
+        let before = probed_binary
+            .metadata()
+            .context("read probed executable identity")?;
+        let after = std::fs::metadata(&binary).context("read captured executable identity")?;
+        if (before.dev(), before.ino()) != (after.dev(), after.ino())
+            || self.firecracker_binary_sha256.is_none()
+        {
+            return self.refresh_firecracker(binary, snapshot).await;
+        }
+        self.firecracker_snapshot_version =
+            Some(probe_snapshot_format(binary, Some(snapshot)).await?);
         Ok(())
     }
 
@@ -68,13 +93,31 @@ impl SnapshotRuntimeVersions {
             tools_drive_version,
         );
         versions.firecracker_binary_sha256 = Some(
-            crate::digest::FileDigest::describe(&vmm_binary)
+            describe_firecracker_binary(&vmm_binary)
                 .await
                 .context("read template runtime identity")?
                 .sha256,
         );
         Ok(versions)
     }
+}
+
+fn spawn_firecracker_digest(
+    binary: Arc<File>,
+) -> tokio::task::JoinHandle<std::io::Result<crate::digest::FileDigest>> {
+    tokio::task::spawn_blocking(move || {
+        // This task owns the descriptor even if its awaiting future is cancelled.
+        let path = PathBuf::from(format!("/proc/self/fd/{}", binary.as_raw_fd()));
+        crate::digest::FileDigest::describe_blocking(&path)
+    })
+}
+
+async fn describe_firecracker_binary(binary: &Path) -> Result<crate::digest::FileDigest> {
+    let binary = Arc::new(File::open(binary).context("retain executable for identity hashing")?);
+    spawn_firecracker_digest(binary)
+        .await
+        .context("join Firecracker identity hashing task")?
+        .context("hash retained Firecracker executable")
 }
 
 async fn probe_envd_version(sandbox: &impl SandboxExecutor) -> Result<String> {
@@ -349,6 +392,155 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn queued_hash_owns_executable_after_replacement_and_cancellation() -> Result<()> {
+        use std::sync::mpsc;
+        for cancel in [false, true] {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(1)
+                .enable_all()
+                .build()?;
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let blocker = rt.spawn_blocking(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            entered_rx.recv_timeout(Duration::from_secs(2))?;
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("runtime");
+            std::fs::write(&path, b"original executable")?;
+            let expected = crate::digest::FileDigest::describe_blocking(&path)?;
+            let file = Arc::new(File::open(&path)?);
+            let weak = Arc::downgrade(&file);
+            let hash = {
+                let _entered = rt.enter();
+                spawn_firecracker_digest(file.clone())
+            };
+            let replacement = dir.path().join("replacement");
+            std::fs::write(&replacement, b"replacement executable")?;
+            std::fs::rename(&replacement, &path)?;
+            drop(file);
+            if cancel {
+                let waiter = rt.spawn(hash);
+                waiter.abort();
+                assert!(rt.block_on(waiter).unwrap_err().is_cancelled());
+                assert!(weak.upgrade().is_some(), "queued task lost its executable");
+                release_tx.send(())?;
+                rt.block_on(blocker)?;
+                // With one blocking worker this fence follows the queued hash.
+                rt.block_on(rt.spawn_blocking(|| ()))?;
+            } else {
+                release_tx.send(())?;
+                assert_eq!(rt.block_on(hash)??, expected);
+                rt.block_on(blocker)?;
+            }
+            assert!(
+                weak.upgrade().is_none(),
+                "finished hash retained its executable"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_hash_propagates_open_and_read_errors() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        assert!(describe_firecracker_binary(&dir.path().join("missing"))
+            .await
+            .is_err());
+        assert!(describe_firecracker_binary(dir.path()).await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn same_build_reuses_identity_but_validates_each_snapshot() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let binary = dir.path().join("firecracker");
+        let calls = dir.path().join("calls");
+        std::fs::write(&binary, format!(
+            "#!/bin/sh\necho \"$1\" >> '{}'\ncase $1 in --version) echo 'Firecracker v1.15.1';; --describe-snapshot) test \"$(cat \"$2\")\" = valid || exit 3; echo v1000.0.0;; esac\n",
+            calls.display()
+        ))?;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))?;
+        let pinned = File::open(&binary)?;
+        let mut metadata = SnapshotRuntimeVersions::new(
+            "6.1.175".into(),
+            probe_vmm_version(binary.clone()).await?,
+            "envd".into(),
+            "tools".into(),
+        );
+        metadata.firecracker_binary_sha256 =
+            Some(describe_firecracker_binary(&binary).await?.sha256);
+        // A distinct cached digest makes any accidental rehash observable.
+        let actual_digest = metadata.firecracker_binary_sha256.clone();
+        metadata.firecracker_binary_sha256 = Some(format!("sha256:{}", "0".repeat(64)));
+        let digest = metadata.firecracker_binary_sha256.clone();
+        assert_ne!(digest, actual_digest);
+        let state = dir.path().join("state.bin");
+        std::fs::write(&state, "valid")?;
+        metadata
+            .refresh_firecracker_after_capture(binary.clone(), state.clone(), &pinned)
+            .await?;
+        assert_eq!(metadata.firecracker_binary_sha256, digest);
+        assert_eq!(metadata.firecracker_version, "1.15.1");
+        assert_eq!(
+            metadata.firecracker_snapshot_version.as_deref(),
+            Some("1000.0.0")
+        );
+        std::fs::write(&state, "corrupt")?;
+        assert!(metadata
+            .refresh_firecracker_after_capture(binary, state, &pinned)
+            .await
+            .is_err());
+        assert_eq!(
+            std::fs::read_to_string(calls)?,
+            "--version\n--describe-snapshot\n--describe-snapshot\n"
+        );
+        assert_eq!(metadata.firecracker_binary_sha256, digest);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn changed_build_executable_refreshes_identity() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir()?;
+        let binary = dir.path().join("firecracker");
+        std::fs::write(&binary, "original executable")?;
+        let pinned = File::open(&binary)?;
+        let old_digest = describe_firecracker_binary(&binary).await?.sha256;
+        let mut metadata = SnapshotRuntimeVersions::new(
+            "kernel".into(),
+            "old".into(),
+            "envd".into(),
+            "tools".into(),
+        );
+        metadata.firecracker_binary_sha256 = Some(old_digest.clone());
+        let replacement = dir.path().join("replacement");
+        std::fs::write(&replacement, "#!/bin/sh\ncase $1 in --version) echo 'Firecracker v2.0.0';; --describe-snapshot) echo v1000.0.0;; esac\n")?;
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::rename(replacement, &binary)?;
+        metadata
+            .refresh_firecracker_after_capture(
+                binary.clone(),
+                dir.path().join("state.bin"),
+                &pinned,
+            )
+            .await?;
+        assert_eq!(metadata.firecracker_version, "2.0.0");
+        assert_ne!(metadata.firecracker_binary_sha256, Some(old_digest));
+        assert_eq!(
+            metadata.firecracker_binary_sha256,
+            Some(describe_firecracker_binary(&binary).await?.sha256)
+        );
+        assert_eq!(metadata.kernel_version, "kernel");
+        assert_eq!(metadata.envd_version, "envd");
+        assert_eq!(metadata.tools_drive_version, "tools");
         Ok(())
     }
 
