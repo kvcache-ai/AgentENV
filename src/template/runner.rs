@@ -286,9 +286,15 @@ impl TemplateBuildRunner {
                         ensure_default_user(&sandbox, &build_context).await?;
                         let startup = prepare_startup(startup, override_startup, &build_context);
                         run_startup_commands(&sandbox, startup.as_ref(), &logger).await?;
-                        let runtime_versions = crate::sandbox::probe_runtime_versions(
+                        let vmm_binary = sandbox
+                            .runtime_info()
+                            .firecracker_binary
+                            .unwrap_or(vmm_binary);
+                        let probed_binary = std::fs::File::open(&vmm_binary)
+                            .context("retain template runtime executable")?;
+                        let mut runtime_versions = crate::sandbox::probe_runtime_versions(
                             &sandbox,
-                            vmm_binary,
+                            vmm_binary.clone(),
                             tools_drive_version,
                         )
                         .await?;
@@ -296,6 +302,22 @@ impl TemplateBuildRunner {
                         info!("capturing template snapshot");
                         let (manifest, capture_artifacts) =
                             sandbox.capture_to_dir(&output_dir).await?;
+                        let captured_binary = capture_artifacts
+                            .as_deref()
+                            .and_then(|artifacts| {
+                                artifacts
+                                    .downcast_ref::<crate::sandbox::FirecrackerCaptureArtifacts>()
+                            })
+                            .and_then(|artifacts| artifacts.runtime_binary_path())
+                            .or_else(|| sandbox.runtime_info().firecracker_binary)
+                            .unwrap_or(vmm_binary);
+                        runtime_versions
+                            .refresh_firecracker_after_capture(
+                                captured_binary,
+                                output_dir.join("vm_state.bin"),
+                                &probed_binary,
+                            )
+                            .await?;
                         debug!("template snapshot captured");
 
                         Ok(TemplateBuildExecution {

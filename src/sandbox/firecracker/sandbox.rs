@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -223,11 +224,20 @@ pub struct FirecrackerCaptureArtifacts {
     snapshot_config: FirecrackerSnapshotConfig,
     snapshot_dir: PathBuf,
     snapshot_root: Arc<PersistentSnapshotRootGuard>,
+    runtime_binary: Option<Arc<fs::File>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct FirecrackerPausedState {
     snapshot_config: FirecrackerSnapshotConfig,
+}
+
+fn select_resume_binary(_config: &crate::cfg::AppConfig, captured: &Path) -> PathBuf {
+    #[cfg(target_arch = "x86_64")]
+    if _config.virtualization_mode == crate::virtualization::VirtualizationMode::Kvm {
+        return _config.resolved_firecracker_binary_path();
+    }
+    captured.to_path_buf()
 }
 
 impl FirecrackerPausedState {
@@ -271,12 +281,20 @@ impl FirecrackerCaptureArtifacts {
         snapshot_config: FirecrackerSnapshotConfig,
         snapshot_dir: PathBuf,
         snapshot_root: Arc<PersistentSnapshotRootGuard>,
+        runtime_binary: Option<Arc<fs::File>>,
     ) -> Self {
         Self {
             snapshot_config,
             snapshot_dir,
             snapshot_root,
+            runtime_binary,
         }
+    }
+
+    pub(crate) fn runtime_binary_path(&self) -> Option<PathBuf> {
+        self.runtime_binary
+            .as_ref()
+            .map(|file| PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd())))
     }
 
     /// The snapshot config produced at capture time (identical memory/rootfs
@@ -399,7 +417,12 @@ impl SandboxBackend for FirecrackerSandbox {
 
         Ok(CapturedSandboxSnapshot::new(
             manifest,
-            FirecrackerCaptureArtifacts::new(snapshot_config, snapshot_dir, live_snapshot_root),
+            FirecrackerCaptureArtifacts::new(
+                snapshot_config,
+                snapshot_dir,
+                live_snapshot_root,
+                self.fc_instance.runtime_binary(),
+            ),
         ))
     }
 
@@ -583,6 +606,7 @@ impl SandboxBackend for FirecrackerSandbox {
 
     fn runtime_info(&self) -> SandboxRuntimeInfo {
         SandboxRuntimeInfo {
+            firecracker_binary: self.fc_instance.runtime_binary_path(),
             rootfs_virtual_size: self.current_rootfs_virtual_size,
             runtime_artifacts: RuntimeArtifactSet::from_overlaybd_image_configs(
                 self.runtime_image_config_paths(),
@@ -740,6 +764,13 @@ impl FirecrackerSandbox {
             "snapshot has {} launch-time volume drives but only {} reserved drive slots",
             snapshot.common.extra_drives.len() - snapshot.common.physical_extra_drive_count,
             snapshot.common.volume_drive_slots
+        );
+        // Saved binary paths are node-local runtime details, not snapshot assets.
+        // Keep the captured tools, envd and drive configuration while selecting the
+        // node's current runtime for committed snapshots, forks and durable pauses.
+        snapshot.common.firecracker_binary = select_resume_binary(
+            ConfigManager::global_config(),
+            &snapshot.common.firecracker_binary,
         );
         // Runtime identity and auth override their values in the source snapshot.
         snapshot.common.envd_access_token = envd_access_token;
@@ -1970,9 +2001,14 @@ impl FirecrackerSandbox {
 
         let capture_output = logging_enabled(config.common.firecracker_log_level.as_deref());
         if config.common.stdout_path.is_none() && config.common.stderr_path.is_none() {
-            if let Some(warm) =
-                FirecrackerPool::global().and_then(|pool| pool.try_acquire(capture_output))
-            {
+            let warm = match FirecrackerPool::global() {
+                Some(pool) => {
+                    pool.try_acquire(&config.common.firecracker_binary, capture_output)
+                        .await
+                }
+                None => None,
+            };
+            if let Some(warm) = warm {
                 let warm_dir = warm.work_dir.path();
                 let (warm_stdout, warm_stderr) = warm_stdio_paths(warm_dir, capture_output);
                 debug!(
@@ -3240,6 +3276,75 @@ mod tests {
                 "snapshot/rootfs/image.json"
             )])
         );
+    }
+
+    #[test]
+    fn resume_binary_selection_preserves_pvm_runtime() {
+        let mut config = ConfigManager::global_config().clone();
+        let captured = Path::new("/captured/firecracker");
+        config.virtualization_mode = crate::virtualization::VirtualizationMode::Pvm;
+        assert_eq!(select_resume_binary(&config, captured), captured);
+        config.virtualization_mode = crate::virtualization::VirtualizationMode::Kvm;
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(
+                select_resume_binary(&config, captured),
+                config.resolved_firecracker_binary_path()
+            );
+        } else {
+            assert_eq!(select_resume_binary(&config, captured), captured);
+        }
+    }
+
+    #[test]
+    fn snapshot_restore_selects_current_runtime_and_preserves_guest_assets() -> Result<()> {
+        let mut common = fresh_config().common;
+        common.firecracker_binary = "/missing/old/firecracker".into();
+        common.tools_drive_version = "captured-tools".into();
+        common.envd_version = "captured-envd".into();
+        let rootfs = common.rootfs_image_config.clone();
+        let drives = serde_json::to_value(&common.extra_drives)?;
+        let snapshot = FirecrackerSnapshotConfig {
+            common,
+            vm_state_path: "snapshot/vm_state.bin".into(),
+            mem_overlaybd_config: OverlaybdConfig {
+                image_config_path: "snapshot/mem_image.json".into(),
+                read_only: true,
+                runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+            },
+            mem_virtual_size: 4096,
+            managed_snapshot_root: None,
+            pack_recording: false,
+            memory_startup_pack: None,
+        };
+        let sandbox = FirecrackerSandbox::from_snapshot_config(&snapshot)?;
+        let restored = sandbox.launch.common();
+        #[cfg(target_arch = "x86_64")]
+        let config = ConfigManager::global_config();
+        #[cfg(target_arch = "x86_64")]
+        if config.virtualization_mode == crate::virtualization::VirtualizationMode::Kvm {
+            assert_eq!(
+                restored.firecracker_binary,
+                config.resolved_firecracker_binary_path()
+            );
+        } else {
+            assert_eq!(
+                restored.firecracker_binary,
+                snapshot.common.firecracker_binary
+            );
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        assert_eq!(
+            restored.firecracker_binary,
+            snapshot.common.firecracker_binary
+        );
+        assert_eq!(restored.tools_drive_version, "captured-tools");
+        assert_eq!(restored.envd_version, "captured-envd");
+        assert_eq!(
+            serde_json::to_value(&restored.rootfs_image_config)?,
+            serde_json::to_value(rootfs)?
+        );
+        assert_eq!(serde_json::to_value(&restored.extra_drives)?, drives);
+        Ok(())
     }
 
     #[test]

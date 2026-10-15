@@ -5987,3 +5987,177 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
     assert!(task.await.unwrap()?.is_empty());
     Ok(())
 }
+
+#[cfg(unix)]
+fn identity_pause_state(directory: &Path) -> Arc<dyn PausedSandboxState> {
+    use crate::sandbox::OverlaybdConfig;
+    use crate::sandbox::{
+        FirecrackerPausedState, FirecrackerSandboxConfig, FirecrackerSnapshotConfig,
+    };
+    let common = FirecrackerSandboxConfig::new(
+        "/missing/source/firecracker".into(),
+        "vmlinux.bin".into(),
+        "0.1.1".into(),
+        "source-image.json".into(),
+    )
+    .common;
+    let snapshot: FirecrackerSnapshotConfig = serde_json::from_value(json!({
+        "common": common,
+        "vm_state_path": directory.join("vm_state.bin"),
+        "mem_overlaybd_config": OverlaybdConfig {
+            image_config_path: directory.join("memory.json"), read_only: true,
+            runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+        },
+        "mem_virtual_size": 4096, "pack_recording": false,
+        "memory_startup_pack": null,
+    }))
+    .unwrap();
+    Arc::new(FirecrackerPausedState::new(snapshot))
+}
+
+#[cfg(unix)]
+fn identity_probe_executable(directory: &Path) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let binary = directory.join("current-firecracker");
+    std::fs::write(&binary, "#!/bin/sh\ncase \"$1\" in\n--version) echo 'Firecracker v2.0.0';;\n--describe-snapshot) cat \"$2\";;\n*) exit 1;;\nesac\n")?;
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))?;
+    Ok(binary)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pause_persists_current_runtime_identity_across_restart() -> anyhow::Result<()> {
+    setup();
+    for stale_identity in [false, true] {
+        let directory = TempDir::new()?;
+        std::fs::write(directory.path().join("vm_state.bin"), "v1000.0.0\n")?;
+        let binary = identity_probe_executable(directory.path())?;
+        let behavior = Arc::new(MockBehavior::new());
+        behavior.set_runtime_info(SandboxRuntimeInfo {
+            firecracker_binary: Some(binary),
+            ..Default::default()
+        });
+        behavior.set_paused_state(identity_pause_state(directory.path()));
+        let root = directory.path().join("persistence");
+        let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::with_behavior(behavior),
+            FileBackedSandboxPersister::new(
+                root.clone(),
+                crate::virtualization::VirtualizationMode::Kvm,
+            ),
+        );
+        let created = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+        let mut metadata = orchestrator.store.get(&created.id).await?.unwrap();
+        // Legacy JSON has no digest or format fields.
+        metadata.runtime_versions = serde_json::from_value(json!({
+            "kernel_version": "6.1.175", "firecracker_version": "source-fc",
+            "envd_version": "0.5.15", "tools_drive_version": "0.1.1",
+        }))?;
+        if stale_identity {
+            metadata.runtime_versions.firecracker_binary_sha256 = Some("sha256:source".into());
+            metadata.runtime_versions.firecracker_snapshot_version = Some("9.0.0".into());
+        }
+        orchestrator.store.update(metadata).await?;
+        orchestrator.pause_sandbox(created.id).await?;
+        let current = orchestrator.store.get(&created.id).await?.unwrap();
+        assert_eq!(current.state, SandboxState::Paused);
+        assert_eq!(
+            current
+                .runtime_versions
+                .firecracker_binary_sha256
+                .as_deref(),
+            None
+        );
+        drop(orchestrator);
+        let reloaded =
+            FileBackedSandboxPersister::new(root, crate::virtualization::VirtualizationMode::Kvm)
+                .load_all(&MockBackendFactory::new())
+                .await?;
+        assert_eq!(reloaded.len(), 1);
+        let versions = &reloaded[0].runtime_versions;
+        assert_eq!(versions.firecracker_version, "2.0.0");
+        assert_eq!(versions.firecracker_binary_sha256.as_deref(), None);
+        assert_eq!(
+            versions.firecracker_snapshot_version.as_deref(),
+            Some("1000.0.0")
+        );
+        assert_eq!(versions.kernel_version, "6.1.175");
+        assert_eq!(versions.envd_version, "0.5.15");
+        assert_eq!(versions.tools_drive_version, "0.1.1");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pause_identity_probe_failure_restores_running_and_cleans_staged_files(
+) -> anyhow::Result<()> {
+    setup();
+    for missing_binary in [false, true] {
+        let directory = TempDir::new()?;
+        std::fs::write(directory.path().join("vm_state.bin"), "invalid-format\n")?;
+        let binary = identity_probe_executable(directory.path())?;
+        let behavior = Arc::new(MockBehavior::new());
+        behavior.set_runtime_info(SandboxRuntimeInfo {
+            firecracker_binary: (!missing_binary).then_some(binary),
+            ..Default::default()
+        });
+        behavior.set_paused_state(identity_pause_state(directory.path()));
+        let root = directory.path().join("persistence");
+        let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+            FileBackedSandboxPersister::new(
+                root.clone(),
+                crate::virtualization::VirtualizationMode::Kvm,
+            ),
+        );
+        let created = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+        let source_versions = created.runtime_versions;
+        let error = orchestrator.pause_sandbox(created.id).await.unwrap_err();
+        assert!(matches!(error, OrchestratorError::InternalError(_)));
+        let metadata = orchestrator.store.get(&created.id).await?.unwrap();
+        assert_eq!(metadata.state, SandboxState::Running);
+        assert!(metadata.paused_state.is_none());
+        assert_eq!(
+            serde_json::to_value(&metadata.runtime_versions)?,
+            serde_json::to_value(source_versions)?
+        );
+        assert_proxy_ready(&orchestrator, &created.id).await?;
+        // This Mock has no live disk references. Staged-file cleanup is checked
+        // here; real restack ownership and retry are covered with the disk backend.
+        let sandbox_artifacts = root.join("artifacts").join(created.id.to_string());
+        assert!(sandbox_artifacts.is_dir());
+        assert_eq!(std::fs::read_dir(&sandbox_artifacts)?.count(), 0);
+        std::fs::write(directory.path().join("vm_state.bin"), "v1000.0.0\n")?;
+        behavior.set_runtime_info(SandboxRuntimeInfo {
+            firecracker_binary: Some(identity_probe_executable(directory.path())?),
+            ..Default::default()
+        });
+        orchestrator.pause_sandbox(created.id).await?;
+        assert_eq!(
+            orchestrator.store.get(&created.id).await?.unwrap().state,
+            SandboxState::Paused
+        );
+        assert_eq!(
+            orchestrator
+                .persister
+                .load_all(&MockBackendFactory::new())
+                .await?
+                .len(),
+            1
+        );
+        orchestrator.delete_sandbox(created.id).await?;
+        assert!(orchestrator
+            .persister
+            .load_all(&MockBackendFactory::new())
+            .await?
+            .is_empty());
+    }
+    Ok(())
+}

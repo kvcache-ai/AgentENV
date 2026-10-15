@@ -93,8 +93,26 @@ class BuildKitTests(unittest.TestCase):
             time.sleep(1)
         self.fail(f"Timed out waiting for {description}; logs: {self.work}")
 
-    def launch_build(self, name, *args, context=None, timeout=180, tty=False, buildctl=None):
+    def launch_build(
+        self, name, *args, context=None, timeout=180, tty=False, buildctl=None, node_url=None
+    ):
         log = self.work / f"{name}.log"
+        environment = {**os.environ, "TERM": "xterm-256color"}
+        if node_url is not None:
+            # An isolated credentials directory selects this build target while
+            # preserving gateway authentication and result checks.
+            config = self.work / f"{name}-config"
+            (config / "aenv").mkdir(parents=True, mode=0o700)
+            credentials = config / "aenv/credentials"
+            with open(
+                credentials, "x", opener=lambda path, flags: os.open(path, flags, 0o600)
+            ) as output:
+                output.write(
+                    f"url = {json.dumps(node_url)}\n"
+                    f"api_key = {json.dumps(self.credentials['api_key'])}\n"
+                )
+            environment["XDG_CONFIG_HOME"] = str(config)
+            self.addCleanup(credentials.unlink, missing_ok=True)
         command = [
             AENV,
             "build",
@@ -119,7 +137,7 @@ class BuildKitTests(unittest.TestCase):
                 stdout=output,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
-                env={**os.environ, "TERM": "xterm-256color"},
+                env=environment,
             )
         build = (process, log)
         self.addCleanup(self.cleanup_build, build)
@@ -313,11 +331,24 @@ class BuildKitTests(unittest.TestCase):
         self.assert_released()
 
     def test_concurrent_builds(self):
+        self.concurrent_builds()
+
+    @unittest.skipUnless(
+        os.environ.get("E2E_MODE") == "compose", "requires two Compose node endpoints"
+    )
+    def test_concurrent_builds_on_distinct_nodes(self):
+        node_urls = [os.environ["AENV_NODE_A_URL"], os.environ["AENV_NODE_B_URL"]]
+        self.assertTrue(all(node_urls), "Compose must expose both node endpoints")
+        self.assertNotEqual(node_urls[0], node_urls[1], "Compose node endpoints must differ")
+        self.concurrent_builds(node_urls)
+
+    def concurrent_builds(self, node_urls=None):
         seed, _ = self.result(
             self.build("seed"), (self.context / "input.txt").read_text().strip()
         )
         builds = []
-        for name in ("parallel-a", "parallel-b"):
+        distinct_nodes = node_urls is not None
+        for name, node_url in zip(("parallel-a", "parallel-b"), node_urls or [None, None]):
             context = self.work / name
             shutil.copytree(self.context, context)
             (context / "input.txt").write_text(name + "\n")
@@ -325,7 +356,8 @@ class BuildKitTests(unittest.TestCase):
                 (
                     name,
                     self.launch_build(
-                        name, "--build-arg", "BUILD_DELAY=30", context=context
+                        name, "--build-arg", "BUILD_DELAY=30", context=context,
+                        node_url=node_url,
                     ),
                 )
             )
@@ -336,17 +368,38 @@ class BuildKitTests(unittest.TestCase):
             "workers did not overlap",
         )
         if os.environ.get("E2E_MODE") == "compose":
-            # Round-robin placement is shared by every unbound request, including
-            # status polls, so concurrent builders may land on the same node.
+            def concurrent_nodes():
+                # Sample liveness before requesting heartbeats to avoid rejecting normal
+                # exits during response or scheduling delays.
+                workers_active_at_request = all(
+                    build[0].poll() is None for _, build in builds
+                )
+                counts = self.node_counts()
+                running = [
+                    value[0] - self.baseline[node][0]
+                    for node, value in counts.items()
+                ]
+                # Shared gateway rotation permits two builders on one node; explicit
+                # placement tests distinct nodes separately.
+                if sum(running) < 2:
+                    return False
+                if distinct_nodes and sum(value > 0 for value in running) < 2:
+                    return False
+                if not workers_active_at_request:
+                    return False
+                print(json.dumps({
+                    "concurrent_node_counts": counts,
+                    "explicit_node_placement": distinct_nodes,
+                    "worker_exit_codes_after_heartbeat": [
+                        build[0].poll() for _, build in builds
+                    ],
+                }), flush=True)
+                return True
+
             self.wait_for(
-                lambda: (
-                    sum(
-                        counts[0] - self.baseline[node][0]
-                        for node, counts in self.node_counts().items()
-                    )
-                    >= 2
-                ),
-                "concurrent builders in node heartbeats",
+                concurrent_nodes,
+                "concurrent builders on different nodes" if distinct_nodes
+                else "concurrent builders in node heartbeats",
             )
         for name, build in builds:
             self.finish(build)

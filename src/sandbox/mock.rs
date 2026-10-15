@@ -74,6 +74,7 @@ pub struct MockBehavior {
     actions: Mutex<HashMap<MockOperation, VecDeque<MockAction>>>,
     on_operation: Mutex<HashMap<MockOperation, Arc<dyn Fn() + Send + Sync>>>,
     runtime_info: Mutex<SandboxRuntimeInfo>,
+    paused_state: Mutex<Option<Arc<dyn PausedSandboxState>>>,
     envd: Mutex<Option<Arc<dyn super::EnvdApi>>>,
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
     stop_calls: AtomicUsize,
@@ -99,6 +100,10 @@ impl MockBehavior {
             .lock()
             .expect("on_operation mutex poisoned")
             .insert(operation, hook);
+    }
+
+    pub fn set_paused_state(&self, state: Arc<dyn PausedSandboxState>) {
+        *self.paused_state.lock().unwrap() = Some(state);
     }
 
     pub fn set_runtime_info(&self, runtime_info: SandboxRuntimeInfo) {
@@ -309,7 +314,13 @@ impl SandboxBackend for MockSandboxBackend {
             }
             return Err(pause_err);
         }
-        Ok(Arc::new(MockSnapshot))
+        Ok(self
+            .behavior
+            .paused_state
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| Arc::new(MockSnapshot)))
     }
 
     async fn resume(&mut self) -> Result<()> {

@@ -59,6 +59,8 @@ impl SnapshotPublishMetadata {
             runtime_versions: SnapshotRuntimeVersions {
                 kernel_version: "kernel".to_string(),
                 firecracker_version: "firecracker".to_string(),
+                firecracker_binary_sha256: None,
+                firecracker_snapshot_version: None,
                 envd_version: "envd".to_string(),
                 tools_drive_version: "0.1.0".to_string(),
             },
@@ -357,6 +359,8 @@ impl CommittedSnapshot {
             runtime_versions: SnapshotRuntimeVersions {
                 kernel_version: "kernel".to_string(),
                 firecracker_version: "firecracker".to_string(),
+                firecracker_binary_sha256: None,
+                firecracker_snapshot_version: None,
                 envd_version: "envd".to_string(),
                 tools_drive_version: "0.1.0".to_string(),
             },

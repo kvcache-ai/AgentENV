@@ -99,6 +99,8 @@ pub struct SandboxForkSpec {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SandboxRuntimeInfo {
+    /// Node-local probe path for the running executable, valid while the backend is alive.
+    pub firecracker_binary: Option<PathBuf>,
     pub rootfs_virtual_size: Option<u64>,
     pub runtime_artifacts: RuntimeArtifactSet,
 }

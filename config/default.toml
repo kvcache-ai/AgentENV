@@ -27,6 +27,9 @@ virtualization_mode = "kvm"
 # Use an existing Firecracker executable instead of downloading one. It must
 # be a readable, non-empty, executable regular file.
 # binary_path = "/opt/agentenv/bin/firecracker"
+# For a validated nested-KVM deployment, use this existing section with matching
+# custom Firecracker/helper assets; see configuration/nested-kvm.md in the docs.
+# The helper must be installed under deps_path/firecracker/<version>/.
 
 # Complete kernel command line passed to guest VMs. Editing it replaces the
 # shipped boot and DAMON reclaim settings; it does not append to them.
@@ -54,6 +57,8 @@ socket_poll_ms = 1
 # Use an existing uncompressed Linux kernel image instead of downloading one.
 # The file must be a readable, non-empty regular file.
 # image_path = "/opt/agentenv/vmlinux.bin"
+# Nested KVM requires a matching guest kernel with built-in KVM. Use image_path
+# for the validated custom ELF; default dependency versions remain in deps_manifest.toml.
 
 [tools]
 # Import an existing ext4 tools drive. This also requires an explicit version;

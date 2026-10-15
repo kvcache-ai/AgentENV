@@ -45,6 +45,13 @@ cache disks. [`install-buildctl.sh`](install-buildctl.sh) downloads the pinned
 client and verifies its release digest. It defaults to the host platform and
 accepts an explicit platform for cross-platform release packaging.
 
+`test_concurrent_builds` uses the gateway and verifies two overlapping workers;
+the shared round-robin sequence may place both on the same node.
+The separate Compose `test_concurrent_builds_on_distinct_nodes` case sends one build to each of `AENV_NODE_A_URL` and
+`AENV_NODE_B_URL` using separate CLI credential directories, then verifies the
+published templates and both nodes' overlapping workers through the gateway.
+Other cases keep all build traffic through the gateway.
+
 [`package-cli.sh`](../release/package-cli.sh) uses the same downloader to produce
 a CLI archive containing `aenv`, its private `aenv-buildctl`, and `manifest.json`.
 The release workflow publishes one archive per supported platform plus
