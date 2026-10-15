@@ -3067,7 +3067,7 @@ async fn test_flatten_keeps_zero_written_blocks_as_data_segments() {
         "source image should keep zero-written blocks as data mappings before compact"
     );
     let flat = Arc::new(LocalFile::new(temp_dir.path().join("flat-zero.lsmt")).unwrap());
-    ro.flatten(flat.clone()).await.unwrap();
+    ro.flatten(CommitArgs::new(flat.clone())).await.unwrap();
 
     let flat_ro = open_file_ro(flat).await.unwrap();
     let mappings = flat_ro
