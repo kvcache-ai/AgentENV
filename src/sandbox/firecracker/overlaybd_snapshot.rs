@@ -6,6 +6,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
@@ -15,7 +16,9 @@ use tempfile::NamedTempFile;
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::overlaybd::{compact_layers, OverlaybdCompactOutput};
+use crate::cfg::ConfigManager;
+use crate::overlaybd::OverlaybdCompactOutput;
+use crate::repository::can_compact_repository_layer;
 use crate::sandbox::ublk::OverlaybdRuntimeHandle;
 use crate::sandbox::ublk::UblkDeviceManager;
 
@@ -197,7 +200,11 @@ async fn stage_overlaybd_snapshot(
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir).await?;
     image.lowers = rewrite_lowers_with_runtime_roots(
-        image.lowers,
+        &image,
+        &ConfigManager::global_config()
+            .ublk
+            .overlaybd
+            .global_config_path,
         output_dir,
         None,
         MANAGED_BASE_LAYER_FILE,
@@ -214,56 +221,112 @@ async fn stage_overlaybd_snapshot(
     Ok(output_path)
 }
 
-fn runtime_layer_budget(base_layers: usize) -> usize {
-    RUNTIME_LAYER_BUDGET_BASE
-        .saturating_sub(base_layers / 4)
-        .max(1)
+/// Only the suffix after the last ineligible layer may be compacted; preserve the prefix.
+fn compactable_suffix_start(
+    lowers: &[LayerConfig],
+    runtime_owned_roots: &[PathBuf],
+    is_managed_layer: impl Fn(&LayerConfig) -> bool,
+) -> usize {
+    lowers
+        .iter()
+        .rposition(|layer| {
+            !layer_references_runtime_owned_artifact(layer, runtime_owned_roots)
+                && !is_managed_layer(layer)
+        })
+        .map_or(0, |index| index + 1)
+}
+
+/// Select an old lower suffix, optionally including the planned `appended_layer` at its end.
+/// The appended file is only needed when the selected range includes it.
+/// A live upper only reserves an output slot; restack seals it after merging old lowers.
+/// `None` leaves capacity validation to capture, or to restack after checking for an empty upper.
+pub(super) fn snapshot_compaction_range(
+    image: &ImageConfig,
+    runtime_owned_roots: &[PathBuf],
+    appended_layer: Option<&LayerConfig>,
+    reserve_upper: bool,
+) -> Option<Range<usize>> {
+    let limit = overlaybd::index_file::MAX_STACK_LAYERS;
+    let appended_count = usize::from(appended_layer.is_some());
+    let reserved_count = usize::from(reserve_upper);
+    let runtime_start = image
+        .lowers
+        .iter()
+        .position(|layer| layer_references_runtime_owned_artifact(layer, runtime_owned_roots))
+        .unwrap_or(image.lowers.len());
+    let runtime_end = image.lowers.len() + appended_count;
+    let runtime_count = runtime_end - runtime_start;
+    let exceeds_limit = runtime_end + reserved_count > limit;
+    let runtime_budget = RUNTIME_LAYER_BUDGET_BASE
+        .saturating_sub(runtime_start / 4)
+        .max(1);
+    if runtime_count + reserved_count <= runtime_budget && !exceeds_limit {
+        return None;
+    }
+    if (2..=limit).contains(&runtime_count) && runtime_start + 1 + reserved_count <= limit {
+        return Some(runtime_start..runtime_end);
+    }
+    if !exceeds_limit {
+        return None;
+    }
+
+    let start = compactable_suffix_start(&image.lowers, runtime_owned_roots, |layer| {
+        can_compact_repository_layer(layer, &image.repo_blob_url)
+    });
+    // Keep the new delta separate: merging it with a full old stack would open 256 inputs.
+    ((2..=limit).contains(&(image.lowers.len() - start))
+        && start + 1 + appended_count + reserved_count <= limit)
+        .then_some(start..image.lowers.len())
 }
 
 pub(super) async fn rewrite_lowers_with_runtime_roots(
-    existing_lowers: Vec<LayerConfig>,
+    image: &ImageConfig,
+    overlaybd_global_config_path: &Path,
     output_dir: &Path,
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
     runtime_owned_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
 ) -> Result<(Vec<LayerConfig>, bool)> {
-    let (mut lowers, runtime_owned_lowers) =
-        split_runtime_suffix(existing_lowers, runtime_owned_roots);
-
-    let max_runtime_owned_layers = runtime_layer_budget(lowers.len());
-    let compactable_count = runtime_owned_lowers.len() + usize::from(appended_layer.is_some());
-    if compactable_count > max_runtime_owned_layers {
-        let mut runtime_suffix = runtime_owned_lowers;
-        if let Some(layer) = appended_layer {
-            runtime_suffix.push(layer);
+    let range =
+        snapshot_compaction_range(image, runtime_owned_roots, appended_layer.as_ref(), false);
+    let compacted = range.is_some();
+    let mut retained_lowers = image.lowers.clone();
+    let mut new_layers: Vec<_> = appended_layer.into_iter().collect();
+    if let Some(range) = range {
+        let mut selected_lowers = retained_lowers.split_off(range.start);
+        if range.end > image.lowers.len() {
+            selected_lowers.append(&mut new_layers);
         }
-        if runtime_suffix.iter().any(|lower| lower.file.is_empty()) {
-            anyhow::bail!("cannot compact runtime-owned overlaybd suffix with remote lowers");
-        }
-        if let Some(compacted_path) = compact_layers(
-            &runtime_suffix,
-            &output_dir.join(compaction_output_name),
-            compaction_output,
-        )
-        .await?
-        {
-            lowers.push(local_layer_config(&compacted_path));
-        }
-        return Ok((lowers, true));
+        let selected = ImageConfig {
+            lowers: selected_lowers,
+            repo_blob_url: image.repo_blob_url.clone(),
+            ..Default::default()
+        };
+        let compacted_path = output_dir.join(compaction_output_name);
+        UblkDeviceManager::global()
+            .compact_layers(
+                &selected,
+                overlaybd_global_config_path,
+                &compacted_path,
+                compaction_output,
+            )
+            .await?;
+        new_layers.insert(0, local_layer_config(&compacted_path));
     }
 
-    let mut lowers = adopt_runtime_owned_lowers(
-        lowers,
-        runtime_owned_lowers,
-        output_dir,
-        runtime_owned_roots,
-    )
-    .await?;
-    if let Some(layer) = appended_layer {
-        lowers.push(layer);
-    }
-    Ok((lowers, false))
+    ensure!(
+        retained_lowers.len() + new_layers.len() <= overlaybd::index_file::MAX_STACK_LAYERS,
+        "snapshot would exceed lower layer limit: no mergeable history suffix (layer_count={}, appended={}, limit={})",
+        image.lowers.len(),
+        new_layers.len(),
+        overlaybd::index_file::MAX_STACK_LAYERS,
+    );
+    let (prefix, owned) = split_runtime_suffix(retained_lowers, runtime_owned_roots);
+    let mut lowers =
+        adopt_runtime_owned_lowers(prefix, owned, output_dir, runtime_owned_roots).await?;
+    lowers.extend(new_layers);
+    Ok((lowers, compacted))
 }
 
 async fn adopt_runtime_owned_lowers(
@@ -312,7 +375,7 @@ async fn adopt_runtime_owned_lowers(
 /// Writable runtimes are first restacked in-place so the sealed old upper
 /// becomes the newest lower. Read-only runtimes skip the restack phase and
 /// only stage the persisted snapshot image config.
-pub(super) async fn restack_snapshot_overlaybd_device(
+pub(super) async fn capture_disk_snapshot(
     runtime: &OverlaybdRuntimeHandle,
     read_only: bool,
     output_dir: &Path,
@@ -336,18 +399,10 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         let layer = layer_dir.join("snapshot.commit");
         let roots =
             runtime_owned_roots_for_live_config(owned_roots, live_runtime_image_config_path);
-        let base_layers = image
-            .lowers
-            .iter()
-            .position(|lower| layer_references_runtime_owned_artifact(lower, &roots))
-            .unwrap_or(image.lowers.len());
-        let runtime_layers = image.lowers.len() - base_layers;
-        let compact_from = (runtime_layers >= 2
-            && (runtime_layers + 1 > runtime_layer_budget(base_layers)
-                || image.lowers.len() + 1 > overlaybd::index_file::MAX_STACK_LAYERS))
-            .then_some(base_layers);
+        let compact_from =
+            snapshot_compaction_range(&image, &roots, None, true).map(|range| range.start);
         let lowers = match UblkDeviceManager::global()
-            .restack_snapshot_device(&runtime.device, &layer, compact_from, kind)
+            .snapshot_device(&runtime.device, &layer, compact_from, kind)
             .await
         {
             Ok(lowers) => lowers,
@@ -357,7 +412,12 @@ pub(super) async fn restack_snapshot_overlaybd_device(
                 return Err(error);
             }
         };
-        record_sealed_upper_size(kind, &layer, compact_from.is_some()).await;
+        if lowers != image.lowers {
+            record_sealed_upper_size(kind, &layer, compact_from.is_some()).await;
+        } else {
+            // An empty upper leaves no layer in the directory prepared for restack.
+            let _ = tokio::fs::remove_dir(&layer_dir).await;
+        }
         image.lowers = lowers;
     }
 
@@ -405,8 +465,15 @@ mod tests {
             local_layer_config(&source_memory_lower),
         ];
 
-        let (preserved, managed) =
-            split_runtime_suffix(lowers, &[sandbox_root, source_snapshot_root]);
+        let roots = [sandbox_root, source_snapshot_root];
+        assert_eq!(
+            compactable_suffix_start(&lowers, &roots, |layer| {
+                Path::new(&layer.file) == snapshot_store_lower
+            }),
+            1
+        );
+        assert_eq!(compactable_suffix_start(&lowers, &roots, |_| false), 2);
+        let (preserved, managed) = split_runtime_suffix(lowers, &roots);
 
         assert_eq!(preserved.len(), 2);
         assert_eq!(preserved[0].file, "");
@@ -448,7 +515,14 @@ mod tests {
         let runtime_owned_roots = [sandbox_root.canonicalize().unwrap()];
 
         let (rewritten, _) = rewrite_lowers_with_runtime_roots(
-            lowers,
+            &ImageConfig {
+                lowers,
+                ..Default::default()
+            },
+            &ConfigManager::global_config()
+                .ublk
+                .overlaybd
+                .global_config_path,
             &output_dir,
             None,
             MANAGED_BASE_LAYER_FILE,
@@ -612,7 +686,8 @@ mod tests {
         std::fs::write(&new_layer, b"memory delta").expect("write mem layer");
         let mut image_config = load_image_config(&parent_config_path).unwrap();
         image_config.lowers = rewrite_lowers_with_runtime_roots(
-            image_config.lowers,
+            &image_config,
+            Path::new("unused-global.json"),
             temp.path(),
             Some(local_layer_config(&new_layer)),
             "mem_compacted.commit",
@@ -662,7 +737,14 @@ mod tests {
         let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
 
         let (rewritten, _) = rewrite_lowers_with_runtime_roots(
-            lowers,
+            &ImageConfig {
+                lowers,
+                ..Default::default()
+            },
+            &ConfigManager::global_config()
+                .ublk
+                .overlaybd
+                .global_config_path,
             &output_dir,
             None,
             MANAGED_BASE_LAYER_FILE,
@@ -718,7 +800,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires the ublk daemon and CAP_SYS_ADMIN; run by make test-unit capability group"]
     async fn rewrite_shrinking_budget_compacts_runtime_suffix() {
+        UblkDeviceManager::init_global_from_config(ConfigManager::global_config())
+            .await
+            .expect("initialize compaction daemon");
+        assert!(UblkDeviceManager::global().is_available());
         let temp = tempfile::tempdir().expect("tempdir");
         let runtime_root = temp.path().join("runtime");
         let output_dir = temp.path().join("out");
@@ -742,7 +829,14 @@ mod tests {
         let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
 
         let (rewritten, _) = rewrite_lowers_with_runtime_roots(
-            lowers,
+            &ImageConfig {
+                lowers,
+                ..Default::default()
+            },
+            &ConfigManager::global_config()
+                .ublk
+                .overlaybd
+                .global_config_path,
             &output_dir,
             None,
             MANAGED_BASE_LAYER_FILE,
@@ -758,5 +852,9 @@ mod tests {
         assert_eq!(compacted, output_dir.join(MANAGED_BASE_LAYER_FILE));
         assert!(compacted.exists());
         assert!(!compacted.with_extension("commit.tmp").exists());
+        UblkDeviceManager::global()
+            .shutdown_daemon()
+            .await
+            .expect("stop compaction daemon");
     }
 }

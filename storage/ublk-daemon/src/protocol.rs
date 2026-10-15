@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use overlaybd::config::{LayerConfig, UpperMode};
 use overlaybd::index_file::DataStat;
+use overlaybd::snapshot::OverlaybdCompactOutput;
 use overlaybd::LayerDescriptor;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -51,11 +52,21 @@ pub enum DaemonRequest {
     Delete {
         dev_id: u32,
     },
-    RestackSnapshot {
+    // Keep the existing wire tag when renaming the Rust API.
+    #[serde(rename = "restack_snapshot")]
+    SnapshotDevice {
         dev_id: u32,
         output_layer_path: PathBuf,
         /// Merge this suffix of existing lowers before sealing the upper.
         compact_from: Option<usize>,
+    },
+    /// Merge immutable lower layers without creating or changing a device.
+    CompactLayers {
+        lowers: Vec<LayerConfig>,
+        repo_blob_url: String,
+        global_config: PathBuf,
+        output_layer_path: PathBuf,
+        output: OverlaybdCompactOutput,
     },
     /// Flush a live image while excluding concurrent image I/O.
     FlushForCheckpoint {
@@ -250,7 +261,8 @@ pub enum DaemonResponse {
         flags: u64,
     },
     Deleted,
-    RestackSnapshotCreated {
+    #[serde(rename = "restack_snapshot_created")]
+    SnapshotDeviceCreated {
         descriptor: Option<LayerDescriptor>,
         /// Actual live lowers after restack, including any compaction.
         lowers: Vec<LayerConfig>,
@@ -282,9 +294,9 @@ pub enum DaemonResponse {
 
 // ── Wire helpers ────────────────────────────────────────────────────────────
 
-/// Client-side outcome of a restack snapshot RPC.
+/// Client-side outcome of a device snapshot RPC.
 #[derive(Debug, Clone, Default)]
-pub struct RestackSnapshotResult {
+pub struct SnapshotDeviceResult {
     pub descriptor: Option<LayerDescriptor>,
     pub lowers: Vec<LayerConfig>,
     pub data_stat: Option<DataStat>,
@@ -545,7 +557,7 @@ mod tests {
 
     #[test]
     fn request_restack_snapshot_round_trip() {
-        let req = DaemonRequest::RestackSnapshot {
+        let req = DaemonRequest::SnapshotDevice {
             dev_id: 5,
             output_layer_path: PathBuf::from("/snapshots/layer0"),
             compact_from: Some(2),
@@ -553,7 +565,7 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
         match decoded {
-            DaemonRequest::RestackSnapshot {
+            DaemonRequest::SnapshotDevice {
                 dev_id,
                 output_layer_path,
                 compact_from,
@@ -645,7 +657,7 @@ mod tests {
 
     #[test]
     fn response_restack_snapshot_created_round_trip() {
-        let resp = DaemonResponse::RestackSnapshotCreated {
+        let resp = DaemonResponse::SnapshotDeviceCreated {
             descriptor: Some(LayerDescriptor {
                 digest: "sha256:abc".to_string(),
                 size: 4096,
@@ -660,7 +672,7 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
         match decoded {
-            DaemonResponse::RestackSnapshotCreated {
+            DaemonResponse::SnapshotDeviceCreated {
                 descriptor,
                 lowers,
                 data_stat,
@@ -689,7 +701,7 @@ mod tests {
 
     #[test]
     fn response_restack_snapshot_created_without_stats_round_trip() {
-        let resp = DaemonResponse::RestackSnapshotCreated {
+        let resp = DaemonResponse::SnapshotDeviceCreated {
             descriptor: None,
             lowers: Vec::new(),
             data_stat: None,
@@ -699,7 +711,7 @@ mod tests {
         let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             decoded,
-            DaemonResponse::RestackSnapshotCreated {
+            DaemonResponse::SnapshotDeviceCreated {
                 descriptor: None,
                 ..
             }
@@ -711,7 +723,7 @@ mod tests {
         let json = r#"{"status":"restack_snapshot_created","descriptor":null,"lowers":[]}"#;
         let decoded: DaemonResponse = serde_json::from_str(json).unwrap();
         match decoded {
-            DaemonResponse::RestackSnapshotCreated {
+            DaemonResponse::SnapshotDeviceCreated {
                 descriptor,
                 data_stat,
                 ext4_used_bytes,

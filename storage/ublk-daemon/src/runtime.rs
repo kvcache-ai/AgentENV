@@ -130,6 +130,9 @@ pub(crate) async fn restack_runtime(
     let (descriptor, lowers) = image
         .create_snapshot_and_restack(output_path, compact_from)
         .await?;
+    if lowers == previous.lowers {
+        return Ok((descriptor, lowers));
+    }
     commit_runtime_config(temporary, config_path, value, &lowers, retained_count)?;
 
     if let Some(start) = compact_from {
@@ -946,6 +949,14 @@ mod tests {
         restack_runtime(&image, &config, &second, None)
             .await
             .unwrap();
+        let before = fs::read(&config).unwrap();
+        let empty = temp.path().join("empty.commit");
+        restack_runtime(&image, &config, &empty, Some(1))
+            .await
+            .unwrap();
+        assert_eq!(fs::read(&config).unwrap(), before);
+        assert!(first.exists() && second.exists());
+        assert!(!empty.exists());
         let exported = temp.path().join("exported.commit");
         fs::hard_link(&first, &exported).unwrap();
         let exported_bytes = fs::read(&exported).unwrap();

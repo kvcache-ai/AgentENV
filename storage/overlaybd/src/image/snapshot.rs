@@ -1,20 +1,90 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "full")]
 use std::path::Path;
-#[cfg(feature = "full")]
 use std::sync::Arc;
 
 #[cfg(feature = "full")]
 use crate::backend::local::LocalFile;
+use crate::compression::zfile::{CompressArgs, CompressOptions, ZFileCompactWriter};
 #[cfg(feature = "full")]
 use crate::image::image_file::ImageFile;
 #[cfg(feature = "full")]
 use crate::image::image_service::ImageService;
 #[cfg(feature = "full")]
+use crate::io::virtual_file::{DigestCompactWriter, DIGEST_COMPACT_WRITER_BUFFER_SIZE};
 use crate::io::virtual_file::VirtualFile;
-#[cfg(feature = "full")]
 use crate::lsmt::file::CommitArgs;
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionAlgorithm {
+    #[default]
+    Lz4,
+    Zstd,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlaybdCompactOutput {
+    Raw,
+    ZFile {
+        algorithm: CompressionAlgorithm,
+        workers: usize,
+    },
+}
+
+impl OverlaybdCompactOutput {
+    /// Maximum persistent compression threads during a snapshot.
+    pub const MAX_COMPRESSION_WORKERS: usize = 64;
+}
+
+pub async fn create_commit_args(
+    output: Arc<dyn VirtualFile>,
+    mode: OverlaybdCompactOutput,
+    concurrency: usize,
+    compute_digest: bool,
+) -> Result<CommitArgs> {
+    let mut args = match mode {
+        #[cfg(feature = "full")]
+        OverlaybdCompactOutput::Raw if compute_digest => CommitArgs::from_writer(
+            DigestCompactWriter::new(DIGEST_COMPACT_WRITER_BUFFER_SIZE, output),
+        ),
+        #[cfg(not(feature = "full"))]
+        OverlaybdCompactOutput::Raw if compute_digest => {
+            anyhow::bail!("digest-tracked raw compaction requires the `full` feature")
+        }
+        OverlaybdCompactOutput::Raw => CommitArgs::new(output),
+        OverlaybdCompactOutput::ZFile { algorithm, workers } => {
+            let algorithm = match algorithm {
+                CompressionAlgorithm::Lz4 => CompressOptions::LZ4,
+                CompressionAlgorithm::Zstd => CompressOptions::ZSTD,
+            };
+            let mut compress_args = CompressArgs::new(CompressOptions::new(
+                algorithm,
+                CompressOptions::DEFAULT_BLOCK_SIZE,
+                0,
+            ));
+            compress_args.workers = workers.max(1);
+            let writer = if compute_digest {
+                #[cfg(feature = "full")]
+                {
+                    ZFileCompactWriter::new_with_digest(output, &compress_args).await?
+                }
+                #[cfg(not(feature = "full"))]
+                {
+                    anyhow::bail!("digest-tracked zfile compaction requires the `full` feature")
+                }
+            } else {
+                ZFileCompactWriter::new(output, &compress_args).await?
+            };
+            CommitArgs::from_writer(Arc::new(writer))
+        }
+    };
+    args.concurrency = concurrency;
+    Ok(args)
+}
 
 #[cfg(feature = "full")]
 pub async fn export_upper_as_snapshot_layer(
