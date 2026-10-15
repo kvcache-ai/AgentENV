@@ -455,7 +455,7 @@ async fn capture_export_failure_keeps_restacked_runtime_usable() -> Result<()> {
 }
 
 #[tokio::test]
-async fn parallel_drive_capture_failure_preserves_completed_restack() -> Result<()> {
+async fn parallel_drive_capture_failure_keeps_empty_drive_unchanged() -> Result<()> {
     common::setup().await;
     let default = common::default_sandbox_config()?;
     let mut rootfs = default.common.rootfs_image_config.unwrap();
@@ -484,7 +484,7 @@ async fn parallel_drive_capture_failure_preserves_completed_restack() -> Result<
     .await;
     let good_lowers = overlaybd_lower_count(&good_config)?;
     let error = capture.expect_err("one attached drive must fail capture");
-    assert_eq!(good_lowers, initial_lowers + 1);
+    assert_eq!(good_lowers, initial_lowers);
     assert!(!error.is_terminal(), "{error:#}");
     fs::write(broken_config, saved_config)?;
     drop(

@@ -598,6 +598,14 @@ async fn repeated_capture_and_pause_compacts_live_disks_without_losing_old_snaps
                 SnapshotPlacement::Local,
             )
             .await?;
+        if capture == 3 {
+            assert_eq!(
+                lower_file_paths_from_image_config(&snapshot.manifest().memory.image_config_path)?
+                    .len(),
+                2,
+                "full memory history must compact before appending the next delta"
+            );
+        }
         let new_paths = lower_file_paths_from_image_config(&runtime_config)?;
         if new_paths.len() < previous_layers {
             compactions += 1;
@@ -622,6 +630,19 @@ async fn repeated_capture_and_pause_compacts_live_disks_without_losing_old_snaps
         drop(sandbox);
         let state = FirecrackerPausedState::decode(paused.encode()?)?;
         drop(paused);
+        if capture == 2 {
+            let path = &state
+                .snapshot_config()
+                .mem_overlaybd_config
+                .image_config_path;
+            let mut image = overlaybd::config::load_image_config(path)?;
+            assert_eq!(image.lowers.len(), 1);
+            image.lowers.resize(
+                overlaybd::index_file::MAX_STACK_LAYERS,
+                image.lowers[0].clone(),
+            );
+            fs::write(path, serde_json::to_vec(&image)?)?;
+        }
         sandbox = FirecrackerSandbox::from_paused_state(&state, id, None, &runtime)?;
         sandbox.start().await?;
         let output = sandbox.run_command("cat", &[DISK_MARKER_PATH]).await?;

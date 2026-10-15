@@ -320,10 +320,10 @@ mod client_tests {
     #[tokio::test]
     async fn snapshot_success() {
         let server = MockServer::start(Box::new(|req| match req {
-            DaemonRequest::RestackSnapshot {
+            DaemonRequest::SnapshotDevice {
                 compact_from: Some(1),
                 ..
-            } => DaemonResponse::RestackSnapshotCreated {
+            } => DaemonResponse::SnapshotDeviceCreated {
                 descriptor: Some(overlaybd::LayerDescriptor {
                     digest: "sha256:abc".to_string(),
                     size: 4096,
@@ -343,7 +343,7 @@ mod client_tests {
 
         let client = server.client();
         let stats = client
-            .restack_snapshot(2, Path::new("/snapshots/layer0"), Some(1))
+            .snapshot_device(2, Path::new("/snapshots/layer0"), Some(1))
             .await
             .unwrap();
         assert_eq!(stats.lowers[0].file, "/snapshots/managed-base.commit");
@@ -365,7 +365,7 @@ mod client_tests {
 
         let client = server.client();
         let err = client
-            .restack_snapshot(2, Path::new("/out"), None)
+            .snapshot_device(2, Path::new("/out"), None)
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -395,13 +395,14 @@ mod client_tests {
                     device_path: PathBuf::from("/dev/ublkb10"),
                 },
                 DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
-                DaemonRequest::RestackSnapshot { .. } => DaemonResponse::RestackSnapshotCreated {
+                DaemonRequest::SnapshotDevice { .. } => DaemonResponse::SnapshotDeviceCreated {
                     descriptor: None,
                     lowers: Vec::new(),
                     data_stat: None,
                     ext4_used_bytes: None,
                 },
                 DaemonRequest::FlushForCheckpoint { .. } => DaemonResponse::Ok,
+                DaemonRequest::CompactLayers { .. } => DaemonResponse::Ok,
                 DaemonRequest::Shutdown => DaemonResponse::Ok,
                 DaemonRequest::GetFeatures => DaemonResponse::Features { flags: 0 },
                 DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
@@ -438,7 +439,7 @@ mod client_tests {
             .unwrap();
         client.delete(30).await.unwrap();
         client
-            .restack_snapshot(40, Path::new("/snap/output"), None)
+            .snapshot_device(40, Path::new("/snap/output"), None)
             .await
             .unwrap();
         client.flush_for_checkpoint(17).await.unwrap();
@@ -453,7 +454,7 @@ mod client_tests {
         assert!(requests[1].contains("Delete"));
         assert!(requests[1].contains("30"));
 
-        assert!(requests[2].contains("RestackSnapshot"));
+        assert!(requests[2].contains("SnapshotDevice"));
         assert!(requests[2].contains("40"));
 
         assert!(requests[3].contains("FlushForCheckpoint"));
@@ -784,7 +785,7 @@ mod server_tests {
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
         send_message(
             &mut stream,
-            &DaemonRequest::RestackSnapshot {
+            &DaemonRequest::SnapshotDevice {
                 dev_id: 888,
                 output_layer_path: PathBuf::from("/tmp/snap"),
                 compact_from: None,

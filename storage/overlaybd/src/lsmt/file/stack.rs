@@ -10,7 +10,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::io::virtual_file::VirtualFile;
-use crate::lsmt::index::{ReadOnlyIndex, Segment};
+use crate::lsmt::index::ReadOnlyIndex;
 
 pub async fn create_file_rw(args: LayerInfo) -> Result<LSMTFile> {
     LSMTFile::create_with_metadata(
@@ -222,10 +222,7 @@ pub async fn open_files_ro_with_premerged_cache(
 pub async fn merge_files_ro(src_files: &[Arc<dyn VirtualFile>], args: CommitArgs) -> Result<()> {
     ensure!(!src_files.is_empty(), "empty src files");
     let lower = open_files_ro(src_files).await?;
-    let query = Segment::new(0, lower.virtual_size.div_ceil(ALIGNMENT) as u32);
-    let mut mappings = Vec::new();
-    lower.index.lookup(query, &mut mappings);
-    compact_to(&lower.layers, &mappings, lower.virtual_size, args).await
+    lower.flatten(args).await
 }
 
 async fn verify_layer_order(

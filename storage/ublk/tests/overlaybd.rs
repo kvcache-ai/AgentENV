@@ -5,6 +5,7 @@ use overlaybd::config::{
     CredentialConfig, DownloadConfig, GlobalConfig, ImageConfig, LayerConfig, UpperConfig,
 };
 use overlaybd::index_file::{create_file_rw, LayerInfo};
+use overlaybd::snapshot::OverlaybdCompactOutput;
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::zfile::is_zfile;
 use overlaybd::{ImageFile, ImageService};
@@ -787,7 +788,7 @@ async fn test_registry_e2e_upper_compact_to_local_lower() -> Result<()> {
             .with_context(|| format!("create compact dest failed: {}", compact_path.display()))?,
     );
     image
-        .compact(compact_dest.clone())
+        .compact(compact_dest.clone(), OverlaybdCompactOutput::Raw)
         .await
         .with_context(|| format!("compact image to {} failed", compact_path.display()))?;
     compact_dest

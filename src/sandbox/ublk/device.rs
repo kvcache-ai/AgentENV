@@ -10,7 +10,7 @@ use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
 use uvm_ublk_daemon::protocol::PackRecordingState;
 use uvm_ublk_daemon::{
-    CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotResult, RestackSnapshotTerminalFailure,
+    CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotTerminalFailure, SnapshotDeviceResult,
     UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 
@@ -455,8 +455,21 @@ impl UblkDeviceManager {
         Ok(())
     }
 
+    /// Merge immutable layers through the daemon's existing readers and cache.
+    pub(crate) async fn compact_layers(
+        &self,
+        image: &overlaybd::config::ImageConfig,
+        global_config: &Path,
+        output_path: &Path,
+        mode: crate::overlaybd::OverlaybdCompactOutput,
+    ) -> Result<()> {
+        self.require_client()?
+            .compact_layers(image, global_config, output_path, mode)
+            .await
+    }
+
     /// Request a restack-style snapshot of an overlaybd device's upper layer.
-    pub(crate) async fn restack_snapshot_device(
+    pub(crate) async fn snapshot_device(
         &self,
         device: &UblkDevice,
         output_layer_path: &Path,
@@ -471,7 +484,7 @@ impl UblkDeviceManager {
         );
         let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "restack_snapshot");
         let result = client
-            .restack_snapshot(device.dev_id, output_layer_path, compact_from)
+            .snapshot_device(device.dev_id, output_layer_path, compact_from)
             .await;
         metric.finish(&result);
         match result {
@@ -907,7 +920,7 @@ impl UblkDevice {
 }
 
 /// Record per-device overlaybd/ext4 usage gauges piggybacked on a restack RPC.
-fn record_restack_usage_stats(dev_id: u32, kind: &'static str, stats: &RestackSnapshotResult) {
+fn record_restack_usage_stats(dev_id: u32, kind: &'static str, stats: &SnapshotDeviceResult) {
     let dev_id = dev_id.to_string();
     if let Some(stat) = &stats.data_stat {
         metrics::gauge!(

@@ -1,7 +1,6 @@
 //! Publishing a captured snapshot: the repository stores its files and layers,
 //! then the catalog commits its record.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use tracing::{debug, info, warn};
@@ -45,7 +44,11 @@ where
             feature: "Distributed publication required".to_string(),
         });
     }
-    validate_attached_drives(&manifest)?;
+    manifest
+        .validate_attached_drives()
+        .map_err(|error| RepositoryError::InvalidRequest {
+            reason: error.to_string(),
+        })?;
     // Fail before uploading anything; the commit checks both again.
     ensure_not_committed(repository, &metadata.id).await?;
     if let Some(alias) = metadata.alias.as_ref() {
@@ -92,29 +95,6 @@ where
             Err(error)
         }
     }
-}
-
-pub(crate) fn validate_attached_drives(manifest: &SandboxSnapshotManifest) -> RepositoryResult<()> {
-    let mut drive_ids = HashSet::new();
-    for drive in &manifest.attached_drives {
-        if !drive_ids.insert(drive.drive_id.clone()) {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!(
-                    "duplicate attached drive id in publish request: {}",
-                    drive.drive_id
-                ),
-            });
-        }
-        if drive.virtual_size == 0 {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!(
-                    "attached drive '{}' virtual_size must be non-zero",
-                    drive.drive_id
-                ),
-            });
-        }
-    }
-    Ok(())
 }
 
 /// Republishing a committed snapshot would overwrite and then, on failure,

@@ -522,13 +522,7 @@ pub struct UblkOverlaybdTomlConfig {
     pub p2p_fetch_range_timeout_ms: u64,
 }
 
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum OverlaybdCompressionAlgorithm {
-    #[default]
-    Lz4,
-    Zstd,
-}
+pub use overlaybd::snapshot::CompressionAlgorithm as OverlaybdCompressionAlgorithm;
 
 #[derive(Debug, Config, Clone)]
 pub struct MemorySnapshotConfig {

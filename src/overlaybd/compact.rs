@@ -4,34 +4,17 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::LayerConfig;
-use overlaybd::index_file::{merge_files_ro, CommitArgs};
+use overlaybd::index_file::merge_files_ro;
 use overlaybd::virtual_file::VirtualFile;
-use overlaybd::zfile::{CompressArgs, CompressOptions, ZFileCompactWriter};
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::cfg::{OverlaybdCompressionAlgorithm, SnapshotPublishCompressionConfig};
+use crate::cfg::SnapshotPublishCompressionConfig;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OverlaybdCompactOutput {
-    Raw,
-    ZFile {
-        algorithm: OverlaybdCompressionAlgorithm,
-        workers: usize,
-    },
-}
+pub(crate) use overlaybd::snapshot::{create_commit_args, OverlaybdCompactOutput};
 
-impl OverlaybdCompactOutput {
-    /// Maximum persistent compression threads. Prevents absurd config values
-    /// from spawning thousands of OS threads during layer upload.
-    const MAX_COMPRESSION_WORKERS: usize = 64;
-
-    /// Resolve the `[snapshot.publish_compression]` switch into the layer
-    /// output mode applied when recontainerizing local raw layers for upload.
-    /// Capture paths never consult this: local layers always stay raw.
-    pub(crate) fn from_publish_compression_config(
-        config: &SnapshotPublishCompressionConfig,
-    ) -> Self {
+impl From<&SnapshotPublishCompressionConfig> for OverlaybdCompactOutput {
+    fn from(config: &SnapshotPublishCompressionConfig) -> Self {
         if config.enabled {
             Self::ZFile {
                 algorithm: config.algorithm,
@@ -41,33 +24,6 @@ impl OverlaybdCompactOutput {
             Self::Raw
         }
     }
-}
-
-pub(crate) async fn create_commit_args(
-    output: Arc<dyn VirtualFile>,
-    mode: OverlaybdCompactOutput,
-    concurrency: usize,
-) -> Result<CommitArgs> {
-    let mut args = match mode {
-        OverlaybdCompactOutput::Raw => CommitArgs::new(output),
-        OverlaybdCompactOutput::ZFile { algorithm, workers } => {
-            let algorithm = match algorithm {
-                OverlaybdCompressionAlgorithm::Lz4 => CompressOptions::LZ4,
-                OverlaybdCompressionAlgorithm::Zstd => CompressOptions::ZSTD,
-            };
-            let mut compress_args = CompressArgs::new(CompressOptions::new(
-                algorithm,
-                CompressOptions::DEFAULT_BLOCK_SIZE,
-                0,
-            ));
-            compress_args.workers = workers.max(1);
-            CommitArgs::from_writer(Arc::new(
-                ZFileCompactWriter::new(output, &compress_args).await?,
-            ))
-        }
-    };
-    args.concurrency = concurrency;
-    Ok(args)
 }
 
 /// Compact multiple overlaybd layers into one sealed commit at `output_path`.
@@ -140,10 +96,13 @@ pub(crate) async fn compact_layers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cfg::OverlaybdCompressionAlgorithm;
     use overlaybd::backend::switch::new_switch_file;
     use overlaybd::backend::tar::new_tar_file_adaptor;
+    use overlaybd::index_file::CommitArgs;
     use overlaybd::index_file::{LSMTFile, LSMTReadOnlyFile};
     use overlaybd::zfile::is_zfile;
+    use overlaybd::zfile::{CompressArgs, CompressOptions, ZFileCompactWriter};
 
     async fn create_sealed_layer(
         dir: &Path,
@@ -327,7 +286,7 @@ mod tests {
             workers: 1,
         };
         assert_eq!(
-            OverlaybdCompactOutput::from_publish_compression_config(&disabled),
+            OverlaybdCompactOutput::from(&disabled),
             OverlaybdCompactOutput::Raw
         );
 
@@ -338,7 +297,7 @@ mod tests {
             workers: 0,
         };
         assert_eq!(
-            OverlaybdCompactOutput::from_publish_compression_config(&zstd),
+            OverlaybdCompactOutput::from(&zstd),
             OverlaybdCompactOutput::ZFile {
                 algorithm: OverlaybdCompressionAlgorithm::Zstd,
                 workers: 1,
@@ -351,7 +310,7 @@ mod tests {
             workers: usize::MAX,
         };
         assert_eq!(
-            OverlaybdCompactOutput::from_publish_compression_config(&clamped),
+            OverlaybdCompactOutput::from(&clamped),
             OverlaybdCompactOutput::ZFile {
                 algorithm: OverlaybdCompressionAlgorithm::Lz4,
                 workers: OverlaybdCompactOutput::MAX_COMPRESSION_WORKERS,

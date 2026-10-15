@@ -5,6 +5,7 @@ use crate::config::{DownloadConfig, ImageConfig, LayerConfig, UpperConfig, Upper
 use crate::image::helper::prepare_runtime_upper;
 use crate::image::image_service::CacheDownloadRequest;
 use crate::image::image_service::ImageService;
+use crate::image::snapshot::{create_commit_args, OverlaybdCompactOutput};
 use crate::io::virtual_file::VirtualFile;
 use crate::layer::layer_metadata::{read_overlaybd_layer_uuid, COMMIT_FILE_NAME, SEALED_FILE_NAME};
 use crate::lsmt::file::{
@@ -84,6 +85,7 @@ impl ImageFileBase {
 struct LiveImageState {
     config: ImageConfig,
     base: ImageFileBase,
+    lower_virtual_size: Option<u64>,
     premerged_index_cache_dir: PathBuf,
     premerged_index_cache_policy: PremergedIndexCachePolicy,
 }
@@ -224,11 +226,16 @@ impl ImageFile {
         }
     }
 
-    pub async fn compact(&self, as_file: Arc<dyn VirtualFile>) -> Result<()> {
+    pub async fn compact(
+        &self,
+        destination: Arc<dyn VirtualFile>,
+        output: OverlaybdCompactOutput,
+    ) -> Result<()> {
+        let args = create_commit_args(destination, output, 32).await?;
         let state = self.state.read().await;
         match &state.base {
-            ImageFileBase::ReadOnly(file) => file.flatten(as_file).await,
-            ImageFileBase::Upper { file, .. } => file.flatten(as_file).await,
+            ImageFileBase::ReadOnly(file) => file.flatten(args).await,
+            ImageFileBase::Upper { file, .. } => file.flatten_with_args(args).await,
         }
     }
 
@@ -342,6 +349,13 @@ impl ImageFile {
             .writable()
             .context("create_snapshot_and_restack requires a writable image")?;
 
+        // An empty upper can still carry a resize that the lowers do not contain.
+        if state.lower_virtual_size == Some(current.size().await?)
+            && current.index().read().await.upper_len() == 0
+        {
+            return Ok((None, state.config.lowers.clone()));
+        }
+
         // Validate the final stack before sealing: a full stack must leave the
         // current image writable when this capture is rejected.
         let mut lower_files = current.lower_layer_files_bottom_to_top();
@@ -443,6 +457,7 @@ impl ImageFile {
             ..LayerConfig::default()
         });
         state.config.lowers = lowers.clone();
+        state.lower_virtual_size = Some(virtual_size);
         state.base = ImageFileBase::Upper {
             file: restacked,
             read_only_upper: false,
@@ -531,6 +546,10 @@ impl ImageFile {
             image_service.global_config().cache_config.cache_size_gb,
         );
 
+        let lower_virtual_size = match lowers.file.as_ref() {
+            Some(lower) => Some(lower.size().await?),
+            None => None,
+        };
         let downloads = lowers.downloads;
         let base = match (lowers.file, upper_file) {
             (Some(lower), Some(upper)) => {
@@ -552,6 +571,7 @@ impl ImageFile {
             state: LiveImageState {
                 config: config.clone(),
                 base,
+                lower_virtual_size,
                 premerged_index_cache_dir,
                 premerged_index_cache_policy,
             },
@@ -1864,7 +1884,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_layer_limit_rejection_preserves_the_writable_upper() -> Result<()> {
+    async fn snapshot_layer_limit_requires_compaction_only_for_nonempty_upper() -> Result<()> {
         let tmp = TempDir::new()?;
         let base = tmp.path().join("base.commit");
         create_sealed_lower(&base, &tmp.path().join("base.index"), &[0x11; 8192]).await?;
@@ -1890,6 +1910,11 @@ mod tests {
         let service = build_service(&tmp).await;
         let image = ImageFile::open(config.clone(), service.clone(), None).await?;
         let path = tmp.path().join("snapshot.commit");
+        let (descriptor, lowers) = image.create_snapshot_and_restack(&path, None).await?;
+        assert!(descriptor.is_none());
+        assert_eq!(lowers, config.lowers);
+        assert!(!path.exists());
+        image.write_at(0, &[0x33; 4096]).await?;
         let error = image
             .create_snapshot_and_restack(&path, None)
             .await
@@ -1902,6 +1927,8 @@ mod tests {
         drop(image);
         let image = ImageFile::open(config, service, None).await?;
         assert_eq!(image.read_at(4096, 4096).await?.as_ref(), &[0x22; 4096]);
+        let (_, lowers) = image.create_snapshot_and_restack(&path, Some(0)).await?;
+        assert_eq!(lowers.len(), 2);
         Ok(())
     }
 
@@ -1931,6 +1958,7 @@ mod tests {
         };
         let service = build_service(&tmp).await;
         let image = ImageFile::open(config, service, None).await?;
+        image.discard(4096, 4096).await?;
         let path = tmp.path().join("snapshot.commit");
         let blocked = tmp.path().join("managed-base.commit");
         std::fs::create_dir(&blocked)?;
@@ -1994,7 +2022,15 @@ mod tests {
             .await
             .expect("open image");
 
-        let first_overlay = vec![0x22; 4096];
+        image.truncate(16384).await.expect("grow image");
+        let resized = tmp.path().join("resized.commit");
+        image
+            .create_snapshot_and_restack(&resized, None)
+            .await
+            .expect("capture empty upper with a resize");
+        assert_eq!(read_overlaybd_layer_virtual_size(&resized).unwrap(), 16384);
+
+        let first_overlay = vec![0; 4096];
         image
             .write_at(0, &first_overlay)
             .await
@@ -3321,6 +3357,13 @@ mod tests {
         assert_eq!(image.size().await.expect("refresh size"), 4096);
         assert_eq!(image.size_bytes(), 4096);
         assert_eq!(image.num_lbas(), 8);
+        let output = tmp.path().join("base.commit");
+        let (_, lowers) = image
+            .create_snapshot_and_restack(&output, None)
+            .await
+            .expect("capture an empty image without lowers");
+        assert_eq!(lowers.len(), 1);
+        assert_eq!(read_overlaybd_layer_virtual_size(&output).unwrap(), 4096);
     }
 
     /// Mocked remote-path test: ImageService::create_image_file -> mocked registry ->
@@ -3333,7 +3376,9 @@ mod tests {
         // --- build a sealed LSMT lower layer blob ---
         let lower_path = tmp.path().join("e2e-lower.data");
         let lower_index = tmp.path().join("e2e-lower.index");
-        let payload: Vec<u8> = (0..32768).map(|i| ((i * 13 + 7) % 251) as u8).collect();
+        let payload: Vec<u8> = (0..1024 * 1024)
+            .map(|i| ((i * 13 + 7) % 251) as u8)
+            .collect();
         create_sealed_lower(&lower_path, &lower_index, &payload)
             .await
             .expect("build sealed lower");
@@ -3401,6 +3446,16 @@ mod tests {
             state.data_bytes.load(AtomicOrdering::Relaxed) > 0,
             "no remote data reads occurred"
         );
+
+        let bytes_before = state.data_bytes.load(AtomicOrdering::Relaxed);
+        let compacted = Arc::new(LocalFile::new(tmp.path().join("compacted.commit")).unwrap());
+        image
+            .compact(compacted.clone(), OverlaybdCompactOutput::Raw)
+            .await
+            .expect("compact remote data before reading the full image");
+        assert!(state.data_bytes.load(AtomicOrdering::Relaxed) > bytes_before);
+        let snapshot = LSMTReadOnlyFile::open(compacted).await.unwrap();
+        assert_eq!(snapshot.read_at(0, payload.len()).await.unwrap(), payload);
 
         // --- verify LSMT read path: data matches original payload ---
         let got = image.read_at(0, payload.len()).await.expect("read lower");

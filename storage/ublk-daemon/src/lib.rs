@@ -9,7 +9,7 @@ pub use client::{
 };
 pub use overlaybd::RestackSnapshotTerminalFailure;
 pub use protocol::{
-    AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec, RestackSnapshotResult,
+    AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec, SnapshotDeviceResult,
     SourceStateStrategy,
 };
 pub use server::UblkDaemonServer;

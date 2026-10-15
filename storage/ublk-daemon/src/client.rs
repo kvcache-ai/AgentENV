@@ -11,9 +11,13 @@ use warm_pool::PoolConfig;
 
 use crate::protocol::{
     recv_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
-    RestackSnapshotResult, SourceStateStrategy,
+    SnapshotDeviceResult, SourceStateStrategy,
 };
-use overlaybd::{config::UpperMode, RestackSnapshotTerminalFailure};
+use overlaybd::{
+    config::{ImageConfig, UpperMode},
+    snapshot::OverlaybdCompactOutput,
+    RestackSnapshotTerminalFailure,
+};
 
 /// Timeout for best-effort daemon RPC calls.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
@@ -495,31 +499,52 @@ impl UblkDaemonClient {
         }
     }
 
-    /// Request a restack-style snapshot of an overlaybd device's upper layer.
-    pub async fn restack_snapshot(
+    /// Request a snapshot of an overlaybd device's upper layer.
+    pub async fn snapshot_device(
         &self,
         dev_id: u32,
         output_layer_path: &Path,
         compact_from: Option<usize>,
-    ) -> Result<RestackSnapshotResult> {
-        let request = DaemonRequest::RestackSnapshot {
+    ) -> Result<SnapshotDeviceResult> {
+        let request = DaemonRequest::SnapshotDevice {
             dev_id,
             output_layer_path: output_layer_path.to_path_buf(),
             compact_from,
         };
         let response = self.call(request).await?;
         match response {
-            DaemonResponse::RestackSnapshotCreated {
+            DaemonResponse::SnapshotDeviceCreated {
                 descriptor,
                 lowers,
                 data_stat,
                 ext4_used_bytes,
-            } => Ok(RestackSnapshotResult {
+            } => Ok(SnapshotDeviceResult {
                 descriptor,
                 lowers,
                 data_stat,
                 ext4_used_bytes,
             }),
+            response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
+        }
+    }
+
+    /// Merge immutable layers and wait until the output file is complete.
+    pub async fn compact_layers(
+        &self,
+        image: &ImageConfig,
+        global_config: &Path,
+        output_layer_path: &Path,
+        output: OverlaybdCompactOutput,
+    ) -> Result<()> {
+        let request = DaemonRequest::CompactLayers {
+            lowers: image.lowers.clone(),
+            repo_blob_url: image.repo_blob_url.clone(),
+            global_config: global_config.to_path_buf(),
+            output_layer_path: output_layer_path.to_path_buf(),
+            output,
+        };
+        match self.call(request).await? {
+            DaemonResponse::Ok => Ok(()),
             response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
@@ -719,7 +744,7 @@ impl UblkDaemonClient {
         };
         match response {
             DaemonResponse::TerminalError { message }
-                if matches!(request, DaemonRequest::RestackSnapshot { .. }) =>
+                if matches!(request, DaemonRequest::SnapshotDevice { .. }) =>
             {
                 Err(RestackSnapshotTerminalFailure::new(message).into())
             }
@@ -864,7 +889,7 @@ mod tests {
             .await
         };
         let (result, served) =
-            tokio::join!(client.restack_snapshot(1, Path::new("layer"), None), server);
+            tokio::join!(client.snapshot_device(1, Path::new("layer"), None), server);
         assert!(result.unwrap_err().is::<RestackSnapshotTerminalFailure>());
         served?;
         let server = async {

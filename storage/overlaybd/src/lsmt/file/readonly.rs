@@ -173,13 +173,11 @@ impl LSMTReadOnlyFile {
         Ok(segs.len())
     }
 
-    pub async fn flatten(&self, dest_file: Arc<dyn VirtualFile>) -> Result<()> {
+    pub async fn flatten(&self, args: CommitArgs) -> Result<()> {
         let query = Segment::new(0, (self.virtual_size.div_ceil(ALIGNMENT)) as u32);
         let mut mappings = Vec::new();
         self.index.lookup(query, &mut mappings);
-        let writer: Arc<dyn CompactWriter> = Arc::new(VirtualFileWriter::new(dest_file));
-        let commit_args = CommitArgs::from_writer(writer);
-        compact_to(&self.layers, &mappings, self.virtual_size, commit_args).await
+        compact_to(&self.layers, &mappings, self.virtual_size, args).await
     }
 
     pub(super) fn from_merged_layers(
