@@ -328,6 +328,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		zap.String("upstream_endpoint", node.GetEndpoint()),
 	)
 
+	if r.Method == http.MethodConnect && isDataPlaneRouteSource(routeSource) {
+		s.relayDataPlaneConnect(w, r, routingCtx, node, hostRoute)
+		return
+	}
+
 	decodedPath := upstreamTargetPath(routeSource, r.URL.Path)
 	escapedPath := upstreamTargetEscapedPath(routeSource, requestEscapedPath(r))
 	upstreamURL, err := joinUpstream(node.GetEndpoint(), decodedPath, escapedPath, r.URL.RawQuery)

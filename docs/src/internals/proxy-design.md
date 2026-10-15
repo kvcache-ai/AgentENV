@@ -208,6 +208,11 @@ and target port exactly like the HTTP path.
   broken tunnel.
 - After `200 OK`, bytes are forwarded bidirectionally with no framing,
   idle timeout, or inspection.
+- Multi-node deployments work too: the gateway cannot reuse its
+  `httputil.ReverseProxy` path (it only bridges 101 upgrades), so it relays
+  CONNECT explicitly — hijack the client connection, replay the CONNECT
+  request with routing headers to the owning node, then bridge raw bytes.
+  The established tunnel is exempt from the gateway routing timeout.
 
 Tunnel failure behavior:
 

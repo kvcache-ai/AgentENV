@@ -112,6 +112,18 @@ func setGatewayRouteSource(w http.ResponseWriter, source routeSource) {
 	}
 }
 
+func (r *statusRecorder) setStatusCode(status int) {
+	r.status = status
+}
+
+// overrideGatewayResponseStatus records the response sent on a hijacked
+// connection, where the ResponseWriter otherwise records a 101 upgrade.
+func overrideGatewayResponseStatus(w http.ResponseWriter, status int) {
+	if recorder, ok := w.(interface{ setStatusCode(int) }); ok {
+		recorder.setStatusCode(status)
+	}
+}
+
 func (s *Server) instrumentGatewayHTTP(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.isLocalGatewayEndpointRequest(r) {
