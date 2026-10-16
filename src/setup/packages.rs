@@ -182,7 +182,7 @@ fn bundled_manifest() -> &'static SetupDependencyManifest {
     &MANIFEST
 }
 
-fn sudo_cmd<I, S>(args: I) -> Result<bool>
+fn sudo_cmd<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -190,7 +190,7 @@ where
     let status = if nix::unistd::Uid::effective().is_root() {
         let mut args = args.into_iter();
         let Some(program) = args.next() else {
-            return Ok(true);
+            return true;
         };
         Command::new(program)
             .args(args)
@@ -204,7 +204,7 @@ where
             .map(|s| s.success())
             .unwrap_or(false)
     };
-    Ok(status)
+    status
 }
 
 fn cmd_success<I, S>(program: &str, args: I) -> bool
@@ -295,7 +295,7 @@ fn missing_runtime_requirements_for_distro(
     manager: PackageManager,
     manifest: &SetupDependencyManifest,
     distro: Distro,
-) -> Result<Vec<MissingRuntimeRequirement>> {
+) -> Vec<MissingRuntimeRequirement> {
     let distro_packages = match distro {
         Distro::Ubuntu => &manifest.packages.runtime.ubuntu,
         Distro::Debian => &manifest.packages.runtime.debian,
@@ -331,7 +331,7 @@ fn missing_runtime_requirements_for_distro(
         missing.push(MissingRuntimeRequirement::command(command, package));
     }
 
-    Ok(missing)
+    missing
 }
 
 fn command_present(command: &str) -> bool {
@@ -350,13 +350,13 @@ fn missing_install_plan(
     }
 
     refresh_package_index(manager)?;
-    select_install_packages(manager, missing)
+    Ok(select_install_packages(manager, missing))
 }
 
 fn select_install_packages(
     manager: PackageManager,
     requirements: &[MissingRuntimeRequirement],
-) -> Result<MissingRuntimeInstallPlan> {
+) -> MissingRuntimeInstallPlan {
     select_install_packages_with_probe(manager, requirements, package_available)
 }
 
@@ -364,7 +364,7 @@ fn select_install_packages_with_probe<F>(
     manager: PackageManager,
     requirements: &[MissingRuntimeRequirement],
     mut is_package_available: F,
-) -> Result<MissingRuntimeInstallPlan>
+) -> MissingRuntimeInstallPlan
 where
     F: FnMut(PackageManager, &str) -> bool,
 {
@@ -385,10 +385,10 @@ where
             None => unavailable.push(requirement.clone()),
         }
     }
-    Ok(MissingRuntimeInstallPlan {
+    MissingRuntimeInstallPlan {
         installable: installable.into_iter().collect(),
         unavailable,
-    })
+    }
 }
 
 fn format_requirements(requirements: &[MissingRuntimeRequirement]) -> String {
@@ -471,7 +471,7 @@ fn install_sudo_packages(manager: &str, prefix: &[&str], packages: &[String]) ->
         .map(|arg| (*arg).to_string())
         .collect::<Vec<_>>();
     args.extend(packages.iter().cloned());
-    if !sudo_cmd(args)? {
+    if !sudo_cmd(args) {
         bail!("failed to install {} via {manager}", packages.join(" "));
     }
     Ok(())
@@ -480,7 +480,7 @@ fn install_sudo_packages(manager: &str, prefix: &[&str], packages: &[String]) ->
 fn refresh_package_index(manager: PackageManager) -> Result<()> {
     match manager {
         PackageManager::Apt => {
-            if !sudo_cmd(APT_UPDATE_ARGS)? {
+            if !sudo_cmd(APT_UPDATE_ARGS) {
                 bail!("apt-get update failed");
             }
         }
@@ -498,7 +498,7 @@ pub fn ensure() -> Result<()> {
     let distro = detect_distro()?;
     let manager = detect_package_manager(distro)?;
     let manifest = bundled_manifest();
-    let missing = missing_runtime_requirements_for_distro(manager, manifest, distro)?;
+    let missing = missing_runtime_requirements_for_distro(manager, manifest, distro);
     let missing = missing_install_plan(manager, &missing)?;
     install_packages(manager, &missing)
 }
@@ -506,7 +506,7 @@ pub fn ensure() -> Result<()> {
 pub fn check_runtime() -> Result<()> {
     let distro = detect_distro()?;
     let manager = detect_package_manager(distro)?;
-    let missing = missing_runtime_requirements_for_distro(manager, bundled_manifest(), distro)?;
+    let missing = missing_runtime_requirements_for_distro(manager, bundled_manifest(), distro);
     if !missing.is_empty() {
         bail!(
             "missing AENV runtime requirements: {}; run `server --setup-only` or install the listed packages manually",
@@ -562,8 +562,7 @@ mod tests {
         let package = PackageChoice::from_str("definitely-not-a-real-package");
         let requirement = MissingRuntimeRequirement::Package(package);
         let selected =
-            select_install_packages_with_probe(PackageManager::Apt, &[requirement], |_, _| false)
-                .expect("select");
+            select_install_packages_with_probe(PackageManager::Apt, &[requirement], |_, _| false);
         assert!(selected.installable.is_empty());
         assert_eq!(selected.unavailable.len(), 1);
         let message = missing_unavailable_requirements_message(&selected.unavailable);

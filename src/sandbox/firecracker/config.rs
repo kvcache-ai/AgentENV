@@ -222,12 +222,14 @@ impl FirecrackerCommonConfig {
         let tools_drive_version = config.resolved_tools_version().to_string();
 
         let mut common = Self::new(firecracker_binary, tools_drive_version, runtime_policy);
-        common.envd_version = config.envd.version.clone();
+        common.envd_version.clone_from(&config.envd.version);
         common.disk_rate_limit = config.machine.disk_rate_limit.clone();
         common.track_dirty_pages = config.memory_snapshot.track_dirty_pages;
         common.rootfs_allow_shrink = config.ublk.overlaybd.allow_shrink;
         common.control_plane_port = config.tools.control_plane_port;
-        common.firecracker_work_base_dir = config.firecracker.work_dir.clone();
+        common
+            .firecracker_work_base_dir
+            .clone_from(&config.firecracker.work_dir);
         common.serial_output_base_dir =
             Self::resolve_serial_output_dir(config.firecracker.serial_dir.clone())?;
         common.firecracker_log_level = config
@@ -419,9 +421,15 @@ impl FirecrackerSandboxConfig {
                 .with_access_token(launch_config.envd_access_token.as_ref())
                 .with_extra(launch_config.extra_mmds.clone()),
         );
-        self.common.network_policy = launch_config.network.clone();
-        self.common.custom_extension_params = launch_config.custom_extension_params.clone();
-        self.common.envd_access_token = launch_config.envd_access_token.clone();
+        self.common
+            .network_policy
+            .clone_from(&launch_config.network);
+        self.common
+            .custom_extension_params
+            .clone_from(&launch_config.custom_extension_params);
+        self.common
+            .envd_access_token
+            .clone_from(&launch_config.envd_access_token);
         self
     }
 
@@ -509,7 +517,9 @@ impl FirecrackerSnapshotConfig {
                 "snapshot does not record a tools drive version; migrate its metadata before launching it"
             );
         }
-        base_common.tools_drive_version = tools_drive_version.clone();
+        base_common
+            .tools_drive_version
+            .clone_from(tools_drive_version);
         let rootfs_image_config = OverlaybdConfig {
             image_config_path: manifest.rootfs.image_config_path.clone(),
             read_only: app_config.ublk.overlaybd.read_only,

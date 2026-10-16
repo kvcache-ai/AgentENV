@@ -26,3 +26,6 @@ tonic-prost-build = "0.14.2"
 [dev-dependencies]
 futures-util = "0.3.31"
 tempfile = "3.22.0"
+
+[lints]
+workspace = true

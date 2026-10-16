@@ -41,7 +41,7 @@ macro_rules! override_sqe {
         let entry = $entry;
         let value = $value;
         unsafe {
-            let sqe: &mut $crate::queue::RawSqe = std::mem::transmute(entry);
+            let sqe = &mut *std::ptr::from_mut(entry).cast::<$crate::queue::RawSqe>();
             sqe.$field = value;
         }
     };
@@ -49,7 +49,7 @@ macro_rules! override_sqe {
         let entry = $entry;
         let value = $value;
         unsafe {
-            let sqe: &mut $crate::queue::RawSqe = std::mem::transmute(entry);
+            let sqe = &mut *std::ptr::from_mut(entry).cast::<$crate::queue::RawSqe>();
             sqe.$field |= value;
         }
     };
@@ -303,7 +303,7 @@ impl UVMUblkQueue {
     }
 
     pub fn io_desc(&self, tag: u16) -> Option<ublk_sys::ublksrv_io_desc> {
-        self.io_desc.get(tag as usize).cloned()
+        self.io_desc.get(tag as usize).copied()
     }
 }
 

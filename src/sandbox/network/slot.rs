@@ -438,7 +438,7 @@ impl Slot {
     ///
     /// Format: `ip=<vm_ip>::<tap_ip>:<netmask>:<hostname>:<iface>:<autoconf>:<dns>`
     pub(crate) fn build_ip_boot_arg(&self) -> String {
-        let dns_ip = self.guest_dns_server();
+        let dns_ip = Self::guest_dns_server();
         format!(
             "ip={}::{}:{}:instance:eth0:off:{}",
             self.address_plan.vm_ip(),
@@ -448,7 +448,7 @@ impl Slot {
         )
     }
 
-    pub(crate) fn guest_dns_server(&self) -> Ipv4Addr {
+    pub(crate) fn guest_dns_server() -> Ipv4Addr {
         resolve_guest_dns_server()
     }
 
@@ -486,7 +486,7 @@ impl Slot {
         }
 
         let netns_path = self.namespace_path();
-        let egress_proxy_port = self.egress_proxy.port();
+        let egress_proxy_port = EgressProxy::port();
         let policy = policy.cloned();
         let handle = thread::spawn(move || -> Result<()> {
             let netns = File::open(&netns_path).with_context(|| {

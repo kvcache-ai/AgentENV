@@ -121,7 +121,10 @@ fn setup(args: Setup) -> Result<()> {
     }
     config.validate()?;
     let mut alias = reqwest::Url::parse("https://unused.invalid/")?;
-    alias.path_segments_mut().unwrap().push(&config.template);
+    alias
+        .path_segments_mut()
+        .expect("https URL has path segments")
+        .push(&config.template);
     match client
         .get(&format!("/templates/aliases{}", alias.path()))
         .call()
@@ -223,7 +226,7 @@ fn absolute(path: &Path) -> Result<PathBuf> {
                     result = result.canonicalize()?;
                 }
             }
-            _ => bail!("Unsupported path"),
+            Component::Prefix(_) => bail!("Unsupported path"),
         }
     }
     Ok(result)
@@ -424,7 +427,7 @@ impl Lease {
                         .timeout(Duration::from_secs(30))
                         .send_json(json!({"timeout":TTL})),
                 ) {
-                    *errors.lock().unwrap() =
+                    *errors.lock().expect("errors lock poisoned") =
                         Some(format!("Sandbox lease renewal failed: {error:#}"));
                     break;
                 }
@@ -437,7 +440,7 @@ impl Lease {
         }
     }
     fn check(&self) -> Result<()> {
-        if let Some(error) = self.error.lock().unwrap().as_ref() {
+        if let Some(error) = self.error.lock().expect("error lock poisoned").as_ref() {
             bail!("{error}");
         }
         Ok(())
@@ -540,12 +543,9 @@ async fn run_session(
         );
         let token = uuid::Uuid::new_v4().simple().to_string();
         guest.start_services(&token).await?;
-        live = Some(Live::start(&session, token).await?);
+        let live = live.insert(Live::start(&session, token).await?);
         println!("Connected. Commands and file operations run in your sandbox.");
-        live.as_mut()
-            .unwrap()
-            .native_ui(&session, options, &lease)
-            .await
+        live.native_ui(&session, options, &lease).await
     };
     let mut result = tokio::select! {
         result = work => result,
@@ -661,7 +661,7 @@ impl Live {
         rpc.call("environment/info", json!({"environmentId":"remote"}))
             .await?;
         let events = socket::Events::new(session.path)?;
-        let gateway = socket::gateway(&ui_path, harness, proxy, token, events.clone()).await?;
+        let gateway = socket::gateway(&ui_path, harness, proxy, token, events.clone())?;
         Ok(Self {
             process,
             rpc,
@@ -706,13 +706,18 @@ impl Live {
     }
 
     async fn native_ui(
-        &mut self,
+        &self,
         session: &Session<'_>,
         options: &TurnOptions,
         lease: &Lease,
     ) -> Result<()> {
         let mut command = Command::new(session.binary);
-        let thread_id = self.events.lock().unwrap().thread_id.clone();
+        let thread_id = self
+            .events
+            .lock()
+            .expect("events lock poisoned")
+            .thread_id
+            .clone();
         if thread_id.is_some() {
             command.arg("resume");
         }
@@ -745,7 +750,7 @@ impl Live {
                 }
                 lease.check()?;
                 {
-                    let events = self.events.lock().unwrap();
+                    let events = self.events.lock().expect("events lock poisoned");
                     if let Some(error) = &events.error {
                         bail!("Codex connection failed: {error}");
                     }
@@ -916,7 +921,7 @@ mod tests {
                     // Preserve the durable pending record while forcing the
                     // post-DELETE replacement to fail, even when run as root.
                     fs::rename(session.join("session.json"), session.join("pending.json"))?;
-                    fs::create_dir(session.join("session.json"))?;
+                    fs::create_dir_all(session.join("session.json"))?;
                 }
                 Ok(())
             },
@@ -952,7 +957,7 @@ mod tests {
             Duration::from_millis(100),
         )?;
         fs::remove_file(session.path().join("session.json"))?;
-        fs::create_dir(session.path().join("session.json"))?;
+        fs::create_dir_all(session.path().join("session.json"))?;
         assert!(delete_saved_sandbox(&client, session.path(), &mut manifest).is_err());
         assert_eq!(
             listener.accept().unwrap_err().kind(),
@@ -1002,7 +1007,7 @@ mod tests {
     #[test]
     fn output_paths_resolve_existing_symlinks() -> Result<()> {
         let root = tempfile::tempdir()?;
-        fs::create_dir(root.path().join("project"))?;
+        fs::create_dir_all(root.path().join("project"))?;
         std::os::unix::fs::symlink(root.path().join("project"), root.path().join("link"))?;
         assert_eq!(
             absolute(&root.path().join("link/new/subdir"))?,

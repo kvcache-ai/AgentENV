@@ -26,7 +26,7 @@ impl Drop for AutoRegBufferInner {
 }
 
 impl AutoRegBuffer {
-    pub async fn new(ring: AsyncIoRing, size: usize) -> Result<Self> {
+    pub fn new(ring: AsyncIoRing, size: usize) -> Result<Self> {
         let data = ublk_sys::ublk_auto_buf_reg {
             index: ring
                 .occupy_sparse_buffer_index()
@@ -123,7 +123,7 @@ pub struct UserBufferInner {
 }
 
 impl UserBufferInner {
-    pub async fn new(ring: AsyncIoRing, size: usize, align: usize) -> Result<Self> {
+    pub fn new(ring: AsyncIoRing, size: usize, align: usize) -> Result<Self> {
         let layout = Layout::from_size_align(size, align).context("invalid layout")?;
         if layout.size() == 0 {
             bail!("UserBufferInner size cannot be zero");
@@ -182,7 +182,7 @@ impl UserBufferInner {
         );
         unsafe {
             let ptr = self.ptr.add(offset);
-            std::slice::from_raw_parts(ptr as _, len)
+            std::slice::from_raw_parts(ptr.cast_const(), len)
         }
     }
 
@@ -198,7 +198,7 @@ impl Drop for UserBufferInner {
                 dealloc(self.ptr, self.layout);
             }
         }
-        if let Some(buf_idx) = self.buf_idx.get().cloned() {
+        if let Some(buf_idx) = self.buf_idx.get().copied() {
             let _ = self.ring.unregister_buffer(buf_idx);
         }
     }
@@ -217,8 +217,8 @@ pub struct UserBuffer {
 }
 
 impl UserBuffer {
-    pub async fn new(ring: AsyncIoRing, size: usize, align: usize) -> Result<Self> {
-        let inner = UserBufferInner::new(ring, size, align).await?;
+    pub fn new(ring: AsyncIoRing, size: usize, align: usize) -> Result<Self> {
+        let inner = UserBufferInner::new(ring, size, align)?;
         Ok(Self {
             inner: Rc::new(inner),
         })
@@ -259,7 +259,11 @@ impl UserBuffer {
     // SAFETY: after the UserBuffer has successfully created, it must
     // register the buffer into uring.
     pub fn uring_buf_idx(&self) -> u16 {
-        self.inner.buf_idx.get().cloned().unwrap() as u16
+        self.inner
+            .buf_idx
+            .get()
+            .copied()
+            .expect("buffer is registered at creation") as u16
     }
 
     /// Read the data from io_ring_file_idx into buffer.

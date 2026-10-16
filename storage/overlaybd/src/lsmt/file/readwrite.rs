@@ -767,6 +767,7 @@ impl LSMTFile {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn write_internal_generic<W: FileWriter>(
         &self,
         writer: &W,

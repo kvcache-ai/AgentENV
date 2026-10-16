@@ -71,7 +71,7 @@ pub fn validate_upper_config(upper: &UpperConfig) -> Result<bool> {
             );
             true
         }
-        Some(UpperMode::LogStructured) | Some(UpperMode::HybridLogStructured) | None => {
+        Some(UpperMode::LogStructured | UpperMode::HybridLogStructured) | None => {
             let has_partial_upper = has_upper_data ^ has_upper_index;
             ensure!(
                 !has_partial_upper,

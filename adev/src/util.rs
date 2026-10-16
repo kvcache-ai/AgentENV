@@ -57,7 +57,7 @@ pub fn download_file(url: &str, dest: &Path) -> Result<()> {
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("{bar:40.cyan/blue} {bytes}/{total_bytes} ({eta})")
-                .unwrap()
+                .expect("valid progress template")
                 .progress_chars("=>-"),
         );
         Some(pb)

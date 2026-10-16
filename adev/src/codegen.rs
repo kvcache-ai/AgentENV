@@ -209,7 +209,7 @@ fn fix_duplicate_auth_trait(path: &std::path::Path) -> Result<()> {
             r"\s+async fn extract_claims_from_header\(&self, headers: &axum::http::header::HeaderMap, key: &str\) -> Option<Self::Claims>;\r?\n",
             r"\s*\}\r?\n\r?\n"
         ))
-        .unwrap()
+        .expect("valid regex")
     });
 
     let matches: Vec<_> = PATTERN.find_iter(&content).collect();

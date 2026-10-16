@@ -578,7 +578,7 @@ async fn drain_output_once(
 
         let event = match next {
             Ok(Some(Ok(event))) => event,
-            Ok(Some(Err(_))) | Ok(None) => return OutputDrain::Disconnected,
+            Ok(Some(Err(_)) | None) => return OutputDrain::Disconnected,
             Err(_) => return OutputDrain::Idle,
         };
         state.finish_recovery();
@@ -609,8 +609,10 @@ fn write_output_event(event: Option<envd::process::ProcessEvent>) -> OutputWrite
     };
     match evt {
         process_event::Event::Data(data) => match data.output {
-            Some(process_event::data_event::Output::Pty(bytes))
-            | Some(process_event::data_event::Output::Stdout(bytes)) => {
+            Some(
+                process_event::data_event::Output::Pty(bytes)
+                | process_event::data_event::Output::Stdout(bytes),
+            ) => {
                 let visible_output = !bytes.is_empty();
                 let mut stdout = std::io::stdout().lock();
                 if stdout
@@ -929,7 +931,9 @@ mod tests {
         let mut recovered_health = false;
         let mut probe = InputStallProbe {
             output_generation: state.output_generation(),
-            deadline: Instant::now() - Duration::from_millis(1),
+            deadline: Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .expect("instant should support a past deadline"),
         };
 
         if state.output_generation() == probe.output_generation && Instant::now() >= probe.deadline

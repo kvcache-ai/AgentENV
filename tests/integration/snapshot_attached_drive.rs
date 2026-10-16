@@ -193,14 +193,14 @@ async fn publish_sandbox_snapshot_with_attached_drive(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
     use agentenv::volume::{VolumeManager, VolumeMode};
 
     common::setup().await;
     let root = tempdir()?;
     let (_, _, repository) = common::snapshot_test_parts(root.path());
-    let volumes =
-        VolumeManager::open_with_repository(root.path().join("volumes"), repository).await?;
+    let volumes = VolumeManager::open_with_repository(root.path().join("volumes"), repository)?;
     let mut config = common::default_sandbox_config()?;
     config.vcpu_count = 2;
     config.mem_size_mib = 512;

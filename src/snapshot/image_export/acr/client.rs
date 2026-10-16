@@ -884,9 +884,10 @@ fn docker_credential_helper_for_registry(
 }
 
 fn matching_docker_auth_address(auths: &serde_json::Value, registry: &str) -> Option<String> {
-    auths.as_object()?.keys().find_map(|address| {
-        docker_auth_address_matches(address, registry).then(|| address.to_string())
-    })
+    auths
+        .as_object()?
+        .keys()
+        .find_map(|address| docker_auth_address_matches(address, registry).then(|| address.clone()))
 }
 
 fn docker_helper_server_url(address: &str) -> String {

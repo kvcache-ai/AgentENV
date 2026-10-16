@@ -43,8 +43,7 @@ pub(super) async fn test_api(
         root.path().join("volumes/catalog.json"),
         backend.repository(),
         limits,
-    )
-    .await?;
+    )?;
     let api = ApiImpl::new(
         orchestrator,
         manager.clone(),

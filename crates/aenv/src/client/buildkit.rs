@@ -15,7 +15,7 @@ use tokio_util::io::ReaderStream;
 
 use super::Client;
 
-pub(crate) async fn bind_local() -> Result<(tempfile::TempDir, BuildkitListener, String)> {
+pub(crate) fn bind_local() -> Result<(tempfile::TempDir, BuildkitListener, String)> {
     let mut directory = tempfile::Builder::new();
     #[cfg(unix)]
     {
@@ -185,7 +185,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::result_large_err)] // The WebSocket handshake fixes the callback error type.
     async fn private_socket_tunnels_authenticated_binary_traffic() -> Result<()> {
-        let (work, listener, address) = bind_local().await?;
+        let (work, listener, address) = bind_local()?;
         assert_eq!(work.path().metadata()?.permissions().mode() & 0o077, 0);
         let path = address.strip_prefix("unix://").unwrap();
         let remote = TcpListener::bind("127.0.0.1:0").await?;

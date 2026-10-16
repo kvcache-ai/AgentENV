@@ -38,7 +38,7 @@ struct ImageRef {
     reference: String,
 }
 
-fn parse_image_ref(raw: &str) -> Result<ImageRef> {
+fn parse_image_ref(raw: &str) -> ImageRef {
     // Handle digest references like redis@sha256:abc123...
     let (rest, reference) = if let Some((name, digest)) = raw.split_once('@') {
         (name, digest.to_string())
@@ -80,11 +80,11 @@ fn parse_image_ref(raw: &str) -> Result<ImageRef> {
         host
     };
 
-    Ok(ImageRef {
+    ImageRef {
         host,
         repo,
         reference,
-    })
+    }
 }
 
 /// Parse WWW-Authenticate bearer challenge.
@@ -273,7 +273,7 @@ fn select_platform<'a>(
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let image_ref = parse_image_ref(&args.image)?;
+    let image_ref = parse_image_ref(&args.image);
     let scheme = if args.insecure {
         eprintln!("WARNING: using insecure HTTP connection");
         "http"

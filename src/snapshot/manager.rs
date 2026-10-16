@@ -206,7 +206,7 @@ impl SnapshotManager {
                     } if drive_id == &drive.drive_id => {
                         Some((committed_layer_digests(layers), managed_layer_uuids(layers)))
                     }
-                    _ => None,
+                    crate::snapshot::CommittedAttachedDrive::Overlaybd { .. } => None,
                 })
                 .unwrap_or_default();
             artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(

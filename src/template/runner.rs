@@ -28,7 +28,7 @@ use crate::virtualization::VirtualizationMode;
 /// Use the same default ready command as E2B
 const DEFAULT_READY_WITH_START_CMD: &str = "/agentenv/bin/busybox sleep 20";
 const READY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-const READY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const READY_TIMEOUT: Duration = Duration::from_mins(10);
 
 fn spawn_with_trace_context<T, F>(span: Span, worker: F) -> JoinHandle<T>
 where
@@ -176,10 +176,16 @@ impl TemplateBuildRunner {
         config.vcpu_count = context.resources.cpu_count;
         config.mem_size_mib = context.resources.memory_mib;
         config.common.ublk_config = ublk_config;
-        config.common.cpu_config_json = context.cpu_config_json.clone();
+        config
+            .common
+            .cpu_config_json
+            .clone_from(&context.cpu_config_json);
         config.common.env_vars = (!context.initial_context.env_vars.is_empty())
             .then_some(context.initial_context.env_vars.clone());
-        config.common.default_user = context.initial_context.user.clone();
+        config
+            .common
+            .default_user
+            .clone_from(&context.initial_context.user);
         config.common.default_workdir = Some(context.initial_context.workdir.clone());
         let image_configs = image_configs.clone();
         let launch_config =
@@ -1033,6 +1039,6 @@ mod tests {
         assert_eq!(timeouts.len(), 1);
         let timeout = timeouts[0].expect("ready command should have a timeout");
         assert!(timeout <= super::READY_TIMEOUT);
-        assert!(timeout > super::READY_TIMEOUT - Duration::from_secs(1));
+        assert!(timeout + Duration::from_secs(1) > super::READY_TIMEOUT);
     }
 }

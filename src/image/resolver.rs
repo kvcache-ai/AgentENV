@@ -259,6 +259,7 @@ impl ImageResolver {
     /// Resolve a successfully-fetched manifest into a block image. Every failure
     /// here is fatal (the manifest already proved the candidate registry has
     /// the image), so all errors collapse into [`ImageError::Other`].
+    #[allow(clippy::too_many_lines)]
     async fn resolve_fetched_manifest(
         &self,
         image_ref: &str,
@@ -628,7 +629,7 @@ mod tests {
                 ],
                 try_referrers_overlaybd_prefixes: vec![
                     " registry.example.com/team/ ".to_string(),
-                    "".to_string(),
+                    String::new(),
                     "registry.example.com/".to_string(),
                 ],
                 ..ImageResolverConfig::default()
@@ -679,7 +680,7 @@ mod tests {
             resolver: ImageResolverConfig {
                 allowed_registries: Some(vec![
                     " registry.example.com/ ".to_string(),
-                    "".to_string(),
+                    String::new(),
                     "   ".to_string(),
                     "ghcr.io".to_string(),
                 ]),

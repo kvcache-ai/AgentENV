@@ -1427,10 +1427,12 @@ fn resolve_optional_config_path_or(
     *path = Some(resolved);
 }
 
+#[allow(clippy::unnecessary_wraps)] // confique `parse_env` requires a Result.
 fn parse_required_path(raw: &str) -> std::result::Result<PathBuf, std::convert::Infallible> {
     Ok(PathBuf::from(raw.trim()))
 }
 
+#[allow(clippy::unnecessary_wraps)] // confique `parse_env` requires a Result.
 fn parse_trimmed_string(raw: &str) -> std::result::Result<String, std::convert::Infallible> {
     Ok(raw.trim().to_string())
 }
@@ -2211,7 +2213,7 @@ mod tests {
             domains: vec![
                 " Sandbox.Example.Invalid. ".to_string(),
                 "sandbox.example.invalid".to_string(),
-                "".to_string(),
+                String::new(),
                 "old.example.invalid".to_string(),
             ],
         };

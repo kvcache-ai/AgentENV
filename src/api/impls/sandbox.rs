@@ -97,7 +97,7 @@ fn end_at(expires_at: Option<SystemTime>) -> chrono::DateTime<chrono::Utc> {
         .map(chrono::DateTime::<chrono::Utc>::from)
         // distant future for non-expiring sandbox
         .unwrap_or(chrono::DateTime::<chrono::Utc>::from(
-            std::time::UNIX_EPOCH + Duration::from_secs(60 * 60 * 24 * 365 * 100),
+            std::time::UNIX_EPOCH + Duration::from_hours(24 * 365 * 100),
         ))
 }
 
@@ -341,7 +341,7 @@ impl From<SandboxMetadata> for models::ListedSandbox {
             template_id: m.snapshot_id,
             alias: m.snapshot_alias,
             sandbox_id: m.id.into(),
-            client_id: "".to_string(), // Deprecated field, only reserved for E2B Python SDK.
+            client_id: String::new(), // Deprecated field, only reserved for E2B Python SDK.
             started_at: started_at(m.created_at),
             end_at: end_at(m.expires_at),
             cpu_count: m.resources.cpu_count,
@@ -361,7 +361,7 @@ impl From<SandboxMetadata> for models::Sandbox {
             template_id: m.snapshot_id,
             sandbox_id: m.id.into(),
             alias: m.snapshot_alias,
-            client_id: "".to_string(), // Deprecated field, only reserved for E2B Python SDK.
+            client_id: String::new(), // Deprecated field, only reserved for E2B Python SDK.
             envd_version: m.runtime_versions.envd_version.clone(),
             envd_access_token: None,
             traffic_access_token: None,
@@ -425,7 +425,7 @@ impl From<SandboxMetadata> for models::SandboxDetail {
             template_id: m.snapshot_id,
             alias: m.snapshot_alias,
             sandbox_id: m.id.into(),
-            client_id: "".to_string(), // Deprecated field, only reserved for E2B Python SDK.
+            client_id: String::new(), // Deprecated field, only reserved for E2B Python SDK.
             started_at: started_at(m.created_at),
             end_at: end_at(m.expires_at),
             envd_version: m.runtime_versions.envd_version.clone(),
@@ -483,8 +483,8 @@ impl ApiImpl {
     }
 }
 
-fn parse_metadata_filter(raw: &Option<String>) -> Option<HashMap<String, String>> {
-    let raw = raw.as_ref()?;
+fn parse_metadata_filter(raw: Option<&str>) -> Option<HashMap<String, String>> {
+    let raw = raw?;
     let map: HashMap<String, String> = url::form_urlencoded::parse(raw.as_bytes())
         .filter(|(key, value)| !key.is_empty() && !value.is_empty())
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
@@ -663,6 +663,7 @@ fn validate_domain_allowlist(policy: &SandboxNetworkPolicy) -> anyhow::Result<()
 impl Sandboxes<()> for ApiImpl {
     type Claims = super::Claims;
 
+    #[allow(clippy::too_many_lines)]
     async fn sandboxes_cold_post(
         &self,
         _method: &Method,
@@ -869,7 +870,10 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         query: &models::SandboxesMetricsGetQueryParams,
     ) -> Result<SandboxesMetricsGetResponse, ()> {
-        use SandboxesMetricsGetResponse::*;
+        use SandboxesMetricsGetResponse::{
+            Status200_SuccessfullyReturnedAllRunningSandboxesWithMetrics, Status400_BadRequest,
+            Status500_ServerError,
+        };
         let ids = match parse_metrics_ids(&query.sandbox_ids) {
             Ok(ids) => ids,
             Err(message) => return Ok(Status400_BadRequest(ApiImpl::error(400, message))),
@@ -898,7 +902,9 @@ impl Sandboxes<()> for ApiImpl {
         path: &models::V2SandboxesSandboxIdLogsGetPathParams,
         query: &models::V2SandboxesSandboxIdLogsGetQueryParams,
     ) -> Result<V2SandboxesSandboxIdLogsGetResponse, ()> {
-        use V2SandboxesSandboxIdLogsGetResponse::*;
+        use V2SandboxesSandboxIdLogsGetResponse::{
+            Status200_SuccessfullyReturnedTheSandboxLogs, Status404_NotFound, Status500_ServerError,
+        };
         let Ok(id) = SandboxId::parse_str(&path.sandbox_id) else {
             return Ok(Status404_NotFound(sandbox_not_found(&path.sandbox_id)));
         };
@@ -950,7 +956,10 @@ impl Sandboxes<()> for ApiImpl {
         path: &models::SandboxesSandboxIdMetricsGetPathParams,
         query: &models::SandboxesSandboxIdMetricsGetQueryParams,
     ) -> Result<SandboxesSandboxIdMetricsGetResponse, ()> {
-        use SandboxesSandboxIdMetricsGetResponse::*;
+        use SandboxesSandboxIdMetricsGetResponse::{
+            Status200_SuccessfullyReturnedTheSandboxMetrics, Status400_BadRequest,
+            Status404_NotFound, Status500_ServerError,
+        };
         if !valid_metrics_interval(query.start, query.end) {
             return Ok(Status400_BadRequest(ApiImpl::error(
                 400,
@@ -989,7 +998,7 @@ impl Sandboxes<()> for ApiImpl {
     ) -> Result<SandboxesGetResponse, ()> {
         let filter = SandboxListFilter {
             states: Some(vec![SandboxState::Running]),
-            user_metadata: parse_metadata_filter(&query_params.metadata),
+            user_metadata: parse_metadata_filter(query_params.metadata.as_deref()),
             ..SandboxListFilter::matches_all()
         };
 
@@ -1747,8 +1756,8 @@ impl Sandboxes<()> for ApiImpl {
             ));
         };
         let timer = SandboxStageTimer::new("pause");
-        match timer
-            .time("pause", self.orchestrator.pause_sandbox(sandbox_id))
+        match Box::pin(timer
+            .time("pause", self.orchestrator.pause_sandbox(sandbox_id)))
             .await
         {
             Ok(_) => Ok(
@@ -1801,32 +1810,32 @@ impl Sandboxes<()> for ApiImpl {
             None => None,
         };
 
-        let capture = match timer
-            .time("capture", self.orchestrator.capture_snapshot(sandbox_id))
-            .await
-        {
-            Ok(capture) => capture,
-            Err(OrchestratorError::SandboxNotFound(id)) => {
-                return Ok(SandboxesSandboxIdSnapshotsPostResponse::Status404_NotFound(
-                    sandbox_not_found(id),
-                ));
-            }
-            Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
-                return Ok(
-                    SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
-                        400,
-                        format!("sandbox cannot be snapshotted from {} state", state),
-                    )),
-                );
-            }
-            Err(err) => {
-                return Ok(
-                    SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(
-                        Self::internal_error(&err),
-                    ),
-                );
-            }
-        };
+        let capture =
+            match Box::pin(timer.time("capture", self.orchestrator.capture_snapshot(sandbox_id)))
+                .await
+            {
+                Ok(capture) => capture,
+                Err(OrchestratorError::SandboxNotFound(id)) => {
+                    return Ok(SandboxesSandboxIdSnapshotsPostResponse::Status404_NotFound(
+                        sandbox_not_found(id),
+                    ));
+                }
+                Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
+                    return Ok(
+                        SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
+                            400,
+                            format!("sandbox cannot be snapshotted from {} state", state),
+                        )),
+                    );
+                }
+                Err(err) => {
+                    return Ok(
+                        SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(
+                            Self::internal_error(&err),
+                        ),
+                    );
+                }
+            };
 
         let volume_snapshots = match snapshot_sandbox_volumes(self, &capture.metadata).await {
             Ok(snapshots) => snapshots,
@@ -1838,30 +1847,29 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
-        let published = match timer
-            .time(
-                "publish",
-                crate::sandbox::publish_captured(
-                    &self.snapshot_manager,
-                    SnapshotPublishMetadata {
-                        id: SnapshotId::generate(),
-                        alias: alias.clone(),
-                        source: SnapshotPublishSource::Sandbox {
-                            source_sandbox_id: capture.metadata.id.to_string(),
-                        },
-                        context: capture.metadata.context.clone(),
-                        startup: capture.metadata.startup.clone(),
-                        resources: capture.metadata.resources,
-                        runtime_versions: capture.metadata.runtime_versions.clone(),
-                        virtualization_mode: capture.metadata.virtualization_mode,
-                        image_configs: capture.metadata.image_configs.clone(),
-                        volume_snapshots,
-                        custom_extension_params: capture.metadata.custom_extension_params.clone(),
+        let published = match Box::pin(timer.time(
+            "publish",
+            crate::sandbox::publish_captured(
+                &self.snapshot_manager,
+                SnapshotPublishMetadata {
+                    id: SnapshotId::generate(),
+                    alias: alias.clone(),
+                    source: SnapshotPublishSource::Sandbox {
+                        source_sandbox_id: capture.metadata.id.to_string(),
                     },
-                    capture.captured_snapshot,
-                ),
-            )
-            .await
+                    context: capture.metadata.context.clone(),
+                    startup: capture.metadata.startup.clone(),
+                    resources: capture.metadata.resources,
+                    runtime_versions: capture.metadata.runtime_versions.clone(),
+                    virtualization_mode: capture.metadata.virtualization_mode,
+                    image_configs: capture.metadata.image_configs.clone(),
+                    volume_snapshots,
+                    custom_extension_params: capture.metadata.custom_extension_params.clone(),
+                },
+                capture.captured_snapshot,
+            ),
+        ))
+        .await
         {
             Ok(snapshot) => snapshot,
             Err(err) => {
@@ -2044,7 +2052,7 @@ impl Sandboxes<()> for ApiImpl {
         let filter = SandboxListFilter {
             states,
             excluded_states: None,
-            user_metadata: parse_metadata_filter(&query_params.metadata),
+            user_metadata: parse_metadata_filter(query_params.metadata.as_deref()),
             started_after: query_params.started_after.map(SystemTime::from),
             template: query_params.template.clone(),
         };
@@ -2150,17 +2158,17 @@ mod tests {
 
     #[test]
     fn parse_metadata_filter_with_none_returns_none() {
-        assert_eq!(parse_metadata_filter(&None), None);
+        assert_eq!(parse_metadata_filter(None), None);
     }
 
     #[test]
     fn parse_metadata_filter_with_empty_string_returns_none() {
-        assert_eq!(parse_metadata_filter(&Some(String::new())), None);
+        assert_eq!(parse_metadata_filter(Some("")), None);
     }
 
     #[test]
     fn parse_metadata_filter_with_single_pair() {
-        let result = parse_metadata_filter(&Some("key=value".to_string()));
+        let result = parse_metadata_filter(Some("key=value"));
         assert_eq!(
             result,
             Some(HashMap::from([("key".to_string(), "value".to_string())]))
@@ -2169,13 +2177,13 @@ mod tests {
 
     #[test]
     fn parse_metadata_filter_with_multiple_pairs() {
-        let result = parse_metadata_filter(&Some("a=1&b=2".to_string()));
+        let result = parse_metadata_filter(Some("a=1&b=2"));
         assert_eq!(result.map(|m| m.len()), Some(2));
     }
 
     #[test]
     fn parse_metadata_filter_filters_empty_keys() {
-        let result = parse_metadata_filter(&Some("=value&key=val".to_string()));
+        let result = parse_metadata_filter(Some("=value&key=val"));
         let map = result.unwrap();
         assert!(!map.contains_key(""));
         assert!(map.contains_key("key"));
@@ -2183,9 +2191,7 @@ mod tests {
 
     #[test]
     fn parse_metadata_filter_with_encoded_characters() {
-        let result = parse_metadata_filter(&Some(
-            "key%20with%20spaces=value%20with%20spaces".to_string(),
-        ));
+        let result = parse_metadata_filter(Some("key%20with%20spaces=value%20with%20spaces"));
         assert_eq!(
             result,
             Some(HashMap::from([(
@@ -2395,8 +2401,8 @@ impl From<crate::sandbox::SandboxMetric> for models::SandboxMetric {
 }
 
 fn valid_metrics_interval(start: Option<u64>, end: Option<u64>) -> bool {
-    start.is_none_or(|s| s <= i64::MAX as u64)
-        && end.is_none_or(|e| e <= i64::MAX as u64)
+    start.is_none_or(|s| i64::try_from(s).is_ok())
+        && end.is_none_or(|e| i64::try_from(e).is_ok())
         && !matches!((start, end), (Some(s), Some(e)) if s > e)
 }
 
@@ -2436,7 +2442,7 @@ mod metrics_contract_tests {
         let alternate_a = a.to_string().replace('-', "");
         for values in [
             vec![],
-            vec!["".into()],
+            vec![String::new()],
             vec!["not-a-uuid".into()],
             vec![format!("{a},not-a-uuid")],
             vec![format!("{a},{a}")],

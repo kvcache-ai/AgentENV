@@ -133,11 +133,14 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         config.common.cpu_config_json = self
             .cpu_config_arc
             .as_ref()
-            .and_then(|arc| arc.read().unwrap().clone());
+            .and_then(|arc| arc.read().expect("arc lock poisoned").clone());
         config.common.env_vars = (!build_spec.context.env_vars.is_empty())
             .then_some(build_spec.context.env_vars.clone());
         config.common.default_workdir = Some(build_spec.context.workdir.clone());
-        config.common.default_user = build_spec.context.user.clone();
+        config
+            .common
+            .default_user
+            .clone_from(&build_spec.context.user);
         let config = config.apply_launch_config(&launch_config);
         let sandbox = FirecrackerSandbox::new_with_id(config, launch_config.sandbox_id)?;
         Ok(Box::new(sandbox))

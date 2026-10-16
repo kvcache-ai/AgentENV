@@ -22,3 +22,6 @@ io-uring = { version = "0.7.9", optional = true }
 [dev-dependencies]
 rand = "0.10"
 tempfile = "3"
+
+[lints]
+workspace = true

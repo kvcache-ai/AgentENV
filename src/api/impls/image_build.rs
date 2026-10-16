@@ -41,7 +41,7 @@ pub(crate) struct BuildSessions {
 
 impl BuildSessions {
     fn reserve(&self, id: &str) -> Result<BuildSession, models::Error> {
-        let mut active = self.active.lock().unwrap();
+        let mut active = self.active.lock().expect("active lock poisoned");
         if active.contains_key(id) {
             return Err(ApiImpl::error(409, "build has already started"));
         }
@@ -61,13 +61,16 @@ impl BuildSessions {
     }
 
     pub(super) fn contains(&self, id: &str) -> bool {
-        self.active.lock().unwrap().contains_key(id)
+        self.active
+            .lock()
+            .expect("active lock poisoned")
+            .contains_key(id)
     }
 
     pub(super) fn is_starting(&self, id: &str) -> bool {
         self.active
             .lock()
-            .unwrap()
+            .expect("active lock poisoned")
             .get(id)
             .is_some_and(|session| matches!(*session.state.borrow(), SessionState::Starting))
     }
@@ -75,7 +78,7 @@ impl BuildSessions {
     pub(super) fn is_finishing(&self, id: &str) -> bool {
         self.active
             .lock()
-            .unwrap()
+            .expect("active lock poisoned")
             .get(id)
             .is_some_and(|session| matches!(*session.state.borrow(), SessionState::Publishing))
     }
@@ -208,7 +211,7 @@ impl ApiImpl {
                 api.build_sessions
                     .active
                     .lock()
-                    .unwrap()
+                    .expect("active lock poisoned")
                     .remove(&id.to_string());
             }
             // Finish allocation even if the request disappears, then release its worker.
@@ -289,7 +292,7 @@ impl ApiImpl {
             .await;
         let api = self.clone();
         tokio::spawn(async move {
-            api.run_image_build(record, body, session, entry).await;
+            Box::pin(api.run_image_build(record, body, session, entry)).await;
         });
         Ok(models::TemplateBuilder::new(build_image_name(
             &id.to_string(),
@@ -303,7 +306,7 @@ impl ApiImpl {
         self.build_sessions
             .active
             .lock()
-            .unwrap()
+            .expect("active lock poisoned")
             .get(build_id)
             .cloned()
             .ok_or_else(|| Self::error(404, "active template build not found"))
@@ -418,8 +421,7 @@ impl ApiImpl {
             }
             Ok::<_, anyhow::Error>(())
         };
-        self.supervise_image_build(&record, &session, logs, work)
-            .await;
+        Box::pin(self.supervise_image_build(&record, &session, logs, work)).await;
     }
 
     async fn supervise_image_build(

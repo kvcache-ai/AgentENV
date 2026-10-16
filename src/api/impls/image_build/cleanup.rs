@@ -48,7 +48,7 @@ impl ApiImpl {
             .build_sessions
             .active
             .lock()
-            .unwrap()
+            .expect("active lock poisoned")
             .entry(id.to_owned())
             .or_insert_with(|| {
                 let session = BuildSession::new();
@@ -65,7 +65,11 @@ impl ApiImpl {
         };
         // Another finalizer may have completed while this caller waited for the lock.
         let Some(value) = journal.get(key.clone()).await? else {
-            let mut active = self.build_sessions.active.lock().unwrap();
+            let mut active = self
+                .build_sessions
+                .active
+                .lock()
+                .expect("active lock poisoned");
             if active
                 .get(id)
                 .is_some_and(|current| Arc::ptr_eq(&current.cleanup, &session.cleanup))
@@ -98,7 +102,11 @@ impl ApiImpl {
             .unregister_template_build(sandbox_id)
             .await;
         journal.delete(key).await?;
-        self.build_sessions.active.lock().unwrap().remove(id);
+        self.build_sessions
+            .active
+            .lock()
+            .expect("active lock poisoned")
+            .remove(id);
         Ok(())
     }
 }

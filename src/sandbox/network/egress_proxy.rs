@@ -92,7 +92,7 @@ impl fmt::Debug for EgressProxy {
             .field("active_policy_count", &active_policy_count)
             .field("pending_policy_count", &pending_policy_count)
             .field("listener_count", &listener_count)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -109,7 +109,7 @@ impl EgressProxy {
         })
     }
 
-    pub(crate) fn port(&self) -> u16 {
+    pub(crate) fn port() -> u16 {
         EGRESS_PROXY_PORT
     }
 
@@ -384,15 +384,11 @@ impl EgressProxy {
             .ok()
             .and_then(|mut connections| {
                 let state = connections.get_mut(&host_interaction_ip)?;
-                let finished = state
-                    .joins
-                    .iter()
-                    .filter_map(|(id, join)| join.is_finished().then_some(*id))
-                    .collect::<Vec<_>>();
                 Some(
-                    finished
-                        .into_iter()
-                        .filter_map(|id| state.joins.remove(&id))
+                    state
+                        .joins
+                        .extract_if(|_, join| join.is_finished())
+                        .map(|(_, join)| join)
                         .collect::<Vec<_>>(),
                 )
             })
@@ -885,7 +881,7 @@ fn original_destination(stream: &TcpStream) -> Result<(Ipv4Addr, u16)> {
             libc::SOL_IP,
             SO_ORIGINAL_DST,
             address.as_mut_ptr().cast(),
-            &mut length,
+            &raw mut length,
         )
     };
     if result != 0 {

@@ -55,11 +55,17 @@ impl ObservabilityService {
     }
 
     pub fn take_cpu_config_json(&self) -> Option<String> {
-        self.pending_cpu_config.lock().unwrap().take()
+        self.pending_cpu_config
+            .lock()
+            .expect("pending_cpu_config lock poisoned")
+            .take()
     }
 
     pub fn store_cluster_cpu_config(&self, config: String) {
-        *self.cluster_cpu_config.write().unwrap() = Some(config);
+        *self
+            .cluster_cpu_config
+            .write()
+            .expect("cluster_cpu_config lock poisoned") = Some(config);
     }
 
     pub fn subscribe_sandbox_events(&self) -> broadcast::Receiver<SandboxLifecycleEvent> {

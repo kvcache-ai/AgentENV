@@ -103,8 +103,8 @@ impl OverlaybdTools {
         req: &CreateLayerRequest,
         work_dir: &Path,
     ) -> Result<StepSummary, ToolExecutionError> {
-        self.ensure_binary_exists(&self.create_bin)?;
-        let mut cmd = self.base_command(&self.create_bin, work_dir);
+        Self::ensure_binary_exists(&self.create_bin)?;
+        let mut cmd = Self::base_command(&self.create_bin, work_dir);
         cmd.arg(&req.data_file)
             .arg(&req.index_file)
             .arg(req.virtual_size_gib.to_string());
@@ -116,7 +116,7 @@ impl OverlaybdTools {
         req: &ApplyLayerRequest,
         work_dir: &Path,
     ) -> Result<StepSummary, ToolExecutionError> {
-        self.ensure_binary_exists(&self.apply_bin)?;
+        Self::ensure_binary_exists(&self.apply_bin)?;
 
         // Overlaybd-apply as of 1.0.16 does not support decompressing
         // zstd-compressed tar layers. The support landed in master:
@@ -153,7 +153,7 @@ impl OverlaybdTools {
             None
         };
 
-        let mut cmd = self.base_command(&self.apply_bin, work_dir);
+        let mut cmd = Self::base_command(&self.apply_bin, work_dir);
         cmd.arg(format!(
             "--service_config_path={}",
             req.global_config_path.display()
@@ -231,8 +231,8 @@ impl OverlaybdTools {
         req: &CommitLayerRequest,
         work_dir: &Path,
     ) -> Result<StepSummary, ToolExecutionError> {
-        self.ensure_binary_exists(&self.commit_bin)?;
-        let mut cmd = self.base_command(&self.commit_bin, work_dir);
+        Self::ensure_binary_exists(&self.commit_bin)?;
+        let mut cmd = Self::base_command(&self.commit_bin, work_dir);
         if let Some(uuid) = req.uuid {
             cmd.arg("--uuid").arg(uuid.to_string());
         }
@@ -338,13 +338,13 @@ impl OverlaybdTools {
         Ok(ConvertLayerResult { layer_commit })
     }
 
-    fn base_command(&self, bin: &Path, work_dir: &Path) -> Command {
+    fn base_command(bin: &Path, work_dir: &Path) -> Command {
         let mut cmd = Command::new(bin);
         cmd.current_dir(work_dir);
         cmd
     }
 
-    fn ensure_binary_exists(&self, bin: &Path) -> Result<(), ToolExecutionError> {
+    fn ensure_binary_exists(bin: &Path) -> Result<(), ToolExecutionError> {
         match std::fs::metadata(bin) {
             Ok(metadata) if metadata.is_file() => Ok(()),
             Ok(_) => Err(ToolExecutionError::MissingBinary {

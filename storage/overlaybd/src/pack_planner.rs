@@ -407,7 +407,7 @@ impl<'a> BlockPlanner<'a> {
         }
 
         let mut new_bytes = 0u64;
-        for object in self.objects[stage_start_objects..].iter() {
+        for object in &self.objects[stage_start_objects..] {
             new_bytes += OBJECT_ENTRY_FIXED_BYTES + object.digest.len() as u64;
         }
         new_bytes += staged.len() as u64 * (OBJECT_BLOCK_BYTES + ENTRY_BYTES);
@@ -415,7 +415,7 @@ impl<'a> BlockPlanner<'a> {
 
         if self.spent_bytes + new_bytes > self.budget_bytes {
             self.objects.truncate(stage_start_objects);
-            for entry in self.object_of_layer.iter_mut() {
+            for entry in &mut self.object_of_layer {
                 if entry.is_some_and(|idx| idx as usize >= stage_start_objects) {
                     *entry = None;
                 }
@@ -448,15 +448,15 @@ impl<'a> BlockPlanner<'a> {
         Ok(Some(resolved))
     }
 
-    fn finish(mut self) -> Result<PackPlan> {
+    fn finish(mut self) -> PackPlan {
         self.stats.unique_blocks = self.seen.len();
         self.stats.payload_bytes = self.stats.unique_blocks as u64 * OBJECT_BLOCK_BYTES;
         self.gap_stats();
-        Ok(PackPlan {
+        PackPlan {
             objects: self.objects,
             blocks: self.blocks,
             stats: self.stats,
-        })
+        }
     }
 
     fn plan(
@@ -505,7 +505,7 @@ impl<'a> BlockPlanner<'a> {
                 }
             }
         }
-        self.finish()
+        Ok(self.finish())
     }
 
     fn plan_ranges(mut self, ranges: &[(u64, u64)], mem_virtual_size: u64) -> Result<PackPlan> {
@@ -544,7 +544,7 @@ impl<'a> BlockPlanner<'a> {
                 self.stats.pages_truncated_by_budget += span_pages;
             }
         }
-        self.finish()
+        Ok(self.finish())
     }
 
     /// Stage a layer's metadata blocks (header + index/trailer region) the

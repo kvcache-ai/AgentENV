@@ -55,7 +55,12 @@ impl BuildkitHistory {
                     });
                     if ours && !collecting {
                         let client = self.client.clone();
-                        let reference = event.record.as_ref().unwrap().r#ref.clone();
+                        let reference = event
+                            .record
+                            .as_ref()
+                            .expect("ours implies a record")
+                            .r#ref
+                            .clone();
                         let logger = logger.clone();
                         collectors
                             .spawn(async move { collect_status(client, reference, logger).await });

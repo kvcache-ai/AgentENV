@@ -123,11 +123,11 @@ impl StartupPackTask {
     }
 
     pub(crate) fn phase(&self) -> StartupPackPhase {
-        *self.phase.lock().unwrap()
+        *self.phase.lock().expect("phase lock poisoned")
     }
 
     fn set_phase(&self, phase: StartupPackPhase) {
-        *self.phase.lock().unwrap() = phase;
+        *self.phase.lock().expect("phase lock poisoned") = phase;
         self.phase_notify.notify_waiters();
     }
 

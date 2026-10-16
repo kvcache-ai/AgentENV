@@ -5,7 +5,7 @@ use agentenv::sandbox::{
 };
 use anyhow::{Context, Result};
 
-async fn sandbox_config_with_overlaybd_ublk() -> Result<FirecrackerSandboxConfig> {
+fn sandbox_config_with_overlaybd_ublk() -> Result<FirecrackerSandboxConfig> {
     let mut config = common::default_sandbox_config()?;
     if matches!(
         config.common.ublk_config.as_ref().map(|cfg| &cfg.backend),
@@ -36,7 +36,7 @@ async fn sandbox_config_with_overlaybd_ublk() -> Result<FirecrackerSandboxConfig
 #[tokio::test]
 async fn overlaybd_ublk_lifecycle() -> Result<()> {
     common::setup().await;
-    let config = sandbox_config_with_overlaybd_ublk().await?;
+    let config = sandbox_config_with_overlaybd_ublk()?;
     let mut sandbox = FirecrackerSandbox::new(config)?;
     sandbox.start().await?;
 

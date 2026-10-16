@@ -412,7 +412,7 @@ impl Lz4Compressor {
         let src_blk_size = usize::try_from(args.opt.block_size).context("invalid block_size")?;
         ensure!(src_blk_size != 0, "block_size must be > 0");
         ensure!(
-            src_blk_size <= i32::MAX as usize,
+            i32::try_from(src_blk_size).is_ok(),
             "block_size {src_blk_size} exceeds LZ4 i32 limit"
         );
 
@@ -998,6 +998,7 @@ impl ZFileRO {
     /// Observability stays on the stack: the loop only increments plain
     /// `u64` fields of `stats`, and only when `decompress_clock` is `Some`
     /// (a sampled pread) does it time decodes into that pread-level sum.
+    #[allow(clippy::too_many_lines)]
     async fn pread_inner<R: FileReader>(
         &self,
         reader: &R,
@@ -2454,7 +2455,7 @@ mod tests {
         out
     }
 
-    async fn new_local_vfile() -> Arc<dyn VirtualFile> {
+    fn new_local_vfile() -> Arc<dyn VirtualFile> {
         let tmp = NamedTempFile::new().expect("create temp file");
         let path = tmp.path().to_path_buf();
         drop(tmp);
@@ -2538,7 +2539,7 @@ mod tests {
     }
 
     async fn build_zfile(data: &[u8], workers: usize, seed: u64) -> Arc<dyn VirtualFile> {
-        let dst = new_local_vfile().await;
+        let dst = new_local_vfile();
         let args = CompressArgs {
             opt: CompressOptions::new(CompressOptions::LZ4, 4096, 1),
             overwrite_header: false,
@@ -2577,9 +2578,9 @@ mod tests {
                     let block_size = 1u32 << bs_shift;
                     let case_tag = format!("crc={enable_crc},algo={algo},bs={block_size}");
 
-                    let src = new_local_vfile().await;
-                    let dst = new_local_vfile().await;
-                    let dec = new_local_vfile().await;
+                    let src = new_local_vfile();
+                    let dst = new_local_vfile();
+                    let dec = new_local_vfile();
                     write_all(&src, &data).await;
 
                     let args = CompressArgs {
@@ -2626,8 +2627,8 @@ mod tests {
     async fn test_validation_check() {
         let data = sample_data(2 * 1024 * 1024 + 517);
 
-        let src = new_local_vfile().await;
-        let dst = new_local_vfile().await;
+        let src = new_local_vfile();
+        let dst = new_local_vfile();
         write_all(&src, &data).await;
 
         let args = CompressArgs {
@@ -2653,8 +2654,8 @@ mod tests {
     async fn test_ht_check() {
         let data = sample_data(1024 * 1024 + 257);
 
-        let src = new_local_vfile().await;
-        let dst = new_local_vfile().await;
+        let src = new_local_vfile();
+        let dst = new_local_vfile();
         write_all(&src, &data).await;
 
         let args = CompressArgs {
@@ -2923,8 +2924,8 @@ mod tests {
     #[tokio::test]
     async fn test_overwrite_header_path() {
         let data = sample_data(1024 * 1024 + 123);
-        let src = new_local_vfile().await;
-        let dst = new_local_vfile().await;
+        let src = new_local_vfile();
+        let dst = new_local_vfile();
         write_all(&src, &data).await;
 
         let args = CompressArgs {

@@ -246,7 +246,7 @@ impl MetadataStore for InMemoryMetadataStore {
     }
 
     async fn list_ids(&self) -> Result<Vec<SandboxId>> {
-        Ok(self.inner.read().await.records.keys().cloned().collect())
+        Ok(self.inner.read().await.records.keys().copied().collect())
     }
 
     async fn list(&self) -> Result<Vec<SandboxMetadata>> {

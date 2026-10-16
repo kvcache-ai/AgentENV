@@ -45,21 +45,19 @@ fn reload_udev() -> Result<()> {
     if !status.success() {
         bail!("udevadm control --reload-rules failed with {status}");
     }
-    Command::new("udevadm")
+    let _ = Command::new("udevadm")
         .args([
             "trigger",
             "--subsystem-match=misc",
             "--sysname-match=ublk-control",
         ])
-        .status()
-        .ok();
+        .status();
     for pattern in ["ublkc*", "ublkb*"] {
-        Command::new("udevadm")
+        let _ = Command::new("udevadm")
             .args(["trigger", &format!("--sysname-match={pattern}")])
-            .status()
-            .ok();
+            .status();
     }
-    Command::new("udevadm").arg("settle").status().ok();
+    let _ = Command::new("udevadm").arg("settle").status();
     Ok(())
 }
 

@@ -188,8 +188,7 @@ impl HostMetricsCollector {
     }
 
     fn read_cgroup_cpu_limit_count(&self) -> Option<u32> {
-        self.cgroup_files
-            .read_first(&self.cgroup_files.cpu_max)
+        CgroupFilePaths::read_first(&self.cgroup_files.cpu_max)
             .as_deref()
             .and_then(Self::parse_cgroup_v2_cpu_limit)
     }
@@ -217,15 +216,12 @@ impl HostMetricsCollector {
     }
 
     fn read_cgroup_memory_limit(&self) -> Option<CgroupMemoryLimit> {
-        self.cgroup_files
-            .read_first(&self.cgroup_files.memory_max)
+        CgroupFilePaths::read_first(&self.cgroup_files.memory_max)
             .as_deref()
             .and_then(|limit| {
                 Self::parse_cgroup_memory_limit(limit).map(|limit_bytes| CgroupMemoryLimit {
                     limit_bytes,
-                    used_bytes: self
-                        .cgroup_files
-                        .read_first(&self.cgroup_files.memory_current)
+                    used_bytes: CgroupFilePaths::read_first(&self.cgroup_files.memory_current)
                         .as_deref()
                         .and_then(Self::parse_cgroup_memory_usage),
                 })
@@ -308,7 +304,7 @@ impl CgroupFilePaths {
         }
     }
 
-    fn read_first(&self, paths: &[PathBuf]) -> Option<String> {
+    fn read_first(paths: &[PathBuf]) -> Option<String> {
         paths.iter().find_map(|path| fs::read_to_string(path).ok())
     }
 }

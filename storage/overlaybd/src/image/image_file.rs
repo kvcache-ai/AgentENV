@@ -1048,12 +1048,12 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct RemoteLayerState {
-        blob: Arc<Vec<u8>>,
+        blob: Arc<[u8]>,
         data_bytes: Arc<AtomicUsize>,
         digest: String,
     }
 
-    async fn handle_remote_blob(
+    fn handle_remote_blob(
         State(state): State<RemoteLayerState>,
         headers: HttpHeaderMap,
     ) -> Response<Body> {
@@ -1069,7 +1069,7 @@ mod tests {
             .expect("302 response")
     }
 
-    async fn handle_remote_data(
+    fn handle_remote_data(
         State(state): State<RemoteLayerState>,
         headers: HttpHeaderMap,
     ) -> Response<Body> {
@@ -1101,10 +1101,10 @@ mod tests {
         let headers = request.headers().clone();
 
         if path.starts_with("/v2/ns/repo/blobs/") {
-            return handle_remote_blob(State(state), headers).await;
+            return handle_remote_blob(State(state), headers);
         }
         if path.starts_with("/data/") {
-            return handle_remote_data(State(state), headers).await;
+            return handle_remote_data(State(state), headers);
         }
 
         Response::builder()
@@ -1148,7 +1148,7 @@ mod tests {
         .await
     }
 
-    async fn build_service_with_io_engine(tmp: &TempDir, io_engine: u32) -> ImageService {
+    fn build_service_with_io_engine(tmp: &TempDir, io_engine: u32) -> ImageService {
         let global_path = tmp.path().join("overlaybd.json");
         write_json(
             &global_path,
@@ -1165,16 +1165,14 @@ mod tests {
                 "download": serde_json::to_value(DownloadConfig::default()).expect("download")
             }),
         );
-        ImageService::from_config_path(global_path)
-            .await
-            .expect("service")
+        ImageService::from_config_path(global_path).expect("service")
     }
 
-    async fn build_service(tmp: &TempDir) -> ImageService {
-        build_service_with_io_engine(tmp, 0).await
+    fn build_service(tmp: &TempDir) -> ImageService {
+        build_service_with_io_engine(tmp, 0)
     }
 
-    async fn build_service_with_p2p_address(tmp: &TempDir, p2p_address: &str) -> ImageService {
+    fn build_service_with_p2p_address(tmp: &TempDir, p2p_address: &str) -> ImageService {
         let global_path = tmp.path().join("overlaybd.json");
         write_json(
             &global_path,
@@ -1195,12 +1193,10 @@ mod tests {
                 }
             }),
         );
-        ImageService::from_config_path(global_path)
-            .await
-            .expect("service")
+        ImageService::from_config_path(global_path).expect("service")
     }
 
-    async fn build_oss_service(tmp: &TempDir, endpoint: &str, region: &str) -> ImageService {
+    fn build_oss_service(tmp: &TempDir, endpoint: &str, region: &str) -> ImageService {
         let global_path = tmp.path().join("overlaybd.json");
         write_json(
             &global_path,
@@ -1224,14 +1220,12 @@ mod tests {
                 }
             }),
         );
-        ImageService::from_config_path(global_path)
-            .await
-            .expect("service")
+        ImageService::from_config_path(global_path).expect("service")
     }
 
     #[derive(Clone, Debug)]
     struct P2pUuidLayerState {
-        blob: Arc<Vec<u8>>,
+        blob: Arc<[u8]>,
         hits: Arc<AtomicUsize>,
         miss: bool,
     }
@@ -1384,7 +1378,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image = ImageFile::open(image_cfg, service, None)
             .await
             .expect("open image");
@@ -1427,7 +1421,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image = ImageFile::open(image_cfg, service, None)
             .await
             .expect("open image");
@@ -1486,7 +1480,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image = ImageFile::open(image_cfg, service, None)
             .await
             .expect("open image");
@@ -1534,7 +1528,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image = ImageFile::open(image_cfg.clone(), service.clone(), None)
             .await
             .expect("open sparse image");
@@ -1598,7 +1592,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image = ImageFile::open(image_cfg, service, None)
             .await
             .expect("open image");
@@ -1647,7 +1641,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image = ImageFile::open(image_cfg, service.clone(), None)
             .await
             .expect("open image");
@@ -1737,7 +1731,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image = ImageFile::open(image_cfg, service.clone(), None)
             .await
             .expect("open image");
@@ -1823,7 +1817,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image = ImageFile::open(image_cfg, service.clone(), None)
             .await
             .expect("open image");
@@ -1912,7 +1906,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image = ImageFile::open(image_cfg, service, None)
             .await
             .expect("open image");
@@ -1923,7 +1917,7 @@ mod tests {
         image.sync().await.expect("sync overlay");
 
         let snapshot_path = tmp.path().join("snapshot.commit");
-        std::fs::create_dir(&snapshot_path).expect("create conflicting directory");
+        std::fs::create_dir_all(&snapshot_path).expect("create conflicting directory");
         let err = image
             .create_snapshot_and_restack(&snapshot_path)
             .await
@@ -1974,7 +1968,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let image = ImageFile::open(image_cfg, build_service(tmp).await, None)
+        let image = ImageFile::open(image_cfg, build_service(tmp), None)
             .await
             .expect("open image");
         (image, upper_data)
@@ -2115,7 +2109,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_oss_service(&tmp, &endpoint, "us-east-1").await;
+        let service = build_oss_service(&tmp, &endpoint, "us-east-1");
         let image = ImageFile::open(image_cfg, service.clone(), None)
             .await
             .expect("open image");
@@ -2181,7 +2175,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let err = ImageFile::open(image_cfg, service, None)
             .await
             .expect_err("missing upper should not be auto-created");
@@ -2203,7 +2197,7 @@ mod tests {
             .await
             .expect("build sealed lower");
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image_path = tmp.path().join("image.json");
         let result_path = tmp.path().join("result.txt");
         write_json(
@@ -2248,12 +2242,12 @@ mod tests {
         let app = Router::new()
             .route("/{*path}", any(handle_p2p_uuid_request))
             .with_state(P2pUuidLayerState {
-                blob: Arc::new(blob),
+                blob: Arc::from(blob),
                 hits: hits.clone(),
                 miss: false,
             });
         let (base, handle) = spawn_server(app).await;
-        let service = build_service_with_p2p_address(&tmp, &format!("{base}/p2p-http")).await;
+        let service = build_service_with_p2p_address(&tmp, &format!("{base}/p2p-http"));
         let image_cfg = ImageConfig {
             repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
@@ -2287,7 +2281,7 @@ mod tests {
     #[tokio::test]
     async fn test_missing_file_lower_without_uuid_errors_without_remote_fallback() {
         let tmp = TempDir::new().expect("tempdir");
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image_cfg = ImageConfig {
             repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
@@ -2335,12 +2329,12 @@ mod tests {
         let app = Router::new()
             .route("/{*path}", any(handle_p2p_uuid_request))
             .with_state(P2pUuidLayerState {
-                blob: Arc::new(blob),
+                blob: Arc::from(blob),
                 hits: hits.clone(),
                 miss: false,
             });
         let (base, handle) = spawn_server(app).await;
-        let service = build_service_with_p2p_address(&tmp, &format!("{base}/p2p-http")).await;
+        let service = build_service_with_p2p_address(&tmp, &format!("{base}/p2p-http"));
         let image_cfg = ImageConfig {
             repo_blob_url: "http://127.0.0.1:9/managed-layers".to_string(),
             lowers: vec![LayerConfig {
@@ -2385,14 +2379,14 @@ mod tests {
         let p2p_app = Router::new()
             .route("/{*path}", any(handle_p2p_uuid_request))
             .with_state(P2pUuidLayerState {
-                blob: Arc::new(blob.clone()),
+                blob: Arc::from(blob.clone()),
                 hits: p2p_hits.clone(),
                 miss: true,
             });
         let (p2p_base, p2p_handle) = spawn_server(p2p_app).await;
 
         let remote_state = RemoteLayerState {
-            blob: Arc::new(blob),
+            blob: Arc::from(blob),
             data_bytes: Arc::new(AtomicUsize::new(0)),
             digest: digest.clone(),
         };
@@ -2402,7 +2396,7 @@ mod tests {
             .with_state(remote_state.clone());
         let (remote_base, remote_handle) = spawn_server(remote_app).await;
 
-        let service = build_service_with_p2p_address(&tmp, &format!("{p2p_base}/p2p-http")).await;
+        let service = build_service_with_p2p_address(&tmp, &format!("{p2p_base}/p2p-http"));
         let image_cfg = ImageConfig {
             repo_blob_url: format!("{remote_base}/v2/ns/repo/blobs"),
             lowers: vec![LayerConfig {
@@ -2443,7 +2437,7 @@ mod tests {
         let digest = digest_of(&blob);
 
         let remote_state = RemoteLayerState {
-            blob: Arc::new(blob),
+            blob: Arc::from(blob),
             data_bytes: Arc::new(AtomicUsize::new(0)),
             digest: digest.clone(),
         };
@@ -2453,7 +2447,7 @@ mod tests {
             .with_state(remote_state.clone());
         let (remote_base, remote_handle) = spawn_server(remote_app).await;
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image_cfg = ImageConfig {
             repo_blob_url: "http://127.0.0.1:9/wrong/blobs".to_string(),
             lowers: vec![LayerConfig {
@@ -2500,7 +2494,7 @@ mod tests {
         let digest = digest_of(&blob);
 
         let state = RemoteLayerState {
-            blob: Arc::new(blob.clone()),
+            blob: Arc::from(blob.clone()),
             data_bytes: Arc::new(AtomicUsize::new(0)),
             digest: digest.clone(),
         };
@@ -2551,7 +2545,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         service
             .cached_file_stats("initialize-runtime")
             .await
@@ -2627,7 +2621,7 @@ mod tests {
         let blob = std::fs::read(&lower_path).expect("read remote lower blob");
         let digest = digest_of(&blob);
         let state = RemoteLayerState {
-            blob: Arc::new(blob.clone()),
+            blob: Arc::from(blob.clone()),
             data_bytes: Arc::new(AtomicUsize::new(0)),
             digest: digest.clone(),
         };
@@ -2674,7 +2668,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image = ImageFile::open(image_cfg.clone(), service.clone(), None)
             .await
             .expect("open remote image must succeed under execution pressure");
@@ -2723,7 +2717,7 @@ mod tests {
         let blob = std::fs::read(&lower_path).expect("read remote lower blob");
         let digest = digest_of(&blob);
         let state = RemoteLayerState {
-            blob: Arc::new(blob),
+            blob: Arc::from(blob),
             data_bytes: Arc::new(AtomicUsize::new(0)),
             digest: digest.clone(),
         };
@@ -2763,7 +2757,7 @@ mod tests {
             record_trace_path: trace_path.to_string_lossy().into_owned(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let remote_url = format!("{}/{}", image_cfg.repo_blob_url, digest);
         let image = ImageFile::open(image_cfg.clone(), service.clone(), None)
             .await
@@ -2840,7 +2834,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image = ImageFile::open(image_cfg, service, None)
             .await
             .expect("open image with acceleration layer");
@@ -2874,7 +2868,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image = ImageFile::open(image_cfg, service, None)
             .await
             .expect("open image");
@@ -2909,7 +2903,7 @@ mod tests {
 
         // --- mock registry server ---
         let state = RemoteLayerState {
-            blob: Arc::new(blob.clone()),
+            blob: Arc::from(blob.clone()),
             data_bytes: Arc::new(AtomicUsize::new(0)),
             digest: digest.clone(),
         };
@@ -2953,7 +2947,7 @@ mod tests {
         );
 
         // --- create ImageService and open image via the full path ---
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let image = service
             .create_image_file(&image_path)
             .await
@@ -3032,7 +3026,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service(&tmp).await;
+        let service = build_service(&tmp);
         let err = ImageFile::open(image_cfg, service, None)
             .await
             .expect_err("warp path should be unsupported");
@@ -3084,7 +3078,7 @@ mod tests {
             record_trace_path: String::new(),
         };
 
-        let service = build_service_with_io_engine(&tmp, IO_ENGINE_LIBAIO).await;
+        let service = build_service_with_io_engine(&tmp, IO_ENGINE_LIBAIO);
         let image = ImageFile::open(image_cfg, service, None)
             .await
             .expect("open image with libaio");

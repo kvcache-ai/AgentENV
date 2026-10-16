@@ -2076,7 +2076,9 @@ mod tests {
         // Cache-local layer with a usable cached commit binds to `file=`.
         match service.overlaybd_layer_location("sha256:layer", size, false) {
             OverlaybdLayerLocation::LocalFile(path) => assert_eq!(path, commit_file),
-            other => panic!("expected LocalFile, got {other:?}"),
+            other @ OverlaybdLayerLocation::CacheDir(_) => {
+                panic!("expected LocalFile, got {other:?}")
+            }
         }
 
         // A remote-recoverable layer must use `dir=` even when the commit is
@@ -2087,13 +2089,17 @@ mod tests {
                 path,
                 commit_index::commit_dir(&service.commit_store, "sha256:layer")
             ),
-            other => panic!("expected CacheDir for remote layer, got {other:?}"),
+            other @ OverlaybdLayerLocation::LocalFile(_) => {
+                panic!("expected CacheDir for remote layer, got {other:?}")
+            }
         }
 
         // Local-only layer without a usable cached commit falls back to `dir=`.
         match service.overlaybd_layer_location("sha256:absent", size, false) {
             OverlaybdLayerLocation::CacheDir(_) => {}
-            other => panic!("expected CacheDir for missing commit, got {other:?}"),
+            other @ OverlaybdLayerLocation::LocalFile(_) => {
+                panic!("expected CacheDir for missing commit, got {other:?}")
+            }
         }
     }
 

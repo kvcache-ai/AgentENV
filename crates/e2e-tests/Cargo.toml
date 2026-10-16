@@ -17,3 +17,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 [[test]]
 name = "snapshot_oss_e2e_test"
 path = "tests/snapshot_oss_e2e_test.rs"
+
+[lints]
+workspace = true

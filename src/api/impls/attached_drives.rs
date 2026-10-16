@@ -218,7 +218,7 @@ mod tests {
         let err = resolve_attached_drives(
             &[drive(
                 "data",
-                models::AttachedDriveSource::new("".to_string()),
+                models::AttachedDriveSource::new(String::new()),
                 None,
                 None,
             )],

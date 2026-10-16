@@ -153,7 +153,7 @@ impl SandboxNetworkPolicy {
     /// retain IPv6 CIDRs for wire compatibility without pretending this
     /// method provides IPv6 iptables enforcement.
     pub(crate) fn is_ip_allowed(&self, ip: Ipv4Addr) -> bool {
-        if self.is_absolutely_denied(ip) {
+        if Self::is_absolutely_denied(ip) {
             return false;
         }
         if self
@@ -196,10 +196,10 @@ impl SandboxNetworkPolicy {
         {
             return false;
         }
-        resolved_ip.is_none_or(|ip| !self.is_absolutely_denied(ip))
+        resolved_ip.is_none_or(|ip| !Self::is_absolutely_denied(ip))
     }
 
-    fn is_absolutely_denied(&self, ip: Ipv4Addr) -> bool {
+    fn is_absolutely_denied(ip: Ipv4Addr) -> bool {
         PLATFORM_DENIED_CIDRS
             .get_or_init(|| {
                 let config = crate::cfg::ConfigManager::global_config();

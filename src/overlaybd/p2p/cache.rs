@@ -29,6 +29,7 @@ impl DescriptorCache {
         }
     }
 
+    #[allow(clippy::option_option)] // None: not cached; Some(None): cached miss.
     pub(super) fn get(&self, key: &P2pArtifactKey) -> Option<Option<P2pArtifactDescriptor>> {
         let cached = self.inner.get(key)?;
         let ttl = if cached.descriptor.is_some() {

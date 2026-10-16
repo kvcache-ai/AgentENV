@@ -120,7 +120,6 @@ impl ImageServiceCache {
             &canonical,
             self.p2p_publish_url.clone(),
         )
-        .await
         .with_context(|| {
             format!(
                 "create ImageService from global config: {}",
@@ -427,7 +426,7 @@ impl UblkDaemonServer {
                     let startup_pack_handles = Arc::clone(&self.startup_pack_handles);
                     let shutdown = Arc::clone(&self.shutdown);
                     tokio::spawn(async move {
-                        if let Err(err) = handle_connection(
+                        if let Err(err) = Box::pin(handle_connection(
                             stream,
                             devices,
                             ctrl_ring,
@@ -439,7 +438,7 @@ impl UblkDaemonServer {
                             pack_recordings,
                             startup_pack_handles,
                             shutdown,
-                        ).await {
+                        )).await {
                             tracing::error!(?err, "daemon connection handler failed");
                         }
                     });
@@ -549,6 +548,7 @@ impl UblkDaemonServer {
 // ── Per-connection handler ──────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 async fn handle_connection(
     mut stream: tokio::net::UnixStream,
     devices: Arc<DashMap<u32, ManagedDevice>>,
@@ -603,13 +603,13 @@ async fn handle_connection(
                 resize_permit: Arc::clone(&resize_permit),
                 allow_shrink,
             };
-            handle_create_overlaybd_runtime_device(
+            Box::pin(handle_create_overlaybd_runtime_device(
                 request,
                 ctrl_ring,
                 &devices,
                 &image_service_cache,
-                &pool_state,
-            )
+                pool_state.as_ref(),
+            ))
             .await
         }
         DaemonRequest::Delete { dev_id } => {
@@ -618,8 +618,10 @@ async fn handle_connection(
         DaemonRequest::RestackSnapshot {
             dev_id,
             output_layer_path,
-        } => handle_restack_snapshot(&devices, &pool_state, dev_id, &output_layer_path).await,
-        DaemonRequest::GetFeatures => handle_get_features(&pool_state),
+        } => {
+            handle_restack_snapshot(&devices, pool_state.as_ref(), dev_id, &output_layer_path).await
+        }
+        DaemonRequest::GetFeatures => Ok(handle_get_features(pool_state.as_ref())),
         DaemonRequest::NotifySandboxReady { device_key } => {
             tracing::info!(
                 device_key,
@@ -635,23 +637,20 @@ async fn handle_connection(
             min_window_ms,
             quiet_ms,
             max_window_ms,
-        } => {
-            handle_start_pack_recording(
-                &devices,
-                &pack_recordings,
-                dev_id,
-                PackRecordingParams {
-                    output,
-                    max_pages,
-                    min_window: Duration::from_millis(min_window_ms),
-                    quiet: Duration::from_millis(quiet_ms),
-                    max_window: Duration::from_millis(max_window_ms),
-                },
-            )
-            .await
-        }
+        } => Ok(handle_start_pack_recording(
+            &devices,
+            &pack_recordings,
+            dev_id,
+            PackRecordingParams {
+                output,
+                max_pages,
+                min_window: Duration::from_millis(min_window_ms),
+                quiet: Duration::from_millis(quiet_ms),
+                max_window: Duration::from_millis(max_window_ms),
+            },
+        )),
         DaemonRequest::PackRecordingStatus { dev_id } => {
-            handle_pack_recording_status(&pack_recordings, dev_id)
+            Ok(handle_pack_recording_status(&pack_recordings, dev_id))
         }
         DaemonRequest::AbortPackRecording { dev_id } => {
             handle_abort_pack_recording(&devices, &pack_recordings, dev_id).await
@@ -687,7 +686,7 @@ async fn handle_connection(
             access_mode,
         } => {
             handle_acquire_overlaybd(
-                &pool_state,
+                pool_state.as_ref(),
                 ctrl_ring.clone(),
                 &image_service_cache,
                 &image_config,
@@ -698,12 +697,12 @@ async fn handle_connection(
             .await
         }
         DaemonRequest::ReleaseOverlaybd { dev_id } => {
-            handle_release_overlaybd(&pool_state, ctrl_ring.clone(), dev_id).await
+            handle_release_overlaybd(pool_state.as_ref(), ctrl_ring.clone(), dev_id).await
         }
         DaemonRequest::UpdateSize {
             dev_id,
             new_sectors,
-        } => handle_update_size(&pool_state, dev_id, new_sectors).await,
+        } => handle_update_size(pool_state.as_ref(), dev_id, new_sectors).await,
         DaemonRequest::Shutdown => {
             shutdown.notify_one();
             Ok(DaemonResponse::Ok)
@@ -757,10 +756,10 @@ async fn handle_create_overlaybd_runtime_device(
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     devices: &DashMap<u32, ManagedDevice>,
     image_service_cache: &ImageServiceCache,
-    pool_state: &Option<Arc<PoolState>>,
+    pool_state: Option<&Arc<PoolState>>,
 ) -> Result<DaemonResponse> {
-    let runtime =
-        match runtime::materialize_overlaybd_runtime(runtime::MaterializeOverlaybdRuntimeRequest {
+    let runtime = match Box::pin(runtime::materialize_overlaybd_runtime(
+        runtime::MaterializeOverlaybdRuntimeRequest {
             image_service_cache,
             source_image_config: request.source_image_config,
             global_config: request.global_config,
@@ -773,19 +772,20 @@ async fn handle_create_overlaybd_runtime_device(
             resize_global_config: request.resize_global_config,
             resize_permit: request.resize_permit,
             allow_shrink: request.allow_shrink,
-        })
-        .await
-        {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "materialize overlaybd runtime in {}",
-                        request.runtime_dir.display()
-                    )
-                });
-            }
-        };
+        },
+    ))
+    .await
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "materialize overlaybd runtime in {}",
+                    request.runtime_dir.display()
+                )
+            });
+        }
+    };
 
     let created = if pool_state.is_some() {
         match handle_acquire_overlaybd(
@@ -919,7 +919,7 @@ async fn create_overlaybd_device(
         return Err(err);
     }
 
-    let device_path = dev.device_path().to_path_buf();
+    let device_path = dev.device_path().clone();
     devices.insert(
         dev_id,
         ManagedDevice {
@@ -982,12 +982,12 @@ struct PackRecordingParams {
     max_window: Duration,
 }
 
-async fn handle_start_pack_recording(
+fn handle_start_pack_recording(
     devices: &DashMap<u32, ManagedDevice>,
     pack_recordings: &DashMap<u32, Arc<PackRecordingHandle>>,
     dev_id: u32,
     params: PackRecordingParams,
-) -> Result<DaemonResponse> {
+) -> DaemonResponse {
     // Replace a finished handle, but never interrupt a live recording.
     if let Some(existing) = pack_recordings.get(&dev_id) {
         let finished = !matches!(
@@ -995,48 +995,48 @@ async fn handle_start_pack_recording(
             PackRecordingState::Recording
         );
         if !finished {
-            return Ok(DaemonResponse::InvalidRequest {
+            return DaemonResponse::InvalidRequest {
                 message: format!("pack recording already active on device {dev_id}"),
-            });
+            };
         }
         drop(existing);
         pack_recordings.remove(&dev_id);
     }
 
     if params.max_pages == 0 {
-        return Ok(DaemonResponse::InvalidRequest {
+        return DaemonResponse::InvalidRequest {
             message: "max_pages must be > 0".to_string(),
-        });
+        };
     }
     if params.quiet.is_zero() {
-        return Ok(DaemonResponse::InvalidRequest {
+        return DaemonResponse::InvalidRequest {
             message: "quiet_ms must be > 0".to_string(),
-        });
+        };
     }
     if params.min_window > params.max_window {
-        return Ok(DaemonResponse::InvalidRequest {
+        return DaemonResponse::InvalidRequest {
             message: format!(
                 "min_window_ms {} exceeds max_window_ms {}",
                 params.min_window.as_millis(),
                 params.max_window.as_millis()
             ),
-        });
+        };
     }
     let Some(parent) = params.output.parent() else {
-        return Ok(DaemonResponse::InvalidRequest {
+        return DaemonResponse::InvalidRequest {
             message: format!("pack output {} has no parent dir", params.output.display()),
-        });
+        };
     };
     if !parent.exists() {
-        return Ok(DaemonResponse::InvalidRequest {
+        return DaemonResponse::InvalidRequest {
             message: format!("pack output dir {} does not exist", parent.display()),
-        });
+        };
     }
 
     let Some(device) = devices.get(&dev_id) else {
-        return Ok(DaemonResponse::InvalidRequest {
+        return DaemonResponse::InvalidRequest {
             message: format!("device {dev_id} not found"),
-        });
+        };
     };
     let (target, image) = (Arc::clone(device.dev.target()), Arc::clone(&device.image));
     drop(device);
@@ -1076,24 +1076,24 @@ async fn handle_start_pack_recording(
             finalize_gate,
         }),
     );
-    Ok(DaemonResponse::Ok)
+    DaemonResponse::Ok
 }
 
 fn handle_pack_recording_status(
     pack_recordings: &DashMap<u32, Arc<PackRecordingHandle>>,
     dev_id: u32,
-) -> Result<DaemonResponse> {
+) -> DaemonResponse {
     let Some(handle) = pack_recordings.get(&dev_id) else {
-        return Ok(DaemonResponse::InvalidRequest {
+        return DaemonResponse::InvalidRequest {
             message: format!("no pack recording on device {dev_id}"),
-        });
+        };
     };
     let state = handle
         .state
         .lock()
         .expect("recording state poisoned")
         .clone();
-    Ok(DaemonResponse::PackRecording { state })
+    DaemonResponse::PackRecording { state }
 }
 
 /// Best-effort startup pack prefetch registration. Every failure mode
@@ -1372,7 +1372,7 @@ async fn stop_overlaybd_device(
 
 async fn handle_restack_snapshot(
     devices: &DashMap<u32, ManagedDevice>,
-    pool_state: &Option<Arc<PoolState>>,
+    pool_state: Option<&Arc<PoolState>>,
     dev_id: u32,
     output_layer_path: &Path,
 ) -> Result<DaemonResponse> {
@@ -1404,14 +1404,15 @@ async fn handle_restack_snapshot(
         "creating restack snapshot"
     );
 
-    let descriptor =
-        if let (Some(pool), Some(image_config)) = (pool_state.as_ref(), image_config.as_deref()) {
-            let image_lock = pool.image_lock(image_config);
-            let _image_guard = image_lock.write().await;
-            image.create_snapshot_and_restack(output_layer_path).await
-        } else {
-            image.create_snapshot_and_restack(output_layer_path).await
-        };
+    let image_lock = pool_state
+        .zip(image_config.as_deref())
+        .map(|(pool, image_config)| pool.image_lock(image_config));
+    let image_guard = match &image_lock {
+        Some(image_lock) => Some(image_lock.write().await),
+        None => None,
+    };
+    let descriptor = image.create_snapshot_and_restack(output_layer_path).await;
+    drop(image_guard);
     let descriptor = descriptor.with_context(|| {
         format!(
             "restack overlaybd snapshot for dev_id={dev_id} to {}",
@@ -1438,13 +1439,13 @@ async fn handle_restack_snapshot(
 
 // ── Pool handlers ───────────────────────────────────────────────────────────
 
-fn handle_get_features(pool_state: &Option<Arc<PoolState>>) -> Result<DaemonResponse> {
+fn handle_get_features(pool_state: Option<&Arc<PoolState>>) -> DaemonResponse {
     let flags = pool_state.as_ref().map(|p| p.features).unwrap_or(0);
-    Ok(DaemonResponse::Features { flags })
+    DaemonResponse::Features { flags }
 }
 
 async fn handle_acquire_overlaybd(
-    pool_state: &Option<Arc<PoolState>>,
+    pool_state: Option<&Arc<PoolState>>,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     image_service_cache: &ImageServiceCache,
     image_config: &Path,
@@ -1545,7 +1546,7 @@ async fn acquire_exclusive(
         prepare_overlaybd_device(&pool, &ctrl_ring, image_config, &image, "exclusive").await?;
 
     let dev_id = dev.dev_id();
-    let device_path = dev.device_path().to_path_buf();
+    let device_path = dev.device_path().clone();
 
     if is_reused {
         tracing::info!(dev_id, path = %device_path.display(), "acquired exclusive overlaybd device (reused)");
@@ -1586,7 +1587,7 @@ async fn acquire_shared(
     if let Some(mut entry) = pool.active_shared.get_mut(&key) {
         entry.refcount += 1;
         let dev_id = entry.dev.dev_id();
-        let device_path = entry.dev.device_path().to_path_buf();
+        let device_path = entry.dev.device_path().clone();
         tracing::info!(
             dev_id,
             refcount = entry.refcount,
@@ -1602,7 +1603,7 @@ async fn acquire_shared(
         prepare_overlaybd_device(&pool, &ctrl_ring, image_config, &image, "shared").await?;
 
     let dev_id = dev.dev_id();
-    let device_path = dev.device_path().to_path_buf();
+    let device_path = dev.device_path().clone();
 
     if is_reused {
         tracing::info!(dev_id, path = %device_path.display(), "acquired shared overlaybd device (reused)");
@@ -1619,7 +1620,7 @@ async fn acquire_shared(
             let active = entry.get_mut();
             active.refcount += 1;
             let existing_dev_id = active.dev.dev_id();
-            let existing_path = active.dev.device_path().to_path_buf();
+            let existing_path = active.dev.device_path().clone();
             let refcount = active.refcount;
             drop(entry);
 
@@ -1658,7 +1659,7 @@ async fn acquire_shared(
 }
 
 async fn handle_release_overlaybd(
-    pool_state: &Option<Arc<PoolState>>,
+    pool_state: Option<&Arc<PoolState>>,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     dev_id: u32,
 ) -> Result<DaemonResponse> {
@@ -1781,7 +1782,7 @@ async fn idle_released_device(
 }
 
 async fn handle_update_size(
-    pool_state: &Option<Arc<PoolState>>,
+    pool_state: Option<&Arc<PoolState>>,
     dev_id: u32,
     new_sectors: u64,
 ) -> Result<DaemonResponse> {
@@ -2063,7 +2064,7 @@ mod tests {
 
     /// Minimal local `ImageService`; placeholder images have no lowers, so this
     /// is never used for registry access.
-    async fn test_image_service(dir: &Path) -> ImageService {
+    fn test_image_service(dir: &Path) -> ImageService {
         let cache_dir = dir.join("cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
         let config_path = dir.join("global_config.json");
@@ -2079,7 +2080,7 @@ mod tests {
             }
         });
         std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
-        ImageService::from_config_path(&config_path).await.unwrap()
+        ImageService::from_config_path(&config_path).unwrap()
     }
 
     fn test_pool_config() -> PoolConfig {
@@ -2094,7 +2095,7 @@ mod tests {
     #[tokio::test]
     async fn failed_idle_pool_refill_waits_before_retry() {
         let dir = TempDir::new().unwrap();
-        let image_service = test_image_service(dir.path()).await;
+        let image_service = test_image_service(dir.path());
         let placeholder_dir = dir.path().join("not-a-directory");
         std::fs::write(&placeholder_dir, b"").unwrap();
         let pool = PoolState::new(
@@ -2129,7 +2130,7 @@ mod tests {
     #[tokio::test]
     async fn placeholder_for_builds_cached_same_size_images_per_virtual_size() {
         let dir = TempDir::new().unwrap();
-        let image_service = test_image_service(dir.path()).await;
+        let image_service = test_image_service(dir.path());
         let placeholder_dir = dir.path().join("placeholders");
         let pool = PoolState::new(
             test_pool_config(),

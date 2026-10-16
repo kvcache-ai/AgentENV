@@ -74,7 +74,7 @@ struct Buffer {
 
 impl BuildLogSink for Mutex<Buffer> {
     fn log(&self, level: LogLevel, step: Option<&str>, message: String) {
-        let mut buffer = self.lock().unwrap();
+        let mut buffer = self.lock().expect("build log buffer lock poisoned");
         if buffer.truncated || buffer.sealed {
             return;
         }
@@ -154,7 +154,7 @@ impl BuildLogs {
         let buffer = Arc::new(Mutex::new(Buffer::default()));
         self.buffers
             .lock()
-            .unwrap()
+            .expect("buffers lock poisoned")
             .insert(id.clone(), buffer.clone());
         let sink = Arc::downgrade(&buffer) as Weak<dyn BuildLogSink>;
         crate::logging::route_build_logs(id.to_string(), sink.clone());
@@ -169,7 +169,7 @@ impl BuildLogs {
                     _ = tokio::time::sleep(flush_interval) => false,
                 };
                 if finishing {
-                    buffer.lock().unwrap().sealed = true;
+                    buffer.lock().expect("buffer lock poisoned").sealed = true;
                 }
                 let mut result = flush(&repository, &id, &buffer, &mut offset).await;
                 if finishing {
@@ -188,7 +188,7 @@ impl BuildLogs {
                     tracing::warn!(build_id = %id, %error, "build log flush failed; will retry");
                 }
             };
-            let mut buffers = buffers.lock().unwrap();
+            let mut buffers = buffers.lock().expect("buffers lock poisoned");
             if buffers
                 .get(&id)
                 .is_some_and(|current| Arc::ptr_eq(current, &buffer))
@@ -208,13 +208,17 @@ impl BuildLogs {
     pub fn temporary(&self, id: &SnapshotId) -> Option<Vec<BuildLogEntry>> {
         self.buffers
             .lock()
-            .unwrap()
+            .expect("buffers lock poisoned")
             .get(id)
-            .map(|b| b.lock().unwrap().entries.clone())
+            .map(|b| b.lock().expect("b lock poisoned").entries.clone())
     }
 
     pub fn remove(&self, id: &SnapshotId) {
-        let removed = self.buffers.lock().unwrap().remove(id);
+        let removed = self
+            .buffers
+            .lock()
+            .expect("buffers lock poisoned")
+            .remove(id);
         let Some(removed) = removed else { return };
         let sink = Arc::downgrade(&removed) as Weak<dyn BuildLogSink>;
         crate::logging::stop_build_log_routing(&id.to_string(), &sink);
@@ -228,7 +232,7 @@ async fn flush(
     offset: &mut usize,
 ) -> Result<()> {
     let entries = {
-        let buffer = buffer.lock().unwrap();
+        let buffer = buffer.lock().expect("buffer lock poisoned");
         if buffer.entries.len() == *offset {
             return Ok(());
         }

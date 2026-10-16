@@ -489,7 +489,7 @@ impl ImageCopyProducer {
                 return Ok(blob_path);
             }
 
-            if let Some(status) = self.poll_exit().await? {
+            if let Some(status) = self.poll_exit()? {
                 if !status.success() {
                     let stderr = self.stderr_text().await;
                     bail!(
@@ -512,7 +512,7 @@ impl ImageCopyProducer {
         }
     }
 
-    async fn poll_exit(&mut self) -> Result<Option<std::process::ExitStatus>> {
+    fn poll_exit(&mut self) -> Result<Option<std::process::ExitStatus>> {
         if let Some(status) = self.exit_status {
             return Ok(Some(status));
         }

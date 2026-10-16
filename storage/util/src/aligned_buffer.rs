@@ -92,7 +92,7 @@ impl std::fmt::Debug for AlignedBuffer {
         f.debug_struct("AlignedBuffer")
             .field("len", &self.len())
             .field("align", &self.layout.align())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

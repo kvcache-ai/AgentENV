@@ -746,7 +746,7 @@ fn matches_filter(record: &SnapshotRecord, filter: &SnapshotListFilter) -> bool 
         };
         if !statuses.contains(&build.status) {
             return false;
-        };
+        }
     }
 
     true

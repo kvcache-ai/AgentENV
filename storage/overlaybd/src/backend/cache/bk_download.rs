@@ -287,7 +287,7 @@ impl BkDownloadScheduler {
             // Closed check, registry insertion, and the active-count
             // increment must be atomic against shutdown: once `closed` is
             // set, no new task may slip past the drain.
-            let closed = self.closed.lock().unwrap();
+            let closed = self.closed.lock().expect("closed lock poisoned");
             if *closed {
                 return Err(BkDownloadSubmitError::Closed.into());
             }
@@ -315,7 +315,7 @@ impl BkDownloadScheduler {
         submission: StartupPackSubmission,
     ) -> std::result::Result<StartupPackHandle, BkDownloadSubmitError> {
         let task_key = submission.task_key.clone();
-        let closed = self.closed.lock().unwrap();
+        let closed = self.closed.lock().expect("closed lock poisoned");
         if *closed {
             return Err(BkDownloadSubmitError::Closed);
         }
@@ -326,7 +326,10 @@ impl BkDownloadScheduler {
                 } else {
                     let task = StartupPackTask::new(submission);
                     slot.insert(task.clone());
-                    self.startup_ready.lock().unwrap().push_back(task);
+                    self.startup_ready
+                        .lock()
+                        .expect("startup_ready lock poisoned")
+                        .push_back(task);
                     self.startup_waiting.fetch_add(1, Ordering::AcqRel);
                     self.ready_notify.notify_one();
                 }
@@ -334,7 +337,10 @@ impl BkDownloadScheduler {
             dashmap::mapref::entry::Entry::Vacant(slot) => {
                 let task = StartupPackTask::new(submission);
                 slot.insert(task.clone());
-                self.startup_ready.lock().unwrap().push_back(task);
+                self.startup_ready
+                    .lock()
+                    .expect("startup_ready lock poisoned")
+                    .push_back(task);
                 self.startup_waiting.fetch_add(1, Ordering::AcqRel);
                 self.ready_notify.notify_one();
             }
@@ -375,7 +381,7 @@ impl BkDownloadScheduler {
         }
         interruptible_sleep(background_download_delay(&task.config), &self.running).await;
         if self.running.load(Ordering::Acquire) {
-            let mut ready = self.ready.lock().unwrap();
+            let mut ready = self.ready.lock().expect("ready lock poisoned");
             if self.running.load(Ordering::Acquire) {
                 ready.push(task.device_key.clone(), task);
                 drop(ready);
@@ -437,7 +443,11 @@ impl BkDownloadScheduler {
             }
             notified.await;
         }
-        self.ready.lock().unwrap().groups.clear();
+        self.ready
+            .lock()
+            .expect("ready lock poisoned")
+            .groups
+            .clear();
         self.tasks.clear();
     }
 
@@ -446,7 +456,7 @@ impl BkDownloadScheduler {
     /// a dispatcher or block task already waiting for a permit is guaranteed
     /// to wake. Called by `shutdown()` and by the primary backend's Drop.
     pub(crate) fn stop(&self) {
-        let mut closed = self.closed.lock().unwrap();
+        let mut closed = self.closed.lock().expect("closed lock poisoned");
         *closed = true;
         self.running.store(false, Ordering::Release);
         self.file_slots.close();
@@ -558,7 +568,11 @@ impl Drop for StartupPackHandle {
             // Last holder: cancel a live task and always deregister.
             if !task.is_terminal() {
                 task.cancel();
-                let mut ready = self.scheduler.startup_ready.lock().unwrap();
+                let mut ready = self
+                    .scheduler
+                    .startup_ready
+                    .lock()
+                    .expect("startup_ready lock poisoned");
                 let before = ready.len();
                 ready.retain(|queued| !Arc::ptr_eq(queued, &task));
                 let removed = before - ready.len();
@@ -645,7 +659,11 @@ async fn dispatch_loop(scheduler: Arc<BkDownloadScheduler>) {
         }
 
         // Startup packs dispatch ahead of background downloads.
-        let startup = scheduler.startup_ready.lock().unwrap().pop_front();
+        let startup = scheduler
+            .startup_ready
+            .lock()
+            .expect("startup_ready lock poisoned")
+            .pop_front();
         if let Some(task) = startup {
             if task.fail_if_past_deadline() {
                 scheduler.startup_waiting.fetch_sub(1, Ordering::AcqRel);
@@ -691,7 +709,7 @@ async fn dispatch_loop(scheduler: Arc<BkDownloadScheduler>) {
             let notified = scheduler.ready_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let task = scheduler.ready.lock().unwrap().pop();
+            let task = scheduler.ready.lock().expect("ready lock poisoned").pop();
             match task {
                 Some(task) => task,
                 None => {
@@ -741,7 +759,7 @@ async fn dispatch_loop(scheduler: Arc<BkDownloadScheduler>) {
                             scheduler
                                 .ready
                                 .lock()
-                                .unwrap()
+                                .expect("ready lock poisoned")
                                 .push(task.device_key.clone(), task);
                             scheduler.ready_notify.notify_one();
                         } else {

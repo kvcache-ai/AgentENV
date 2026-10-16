@@ -46,9 +46,8 @@ impl PosixFsCatalogStore {
     }
 
     pub(crate) fn put_document(&self, key: &DocumentKey, bytes: &[u8]) -> RepositoryResult<()> {
-        let _guard =
-            self.acquire_catalog_lock(self.root.join(key.posix_lock_path()), "document")?;
-        self.write_bytes(&self.root.join(key.posix_path()), bytes)
+        let _guard = Self::acquire_catalog_lock(self.root.join(key.posix_lock_path()), "document")?;
+        Self::write_bytes(&self.root.join(key.posix_path()), bytes)
     }
 
     pub(crate) fn update_document(
@@ -56,25 +55,23 @@ impl PosixFsCatalogStore {
         key: &DocumentKey,
         update: DocumentUpdate,
     ) -> RepositoryResult<Option<Vec<u8>>> {
-        let _guard =
-            self.acquire_catalog_lock(self.root.join(key.posix_lock_path()), "document")?;
+        let _guard = Self::acquire_catalog_lock(self.root.join(key.posix_lock_path()), "document")?;
         let current = self.get_document(key)?;
         match update(current.as_deref())? {
             DocumentChange::Keep => {}
             DocumentChange::Put(bytes) => {
-                self.write_bytes(&self.root.join(key.posix_path()), &bytes)?
+                Self::write_bytes(&self.root.join(key.posix_path()), &bytes)?
             }
             DocumentChange::Delete => {
-                self.remove_file_if_exists(&self.root.join(key.posix_path()))?
+                Self::remove_file_if_exists(&self.root.join(key.posix_path()))?
             }
         }
         Ok(current)
     }
 
     pub(crate) fn delete_document(&self, key: &DocumentKey) -> RepositoryResult<()> {
-        let _guard =
-            self.acquire_catalog_lock(self.root.join(key.posix_lock_path()), "document")?;
-        self.remove_file_if_exists(&self.root.join(key.posix_path()))
+        let _guard = Self::acquire_catalog_lock(self.root.join(key.posix_lock_path()), "document")?;
+        Self::remove_file_if_exists(&self.root.join(key.posix_path()))
     }
 
     pub(crate) fn list_documents(
@@ -142,7 +139,7 @@ impl PosixFsCatalogStore {
         Ok(documents)
     }
 
-    fn write_bytes(&self, path: &Path, bytes: &[u8]) -> RepositoryResult<()> {
+    fn write_bytes(path: &Path, bytes: &[u8]) -> RepositoryResult<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 RepositoryError::backend(format!("create '{}'", parent.display()), error)
@@ -178,7 +175,7 @@ impl PosixFsCatalogStore {
         sync_dir(parent)
     }
 
-    fn remove_file_if_exists(&self, path: &Path) -> RepositoryResult<()> {
+    fn remove_file_if_exists(path: &Path) -> RepositoryResult<()> {
         match fs::remove_file(path) {
             Ok(()) => path.parent().map_or(Ok(()), sync_dir),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -190,7 +187,6 @@ impl PosixFsCatalogStore {
     }
 
     fn acquire_file_lock(
-        &self,
         lock_path: PathBuf,
         contents: String,
         label: &'static str,
@@ -255,11 +251,10 @@ impl PosixFsCatalogStore {
     }
 
     fn acquire_catalog_lock(
-        &self,
         lock_path: PathBuf,
         label: &'static str,
     ) -> RepositoryResult<PosixFileLockGuard> {
-        self.acquire_file_lock(
+        Self::acquire_file_lock(
             lock_path.clone(),
             std::process::id().to_string(),
             label,

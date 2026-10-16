@@ -411,7 +411,10 @@ impl Templates<()> for ApiImpl {
         path: &models::TemplatesTemplateIdBuildsBuildIdBuilderPutPathParams,
         body: &models::TemplateBuilderRequest,
     ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderPutResponse, ()> {
-        use TemplatesTemplateIdBuildsBuildIdBuilderPutResponse::*;
+        use TemplatesTemplateIdBuildsBuildIdBuilderPutResponse::{
+            Status202_BuilderPreparationAccepted, Status400_BadRequest, Status404_NotFound,
+            Status409_Conflict, Status429_ConcurrentBuildLimitReached, Status500_ServerError,
+        };
         Ok(
             match self
                 .start_image_build(&path.template_id, &path.build_id, body)
@@ -440,7 +443,10 @@ impl Templates<()> for ApiImpl {
         _claims: &Self::Claims,
         path: &models::TemplatesTemplateIdBuildsBuildIdBuilderDeletePathParams,
     ) -> Result<TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse, ()> {
-        use TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse::*;
+        use TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse::{
+            Status204_BuilderReleased, Status404_NotFound, Status409_Conflict,
+            Status500_ServerError,
+        };
         Ok(
             match self
                 .cancel_image_build(&path.template_id, &path.build_id)
@@ -848,6 +854,7 @@ impl Templates<()> for ApiImpl {
         Ok(V3TemplatesPostResponse::Status202_TheBuildWasRequestedSuccessfully(response))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn v2_templates_template_id_builds_build_id_post(
         &self,
         _method: &Method,
@@ -1070,8 +1077,7 @@ impl Templates<()> for ApiImpl {
                         }
                     }
                 };
-                if std::panic::AssertUnwindSafe(work)
-                    .catch_unwind()
+                if Box::pin(std::panic::AssertUnwindSafe(work).catch_unwind())
                     .await
                     .is_err()
                 {

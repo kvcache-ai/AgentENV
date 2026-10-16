@@ -102,7 +102,7 @@ mod tests {
 
         table.upsert(sandbox_id, target.clone(), 2);
         assert_eq!(table.proxy_target(&sandbox_id), Some(target));
-        assert_eq!(table.routes.get(&sandbox_id).unwrap().version(), 2);
+        assert_eq!(table.routes[&sandbox_id].version(), 2);
     }
 
     #[test]

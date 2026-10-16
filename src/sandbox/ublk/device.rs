@@ -555,7 +555,11 @@ impl UblkDeviceManager {
 
     /// Gracefully shut down the daemon process.
     pub async fn shutdown_daemon(&self) -> Result<()> {
-        let recent = self.recent_tools_device.lock().unwrap().take();
+        let recent = self
+            .recent_tools_device
+            .lock()
+            .expect("recent_tools_device lock poisoned")
+            .take();
         if let Some(device) = recent {
             if let Err(error) = device.release().await {
                 warn!(error = %error, "failed to release cached tools device during shutdown");
@@ -598,7 +602,7 @@ impl UblkDeviceManager {
         // Retain one idle tools image; active sandboxes retain any other versions.
         self.recent_tools_device
             .lock()
-            .unwrap()
+            .expect("recent_tools_device lock poisoned")
             .replace(device.clone());
         Ok(device)
     }
@@ -755,7 +759,12 @@ impl Drop for SharedReadOnlyDeviceInner {
             return;
         }
 
-        drop(self.cache_fd.get_mut().unwrap().take());
+        drop(
+            self.cache_fd
+                .get_mut()
+                .expect("cache_fd lock poisoned")
+                .take(),
+        );
         let dev_id = self.device.dev_id;
         let key = self.image_config_key.clone();
         let device_path = self.device.device_path.clone();
@@ -871,7 +880,13 @@ impl SharedReadOnlyDevice {
             .shared_readonly_releases
             .insert(key.clone(), Arc::clone(&notify));
         drop(entry);
-        drop(self.inner.cache_fd.lock().unwrap().take());
+        drop(
+            self.inner
+                .cache_fd
+                .lock()
+                .expect("cache_fd lock poisoned")
+                .take(),
+        );
         release_shared_readonly_device(key, device, notify).await
     }
 }

@@ -117,11 +117,11 @@ impl fmt::Debug for ImageService {
 }
 
 impl ImageService {
-    async fn with_global_config(global_config: GlobalConfig, config_path: PathBuf) -> Result<Self> {
-        Self::with_global_config_and_p2p_publish_url(global_config, config_path, None).await
+    fn with_global_config(global_config: GlobalConfig, config_path: PathBuf) -> Result<Self> {
+        Self::with_global_config_and_p2p_publish_url(global_config, config_path, None)
     }
 
-    async fn with_global_config_and_p2p_publish_url(
+    fn with_global_config_and_p2p_publish_url(
         global_config: GlobalConfig,
         config_path: PathBuf,
         p2p_publish_url: Option<String>,
@@ -151,23 +151,23 @@ impl ImageService {
     }
 
     /// Creates an `ImageService` from an in-memory [`GlobalConfig`].
-    pub async fn new(global_config: GlobalConfig) -> Result<Self> {
-        Self::with_global_config(global_config, PathBuf::new()).await
+    pub fn new(global_config: GlobalConfig) -> Result<Self> {
+        Self::with_global_config(global_config, PathBuf::new())
     }
 
-    pub async fn from_config_path(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn from_config_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let global_config = load_global_config(&path)?;
-        Self::with_global_config(global_config, path).await
+        Self::with_global_config(global_config, path)
     }
 
-    pub async fn from_config_path_with_p2p_publish_url(
+    pub fn from_config_path_with_p2p_publish_url(
         path: impl AsRef<Path>,
         p2p_publish_url: Option<String>,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let global_config = load_global_config(&path)?;
-        Self::with_global_config_and_p2p_publish_url(global_config, path, p2p_publish_url).await
+        Self::with_global_config_and_p2p_publish_url(global_config, path, p2p_publish_url)
     }
 
     /// Return the path from which this `ImageService` was loaded.
@@ -337,11 +337,11 @@ impl ImageService {
 
         match ImageFile::open(image_config, self.clone(), Some(device_key)).await {
             Ok(image) => {
-                self.set_result_file(&result_file, "success")?;
+                Self::set_result_file(&result_file, "success")?;
                 Ok(image)
             }
             Err(err) => {
-                let _ = self.set_result_file(&result_file, &format!("failed:{err}"));
+                let _ = Self::set_result_file(&result_file, &format!("failed:{err}"));
                 Err(err)
             }
         }
@@ -661,7 +661,7 @@ impl ImageService {
         upload_result
     }
 
-    fn set_result_file(&self, filename: &str, data: &str) -> Result<()> {
+    fn set_result_file(filename: &str, data: &str) -> Result<()> {
         if filename.is_empty() {
             return Ok(());
         }
@@ -854,12 +854,12 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct OssObjectState {
-        blob: Arc<Vec<u8>>,
+        blob: Arc<[u8]>,
     }
 
     #[derive(Clone)]
     struct CountedBlobState {
-        blob: Arc<Vec<u8>>,
+        blob: Arc<[u8]>,
         hits: Arc<AtomicUsize>,
     }
 
@@ -882,7 +882,7 @@ mod tests {
         request: Request,
     ) -> Response<Body> {
         let headers = request.headers().clone();
-        let body = state.blob.as_slice();
+        let body = &state.blob[..];
         let len = body.len() as u64;
 
         match *request.method() {
@@ -1000,9 +1000,7 @@ mod tests {
             }),
         );
 
-        let service = ImageService::from_config_path(&global_path)
-            .await
-            .expect("service");
+        let service = ImageService::from_config_path(&global_path).expect("service");
         let cfg = service.load_image_config(&image_path).expect("image cfg");
         let download = cfg.effective_download(service.global_config());
 
@@ -1014,32 +1012,12 @@ mod tests {
         assert_eq!(download.block_size, 131072);
     }
 
-    #[tokio::test]
-    async fn test_set_result_file_writes_status() {
+    #[test]
+    fn test_set_result_file_writes_status() {
         let tmp = TempDir::new().expect("tempdir");
-        let global_path = tmp.path().join("overlaybd.json");
         let result_path = tmp.path().join("result.txt");
 
-        write_json(
-            &global_path,
-            &serde_json::json!({
-                "registryFsVersion": "v2",
-                "ioEngine": 0,
-                "cacheConfig": {
-                    "cacheType": "file",
-                    "cacheDir": tmp.path().join("cache"),
-                    "cacheSizeGB": 1,
-                    "refillSize": 262144,
-                    "blockSize": 65536
-                }
-            }),
-        );
-
-        let service = ImageService::from_config_path(&global_path)
-            .await
-            .expect("service");
-        service
-            .set_result_file(result_path.to_string_lossy().as_ref(), "success")
+        ImageService::set_result_file(result_path.to_string_lossy().as_ref(), "success")
             .expect("write result");
 
         let raw = std::fs::read_to_string(result_path).expect("read result");
@@ -1094,7 +1072,6 @@ mod tests {
         );
 
         let service = ImageService::from_config_path(&global_path)
-            .await
             .expect("local-only service should not initialize remote runtime eagerly");
         let image = service
             .create_image_file(&image_path)
@@ -1112,7 +1089,7 @@ mod tests {
         let app = Router::new()
             .route("/test-bucket/layers/lower", any(handle_oss_object))
             .with_state(OssObjectState {
-                blob: Arc::new(object.clone()),
+                blob: Arc::from(object.clone()),
             });
         let (endpoint, server_handle) = spawn_server(app).await;
 
@@ -1138,9 +1115,7 @@ mod tests {
             }),
         );
 
-        let service = ImageService::from_config_path(&global_path)
-            .await
-            .expect("service");
+        let service = ImageService::from_config_path(&global_path).expect("service");
         let url = format!(
             "s3://test-bucket/layers/lower?endpoint={}&region=us-east-1",
             endpoint
@@ -1167,7 +1142,7 @@ mod tests {
                 any(handle_oss_get_only_object),
             )
             .with_state(OssObjectState {
-                blob: Arc::new(object.clone()),
+                blob: Arc::from(object.clone()),
             });
         let (endpoint, server_handle) = spawn_server(app).await;
 
@@ -1193,9 +1168,7 @@ mod tests {
             }),
         );
 
-        let service = ImageService::from_config_path(&global_path)
-            .await
-            .expect("service");
+        let service = ImageService::from_config_path(&global_path).expect("service");
         let url = format!(
             "s3://test-bucket/source/hinted?endpoint={}&region=us-east-1",
             endpoint
@@ -1213,9 +1186,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_zero_remote_io_workers_uses_current_runtime() {
-        let service = ImageService::new(GlobalConfig::default())
-            .await
-            .expect("service");
+        let service = ImageService::new(GlobalConfig::default()).expect("service");
         assert!(service.inner.remote_io_runtime.is_none());
         assert_eq!(
             service.inner.remote_io_handle.id(),
@@ -1229,7 +1200,7 @@ mod tests {
             remote_io_workers: 2,
             ..GlobalConfig::default()
         };
-        let service = ImageService::new(config).await.expect("service");
+        let service = ImageService::new(config).expect("service");
         let handle = service.inner.remote_io_handle.clone();
         // Dropping the service inside an async context must not panic: the
         // remote-io runtime is shut down in the background by
@@ -1253,7 +1224,7 @@ mod tests {
         let app = Router::new()
             .route("/ns/repo/blobs/sha256:abc", any(handle_counted_blob))
             .with_state(CountedBlobState {
-                blob: Arc::new(object.clone()),
+                blob: Arc::from(object.clone()),
                 hits: hits.clone(),
             });
         let (endpoint, server_handle) = spawn_server(app).await;
@@ -1274,9 +1245,7 @@ mod tests {
             }),
         );
 
-        let service = ImageService::from_config_path(&global_path)
-            .await
-            .expect("service");
+        let service = ImageService::from_config_path(&global_path).expect("service");
         let url = format!("{endpoint}/ns/repo/blobs/sha256:abc");
         let file = service
             .open_source_blob_with_size(&url, None)
@@ -1323,9 +1292,7 @@ mod tests {
             }),
         );
 
-        let service = ImageService::from_config_path(&global_path)
-            .await
-            .expect("service");
+        let service = ImageService::from_config_path(&global_path).expect("service");
 
         assert_eq!(
             service.p2p_uuid_address().as_deref(),
@@ -1344,7 +1311,7 @@ mod tests {
                 any(handle_aliyun_oss_object),
             )
             .with_state(OssObjectState {
-                blob: Arc::new(object.clone()),
+                blob: Arc::from(object.clone()),
             });
         let (endpoint, server_handle) = spawn_server(app).await;
 
@@ -1370,9 +1337,7 @@ mod tests {
             }),
         );
 
-        let service = ImageService::from_config_path(&global_path)
-            .await
-            .expect("service");
+        let service = ImageService::from_config_path(&global_path).expect("service");
         let url = "oss://aliyun-bucket/objects/layer?region=cn-hangzhou".to_string();
 
         let file = service

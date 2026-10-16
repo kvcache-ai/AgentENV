@@ -497,7 +497,6 @@ async fn test_registry_e2e_read_download_verify() -> Result<()> {
     let global_cfg_path = resolve_global_config(&tmp)?;
 
     let service = ImageService::from_config_path(&global_cfg_path)
-        .await
         .with_context(|| format!("open image service failed: {}", global_cfg_path.display()))?;
     let image = create_image_file_with_retry(&service, &image_cfg_path).await?;
 
@@ -601,7 +600,6 @@ async fn test_registry_e2e_upper_write_sync_reopen_persist() -> Result<()> {
     }
     let global_cfg_path = resolve_global_config(&tmp)?;
     let service = ImageService::from_config_path(&global_cfg_path)
-        .await
         .with_context(|| format!("open image service failed: {}", global_cfg_path.display()))?;
 
     let upper_data = work_root.join("upper.data");
@@ -740,7 +738,6 @@ async fn test_registry_e2e_upper_compact_to_local_lower() -> Result<()> {
     }
     let global_cfg_path = resolve_global_config(&tmp)?;
     let service = ImageService::from_config_path(&global_cfg_path)
-        .await
         .with_context(|| format!("open image service failed: {}", global_cfg_path.display()))?;
 
     let upper_data = work_root.join("compact-upper.data");
@@ -876,7 +873,7 @@ async fn test_registry_e2e_upper_compact_to_local_lower() -> Result<()> {
 }
 
 #[test]
-fn test_sample_config_valid() -> Result<()> {
+fn test_sample_config_valid() {
     let cfg = sample_image_config();
     assert_eq!(
         cfg.repo_blob_url,
@@ -888,5 +885,4 @@ fn test_sample_config_valid() -> Result<()> {
         .iter()
         .all(|lower| lower.digest.starts_with("sha256:")));
     assert!(cfg.lowers.iter().all(|lower| lower.size > 0));
-    Ok(())
 }

@@ -903,7 +903,7 @@ impl FileCacheBackend {
     // set_cached_size
     // -------------------------------------------------------------------
 
-    pub(crate) async fn set_cached_size(&self, cache_id: &str, size: u64) -> Result<()> {
+    pub(crate) fn set_cached_size(&self, cache_id: &str, size: u64) -> Result<()> {
         let entry = match self.get_cache_entry(cache_id) {
             Some(e) => e,
             None => return Ok(()),
@@ -1356,7 +1356,7 @@ impl CachedFile {
             if let Some(source) = source {
                 let latest = source.size().await?;
                 if latest != size {
-                    self.backend.set_cached_size(&self.cache_id, latest).await?;
+                    self.backend.set_cached_size(&self.cache_id, latest)?;
                     self.source_size.store(latest, Ordering::Relaxed);
                     size = latest;
                 }

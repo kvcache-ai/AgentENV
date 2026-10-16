@@ -62,7 +62,11 @@ impl TemplateBuilder {
     }
 
     fn current_cpu_config(&self) -> Option<String> {
-        self.cpu_config_arc.as_ref()?.read().unwrap().clone()
+        self.cpu_config_arc
+            .as_ref()?
+            .read()
+            .expect("cpu_config lock poisoned")
+            .clone()
     }
 
     /// Builds a new snapshot from `config`, publishes it, and returns the committed record.
@@ -240,7 +244,7 @@ impl TemplateBuilder {
         }
     }
 
-    fn create_local_dir(&self, snapshot_id: &SnapshotId) -> TemplateBuildResult<TempDir> {
+    fn create_local_dir(snapshot_id: &SnapshotId) -> TemplateBuildResult<TempDir> {
         let prefix = format!("snapshot-{snapshot_id}-");
         let mut builder = tempfile::Builder::new();
         builder.prefix(&prefix);
@@ -260,10 +264,10 @@ impl TemplateBuilder {
         })?;
         let resources = spec
             .resources_ref()
-            .cloned()
+            .copied()
             .unwrap_or_else(Self::default_sandbox_resources);
         let base = Self::prepare_base_rootfs(&rootfs_base)?;
-        let workspace = self.create_local_dir(&snapshot_id)?;
+        let workspace = Self::create_local_dir(&snapshot_id)?;
 
         Ok(TemplateBuildContext {
             logger: spec.logger.clone(),
@@ -335,7 +339,7 @@ impl TemplateBuilder {
         } else {
             base_snapshot.committed().startup.clone()
         };
-        let workspace = self.create_local_dir(&snapshot_id)?;
+        let workspace = Self::create_local_dir(&snapshot_id)?;
 
         Ok(TemplateBuildContext {
             logger: spec.logger.clone(),

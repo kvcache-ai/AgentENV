@@ -4,6 +4,7 @@
 //! mock server that speaks the same length-prefixed JSON wire format. This
 //! lets us thoroughly test client-side RPC logic, response mapping, and
 //! error handling without requiring ublk hardware or kernel modules.
+#![allow(clippy::unwrap_used)] // Test and benchmark code may unwrap.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -39,7 +40,7 @@ struct MockServer {
 impl MockServer {
     /// Start a mock server with the given handler. Returns immediately;
     /// the server runs in a background task.
-    async fn start(handler: MockHandler) -> Self {
+    fn start(handler: MockHandler) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("daemon.sock");
 
@@ -79,7 +80,7 @@ impl MockServer {
     }
 
     /// Start a mock server that accepts a connection but never responds.
-    async fn start_hanging() -> Self {
+    fn start_hanging() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("daemon.sock");
 
@@ -112,7 +113,7 @@ impl MockServer {
     }
 
     /// Start a mock server that accepts and immediately closes the connection.
-    async fn start_drop_connection() -> Self {
+    fn start_drop_connection() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("daemon.sock");
 
@@ -288,8 +289,7 @@ mod client_tests {
             _ => DaemonResponse::Error {
                 message: "unexpected request".into(),
             },
-        }))
-        .await;
+        }));
 
         let client = server.client();
         let (dev_id, path) = client
@@ -304,8 +304,7 @@ mod client_tests {
     async fn create_overlaybd_error() {
         let server = MockServer::start(Box::new(|_| DaemonResponse::Error {
             message: "disk full".into(),
-        }))
-        .await;
+        }));
 
         let client = server.client();
         let err = client
@@ -321,7 +320,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn create_overlaybd_unexpected_response() {
-        let server = MockServer::start(Box::new(|_| DaemonResponse::Deleted)).await;
+        let server = MockServer::start(Box::new(|_| DaemonResponse::Deleted));
 
         let client = server.client();
         let err = client
@@ -366,8 +365,7 @@ mod client_tests {
             _ => DaemonResponse::Error {
                 message: "unexpected request".into(),
             },
-        }))
-        .await;
+        }));
 
         let client = server.client();
         let device = client
@@ -401,8 +399,7 @@ mod client_tests {
             _ => DaemonResponse::Error {
                 message: "unexpected request".into(),
             },
-        }))
-        .await;
+        }));
 
         let client = server.client();
         let err = client
@@ -425,8 +422,7 @@ mod client_tests {
     async fn create_overlaybd_runtime_device_preserves_invalid_request_type() {
         let server = MockServer::start(Box::new(|_| DaemonResponse::InvalidRequest {
             message: "disk size is invalid".into(),
-        }))
-        .await;
+        }));
         let err = server
             .client()
             .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
@@ -446,7 +442,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn create_overlaybd_runtime_device_unexpected_response() {
-        let server = MockServer::start(Box::new(|_| DaemonResponse::Deleted)).await;
+        let server = MockServer::start(Box::new(|_| DaemonResponse::Deleted));
 
         let client = server.client();
         let err = client
@@ -474,8 +470,7 @@ mod client_tests {
             _ => DaemonResponse::Error {
                 message: "unexpected".into(),
             },
-        }))
-        .await;
+        }));
 
         let client = server.client();
         client.delete(7).await.unwrap();
@@ -485,8 +480,7 @@ mod client_tests {
     async fn delete_error() {
         let server = MockServer::start(Box::new(|_| DaemonResponse::Error {
             message: "device 99 not found".into(),
-        }))
-        .await;
+        }));
 
         let client = server.client();
         let err = client.delete(99).await.unwrap_err();
@@ -499,8 +493,7 @@ mod client_tests {
         let server = MockServer::start(Box::new(|_| DaemonResponse::DeviceCreated {
             dev_id: 0,
             device_path: PathBuf::from("/dev/ublkb0"),
-        }))
-        .await;
+        }));
 
         let client = server.client();
         let err = client.delete(1).await.unwrap_err();
@@ -524,8 +517,7 @@ mod client_tests {
             _ => DaemonResponse::Error {
                 message: "unexpected".into(),
             },
-        }))
-        .await;
+        }));
 
         let client = server.client();
         let stats = client
@@ -545,8 +537,7 @@ mod client_tests {
     async fn snapshot_error() {
         let server = MockServer::start(Box::new(|_| DaemonResponse::Error {
             message: "snapshot failed".into(),
-        }))
-        .await;
+        }));
 
         let client = server.client();
         let err = client
@@ -562,8 +553,7 @@ mod client_tests {
     async fn snapshot_terminal_error() {
         let server = MockServer::start(Box::new(|_| DaemonResponse::TerminalError {
             message: "sealed upper left live runtime mutated".into(),
-        }))
-        .await;
+        }));
 
         let client = server.client();
         let err = client
@@ -579,7 +569,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn snapshot_unexpected_response() {
-        let server = MockServer::start(Box::new(|_| DaemonResponse::Deleted)).await;
+        let server = MockServer::start(Box::new(|_| DaemonResponse::Deleted));
 
         let client = server.client();
         let err = client
@@ -595,7 +585,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn shutdown_succeeds_even_without_response() {
-        let server = MockServer::start_drop_connection().await;
+        let server = MockServer::start_drop_connection();
         let client = server.client();
 
         // shutdown() is best-effort — should succeed even if daemon doesn't respond.
@@ -623,7 +613,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn server_drops_connection_without_response() {
-        let server = MockServer::start_drop_connection().await;
+        let server = MockServer::start_drop_connection();
         let client = server.client();
 
         let err = client
@@ -640,7 +630,7 @@ mod client_tests {
 
     #[tokio::test]
     async fn rpc_timeout() {
-        let server = MockServer::start_hanging().await;
+        let server = MockServer::start_hanging();
 
         // Create client with a very short timeout by calling the private call method
         // indirectly. Since we can't change the timeout on public methods, we test
@@ -664,7 +654,7 @@ mod client_tests {
     #[tokio::test]
     async fn daemon_dead_prevents_all_rpcs() {
         // Even with a valid server running, a dead daemon flag should prevent calls.
-        let server = MockServer::start(Box::new(|_| DaemonResponse::Deleted)).await;
+        let server = MockServer::start(Box::new(|_| DaemonResponse::Deleted));
 
         // Create client with daemon_dead=true.
         let client = UblkDaemonClient::new_for_test(server.socket_path.clone(), true);
@@ -733,8 +723,7 @@ mod client_tests {
                 DaemonRequest::AbortPackRecording { .. } => DaemonResponse::Ok,
                 DaemonRequest::PrefetchStartupPack { .. } => DaemonResponse::Ok,
             }
-        }))
-        .await;
+        }));
 
         let client = server.client();
 
@@ -780,7 +769,7 @@ mod server_tests {
     /// We write a minimal global config JSON and construct from it. The
     /// image service won't be used for actual image operations in these
     /// tests — we only test the server's accept loop and shutdown.
-    async fn test_image_service(dir: &Path) -> ImageService {
+    fn test_image_service(dir: &Path) -> ImageService {
         let cache_dir = dir.join("cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
 
@@ -797,7 +786,7 @@ mod server_tests {
             }
         });
         std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
-        ImageService::from_config_path(&config_path).await.unwrap()
+        ImageService::from_config_path(&config_path).unwrap()
     }
 
     #[tokio::test]
@@ -805,7 +794,7 @@ mod server_tests {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("server.sock");
 
-        let image_service = test_image_service(dir.path()).await;
+        let image_service = test_image_service(dir.path());
         let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
         let server = UblkDaemonServer::new(
             sock_path.clone(),
@@ -845,7 +834,7 @@ mod server_tests {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("server.sock");
 
-        let image_service = test_image_service(dir.path()).await;
+        let image_service = test_image_service(dir.path());
         let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
         let server = Arc::new(UblkDaemonServer::new(
             sock_path.clone(),
@@ -881,7 +870,7 @@ mod server_tests {
         // The file exists but nobody is listening.
         assert!(sock_path.exists(), "stale socket should exist");
 
-        let image_service = test_image_service(dir.path()).await;
+        let image_service = test_image_service(dir.path());
         let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
         let server = Arc::new(UblkDaemonServer::new(
             sock_path.clone(),
@@ -917,7 +906,7 @@ mod server_tests {
         // Create a socket that IS actively being listened on.
         let _active_listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
 
-        let image_service = test_image_service(dir.path()).await;
+        let image_service = test_image_service(dir.path());
         let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
         let server = UblkDaemonServer::new(
             sock_path.clone(),
@@ -938,7 +927,7 @@ mod server_tests {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("server.sock");
 
-        let image_service = test_image_service(dir.path()).await;
+        let image_service = test_image_service(dir.path());
         let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
         let server = Arc::new(UblkDaemonServer::new(
             sock_path.clone(),
@@ -983,7 +972,7 @@ mod server_tests {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("server.sock");
 
-        let image_service = test_image_service(dir.path()).await;
+        let image_service = test_image_service(dir.path());
         let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
         let server = Arc::new(UblkDaemonServer::new(
             sock_path.clone(),
@@ -1028,7 +1017,7 @@ mod server_tests {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("server.sock");
 
-        let image_service = test_image_service(dir.path()).await;
+        let image_service = test_image_service(dir.path());
         let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
         let server = Arc::new(UblkDaemonServer::new(
             sock_path.clone(),
@@ -1069,7 +1058,7 @@ mod server_tests {
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("server.sock");
 
-        let image_service = test_image_service(dir.path()).await;
+        let image_service = test_image_service(dir.path());
         let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
         let server = Arc::new(UblkDaemonServer::new(
             sock_path.clone(),
@@ -1118,8 +1107,7 @@ mod server_tests {
             _ => DaemonResponse::Error {
                 message: "unexpected request".into(),
             },
-        }))
-        .await;
+        }));
 
         let client = server.client();
         let flags = client.get_features().await.unwrap();
@@ -1136,8 +1124,7 @@ mod server_tests {
             _ => DaemonResponse::Error {
                 message: "unexpected request".into(),
             },
-        }))
-        .await;
+        }));
 
         let client = server.client();
         let (dev_id, path) = client
@@ -1171,8 +1158,7 @@ mod server_tests {
             _ => DaemonResponse::Error {
                 message: "unexpected request".into(),
             },
-        }))
-        .await;
+        }));
 
         let client = server.client();
         let (dev_id, path) = client
@@ -1198,8 +1184,7 @@ mod server_tests {
             _ => DaemonResponse::Error {
                 message: "unexpected request".into(),
             },
-        }))
-        .await;
+        }));
 
         let client = server.client();
         client.release_overlaybd(15).await.unwrap();
@@ -1219,8 +1204,7 @@ mod server_tests {
             _ => DaemonResponse::Error {
                 message: "unexpected request".into(),
             },
-        }))
-        .await;
+        }));
 
         let client = server.client();
         client.update_size(25, 2048).await.unwrap();
@@ -1235,8 +1219,7 @@ mod server_tests {
             _ => DaemonResponse::Error {
                 message: "unexpected request".into(),
             },
-        }))
-        .await;
+        }));
 
         let client = server.client();
         let result = client

@@ -61,7 +61,7 @@ pub fn copy_with_sha256_hex(
 ) -> io::Result<(String, u64)> {
     let mut hasher = Sha256::new();
     let mut copied = 0_u64;
-    let mut buffer = [0_u8; DIGEST_BUFFER_SIZE];
+    let mut buffer = vec![0_u8; DIGEST_BUFFER_SIZE];
 
     loop {
         let read = source.read(&mut buffer)?;
@@ -79,7 +79,7 @@ pub fn copy_with_sha256_hex(
 fn hash_reader(mut reader: impl Read) -> io::Result<(Sha256, u64)> {
     let mut hasher = Sha256::new();
     let mut size = 0_u64;
-    let mut buffer = [0_u8; DIGEST_BUFFER_SIZE];
+    let mut buffer = vec![0_u8; DIGEST_BUFFER_SIZE];
 
     loop {
         let read = reader.read(&mut buffer)?;

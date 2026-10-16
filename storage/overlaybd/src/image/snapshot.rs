@@ -131,7 +131,7 @@ mod tests {
             UpperMode::LogStructured,
         )?;
 
-        let image_service = ImageService::from_config_path(&global_path).await?;
+        let image_service = ImageService::from_config_path(&global_path)?;
         let image = image_service.create_image_file(&image_path).await?;
         image.write_at(0, &[0xAB; 4096]).await?;
         image.sync().await?;
@@ -155,7 +155,7 @@ mod tests {
         create_sealed_lower(&lower_path, &lower_index, &[0x11; 4096]).await?;
         let image_path = write_image_config(&temp, &lower_path, true)?;
 
-        let image_service = ImageService::from_config_path(&global_path).await?;
+        let image_service = ImageService::from_config_path(&global_path)?;
         let image = image_service.create_image_file(&image_path).await?;
         let snapshot_path = temp.path().join("readonly-snapshot.commit");
 

@@ -75,7 +75,7 @@ pub fn decode_trace(bytes: &[u8]) -> Result<(u64, Vec<u64>)> {
     let version = u32::from_le_bytes(
         bytes[TRACE_OFF_VERSION..TRACE_OFF_VERSION + 4]
             .try_into()
-            .unwrap(),
+            .expect("fixed-size slice"),
     );
     ensure!(
         version == TRACE_FORMAT_VERSION,
@@ -84,7 +84,7 @@ pub fn decode_trace(bytes: &[u8]) -> Result<(u64, Vec<u64>)> {
     let header_bytes = u32::from_le_bytes(
         bytes[TRACE_OFF_HEADER_BYTES..TRACE_OFF_HEADER_BYTES + 4]
             .try_into()
-            .unwrap(),
+            .expect("fixed-size slice"),
     );
     ensure!(
         header_bytes as usize == TRACE_HEADER_BYTES,
@@ -93,12 +93,12 @@ pub fn decode_trace(bytes: &[u8]) -> Result<(u64, Vec<u64>)> {
     let mem_virtual_size = u64::from_le_bytes(
         bytes[TRACE_OFF_MEM_VSIZE..TRACE_OFF_MEM_VSIZE + 8]
             .try_into()
-            .unwrap(),
+            .expect("fixed-size slice"),
     );
     let page_count = u32::from_le_bytes(
         bytes[TRACE_OFF_PAGE_COUNT..TRACE_OFF_PAGE_COUNT + 4]
             .try_into()
-            .unwrap(),
+            .expect("fixed-size slice"),
     );
     ensure!(
         bytes[TRACE_OFF_RESERVED..TRACE_HEADER_BYTES]

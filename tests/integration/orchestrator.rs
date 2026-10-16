@@ -50,9 +50,10 @@ fn host_file_persister(root: PathBuf) -> FileBackedSandboxPersister {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn orchestrator_lifecycle() -> Result<()> {
     common::setup().await;
-    timeout(TEST_TIMEOUT, async {
+    Box::pin(timeout(TEST_TIMEOUT, async {
         let root = tempdir()?;
         let (builder, snapshot_manager, _) = common::snapshot_test_parts(root.path());
         let alias = format!("orchestrator-test-shared-{}", Uuid::now_v7());
@@ -214,7 +215,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
         assert_eq!(lookup, ProxyLookupResult::NotFound);
 
         Ok(())
-    })
+    }))
     .await
     .map_err(|_| anyhow::anyhow!("test timed out"))?
 }
@@ -222,7 +223,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
 #[tokio::test]
 async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Result<()> {
     common::setup().await;
-    timeout(TEST_TIMEOUT, async {
+    Box::pin(timeout(TEST_TIMEOUT, async {
         let root = tempdir()?;
         let (builder, snapshot_manager, _) = common::snapshot_test_parts(root.path());
         let base_alias = format!("orchestrator-capture-base-{}", Uuid::now_v7());
@@ -370,7 +371,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
         orchestrator.delete_sandbox(relaunched.id).await?;
         orchestrator.delete_sandbox(sandbox_id).await?;
         Ok(())
-    })
+    }))
     .await
     .map_err(|_| anyhow::anyhow!("test timed out"))?
 }
