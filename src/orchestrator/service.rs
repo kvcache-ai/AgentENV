@@ -451,6 +451,7 @@ where
         skip(self, request),
         fields(sandbox_id = %sandbox_id)
     )]
+    #[allow(clippy::too_many_lines)]
     async fn create_sandbox_inner(
         self: Arc<Self>,
         sandbox_id: SandboxId,
@@ -496,7 +497,7 @@ where
                 let mut extra_mmds = serde_json::Map::new();
                 if !launch_image_configs.is_empty() {
                     extra_mmds.insert("imageConfigs".to_string(), launch_image_configs.to_value());
-                };
+                }
                 // Effective custom config: a launch-provided value overrides the
                 // one persisted in the source snapshot; otherwise inherit it.
                 // Store the effective value so publishing a snapshot from this
@@ -562,7 +563,7 @@ where
                 let mut extra_mmds = serde_json::Map::new();
                 if !launch_image_configs.is_empty() {
                     extra_mmds.insert("imageConfigs".to_string(), launch_image_configs.to_value());
-                };
+                }
                 let launch_config = SandboxLaunchConfig {
                     sandbox_id,
                     snapshot_id: image_ref.clone(),
@@ -676,6 +677,7 @@ where
         skip(self, child_specs),
         fields(source_sandbox_id = %source_sandbox_id, count = child_specs.len())
     )]
+    #[allow(clippy::too_many_lines)]
     async fn fork_sandbox_inner(
         self: Arc<Self>,
         source_sandbox_id: SandboxId,
@@ -1439,6 +1441,7 @@ where
         self.pause_sandbox_impl(sandbox_id).await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         // Pin paused runtime artifacts before detaching from the running set.
         let runtime_artifacts = {
@@ -2083,7 +2086,7 @@ where
         // so this may fail. But it's acceptable since extension state should be transient like network policy
         self.store
             .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
-                metadata.custom_extension_params = new_params.clone();
+                metadata.custom_extension_params.clone_from(&new_params);
             })
             .await
             .map_err(|err| match err {

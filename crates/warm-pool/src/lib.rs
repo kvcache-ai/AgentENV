@@ -134,7 +134,7 @@ impl<T: Send> WarmPool<T> {
 
     /// Return the current number of idle resources.
     pub fn len(&self) -> usize {
-        self.pool.lock().unwrap().len()
+        self.pool.lock().expect("pool lock poisoned").len()
     }
 
     /// Return whether the pool currently has no idle resources.
@@ -164,7 +164,8 @@ impl<T: Send> WarmPool<T> {
     }
 
     fn current_fill_target(&self) -> usize {
-        (*self.fill_target.lock().unwrap()).min(self.config.high_watermark)
+        (*self.fill_target.lock().expect("fill_target lock poisoned"))
+            .min(self.config.high_watermark)
     }
 
     fn grow_fill_target_after_pressure(&self, pool_len: usize) {
@@ -173,7 +174,7 @@ impl<T: Send> WarmPool<T> {
         }
 
         let low = self.config.low_watermark.min(self.config.high_watermark);
-        let mut target = self.fill_target.lock().unwrap();
+        let mut target = self.fill_target.lock().expect("fill_target lock poisoned");
         let next = (*target)
             .max(low)
             .max(1)
@@ -198,7 +199,10 @@ impl<T: Send> WarmPool<T> {
             return;
         }
 
-        let mut signal = self.maintenance_signal.lock().unwrap();
+        let mut signal = self
+            .maintenance_signal
+            .lock()
+            .expect("maintenance_signal lock poisoned");
         if signal.stop {
             return;
         }
@@ -216,7 +220,7 @@ impl<T: Send> WarmPool<T> {
         if self.is_shutting_down() {
             return None;
         }
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock().expect("pool lock poisoned");
         let resource = pool.pop_front();
         let next_pool_len = pool.len();
         drop(pool);
@@ -231,7 +235,7 @@ impl<T: Send> WarmPool<T> {
         if self.is_shutting_down() {
             return None;
         }
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock().expect("pool lock poisoned");
         let resource = pool
             .iter()
             .position(&mut predicate)
@@ -248,7 +252,7 @@ impl<T: Send> WarmPool<T> {
     /// resource and need a final bounded insert before publishing it as idle.
     pub fn try_push_bounded(&self, resource: T) -> Result<(), T> {
         if !self.is_shutting_down() {
-            let mut pool = self.pool.lock().unwrap();
+            let mut pool = self.pool.lock().expect("pool lock poisoned");
             if !self.is_shutting_down() && pool.len() < self.config.high_watermark {
                 pool.push_back(resource);
                 return Ok(());
@@ -259,7 +263,7 @@ impl<T: Send> WarmPool<T> {
 
     /// Drain one idle resource from the back of the pool.
     pub fn try_drain_one(&self) -> Option<T> {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock().expect("pool lock poisoned");
         pool.pop_back()
     }
 
@@ -271,7 +275,7 @@ impl<T: Send> WarmPool<T> {
     /// returns `Err(resource)` when the pool is full.
     pub fn release(&self, resource: T) -> Result<(), T> {
         if !self.is_shutting_down() {
-            let mut pool = self.pool.lock().unwrap();
+            let mut pool = self.pool.lock().expect("pool lock poisoned");
             // Re-check after taking the lock to avoid racing shutdown.
             if !self.is_shutting_down()
                 && (self.config.maintenance_enabled || pool.len() < self.config.high_watermark)
@@ -299,7 +303,7 @@ impl<T: Send> WarmPool<T> {
         self.shutting_down.store(true, Ordering::Release);
         self.stop_maintenance_worker();
 
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock().expect("pool lock poisoned");
         pool.drain(..).collect()
     }
 
@@ -324,7 +328,10 @@ impl<T: Send> WarmPool<T> {
             .spawn(move || self.maintenance_worker_loop(run_cycle))
         {
             Ok(handle) => {
-                *self.maintenance_worker.lock().unwrap() = Some(handle);
+                *self
+                    .maintenance_worker
+                    .lock()
+                    .expect("maintenance_worker lock poisoned") = Some(handle);
                 self.request_maintenance();
             }
             Err(err) => {
@@ -341,9 +348,15 @@ impl<T: Send> WarmPool<T> {
         let mut has_immediate_work = false;
         loop {
             if !has_immediate_work {
-                let mut signal = self.maintenance_signal.lock().unwrap();
+                let mut signal = self
+                    .maintenance_signal
+                    .lock()
+                    .expect("maintenance_signal lock poisoned");
                 while !signal.stop && !signal.pending {
-                    signal = self.maintenance_cv.wait(signal).unwrap();
+                    signal = self
+                        .maintenance_cv
+                        .wait(signal)
+                        .expect("maintenance_signal lock poisoned");
                 }
                 if signal.stop {
                     break;
@@ -362,7 +375,7 @@ impl<T: Send> WarmPool<T> {
             }
 
             has_immediate_work = {
-                let pool_len = self.pool.lock().unwrap().len();
+                let pool_len = self.pool.lock().expect("pool lock poisoned").len();
                 !matches!(
                     self.compute_maintenance_action(pool_len),
                     PoolMaintenanceAction::Idle
@@ -377,13 +390,21 @@ impl<T: Send> WarmPool<T> {
         }
 
         {
-            let mut signal = self.maintenance_signal.lock().unwrap();
+            let mut signal = self
+                .maintenance_signal
+                .lock()
+                .expect("maintenance_signal lock poisoned");
             signal.stop = true;
             signal.pending = true;
             self.maintenance_cv.notify_all();
         }
 
-        if let Some(handle) = self.maintenance_worker.lock().unwrap().take() {
+        if let Some(handle) = self
+            .maintenance_worker
+            .lock()
+            .expect("maintenance_worker lock poisoned")
+            .take()
+        {
             if let Err(err) = handle.join() {
                 tracing::warn!(?err, "warm pool maintenance worker panicked during join");
             }

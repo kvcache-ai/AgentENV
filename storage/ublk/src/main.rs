@@ -119,9 +119,7 @@ fn main() -> Result<()> {
                 let (ring, _) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
                 delete_dev(ring, dev_id).await
             }
-            Command::Recovery => {
-                unimplemented!();
-            }
+            Command::Recovery => bail!("recovery is not implemented"),
         }
     })
 }

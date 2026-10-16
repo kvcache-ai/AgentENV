@@ -619,7 +619,7 @@ fn extract_firecracker(tgz_path: &Path, fc_path: &Path, cth_path: &Path) -> Resu
         }
     }
 
-    std::fs::remove_dir_all(&tmp_dir).ok();
+    let _ = std::fs::remove_dir_all(&tmp_dir);
     Ok(())
 }
 
@@ -627,7 +627,9 @@ fn find_cpu_template_helper(dir: &Path) -> Option<PathBuf> {
     walkdir(dir).ok()?.into_iter().find_map(|entry| {
         let name = entry.file_name().to_string_lossy().into_owned();
         (name.contains("cpu-template-helper")
-            && !name.ends_with(".debug")
+            && !Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("debug"))
             && entry.file_type().map(|ft| ft.is_file()).unwrap_or(false))
         .then(|| entry.path())
     })
@@ -756,7 +758,7 @@ fn extract_ext4_from_ghcr(
         walkdir(&rootfs_dir)?
             .into_iter()
             .find(|e| e.file_name().to_string_lossy() == filename)
-            .map(|e| e.path().to_path_buf())
+            .map(|e| e.path().clone())
             .ok_or_else(|| anyhow::anyhow!("failed to find /{filename} in image {image}"))?
     };
 
@@ -1231,7 +1233,7 @@ mod tests {
         assert!(err.to_string().contains(&missing.display().to_string()));
 
         let directory = temp.path().join("directory");
-        std::fs::create_dir(&directory).expect("create directory");
+        std::fs::create_dir_all(&directory).expect("create directory");
         let err = validate_explicit_file("tools.drive_path", &directory, false)
             .expect_err("directory must fail");
         assert!(err.to_string().contains("not a regular file"));
@@ -1257,7 +1259,7 @@ mod tests {
         let directory = temp.path().join("directory");
         let empty = temp.path().join("empty");
         let file = temp.path().join("file");
-        std::fs::create_dir(&directory).expect("create directory");
+        std::fs::create_dir_all(&directory).expect("create directory");
         std::fs::write(&empty, []).expect("write empty");
         std::fs::write(&file, b"data").expect("write file");
 

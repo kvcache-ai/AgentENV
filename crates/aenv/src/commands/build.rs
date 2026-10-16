@@ -259,7 +259,7 @@ async fn build(
     let path = builder_path(session);
     wait_for_status(client, session, "building").await?;
     progress.stage(1, "Building image");
-    let (_work, listener, address) = buildkit::bind_local().await?;
+    let (_work, listener, address) = buildkit::bind_local()?;
     let command = async {
         let mut command = Command::new(
             args.buildctl
@@ -450,8 +450,8 @@ mod tests {
         let work = tempfile::tempdir()?;
         let context = work.path().join("context");
         let dockerfiles = work.path().join("dockerfiles");
-        std::fs::create_dir(&context)?;
-        std::fs::create_dir(&dockerfiles)?;
+        std::fs::create_dir_all(&context)?;
+        std::fs::create_dir_all(&dockerfiles)?;
         let custom = dockerfiles.join("Custom.Dockerfile");
         std::fs::write(&custom, "FROM scratch\n")?;
         std::fs::write(context.join("Dockerfile"), "FROM scratch\n")?;

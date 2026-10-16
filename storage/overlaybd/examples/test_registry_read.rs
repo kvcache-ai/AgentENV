@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
         let n = std::cmp::min(64, reported_size as usize);
         let data = file.read_at(0, n).await?;
         print!("    [{i}] ");
-        for b in data.iter() {
+        for b in &data {
             print!("{b:02x}");
         }
         println!("  ({reported_size} bytes)");

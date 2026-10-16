@@ -269,7 +269,8 @@ impl Guest<'_> {
                     started: leader.started,
                 });
             }
-            self.stop_service(process.tag.as_deref().unwrap()).await?;
+            self.stop_service(process.tag.as_deref().expect("owned services are tagged"))
+                .await?;
         }
         if records.is_empty() {
             return Ok(());
@@ -329,7 +330,7 @@ impl Guest<'_> {
             ),
         ] {
             let request = service_request(name, home, &args);
-            let tag = request.tag.clone().unwrap();
+            let tag = request.tag.clone().expect("service requests are tagged");
             let mut stream = self
                 .transport()?
                 .server_stream::<_, StartResponse>("Start", request)
@@ -422,7 +423,7 @@ fn service_request(name: &str, home: &str, args: &[&str]) -> StartRequest {
         pty: None,
         stdin: false,
     });
-    request.process.as_mut().unwrap().cwd = Some(WORKSPACE.into());
+    request.process.as_mut().expect("process is set above").cwd = Some(WORKSPACE.into());
     request.tag = Some(format!("aenv-codex-{name}-{}", uuid::Uuid::new_v4()));
     request
 }

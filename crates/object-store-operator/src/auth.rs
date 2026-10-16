@@ -401,7 +401,7 @@ impl fmt::Debug for CachedCredentialSource {
                     CredentialSource::Process { .. } => "process",
                 },
             )
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

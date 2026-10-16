@@ -65,3 +65,6 @@ required-features = ["full"]
 name = "zfile_read"
 path = "benches/zfile_read_benchmark.rs"
 harness = false
+
+[lints]
+workspace = true

@@ -1805,11 +1805,11 @@ async fn test_hybrid_discard_mixed_ranges_preserves_physical_offsets() {
         assert!(m.zeroed);
         assert_eq!(m.moffset, NO_PHYSICAL_OFFSET);
     }
-    upper.write_at(0, &[0xBB; 6 * 4096]).await.unwrap();
+    upper.write_at(0, &vec![0xBB; 6 * 4096]).await.unwrap();
     assert_eq!(data.size().await.unwrap(), HEADER_SIZE + 6 * 4096);
     assert_eq!(
         upper.read_at(0, 6 * 4096).await.unwrap().as_ref(),
-        &[0xBB; 6 * 4096]
+        &vec![0xBB; 6 * 4096]
     );
     let mappings = upper.index.read().await.upper.dump();
     for (logical, physical) in [(0, 8), (16, 24), (40, 16)] {
@@ -3571,7 +3571,7 @@ async fn test_export_upper_as_sealed_parent_uuid() {
     }
 
     let mut headers = vec![];
-    for layer in lower_layers.iter() {
+    for layer in &lower_layers {
         let header = verify_ht(layer, true, layer.size().await.unwrap())
             .await
             .unwrap();

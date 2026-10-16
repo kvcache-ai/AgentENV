@@ -129,7 +129,7 @@ impl Proxy {
                                 move |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
                                     if request.uri().path() != path || request.headers().contains_key("origin") {
                                         return Err(tokio_tungstenite::tungstenite::http::Response::builder().status(403)
-                                            .body(Some("Forbidden".into())).unwrap());
+                                            .body(Some("Forbidden".into())).expect("valid 403 response"));
                                     }
                                     Ok(response)
                                 })).await??;
@@ -273,7 +273,7 @@ fn sandbox_method(method: &str) -> bool {
         || method.starts_with("fuzzyFileSearch/")
 }
 
-pub(super) async fn gateway(
+pub(super) fn gateway(
     path: &Path,
     harness: PathBuf,
     proxy: Proxy,
@@ -290,7 +290,7 @@ pub(super) async fn gateway(
                     let (harness, proxy, token, events) = (harness.clone(), proxy.clone(), token.clone(), events.clone());
                     connections.spawn(async move {
                         let result = forward(stream, &harness, &proxy, &token, &events).await;
-                        if let Err(error) = result { events.lock().unwrap().error = Some(format!("{error:#}")); }
+                        if let Err(error) = result { events.lock().expect("events lock poisoned").error = Some(format!("{error:#}")); }
                     });
                 },
                 _ = connections.join_next(), if !connections.is_empty() => (),
@@ -315,7 +315,7 @@ async fn forward(
                 return Err(tokio_tungstenite::tungstenite::http::Response::builder()
                     .status(403)
                     .body(None)
-                    .unwrap());
+                    .expect("valid 403 response"));
             }
             Ok(response)
         },
@@ -371,7 +371,10 @@ async fn forward(
             message = guest.receive() => (message?, false),
         };
         if from_main {
-            events.lock().unwrap().observe(&message)?;
+            events
+                .lock()
+                .expect("events lock poisoned")
+                .observe(&message)?;
         } else if message["method"]
             .as_str()
             .is_some_and(|m| !sandbox_method(m))
@@ -542,7 +545,7 @@ mod tests {
         let events = Events::new(root.path())?;
         let mut events = events.lock().unwrap();
         let path = root.path().join("thread-id");
-        std::fs::create_dir(&path)?;
+        std::fs::create_dir_all(&path)?;
         assert!(Events::new(root.path()).is_err());
         events.observe(&json!({"result":{"thread":{"id":"conversation","ephemeral":false}}}))?;
         let turn = json!({"method":"turn/started","params":{"threadId":"conversation"}});

@@ -113,18 +113,18 @@ fn load_pool_config(
     config: Option<&DaemonTomlConfig>,
     force_enable: bool,
     overrides: &PoolConfigOverrides,
-) -> Result<Option<warm_pool::PoolConfig>> {
+) -> Option<warm_pool::PoolConfig> {
     let Some(config) = config else {
-        return Ok(force_enable.then(|| apply_pool_overrides(default_pool_config(), overrides)));
+        return force_enable.then(|| apply_pool_overrides(default_pool_config(), overrides));
     };
 
     let common = config.pool.as_ref();
     let pool = common.and_then(|pool| pool.block.as_ref());
     let enabled = pool.and_then(|pool| pool.enabled).unwrap_or(force_enable);
     if !enabled {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(warm_pool::PoolConfig {
+    Some(warm_pool::PoolConfig {
         low_watermark: overrides
             .low_watermark
             .or_else(|| common.and_then(|pool| pool.low_watermark))
@@ -142,7 +142,7 @@ fn load_pool_config(
             .startup_prewarm
             .or_else(|| pool.and_then(|pool| pool.startup_prewarm))
             .unwrap_or(true),
-    }))
+    })
 }
 
 fn load_daemon_config(path: Option<&PathBuf>) -> Result<Option<DaemonTomlConfig>> {
@@ -284,7 +284,6 @@ fn main() -> Result<()> {
             &cli.global_config,
             cli.p2p_publish_url.clone(),
         )
-        .await
         .with_context(|| {
             format!(
                 "create ImageService from global config: {}",
@@ -326,7 +325,6 @@ fn main() -> Result<()> {
         });
         if let Some(mut pool_config) =
             load_pool_config(daemon_config.as_ref(), cli.enable_pool, &pool_overrides)
-                .context("load warm pool config")?
         {
             let features = server.detect_ublk_features().await?;
             let update_size_supported = features & ublk_caps::UBLK_F_UPDATE_SIZE != 0;

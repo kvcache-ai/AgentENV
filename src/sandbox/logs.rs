@@ -199,8 +199,8 @@ fn parse_log_line(bytes: &[u8]) -> Option<SandboxLogEntry> {
             .collect();
         Some(SandboxLogEntry {
             timestamp,
-            message,
             level,
+            message,
             fields,
         })
     } else {

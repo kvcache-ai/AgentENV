@@ -52,7 +52,7 @@ pub fn ensure_protoc(version: &str, url_template: &str) -> Result<PathBuf> {
         _ => bail!("unsupported arch for protoc: {arch}"),
     };
 
-    let install_dir = dirs_install()?;
+    let install_dir = dirs_install();
     let url = config::resolve_url(
         url_template,
         &[("version", version), ("platform", platform)],
@@ -77,20 +77,19 @@ pub fn ensure_protoc(version: &str, url_template: &str) -> Result<PathBuf> {
     // Add to GITHUB_PATH if in CI
     if let Ok(github_path) = std::env::var("GITHUB_PATH") {
         let bin_dir = install_dir.join("bin");
-        std::fs::OpenOptions::new()
+        let _ = std::fs::OpenOptions::new()
             .append(true)
             .open(&github_path)
             .and_then(|mut f| {
                 use std::io::Write;
                 writeln!(f, "{}", bin_dir.display())
-            })
-            .ok();
+            });
     }
 
     Ok(bin_path)
 }
 
-fn dirs_install() -> Result<PathBuf> {
+fn dirs_install() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-    Ok(PathBuf::from(home).join(".local"))
+    PathBuf::from(home).join(".local")
 }

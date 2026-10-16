@@ -391,7 +391,7 @@ async fn convert_standard_oci_layers_pipeline(
     converter: &OverlaybdLayerConverter,
 ) -> Result<Vec<LocalLayer>> {
     let layout_dir = work_root.join("oci");
-    let mut producer = RegctlImageCopyProducer::start(regctl_binary, image_ref, layout_dir).await?;
+    let mut producer = RegctlImageCopyProducer::start(regctl_binary, image_ref, layout_dir)?;
     let result = convert_standard_oci_layers_pipeline_inner(
         manifest,
         image_ref,
@@ -615,11 +615,7 @@ pub(super) async fn convert_content_image(
 }
 
 impl RegctlImageCopyProducer {
-    async fn start(
-        regctl_binary: &Path,
-        image_ref: &str,
-        layout_dir: PathBuf,
-    ) -> ImageResult<Self> {
+    fn start(regctl_binary: &Path, image_ref: &str, layout_dir: PathBuf) -> ImageResult<Self> {
         ensure_regctl_binary(regctl_binary)?;
         let mut producer = Self {
             regctl_binary: regctl_binary.to_path_buf(),
@@ -691,7 +687,7 @@ impl LayerBlobSource for RegctlImageCopyProducer {
                 return Ok(blob_path);
             }
 
-            if let Some(status) = self.poll_exit().await? {
+            if let Some(status) = self.poll_exit()? {
                 if !status.success() {
                     let stderr = self.stderr_text().await;
                     if regctl_stderr_is_not_found(&stderr) {
@@ -735,7 +731,7 @@ impl LayerBlobSource for RegctlImageCopyProducer {
 }
 
 impl RegctlImageCopyProducer {
-    async fn poll_exit(&mut self) -> Result<Option<std::process::ExitStatus>> {
+    fn poll_exit(&mut self) -> Result<Option<std::process::ExitStatus>> {
         if let Some(status) = self.exit_status {
             return Ok(Some(status));
         }

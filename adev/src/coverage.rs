@@ -209,7 +209,7 @@ struct CoverageFields {
 fn strip_ansi(s: &str) -> String {
     use std::sync::LazyLock;
     static RE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"\x1B\[[0-9;]*[A-Za-z]").unwrap());
+        LazyLock::new(|| regex::Regex::new(r"\x1B\[[0-9;]*[A-Za-z]").expect("valid regex"));
     RE.replace_all(s, "").to_string()
 }
 

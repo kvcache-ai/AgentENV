@@ -534,7 +534,7 @@ impl FileCacheBackend {
     /// The returned list is from old to fresh.
     fn evictable_cache_ids_by_lru(state: &BackendState) -> Vec<String> {
         let mut candidates = Vec::new();
-        for slot_ref in state.cache_entries.iter() {
+        for slot_ref in &state.cache_entries {
             let Some(entry) = slot_ref.value().as_active() else {
                 continue;
             };
@@ -555,7 +555,7 @@ impl FileCacheBackend {
     /// refills are skipped.
     fn idle_open_cache_ids_by_lru(state: &BackendState, idle_cutoff: u64) -> Vec<String> {
         let mut candidates = Vec::new();
-        for slot_ref in state.cache_entries.iter() {
+        for slot_ref in &state.cache_entries {
             let Some(entry) = slot_ref.value().as_active() else {
                 continue;
             };
@@ -751,7 +751,7 @@ impl FileCacheBackend {
             misses: 0,
             refills: 0,
         };
-        for slot_ref in self.state.cache_entries.iter() {
+        for slot_ref in &self.state.cache_entries {
             let Some(entry) = slot_ref.value().as_active() else {
                 continue;
             };
@@ -850,7 +850,7 @@ impl FileCacheBackend {
         })
     }
 
-    pub async fn set_quota(&self, _pathname: &str, _quota: u64) -> Result<()> {
+    pub fn set_quota(&self, _pathname: &str, _quota: u64) -> Result<()> {
         bail!("set_quota is not supported in file cache backend");
     }
 
@@ -898,7 +898,7 @@ impl FileCacheBackend {
         self.evict_global().await
     }
 
-    pub async fn resize(&self, _n: u64, _flags: u32) -> Result<()> {
+    pub fn resize(&self, _n: u64, _flags: u32) -> Result<()> {
         bail!("resize is not supported in file cache backend");
     }
 

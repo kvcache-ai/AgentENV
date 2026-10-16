@@ -2850,10 +2850,10 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
         runtime_cache_root: Some(temp.path().join("runtime")),
     })?;
     let repository = backend.repository();
-    let volumes = Arc::new(
-        VolumeManager::open_with_repository(temp.path().join("volumes"), repository.clone())
-            .await?,
-    );
+    let volumes = Arc::new(VolumeManager::open_with_repository(
+        temp.path().join("volumes"),
+        repository.clone(),
+    )?);
     let behavior = Arc::new(MockBehavior::new());
     let thawed = Arc::new(AtomicBool::new(false));
     let thawed_hook = thawed.clone();
@@ -3120,10 +3120,10 @@ async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyh
         runtime_cache_root: Some(temp.path().join("runtime")),
     })?;
     let repository = backend.repository();
-    let volumes = Arc::new(
-        VolumeManager::open_with_repository(temp.path().join("volumes"), repository.clone())
-            .await?,
-    );
+    let volumes = Arc::new(VolumeManager::open_with_repository(
+        temp.path().join("volumes"),
+        repository.clone(),
+    )?);
     let behavior = Arc::new(MockBehavior::new());
     let orchestrator = TestOrchestrator::new_inner_with_volumes(
         InMemoryMetadataStore::new(),

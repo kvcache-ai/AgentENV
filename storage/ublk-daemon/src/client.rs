@@ -325,7 +325,10 @@ impl UblkDaemonClient {
                 tracing::error!(%reason, "ublk daemon exited unexpectedly");
             }
 
-            *inner.death_reason.lock().unwrap() = Some(reason);
+            *inner
+                .death_reason
+                .lock()
+                .expect("death_reason lock poisoned") = Some(reason);
             inner.daemon_dead.store(true, Ordering::Release);
             inner.daemon_exited.send_replace(true);
         });
@@ -693,7 +696,11 @@ impl UblkDaemonClient {
     async fn call(&self, request: DaemonRequest, timeout: Duration) -> Result<DaemonResponse> {
         // Fail fast if daemon is dead.
         if self.inner.daemon_dead.load(Ordering::Acquire) {
-            let reason = self.inner.death_reason.lock().unwrap();
+            let reason = self
+                .inner
+                .death_reason
+                .lock()
+                .expect("death_reason lock poisoned");
             bail!(
                 "ublk daemon is not running: {}",
                 reason.as_deref().unwrap_or("unknown reason")

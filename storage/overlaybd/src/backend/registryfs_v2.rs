@@ -30,7 +30,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RETRY_COUNT: u32 = 3;
 const DEFAULT_UPLOAD_CHUNK_SIZE: usize = 128 * 1024 * 1024;
 const RETRY_BACKOFF: Duration = Duration::from_millis(1);
-const HTTP_CLIENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const HTTP_CLIENT_REFRESH_INTERVAL: Duration = Duration::from_mins(5);
 
 #[derive(Debug, Clone)]
 pub struct RegistryFsV2Options {
@@ -1178,7 +1178,7 @@ impl UploadSession {
         Ok(session)
     }
 
-    async fn refresh_backend_if_needed(&mut self) -> Result<()> {
+    fn refresh_backend_if_needed(&mut self) -> Result<()> {
         let elapsed = Instant::now().saturating_duration_since(self.last_client_refresh);
         if elapsed < HTTP_CLIENT_REFRESH_INTERVAL {
             return Ok(());
@@ -1300,7 +1300,7 @@ impl UploadSession {
     }
 
     async fn init_upload(&mut self) -> Result<()> {
-        self.upload_url = self.origin_upload_url.clone();
+        self.upload_url.clone_from(&self.origin_upload_url);
         self.token = self.backend.refresh_token(&self.upload_url).await?;
 
         let mut req = self
@@ -1350,7 +1350,7 @@ impl UploadSession {
         count: usize,
         digest: Option<&str>,
     ) -> Result<u64> {
-        self.refresh_backend_if_needed().await?;
+        self.refresh_backend_if_needed()?;
 
         let method = if digest.is_some() { "PUT" } else { "PATCH" };
         let base_url = self.upload_url.clone();
@@ -1941,7 +1941,7 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct ReadTestState {
-        blob: Arc<Vec<u8>>,
+        blob: Arc<[u8]>,
         data_hits: Arc<AtomicUsize>,
         token_hits: Arc<AtomicUsize>,
     }
@@ -2001,7 +2001,7 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct PingCacheState {
-        blob: Arc<Vec<u8>>,
+        blob: Arc<[u8]>,
         data_hits: Arc<AtomicUsize>,
         ping_hits: Arc<AtomicUsize>,
         token_hits: Arc<AtomicUsize>,
@@ -2110,7 +2110,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_read_with_redirect() {
         let read_state = ReadTestState {
-            blob: Arc::new(b"hello-registryfs-v2".to_vec()),
+            blob: Arc::from(b"hello-registryfs-v2".to_vec()),
             data_hits: Arc::new(AtomicUsize::new(0)),
             token_hits: Arc::new(AtomicUsize::new(0)),
         };
@@ -2151,7 +2151,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_token_fetch_is_coalesced_per_scope() {
         let read_state = ReadTestState {
-            blob: Arc::new(b"hello-registryfs-v2".to_vec()),
+            blob: Arc::from(b"hello-registryfs-v2".to_vec()),
             data_hits: Arc::new(AtomicUsize::new(0)),
             token_hits: Arc::new(AtomicUsize::new(0)),
         };
@@ -2196,7 +2196,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_challenge_ping_is_cached_per_origin() {
         let state = PingCacheState {
-            blob: Arc::new(b"hello-registryfs-v2".to_vec()),
+            blob: Arc::from(b"hello-registryfs-v2".to_vec()),
             data_hits: Arc::new(AtomicUsize::new(0)),
             ping_hits: Arc::new(AtomicUsize::new(0)),
             token_hits: Arc::new(AtomicUsize::new(0)),
@@ -2235,7 +2235,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_bad_ping_falls_back_to_per_url_probe() {
         let state = PingCacheState {
-            blob: Arc::new(b"hello-registryfs-v2".to_vec()),
+            blob: Arc::from(b"hello-registryfs-v2".to_vec()),
             data_hits: Arc::new(AtomicUsize::new(0)),
             ping_hits: Arc::new(AtomicUsize::new(0)),
             token_hits: Arc::new(AtomicUsize::new(0)),
@@ -2277,7 +2277,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_open_with_size_hint_skips_length_probe() {
         let read_state = ReadTestState {
-            blob: Arc::new(b"hello-registryfs-v2".to_vec()),
+            blob: Arc::from(b"hello-registryfs-v2".to_vec()),
             data_hits: Arc::new(AtomicUsize::new(0)),
             token_hits: Arc::new(AtomicUsize::new(0)),
         };
@@ -2348,7 +2348,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_read_with_accelerate_error_no_fallback() {
         let read_state = ReadTestState {
-            blob: Arc::new(b"hello-registryfs-v2".to_vec()),
+            blob: Arc::from(b"hello-registryfs-v2".to_vec()),
             data_hits: Arc::new(AtomicUsize::new(0)),
             token_hits: Arc::new(AtomicUsize::new(0)),
         };
@@ -2416,7 +2416,7 @@ mod tests {
 
     #[derive(Clone, Debug)]
     struct RefreshState {
-        blob: Arc<Vec<u8>>,
+        blob: Arc<[u8]>,
         token_hits: Arc<AtomicUsize>,
     }
 
@@ -2480,7 +2480,7 @@ mod tests {
     #[tokio::test]
     async fn test_registry_refresh_token_after_401() {
         let state = RefreshState {
-            blob: Arc::new(b"token-refresh-success".to_vec()),
+            blob: Arc::from(b"token-refresh-success".to_vec()),
             token_hits: Arc::new(AtomicUsize::new(0)),
         };
         let app = Router::new()

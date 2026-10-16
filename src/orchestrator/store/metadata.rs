@@ -106,19 +106,19 @@ impl Default for SandboxMetadata {
 
 impl SandboxMetadata {
     pub fn set_timeout(&mut self, timeout: Option<Duration>) {
-        self._set_timeout(timeout, SystemTime::now());
+        self.set_timeout_from(timeout, SystemTime::now());
     }
 
-    fn _set_timeout(&mut self, timeout: Option<Duration>, from: SystemTime) {
+    fn set_timeout_from(&mut self, timeout: Option<Duration>, from: SystemTime) {
         self.timeout = timeout;
         self.expires_at = timeout.and_then(|ttl| from.checked_add(ttl));
     }
 
     pub fn update_timeout(&mut self, new_timeout: NewTimeout) {
-        self._update_timeout(new_timeout, SystemTime::now());
+        self.update_timeout_from(new_timeout, SystemTime::now());
     }
 
-    fn _update_timeout(&mut self, new_timeout: NewTimeout, from: SystemTime) {
+    fn update_timeout_from(&mut self, new_timeout: NewTimeout, from: SystemTime) {
         let timeout = match new_timeout {
             NewTimeout::UseExisting => self.timeout,
             NewTimeout::Set(timeout) => Some(timeout),
@@ -128,7 +128,7 @@ impl SandboxMetadata {
             },
             NewTimeout::None => None,
         };
-        self._set_timeout(timeout, from);
+        self.set_timeout_from(timeout, from);
     }
 
     pub fn is_expired(&self, now: SystemTime) -> bool {
@@ -148,7 +148,7 @@ mod tests {
             created_at: base,
             ..Default::default()
         };
-        metadata._set_timeout(Some(Duration::from_secs(10)), base);
+        metadata.set_timeout_from(Some(Duration::from_secs(10)), base);
 
         assert_eq!(metadata.expires_at, Some(base + Duration::from_secs(10)));
         assert!(!metadata.is_expired(base + Duration::from_secs(9)));
@@ -163,11 +163,11 @@ mod tests {
     fn update_timeout_ensure_minimum_respects_longer_existing_timeout() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
         let mut metadata = SandboxMetadata::default();
-        metadata.set_timeout(Some(Duration::from_secs(900)));
+        metadata.set_timeout(Some(Duration::from_mins(15)));
 
-        metadata._update_timeout(NewTimeout::EnsureMinimum(Duration::from_secs(300)), base);
-        assert_eq!(metadata.timeout, Some(Duration::from_secs(900)));
-        assert_eq!(metadata.expires_at, Some(base + Duration::from_secs(900)));
+        metadata.update_timeout_from(NewTimeout::EnsureMinimum(Duration::from_secs(300)), base);
+        assert_eq!(metadata.timeout, Some(Duration::from_mins(15)));
+        assert_eq!(metadata.expires_at, Some(base + Duration::from_mins(15)));
     }
 
     #[test]
@@ -176,15 +176,15 @@ mod tests {
         let mut metadata = SandboxMetadata::default();
         metadata.set_timeout(Some(Duration::from_secs(120)));
 
-        metadata._update_timeout(NewTimeout::EnsureMinimum(Duration::from_secs(300)), base);
+        metadata.update_timeout_from(NewTimeout::EnsureMinimum(Duration::from_secs(300)), base);
         assert_eq!(metadata.timeout, Some(Duration::from_secs(300)));
         assert_eq!(metadata.expires_at, Some(base + Duration::from_secs(300)));
 
-        metadata._update_timeout(NewTimeout::UseExisting, base);
+        metadata.update_timeout_from(NewTimeout::UseExisting, base);
         assert_eq!(metadata.timeout, Some(Duration::from_secs(300)));
         assert_eq!(metadata.expires_at, Some(base + Duration::from_secs(300)));
 
-        metadata._update_timeout(NewTimeout::Set(Duration::from_secs(45)), base);
+        metadata.update_timeout_from(NewTimeout::Set(Duration::from_secs(45)), base);
         assert_eq!(metadata.timeout, Some(Duration::from_secs(45)));
         assert_eq!(metadata.expires_at, Some(base + Duration::from_secs(45)));
 

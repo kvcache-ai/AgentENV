@@ -270,7 +270,7 @@ impl LazySourceFile {
         }
     }
 
-    fn source_open_flags(&self) -> u32 {
+    fn source_open_flags() -> u32 {
         // NOTE: source file is read only
         libc::O_RDONLY as u32
     }
@@ -282,7 +282,7 @@ impl LazySourceFile {
         }
         let file = self
             .source_fs
-            .open(&self.pathname, self.source_open_flags(), self.mode)
+            .open(&self.pathname, Self::source_open_flags(), self.mode)
             .await?;
         *guard = Some(file.clone());
         Ok(file)

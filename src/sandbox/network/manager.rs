@@ -480,7 +480,7 @@ impl NetworkManager {
             .chain(network_range_patterns.iter().cloned())
             .collect::<Vec<_>>();
 
-        self.check_conflicts(
+        Self::check_conflicts(
             "host interface addresses",
             "ip",
             &["-o", "addr", "show"],
@@ -488,7 +488,7 @@ impl NetworkManager {
             &network_range_patterns,
             "detected host interface addresses overlapping AgentENV network ranges; another program may already be using the same address space",
         );
-        self.check_conflicts(
+        Self::check_conflicts(
             "host routes",
             "ip",
             &["-o", "route", "show"],
@@ -496,7 +496,7 @@ impl NetworkManager {
             &network_range_patterns,
             "detected host routes overlapping AgentENV network ranges; another program may already be using the same address space",
         );
-        self.check_conflicts(
+        Self::check_conflicts(
             "iptables-save",
             "iptables-save",
             &[],
@@ -504,7 +504,7 @@ impl NetworkManager {
             &firewall_conflict_patterns,
             "detected iptables rules referencing AgentENV interfaces or network ranges; sandbox traffic may be redirected, filtered, or rewritten by another program",
         );
-        self.check_conflicts(
+        Self::check_conflicts(
             "nft ruleset",
             "nft",
             &["list", "ruleset"],
@@ -515,7 +515,6 @@ impl NetworkManager {
     }
 
     fn check_conflicts(
-        &self,
         source: &str,
         command: &str,
         args: &[&str],
@@ -1191,11 +1190,9 @@ mod tests {
         for idx in 1u32..=50 {
             manager.allocated.insert(idx as usize);
         }
-        let slot_values: Vec<Slot> = (1u32..=50).map(test_slot).collect();
-
         // Release all 50 slots concurrently — at most 10 should end up in the pool.
-        let handles: Vec<_> = slot_values
-            .into_iter()
+        let handles: Vec<_> = (1u32..=50)
+            .map(test_slot)
             .map(|slot| {
                 let m = manager.clone();
                 std::thread::spawn(move || {

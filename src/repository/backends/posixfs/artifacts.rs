@@ -24,17 +24,17 @@ impl PosixFsArtifactStore {
     pub(crate) fn put_blob(&self, key: &BlobKey, body: BlobBody<'_>) -> RepositoryResult<()> {
         match (key, body) {
             (BlobKey::Layer { digest, .. }, BlobBody::File(source)) => {
-                self.put_layer(digest, self.blob_path(key), source)
+                Self::put_layer(digest, self.blob_path(key), source)
             }
             (BlobKey::Layer { digest, .. }, BlobBody::Bytes(bytes)) => {
                 let mut staged = self.staging_file()?;
                 std::io::Write::write_all(&mut staged, &bytes).map_err(|error| {
                     RepositoryError::backend(format!("write '{}'", staged.path().display()), error)
                 })?;
-                self.put_layer(digest, self.blob_path(key), staged.path())
+                Self::put_layer(digest, self.blob_path(key), staged.path())
             }
             (BlobKey::Snapshot(..), BlobBody::File(source)) => {
-                self.copy_local_artifact(self.blob_path(key), source)
+                Self::copy_local_artifact(self.blob_path(key), source)
             }
             (BlobKey::Snapshot(id, file), BlobBody::Bytes(bytes)) => {
                 self.put_snapshot_bytes(id, file.name(), &bytes)
@@ -121,7 +121,7 @@ impl PosixFsArtifactStore {
         sync_dir(&snapshot_dir)
     }
 
-    fn copy_local_artifact(&self, destination: PathBuf, source: &Path) -> RepositoryResult<()> {
+    fn copy_local_artifact(destination: PathBuf, source: &Path) -> RepositoryResult<()> {
         let source_metadata = fs::metadata(source).map_err(|error| {
             RepositoryError::backend(
                 format!("read source artifact metadata '{}'", source.display()),
@@ -168,7 +168,7 @@ impl PosixFsArtifactStore {
 
     /// Stores a content-addressed layer unless one is already there,
     /// hard-linking it when possible.
-    fn put_layer(&self, digest: &str, destination: PathBuf, source: &Path) -> RepositoryResult<()> {
+    fn put_layer(digest: &str, destination: PathBuf, source: &Path) -> RepositoryResult<()> {
         if destination.exists() {
             let size = fs::metadata(source)
                 .map_err(|error| {

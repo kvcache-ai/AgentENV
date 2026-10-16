@@ -54,6 +54,7 @@ struct ServerCli {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
     agentenv::logging::init();
     agentenv_observability::init_prometheus_recorder()?;
@@ -114,17 +115,14 @@ async fn main() -> anyhow::Result<()> {
         &cluster_cpu_arc,
     )));
     let image_resolver = Arc::new(ImageResolver::new(config));
-    let volume_manager = Arc::new(
-        VolumeManager::open_with_repository_and_limits(
-            config.home_path.join("volumes/catalog"),
-            snapshot_manager.repository(),
-            VolumeLimits {
-                max_size_mb: config.volume.max_size_mb,
-                max_mounts: config.volume.max_volume_count,
-            },
-        )
-        .await?,
-    );
+    let volume_manager = Arc::new(VolumeManager::open_with_repository_and_limits(
+        config.home_path.join("volumes/catalog"),
+        snapshot_manager.repository(),
+        VolumeLimits {
+            max_size_mb: config.volume.max_size_mb,
+            max_mounts: config.volume.max_volume_count,
+        },
+    )?);
     let factory = FirecrackerSandboxFactory::with_cpu_config(Arc::clone(&cluster_cpu_arc));
     let orchestrator = Orchestrator::with_file_backed_store_factory_and_volumes(
         factory,

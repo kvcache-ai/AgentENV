@@ -433,6 +433,7 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;

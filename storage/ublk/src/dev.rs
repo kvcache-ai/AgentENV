@@ -121,22 +121,18 @@ impl UVMUblkQueue {
         let mut buf = if self.is_zero_copy() {
             IOBuffer::AutoReg(
                 AutoRegBuffer::new(self.ring.clone(), bufsize as _)
-                    .await
                     .context("allocate io auto_ref buffer")?,
             )
         } else {
             IOBuffer::User(
                 UserBuffer::new(self.ring.clone(), bufsize as _, 512)
-                    .await
                     .context("allocate io user buffer")?,
             )
         };
 
         let mut extra = match tgt.per_slot_extra_buf_len() {
             Some(size) if size.is_multiple_of(512) => Some(IOBuffer::User(
-                UserBuffer::new(self.ring.clone(), size, 512)
-                    .await
-                    .context("allocate extra buffer")?,
+                UserBuffer::new(self.ring.clone(), size, 512).context("allocate extra buffer")?,
             )),
             Some(size) => {
                 bail!("extra buffer length ({size}) not aligned");
@@ -290,7 +286,11 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
             match spawn_result {
                 Ok(()) => result_rxs.push(rx),
                 Err(err) => {
-                    inner.queue_threads.lock().unwrap().extend(result_rxs);
+                    inner
+                        .queue_threads
+                        .lock()
+                        .expect("queue_threads lock poisoned")
+                        .extend(result_rxs);
                     tracing::error!(
                         dev_id = dev_info.dev_id,
                         qid,
@@ -313,7 +313,11 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
                 }
             }
         }
-        inner.queue_threads.lock().unwrap().extend(result_rxs);
+        inner
+            .queue_threads
+            .lock()
+            .expect("queue_threads lock poisoned")
+            .extend(result_rxs);
         Ok(())
     }
 
@@ -390,7 +394,11 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
 
     pub async fn wait_for_bg_tasks(&mut self) {
         let tasks = {
-            let mut tasks = self.inner.queue_threads.lock().unwrap();
+            let mut tasks = self
+                .inner
+                .queue_threads
+                .lock()
+                .expect("queue_threads lock poisoned");
             std::mem::take(&mut *tasks)
         };
         for task in tasks {

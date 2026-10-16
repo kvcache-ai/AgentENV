@@ -173,14 +173,14 @@ impl Default for VolumeLimits {
 }
 
 impl VolumeManager {
-    pub async fn open_with_repository(
+    pub fn open_with_repository(
         path: impl Into<std::path::PathBuf>,
         repository: Arc<dyn Repository>,
     ) -> anyhow::Result<Self> {
-        Self::open_with_repository_and_limits(path, repository, VolumeLimits::default()).await
+        Self::open_with_repository_and_limits(path, repository, VolumeLimits::default())
     }
 
-    pub async fn open_with_repository_and_limits(
+    pub fn open_with_repository_and_limits(
         path: impl Into<std::path::PathBuf>,
         repository: Arc<dyn Repository>,
         mut limits: VolumeLimits,
@@ -948,7 +948,7 @@ mod tests {
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::{ManagedLayer, OverlaybdLayerRef};
 
-    async fn manager_at(root: &Path) -> VolumeManager {
+    fn manager_at(root: &Path) -> VolumeManager {
         let backend = PosixFsBackend::new(PosixFsBackendConfig {
             root: root.join("repository"),
             cache_root: Some(root.join("cache")),
@@ -956,7 +956,6 @@ mod tests {
         })
         .expect("POSIX snapshot backend");
         VolumeManager::open_with_repository(root.join("volumes/catalog"), backend.repository())
-            .await
             .expect("volume manager")
     }
 
@@ -1007,7 +1006,7 @@ mod tests {
     #[tokio::test]
     async fn published_volume_clones_survive_parent_deletion_without_local_files() {
         let temp = tempfile::tempdir().unwrap();
-        let manager = manager_at(temp.path()).await;
+        let manager = manager_at(temp.path());
         let parent = published_volume(temp.path(), &manager).await;
         // A stale local config must not override the committed backing, even
         // when the manager still has the config path in its in-memory cache.
@@ -1016,7 +1015,7 @@ mod tests {
             b"stale config",
         )
         .unwrap();
-        let cold_manager = manager_at(temp.path()).await;
+        let cold_manager = manager_at(temp.path());
         let mut children = Vec::new();
         for (index, (manager, mode)) in [
             (&manager, VolumeMode::ReadOnly),
@@ -1042,7 +1041,7 @@ mod tests {
             children.push(child);
         }
         manager.delete(&parent.id).await.unwrap();
-        let restarted = manager_at(temp.path()).await;
+        let restarted = manager_at(temp.path());
         for child in children {
             let child = restarted.materialize_backing(&child.id).await.unwrap();
             let config =
@@ -1071,7 +1070,7 @@ mod tests {
     #[tokio::test]
     async fn volume_generations_preserve_inherited_descriptors_and_new_writes() {
         let temp = tempfile::tempdir().unwrap();
-        let manager = manager_at(temp.path()).await;
+        let manager = manager_at(temp.path());
         let parent = published_volume(temp.path(), &manager).await;
         let seed = manager
             .create(
@@ -1144,7 +1143,7 @@ mod tests {
     #[tokio::test]
     async fn reserved_volume_clone_retains_unpublished_local_layers() {
         let temp = tempfile::tempdir().unwrap();
-        let manager = manager_at(temp.path()).await;
+        let manager = manager_at(temp.path());
         let parent = published_volume(temp.path(), &manager).await;
         manager.reserve(&parent.id, "source").await.unwrap();
         append_local_layer(&parent);
@@ -1184,7 +1183,7 @@ mod tests {
     #[tokio::test]
     async fn published_volume_clone_validates_source_state_and_size() {
         let temp = tempfile::tempdir().unwrap();
-        let manager = manager_at(temp.path()).await;
+        let manager = manager_at(temp.path());
         let mut parent = published_volume(temp.path(), &manager).await;
         assert_eq!(
             manager
@@ -1240,7 +1239,7 @@ mod tests {
     #[tokio::test]
     async fn create_from_snapshot_preserves_read_only_mode() {
         let temp = tempfile::tempdir().expect("temporary volume repository");
-        let manager = manager_at(temp.path()).await;
+        let manager = manager_at(temp.path());
 
         let restored = manager
             .create_from_snapshot(

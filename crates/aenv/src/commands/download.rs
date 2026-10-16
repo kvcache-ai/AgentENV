@@ -566,7 +566,7 @@ mod tests {
 
         let temp = TempDir::new().unwrap();
         let target = temp.path().join("target");
-        std::fs::create_dir(&target).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
         let root = temp.path().join("project");
         symlink(&target, &root).unwrap();
 

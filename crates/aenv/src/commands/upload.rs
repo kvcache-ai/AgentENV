@@ -318,8 +318,8 @@ mod tests {
     #[test]
     fn directory_walk_includes_files_and_empty_directories() {
         let temp = TempDir::new().unwrap();
-        fs::create_dir(temp.path().join("empty")).unwrap();
-        fs::create_dir(temp.path().join("nested")).unwrap();
+        fs::create_dir_all(temp.path().join("empty")).unwrap();
+        fs::create_dir_all(temp.path().join("nested")).unwrap();
         fs::write(temp.path().join("nested/file.txt"), "content").unwrap();
         fs::write(temp.path().join(".hidden"), "hidden").unwrap();
 

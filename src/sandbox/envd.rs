@@ -129,7 +129,7 @@ impl EnvdInstance {
                 return Err(anyhow!("timed out waiting for envd"));
             }
 
-            let remaining = timeout - elapsed;
+            let remaining = timeout.saturating_sub(elapsed);
             let probe_timeout = std::cmp::min(HEALTH_PROBE_TIMEOUT, remaining);
             match tokio::time::timeout(probe_timeout, default_api::health_get(&self.config)).await {
                 Ok(Ok(_)) => {
@@ -349,7 +349,9 @@ fn is_log_filename(name: &str) -> bool {
     name == "current"
         || (name.len() == 27
             && name.starts_with('@')
-            && name.ends_with(".s")
+            && std::path::Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("s"))
             && name.as_bytes()[1..25].iter().all(u8::is_ascii_hexdigit))
 }
 

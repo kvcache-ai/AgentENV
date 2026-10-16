@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // Test and benchmark code may unwrap.
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 

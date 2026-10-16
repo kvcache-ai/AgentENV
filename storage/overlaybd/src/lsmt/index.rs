@@ -34,13 +34,11 @@ impl Segment {
         let delta = x - self.offset;
         if delta >= self.length as u64 {
             self.length = 0;
-            self.offset = x;
-            delta
         } else {
             self.length -= delta as u32;
-            self.offset = x;
-            delta
         }
+        self.offset = x;
+        delta
     }
 
     pub fn backward_end_to(&mut self, x: u64) {
@@ -565,7 +563,7 @@ impl MutableIndex {
     }
 
     pub fn dump(&self) -> Vec<SegmentMapping> {
-        self.mappings.iter().cloned().collect()
+        self.mappings.iter().copied().collect()
     }
 }
 
@@ -622,7 +620,7 @@ impl ComboIndex {
     ) -> Self {
         if ro_layers_count > 0 {
             // FIXME: why do not alter upper directly?
-            let old_mappings: Vec<_> = upper.mappings.iter().cloned().collect();
+            let old_mappings: Vec<_> = upper.mappings.iter().copied().collect();
             upper.mappings.clear();
             for mut m in old_mappings {
                 m.tag += ro_layers_count;
@@ -652,12 +650,10 @@ impl LogIndex for ComboIndex {
         let mut upper_results = Vec::new();
         self.upper.lookup(query, &mut upper_results);
 
-        if self.lower.is_none() {
+        let Some(lower) = self.lower.as_ref() else {
             dst.extend(upper_results);
             return dst.len() - start_len;
-        }
-
-        let lower = self.lower.as_ref().unwrap();
+        };
 
         let mut current_pos = query.offset;
         let end_pos = query.end();

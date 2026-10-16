@@ -7,3 +7,6 @@ edition = "2021"
 tracing = "0.1"
 
 [dev-dependencies]
+
+[lints]
+workspace = true

@@ -1316,6 +1316,7 @@ async fn test_closed_entry_is_removed_by_evict_size() {
 
 // Ported from C++ RoCachedFs.Basic (commonTest(false, false, false)).
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_ro_cached_fs_basic() {
     let tmp = tempdir().expect("create tempdir");
     let src_path = tmp.path().join("file_1");
@@ -2006,10 +2007,9 @@ async fn test_cache_pool_controls_stat_list_and_evict_size() {
 
     let unsupported = backend
         .set_quota("/pool", 1024 * 1024)
-        .await
         .expect_err("set_quota unsupported");
     assert_err_contains(&unsupported, "set_quota is not supported");
-    let unsupported = backend.resize(1, 0).await.expect_err("resize unsupported");
+    let unsupported = backend.resize(1, 0).expect_err("resize unsupported");
     assert_err_contains(&unsupported, "resize is not supported");
 }
 
@@ -2662,7 +2662,7 @@ async fn test_eviction_clears_bitmap_before_destroying_data() {
         .expect("entry");
     let meta_path = entry.paths.meta_path.clone();
     let _ = std::fs::remove_file(&meta_path);
-    std::fs::create_dir(&meta_path).expect("replace meta.bin with a directory");
+    std::fs::create_dir_all(&meta_path).expect("replace meta.bin with a directory");
     entry
         .evict_all_blocks()
         .await

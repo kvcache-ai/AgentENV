@@ -85,7 +85,7 @@ mod tests {
         img
     }
 
-    async fn open_image(dir: &tempfile::TempDir, bytes: &[u8]) -> Arc<dyn VirtualFile> {
+    fn open_image(dir: &tempfile::TempDir, bytes: &[u8]) -> Arc<dyn VirtualFile> {
         let path = dir.path().join("dev.img");
         std::fs::write(&path, bytes).unwrap();
         Arc::new(LocalFile::open_ro(&path).unwrap())
@@ -95,7 +95,7 @@ mod tests {
     async fn reads_used_bytes_from_superblock() {
         let dir = tempfile::tempdir().unwrap();
         // 4 KiB blocks, 1000 blocks total, 250 free → used = 750 * 4096.
-        let file = open_image(&dir, &fake_image(2, 1000, 250, false)).await;
+        let file = open_image(&dir, &fake_image(2, 1000, 250, false));
         assert_eq!(ext4_used_bytes(&file).await.unwrap(), 750 * 4096);
     }
 
@@ -104,7 +104,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blocks = 5u64 << 30;
         let free = 1u64 << 30;
-        let file = open_image(&dir, &fake_image(2, blocks, free, true)).await;
+        let file = open_image(&dir, &fake_image(2, blocks, free, true));
         assert_eq!(
             ext4_used_bytes(&file).await.unwrap(),
             (blocks - free) * 4096
@@ -114,7 +114,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_non_ext4_view() {
         let dir = tempfile::tempdir().unwrap();
-        let file = open_image(&dir, &vec![0u8; 2048]).await;
+        let file = open_image(&dir, &vec![0u8; 2048]);
         assert!(ext4_used_bytes(&file).await.is_err());
     }
 }

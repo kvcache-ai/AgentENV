@@ -126,8 +126,8 @@ fn build_disk_rate_limiter(
 /// `size == 0` and `refill_time == 0`; a mixed bucket (e.g. `size == 0`,
 /// `refill_time == 1`) is not the sentinel and can be rejected as an invalid
 /// token bucket, failing the resume PATCH. Send both fields as zero.
-fn disabled_bucket() -> Box<firecracker_client::models::TokenBucket> {
-    Box::new(firecracker_client::models::TokenBucket::new(0, 0))
+fn disabled_bucket() -> firecracker_client::models::TokenBucket {
+    firecracker_client::models::TokenBucket::new(0, 0)
 }
 
 /// Build the limiter to PATCH on resume, reconciling a snapshot-inherited
@@ -145,8 +145,8 @@ fn reconcile_disk_rate_limiter(
         (None, None)
     };
     let mut rl = firecracker_client::models::RateLimiter::new();
-    rl.bandwidth = Some(bandwidth.unwrap_or_else(disabled_bucket));
-    rl.ops = Some(ops.unwrap_or_else(disabled_bucket));
+    rl.bandwidth = Some(bandwidth.unwrap_or_else(|| Box::new(disabled_bucket())));
+    rl.ops = Some(ops.unwrap_or_else(|| Box::new(disabled_bucket())));
     Ok(Box::new(rl))
 }
 
@@ -437,44 +437,39 @@ impl SandboxBackend for FirecrackerSandbox {
             .await
             .map_err(SandboxCaptureError::terminal)?;
 
-        let children = spec
-            .iter()
-            .map(|child| {
-                let physical_count = snapshot_config.common.physical_extra_drive_count;
-                if child.replace_drive_ids.iter().any(|(drive_id, _)| {
-                    snapshot_config
-                        .common
-                        .extra_drives
-                        .iter()
-                        .take(physical_count)
-                        .any(|drive| drive.drive_id() == drive_id)
-                }) {
-                    return Err(anyhow::anyhow!(
-                        "fork replacement drives must refer to launch-time volume drives"
-                    ));
-                }
-                let child_snapshot_config = snapshot_config_for_fork(&snapshot_config, child)?;
-                Self::from_snapshot_config_with_override(
-                    child_snapshot_config,
-                    child.sandbox_id,
-                    child.envd_access_token.clone(),
-                )
-                .map(|child| Box::new(child) as Box<dyn SandboxBackend>)
-                .context("build forked sandbox")
-            })
-            .collect::<Vec<_>>();
+        let children = spec.iter().map(|child| {
+            let physical_count = snapshot_config.common.physical_extra_drive_count;
+            if child.replace_drive_ids.iter().any(|(drive_id, _)| {
+                snapshot_config
+                    .common
+                    .extra_drives
+                    .iter()
+                    .take(physical_count)
+                    .any(|drive| drive.drive_id() == drive_id)
+            }) {
+                return Err(anyhow::anyhow!(
+                    "fork replacement drives must refer to launch-time volume drives"
+                ));
+            }
+            let child_snapshot_config = snapshot_config_for_fork(&snapshot_config, child)?;
+            Self::from_snapshot_config_with_override(
+                child_snapshot_config,
+                child.sandbox_id,
+                child.envd_access_token.clone(),
+            )
+            .map(|child| Box::new(child) as Box<dyn SandboxBackend>)
+            .context("build forked sandbox")
+        });
 
-        let start_results = futures::future::join_all(children.into_iter().map(|child| {
-            async move {
-                let mut child = child?;
-                match child.start().await {
-                    Ok(()) => Ok(child),
-                    Err(err) => {
-                        if let Err(stop_err) = child.stop().await {
-                            warn!(error = ?stop_err, "failed to stop fork child after start failure");
-                        }
-                        Err(err.context("start forked sandbox"))
+        let start_results = futures::future::join_all(children.map(|child| async move {
+            let mut child = child?;
+            match child.start().await {
+                Ok(()) => Ok(child),
+                Err(err) => {
+                    if let Err(stop_err) = child.stop().await {
+                        warn!(error = ?stop_err, "failed to stop fork child after start failure");
                     }
+                    Err(err.context("start forked sandbox"))
                 }
             }
         }))
@@ -520,7 +515,13 @@ impl SandboxBackend for FirecrackerSandbox {
                         output.stderr.trim()
                     );
                 }
-                self.frozen_volume_mounts.last_mut().unwrap().1 = output.stdout.trim().to_owned();
+                output.stdout.trim().clone_into(
+                    &mut self
+                        .frozen_volume_mounts
+                        .last_mut()
+                        .expect("mount is recorded above")
+                        .1,
+                );
             }
             self.snapshot_persistent_volume_drives().await?;
             Ok::<(), anyhow::Error>(())
@@ -622,7 +623,7 @@ impl FirecrackerSandbox {
     }
 
     async fn recover_capture_failure<T>(
-        &mut self,
+        &self,
         operation: &'static str,
         error: anyhow::Error,
     ) -> SandboxCaptureResult<T> {
@@ -801,8 +802,14 @@ impl FirecrackerSandbox {
                 .with_access_token(launch_config.envd_access_token.as_ref())
                 .with_extra(launch_config.extra_mmds.clone()),
         );
-        snapshot_config.common.envd_access_token = launch_config.envd_access_token.clone();
-        snapshot_config.common.network_policy = launch_config.network.clone();
+        snapshot_config
+            .common
+            .envd_access_token
+            .clone_from(&launch_config.envd_access_token);
+        snapshot_config
+            .common
+            .network_policy
+            .clone_from(&launch_config.network);
 
         // Launch-provided custom config overrides the value persisted in the
         // source snapshot; otherwise inherit the snapshot's.
@@ -1085,9 +1092,15 @@ impl FirecrackerSandbox {
             .cloned()
             .collect::<Vec<_>>();
         let mut snapshot_common = self.launch.common().clone();
-        snapshot_common.network_policy = self.current_network_policy.clone();
-        snapshot_common.custom_extension_params = self.current_custom_extension_params.clone();
-        snapshot_common.extra_drives = snapshot_extra_drives.clone();
+        snapshot_common
+            .network_policy
+            .clone_from(&self.current_network_policy);
+        snapshot_common
+            .custom_extension_params
+            .clone_from(&self.current_custom_extension_params);
+        snapshot_common
+            .extra_drives
+            .clone_from(&snapshot_extra_drives);
         let mut rootfs_read_only = false;
 
         // Rewrite the overlaybd backend's image config path to point at the snapshot's rootfs.
@@ -1095,7 +1108,7 @@ impl FirecrackerSandbox {
         if let Some(ublk_config) = snapshot_common.ublk_config.as_mut() {
             let UblkBackend::Overlaybd(source) = &mut ublk_config.backend;
             rootfs_read_only = source.read_only;
-            source.image_config_path = base_rootfs_path.clone();
+            source.image_config_path.clone_from(&base_rootfs_path);
         }
         let runtime_upper_mode = snapshot_common
             .ublk_config
@@ -3190,7 +3203,7 @@ mod tests {
     }
 
     #[test]
-    fn from_snapshot_merges_launch_env_over_snapshot_env() -> Result<()> {
+    fn from_snapshot_merges_launch_env_over_snapshot_env() {
         let mut snapshot_env_vars = HashMap::new();
         snapshot_env_vars.insert("FROM_SNAPSHOT".to_string(), "true".to_string());
         snapshot_env_vars.insert("SHARED_KEY".to_string(), "snapshot".to_string());
@@ -3228,7 +3241,6 @@ mod tests {
         assert_eq!(env_vars.get("FROM_SNAPSHOT"), Some(&"true".to_string()));
         assert_eq!(env_vars.get("FROM_LAUNCH"), Some(&"true".to_string()));
         assert_eq!(env_vars.get("SHARED_KEY"), Some(&"launch".to_string()));
-        Ok(())
     }
 
     /// Build custom extension params from a JSON object literal.

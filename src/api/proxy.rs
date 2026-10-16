@@ -744,7 +744,7 @@ async fn resolve_proxy_request(
                     SandboxState::Paused,
                 ))
             }
-            Ok(ProxyLookupResult::Unavailable(_)) | Ok(ProxyLookupResult::RouteMissing)
+            Ok(ProxyLookupResult::Unavailable(_) | ProxyLookupResult::RouteMissing)
                 if auto_resume_attempted =>
             {
                 return Err(ProxyRequestError::AutoResumeFailed(sandbox_id))
@@ -1209,6 +1209,7 @@ mod tests {
     use super::*;
     use std::{
         convert::Infallible,
+        fmt::Write as _,
         net::{Ipv4Addr, SocketAddr},
         sync::Arc,
         time::Duration,
@@ -1687,8 +1688,10 @@ mod tests {
         let encoded = id
             .to_string()
             .bytes()
-            .map(|byte| format!("%{byte:02X}"))
-            .collect::<String>();
+            .fold(String::new(), |mut encoded, byte| {
+                write!(encoded, "%{byte:02X}").unwrap();
+                encoded
+            });
         for path_id in [id.to_string(), encoded] {
             for method in ["GET", "DELETE"] {
                 let response = app
@@ -1735,7 +1738,6 @@ mod tests {
                 root.path().join("volumes/catalog.json"),
                 snapshot_manager.repository(),
             )
-            .await
             .unwrap(),
         );
         Arc::new(ApiImpl::new(

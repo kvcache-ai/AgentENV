@@ -74,9 +74,8 @@ impl OverlaybdTarget {
     ) -> Result<Self> {
         let global_config_path = global_config_path.as_ref().to_path_buf();
         let image_config_path = image_config_path.as_ref().to_path_buf();
-        let image_service = ImageService::from_config_path(&global_config_path)
-            .await
-            .with_context(|| {
+        let image_service =
+            ImageService::from_config_path(&global_config_path).with_context(|| {
                 format!(
                     "open overlaybd image service failed: {}",
                     global_config_path.display()
@@ -173,7 +172,6 @@ impl OverlaybdTarget {
     }
 
     fn request_meta(
-        &self,
         state: &TargetState,
         io_desc: ublk_sys::ublksrv_io_desc,
     ) -> std::result::Result<(UblkDescOperation, u64, usize), i32> {
@@ -362,7 +360,7 @@ impl UVMUblkTarget for OverlaybdTarget {
         io_ring: &AsyncIoRing,
     ) -> i32 {
         let state = self.state.load_full();
-        let (op, offset, len) = match self.request_meta(&state, io_desc) {
+        let (op, offset, len) = match Self::request_meta(&state, io_desc) {
             Ok(meta) => meta,
             Err(err) => {
                 tracing::error!(qid, tag, ?io_desc, "invalid overlaybd ublk request");
@@ -537,9 +535,7 @@ mod tests {
         let image_config =
             write_sparse_image_config(&tmp, &upper_data).expect("write image config");
 
-        let service = ImageService::from_config_path(&global_config)
-            .await
-            .expect("open image service");
+        let service = ImageService::from_config_path(&global_config).expect("open image service");
         let image = Arc::new(
             service
                 .create_image_file(&image_config)
@@ -561,11 +557,8 @@ mod tests {
             .cqe_entries(16)
             .build()
             .expect("build async io ring");
-        let mut buf = IOBuffer::User(
-            UserBuffer::new(ring.clone(), 4096, 512)
-                .await
-                .expect("allocate io buffer"),
-        );
+        let mut buf =
+            IOBuffer::User(UserBuffer::new(ring.clone(), 4096, 512).expect("allocate io buffer"));
         let io_desc = ublksrv_io_desc {
             op_flags: ublk_sys::UBLK_IO_OP_DISCARD,
             nr_sectors: 8,

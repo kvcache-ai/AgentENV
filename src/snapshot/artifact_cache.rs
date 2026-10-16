@@ -211,11 +211,7 @@ impl LocalArtifactCache {
 
             if self.is_over_limit() {
                 let cache = Arc::clone(self);
-                tokio::spawn(async move {
-                    if let Err(error) = cache.evict_lru() {
-                        warn!(error = %error, "failed to evict snapshot artifact cache entries");
-                    }
-                });
+                tokio::spawn(async move { cache.evict_lru() });
             }
 
             return Ok(CacheHandle {
@@ -350,13 +346,13 @@ impl LocalArtifactCache {
         idx.total_size > self.max_size_bytes
     }
 
-    fn evict_lru(&self) -> Result<()> {
+    fn evict_lru(&self) {
         let target = (self.max_size_bytes as f64 * EVICTION_TARGET_RATIO) as u64;
 
         let (mut candidates, total_size) = {
             let idx = self.lock_index();
             if idx.total_size <= target {
-                return Ok(());
+                return;
             }
 
             let candidates = idx
@@ -368,7 +364,7 @@ impl LocalArtifactCache {
             (candidates, idx.total_size)
         };
         if total_size <= target {
-            return Ok(());
+            return;
         }
 
         candidates.sort_by_key(|(_, ts, _)| *ts);
@@ -403,8 +399,6 @@ impl LocalArtifactCache {
                 }
             }
         }
-
-        Ok(())
     }
 }
 
@@ -478,14 +472,14 @@ mod tests {
 
         {
             let idx = cache.lock_index();
-            let entry = idx.entries.get(key).unwrap();
+            let entry = &idx.entries[key];
             assert_eq!(entry.ref_count, 1);
         }
 
         drop(handle);
         {
             let idx = cache.lock_index();
-            let entry = idx.entries.get(key).unwrap();
+            let entry = &idx.entries[key];
             assert_eq!(entry.ref_count, 0);
         }
     }
@@ -518,7 +512,7 @@ mod tests {
             idx.total_size = cache.max_size_bytes + 1;
         }
 
-        cache.evict_lru().unwrap();
+        cache.evict_lru();
 
         assert!(
             !path_a.exists() || {
@@ -562,7 +556,7 @@ mod tests {
         let path_b = handle_b.path().to_path_buf();
         drop(handle_b);
 
-        cache.evict_lru().unwrap();
+        cache.evict_lru();
 
         let idx = cache.lock_index();
         assert!(idx.total_size <= 8);
@@ -594,7 +588,7 @@ mod tests {
 
         {
             let idx = cache.lock_index();
-            let entry = idx.entries.get("runtime/snapshot/image.json").unwrap();
+            let entry = &idx.entries["runtime/snapshot/image.json"];
             assert_eq!(entry.ref_count, 2);
             assert_eq!(idx.total_size, expected_size);
         }
@@ -602,7 +596,7 @@ mod tests {
         drop(first);
         drop(second);
         let idx = cache.lock_index();
-        let entry = idx.entries.get("runtime/snapshot/image.json").unwrap();
+        let entry = &idx.entries["runtime/snapshot/image.json"];
         assert_eq!(entry.ref_count, 0);
     }
 

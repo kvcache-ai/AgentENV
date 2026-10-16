@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // Test and benchmark code may unwrap.
 use agentenv::image::ImageResolver;
 use agentenv::sandbox::{
     CapturedSandboxSnapshot, FirecrackerSandbox, FirecrackerSandboxConfig,
@@ -90,7 +91,7 @@ fn should_run(name: &str, filters: &[String]) -> bool {
     filters.is_empty() || filters.iter().any(|filter| name.contains(filter))
 }
 
-fn filtered_benchmark_names() -> Result<Option<Vec<String>>> {
+fn filtered_benchmark_names() -> Option<Vec<String>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--list") {
         println!("snapshot_creation");
@@ -102,14 +103,14 @@ fn filtered_benchmark_names() -> Result<Option<Vec<String>>> {
         println!("concurrent_resume_throughput");
         println!("concurrent_snapshot_capture_throughput");
         println!("concurrent_pause_throughput");
-        return Ok(None);
+        return None;
     }
 
-    Ok(Some(
+    Some(
         args.into_iter()
             .filter(|arg| !arg.starts_with('-'))
             .collect(),
-    ))
+    )
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -986,7 +987,7 @@ fn bench_snapshot_throughput(c: &mut Criterion) {
 }
 
 fn run_default_snapshot_benchmarks() -> Result<()> {
-    let Some(filters) = filtered_benchmark_names()? else {
+    let Some(filters) = filtered_benchmark_names() else {
         return Ok(());
     };
 

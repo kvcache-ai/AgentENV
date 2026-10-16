@@ -46,6 +46,7 @@ struct ClaimedRuntimeDir {
 
 impl ClaimedRuntimeDir {
     fn claim(path: &Path) -> Result<Self> {
+        #[allow(clippy::create_dir)] // Claiming requires the directory not to exist.
         fs::create_dir(path).with_context(|| {
             format!(
                 "claim overlaybd runtime dir {} (it must not already exist)",
@@ -125,7 +126,7 @@ pub(crate) async fn materialize_overlaybd_runtime(
     request: MaterializeOverlaybdRuntimeRequest<'_>,
 ) -> Result<MaterializedOverlaybdRuntime> {
     let claimed_runtime_dir = ClaimedRuntimeDir::claim(request.runtime_dir)?;
-    match materialize_runtime_contents(request).await {
+    match Box::pin(materialize_runtime_contents(request)).await {
         Ok((runtime_image_config_path, actual_virtual_size)) => Ok(MaterializedOverlaybdRuntime {
             runtime_image_config_path,
             actual_virtual_size,
@@ -232,12 +233,12 @@ async fn materialize_runtime_contents(
         // error propagation; verification reopens through the Rust
         // ImageService with the request's normal global config.
         let resize_guard = resize_permit.lock().await;
-        run_resize_tool(
+        Box::pin(run_resize_tool(
             tool,
             &runtime_image_config_path,
             resize_global_config,
             actual_virtual_size,
-        )
+        ))
         .await?;
         drop(resize_guard);
         verify_resized_runtime(
@@ -364,7 +365,7 @@ async fn run_resize_tool(
         .take()
         .context("capture overlaybd-resize stderr")?;
     let timeout = Duration::from_secs(tool.timeout_secs);
-    let output = tokio::time::timeout(timeout, async {
+    let output = Box::pin(tokio::time::timeout(timeout, async {
         let (stdout, stderr, status) = tokio::join!(
             read_bounded_output(stdout),
             read_bounded_output(stderr),
@@ -375,7 +376,7 @@ async fn run_resize_tool(
             stderr.context("read overlaybd-resize stderr")?,
             status.context("wait for overlaybd-resize")?,
         ))
-    })
+    }))
     .await;
     let (stdout, stderr, status) = match output {
         Ok(output) => output?,
@@ -693,12 +694,12 @@ mod tests {
         );
         let runtime_dir = temp.path().join("runtime");
 
-        let runtime = materialize_overlaybd_runtime(materialize_test_request(
+        let runtime = Box::pin(materialize_overlaybd_runtime(materialize_test_request(
             &cache,
             &source,
             &global_config,
             &runtime_dir,
-        ))
+        )))
         .await
         .unwrap();
 
@@ -757,7 +758,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_bounded_output_marks_truncation_within_limit() {
-        let output = read_bounded_output(&[b'x'; RESIZE_OUTPUT_LIMIT + 1][..])
+        let output = read_bounded_output(&vec![b'x'; RESIZE_OUTPUT_LIMIT + 1][..])
             .await
             .unwrap();
         assert_eq!(output.len(), RESIZE_OUTPUT_LIMIT);
@@ -787,7 +788,7 @@ mod tests {
         );
 
         let templates = temp.path().join("templates");
-        fs::create_dir(&templates).unwrap();
+        fs::create_dir_all(&templates).unwrap();
         let template_data = templates.join("upper.data");
         let template_index = templates.join("upper.index");
         prepare_runtime_upper(
@@ -827,7 +828,9 @@ mod tests {
         request.resize_tool = Some(&resize_tool);
         request.resize_global_config = &resize_global_config;
         request.resize_permit = Arc::clone(&resize_permit);
-        let materialized = materialize_overlaybd_runtime(request).await.unwrap();
+        let materialized = Box::pin(materialize_overlaybd_runtime(request))
+            .await
+            .unwrap();
 
         assert_eq!(materialized.actual_virtual_size, 2 * GIB);
         validate_rw_header_pair_paths(
@@ -872,7 +875,7 @@ mod tests {
         timed_out_request.resize_tool = Some(&timeout_tool);
         timed_out_request.resize_global_config = &resize_global_config;
         timed_out_request.resize_permit = Arc::clone(&resize_permit);
-        let err = materialize_overlaybd_runtime(timed_out_request)
+        let err = Box::pin(materialize_overlaybd_runtime(timed_out_request))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("timed out after 1 seconds"));
@@ -885,12 +888,12 @@ mod tests {
         };
         tokio::time::timeout(Duration::from_secs(10), async {
             let _guard = resize_permit.lock().await;
-            run_resize_tool(
+            Box::pin(run_resize_tool(
                 &second_tool,
                 &materialized.runtime_image_config_path,
                 &resize_global_config,
                 2 * GIB,
-            )
+            ))
             .await
         })
         .await
@@ -904,7 +907,7 @@ mod tests {
         let image = temp.path().join("image.json");
         let global = temp.path().join("global.json");
         let failure = fake_resize_tool(temp.path(), "echo failed-out; echo failed-err >&2; exit 7");
-        let err = run_resize_tool(
+        let err = Box::pin(run_resize_tool(
             &ResizeToolSpec {
                 binary: failure,
                 lib_dir: None,
@@ -913,14 +916,14 @@ mod tests {
             &image,
             &global,
             GIB,
-        )
+        ))
         .await
         .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("failed-out") && message.contains("failed-err"));
 
         let timeout = fake_resize_tool(temp.path(), "sleep 5");
-        let err = run_resize_tool(
+        let err = Box::pin(run_resize_tool(
             &ResizeToolSpec {
                 binary: timeout,
                 lib_dir: None,
@@ -929,7 +932,7 @@ mod tests {
             &image,
             &global,
             GIB,
-        )
+        ))
         .await
         .unwrap_err();
         assert!(err.to_string().contains("timed out after 1 seconds"));
@@ -952,7 +955,9 @@ mod tests {
         let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
         request.read_only = true;
         request.known_source_virtual_size = Some(8192);
-        let runtime = materialize_overlaybd_runtime(request).await.unwrap();
+        let runtime = Box::pin(materialize_overlaybd_runtime(request))
+            .await
+            .unwrap();
 
         assert_eq!(runtime.actual_virtual_size, 8192);
         assert!(runtime.runtime_image_config_path.exists());
@@ -984,7 +989,9 @@ mod tests {
             request.runtime_upper_mode = mode;
             request.requested_virtual_size = Some(4096);
             request.known_source_virtual_size = Some(4096);
-            let runtime = materialize_overlaybd_runtime(request).await.unwrap();
+            let runtime = Box::pin(materialize_overlaybd_runtime(request))
+                .await
+                .unwrap();
 
             assert_eq!(runtime.actual_virtual_size, 4096);
             assert!(runtime_dir.join(RUNTIME_UPPER_DATA_FILE).exists());
@@ -1025,7 +1032,9 @@ mod tests {
         let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
         request.runtime_upper_mode = UpperMode::Sparse;
         request.known_source_virtual_size = Some(16384);
-        let runtime = materialize_overlaybd_runtime(request).await.unwrap();
+        let runtime = Box::pin(materialize_overlaybd_runtime(request))
+            .await
+            .unwrap();
 
         assert_eq!(runtime.actual_virtual_size, 16384);
         assert!(!runtime_dir.join(RUNTIME_UPPER_DATA_FILE).exists());
@@ -1054,7 +1063,9 @@ mod tests {
 
         let mut request = materialize_test_request(&cache, &source, &global_config, &runtime_dir);
         request.known_source_virtual_size = Some(8192);
-        let runtime = materialize_overlaybd_runtime(request).await.unwrap();
+        let runtime = Box::pin(materialize_overlaybd_runtime(request))
+            .await
+            .unwrap();
 
         assert_eq!(runtime.actual_virtual_size, 8192);
         assert!(!runtime_dir.join(RUNTIME_UPPER_DATA_FILE).exists());
@@ -1096,7 +1107,7 @@ mod tests {
         let claimed = ClaimedRuntimeDir::claim(&runtime_dir).unwrap();
         fs::write(runtime_dir.join(RUNTIME_IMAGE_CONFIG_FILE), b"runtime").unwrap();
         let tool_temp_dir = runtime_dir.join("resize-tmp");
-        fs::create_dir(&tool_temp_dir).unwrap();
+        fs::create_dir_all(&tool_temp_dir).unwrap();
         fs::write(tool_temp_dir.join("scratch"), b"temporary").unwrap();
 
         claimed.cleanup();

@@ -274,7 +274,7 @@ impl IrohBlobsP2pTransport {
             .map_err(|err| Error::internal_message("export local P2P blob", err))
     }
 
-    async fn export_local_blob_range(
+    fn export_local_blob_range(
         &self,
         blob_hash: iroh_blobs::Hash,
         range: Range<u64>,
@@ -607,7 +607,7 @@ impl P2pTransport for IrohBlobsP2pTransport {
         let (blob_hash, providers) = match self.resolve_fetch_source(descriptor)? {
             BlobFetchSource::Local { blob_hash } => {
                 let tag = self.pin_blob(blob_hash).await?;
-                let stream = self.export_local_blob_range(blob_hash, range, tag).await?;
+                let stream = self.export_local_blob_range(blob_hash, range, tag)?;
                 debug!("fetched artifact range from local P2P store");
                 return Ok(stream);
             }
@@ -624,7 +624,7 @@ impl P2pTransport for IrohBlobsP2pTransport {
         let tag = self
             .download_blob(GetRequest::blob_ranges(blob_hash, ranges), providers)
             .await?;
-        let stream = self.export_local_blob_range(blob_hash, range, tag).await?;
+        let stream = self.export_local_blob_range(blob_hash, range, tag)?;
         debug!(providers_count, "fetched artifact range from P2P provider");
         Ok(stream)
     }
@@ -675,7 +675,7 @@ impl P2pTransport for IrohBlobsP2pTransport {
         if self.published_catalog.remove(key).await?.is_none() {
             debug!("P2P unpublish skipped missing local artifact");
             return Ok(false);
-        };
+        }
 
         self.store
             .tags()

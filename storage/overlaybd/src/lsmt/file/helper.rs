@@ -1418,6 +1418,7 @@ async fn compact_copy_mapping_with_zero_detection(
 /// written and the destination writer has been finalized. Finalization does not
 /// imply that the output has been synced to stable storage. Returns an error on
 /// any read, write, or finalization failure.
+#[allow(clippy::too_many_lines)]
 pub async fn compact_to(
     src_layers: &[Arc<dyn VirtualFile>],
     mappings: &[SegmentMapping],
@@ -1532,7 +1533,7 @@ pub async fn compact_to(
                 dest_moffset += blocks_taken;
 
                 if chunk.total_len >= buf_size {
-                    chunks.push(current_chunk.take().unwrap());
+                    chunks.push(current_chunk.take().expect("chunk is in progress"));
                 }
             }
         }

@@ -209,7 +209,7 @@ impl FirecrackerInstance {
         let bytes_to_read = file.metadata()?.len().min(MAX_BYTES);
         file.seek(SeekFrom::End(-(bytes_to_read as i64)))?;
         let mut bytes = Vec::with_capacity(bytes_to_read as usize);
-        file.read_to_end(&mut bytes)?;
+        file.take(bytes_to_read).read_to_end(&mut bytes)?;
         Ok(String::from_utf8_lossy(&bytes).trim().to_owned())
     }
 

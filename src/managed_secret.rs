@@ -167,6 +167,7 @@ fn open_secret(_path: &Path) -> io::Result<File> {
 }
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)] // Matches the non-Unix signature.
 fn ensure_supported() -> Result<()> {
     Ok(())
 }
@@ -243,7 +244,7 @@ mod tests {
         let root = tempfile::tempdir()?;
         let directory = root.path().join("secrets");
         let secret = directory.join("api-key");
-        fs::create_dir(&directory)?;
+        fs::create_dir_all(&directory)?;
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))?;
 
         assert!(read(&secret, 64)?.is_none());

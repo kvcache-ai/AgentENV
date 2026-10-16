@@ -247,7 +247,7 @@ impl fmt::Debug for HeaderTrailer {
             .field("virtual_size", &virtual_size)
             .field("is_header", &self.is_header())
             .field("is_sealed", &self.is_sealed())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

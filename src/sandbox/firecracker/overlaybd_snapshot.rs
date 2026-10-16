@@ -308,7 +308,7 @@ async fn copy_file_atomically(src: &Path, dst: &Path, description: &str) -> Resu
     Ok(())
 }
 
-async fn rewrite_live_runtime_config_for_restack(
+fn rewrite_live_runtime_config_for_restack(
     live_runtime_image_config_path: &Path,
     snapshot_layer_path: &Path,
     descriptor: Option<&overlaybd::LayerDescriptor>,
@@ -562,7 +562,6 @@ async fn capture_live_overlaybd_snapshot(
         &snapshot_layer_path,
         descriptor.as_ref(),
     )
-    .await
     .context("rewrite live runtime config after restack snapshot")
     .map_err(into_terminal_snapshot_failure)?;
 

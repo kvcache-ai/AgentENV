@@ -62,7 +62,7 @@ fn assert_no_lower_paths_under(paths: &[PathBuf], root: &Path, context: &str) {
 }
 
 /// Write a marker file to guest disk via envd and verify it was written.
-async fn write_disk_marker(sandbox: &mut FirecrackerSandbox) -> Result<()> {
+async fn write_disk_marker(sandbox: &FirecrackerSandbox) -> Result<()> {
     let output = sandbox
         .run_command(
             "sh",
@@ -76,7 +76,7 @@ async fn write_disk_marker(sandbox: &mut FirecrackerSandbox) -> Result<()> {
 }
 
 /// Read the marker file from guest disk and verify it contains the expected value.
-async fn verify_disk_marker(sandbox: &mut FirecrackerSandbox) -> Result<()> {
+async fn verify_disk_marker(sandbox: &FirecrackerSandbox) -> Result<()> {
     let output = sandbox.run_command("cat", &[DISK_MARKER_PATH]).await?;
     if output.exit_code != 0 {
         bail!(
@@ -148,19 +148,19 @@ async fn microvm_lifecycle_and_snapshot_preserve_disk_state() -> Result<()> {
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
 
-    write_disk_marker(&mut sandbox).await?;
+    write_disk_marker(&sandbox).await?;
     let snapshot = sandbox.pause().await?;
     assert!(snapshot.vm_state_path.exists());
     assert!(snapshot.mem_overlaybd_config.image_config_path.exists());
 
     sandbox.resume().await?;
-    verify_disk_marker(&mut sandbox).await?;
+    verify_disk_marker(&sandbox).await?;
 
     let snapshot = sandbox.pause().await?;
     sandbox.stop().await?;
 
     let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
-    verify_disk_marker(&mut resumed).await?;
+    verify_disk_marker(&resumed).await?;
     resumed.stop().await?;
     Ok(())
 }
@@ -253,7 +253,7 @@ async fn oci_tools_share_a_readonly_device_across_concurrent_launches() -> Resul
         .unwrap()
         .to_string();
     let rootfs = release.path().join("rootfs");
-    fs::create_dir(&rootfs)?;
+    fs::create_dir_all(&rootfs)?;
 
     // Reuse the provisioned guest binaries, regardless of the default tools format.
     let mut seed = FirecrackerSandbox::new(common::default_sandbox_config()?)?;
@@ -349,7 +349,7 @@ async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
 
-    write_disk_marker(&mut sandbox).await?;
+    write_disk_marker(&sandbox).await?;
     let snapshot_dir = tempfile::tempdir()?;
     let (snapshot, _) = sandbox.pause_to_dir(snapshot_dir.path()).await?;
     sandbox.stop().await?;
@@ -368,7 +368,7 @@ async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
     assert_memory_layer_is_raw(&snapshot).await?;
 
     let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
-    verify_disk_marker(&mut resumed).await?;
+    verify_disk_marker(&resumed).await?;
     resumed.stop().await?;
     Ok(())
 }
@@ -389,7 +389,7 @@ async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<(
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
 
-    write_disk_marker(&mut sandbox).await?;
+    write_disk_marker(&sandbox).await?;
     let temp = tempfile::tempdir()?;
     let artifact_root = temp.path().join("paused-artifacts");
     let paused_state = SandboxBackend::pause(&mut sandbox, Some(&artifact_root)).await?;
@@ -405,7 +405,7 @@ async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<(
         agentenv::sandbox::FirecrackerPausedState::decode(artifact_root.clone(), encoded)?;
     let mut resumed =
         FirecrackerSandbox::resume_from_snapshot_config(decoded.snapshot_config()).await?;
-    verify_disk_marker(&mut resumed).await?;
+    verify_disk_marker(&resumed).await?;
     resumed.stop().await?;
     Ok(())
 }
@@ -413,13 +413,14 @@ async fn backend_pause_state_round_trips_through_encoded_artifacts() -> Result<(
 /// Verify multi-level snapshot chains: first → second → resume from second after
 /// dropping the first snapshot handle.
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Result<()> {
     common::setup().await;
     let sandbox_config = common::default_sandbox_config()?;
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
 
-    write_disk_marker(&mut sandbox).await?;
+    write_disk_marker(&sandbox).await?;
     let first_snapshot = sandbox.pause().await?;
     assert_memory_layer_is_raw(&first_snapshot).await?;
     sandbox.stop().await?;
@@ -450,7 +451,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
 
     // Resume from first, write additional data, pause again.
     let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&first_snapshot).await?;
-    verify_disk_marker(&mut resumed).await?;
+    verify_disk_marker(&resumed).await?;
     let second_snapshot = resumed.pause().await?;
     assert_memory_layer_is_raw(&second_snapshot).await?;
     resumed.stop().await?;
@@ -517,7 +518,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
 
     let mut resumed_again =
         FirecrackerSandbox::resume_from_snapshot_config(&second_snapshot).await?;
-    verify_disk_marker(&mut resumed_again).await?;
+    verify_disk_marker(&resumed_again).await?;
 
     // Also test pause_to_dir with snapshot-owned inherited layer adoption.
     let expected_snapshot_dir = tempfile::tempdir()?;
@@ -573,7 +574,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
 
     let mut resumed_from_dir =
         FirecrackerSandbox::resume_from_snapshot_config(&dir_snapshot).await?;
-    verify_disk_marker(&mut resumed_from_dir).await?;
+    verify_disk_marker(&resumed_from_dir).await?;
     resumed_from_dir.stop().await?;
     Ok(())
 }
@@ -587,7 +588,7 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
 
-    write_disk_marker(&mut sandbox).await?;
+    write_disk_marker(&sandbox).await?;
     let snapshot = sandbox.pause().await?;
     sandbox.stop().await?;
 
@@ -597,7 +598,7 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
     let mut snapshots = Vec::new();
     for i in 0..vm_count {
         let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
-        verify_disk_marker(&mut resumed).await?;
+        verify_disk_marker(&resumed).await?;
         // Write a per-instance marker to prove writable state is independent.
         let per_vm_marker = format!("{DISK_MARKER_PATH}.vm{i}");
         let output = resumed
@@ -616,7 +617,7 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
     // Verify each snapshot still has the original marker.
     for snap in &snapshots {
         let mut sandbox = FirecrackerSandbox::resume_from_snapshot_config(snap).await?;
-        verify_disk_marker(&mut sandbox).await?;
+        verify_disk_marker(&sandbox).await?;
         sandbox.stop().await?;
     }
 
@@ -627,7 +628,7 @@ async fn multiple_resumes_have_independent_disk_state() -> Result<()> {
 /// DNS or upstream failures do not fail policy assertions. Expected failures
 /// run once: a retry cannot turn a correctly blocked connection into a pass.
 async fn run_connectivity_probe(
-    sandbox: &mut FirecrackerSandbox,
+    sandbox: &FirecrackerSandbox,
     cmd: &str,
     args: &[&str],
     should_succeed: bool,
@@ -651,7 +652,7 @@ async fn run_connectivity_probe(
 }
 
 async fn assert_tcp_connect(
-    sandbox: &mut FirecrackerSandbox,
+    sandbox: &FirecrackerSandbox,
     destination: &str,
     should_succeed: bool,
 ) -> Result<()> {
@@ -668,11 +669,7 @@ async fn assert_tcp_connect(
     Ok(())
 }
 
-async fn assert_curl(
-    sandbox: &mut FirecrackerSandbox,
-    url: &str,
-    should_succeed: bool,
-) -> Result<()> {
+async fn assert_curl(sandbox: &FirecrackerSandbox, url: &str, should_succeed: bool) -> Result<()> {
     let output = run_connectivity_probe(
         sandbox,
         "curl",
@@ -704,7 +701,7 @@ async fn assert_curl(
     Ok(())
 }
 
-async fn test_network(sandbox: &mut FirecrackerSandbox, after_resume: bool) -> Result<()> {
+async fn test_network(sandbox: &FirecrackerSandbox, after_resume: bool) -> Result<()> {
     let checks = [("tcp_ip", "8.8.8.8/53"), ("tcp_dns", "www.baidu.com/443")];
 
     for (name, destination) in checks {
@@ -728,12 +725,12 @@ async fn microvm_can_access_internet() -> Result<()> {
     let sandbox_config = common::default_sandbox_config()?;
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
-    test_network(&mut sandbox, false).await?;
+    test_network(&sandbox, false).await?;
     let snapshot = sandbox.pause().await?;
     sandbox.stop().await?;
 
     let mut resumed_sandbox = FirecrackerSandbox::resume_from_snapshot_config(&snapshot).await?;
-    test_network(&mut resumed_sandbox, true).await?;
+    test_network(&resumed_sandbox, true).await?;
     resumed_sandbox.stop().await?;
 
     Ok(())
@@ -752,8 +749,8 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
 
-    assert_tcp_connect(&mut sandbox, "8.8.8.8/53", true).await?;
-    assert_tcp_connect(&mut sandbox, "1.1.1.1/53", false).await?;
+    assert_tcp_connect(&sandbox, "8.8.8.8/53", true).await?;
+    assert_tcp_connect(&sandbox, "1.1.1.1/53", false).await?;
 
     sandbox
         .update_network_policy(Some(SandboxNetworkPolicy::new(
@@ -763,8 +760,8 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
         )))
         .await?;
 
-    assert_tcp_connect(&mut sandbox, "8.8.8.8/53", false).await?;
-    assert_tcp_connect(&mut sandbox, "1.1.1.1/53", true).await?;
+    assert_tcp_connect(&sandbox, "8.8.8.8/53", false).await?;
+    assert_tcp_connect(&sandbox, "1.1.1.1/53", true).await?;
 
     sandbox
         .update_network_policy(Some(SandboxNetworkPolicy::new(
@@ -777,14 +774,14 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
         )))
         .await?;
 
-    assert_tcp_connect(&mut sandbox, "8.8.8.8/53", true).await?;
-    assert_tcp_connect(&mut sandbox, "1.1.1.1/53", false).await?;
-    assert_tcp_connect(&mut sandbox, "1.0.0.1/53", true).await?;
+    assert_tcp_connect(&sandbox, "8.8.8.8/53", true).await?;
+    assert_tcp_connect(&sandbox, "1.1.1.1/53", false).await?;
+    assert_tcp_connect(&sandbox, "1.0.0.1/53", true).await?;
 
     sandbox.update_network_policy(None).await?;
-    assert_tcp_connect(&mut sandbox, "8.8.8.8/53", true).await?;
-    assert_tcp_connect(&mut sandbox, "1.1.1.1/53", true).await?;
-    assert_tcp_connect(&mut sandbox, "10.255.255.254/80", false).await?;
+    assert_tcp_connect(&sandbox, "8.8.8.8/53", true).await?;
+    assert_tcp_connect(&sandbox, "1.1.1.1/53", true).await?;
+    assert_tcp_connect(&sandbox, "10.255.255.254/80", false).await?;
 
     sandbox
         .update_network_policy(Some(SandboxNetworkPolicy::new(
@@ -793,7 +790,7 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
             SandboxNetworkEgressPolicy::new(Some(vec!["10.0.0.0/8".to_string()]), None)?,
         )))
         .await?;
-    assert_tcp_connect(&mut sandbox, "10.255.255.254/80", false).await?;
+    assert_tcp_connect(&sandbox, "10.255.255.254/80", false).await?;
 
     sandbox
         .update_network_policy(Some(SandboxNetworkPolicy::new(
@@ -806,9 +803,9 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
         )))
         .await?;
 
-    assert_curl(&mut sandbox, "http://www.baidu.com/", true).await?;
-    assert_curl(&mut sandbox, "https://www.baidu.com/", true).await?;
-    assert_curl(&mut sandbox, "https://www.qq.com/", false).await?;
+    assert_curl(&sandbox, "http://www.baidu.com/", true).await?;
+    assert_curl(&sandbox, "https://www.baidu.com/", true).await?;
+    assert_curl(&sandbox, "https://www.qq.com/", false).await?;
 
     sandbox
         .update_network_policy(Some(SandboxNetworkPolicy::new(
@@ -821,12 +818,12 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
         )))
         .await?;
 
-    assert_curl(&mut sandbox, "https://www.baidu.com/", false).await?;
-    assert_curl(&mut sandbox, "https://www.qq.com/", true).await?;
+    assert_curl(&sandbox, "https://www.baidu.com/", false).await?;
+    assert_curl(&sandbox, "https://www.qq.com/", true).await?;
 
     sandbox.update_network_policy(None).await?;
-    assert_curl(&mut sandbox, "https://www.baidu.com/", true).await?;
-    assert_curl(&mut sandbox, "https://www.qq.com/", true).await?;
+    assert_curl(&sandbox, "https://www.baidu.com/", true).await?;
+    assert_curl(&sandbox, "https://www.qq.com/", true).await?;
 
     sandbox.stop().await?;
     Ok(())

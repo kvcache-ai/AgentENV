@@ -41,3 +41,6 @@ ureq = { version = "2", features = ["json", "tls"] }
 walkdir = "2"
 shell-util = { path = "../../crates/shell-util" }
 uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true

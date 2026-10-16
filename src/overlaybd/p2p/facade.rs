@@ -29,7 +29,7 @@ use super::cache::DescriptorCache;
 
 const DEFAULT_LOOKUP_TIMEOUT: Duration = Duration::from_millis(300);
 const DEFAULT_FETCH_RANGE_TIMEOUT: Duration = Duration::from_secs(2);
-const DEFAULT_DESCRIPTOR_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_DESCRIPTOR_CACHE_TTL: Duration = Duration::from_mins(5);
 const DEFAULT_DESCRIPTOR_MISS_CACHE_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_DESCRIPTOR_CACHE_MAX_ENTRIES: usize = 16 * 1024;
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -134,7 +134,7 @@ struct P2pHttpFacadeState {
     lookup_timeout: Duration,
     fetch_range_timeout: Duration,
     descriptor_cache: DescriptorCache,
-    allowed_publish_roots: Arc<Vec<PathBuf>>,
+    allowed_publish_roots: Arc<[PathBuf]>,
 }
 
 struct P2pHttpFacadeServer;
@@ -165,7 +165,7 @@ impl P2pHttpFacadeServer {
                 config.descriptor_miss_cache_ttl,
                 config.descriptor_cache_max_entries,
             ),
-            allowed_publish_roots: Arc::new(allowed_publish_roots),
+            allowed_publish_roots: allowed_publish_roots.into(),
         };
         let app = Router::new()
             .route(
@@ -876,7 +876,7 @@ mod tests {
 
     #[derive(Clone)]
     struct OriginState {
-        blob: Arc<Vec<u8>>,
+        blob: Arc<[u8]>,
         hits: Arc<AtomicUsize>,
         force_200: bool,
     }
@@ -889,7 +889,7 @@ mod tests {
         if state.force_200 {
             return Response::builder()
                 .status(StatusCode::OK)
-                .body(Body::from(state.blob.as_ref().clone()))
+                .body(Body::from(state.blob.to_vec()))
                 .expect("200 response");
         }
         let (start, requested_end) = parse_origin_range(&headers).expect("range");
@@ -1024,7 +1024,7 @@ mod tests {
 
         let hits = Arc::new(AtomicUsize::new(0));
         let (origin, origin_handle) = spawn_origin(OriginState {
-            blob: Arc::new(blob.clone()),
+            blob: Arc::from(blob.clone()),
             hits: hits.clone(),
             force_200: false,
         })
@@ -1119,7 +1119,7 @@ mod tests {
 
         let hits = Arc::new(AtomicUsize::new(0));
         let (origin, origin_handle) = spawn_origin(OriginState {
-            blob: Arc::new(blob.clone()),
+            blob: Arc::from(blob.clone()),
             hits: hits.clone(),
             force_200: false,
         })
@@ -1162,7 +1162,7 @@ mod tests {
 
         let hits = Arc::new(AtomicUsize::new(0));
         let (origin, origin_handle) = spawn_origin(OriginState {
-            blob: Arc::new(blob),
+            blob: Arc::from(blob),
             hits: hits.clone(),
             force_200: false,
         })
@@ -1183,7 +1183,7 @@ mod tests {
         let blob: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
         let hits = Arc::new(AtomicUsize::new(0));
         let (origin, origin_handle) = spawn_origin(OriginState {
-            blob: Arc::new(blob.clone()),
+            blob: Arc::from(blob.clone()),
             hits: hits.clone(),
             force_200: false,
         })
@@ -1205,7 +1205,7 @@ mod tests {
         let blob: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
         let hits = Arc::new(AtomicUsize::new(0));
         let (origin, origin_handle) = spawn_origin(OriginState {
-            blob: Arc::new(blob.clone()),
+            blob: Arc::from(blob.clone()),
             hits,
             force_200: false,
         })
@@ -1228,7 +1228,7 @@ mod tests {
         let blob: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
         let hits = Arc::new(AtomicUsize::new(0));
         let (origin, origin_handle) = spawn_origin(OriginState {
-            blob: Arc::new(blob),
+            blob: Arc::from(blob),
             hits,
             force_200: false,
         })
@@ -1263,7 +1263,7 @@ mod tests {
         let blob: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
         let hits = Arc::new(AtomicUsize::new(0));
         let (origin, origin_handle) = spawn_origin(OriginState {
-            blob: Arc::new(blob),
+            blob: Arc::from(blob),
             hits,
             force_200: false,
         })
@@ -1287,7 +1287,7 @@ mod tests {
         let blob: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
         let hits = Arc::new(AtomicUsize::new(0));
         let (origin, origin_handle) = spawn_origin(OriginState {
-            blob: Arc::new(blob),
+            blob: Arc::from(blob),
             hits: hits.clone(),
             force_200: false,
         })
@@ -1342,7 +1342,7 @@ mod tests {
 
         let hits = Arc::new(AtomicUsize::new(0));
         let (origin, origin_handle) = spawn_origin(OriginState {
-            blob: Arc::new(blob.clone()),
+            blob: Arc::from(blob.clone()),
             hits: hits.clone(),
             force_200: false,
         })
@@ -1375,7 +1375,7 @@ mod tests {
     async fn origin_200_for_range_is_rejected_and_not_published() {
         let blob: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
         let (origin, origin_handle) = spawn_origin(OriginState {
-            blob: Arc::new(blob),
+            blob: Arc::from(blob),
             hits: Arc::new(AtomicUsize::new(0)),
             force_200: true,
         })

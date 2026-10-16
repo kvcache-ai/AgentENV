@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // Test and benchmark code may unwrap.
 use anyhow::{bail, Context, Result};
 use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
 use overlaybd::config::UpperMode;
@@ -425,15 +426,12 @@ impl BenchEnv {
             .context("init OverlaybdTarget")?;
 
         let mut buf = IOBuffer::User(
-            UserBuffer::new(ring.clone(), io_size, 512)
-                .await
-                .context("create benchmark IO buffer")?,
+            UserBuffer::new(ring.clone(), io_size, 512).context("create benchmark IO buffer")?,
         );
         fill_write_pattern(&mut buf, io_size);
 
         let mut prime_buf = IOBuffer::User(
             UserBuffer::new(ring.clone(), PRIME_IO_SIZE_BYTES, 512)
-                .await
                 .context("create prime IO buffer")?,
         );
         fill_write_pattern(&mut prime_buf, PRIME_IO_SIZE_BYTES);
@@ -443,7 +441,6 @@ impl BenchEnv {
             for _ in 0..io_depth {
                 bufs.push(IOBuffer::User(
                     UserBuffer::new(ring.clone(), io_size, 512)
-                        .await
                         .context("create depth IO buffer")?,
                 ));
             }
@@ -588,7 +585,7 @@ fn fill_write_pattern(buf: &mut IOBuffer, io_size: usize) {
                 *b = (idx as u8).wrapping_mul(31).wrapping_add(17);
             }
         }
-        _ => panic!(
+        IOBuffer::AutoReg(_) => panic!(
             "fill_write_pattern: unsupported IOBuffer variant; benchmark would silently write zeroes"
         ),
     }

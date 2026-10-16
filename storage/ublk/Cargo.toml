@@ -32,3 +32,6 @@ tempfile = "3"
 axum = "0.8.6"
 sha2 = { version = "0.10.9", features = ["asm"] }
 storage-util = { path = "../util", features = ["io-uring"] }
+
+[lints]
+workspace = true

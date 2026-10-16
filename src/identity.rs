@@ -37,7 +37,10 @@ impl NodeIdentity {
 
         Self {
             id,
-            cluster_id: parse_uuid_with_fallback("node_identity.cluster_id", &config.cluster_id),
+            cluster_id: parse_uuid_with_fallback(
+                "node_identity.cluster_id",
+                config.cluster_id.as_deref(),
+            ),
             service_instance_id: config
                 .service_instance_id
                 .clone()
@@ -49,7 +52,7 @@ impl NodeIdentity {
     }
 }
 
-fn parse_uuid_with_fallback(field: &str, config_value: &Option<String>) -> Uuid {
+fn parse_uuid_with_fallback(field: &str, config_value: Option<&str>) -> Uuid {
     match config_value {
         Some(raw) => match Uuid::parse_str(raw) {
             Ok(parsed) => parsed,
